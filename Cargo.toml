@@ -1,0 +1,11 @@
+[package]
+categories = ["command-line-utilities"]
+description = "The rust implementation of paimon"
+documentation = "https://docs.rs/paimon"
+repository = "https://github.com/apache/paimon-rust"
+edition = "2021"
+license = "Apache-2.0"
+name = "paimon"
+version = "0.0.0"
+
+[dependencies]
