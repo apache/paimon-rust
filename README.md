@@ -5,7 +5,7 @@
 [Latest Version]: https://img.shields.io/crates/v/paimon.svg
 [crates.io]: https://crates.io/crates/paimon
 
-The rust impelmation of Apache Paimon. 
+The rust implementation of Apache Paimon. 
 
 ## Quick Start
 
