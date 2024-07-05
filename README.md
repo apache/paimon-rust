@@ -17,7 +17,7 @@ Check out the [CONTRIBUTING.md](./CONTRIBUTING.md) guide for more details on get
 
 ## Getting help
 
-Submit [issues](https://github.com/apache/paimon/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/apache/paimon/discussions/new?category=q-a).
+Submit [issues](https://github.com/apache/paimon-rust/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/apache/paimon-rust/discussions/new?category=q-a).
 
 #### License
 
