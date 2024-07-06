@@ -15,17 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-resolver = "2"
-members = [
-    "crates/paimon",
-]
-
-[workspace.package]
-version = "0.0.0"
-edition = "2021"
-homepage = "https://paimon.apache.org/"
-
+[package]
+categories = ["command-line-utilities"]
+description = "The rust implementation of paimon"
+documentation = "https://docs.rs/paimon"
 repository = "https://github.com/apache/paimon-rust"
+edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.77.1"
+name = "paimon"
+version = "0.0.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_with = "3.8.3"
+snafu = "0.8.3"
