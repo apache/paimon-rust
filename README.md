@@ -26,17 +26,17 @@
 
 The rust implementation of Apache Paimon. 
 
-## Progress
+## Issue Tracker
 
-See [Tracking issues of paimon rust 0.1.0 release](https://github.com/apache/paimon-rust/issues/3)
+See [Tracking issues of 0.1.0 version for Apache Paimon Rust](https://github.com/apache/paimon-rust/issues/3)
 
 ## Contributing
 
-Apache Paimon Rust is under active development. We are always open to people who want to use it or contribute to it. Here are some ways to go.
+Apache Paimon Rust is an exciting project currently under active development. Whether you're looking to use it in your projects or contribute to its growth, there are several ways you can get involved:
 
-- Start with [Contributing Guide](CONTRIBUTING.md).
-- Submit [Issues](https://github.com/apache/paimon-rust/issues/new) for bug report or feature requests.
-- Discuss at [dev mailing list](mailto:dev@paimon.apache.org) ([subscribe](<mailto:dev-subscribe@paimon.apache.org?subject=(send%20this%20email%20to%20subscribe)>) / [unsubscribe](<mailto:dev-unsubscribe@paimon.apache.org?subject=(send%20this%20email%20to%20unsubscribe)>) / [archives](https://lists.apache.org/list.html?dev@paimon.apache.org))
+- Follow the [Contributing Guide](CONTRIBUTING.md) to contribute.
+- Create new [Issue](https://github.com/apache/paimon-rust/issues/new) for bug reportor or feature request.
+- Start discussion thread at [dev mailing list](mailto:dev@paimon.apache.org) ([subscribe](<mailto:dev-subscribe@paimon.apache.org?subject=(send%20this%20email%20to%20subscribe)>) / [unsubscribe](<mailto:dev-unsubscribe@paimon.apache.org?subject=(send%20this%20email%20to%20unsubscribe)>) / [archives](https://lists.apache.org/list.html?dev@paimon.apache.org))
 - Talk to community directly at [Slack #paimon channel](https://join.slack.com/t/the-asf/shared_invite/zt-2l9rns8pz-H8PE2Xnz6KraVd2Ap40z4g).
 
 ## Getting help
