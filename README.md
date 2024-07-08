@@ -43,8 +43,7 @@ Apache Paimon Rust is an exciting project currently under active development. Wh
 
 Submit [issues](https://github.com/apache/paimon-rust/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/apache/paimon-rust/discussions/new?category=q-a).
 
-#### License
+## License
 
-<sup>
 Licensed under <a href="./LICENSE">Apache License, Version 2.0</a>.
-</sup>
+
