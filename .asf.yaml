@@ -31,16 +31,12 @@ github:
   enabled_merge_buttons:
     squash: true
     merge: false
-    rebase: false
+    rebase: true
   features:
     issues: true
     discussions: true
     wiki: false
     projects: false
-  protected_branches:
-    main:
-      required_pull_request_reviews:
-        required_approving_review_count: 1
     gh-pages:
       whatever: Just a placeholder to make it take effects
   collaborators:
