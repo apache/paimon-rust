@@ -16,14 +16,15 @@
 # under the License.
 
 [package]
-categories = ["command-line-utilities"]
-description = "The rust implementation of paimon"
+categories = ["database"]
+description = "The rust implementation of Apache Paimon"
 documentation = "https://docs.rs/paimon"
-repository = "https://github.com/apache/paimon-rust"
-edition = "2021"
-license = "Apache-2.0"
 name = "paimon"
-version = "0.0.0"
+
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
