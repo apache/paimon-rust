@@ -57,66 +57,79 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Get the version of this snapshot.
     #[inline]
     pub fn version(&self) -> i32 {
         self.version
     }
 
+    /// Get the id of this snapshot.
     #[inline]
     pub fn id(&self) -> i64 {
         self.id
     }
 
+    /// Get the schema id of this snapshot.
     #[inline]
     pub fn schema_id(&self) -> i64 {
         self.schema_id
     }
 
+    /// Get the base manifest list of this snapshot.
     #[inline]
     pub fn base_manifest_list(&self) -> &str {
         &self.base_manifest_list
     }
 
+    /// Get the delta manifest list of this snapshot.
     #[inline]
     pub fn delta_manifest_list(&self) -> &str {
         &self.delta_manifest_list
     }
 
+    /// Get the changelog manifest list of this snapshot.
     #[inline]
     pub fn changelog_manifest_list(&self) -> Option<&str> {
         self.changelog_manifest_list.as_deref()
     }
 
+    /// Get the index manifest of this snapshot.
     #[inline]
     pub fn index_manifest(&self) -> Option<&str> {
         self.index_manifest.as_deref()
     }
 
+    /// Get the commit user of this snapshot.
     #[inline]
     pub fn commit_user(&self) -> &str {
         &self.commit_user
     }
 
+    /// Get the total record count of this snapshot.
     #[inline]
     pub fn total_record_count(&self) -> Option<i64> {
         self.total_record_count
     }
 
+    /// Get the delta record count of this snapshot.
     #[inline]
     pub fn delta_record_count(&self) -> Option<i64> {
         self.delta_record_count
     }
 
+    /// Get the changelog record count of this snapshot.
     #[inline]
     pub fn changelog_record_count(&self) -> Option<i64> {
         self.changelog_record_count
     }
 
+    /// Get the watermark of this snapshot.
     #[inline]
     pub fn watermark(&self) -> Option<i64> {
         self.watermark
     }
 
+    /// Get the statistics of this snapshot.
     #[inline]
     pub fn statistics(&self) -> Option<&str> {
         self.statistics.as_deref()
