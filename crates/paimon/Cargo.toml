@@ -27,6 +27,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono = "0.4.38"
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.8.3"
 snafu = "0.8.3"
