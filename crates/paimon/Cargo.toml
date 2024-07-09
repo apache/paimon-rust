@@ -29,5 +29,6 @@ version.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.8.3"
+serde_bytes = "0.11.15"
 snafu = "0.8.3"
 typed-builder = "^0.18"
