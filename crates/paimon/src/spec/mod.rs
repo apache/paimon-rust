@@ -20,3 +20,4 @@
 //! All paimon specs types are defined here.
 
 mod schema;
+mod snapshot;
