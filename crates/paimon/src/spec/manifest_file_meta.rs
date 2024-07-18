@@ -16,7 +16,7 @@
 // under the License.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_bytes::{Bytes, Deserialize as SerdeBytesDeserialize, Serialize as SerdeBytesSerialize};
+use serde_bytes::Bytes;
 use std::fmt::{Display, Formatter};
 
 /// Metadata of a manifest file.
