@@ -20,4 +20,7 @@
 //! All paimon specs types are defined here.
 
 mod schema;
+pub use schema::*;
+
 mod snapshot;
+pub use snapshot::*;
