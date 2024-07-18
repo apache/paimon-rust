@@ -31,12 +31,12 @@ use std::fmt::{Display, Formatter};
 /// TODO: make RowType extends DataType.
 /// TODO: move me to a better place.
 pub struct RowType {
-    fields: Vec<DataField>,
+    _fields: Vec<DataField>,
 }
 
 impl RowType {
     pub const fn new(list: Vec<DataField>) -> Self {
-        Self { fields: list }
+        Self { _fields: list }
     }
 }
 
@@ -46,7 +46,7 @@ pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/data/BinaryRow.java>
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all("camelCase"))]
+#[serde(rename_all = "camelCase")]
 pub struct BinaryRow {
     arity: i32,
     null_bits_size_in_bytes: i32,
@@ -80,7 +80,7 @@ type SimpleStats = ();
 /// Impl References: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all("camelCase"))]
+#[serde(rename_all = "camelCase")]
 pub enum FileSource {
     Append = 0,
     Compact = 1,
@@ -90,7 +90,7 @@ pub enum FileSource {
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all("camelCase"))]
+#[serde(rename_all = "camelCase")]
 pub struct DataFileMeta {
     pub file_name: String,
     pub file_size: i64,
