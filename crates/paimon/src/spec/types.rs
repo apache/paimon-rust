@@ -270,7 +270,7 @@ impl DataType {
 
     fn with_nullability(&self, _format: &str, params: &[&str]) -> String {
         if !self.is_nullable() {
-            format!("{}{} NOT NULL",  _format, params.concat())
+            format!("{}{} NOT NULL", _format, params.concat())
         } else {
             format!("{}{}", _format, params.concat())
         }
@@ -302,7 +302,6 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-
     pub fn new(is_nullable: bool) -> Self {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Array),
@@ -503,8 +502,8 @@ impl DecimalType {
                 Self::MAX_PRECISION
             ));
         }
-       
-        if !(Self::MIN_SCALE..=precision).contains(&scale) {        
+
+        if !(Self::MIN_SCALE..=precision).contains(&scale) {
             return Err(format!(
                 "Decimal scale must be between {} and the precision {} (both inclusive).",
                 Self::MIN_SCALE,
@@ -623,7 +622,7 @@ impl LocalZonedTimestampType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {    
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -696,7 +695,7 @@ impl TimeType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) { 
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Time precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -747,7 +746,7 @@ impl TimestampType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {     
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -865,7 +864,7 @@ impl VarCharType {
     }
 
     pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
-        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {         
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
                 VarCharType::MIN_LENGTH,
