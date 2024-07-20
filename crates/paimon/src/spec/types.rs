@@ -286,8 +286,7 @@ impl DataType {
         visitor.visit(self);
     }
 
-    fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-    }
+    fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {}
 
     fn not_null(&self) -> Self {
         self.copy(false)
@@ -309,7 +308,7 @@ pub struct ArrayType {
 
 impl ArrayType {
     pub const FORMAT: &str = "ARRAY<{}>";
-    
+
     pub fn new(is_nullable: bool) -> Self {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Array),
