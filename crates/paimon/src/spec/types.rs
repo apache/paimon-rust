@@ -315,7 +315,7 @@ impl ArrayType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         ArrayType::new(true)
     }
 
@@ -339,7 +339,7 @@ impl BigIntType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         BigIntType::new(true)
     }
 
@@ -387,7 +387,7 @@ impl BinaryType {
         BinaryType::new(true, length)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         BinaryType::with_length(BinaryType::DEFAULT_LENGTH)
     }
 
@@ -415,7 +415,7 @@ impl BooleanType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         BooleanType::new(true)
     }
 
@@ -465,7 +465,7 @@ impl CharType {
         CharType::new(true, length)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         CharType::with_length(CharType::DEFAULT_LENGTH)
     }
 
@@ -493,7 +493,7 @@ impl DateType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         DateType::new(true)
     }
 
@@ -557,7 +557,7 @@ impl DecimalType {
         DecimalType::new(true, precision, scale)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         DecimalType::with_precision_and_scale(
             DecimalType::DEFAULT_PRECISION,
             DecimalType::DEFAULT_SCALE,
@@ -592,7 +592,7 @@ impl DoubleType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         DoubleType::new(true)
     }
 
@@ -616,7 +616,7 @@ impl FloatType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         FloatType::new(true)
     }
 
@@ -640,7 +640,7 @@ impl IntType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         IntType::new(true)
     }
 
@@ -691,7 +691,7 @@ impl LocalZonedTimestampType {
         LocalZonedTimestampType::new(true, precision)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         LocalZonedTimestampType::with_precision(LocalZonedTimestampType::DEFAULT_PRECISION)
     }
 
@@ -721,7 +721,7 @@ impl SmallIntType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         SmallIntType::new(true)
     }
 
@@ -772,7 +772,7 @@ impl TimeType {
         TimeType::new(true, precision)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         TimeType::with_precision(TimeType::DEFAULT_PRECISION)
     }
 
@@ -827,7 +827,7 @@ impl TimestampType {
         TimestampType::new(true, precision)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         TimestampType::with_precision(TimestampType::DEFAULT_PRECISION)
     }
 
@@ -855,7 +855,7 @@ impl TinyIntType {
         }
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         TinyIntType::new(true)
     }
 
@@ -902,7 +902,7 @@ impl VarBinaryType {
         VarBinaryType::new(true, length)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         VarBinaryType::with_length(VarBinaryType::DEFAULT_LENGTH)
     }
 
@@ -957,7 +957,7 @@ impl VarCharType {
         VarCharType::new(true, length)
     }
 
-    pub fn default() -> Self {
+    pub fn default_value() -> Self {
         VarCharType::with_length(VarCharType::DEFAULT_LENGTH)
     }
 
