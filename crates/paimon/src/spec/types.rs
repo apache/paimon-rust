@@ -311,6 +311,10 @@ impl ArrayType {
     pub fn default_value() -> Self {
         ArrayType::new(true)
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("ARRAY<{}>", self.element_type.as_sql_string())
+    }
 }
 
 /// BigIntType for paimon.
@@ -330,6 +334,10 @@ impl BigIntType {
 
     pub fn default_value() -> Self {
         BigIntType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "BIGINT".to_string()
     }
 }
 
@@ -378,6 +386,10 @@ impl BinaryType {
 
     pub fn get_length(&self) -> usize {
         self.length
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("BINARY({})", self.length)
     }
 }
 
@@ -447,6 +459,10 @@ impl CharType {
     pub fn get_length(&self) -> usize {
         self.length
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("CHAR({})", self.length)
+    }
 }
 
 /// DateType for paimon.
@@ -466,6 +482,10 @@ impl DateType {
 
     pub fn default_value() -> Self {
         DateType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "DATE".to_string()
     }
 }
 
@@ -539,6 +559,10 @@ impl DecimalType {
     pub fn get_scale(&self) -> u32 {
         self.scale
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("DECIMAL({}, {})", self.precision, self.scale)
+    }
 }
 
 /// DoubleType for paimon.
@@ -558,6 +582,10 @@ impl DoubleType {
 
     pub fn default_value() -> Self {
         DoubleType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "DOUBLE".to_string()
     }
 }
 
@@ -579,6 +607,10 @@ impl FloatType {
     pub fn default_value() -> Self {
         FloatType::new(true)
     }
+
+    pub fn as_sql_string(&self) -> String {
+        "FLOAT".to_string()
+    }
 }
 
 /// IntType for paimon.
@@ -598,6 +630,10 @@ impl IntType {
 
     pub fn default_value() -> Self {
         IntType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "INTEGER".to_string()
     }
 }
 
@@ -650,6 +686,10 @@ impl LocalZonedTimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)
+    }
 }
 
 /// Next TODO: MapType、MultisetType、RowType
@@ -671,6 +711,10 @@ impl SmallIntType {
 
     pub fn default_value() -> Self {
         SmallIntType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "SMALLINT".to_string()
     }
 }
 
@@ -723,6 +767,10 @@ impl TimeType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("TIME({})", self.precision)
+    }
 }
 
 /// TimestampType for paimon.
@@ -774,6 +822,10 @@ impl TimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("TIMESTAMP({})", self.precision)
+    }
 }
 
 /// TinyIntType for paimon.
@@ -793,6 +845,10 @@ impl TinyIntType {
 
     pub fn default_value() -> Self {
         TinyIntType::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        "TINYINT".to_string()
     }
 }
 
@@ -840,6 +896,10 @@ impl VarBinaryType {
 
     pub fn get_length(&self) -> u32 {
         self.length
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("VARBINARY({})", self.length)
     }
 }
 
@@ -891,5 +951,9 @@ impl VarCharType {
 
     pub fn get_length(&self) -> u32 {
         self.length
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        format!("VARCHAR({})", self.length)
     }
 }
