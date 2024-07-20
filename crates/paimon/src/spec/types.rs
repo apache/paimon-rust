@@ -969,10 +969,3 @@ impl VarCharType {
         self.element_type.collect_field_ids(field_ids);
     }
 }
-
-fn main() {
-    let data_type: DataType = DataType::new(true, DataTypeRoot::Char);
-    println!("{:?}", data_type);
-
-    let array_type: ArrayType = ArrayType::new(true);
-}
