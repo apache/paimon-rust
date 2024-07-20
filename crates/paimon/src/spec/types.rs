@@ -151,8 +151,8 @@ pub struct DataType {
 }
 
 impl Display for DataType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_sql_string())
     }
 }
 
@@ -164,6 +164,7 @@ impl FromStr for DataType {
     }
 }
 
+#[allow(dead_code)]
 impl DataType {
     fn new(is_nullable: bool, type_root: DataTypeRoot) -> Self {
         Self {
@@ -267,16 +268,12 @@ impl DataType {
         serde_json::to_string(self).unwrap()
     }
 
-    fn with_nullability(&self, format: &str, params: &[&str]) -> String {
+    fn with_nullability(&self, _format: &str, params: &[&str]) -> String {
         if !self.is_nullable() {
-            format!("{} NOT NULL", format!("{}{}", format, params.concat()))
+            format!("{}{} NOT NULL",  _format, params.concat())
         } else {
-            format!("{}{}", format, params.concat())
+            format!("{}{}", _format, params.concat())
         }
-    }
-
-    fn to_string(&self) -> String {
-        self.as_sql_string()
     }
 
     fn accept<T>(&self, visitor: &mut T)
@@ -285,8 +282,6 @@ impl DataType {
     {
         visitor.visit(self);
     }
-
-    fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {}
 
     fn not_null(&self) -> Self {
         self.copy(false)
@@ -307,7 +302,6 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
-    pub const FORMAT: &str = "ARRAY<{}>";
 
     pub fn new(is_nullable: bool) -> Self {
         Self {
@@ -317,10 +311,6 @@ impl ArrayType {
 
     pub fn default_value() -> Self {
         ArrayType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -341,10 +331,6 @@ impl BigIntType {
 
     pub fn default_value() -> Self {
         BigIntType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -394,10 +380,6 @@ impl BinaryType {
     pub fn get_length(&self) -> usize {
         self.length
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// BooleanType for paimon.
@@ -418,10 +400,6 @@ impl BooleanType {
     pub fn default_value() -> Self {
         BooleanType::new(true)
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// CharType for paimon.
@@ -441,14 +419,12 @@ impl CharType {
 
     pub const MAX_LENGTH: usize = 255;
 
-    pub const FORMAT: &str = "CHAR(%d)";
-
     pub fn new(is_nullable: bool, length: usize) -> Self {
         CharType::new_with_result(is_nullable, length).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
-        if length < Self::MIN_LENGTH || length > Self::MAX_LENGTH {
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             Err("Character string length must be between 1 and 255 (both inclusive).")
         } else {
             Ok(CharType {
@@ -472,10 +448,6 @@ impl CharType {
     pub fn get_length(&self) -> usize {
         self.length
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// DateType for paimon.
@@ -495,10 +467,6 @@ impl DateType {
 
     pub fn default_value() -> Self {
         DateType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -528,14 +496,15 @@ impl DecimalType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
-        if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Decimal precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
                 Self::MAX_PRECISION
             ));
         }
-        if scale < Self::MIN_SCALE || scale > precision {
+       
+        if !(Self::MIN_SCALE..=precision).contains(&scale) {        
             return Err(format!(
                 "Decimal scale must be between {} and the precision {} (both inclusive).",
                 Self::MIN_SCALE,
@@ -571,10 +540,6 @@ impl DecimalType {
     pub fn get_scale(&self) -> u32 {
         self.scale
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// DoubleType for paimon.
@@ -594,10 +559,6 @@ impl DoubleType {
 
     pub fn default_value() -> Self {
         DoubleType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -619,10 +580,6 @@ impl FloatType {
     pub fn default_value() -> Self {
         FloatType::new(true)
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// IntType for paimon.
@@ -642,10 +599,6 @@ impl IntType {
 
     pub fn default_value() -> Self {
         IntType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -670,7 +623,7 @@ impl LocalZonedTimestampType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {    
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -698,10 +651,6 @@ impl LocalZonedTimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// Next TODO: MapType、MultisetType、RowType
@@ -723,10 +672,6 @@ impl SmallIntType {
 
     pub fn default_value() -> Self {
         SmallIntType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -751,7 +696,7 @@ impl TimeType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) { 
             return Err(format!(
                 "Time precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -779,10 +724,6 @@ impl TimeType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// TimestampType for paimon.
@@ -806,7 +747,7 @@ impl TimestampType {
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
-        if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {     
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
                 Self::MIN_PRECISION,
@@ -834,10 +775,6 @@ impl TimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// TinyIntType for paimon.
@@ -857,10 +794,6 @@ impl TinyIntType {
 
     pub fn default_value() -> Self {
         TinyIntType::new(true)
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
 
@@ -909,10 +842,6 @@ impl VarBinaryType {
     pub fn get_length(&self) -> u32 {
         self.length
     }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
-    }
 }
 
 /// VarCharType for paimon.
@@ -936,7 +865,7 @@ impl VarCharType {
     }
 
     pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
-        if length < VarCharType::MIN_LENGTH || length > VarCharType::MAX_LENGTH {
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {         
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
                 VarCharType::MIN_LENGTH,
@@ -963,9 +892,5 @@ impl VarCharType {
 
     pub fn get_length(&self) -> u32 {
         self.length
-    }
-
-    pub fn collect_field_ids(&self, field_ids: &mut Vec<i32>) {
-        self.element_type.collect_field_ids(field_ids);
     }
 }
