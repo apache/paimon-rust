@@ -309,7 +309,7 @@ impl ArrayType {
     }
 
     pub fn default_value() -> Self {
-        ArrayType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -333,7 +333,7 @@ impl BigIntType {
     }
 
     pub fn default_value() -> Self {
-        BigIntType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -359,14 +359,14 @@ impl BinaryType {
     pub const DEFAULT_LENGTH: usize = 1;
 
     pub fn new(is_nullable: bool, length: usize) -> Self {
-        BinaryType::new_with_result(is_nullable, length).unwrap()
+        Self::new_with_result(is_nullable, length).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
-        if length < BinaryType::MIN_LENGTH {
+        if length < Self::MIN_LENGTH {
             Err("Binary string length must be at least 1.")
         } else {
-            Ok(BinaryType {
+            Ok(Self {
                 element_type: DataType {
                     is_nullable,
                     type_root: DataTypeRoot::Binary,
@@ -377,11 +377,11 @@ impl BinaryType {
     }
 
     pub fn with_length(length: usize) -> Self {
-        BinaryType::new(true, length)
+        Self::new(true, length)
     }
 
     pub fn default_value() -> Self {
-        BinaryType::with_length(BinaryType::DEFAULT_LENGTH)
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 
     pub fn get_length(&self) -> usize {
@@ -409,7 +409,7 @@ impl BooleanType {
     }
 
     pub fn default_value() -> Self {
-        BooleanType::new(true)
+        Self::new(true)
     }
 }
 
@@ -431,7 +431,7 @@ impl CharType {
     pub const MAX_LENGTH: usize = 255;
 
     pub fn new(is_nullable: bool, length: usize) -> Self {
-        CharType::new_with_result(is_nullable, length).unwrap()
+        Self::new_with_result(is_nullable, length).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
@@ -449,11 +449,11 @@ impl CharType {
     }
 
     pub fn with_length(length: usize) -> Self {
-        CharType::new(true, length)
+        Self::new(true, length)
     }
 
     pub fn default_value() -> Self {
-        CharType::with_length(CharType::DEFAULT_LENGTH)
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 
     pub fn get_length(&self) -> usize {
@@ -481,7 +481,7 @@ impl DateType {
     }
 
     pub fn default_value() -> Self {
-        DateType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -511,7 +511,7 @@ impl DecimalType {
     pub const DEFAULT_SCALE: u32 = 0;
 
     pub fn new(is_nullable: bool, precision: u32, scale: u32) -> Self {
-        DecimalType::new_with_result(is_nullable, precision, scale).unwrap()
+        Self::new_with_result(is_nullable, precision, scale).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
@@ -542,14 +542,11 @@ impl DecimalType {
     }
 
     pub fn with_precision_and_scale(precision: u32, scale: u32) -> Self {
-        DecimalType::new(true, precision, scale)
+        Self::new(true, precision, scale)
     }
 
     pub fn default_value() -> Self {
-        DecimalType::with_precision_and_scale(
-            DecimalType::DEFAULT_PRECISION,
-            DecimalType::DEFAULT_SCALE,
-        )
+        Self::with_precision_and_scale(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
     }
 
     pub fn get_precision(&self) -> u32 {
@@ -581,7 +578,7 @@ impl DoubleType {
     }
 
     pub fn default_value() -> Self {
-        DoubleType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -605,7 +602,7 @@ impl FloatType {
     }
 
     pub fn default_value() -> Self {
-        FloatType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -629,7 +626,7 @@ impl IntType {
     }
 
     pub fn default_value() -> Self {
-        IntType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -676,11 +673,11 @@ impl LocalZonedTimestampType {
     }
 
     pub fn with_precision(precision: u32) -> Self {
-        LocalZonedTimestampType::new(true, precision)
+        Self::new(true, precision)
     }
 
     pub fn default_value() -> Self {
-        LocalZonedTimestampType::with_precision(LocalZonedTimestampType::DEFAULT_PRECISION)
+        Self::with_precision(Self::DEFAULT_PRECISION)
     }
 
     pub fn get_precision(&self) -> u32 {
@@ -710,7 +707,7 @@ impl SmallIntType {
     }
 
     pub fn default_value() -> Self {
-        SmallIntType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -735,7 +732,7 @@ impl TimeType {
     pub const DEFAULT_PRECISION: u32 = 0;
 
     pub fn new(is_nullable: bool, precision: u32) -> Self {
-        TimeType::new_with_result(is_nullable, precision).unwrap()
+        Self::new_with_result(is_nullable, precision).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
@@ -757,11 +754,11 @@ impl TimeType {
     }
 
     pub fn with_precision(precision: u32) -> Self {
-        TimeType::new(true, precision)
+        Self::new(true, precision)
     }
 
     pub fn default_value() -> Self {
-        TimeType::with_precision(TimeType::DEFAULT_PRECISION)
+        Self::with_precision(TimeType::DEFAULT_PRECISION)
     }
 
     pub fn get_precision(&self) -> u32 {
@@ -790,7 +787,7 @@ impl TimestampType {
     pub const DEFAULT_PRECISION: u32 = 6;
 
     pub fn new(is_nullable: bool, precision: u32) -> Self {
-        TimestampType::new_with_result(is_nullable, precision).unwrap()
+        Self::new_with_result(is_nullable, precision).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
@@ -812,11 +809,11 @@ impl TimestampType {
     }
 
     pub fn with_precision(precision: u32) -> Self {
-        TimestampType::new(true, precision)
+        Self::new(true, precision)
     }
 
     pub fn default_value() -> Self {
-        TimestampType::with_precision(TimestampType::DEFAULT_PRECISION)
+        Self::with_precision(Self::DEFAULT_PRECISION)
     }
 
     pub fn get_precision(&self) -> u32 {
@@ -844,7 +841,7 @@ impl TinyIntType {
     }
 
     pub fn default_value() -> Self {
-        TinyIntType::new(true)
+        Self::new(true)
     }
 
     pub fn as_sql_string(&self) -> String {
@@ -869,11 +866,11 @@ impl VarBinaryType {
     pub const DEFAULT_LENGTH: u32 = 1;
 
     pub fn new(is_nullable: bool, length: u32) -> Self {
-        VarBinaryType::new_with_result(is_nullable, length).unwrap()
+        Self::new_with_result(is_nullable, length).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
-        if length < VarBinaryType::MIN_LENGTH {
+        if length < Self::MIN_LENGTH {
             return Err("Binary string length must be at least 1.".to_string());
         }
 
@@ -887,11 +884,11 @@ impl VarBinaryType {
     }
 
     pub fn with_length(length: u32) -> Self {
-        VarBinaryType::new(true, length)
+        Self::new(true, length)
     }
 
     pub fn default_value() -> Self {
-        VarBinaryType::with_length(VarBinaryType::DEFAULT_LENGTH)
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 
     pub fn get_length(&self) -> u32 {
@@ -920,15 +917,15 @@ impl VarCharType {
     pub const DEFAULT_LENGTH: u32 = 1;
 
     pub fn new(is_nullable: bool, length: u32) -> Self {
-        VarCharType::new_with_result(is_nullable, length).unwrap()
+        Self::new_with_result(is_nullable, length).unwrap()
     }
 
     pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
-                VarCharType::MIN_LENGTH,
-                VarCharType::MAX_LENGTH
+                Self::MIN_LENGTH,
+                Self::MAX_LENGTH
             ));
         }
 
@@ -942,11 +939,11 @@ impl VarCharType {
     }
 
     pub fn with_length(length: u32) -> Self {
-        VarCharType::new(true, length)
+        Self::new(true, length)
     }
 
     pub fn default_value() -> Self {
-        VarCharType::with_length(VarCharType::DEFAULT_LENGTH)
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 
     pub fn get_length(&self) -> u32 {
