@@ -152,7 +152,11 @@ pub struct DataType {
 
 impl Display for DataType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_sql_string())
+        if !self.is_nullable() {
+            write!(f, "{} NOT NULL", self.as_sql_string())
+        } else {
+            write!(f, "{}", self.as_sql_string())
+        }
     }
 }
 
