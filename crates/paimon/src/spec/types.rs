@@ -18,7 +18,7 @@
 use crate::error::Error;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Arguments, Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
@@ -191,37 +191,37 @@ impl DataType {
         &self.type_root
     }
 
-    /// Returns the family of the data type.
+    /// Returns whether the root of the type equals to the type_root or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L186>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L75>
     fn is(&self, type_root: &DataTypeRoot) -> bool {
         &self.type_root == type_root
     }
 
-    /// Returns true if the data type is with the family.
+    /// Returns whether the family type of the type equals to the family or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L195>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L103>
     fn is_with_family(&self, family: DataTypeFamily) -> bool {
         self.type_root.families().contains(family)
     }
 
-    /// Returns true if the data type is with the family.
+    /// Returns whether the root of the type equals to at least on of the type_roots or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L204>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L84>
     fn is_any_of(&self, type_roots: &[DataTypeRoot]) -> bool {
         type_roots.iter().any(|tr: &DataTypeRoot| self.is(tr))
     }
 
-    /// Returns true if the data type is with the family.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L214>
+    /// Returns whether the root of the type is part of at least one family of the families or not.
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L94>
     fn is_any_of_family(&self, families: &[DataTypeFamily]) -> bool {
         families
             .iter()
             .any(|f: &DataTypeFamily| self.is_with_family(f.clone()))
     }
 
-    /// Returns true if the data type is with the family.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L224>
+    /// Returns a deep copy of this type with possibly different nullability.
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L113>
     fn copy(&self, is_nullable: bool) -> Self {
         Self {
             is_nullable,
@@ -229,54 +229,27 @@ impl DataType {
         }
     }
 
-    /// Returns true if the data type is with the family.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L231>
+    /// Returns a deep copy of this type. It requires an implementation of {@link #copy(boolean)}.
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L120>
     fn copy_with_nullable(&self) -> Self {
         self.copy(self.is_nullable)
     }
 
-    /// Returns true if the data type is with the family.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L240>
+    /// Compare two data types without nullable.
+    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L129>
     fn copy_ignore_nullable(&self) -> Self {
         self.copy(false)
-    }
-
-    fn as_sql_string(&self) -> String {
-        match self.type_root {
-            DataTypeRoot::Char => "CHAR".to_string(),
-            DataTypeRoot::Varchar => "VARCHAR".to_string(),
-            DataTypeRoot::Boolean => "BOOLEAN".to_string(),
-            DataTypeRoot::Binary => "BINARY".to_string(),
-            DataTypeRoot::Varbinary => "VARBINARY".to_string(),
-            DataTypeRoot::Decimal => "DECIMAL".to_string(),
-            DataTypeRoot::Tinyint => "TINYINT".to_string(),
-            DataTypeRoot::Smallint => "SMALLINT".to_string(),
-            DataTypeRoot::Integer => "INTEGER".to_string(),
-            DataTypeRoot::Bigint => "BIGINT".to_string(),
-            DataTypeRoot::Float => "FLOAT".to_string(),
-            DataTypeRoot::Double => "DOUBLE".to_string(),
-            DataTypeRoot::Date => "DATE".to_string(),
-            DataTypeRoot::TimeWithoutTimeZone => "TIME".to_string(),
-            DataTypeRoot::TimestampWithoutTimeZone => "TIMESTAMP".to_string(),
-            DataTypeRoot::TimestampWithLocalTimeZone => {
-                "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
-            }
-            DataTypeRoot::Array => "ARRAY".to_string(),
-            DataTypeRoot::Multiset => "MULTISET".to_string(),
-            DataTypeRoot::Map => "MAP".to_string(),
-            DataTypeRoot::Row => "ROW".to_string(),
-        }
     }
 
     fn serialize_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
 
-    fn with_nullability(&self, _format: &str, params: &[&str]) -> String {
+    fn with_nullability(&self, args: Arguments) -> String {
         if !self.is_nullable() {
-            format!("{}{} NOT NULL", _format, params.concat())
+            format!("{} NOT NULL", args)
         } else {
-            format!("{}{}", _format, params.concat())
+            format!("{}", args)
         }
     }
 
@@ -293,6 +266,35 @@ impl DataType {
 
     fn nullable(&self) -> Self {
         self.copy(true)
+    }
+
+    fn as_sql_string(&self) -> String {
+        match self.type_root {
+            DataTypeRoot::Char => CharType::default_value().as_sql_string(),
+            DataTypeRoot::Varchar => VarCharType::default_value().as_sql_string(),
+            DataTypeRoot::Boolean => BooleanType::default_value().as_sql_string(),
+            DataTypeRoot::Binary => BinaryType::default_value().as_sql_string(),
+            DataTypeRoot::Varbinary => VarBinaryType::default_value().as_sql_string(),
+            DataTypeRoot::Decimal => DecimalType::default_value().as_sql_string(),
+            DataTypeRoot::Tinyint => TinyIntType::default_value().as_sql_string(),
+            DataTypeRoot::Smallint => SmallIntType::default_value().as_sql_string(),
+            DataTypeRoot::Integer => IntType::default_value().as_sql_string(),
+            DataTypeRoot::Bigint => BigIntType::default_value().as_sql_string(),
+            DataTypeRoot::Float => FloatType::default_value().as_sql_string(),
+            DataTypeRoot::Double => DoubleType::default_value().as_sql_string(),
+            DataTypeRoot::Date => DateType::default_value().as_sql_string(),
+            DataTypeRoot::TimeWithoutTimeZone => TimeType::default_value().as_sql_string(),
+            DataTypeRoot::TimestampWithoutTimeZone => {
+                TimestampType::default_value().as_sql_string()
+            }
+            DataTypeRoot::TimestampWithLocalTimeZone => {
+                LocalZonedTimestampType::default_value().as_sql_string()
+            }
+            DataTypeRoot::Array => ArrayType::default_value().as_sql_string(),
+            DataTypeRoot::Multiset => todo!(),
+            DataTypeRoot::Map => todo!(),
+            DataTypeRoot::Row => todo!(),
+        }
     }
 }
 
@@ -317,7 +319,8 @@ impl ArrayType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("ARRAY<{}>", self.element_type.as_sql_string())
+        self.element_type
+            .with_nullability(format_args!("ARRAY<{}>", self.element_type))
     }
 }
 
@@ -341,7 +344,8 @@ impl BigIntType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "BIGINT".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "BIGINT"))
     }
 }
 
@@ -393,7 +397,8 @@ impl BinaryType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("BINARY({})", self.length)
+        self.element_type
+            .with_nullability(format_args!("BINARY({})", self.length))
     }
 }
 
@@ -414,6 +419,11 @@ impl BooleanType {
 
     pub fn default_value() -> Self {
         Self::new(true)
+    }
+
+    pub fn as_sql_string(&self) -> String {
+        self.element_type
+            .with_nullability(format_args!("{}", "BOOLEAN"))
     }
 }
 
@@ -465,7 +475,8 @@ impl CharType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("CHAR({})", self.length)
+        self.element_type
+            .with_nullability(format_args!("CHAR({})", self.length))
     }
 }
 
@@ -489,7 +500,8 @@ impl DateType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "DATE".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "DATE"))
     }
 }
 
@@ -562,7 +574,8 @@ impl DecimalType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("DECIMAL({}, {})", self.precision, self.scale)
+        self.element_type
+            .with_nullability(format_args!("DECIMAL({}, {})", self.precision, self.scale))
     }
 }
 
@@ -586,7 +599,8 @@ impl DoubleType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "DOUBLE".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "DOUBLE"))
     }
 }
 
@@ -610,7 +624,8 @@ impl FloatType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "FLOAT".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "FLOAT"))
     }
 }
 
@@ -634,7 +649,8 @@ impl IntType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "INTEGER".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "INTEGER"))
     }
 }
 
@@ -689,7 +705,10 @@ impl LocalZonedTimestampType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)
+        self.element_type.with_nullability(format_args!(
+            "TIMESTAMP WITH LOCAL TIME ZONE({})",
+            self.precision
+        ))
     }
 }
 
@@ -715,7 +734,8 @@ impl SmallIntType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "SMALLINT".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "SMALLINT"))
     }
 }
 
@@ -770,7 +790,8 @@ impl TimeType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("TIME({})", self.precision)
+        self.element_type
+            .with_nullability(format_args!("TIME({})", self.precision))
     }
 }
 
@@ -825,7 +846,8 @@ impl TimestampType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("TIMESTAMP({})", self.precision)
+        self.element_type
+            .with_nullability(format_args!("TIMESTAMP({})", self.precision))
     }
 }
 
@@ -849,7 +871,8 @@ impl TinyIntType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        "TINYINT".to_string()
+        self.element_type
+            .with_nullability(format_args!("{}", "TINYINT"))
     }
 }
 
@@ -900,7 +923,8 @@ impl VarBinaryType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("VARBINARY({})", self.length)
+        self.element_type
+            .with_nullability(format_args!("VARBINARY({})", self.length))
     }
 }
 
@@ -955,6 +979,7 @@ impl VarCharType {
     }
 
     pub fn as_sql_string(&self) -> String {
-        format!("VARCHAR({})", self.length)
+        self.element_type
+            .with_nullability(format_args!("VARCHAR({})", self.length))
     }
 }
