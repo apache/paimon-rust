@@ -48,12 +48,12 @@ bitflags! {
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub enum DataTypeRoot {
-    Char,
+    Char { length: usize },
     Varchar,
     Boolean,
-    Binary,
+    Binary { length: usize },
     Varbinary,
-    Decimal,
+    Decimal { precision: u32, scale: u32 },
     Tinyint,
     Smallint,
     Integer,
@@ -73,12 +73,19 @@ pub enum DataTypeRoot {
 impl DataTypeRoot {
     pub fn families(&self) -> DataTypeFamily {
         match self {
-            Self::Char => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
+            Self::Char { length: _ } => {
+                DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
+            }
             Self::Varchar => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
             Self::Boolean => DataTypeFamily::PREDEFINED,
-            Self::Binary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
+            Self::Binary { length: _ } => {
+                DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
+            }
             Self::Varbinary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
-            Self::Decimal => {
+            Self::Decimal {
+                precision: _,
+                scale: _,
+            } => {
                 DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::EXACT_NUMERIC
             }
             Self::Tinyint => {
@@ -151,12 +158,8 @@ pub struct DataType {
 }
 
 impl Display for DataType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if !self.is_nullable() {
-            write!(f, "{} NOT NULL", self.as_sql_string())
-        } else {
-            write!(f, "{}", self.as_sql_string())
-        }
+    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
     }
 }
 
@@ -267,35 +270,6 @@ impl DataType {
     fn nullable(&self) -> Self {
         self.copy(true)
     }
-
-    fn as_sql_string(&self) -> String {
-        match self.type_root {
-            DataTypeRoot::Char => CharType::default_value().as_sql_string(),
-            DataTypeRoot::Varchar => VarCharType::default_value().as_sql_string(),
-            DataTypeRoot::Boolean => BooleanType::default_value().as_sql_string(),
-            DataTypeRoot::Binary => BinaryType::default_value().as_sql_string(),
-            DataTypeRoot::Varbinary => VarBinaryType::default_value().as_sql_string(),
-            DataTypeRoot::Decimal => DecimalType::default_value().as_sql_string(),
-            DataTypeRoot::Tinyint => TinyIntType::default_value().as_sql_string(),
-            DataTypeRoot::Smallint => SmallIntType::default_value().as_sql_string(),
-            DataTypeRoot::Integer => IntType::default_value().as_sql_string(),
-            DataTypeRoot::Bigint => BigIntType::default_value().as_sql_string(),
-            DataTypeRoot::Float => FloatType::default_value().as_sql_string(),
-            DataTypeRoot::Double => DoubleType::default_value().as_sql_string(),
-            DataTypeRoot::Date => DateType::default_value().as_sql_string(),
-            DataTypeRoot::TimeWithoutTimeZone => TimeType::default_value().as_sql_string(),
-            DataTypeRoot::TimestampWithoutTimeZone => {
-                TimestampType::default_value().as_sql_string()
-            }
-            DataTypeRoot::TimestampWithLocalTimeZone => {
-                LocalZonedTimestampType::default_value().as_sql_string()
-            }
-            DataTypeRoot::Array => ArrayType::default_value().as_sql_string(),
-            DataTypeRoot::Multiset => todo!(),
-            DataTypeRoot::Map => todo!(),
-            DataTypeRoot::Row => todo!(),
-        }
-    }
 }
 
 /// ArrayType for paimon.
@@ -305,6 +279,16 @@ impl DataType {
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
     pub element_type: DataType,
+}
+
+impl Display for ArrayType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "ARRAY NOT NULL")
+        } else {
+            write!(f, "ARRAY")
+        }
+    }
 }
 
 impl ArrayType {
@@ -317,11 +301,6 @@ impl ArrayType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("ARRAY<{}>", self.element_type))
-    }
 }
 
 /// BigIntType for paimon.
@@ -330,6 +309,16 @@ impl ArrayType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct BigIntType {
     pub element_type: DataType,
+}
+
+impl Display for BigIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "BIGINT NOT NULL")
+        } else {
+            write!(f, "BIGINT")
+        }
+    }
 }
 
 impl BigIntType {
@@ -342,11 +331,6 @@ impl BigIntType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "BIGINT"))
-    }
 }
 
 /// BinaryType for paimon.
@@ -357,6 +341,16 @@ impl BigIntType {
 pub struct BinaryType {
     pub element_type: DataType,
     length: usize,
+}
+
+impl Display for BinaryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "BINARY({}) NOT NULL", self.length)
+        } else {
+            write!(f, "BINARY({})", self.length)
+        }
+    }
 }
 
 impl BinaryType {
@@ -377,7 +371,7 @@ impl BinaryType {
             Ok(Self {
                 element_type: DataType {
                     is_nullable,
-                    type_root: DataTypeRoot::Binary,
+                    type_root: DataTypeRoot::Binary { length },
                 },
                 length,
             })
@@ -395,11 +389,6 @@ impl BinaryType {
     pub fn get_length(&self) -> usize {
         self.length
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("BINARY({})", self.length))
-    }
 }
 
 /// BooleanType for paimon.
@@ -408,6 +397,16 @@ impl BinaryType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct BooleanType {
     pub element_type: DataType,
+}
+
+impl Display for BooleanType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "BOOLEAN NOT NULL")
+        } else {
+            write!(f, "BOOLEAN")
+        }
+    }
 }
 
 impl BooleanType {
@@ -420,11 +419,6 @@ impl BooleanType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "BOOLEAN"))
-    }
 }
 
 /// CharType for paimon.
@@ -435,6 +429,16 @@ impl BooleanType {
 pub struct CharType {
     element_type: DataType,
     length: usize,
+}
+
+impl Display for CharType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "CHAR({}) NOT NULL", self.length)
+        } else {
+            write!(f, "CHAR({})", self.length)
+        }
+    }
 }
 
 impl CharType {
@@ -455,7 +459,7 @@ impl CharType {
             Ok(CharType {
                 element_type: DataType {
                     is_nullable,
-                    type_root: DataTypeRoot::Char,
+                    type_root: DataTypeRoot::Char { length },
                 },
                 length,
             })
@@ -473,11 +477,6 @@ impl CharType {
     pub fn get_length(&self) -> usize {
         self.length
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("CHAR({})", self.length))
-    }
 }
 
 /// DateType for paimon.
@@ -486,6 +485,16 @@ impl CharType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DateType {
     element_type: DataType,
+}
+
+impl Display for DateType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "DATE NOT NULL")
+        } else {
+            write!(f, "DATE")
+        }
+    }
 }
 
 impl DateType {
@@ -498,11 +507,6 @@ impl DateType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "DATE"))
-    }
 }
 
 /// DecimalType for paimon.
@@ -513,6 +517,16 @@ pub struct DecimalType {
     element_type: DataType,
     precision: u32,
     scale: u32,
+}
+
+impl Display for DecimalType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "DECIMAL({}, {}) NOT NULL", self.precision, self.scale)
+        } else {
+            write!(f, "DECIMAL({}, {})", self.precision, self.scale)
+        }
+    }
 }
 
 impl DecimalType {
@@ -550,7 +564,7 @@ impl DecimalType {
         Ok(DecimalType {
             element_type: DataType {
                 is_nullable,
-                type_root: DataTypeRoot::Decimal,
+                type_root: DataTypeRoot::Decimal { precision, scale },
             },
             precision,
             scale,
@@ -572,11 +586,6 @@ impl DecimalType {
     pub fn get_scale(&self) -> u32 {
         self.scale
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("DECIMAL({}, {})", self.precision, self.scale))
-    }
 }
 
 /// DoubleType for paimon.
@@ -585,6 +594,16 @@ impl DecimalType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DoubleType {
     element_type: DataType,
+}
+
+impl Display for DoubleType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "DOUBLE NOT NULL")
+        } else {
+            write!(f, "DOUBLE")
+        }
+    }
 }
 
 impl DoubleType {
@@ -597,11 +616,6 @@ impl DoubleType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "DOUBLE"))
-    }
 }
 
 /// FloatType for paimon.
@@ -610,6 +624,16 @@ impl DoubleType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct FloatType {
     element_type: DataType,
+}
+
+impl Display for FloatType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "FLOAT NOT NULL")
+        } else {
+            write!(f, "FLOAT")
+        }
+    }
 }
 
 impl FloatType {
@@ -622,11 +646,6 @@ impl FloatType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "FLOAT"))
-    }
 }
 
 /// IntType for paimon.
@@ -635,6 +654,16 @@ impl FloatType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct IntType {
     element_type: DataType,
+}
+
+impl Display for IntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "INTEGER NOT NULL")
+        } else {
+            write!(f, "INTEGER")
+        }
+    }
 }
 
 impl IntType {
@@ -647,11 +676,6 @@ impl IntType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "INTEGER"))
-    }
 }
 
 /// LocalZonedTimestampType for paimon.
@@ -661,6 +685,20 @@ impl IntType {
 pub struct LocalZonedTimestampType {
     element_type: DataType,
     precision: u32,
+}
+
+impl Display for LocalZonedTimestampType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(
+                f,
+                "TIMESTAMP WITH LOCAL TIME ZONE({}) NOT NULL",
+                self.precision
+            )
+        } else {
+            write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)
+        }
+    }
 }
 
 impl LocalZonedTimestampType {
@@ -703,13 +741,6 @@ impl LocalZonedTimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type.with_nullability(format_args!(
-            "TIMESTAMP WITH LOCAL TIME ZONE({})",
-            self.precision
-        ))
-    }
 }
 
 /// Next TODO: MapType、MultisetType、RowType
@@ -722,6 +753,16 @@ pub struct SmallIntType {
     element_type: DataType,
 }
 
+impl Display for SmallIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "SMALLINT NOT NULL")
+        } else {
+            write!(f, "SMALLINT")
+        }
+    }
+}
+
 impl SmallIntType {
     pub fn new(is_nullable: bool) -> Self {
         Self {
@@ -732,11 +773,6 @@ impl SmallIntType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "SMALLINT"))
-    }
 }
 
 /// TimeType for paimon.
@@ -746,6 +782,16 @@ impl SmallIntType {
 pub struct TimeType {
     element_type: DataType,
     precision: u32,
+}
+
+impl Display for TimeType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "TIME({}) NOT NULL", self.precision)
+        } else {
+            write!(f, "TIME({})", self.precision)
+        }
+    }
 }
 
 impl TimeType {
@@ -788,11 +834,6 @@ impl TimeType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("TIME({})", self.precision))
-    }
 }
 
 /// TimestampType for paimon.
@@ -802,6 +843,16 @@ impl TimeType {
 pub struct TimestampType {
     element_type: DataType,
     precision: u32,
+}
+
+impl Display for TimestampType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "TIMESTAMP({}) NOT NULL", self.precision)
+        } else {
+            write!(f, "TIMESTAMP({})", self.precision)
+        }
+    }
 }
 
 impl TimestampType {
@@ -844,11 +895,6 @@ impl TimestampType {
     pub fn get_precision(&self) -> u32 {
         self.precision
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("TIMESTAMP({})", self.precision))
-    }
 }
 
 /// TinyIntType for paimon.
@@ -857,6 +903,16 @@ impl TimestampType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct TinyIntType {
     element_type: DataType,
+}
+
+impl Display for TinyIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "TINYINT NOT NULL")
+        } else {
+            write!(f, "TINYINT")
+        }
+    }
 }
 
 impl TinyIntType {
@@ -869,11 +925,6 @@ impl TinyIntType {
     pub fn default_value() -> Self {
         Self::new(true)
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("{}", "TINYINT"))
-    }
 }
 
 /// VarBinaryType for paimon.
@@ -883,6 +934,16 @@ impl TinyIntType {
 pub struct VarBinaryType {
     element_type: DataType,
     length: u32,
+}
+
+impl Display for VarBinaryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "VARBINARY({}) NOT NULL", self.length)
+        } else {
+            write!(f, "VARBINARY({})", self.length)
+        }
+    }
 }
 
 impl VarBinaryType {
@@ -921,11 +982,6 @@ impl VarBinaryType {
     pub fn get_length(&self) -> u32 {
         self.length
     }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("VARBINARY({})", self.length))
-    }
 }
 
 /// VarCharType for paimon.
@@ -935,6 +991,16 @@ impl VarBinaryType {
 pub struct VarCharType {
     element_type: DataType,
     length: u32,
+}
+
+impl Display for VarCharType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.element_type.is_nullable() {
+            write!(f, "VARCHAR({}) NOT NULL", self.length)
+        } else {
+            write!(f, "VARCHAR({})", self.length)
+        }
+    }
 }
 
 impl VarCharType {
@@ -976,10 +1042,5 @@ impl VarCharType {
 
     pub fn get_length(&self) -> u32 {
         self.length
-    }
-
-    pub fn as_sql_string(&self) -> String {
-        self.element_type
-            .with_nullability(format_args!("VARCHAR({})", self.length))
     }
 }
