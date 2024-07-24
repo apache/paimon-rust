@@ -19,7 +19,13 @@
 //!
 //! All paimon specs types are defined here.
 
+mod data_file;
+pub use data_file::*;
+
+mod schema;
+pub use schema::*;
+
+mod snapshot;
+pub use snapshot::*;
 mod manifest_file_meta;
 mod manifest_list;
-mod schema;
-mod snapshot;
