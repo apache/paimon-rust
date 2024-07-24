@@ -21,10 +21,6 @@ use super::manifest_file_meta::ManifestFileMeta;
 pub struct ManifestList {}
 
 impl ManifestList {
-    /// Create ManifestList.
-    pub fn new() -> ManifestList {
-        todo!()
-    }
 
     /// Write several [`ManifestFileMeta`]s into a manifest list.
     ///
