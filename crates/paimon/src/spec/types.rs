@@ -48,12 +48,12 @@ bitflags! {
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub enum DataTypeRoot {
-    Char { length: usize },
+    Char,
     Varchar,
     Boolean,
-    Binary { length: usize },
+    Binary,
     Varbinary,
-    Decimal { precision: u32, scale: u32 },
+    Decimal,
     Tinyint,
     Smallint,
     Integer,
@@ -73,19 +73,12 @@ pub enum DataTypeRoot {
 impl DataTypeRoot {
     pub fn families(&self) -> DataTypeFamily {
         match self {
-            Self::Char { length: _ } => {
-                DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
-            }
+            Self::Char => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
             Self::Varchar => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
             Self::Boolean => DataTypeFamily::PREDEFINED,
-            Self::Binary { length: _ } => {
-                DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
-            }
+            Self::Binary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
             Self::Varbinary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
-            Self::Decimal {
-                precision: _,
-                scale: _,
-            } => {
+            Self::Decimal => {
                 DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::EXACT_NUMERIC
             }
             Self::Tinyint => {
@@ -245,7 +238,7 @@ impl DataType {
     }
 
     fn serialize_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
+        serde_json::to_string(&self.to_string()).unwrap()
     }
 
     fn with_nullability(&self, args: Arguments) -> String {
@@ -371,7 +364,7 @@ impl BinaryType {
             Ok(Self {
                 element_type: DataType {
                     is_nullable,
-                    type_root: DataTypeRoot::Binary { length },
+                    type_root: DataTypeRoot::Binary,
                 },
                 length,
             })
@@ -459,7 +452,7 @@ impl CharType {
             Ok(CharType {
                 element_type: DataType {
                     is_nullable,
-                    type_root: DataTypeRoot::Char { length },
+                    type_root: DataTypeRoot::Char,
                 },
                 length,
             })
@@ -564,7 +557,7 @@ impl DecimalType {
         Ok(DecimalType {
             element_type: DataType {
                 is_nullable,
-                type_root: DataTypeRoot::Decimal { precision, scale },
+                type_root: DataTypeRoot::Decimal,
             },
             precision,
             scale,
