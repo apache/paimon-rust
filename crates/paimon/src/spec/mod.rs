@@ -19,6 +19,9 @@
 //!
 //! All paimon specs types are defined here.
 
+mod data_file;
+pub use data_file::*;
+
 mod schema;
 pub use schema::*;
 
