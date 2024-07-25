@@ -18,7 +18,7 @@
 use crate::error::Error;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Arguments, Display, Formatter};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
@@ -183,7 +183,7 @@ impl DataType {
     /// Returns the root of the data type.
     ///
     /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L66>
-    fn get_type_root(&self) -> &DataTypeRoot {
+    fn type_root(&self) -> &DataTypeRoot {
         &self.type_root
     }
 
@@ -197,7 +197,7 @@ impl DataType {
     /// Returns whether the family type of the type equals to the family or not.
     ///
     /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L103>
-    fn is_with_family(&self, family: DataTypeFamily) -> bool {
+    fn with_family(&self, family: DataTypeFamily) -> bool {
         self.type_root.families().contains(family)
     }
 
@@ -213,39 +213,15 @@ impl DataType {
     fn is_any_of_family(&self, families: &[DataTypeFamily]) -> bool {
         families
             .iter()
-            .any(|f: &DataTypeFamily| self.is_with_family(f.clone()))
+            .any(|f: &DataTypeFamily| self.with_family(f.clone()))
     }
 
     /// Returns a deep copy of this type with possibly different nullability.
     /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L113>
-    fn copy(&self, is_nullable: bool) -> Self {
+    fn with_nullable(&self, is_nullable: bool) -> Self {
         Self {
             is_nullable,
             type_root: self.type_root.clone(),
-        }
-    }
-
-    /// Returns a deep copy of this type. It requires an implementation of {@link #copy(boolean)}.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L120>
-    fn copy_with_nullable(&self) -> Self {
-        self.copy(self.is_nullable)
-    }
-
-    /// Compare two data types without nullable.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L129>
-    fn copy_ignore_nullable(&self) -> Self {
-        self.copy(false)
-    }
-
-    fn serialize_json(&self) -> String {
-        serde_json::to_string(&self.to_string()).unwrap()
-    }
-
-    fn with_nullability(&self, args: Arguments) -> String {
-        if !self.is_nullable() {
-            format!("{} NOT NULL", args)
-        } else {
-            format!("{}", args)
         }
     }
 
@@ -255,14 +231,6 @@ impl DataType {
     {
         visitor.visit(self);
     }
-
-    fn not_null(&self) -> Self {
-        self.copy(false)
-    }
-
-    fn nullable(&self) -> Self {
-        self.copy(true)
-    }
 }
 
 /// ArrayType for paimon.
@@ -271,16 +239,22 @@ impl DataType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
-    pub element_type: DataType,
+    element_type: DataType,
 }
 
 impl Display for ArrayType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if !self.element_type.is_nullable() {
-            write!(f, "ARRAY NOT NULL")
-        } else {
+        if self.element_type.is_nullable() {
             write!(f, "ARRAY")
+        } else {
+            write!(f, "ARRAY NOT NULL")
         }
+    }
+}
+
+impl Default for ArrayType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -290,10 +264,6 @@ impl ArrayType {
             element_type: DataType::new(is_nullable, DataTypeRoot::Array),
         }
     }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
-    }
 }
 
 /// BigIntType for paimon.
@@ -301,16 +271,22 @@ impl ArrayType {
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct BigIntType {
-    pub element_type: DataType,
+    element_type: DataType,
 }
 
 impl Display for BigIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BIGINT")?;
         if !self.element_type.is_nullable() {
-            write!(f, "BIGINT NOT NULL")
-        } else {
-            write!(f, "BIGINT")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for BigIntType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -320,10 +296,6 @@ impl BigIntType {
             element_type: DataType::new(is_nullable, DataTypeRoot::Bigint),
         }
     }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
-    }
 }
 
 /// BinaryType for paimon.
@@ -332,51 +304,52 @@ impl BigIntType {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryType {
-    pub element_type: DataType,
+    element_type: DataType,
     length: usize,
 }
 
 impl Display for BinaryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BINARY({})", self.length)?;
         if !self.element_type.is_nullable() {
-            write!(f, "BINARY({}) NOT NULL", self.length)
-        } else {
-            write!(f, "BINARY({})", self.length)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for BinaryType {
+    fn default() -> Self {
+        Self::new(true, Self::DEFAULT_LENGTH)
     }
 }
 
 impl BinaryType {
     pub const MIN_LENGTH: usize = 1;
 
-    pub const MAX_LENGTH: usize = isize::MAX as usize;
+    pub const MAX_LENGTH: usize = usize::MAX;
 
     pub const DEFAULT_LENGTH: usize = 1;
 
     pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::new_with_result(is_nullable, length).unwrap()
+        Self::try_new(is_nullable, length).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn try_new(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
         if length < Self::MIN_LENGTH {
-            Err("Binary string length must be at least 1.")
-        } else {
-            Ok(Self {
-                element_type: DataType {
-                    is_nullable,
-                    type_root: DataTypeRoot::Binary,
-                },
-                length,
-            })
+            return Err("Binary string length must be at least 1.");
         }
+        Ok(Self {
+            element_type: DataType {
+                is_nullable,
+                type_root: DataTypeRoot::Binary,
+            },
+            length,
+        })
     }
 
     pub fn with_length(length: usize) -> Self {
         Self::new(true, length)
-    }
-
-    pub fn default_value() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
     }
 
     pub fn get_length(&self) -> usize {
@@ -394,11 +367,17 @@ pub struct BooleanType {
 
 impl Display for BooleanType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BOOLEAN")?;
         if !self.element_type.is_nullable() {
-            write!(f, "BOOLEAN NOT NULL")
-        } else {
-            write!(f, "BOOLEAN")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for BooleanType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -407,10 +386,6 @@ impl BooleanType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Boolean),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -426,11 +401,17 @@ pub struct CharType {
 
 impl Display for CharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CHAR({})", self.length)?;
         if !self.element_type.is_nullable() {
-            write!(f, "CHAR({}) NOT NULL", self.length)
-        } else {
-            write!(f, "CHAR({})", self.length)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for CharType {
+    fn default() -> Self {
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 }
 
@@ -442,32 +423,27 @@ impl CharType {
     pub const MAX_LENGTH: usize = 255;
 
     pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::new_with_result(is_nullable, length).unwrap()
+        Self::try_new(is_nullable, length).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn try_new(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
-            Err("Character string length must be between 1 and 255 (both inclusive).")
-        } else {
-            Ok(CharType {
-                element_type: DataType {
-                    is_nullable,
-                    type_root: DataTypeRoot::Char,
-                },
-                length,
-            })
+            return Err("Character string length must be between 1 and 255 (both inclusive).");
         }
+        Ok(CharType {
+            element_type: DataType {
+                is_nullable,
+                type_root: DataTypeRoot::Char,
+            },
+            length,
+        })
     }
 
     pub fn with_length(length: usize) -> Self {
         Self::new(true, length)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
-    }
-
-    pub fn get_length(&self) -> usize {
+    pub fn length(&self) -> usize {
         self.length
     }
 }
@@ -482,11 +458,17 @@ pub struct DateType {
 
 impl Display for DateType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DATE")?;
         if !self.element_type.is_nullable() {
-            write!(f, "DATE NOT NULL")
-        } else {
-            write!(f, "DATE")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for DateType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -495,10 +477,6 @@ impl DateType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Date),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -514,11 +492,17 @@ pub struct DecimalType {
 
 impl Display for DecimalType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DECIMAL({}, {})", self.precision, self.scale)?;
         if !self.element_type.is_nullable() {
-            write!(f, "DECIMAL({}, {}) NOT NULL", self.precision, self.scale)
-        } else {
-            write!(f, "DECIMAL({}, {})", self.precision, self.scale)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for DecimalType {
+    fn default() -> Self {
+        Self::with_precision_and_scale(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
     }
 }
 
@@ -534,10 +518,10 @@ impl DecimalType {
     pub const DEFAULT_SCALE: u32 = 0;
 
     pub fn new(is_nullable: bool, precision: u32, scale: u32) -> Self {
-        Self::new_with_result(is_nullable, precision, scale).unwrap()
+        Self::try_new(is_nullable, precision, scale).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Decimal precision must be between {} and {} (both inclusive).",
@@ -568,15 +552,11 @@ impl DecimalType {
         Self::new(true, precision, scale)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_precision_and_scale(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
-    }
-
-    pub fn get_precision(&self) -> u32 {
+    pub fn precision(&self) -> u32 {
         self.precision
     }
 
-    pub fn get_scale(&self) -> u32 {
+    pub fn scale(&self) -> u32 {
         self.scale
     }
 }
@@ -591,11 +571,17 @@ pub struct DoubleType {
 
 impl Display for DoubleType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DOUBLE")?;
         if !self.element_type.is_nullable() {
-            write!(f, "DOUBLE NOT NULL")
-        } else {
-            write!(f, "DOUBLE")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for DoubleType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -604,10 +590,6 @@ impl DoubleType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Double),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -621,11 +603,17 @@ pub struct FloatType {
 
 impl Display for FloatType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FLOAT")?;
         if !self.element_type.is_nullable() {
-            write!(f, "FLOAT NOT NULL")
-        } else {
-            write!(f, "FLOAT")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for FloatType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -634,10 +622,6 @@ impl FloatType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Float),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -651,11 +635,17 @@ pub struct IntType {
 
 impl Display for IntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "INTEGER")?;
         if !self.element_type.is_nullable() {
-            write!(f, "INTEGER NOT NULL")
-        } else {
-            write!(f, "INTEGER")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for IntType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -664,10 +654,6 @@ impl IntType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Integer),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -682,15 +668,17 @@ pub struct LocalZonedTimestampType {
 
 impl Display for LocalZonedTimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)?;
         if !self.element_type.is_nullable() {
-            write!(
-                f,
-                "TIMESTAMP WITH LOCAL TIME ZONE({}) NOT NULL",
-                self.precision
-            )
-        } else {
-            write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for LocalZonedTimestampType {
+    fn default() -> Self {
+        Self::with_precision(Self::DEFAULT_PRECISION)
     }
 }
 
@@ -702,10 +690,10 @@ impl LocalZonedTimestampType {
     pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
 
     pub fn new(is_nullable: bool, precision: u32) -> Self {
-        LocalZonedTimestampType::new_with_result(is_nullable, precision).unwrap()
+        LocalZonedTimestampType::try_new(is_nullable, precision).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -727,11 +715,7 @@ impl LocalZonedTimestampType {
         Self::new(true, precision)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
-    }
-
-    pub fn get_precision(&self) -> u32 {
+    pub fn precision(&self) -> u32 {
         self.precision
     }
 }
@@ -748,11 +732,17 @@ pub struct SmallIntType {
 
 impl Display for SmallIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SMALLINT")?;
         if !self.element_type.is_nullable() {
-            write!(f, "SMALLINT NOT NULL")
-        } else {
-            write!(f, "SMALLINT")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for SmallIntType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -761,10 +751,6 @@ impl SmallIntType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Smallint),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -779,11 +765,17 @@ pub struct TimeType {
 
 impl Display for TimeType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIME({})", self.precision)?;
         if !self.element_type.is_nullable() {
-            write!(f, "TIME({}) NOT NULL", self.precision)
-        } else {
-            write!(f, "TIME({})", self.precision)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for TimeType {
+    fn default() -> Self {
+        Self::with_precision(TimeType::DEFAULT_PRECISION)
     }
 }
 
@@ -795,10 +787,10 @@ impl TimeType {
     pub const DEFAULT_PRECISION: u32 = 0;
 
     pub fn new(is_nullable: bool, precision: u32) -> Self {
-        Self::new_with_result(is_nullable, precision).unwrap()
+        Self::try_new(is_nullable, precision).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Time precision must be between {} and {} (both inclusive).",
@@ -820,11 +812,7 @@ impl TimeType {
         Self::new(true, precision)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_precision(TimeType::DEFAULT_PRECISION)
-    }
-
-    pub fn get_precision(&self) -> u32 {
+    pub fn precision(&self) -> u32 {
         self.precision
     }
 }
@@ -840,11 +828,17 @@ pub struct TimestampType {
 
 impl Display for TimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIMESTAMP({})", self.precision)?;
         if !self.element_type.is_nullable() {
-            write!(f, "TIMESTAMP({}) NOT NULL", self.precision)
-        } else {
-            write!(f, "TIMESTAMP({})", self.precision)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for TimestampType {
+    fn default() -> Self {
+        Self::with_precision(Self::DEFAULT_PRECISION)
     }
 }
 
@@ -856,10 +850,10 @@ impl TimestampType {
     pub const DEFAULT_PRECISION: u32 = 6;
 
     pub fn new(is_nullable: bool, precision: u32) -> Self {
-        Self::new_with_result(is_nullable, precision).unwrap()
+        Self::try_new(is_nullable, precision).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -881,11 +875,7 @@ impl TimestampType {
         Self::new(true, precision)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
-    }
-
-    pub fn get_precision(&self) -> u32 {
+    pub fn precision(&self) -> u32 {
         self.precision
     }
 }
@@ -900,11 +890,17 @@ pub struct TinyIntType {
 
 impl Display for TinyIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TINYINT")?;
         if !self.element_type.is_nullable() {
-            write!(f, "TINYINT NOT NULL")
-        } else {
-            write!(f, "TINYINT")
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for TinyIntType {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -913,10 +909,6 @@ impl TinyIntType {
         Self {
             element_type: DataType::new(is_nullable, DataTypeRoot::Tinyint),
         }
-    }
-
-    pub fn default_value() -> Self {
-        Self::new(true)
     }
 }
 
@@ -931,11 +923,17 @@ pub struct VarBinaryType {
 
 impl Display for VarBinaryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VARBINARY({})", self.length)?;
         if !self.element_type.is_nullable() {
-            write!(f, "VARBINARY({}) NOT NULL", self.length)
-        } else {
-            write!(f, "VARBINARY({})", self.length)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for VarBinaryType {
+    fn default() -> Self {
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 }
 
@@ -947,10 +945,10 @@ impl VarBinaryType {
     pub const DEFAULT_LENGTH: u32 = 1;
 
     pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::new_with_result(is_nullable, length).unwrap()
+        Self::try_new(is_nullable, length).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, length: u32) -> Result<Self, String> {
         if length < Self::MIN_LENGTH {
             return Err("Binary string length must be at least 1.".to_string());
         }
@@ -968,11 +966,7 @@ impl VarBinaryType {
         Self::new(true, length)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
-    }
-
-    pub fn get_length(&self) -> u32 {
+    pub fn length(&self) -> u32 {
         self.length
     }
 }
@@ -988,11 +982,17 @@ pub struct VarCharType {
 
 impl Display for VarCharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VARCHAR({})", self.length)?;
         if !self.element_type.is_nullable() {
-            write!(f, "VARCHAR({}) NOT NULL", self.length)
-        } else {
-            write!(f, "VARCHAR({})", self.length)
+            write!(f, " NOT NULL")?;
         }
+        Ok(())
+    }
+}
+
+impl Default for VarCharType {
+    fn default() -> Self {
+        Self::with_length(Self::DEFAULT_LENGTH)
     }
 }
 
@@ -1004,10 +1004,10 @@ impl VarCharType {
     pub const DEFAULT_LENGTH: u32 = 1;
 
     pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::new_with_result(is_nullable, length).unwrap()
+        Self::try_new(is_nullable, length).unwrap()
     }
 
-    pub fn new_with_result(is_nullable: bool, length: u32) -> Result<Self, String> {
+    pub fn try_new(is_nullable: bool, length: u32) -> Result<Self, String> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
@@ -1029,11 +1029,7 @@ impl VarCharType {
         Self::new(true, length)
     }
 
-    pub fn default_value() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
-    }
-
-    pub fn get_length(&self) -> u32 {
+    pub fn length(&self) -> u32 {
         self.length
     }
 }
