@@ -51,3 +51,11 @@ pub struct DataField {
     typ: DataType,
     description: Option<String>,
 }
+
+/// Schema Manager to manage schema versions.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java#>
+// FIXME: This struct is partially implemented
+pub struct SchemaManager {
+    branch: String
+}

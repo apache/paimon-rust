@@ -45,7 +45,7 @@ pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
 /// An implementation of InternalRow.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/data/BinaryRow.java>
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryRow {
     arity: i32,

@@ -30,3 +30,4 @@ pub use snapshot::*;
 
 mod types;
 pub use types::*;
+mod manifest;
