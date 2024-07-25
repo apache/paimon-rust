@@ -210,7 +210,7 @@ impl DataType {
 
     /// Returns whether the root of the type is part of at least one family of the families or not.
     /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L94>
-    fn is_any_of_family(&self, families: &[DataTypeFamily]) -> bool {
+    fn is_any_with_family(&self, families: &[DataTypeFamily]) -> bool {
         families
             .iter()
             .any(|f: &DataTypeFamily| self.with_family(f.clone()))
