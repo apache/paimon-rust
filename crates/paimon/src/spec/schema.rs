@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::error::Error;
+use crate::spec::types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
 
 /// The table schema for paimon table.
 ///
@@ -53,32 +51,3 @@ pub struct DataField {
     typ: DataType,
     description: Option<String>,
 }
-
-/// Data type for paimon table.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DataType {
-    is_nullable: bool,
-    type_root: DataTypeRoot,
-}
-
-impl Display for DataType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
-    }
-}
-
-impl FromStr for DataType {
-    type Err = Error;
-
-    fn from_str(_: &str) -> Result<Self, Self::Err> {
-        todo!()
-    }
-}
-
-/// The root of data type.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DataTypeRoot {}

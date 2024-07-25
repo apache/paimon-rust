@@ -27,3 +27,6 @@ pub use schema::*;
 
 mod snapshot;
 pub use snapshot::*;
+
+mod types;
+pub use types::*;
