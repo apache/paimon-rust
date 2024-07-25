@@ -46,7 +46,7 @@ bitflags! {
 /// The root of data type.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub enum DataTypeRoot {
     Char,
     Varchar,
@@ -144,7 +144,7 @@ pub trait DataTypeVisitor<R> {
 /// Data type for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DataType {
     is_nullable: bool,
     type_root: DataTypeRoot,
@@ -221,7 +221,7 @@ impl DataType {
     fn with_nullable(&self, is_nullable: bool) -> Self {
         Self {
             is_nullable,
-            type_root: self.type_root.clone(),
+            type_root: self.type_root,
         }
     }
 
