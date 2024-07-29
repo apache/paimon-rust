@@ -15,26 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use snafu::prelude::*;
-
-/// Result type used in paimon.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// Error type for paimon.
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("paimon data invalid for {}: {:?}", message, source))]
-    DataInvalid {
-        message: String,
-        #[snafu(backtrace)]
-        source: snafu::Whatever,
-    },
-    #[snafu(
-        visibility(pub(crate)),
-        display("paimon hitting unexpected error {}: {:?}", message, source)
-    )]
-    IoUnexpected {
-        message: String,
-        source: opendal::Error,
-    },
-}
+mod file_io;
+pub use file_io::*;

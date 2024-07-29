@@ -28,8 +28,9 @@ version.workspace = true
 
 [dependencies]
 bitflags = "2.6.0"
-chrono = {version = "0.4.38", features = ["serde"]}
+chrono = { version = "0.4.38", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.8.3"
 snafu = "0.8.3"
 typed-builder = "^0.18"
+opendal = "0.48"
