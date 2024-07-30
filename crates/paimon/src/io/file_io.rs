@@ -30,7 +30,7 @@ pub struct FileIO {
 impl FileIO {
     /// Create a new FileIO.
     ///
-    /// The input HashMap is paimon-java's [`Options`](https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/options/Options.java#L60)
+    /// The input HashMap is paimon-java's [`Options`](https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/options/Options.java#L60)
     ///
     /// TODO: Support building Operator from HashMap via options.
     pub fn new(_: HashMap<String, String>) -> Result<Self> {
@@ -44,7 +44,7 @@ impl FileIO {
 
     /// Create a new input file to read data.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> InputFile {
         InputFile {
             _op: self.op.clone(),
@@ -54,7 +54,7 @@ impl FileIO {
 
     /// Create a new output file to write data.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> OutputFile {
         OutputFile {
             _op: self.op.clone(),
@@ -64,7 +64,7 @@ impl FileIO {
 
     /// Return a file status object that represents the path.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
         let meta = self.op.stat(path).await.context(IoUnexpectedSnafu {
             message: "Failed to get file status".to_string(),
@@ -77,7 +77,7 @@ impl FileIO {
 
     /// List the statuses of the files/directories in the given path if the path is a directory.
     ///
-    /// References: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L105>
+    /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L105>
     ///
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
@@ -100,7 +100,7 @@ impl FileIO {
 
     /// Check if exists.
     ///
-    /// References: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
+    /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
     pub async fn exists(&self, path: &str) -> Result<bool> {
         self.op.is_exist(path).await.context(IoUnexpectedSnafu {
             message: "Failed to check file existence".to_string(),
@@ -109,7 +109,7 @@ impl FileIO {
 
     /// Delete a file.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         self.op.delete(path).await.context(IoUnexpectedSnafu {
             message: "Failed to delete file".to_string(),
@@ -120,7 +120,7 @@ impl FileIO {
 
     /// Delete a dir recursively.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         self.op.remove_all(path).await.context(IoUnexpectedSnafu {
             message: "Failed to delete dir".to_string(),
@@ -132,7 +132,7 @@ impl FileIO {
     ///
     /// Has the semantics of Unix 'mkdir -p'. Existence of the directory hierarchy is not an error.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L150>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L150>
     pub async fn mkdirs(&self, path: &str) -> Result<()> {
         self.op.create_dir(path).await.context(IoUnexpectedSnafu {
             message: "Failed to create dir".to_string(),
@@ -142,7 +142,7 @@ impl FileIO {
 
     /// Renames the file/directory src to dst.
     ///
-    /// Reference: <https://github.com/apache/paimon/blob/405779a83e36bfb27af4870a3e710ddbdff729a4/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         self.op.rename(src, dst).await.context(IoUnexpectedSnafu {
             message: "Failed to rename file".to_string(),

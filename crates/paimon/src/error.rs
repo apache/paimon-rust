@@ -23,7 +23,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Error type for paimon.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("paimon data invalid for {}: {:?}", message, source))]
+    #[snafu(display("Paimon data invalid for {}: {:?}", message, source))]
     DataInvalid {
         message: String,
         #[snafu(backtrace)]
@@ -31,7 +31,7 @@ pub enum Error {
     },
     #[snafu(
         visibility(pub(crate)),
-        display("paimon hitting unexpected error {}: {:?}", message, source)
+        display("Paimon hitting unexpected error {}: {:?}", message, source)
     )]
     IoUnexpected {
         message: String,
