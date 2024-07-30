@@ -21,7 +21,6 @@ use super::manifest_file_meta::ManifestFileMeta;
 pub struct ManifestList {}
 
 impl ManifestList {
-
     /// Write several [`ManifestFileMeta`]s into a manifest list.
     ///
     /// NOTE: This method is atomic.

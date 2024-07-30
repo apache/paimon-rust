@@ -21,7 +21,7 @@ use std::fmt::{Display, Formatter};
 
 /// Metadata of a manifest file.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFileMeta.java>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFileMeta.java>
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFileMeta {
     /// manifest file name
@@ -42,7 +42,7 @@ pub struct ManifestFileMeta {
 
     /// partition stats, the minimum and maximum values of partition fields in this manifest are beneficial for skipping certain manifest files during queries, it is a SimpleStats.
     #[serde(rename = "_PARTITION_STATS")]
-    partition_stats: SimpleStats,
+    partition_stats: BinaryTableStats,
 
     /// schema id when writing this manifest file.
     #[serde(rename = "_SCHEMA_ID")]
@@ -75,7 +75,7 @@ impl ManifestFileMeta {
     }
 
     /// Get the partition stats
-    pub fn partition_stats(&self) -> &SimpleStats {
+    pub fn partition_stats(&self) -> &BinaryTableStats {
         &self.partition_stats
     }
 
@@ -105,11 +105,9 @@ impl Display for ManifestFileMeta {
 ///
 /// All statistics are stored in the form of a Binary, which can significantly reduce its memory consumption, but the cost is that the column type needs to be known when getting.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/stats/SimpleStats.java>
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/stats/SimpleStatsConverter.java#L111>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/stats/FieldStatsArraySerializer.java#L111>
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
-pub struct SimpleStats {
+pub struct BinaryTableStats {
     /// the minimum values of the columns
     #[serde(rename = "_MIN_VALUES", with = "serde_bytes")]
     min_values: Vec<u8>,
@@ -127,7 +125,7 @@ pub struct SimpleStats {
     null_counts: Vec<i64>,
 }
 
-impl SimpleStats {
+impl BinaryTableStats {
     /// Get the minimum values of the columns
     #[inline]
     pub fn min_values(&self) -> &[u8] {
@@ -147,7 +145,7 @@ impl SimpleStats {
     }
 }
 
-impl Display for SimpleStats {
+impl Display for BinaryTableStats {
     fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
