@@ -26,7 +26,7 @@ use std::fmt::{Display, Formatter};
 /// column. Compared to the SQL standard, an optional field description simplifies the handling with
 /// complex structures.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>
 ///
 /// TODO: make RowType extends DataType.
 /// TODO: move me to a better place.
@@ -44,7 +44,7 @@ pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
 
 /// An implementation of InternalRow.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/data/BinaryRow.java>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/data/BinaryRow.java>
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryRow {
@@ -71,13 +71,13 @@ impl BinaryRow {
 /// TODO: implement me.
 /// The statistics for columns, supports the following stats.
 ///
-/// Impl References: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/stats/SimpleStats.java>
+/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/stats/SimpleStats.java>
 type SimpleStats = ();
 
 /// The Source of a file.
 /// TODO: move me to the manifest module.
 ///
-/// Impl References: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
+/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +88,7 @@ pub enum FileSource {
 
 /// Metadata of a data file.
 ///
-/// Impl References: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
+/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFileMeta {

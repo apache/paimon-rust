@@ -45,7 +45,7 @@ bitflags! {
 
 /// The root of data type.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub enum DataTypeRoot {
     Char,
@@ -143,7 +143,7 @@ pub trait DataTypeVisitor<R> {
 
 /// Data type for paimon table.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DataType {
     is_nullable: bool,
@@ -174,7 +174,7 @@ impl DataType {
     }
 
     /// Returns a deep copy of this type with possibly different nullability.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L113>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L113>
     fn with_nullable(&self, is_nullable: bool) -> Self {
         Self {
             is_nullable,
@@ -184,41 +184,41 @@ impl DataType {
 
     /// Returns true if the data type is nullable.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L59>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L59>
     fn is_nullable(&self) -> bool {
         self.is_nullable
     }
 
     /// Returns the root of the data type.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L66>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L66>
     fn type_root(&self) -> &DataTypeRoot {
         &self.type_root
     }
 
     /// Returns whether the root of the type equals to the type_root or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L75>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L75>
     fn is(&self, type_root: &DataTypeRoot) -> bool {
         &self.type_root == type_root
     }
 
     /// Returns whether the family type of the type equals to the family or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L103>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L103>
     fn is_family(&self, family: DataTypeFamily) -> bool {
         self.type_root.families().contains(family)
     }
 
     /// Returns whether the root of the type equals to at least on of the type_roots or not.
     ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L84>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L84>
     fn is_any_of(&self, type_roots: &[DataTypeRoot]) -> bool {
         type_roots.iter().any(|tr: &DataTypeRoot| self.is(tr))
     }
 
     /// Returns whether the root of the type is part of at least one family of the families or not.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L94>
+    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L94>
     fn is_any_of_family(&self, families: &[DataTypeFamily]) -> bool {
         families.iter().any(|f: &DataTypeFamily| self.is_family(*f))
     }
@@ -233,7 +233,7 @@ impl DataType {
 
 /// ArrayType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
@@ -389,7 +389,7 @@ impl BooleanType {
 
 /// CharType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CharType {
