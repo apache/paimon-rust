@@ -16,4 +16,8 @@
 // under the License.
 
 mod error;
+pub use error::Error;
+pub use error::Result;
+
+pub mod io;
 pub mod spec;

@@ -27,7 +27,12 @@ pub use schema::*;
 
 mod snapshot;
 pub use snapshot::*;
+
 mod manifest_file_meta;
 pub use manifest_file_meta::*;
+
 mod manifest_list;
 pub use manifest_list::*;
+
+mod types;
+pub use types::*;

@@ -20,7 +20,7 @@ use typed_builder::TypedBuilder;
 
 /// Snapshot for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/db8bcd7fdd9c2705435d2ab1d2341c52d1f67ee5/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L68>.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L68>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, TypedBuilder)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
