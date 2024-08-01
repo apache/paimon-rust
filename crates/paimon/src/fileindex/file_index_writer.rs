@@ -15,9 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub mod fileindex;
-pub mod fs;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait FileIndexWriter: Send + Sync {
+    async fn write(&mut self, key: &[u8]);
+
+    async fn serialized_bytes(&self) -> Vec<u8>;
+
+    async fn write_record(&mut self, key: &[u8]) {
+        self.set_empty(false);
+        self.write(key).await;
+    }
+
+    fn is_empty(&self) -> bool;
+
+    fn set_empty(&mut self, empty: bool);
+}

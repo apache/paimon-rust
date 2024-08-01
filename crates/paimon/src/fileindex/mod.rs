@@ -15,9 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub mod fileindex;
-pub mod fs;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+mod file_index_format;
+pub use file_index_format::*;
+
+mod file_index_writer;
+pub use file_index_writer::*;
+
+mod file_index_reader;
+pub use file_index_reader::*;
+
+mod file_index_result;
+pub use file_index_result::*;
+
+mod file_index_common;
+pub use file_index_common::*;
+
+mod file_indexer_factory;
+pub use file_indexer_factory::*;
+
+mod file_indexer;
+pub use file_indexer::*;

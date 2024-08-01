@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub mod fileindex;
-pub mod fs;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+use std::collections::HashMap;
+
+use crate::spec::{DataField, DataType};
+
+pub fn to_map_key(map_column_name: &str, key_name: &str) -> String {
+    format!("{}[{}]", map_column_name, key_name)
+}
+
+pub fn get_field_type(_fields: &HashMap<String, DataField>, _column_name: &str) -> DataType {
+    todo!()
+}

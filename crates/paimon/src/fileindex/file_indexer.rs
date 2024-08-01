@@ -15,9 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub mod fileindex;
-pub mod fs;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+use std::sync::Arc;
+
+use crate::{fs::SeekableInputStream, options::Options, spec::DataType};
+
+use super::{FileIndexReader, FileIndexWriter};
+
+pub trait FileIndexer: Send + Sync {
+    fn create_writer(&self) -> Arc<dyn FileIndexWriter>;
+    fn create_reader(
+        &self,
+        input_stream: Arc<dyn SeekableInputStream>,
+        start: usize,
+        length: usize,
+    ) -> impl FileIndexReader;
+
+    fn create(&self, _typ: &str, _data_type: DataType, _options: Options) -> Arc<Self> {
+        // let file_indexer_factory = FileIndexerFactoryRegistry::load(typ);
+        // file_indexer_factory.create(data_type, options)
+        todo!()
+    }
+}

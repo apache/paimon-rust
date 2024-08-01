@@ -15,9 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub mod fileindex;
-pub mod fs;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+mod field_ref;
+pub use field_ref::*;
+
+mod predicate_visitor;
+pub use predicate_visitor::*;
+
+mod function_visitor;
+pub use function_visitor::*;
+
+pub trait Predicate: Send + Sync {
+    fn negate(&self) -> Option<std::sync::Arc<Self>>;
+    fn visit<T>(&self, visitor: &impl PredicateVisitor<T>) -> T;
+}
