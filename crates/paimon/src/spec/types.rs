@@ -131,7 +131,11 @@ impl Display for ArrayType {
 }
 
 impl ArrayType {
-    pub fn new(nullable: bool, element_type: DataType) -> Self {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
         Self {
             nullable,
             element_type: Box::new(element_type),
@@ -165,12 +169,16 @@ impl Display for BigIntType {
 
 impl Default for BigIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl BigIntType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -206,7 +214,7 @@ impl Display for BinaryType {
 
 impl Default for BinaryType {
     fn default() -> Self {
-        Self::new(true, Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -217,19 +225,15 @@ impl BinaryType {
 
     pub const DEFAULT_LENGTH: usize = 1;
 
-    pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: usize) -> Result<Self, &'static str> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, &'static str> {
         if length < Self::MIN_LENGTH {
             return Err("Binary string length must be at least 1.");
         }
         Ok(Self { nullable, length })
-    }
-
-    pub fn with_length(length: usize) -> Self {
-        Self::new(true, length)
     }
 
     pub fn length(&self) -> usize {
@@ -263,12 +267,16 @@ impl Display for BooleanType {
 
 impl Default for BooleanType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl BooleanType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -301,7 +309,7 @@ impl Display for CharType {
 
 impl Default for CharType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -312,19 +320,15 @@ impl CharType {
 
     pub const MAX_LENGTH: usize = 255;
 
-    pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: usize) -> Result<Self, &'static str> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, &'static str> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err("Character string length must be between 1 and 255 (both inclusive).");
         }
         Ok(CharType { nullable, length })
-    }
-
-    pub fn with_length(length: usize) -> Self {
-        Self::new(true, length)
     }
 
     pub fn length(&self) -> usize {
@@ -358,12 +362,16 @@ impl Display for DateType {
 
 impl Default for DateType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl DateType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -397,7 +405,7 @@ impl Display for DecimalType {
 
 impl Default for DecimalType {
     fn default() -> Self {
-        Self::with_precision_and_scale(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
+        Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE).unwrap()
     }
 }
 
@@ -412,11 +420,11 @@ impl DecimalType {
 
     pub const DEFAULT_SCALE: u32 = 0;
 
-    pub fn new(nullable: bool, precision: u32, scale: u32) -> Self {
-        Self::try_new(nullable, precision, scale).unwrap()
+    pub fn new(precision: u32, scale: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision, scale)
     }
 
-    pub fn try_new(nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Decimal precision must be between {} and {} (both inclusive).",
@@ -438,10 +446,6 @@ impl DecimalType {
             precision,
             scale,
         })
-    }
-
-    pub fn with_precision_and_scale(precision: u32, scale: u32) -> Self {
-        Self::new(true, precision, scale)
     }
 
     pub fn precision(&self) -> u32 {
@@ -479,12 +483,16 @@ impl Display for DoubleType {
 
 impl Default for DoubleType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl DoubleType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -513,12 +521,16 @@ impl Display for FloatType {
 
 impl Default for FloatType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl FloatType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -549,12 +561,16 @@ impl Display for IntType {
 
 impl Default for IntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl IntType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -589,7 +605,7 @@ impl Display for LocalZonedTimestampType {
 
 impl Default for LocalZonedTimestampType {
     fn default() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -600,11 +616,11 @@ impl LocalZonedTimestampType {
 
     pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
 
-    pub fn new(is_nullable: bool, precision: u32) -> Self {
-        LocalZonedTimestampType::try_new(is_nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -617,10 +633,6 @@ impl LocalZonedTimestampType {
             nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
@@ -657,12 +669,16 @@ impl Display for SmallIntType {
 
 impl Default for SmallIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl SmallIntType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -698,7 +714,7 @@ impl Display for TimeType {
 
 impl Default for TimeType {
     fn default() -> Self {
-        Self::with_precision(TimeType::DEFAULT_PRECISION)
+        Self::new(TimeType::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -709,11 +725,11 @@ impl TimeType {
 
     pub const DEFAULT_PRECISION: u32 = 0;
 
-    pub fn new(is_nullable: bool, precision: u32) -> Self {
-        Self::try_new(is_nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Time precision must be between {} and {} (both inclusive).",
@@ -726,10 +742,6 @@ impl TimeType {
             nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
@@ -764,7 +776,7 @@ impl Display for TimestampType {
 
 impl Default for TimestampType {
     fn default() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -775,11 +787,11 @@ impl TimestampType {
 
     pub const DEFAULT_PRECISION: u32 = 6;
 
-    pub fn new(nullable: bool, precision: u32) -> Self {
-        Self::try_new(nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -792,10 +804,6 @@ impl TimestampType {
             nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
@@ -829,12 +837,16 @@ impl Display for TinyIntType {
 
 impl Default for TinyIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl TinyIntType {
-    pub fn new(nullable: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -869,7 +881,7 @@ impl Display for VarBinaryType {
 
 impl Default for VarBinaryType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -880,8 +892,8 @@ impl VarBinaryType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: u32) -> Result<Self, String> {
+        Self::try_new(true, length)
     }
 
     pub fn try_new(nullable: bool, length: u32) -> Result<Self, String> {
@@ -890,10 +902,6 @@ impl VarBinaryType {
         }
 
         Ok(VarBinaryType { nullable, length })
-    }
-
-    pub fn with_length(length: u32) -> Self {
-        Self::new(true, length)
     }
 
     pub fn length(&self) -> u32 {
@@ -928,7 +936,7 @@ impl Display for VarCharType {
 
 impl Default for VarCharType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -939,11 +947,11 @@ impl VarCharType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: u32) -> Result<Self, String> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, String> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
@@ -953,10 +961,6 @@ impl VarCharType {
         }
 
         Ok(VarCharType { nullable, length })
-    }
-
-    pub fn with_length(length: u32) -> Self {
-        Self::new(true, length)
     }
 
     pub fn length(&self) -> u32 {
@@ -987,7 +991,11 @@ impl Display for MapType {
 }
 
 impl MapType {
-    pub fn new(nullable: bool, key_type: DataType, value_type: DataType) -> Self {
+    pub fn new(key_type: DataType, value_type: DataType) -> Self {
+        Self::with_nullable(true, key_type, value_type)
+    }
+
+    pub fn with_nullable(nullable: bool, key_type: DataType, value_type: DataType) -> Self {
         Self {
             nullable,
             key_type: Box::new(key_type),
@@ -1019,7 +1027,11 @@ impl Display for MultisetType {
 }
 
 impl MultisetType {
-    pub fn new(nullable: bool, element_type: DataType) -> Self {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
         Self {
             nullable,
             element_type: Box::new(element_type),
@@ -1052,7 +1064,11 @@ impl Display for RowType {
 }
 
 impl RowType {
-    pub const fn new(nullable: bool, fields: Vec<DataField>) -> Self {
+    pub const fn new(fields: Vec<DataField>) -> Self {
+        Self::with_nullable(true, fields)
+    }
+
+    pub const fn with_nullable(nullable: bool, fields: Vec<DataField>) -> Self {
         Self { nullable, fields }
     }
 

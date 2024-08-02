@@ -101,5 +101,5 @@ impl Display for DataFileMeta {
 
 impl DataFileMeta {
     // TODO: implement me
-    pub const SCHEMA: RowType = RowType::new(false, vec![]);
+    pub const SCHEMA: RowType = RowType::new(vec![]);
 }
