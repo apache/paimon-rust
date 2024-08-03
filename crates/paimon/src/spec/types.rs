@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::spec::DataField;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
@@ -98,9 +98,58 @@ pub enum DataType {
     Row(RowType),
 }
 
+#[allow(dead_code)]
+impl DataType {
+    fn is_nullable(&self) -> bool {
+        match self {
+            DataType::Boolean(v) => v.nullable,
+            DataType::TinyInt(v) => v.nullable,
+            DataType::SmallInt(v) => v.nullable,
+            DataType::Int(v) => v.nullable,
+            DataType::BigInt(v) => v.nullable,
+            DataType::Decimal(v) => v.nullable,
+            DataType::Double(v) => v.nullable,
+            DataType::Float(v) => v.nullable,
+            DataType::Binary(v) => v.nullable,
+            DataType::VarBinary(v) => v.nullable,
+            DataType::Char(v) => v.nullable,
+            DataType::VarChar(v) => v.nullable,
+            DataType::Date(v) => v.nullable,
+            DataType::LocalZonedTimestamp(v) => v.nullable,
+            DataType::Time(v) => v.nullable,
+            DataType::Timestamp(v) => v.nullable,
+            DataType::Array(v) => v.nullable,
+            DataType::Map(v) => v.nullable,
+            DataType::Multiset(v) => v.nullable,
+            DataType::Row(v) => v.nullable,
+        }
+    }
+}
+
 impl Display for DataType {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Boolean(v) => write!(f, "{v}"),
+            DataType::TinyInt(v) => write!(f, "{v}"),
+            DataType::SmallInt(v) => write!(f, "{v}"),
+            DataType::Int(v) => write!(f, "{v}"),
+            DataType::BigInt(v) => write!(f, "{v}"),
+            DataType::Decimal(v) => write!(f, "{v}"),
+            DataType::Double(v) => write!(f, "{v}"),
+            DataType::Float(v) => write!(f, "{v}"),
+            DataType::Binary(v) => write!(f, "{v}"),
+            DataType::VarBinary(v) => write!(f, "{v}"),
+            DataType::Char(v) => write!(f, "{v}"),
+            DataType::VarChar(v) => write!(f, "{v}"),
+            DataType::Date(v) => write!(f, "{v}"),
+            DataType::LocalZonedTimestamp(v) => write!(f, "{v}"),
+            DataType::Time(v) => write!(f, "{v}"),
+            DataType::Timestamp(v) => write!(f, "{v}"),
+            DataType::Array(v) => write!(f, "{v}"),
+            DataType::Map(v) => write!(f, "{v}"),
+            DataType::Multiset(v) => write!(f, "{v}"),
+            DataType::Row(v) => write!(f, "{v}"),
+        }
     }
 }
 
@@ -125,8 +174,12 @@ pub struct ArrayType {
 }
 
 impl Display for ArrayType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ARRAY<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
     }
 }
 
@@ -985,8 +1038,12 @@ pub struct MapType {
 }
 
 impl Display for MapType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MAP<{}, {}>", self.key_type, self.value_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
     }
 }
 
@@ -1021,8 +1078,12 @@ pub struct MultisetType {
 }
 
 impl Display for MultisetType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MULTISET<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
     }
 }
 
@@ -1058,8 +1119,18 @@ pub struct RowType {
 }
 
 impl Display for RowType {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let fields = self
+            .fields
+            .iter()
+            .map(|field| field.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        write!(f, "ROW<{}>", fields)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
     }
 }
 
@@ -1074,5 +1145,170 @@ impl RowType {
 
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_data_type_to_string() {
+        assert_eq!(
+            DataType::Boolean(BooleanType::with_nullable(true)).to_string(),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            DataType::Boolean(BooleanType::with_nullable(false)).to_string(),
+            "BOOLEAN NOT NULL"
+        );
+        assert_eq!(
+            DataType::TinyInt(TinyIntType::with_nullable(true)).to_string(),
+            "TINYINT"
+        );
+        assert_eq!(
+            DataType::TinyInt(TinyIntType::with_nullable(false)).to_string(),
+            "TINYINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::SmallInt(SmallIntType::with_nullable(true)).to_string(),
+            "SMALLINT"
+        );
+        assert_eq!(
+            DataType::SmallInt(SmallIntType::with_nullable(false)).to_string(),
+            "SMALLINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Int(IntType::with_nullable(true)).to_string(),
+            "INTEGER"
+        );
+        assert_eq!(
+            DataType::Int(IntType::with_nullable(false)).to_string(),
+            "INTEGER NOT NULL"
+        );
+        assert_eq!(
+            DataType::BigInt(BigIntType::with_nullable(true)).to_string(),
+            "BIGINT"
+        );
+        assert_eq!(
+            DataType::BigInt(BigIntType::with_nullable(false)).to_string(),
+            "BIGINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap()).to_string(),
+            "DECIMAL(10, 2)"
+        );
+        assert_eq!(
+            DataType::Decimal(DecimalType::with_nullable(false, 10, 2).unwrap()).to_string(),
+            "DECIMAL(10, 2) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Double(DoubleType::with_nullable(true)).to_string(),
+            "DOUBLE"
+        );
+        assert_eq!(
+            DataType::Double(DoubleType::with_nullable(false)).to_string(),
+            "DOUBLE NOT NULL"
+        );
+        assert_eq!(
+            DataType::Float(FloatType::with_nullable(true)).to_string(),
+            "FLOAT"
+        );
+        assert_eq!(
+            DataType::Float(FloatType::with_nullable(false)).to_string(),
+            "FLOAT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Binary(BinaryType::with_nullable(true, 10).unwrap()).to_string(),
+            "BINARY(10)"
+        );
+        assert_eq!(
+            DataType::Binary(BinaryType::with_nullable(false, 10).unwrap()).to_string(),
+            "BINARY(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::VarBinary(VarBinaryType::try_new(true, 10).unwrap()).to_string(),
+            "VARBINARY(10)"
+        );
+        assert_eq!(
+            DataType::VarBinary(VarBinaryType::try_new(false, 10).unwrap()).to_string(),
+            "VARBINARY(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Char(CharType::with_nullable(true, 10).unwrap()).to_string(),
+            "CHAR(10)"
+        );
+        assert_eq!(
+            DataType::Char(CharType::with_nullable(false, 10).unwrap()).to_string(),
+            "CHAR(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::VarChar(VarCharType::with_nullable(true, 10).unwrap()).to_string(),
+            "VARCHAR(10)"
+        );
+        assert_eq!(
+            DataType::VarChar(VarCharType::with_nullable(false, 10).unwrap()).to_string(),
+            "VARCHAR(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Date(DateType::with_nullable(true)).to_string(),
+            "DATE"
+        );
+        assert_eq!(
+            DataType::Date(DateType::with_nullable(false)).to_string(),
+            "DATE NOT NULL"
+        );
+        assert_eq!(
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::with_nullable(true, 6).unwrap())
+                .to_string(),
+            "TIMESTAMP WITH LOCAL TIME ZONE(6)"
+        );
+        assert_eq!(
+            DataType::LocalZonedTimestamp(
+                LocalZonedTimestampType::with_nullable(false, 6).unwrap()
+            )
+            .to_string(),
+            "TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Time(TimeType::with_nullable(true, 6).unwrap()).to_string(),
+            "TIME(6)"
+        );
+        assert_eq!(
+            DataType::Time(TimeType::with_nullable(false, 6).unwrap()).to_string(),
+            "TIME(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Timestamp(TimestampType::with_nullable(false, 6).unwrap()).to_string(),
+            "TIMESTAMP(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Timestamp(TimestampType::with_nullable(true, 6).unwrap()).to_string(),
+            "TIMESTAMP(6)"
+        );
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let arr_type = DataType::Array(ArrayType::with_nullable(true, int_type.clone()));
+        assert_eq!(arr_type.to_string(), "ARRAY<INTEGER>");
+        assert_eq!(
+            DataType::Array(ArrayType::with_nullable(true, arr_type.clone())).to_string(),
+            "ARRAY<ARRAY<INTEGER>>"
+        );
+        let map_type = DataType::Map(MapType::with_nullable(
+            true,
+            int_type.clone(),
+            arr_type.clone(),
+        ));
+        assert_eq!(map_type.to_string(), "MAP<INTEGER, ARRAY<INTEGER>>");
+        let multiset_type = DataType::Multiset(MultisetType::with_nullable(true, int_type.clone()));
+        assert_eq!(multiset_type.to_string(), "MULTISET<INTEGER>");
+        let row_type = DataType::Row(RowType::with_nullable(
+            true,
+            vec![
+                DataField::new(1, "a".to_string(), int_type.clone()),
+                DataField::new(2, "b".to_string(), arr_type.clone()),
+            ],
+        ));
+        assert_eq!(row_type.to_string(), "ROW<INTEGER, ARRAY<INTEGER>>");
     }
 }
