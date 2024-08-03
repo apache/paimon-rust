@@ -225,13 +225,16 @@ impl BinaryType {
 
     pub const DEFAULT_LENGTH: usize = 1;
 
-    pub fn new(length: usize) -> Result<Self, InvalidBinaryType> {
+    pub fn new(length: usize) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, InvalidBinaryType> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, DataTypeError> {
         if length < Self::MIN_LENGTH {
-            return LengthTooSmallSnafu {}.fail();
+            return DataTypeInvalidSnafu {
+                message: "Binary string length must be at least 1.".to_string(),
+            }
+            .fail();
         }
         Ok(Self { nullable, length })
     }
@@ -320,13 +323,16 @@ impl CharType {
 
     pub const MAX_LENGTH: usize = 255;
 
-    pub fn new(length: usize) -> Result<Self, InvalidCharType> {
+    pub fn new(length: usize) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, InvalidCharType> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, DataTypeError> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
-            return LengthOutOfRangeSnafu {}.fail();
+            return DataTypeInvalidSnafu {
+                message: "Char string length must be between 1 and 255.".to_string(),
+            }
+            .fail();
         }
         Ok(CharType { nullable, length })
     }
@@ -420,7 +426,7 @@ impl DecimalType {
 
     pub const DEFAULT_SCALE: u32 = 0;
 
-    pub fn new(precision: u32, scale: u32) -> Result<Self, InvalidDecimalType> {
+    pub fn new(precision: u32, scale: u32) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, precision, scale)
     }
 
@@ -428,19 +434,25 @@ impl DecimalType {
         nullable: bool,
         precision: u32,
         scale: u32,
-    ) -> Result<Self, InvalidDecimalType> {
+    ) -> Result<Self, DataTypeError> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
-            return PrecisionOutOfRangeSnafu {
-                min: { Self::MIN_PRECISION },
-                max: { Self::MAX_PRECISION },
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Decimal precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
             }
             .fail();
         }
 
         if !(Self::MIN_SCALE..=precision).contains(&scale) {
-            return ScaleOutOfRangeSnafu {
-                min: { Self::MIN_SCALE },
-                max: { precision },
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Decimal scale must be between {} and {} (both inclusive).",
+                    Self::MIN_SCALE,
+                    precision
+                ),
             }
             .fail();
         }
@@ -620,18 +632,18 @@ impl LocalZonedTimestampType {
 
     pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
 
-    pub fn new(precision: u32) -> Result<Self, InvalidLocalZonedTimestampType> {
+    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(
-        nullable: bool,
-        precision: u32,
-    ) -> Result<Self, InvalidLocalZonedTimestampType> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
-            return LocalZonedTimestampPrecisionOutOfRangeSnafu {
-                min: Self::MIN_PRECISION,
-                max: Self::MAX_PRECISION,
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "LocalZonedTimestamp precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
             }
             .fail();
         }
@@ -732,15 +744,18 @@ impl TimeType {
 
     pub const DEFAULT_PRECISION: u32 = 0;
 
-    pub fn new(precision: u32) -> Result<Self, InvalidTimeType> {
+    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, InvalidTimeType> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
-            return TimePrecisionOutOfRangeSnafu {
-                min: Self::MIN_PRECISION,
-                max: Self::MAX_PRECISION,
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Time precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
             }
             .fail();
         }
@@ -794,15 +809,18 @@ impl TimestampType {
 
     pub const DEFAULT_PRECISION: u32 = 6;
 
-    pub fn new(precision: u32) -> Result<Self, InvalidTimestampType> {
+    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, InvalidTimestampType> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
-            return TimestampPrecisionOutOfRangeSnafu {
-                min: Self::MIN_PRECISION,
-                max: Self::MAX_PRECISION,
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Timestamp precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
             }
             .fail();
         }
@@ -899,13 +917,16 @@ impl VarBinaryType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(length: u32) -> Result<Self, InvalidVarBinaryType> {
+    pub fn new(length: u32) -> Result<Self, DataTypeError> {
         Self::try_new(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: u32) -> Result<Self, InvalidVarBinaryType> {
+    pub fn try_new(nullable: bool, length: u32) -> Result<Self, DataTypeError> {
         if length < Self::MIN_LENGTH {
-            return VarBinaryLengthTooSmallSnafu {}.fail();
+            return DataTypeInvalidSnafu {
+                message: "VarBinary string length must be at least 1.".to_string(),
+            }
+            .fail();
         }
 
         Ok(VarBinaryType { nullable, length })
@@ -954,15 +975,18 @@ impl VarCharType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(length: u32) -> Result<Self, InvalidVarCharType> {
+    pub fn new(length: u32) -> Result<Self, DataTypeError> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, InvalidVarCharType> {
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, DataTypeError> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
-            return VarCharLengthOutOfRangeSnafu {
-                min: Self::MIN_LENGTH,
-                max: Self::MAX_LENGTH,
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "VarChar string length must be between {} and {}.",
+                    Self::MIN_LENGTH,
+                    Self::MAX_LENGTH
+                ),
             }
             .fail();
         }
