@@ -38,3 +38,97 @@ pub enum Error {
         source: opendal::Error,
     },
 }
+
+#[derive(Debug, Snafu)]
+pub enum InvalidBinaryType {
+    #[snafu(
+        visibility(pub(crate)),
+        display("Binary string length must be at least 1.")
+    )]
+    LengthTooSmall,
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidCharType {
+    #[snafu(
+        visibility(pub(crate)),
+        display("Character string length must be between 1 and 255 (both inclusive).")
+    )]
+    LengthOutOfRange,
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidDecimalType {
+    #[snafu(
+        visibility(pub(crate)),
+        display(
+            "Decimal precision must be between {} and {} (both inclusive).",
+            min,
+            max
+        )
+    )]
+    PrecisionOutOfRange { min: u32, max: u32 },
+
+    #[snafu(
+        visibility(pub(crate)),
+        display("Decimal scale must be between {} and {} (both inclusive).", min, max)
+    )]
+    ScaleOutOfRange { min: u32, max: u32 },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidLocalZonedTimestampType {
+    #[snafu(
+        visibility(pub(crate)),
+        display(
+            "Local zoned timestamp precision must be between {} and {} (both inclusive).",
+            min,
+            max
+        )
+    )]
+    LocalZonedTimestampPrecisionOutOfRange { min: u32, max: u32 },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidTimeType {
+    #[snafu(
+        visibility(pub(crate)),
+        display("Time precision must be between {} and {} (both inclusive).", min, max)
+    )]
+    TimePrecisionOutOfRange { min: u32, max: u32 },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidTimestampType {
+    #[snafu(
+        visibility(pub(crate)),
+        display(
+            "Timestamp precision must be between {} and {} (both inclusive).",
+            min,
+            max
+        )
+    )]
+    TimestampPrecisionOutOfRange { min: u32, max: u32 },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidVarBinaryType {
+    #[snafu(
+        visibility(pub(crate)),
+        display("VarBinary string length must be at least 1.")
+    )]
+    VarBinaryLengthTooSmall,
+}
+
+#[derive(Debug, Snafu)]
+pub enum InvalidVarCharType {
+    #[snafu(
+        visibility(pub(crate)),
+        display(
+            "Character string length must be between {} and {} (both inclusive).",
+            min,
+            max
+        )
+    )]
+    VarCharLengthOutOfRange { min: u32, max: u32 },
+}
