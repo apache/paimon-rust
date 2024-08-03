@@ -983,7 +983,7 @@ impl VarCharType {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return DataTypeInvalidSnafu {
                 message: format!(
-                    "VarChar string length must be between {} and {}.",
+                    "VarChar string length must be between {} and {} (both inclusive).",
                     Self::MIN_LENGTH,
                     Self::MAX_LENGTH
                 ),
