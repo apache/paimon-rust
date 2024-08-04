@@ -430,11 +430,7 @@ impl DecimalType {
         Self::with_nullable(true, precision, scale)
     }
 
-    pub fn with_nullable(
-        nullable: bool,
-        precision: u32,
-        scale: u32,
-    ) -> Result<Self, Error> {
+    pub fn with_nullable(nullable: bool, precision: u32, scale: u32) -> Result<Self, Error> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return DataTypeInvalidSnafu {
                 message: format!(
