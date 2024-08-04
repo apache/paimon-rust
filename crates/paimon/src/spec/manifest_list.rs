@@ -15,27 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Spec module for paimon.
-//!
-//! All paimon specs types are defined here.
+use super::manifest_file_meta::ManifestFileMeta;
 
-mod data_file;
-pub use data_file::*;
+/// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
+pub struct ManifestList {}
 
-mod schema;
-pub use schema::*;
-
-mod schema_change;
-pub use schema_change::*;
-
-mod snapshot;
-pub use snapshot::*;
-
-mod manifest_file_meta;
-pub use manifest_file_meta::*;
-
-mod manifest_list;
-pub use manifest_list::*;
-
-mod types;
-pub use types::*;
+impl ManifestList {
+    /// Write several [`ManifestFileMeta`]s into a manifest list.
+    ///
+    /// NOTE: This method is atomic.
+    pub fn write(&mut self, _metas: Vec<ManifestFileMeta>) -> &str {
+        todo!()
+    }
+}

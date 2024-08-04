@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::DataTypeRoot;
 use serde::{Deserialize, Serialize};
+use crate::spec::DataType;
 
 /// Schema change to table.
 ///
@@ -109,19 +109,19 @@ impl UpdateComment {
 #[serde(rename_all = "camelCase")]
 pub struct AddColumn {
     field_name: String,
-    data_type: DataTypeRoot,
+    data_type: DataType,
     description: Option<String>,
     #[serde(rename = "move")]
-    move_: Option<Move>,
+    move_: Option<ColumnMove>,
 }
 
 impl AddColumn {
     /// Create a new `AddColumn`.
     pub fn new(
         field_name: String,
-        data_type: DataTypeRoot,
+        data_type: DataType,
         description: Option<String>,
-        move_: Option<Move>,
+        move_: Option<ColumnMove>,
     ) -> Self {
         AddColumn {
             field_name,
@@ -137,7 +137,7 @@ impl AddColumn {
     }
 
     /// Get the data type.
-    pub fn data_type(&self) -> &DataTypeRoot {
+    pub fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
@@ -147,7 +147,7 @@ impl AddColumn {
     }
 
     /// Get the move.
-    pub fn move_(&self) -> Option<&Move> {
+    pub fn move_(&self) -> Option<&ColumnMove> {
         self.move_.as_ref()
     }
 }
@@ -209,12 +209,12 @@ impl DropColumn {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateColumnType {
     field_name: String,
-    new_data_type: DataTypeRoot,
+    new_data_type: DataType,
 }
 
 impl UpdateColumnType {
     /// Create a new `UpdateColumnType`.
-    pub fn new(field_name: String, new_data_type: DataTypeRoot) -> Self {
+    pub fn new(field_name: String, new_data_type: DataType) -> Self {
         UpdateColumnType {
             field_name,
             new_data_type,
@@ -227,7 +227,7 @@ impl UpdateColumnType {
     }
 
     /// Get the new data type.
-    pub fn new_data_type(&self) -> &DataTypeRoot {
+    pub fn new_data_type(&self) -> &DataType {
         &self.new_data_type
     }
 }
@@ -238,17 +238,17 @@ impl UpdateColumnType {
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct UpdateColumnPosition {
     #[serde(rename = "move")]
-    move_: Move,
+    move_: ColumnMove,
 }
 
 impl UpdateColumnPosition {
     /// Create a new `UpdateColumnPosition`.
-    pub fn new(move_: Move) -> Self {
+    pub fn new(move_: ColumnMove) -> Self {
         UpdateColumnPosition { move_ }
     }
 
     /// Get the move.
-    pub fn move_(&self) -> &Move {
+    pub fn move_(&self) -> &ColumnMove {
         &self.move_
     }
 }
@@ -330,14 +330,14 @@ impl SchemaChange {
     }
 
     /// impl the `add_column`.
-    pub fn add_column(field_name: String, data_type: DataTypeRoot) -> Self {
+    pub fn add_column(field_name: String, data_type: DataType) -> Self {
         SchemaChange::AddColumn(AddColumn::new(field_name, data_type, None, None))
     }
 
     /// impl the `add_column_with_comment`.
     pub fn add_column_with_comment(
         field_name: String,
-        data_type: DataTypeRoot,
+        data_type: DataType,
         comment: String,
     ) -> Self {
         SchemaChange::AddColumn(AddColumn::new(field_name, data_type, Some(comment), None))
@@ -346,9 +346,9 @@ impl SchemaChange {
     /// impl the `add_column_with_comment_and_move`.
     pub fn add_column_with_comment_and_move(
         field_name: String,
-        data_type: DataTypeRoot,
+        data_type: DataType,
         comment: String,
-        move_: Move,
+        move_: ColumnMove,
     ) -> Self {
         SchemaChange::AddColumn(AddColumn::new(
             field_name,
@@ -369,7 +369,7 @@ impl SchemaChange {
     }
 
     /// impl the `update_column_type`.
-    pub fn update_column_type(field_name: String, new_data_type: DataTypeRoot) -> Self {
+    pub fn update_column_type(field_name: String, new_data_type: DataType) -> Self {
         SchemaChange::UpdateColumnType(UpdateColumnType::new(field_name, new_data_type))
     }
 
@@ -406,7 +406,7 @@ impl SchemaChange {
     }
 
     /// impl the `update_column_position`.
-    pub fn update_column_position(move_: Move) -> Self {
+    pub fn update_column_position(move_: ColumnMove) -> Self {
         SchemaChange::UpdateColumnPosition(UpdateColumnPosition::new(move_))
     }
 }
@@ -415,7 +415,7 @@ impl SchemaChange {
 ///
 /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L412>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub enum MoveType {
+pub enum ColumnMoveType {
     FIRST,
     AFTER,
     BEFORE,
@@ -427,19 +427,19 @@ pub enum MoveType {
 /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L410>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Move {
+pub struct ColumnMove {
     field_name: String,
     referenced_field_name: Option<String>,
     #[serde(rename = "type")]
-    move_type: MoveType,
+    move_type: ColumnMoveType,
 }
 
-impl Move {
+impl ColumnMove {
     /// Create a new `Move`.
     pub fn new(
         field_name: String,
         referenced_field_name: Option<String>,
-        move_type: MoveType,
+        move_type: ColumnMoveType,
     ) -> Self {
         Self {
             field_name,
@@ -459,49 +459,50 @@ impl Move {
     }
 
     /// Get the move type.
-    pub fn move_type(&self) -> &MoveType {
+    pub fn move_type(&self) -> &ColumnMoveType {
         &self.move_type
     }
 
     /// Create a new `Move` with `FIRST` move type.
     pub fn first(field_name: String) -> Self {
-        Move {
+        ColumnMove {
             field_name,
             referenced_field_name: None,
-            move_type: MoveType::FIRST,
+            move_type: ColumnMoveType::FIRST,
         }
     }
 
     /// Create a new `Move` with `AFTER` move type.
     pub fn after(field_name: String, referenced_field_name: String) -> Self {
-        Move {
+        ColumnMove {
             field_name,
             referenced_field_name: Some(referenced_field_name),
-            move_type: MoveType::AFTER,
+            move_type: ColumnMoveType::AFTER,
         }
     }
 
     /// Create a new `Move` with `BEFORE` move type.
     pub fn before(field_name: String, referenced_field_name: String) -> Self {
-        Move {
+        ColumnMove {
             field_name,
             referenced_field_name: Some(referenced_field_name),
-            move_type: MoveType::BEFORE,
+            move_type: ColumnMoveType::BEFORE,
         }
     }
 
     /// Create a new `Move` with `LAST` move type.
     pub fn last(field_name: String) -> Self {
-        Move {
+        ColumnMove {
             field_name,
             referenced_field_name: None,
-            move_type: MoveType::LAST,
+            move_type: ColumnMoveType::LAST,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::spec::IntType;
     use super::*;
 
     #[test]
@@ -545,8 +546,8 @@ mod tests {
     #[test]
     fn test_add_column() {
         let field_name = "new_column".to_string();
-        let data_type = DataTypeRoot::Integer;
-        let schema_change = SchemaChange::add_column(field_name.clone(), data_type);
+        let data_type = DataType::Int(IntType::new());
+        let schema_change = SchemaChange::add_column(field_name.clone(), data_type.clone());
 
         if let SchemaChange::AddColumn(add_column) = schema_change {
             assert_eq!(add_column.field_name(), field_name);
@@ -561,10 +562,10 @@ mod tests {
     #[test]
     fn test_add_column_with_comment() {
         let field_name = "new_column".to_string();
-        let data_type = DataTypeRoot::Varchar;
+        let data_type = DataType::Int(IntType::new());
         let comment = "This is a new column".to_string();
         let schema_change =
-            SchemaChange::add_column_with_comment(field_name.clone(), data_type, comment.clone());
+            SchemaChange::add_column_with_comment(field_name.clone(), data_type.clone(), comment.clone());
 
         if let SchemaChange::AddColumn(add_column) = schema_change {
             assert_eq!(add_column.field_name(), field_name);
@@ -579,15 +580,15 @@ mod tests {
     #[test]
     fn test_add_column_with_comment_and_move() {
         let field_name = "new_column".to_string();
-        let data_type = DataTypeRoot::Double;
+        let data_type = DataType::Int(IntType::new());
         let comment = "This is a new column".to_string();
-        let move_ = Move::after(
+        let move_ = ColumnMove::after(
             "existing_column".to_string(),
             "reference_column".to_string(),
         );
         let schema_change = SchemaChange::add_column_with_comment_and_move(
             field_name.clone(),
-            data_type,
+            data_type.clone(),
             comment.clone(),
             move_.clone(),
         );
@@ -646,7 +647,7 @@ mod tests {
     #[test]
     fn test_update_column_position() {
         let field_name = "column_to_move".to_string();
-        let move_ = Move::first(field_name.clone());
+        let move_ = ColumnMove::first(field_name.clone());
         let schema_change = SchemaChange::update_column_position(move_.clone());
 
         if let SchemaChange::UpdateColumnPosition(update_position) = schema_change {
@@ -689,48 +690,48 @@ mod tests {
     #[test]
     fn test_move_first() {
         let field_name = "column1".to_string();
-        let move_ = Move::first(field_name.clone());
+        let move_ = ColumnMove::first(field_name.clone());
 
         assert_eq!(move_.field_name(), field_name);
         assert_eq!(move_.referenced_field_name(), None);
-        assert_eq!(move_.move_type(), &MoveType::FIRST);
+        assert_eq!(move_.move_type(), &ColumnMoveType::FIRST);
     }
 
     #[test]
     fn test_move_after() {
         let field_name = "column1".to_string();
         let referenced_field_name = "column2".to_string();
-        let move_ = Move::after(field_name.clone(), referenced_field_name.clone());
+        let move_ = ColumnMove::after(field_name.clone(), referenced_field_name.clone());
 
         assert_eq!(move_.field_name(), field_name);
         assert_eq!(
             move_.referenced_field_name(),
             Some(referenced_field_name.as_str())
         );
-        assert_eq!(move_.move_type(), &MoveType::AFTER);
+        assert_eq!(move_.move_type(), &ColumnMoveType::AFTER);
     }
 
     #[test]
     fn test_move_before() {
         let field_name = "column1".to_string();
         let referenced_field_name = "column2".to_string();
-        let move_ = Move::before(field_name.clone(), referenced_field_name.clone());
+        let move_ = ColumnMove::before(field_name.clone(), referenced_field_name.clone());
 
         assert_eq!(move_.field_name(), field_name);
         assert_eq!(
             move_.referenced_field_name(),
             Some(referenced_field_name.as_str())
         );
-        assert_eq!(move_.move_type(), &MoveType::BEFORE);
+        assert_eq!(move_.move_type(), &ColumnMoveType::BEFORE);
     }
 
     #[test]
     fn test_move_last() {
         let field_name = "column1".to_string();
-        let move_ = Move::last(field_name.clone());
+        let move_ = ColumnMove::last(field_name.clone());
 
         assert_eq!(move_.field_name(), field_name);
         assert_eq!(move_.referenced_field_name(), None);
-        assert_eq!(move_.move_type(), &MoveType::LAST);
+        assert_eq!(move_.move_type(), &ColumnMoveType::LAST);
     }
 }

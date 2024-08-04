@@ -16,15 +16,16 @@
 // under the License.
 
 use crate::error::Error;
+use crate::spec::DataField;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/DataTypeFamily.java>
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataTypeFamily.java>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DataTypeFamily: u32 {
         const PREDEFINED = 1 << 0;
@@ -43,116 +44,112 @@ bitflags! {
     }
 }
 
-/// The root of data type.
+/// Data type for paimon table.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataTypeRoot.java#L49>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
-pub enum DataTypeRoot {
-    Char,
-    Varchar,
-    Boolean,
-    Binary,
-    Varbinary,
-    Decimal,
-    Tinyint,
-    Smallint,
-    Integer,
-    Bigint,
-    Float,
-    Double,
-    Date,
-    TimeWithoutTimeZone,
-    TimestampWithoutTimeZone,
-    TimestampWithLocalTimeZone,
-    Array,
-    Multiset,
-    Map,
-    Row,
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub enum DataType {
+    /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
+    Boolean(BooleanType),
+
+    /// Data type of a 1-byte (2^8) signed integer with values from -128 to 127.
+    TinyInt(TinyIntType),
+    /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
+    SmallInt(SmallIntType),
+    /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
+    Int(IntType),
+    /// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+    BigInt(BigIntType),
+    /// Data type of a decimal number with fixed precision and scale.
+    Decimal(DecimalType),
+    /// Data type of an 8-byte double precision floating point number.
+    Double(DoubleType),
+    /// Data type of a 4-byte single precision floating point number.
+    Float(FloatType),
+
+    /// Data type of a fixed-length binary string (=a sequence of bytes).
+    Binary(BinaryType),
+    /// Data type of a variable-length binary string (=a sequence of bytes).
+    VarBinary(VarBinaryType),
+    /// Data type of a fixed-length character string.
+    Char(CharType),
+    /// Data type of a variable-length character string.
+    VarChar(VarCharType),
+
+    /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
+    Date(DateType),
+    /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone`.
+    LocalZonedTimestamp(LocalZonedTimestampType),
+    /// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
+    /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
+    Time(TimeType),
+    /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
+    Timestamp(TimestampType),
+
+    /// Data type of an array of elements with same subtype.
+    Array(ArrayType),
+    /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
+    Map(MapType),
+    /// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
+    /// elements with a common subtype.
+    Multiset(MultisetType),
+    /// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
+    /// description.
+    Row(RowType),
 }
 
-impl DataTypeRoot {
-    pub fn families(&self) -> DataTypeFamily {
+#[allow(dead_code)]
+impl DataType {
+    fn is_nullable(&self) -> bool {
         match self {
-            Self::Char => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
-            Self::Varchar => DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING,
-            Self::Boolean => DataTypeFamily::PREDEFINED,
-            Self::Binary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
-            Self::Varbinary => DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING,
-            Self::Decimal => {
-                DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::EXACT_NUMERIC
-            }
-            Self::Tinyint => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::INTEGER_NUMERIC
-                    | DataTypeFamily::EXACT_NUMERIC
-            }
-            Self::Smallint => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::INTEGER_NUMERIC
-                    | DataTypeFamily::EXACT_NUMERIC
-            }
-            Self::Integer => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::INTEGER_NUMERIC
-                    | DataTypeFamily::EXACT_NUMERIC
-            }
-            Self::Bigint => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::INTEGER_NUMERIC
-                    | DataTypeFamily::EXACT_NUMERIC
-            }
-            Self::Float => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::APPROXIMATE_NUMERIC
-            }
-            Self::Double => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::NUMERIC
-                    | DataTypeFamily::APPROXIMATE_NUMERIC
-            }
-            Self::Date => DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME,
-            Self::TimeWithoutTimeZone => {
-                DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIME
-            }
-            Self::TimestampWithoutTimeZone => {
-                DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIMESTAMP
-            }
-            Self::TimestampWithLocalTimeZone => {
-                DataTypeFamily::PREDEFINED
-                    | DataTypeFamily::DATETIME
-                    | DataTypeFamily::TIMESTAMP
-                    | DataTypeFamily::EXTENSION
-            }
-            Self::Array => DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION,
-            Self::Multiset => DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION,
-            Self::Map => DataTypeFamily::CONSTRUCTED | DataTypeFamily::EXTENSION,
-            Self::Row => DataTypeFamily::CONSTRUCTED,
+            DataType::Boolean(v) => v.nullable,
+            DataType::TinyInt(v) => v.nullable,
+            DataType::SmallInt(v) => v.nullable,
+            DataType::Int(v) => v.nullable,
+            DataType::BigInt(v) => v.nullable,
+            DataType::Decimal(v) => v.nullable,
+            DataType::Double(v) => v.nullable,
+            DataType::Float(v) => v.nullable,
+            DataType::Binary(v) => v.nullable,
+            DataType::VarBinary(v) => v.nullable,
+            DataType::Char(v) => v.nullable,
+            DataType::VarChar(v) => v.nullable,
+            DataType::Date(v) => v.nullable,
+            DataType::LocalZonedTimestamp(v) => v.nullable,
+            DataType::Time(v) => v.nullable,
+            DataType::Timestamp(v) => v.nullable,
+            DataType::Array(v) => v.nullable,
+            DataType::Map(v) => v.nullable,
+            DataType::Multiset(v) => v.nullable,
+            DataType::Row(v) => v.nullable,
         }
     }
 }
 
-/// A visitor that can visit different data types.
-pub trait DataTypeVisitor<R> {
-    fn visit(&mut self, data_type: &DataType) -> R;
-}
-
-/// Data type for paimon table.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
-pub struct DataType {
-    is_nullable: bool,
-    type_root: DataTypeRoot,
-}
-
 impl Display for DataType {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Boolean(v) => write!(f, "{v}"),
+            DataType::TinyInt(v) => write!(f, "{v}"),
+            DataType::SmallInt(v) => write!(f, "{v}"),
+            DataType::Int(v) => write!(f, "{v}"),
+            DataType::BigInt(v) => write!(f, "{v}"),
+            DataType::Decimal(v) => write!(f, "{v}"),
+            DataType::Double(v) => write!(f, "{v}"),
+            DataType::Float(v) => write!(f, "{v}"),
+            DataType::Binary(v) => write!(f, "{v}"),
+            DataType::VarBinary(v) => write!(f, "{v}"),
+            DataType::Char(v) => write!(f, "{v}"),
+            DataType::VarChar(v) => write!(f, "{v}"),
+            DataType::Date(v) => write!(f, "{v}"),
+            DataType::LocalZonedTimestamp(v) => write!(f, "{v}"),
+            DataType::Time(v) => write!(f, "{v}"),
+            DataType::Timestamp(v) => write!(f, "{v}"),
+            DataType::Array(v) => write!(f, "{v}"),
+            DataType::Map(v) => write!(f, "{v}"),
+            DataType::Multiset(v) => write!(f, "{v}"),
+            DataType::Row(v) => write!(f, "{v}"),
+        }
     }
 }
 
@@ -164,118 +161,59 @@ impl FromStr for DataType {
     }
 }
 
-#[allow(dead_code)]
-impl DataType {
-    fn new(is_nullable: bool, type_root: DataTypeRoot) -> Self {
-        Self {
-            is_nullable,
-            type_root,
-        }
-    }
-
-    /// Returns a deep copy of this type with possibly different nullability.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L113>
-    fn with_nullable(&self, is_nullable: bool) -> Self {
-        Self {
-            is_nullable,
-            type_root: self.type_root,
-        }
-    }
-
-    /// Returns true if the data type is nullable.
-    ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L59>
-    fn is_nullable(&self) -> bool {
-        self.is_nullable
-    }
-
-    /// Returns the root of the data type.
-    ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L66>
-    fn type_root(&self) -> &DataTypeRoot {
-        &self.type_root
-    }
-
-    /// Returns whether the root of the type equals to the type_root or not.
-    ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L75>
-    fn is(&self, type_root: &DataTypeRoot) -> bool {
-        &self.type_root == type_root
-    }
-
-    /// Returns whether the family type of the type equals to the family or not.
-    ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L103>
-    fn is_family(&self, family: DataTypeFamily) -> bool {
-        self.type_root.families().contains(family)
-    }
-
-    /// Returns whether the root of the type equals to at least on of the type_roots or not.
-    ///
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L84>
-    fn is_any_of(&self, type_roots: &[DataTypeRoot]) -> bool {
-        type_roots.iter().any(|tr: &DataTypeRoot| self.is(tr))
-    }
-
-    /// Returns whether the root of the type is part of at least one family of the families or not.
-    /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L94>
-    fn is_any_of_family(&self, families: &[DataTypeFamily]) -> bool {
-        families.iter().any(|f: &DataTypeFamily| self.is_family(*f))
-    }
-
-    fn accept<T>(&self, visitor: &mut T)
-    where
-        T: DataTypeVisitor<T>,
-    {
-        visitor.visit(self);
-    }
-}
-
 /// ArrayType for paimon.
+///
+/// Data type of an array of elements with same subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
-    element_type: DataType,
+    nullable: bool,
+    element_type: Box<DataType>,
 }
 
 impl Display for ArrayType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.element_type.is_nullable() {
-            write!(f, "ARRAY")
-        } else {
-            write!(f, "ARRAY NOT NULL")
+        write!(f, "ARRAY<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
         }
-    }
-}
-
-impl Default for ArrayType {
-    fn default() -> Self {
-        Self::new(true)
+        Ok(())
     }
 }
 
 impl ArrayType {
-    pub fn new(is_nullable: bool) -> Self {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
         Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Array),
+            nullable,
+            element_type: Box::new(element_type),
         }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
     }
 }
 
 /// BigIntType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
+/// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct BigIntType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for BigIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "BIGINT")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -284,32 +222,43 @@ impl Display for BigIntType {
 
 impl Default for BigIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl BigIntType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Bigint),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
     }
 }
 
 /// BinaryType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
+/// Data type of a fixed-length binary string (=a sequence of bytes).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryType {
-    element_type: DataType,
+    nullable: bool,
     length: usize,
 }
 
 impl Display for BinaryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "BINARY({})", self.length)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -318,7 +267,7 @@ impl Display for BinaryType {
 
 impl Default for BinaryType {
     fn default() -> Self {
-        Self::new(true, Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -329,44 +278,40 @@ impl BinaryType {
 
     pub const DEFAULT_LENGTH: usize = 1;
 
-    pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: usize) -> Result<Self, &'static str> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, &'static str> {
         if length < Self::MIN_LENGTH {
             return Err("Binary string length must be at least 1.");
         }
-        Ok(Self {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::Binary,
-            },
-            length,
-        })
-    }
-
-    pub fn with_length(length: usize) -> Self {
-        Self::new(true, length)
+        Ok(Self { nullable, length })
     }
 
     pub fn length(&self) -> usize {
         self.length
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
+    }
 }
 
 /// BooleanType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/BooleanType.java>.
+/// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct BooleanType {
-    pub element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for BooleanType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "BOOLEAN")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -375,32 +320,40 @@ impl Display for BooleanType {
 
 impl Default for BooleanType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl BooleanType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Boolean),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
     }
 }
 
 /// CharType for paimon.
 ///
+/// Data type of a fixed-length character string.
+///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CharType {
-    element_type: DataType,
+    nullable: bool,
     length: usize,
 }
 
 impl Display for CharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "CHAR({})", self.length)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -409,7 +362,7 @@ impl Display for CharType {
 
 impl Default for CharType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -420,44 +373,40 @@ impl CharType {
 
     pub const MAX_LENGTH: usize = 255;
 
-    pub fn new(is_nullable: bool, length: usize) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: usize) -> Result<Self, &'static str> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(is_nullable: bool, length: usize) -> Result<Self, &'static str> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, &'static str> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err("Character string length must be between 1 and 255 (both inclusive).");
         }
-        Ok(CharType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::Char,
-            },
-            length,
-        })
-    }
-
-    pub fn with_length(length: usize) -> Self {
-        Self::new(true, length)
+        Ok(CharType { nullable, length })
     }
 
     pub fn length(&self) -> usize {
         self.length
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
+    }
 }
 
 /// DateType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+/// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Serialize)]
 pub struct DateType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for DateType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "DATE")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -466,24 +415,33 @@ impl Display for DateType {
 
 impl Default for DateType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl DateType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Date),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME
     }
 }
 
 /// DecimalType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
+/// Data type of a decimal number with fixed precision and scale.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DecimalType {
-    element_type: DataType,
+    nullable: bool,
+
     precision: u32,
     scale: u32,
 }
@@ -491,7 +449,7 @@ pub struct DecimalType {
 impl Display for DecimalType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "DECIMAL({}, {})", self.precision, self.scale)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -500,7 +458,7 @@ impl Display for DecimalType {
 
 impl Default for DecimalType {
     fn default() -> Self {
-        Self::with_precision_and_scale(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
+        Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE).unwrap()
     }
 }
 
@@ -515,11 +473,11 @@ impl DecimalType {
 
     pub const DEFAULT_SCALE: u32 = 0;
 
-    pub fn new(is_nullable: bool, precision: u32, scale: u32) -> Self {
-        Self::try_new(is_nullable, precision, scale).unwrap()
+    pub fn new(precision: u32, scale: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision, scale)
     }
 
-    pub fn try_new(is_nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32, scale: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Decimal precision must be between {} and {} (both inclusive).",
@@ -537,17 +495,10 @@ impl DecimalType {
         }
 
         Ok(DecimalType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::Decimal,
-            },
+            nullable,
             precision,
             scale,
         })
-    }
-
-    pub fn with_precision_and_scale(precision: u32, scale: u32) -> Self {
-        Self::new(true, precision, scale)
     }
 
     pub fn precision(&self) -> u32 {
@@ -557,20 +508,26 @@ impl DecimalType {
     pub fn scale(&self) -> u32 {
         self.scale
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::EXACT_NUMERIC
+    }
 }
 
 /// DoubleType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
+/// Data type of an 8-byte double precision floating point number.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DoubleType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for DoubleType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "DOUBLE")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -579,30 +536,36 @@ impl Display for DoubleType {
 
 impl Default for DoubleType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl DoubleType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Double),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::APPROXIMATE_NUMERIC
     }
 }
 
 /// FloatType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct FloatType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for FloatType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "FLOAT")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -611,30 +574,38 @@ impl Display for FloatType {
 
 impl Default for FloatType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl FloatType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Float),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::APPROXIMATE_NUMERIC
     }
 }
 
 /// IntType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
+/// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct IntType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for IntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "INTEGER")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -643,31 +614,42 @@ impl Display for IntType {
 
 impl Default for IntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl IntType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Integer),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
     }
 }
 
 /// LocalZonedTimestampType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
+/// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct LocalZonedTimestampType {
-    element_type: DataType,
+    nullable: bool,
     precision: u32,
 }
 
 impl Display for LocalZonedTimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -676,7 +658,7 @@ impl Display for LocalZonedTimestampType {
 
 impl Default for LocalZonedTimestampType {
     fn default() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -687,11 +669,11 @@ impl LocalZonedTimestampType {
 
     pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
 
-    pub fn new(is_nullable: bool, precision: u32) -> Self {
-        LocalZonedTimestampType::try_new(is_nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -701,37 +683,37 @@ impl LocalZonedTimestampType {
         }
 
         Ok(LocalZonedTimestampType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::TimestampWithLocalTimeZone,
-            },
+            nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
         self.precision
     }
-}
 
-/// Next TODO: MapType、MultisetType、RowType
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::DATETIME
+            | DataTypeFamily::TIMESTAMP
+            | DataTypeFamily::EXTENSION
+    }
+}
 
 /// SmallIntType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
+/// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct SmallIntType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for SmallIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "SMALLINT")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -740,31 +722,43 @@ impl Display for SmallIntType {
 
 impl Default for SmallIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl SmallIntType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Smallint),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
     }
 }
 
 /// TimeType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
+/// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
+/// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct TimeType {
-    element_type: DataType,
+    nullable: bool,
     precision: u32,
 }
 
 impl Display for TimeType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "TIME({})", self.precision)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -773,7 +767,7 @@ impl Display for TimeType {
 
 impl Default for TimeType {
     fn default() -> Self {
-        Self::with_precision(TimeType::DEFAULT_PRECISION)
+        Self::new(TimeType::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -784,11 +778,11 @@ impl TimeType {
 
     pub const DEFAULT_PRECISION: u32 = 0;
 
-    pub fn new(is_nullable: bool, precision: u32) -> Self {
-        Self::try_new(is_nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Time precision must be between {} and {} (both inclusive).",
@@ -798,36 +792,35 @@ impl TimeType {
         }
 
         Ok(TimeType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::TimeWithoutTimeZone,
-            },
+            nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
         self.precision
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIME
+    }
 }
 
 /// TimestampType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
+/// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct TimestampType {
-    element_type: DataType,
+    nullable: bool,
     precision: u32,
 }
 
 impl Display for TimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "TIMESTAMP({})", self.precision)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -836,7 +829,7 @@ impl Display for TimestampType {
 
 impl Default for TimestampType {
     fn default() -> Self {
-        Self::with_precision(Self::DEFAULT_PRECISION)
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
     }
 }
 
@@ -847,11 +840,11 @@ impl TimestampType {
 
     pub const DEFAULT_PRECISION: u32 = 6;
 
-    pub fn new(is_nullable: bool, precision: u32) -> Self {
-        Self::try_new(is_nullable, precision).unwrap()
+    pub fn new(precision: u32) -> Result<Self, String> {
+        Self::with_nullable(true, precision)
     }
 
-    pub fn try_new(is_nullable: bool, precision: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, String> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return Err(format!(
                 "Timestamp precision must be between {} and {} (both inclusive).",
@@ -861,35 +854,34 @@ impl TimestampType {
         }
 
         Ok(TimestampType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::TimestampWithoutTimeZone,
-            },
+            nullable,
             precision,
         })
-    }
-
-    pub fn with_precision(precision: u32) -> Self {
-        Self::new(true, precision)
     }
 
     pub fn precision(&self) -> u32 {
         self.precision
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIMESTAMP
+    }
 }
 
 /// TinyIntType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/TinyIntType.java>.
+/// Data type of a 1-byte signed integer with values from -128 to 127.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct TinyIntType {
-    element_type: DataType,
+    nullable: bool,
 }
 
 impl Display for TinyIntType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "TINYINT")?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -898,31 +890,42 @@ impl Display for TinyIntType {
 
 impl Default for TinyIntType {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
 impl TinyIntType {
-    pub fn new(is_nullable: bool) -> Self {
-        Self {
-            element_type: DataType::new(is_nullable, DataTypeRoot::Tinyint),
-        }
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
     }
 }
 
 /// VarBinaryType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
+/// Data type of a variable-length binary string (=a sequence of bytes).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct VarBinaryType {
-    element_type: DataType,
+    nullable: bool,
     length: u32,
 }
 
 impl Display for VarBinaryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "VARBINARY({})", self.length)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -931,7 +934,7 @@ impl Display for VarBinaryType {
 
 impl Default for VarBinaryType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -942,46 +945,42 @@ impl VarBinaryType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: u32) -> Result<Self, String> {
+        Self::try_new(true, length)
     }
 
-    pub fn try_new(is_nullable: bool, length: u32) -> Result<Self, String> {
+    pub fn try_new(nullable: bool, length: u32) -> Result<Self, String> {
         if length < Self::MIN_LENGTH {
             return Err("Binary string length must be at least 1.".to_string());
         }
 
-        Ok(VarBinaryType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::Varbinary,
-            },
-            length,
-        })
-    }
-
-    pub fn with_length(length: u32) -> Self {
-        Self::new(true, length)
+        Ok(VarBinaryType { nullable, length })
     }
 
     pub fn length(&self) -> u32 {
         self.length
     }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
+    }
 }
 
 /// VarCharType for paimon.
 ///
-/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
+/// Data type of a variable-length character string.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct VarCharType {
-    element_type: DataType,
+    nullable: bool,
     length: u32,
 }
 
 impl Display for VarCharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "VARCHAR({})", self.length)?;
-        if !self.element_type.is_nullable() {
+        if !self.nullable {
             write!(f, " NOT NULL")?;
         }
         Ok(())
@@ -990,7 +989,7 @@ impl Display for VarCharType {
 
 impl Default for VarCharType {
     fn default() -> Self {
-        Self::with_length(Self::DEFAULT_LENGTH)
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
     }
 }
 
@@ -1001,11 +1000,11 @@ impl VarCharType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(is_nullable: bool, length: u32) -> Self {
-        Self::try_new(is_nullable, length).unwrap()
+    pub fn new(length: u32) -> Result<Self, String> {
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(is_nullable: bool, length: u32) -> Result<Self, String> {
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, String> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return Err(format!(
                 "Character string length must be between {} and {} (both inclusive).",
@@ -1014,20 +1013,302 @@ impl VarCharType {
             ));
         }
 
-        Ok(VarCharType {
-            element_type: DataType {
-                is_nullable,
-                type_root: DataTypeRoot::Varchar,
-            },
-            length,
-        })
-    }
-
-    pub fn with_length(length: u32) -> Self {
-        Self::new(true, length)
+        Ok(VarCharType { nullable, length })
     }
 
     pub fn length(&self) -> u32 {
         self.length
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
+    }
+}
+
+/// MapType for paimon.
+///
+/// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct MapType {
+    nullable: bool,
+    key_type: Box<DataType>,
+    value_type: Box<DataType>,
+}
+
+impl Display for MapType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MAP<{}, {}>", self.key_type, self.value_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl MapType {
+    pub fn new(key_type: DataType, value_type: DataType) -> Self {
+        Self::with_nullable(true, key_type, value_type)
+    }
+
+    pub fn with_nullable(nullable: bool, key_type: DataType, value_type: DataType) -> Self {
+        Self {
+            nullable,
+            key_type: Box::new(key_type),
+            value_type: Box::new(value_type),
+        }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+}
+
+/// MultisetType for paimon.
+///
+/// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
+/// elements with a common subtype.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct MultisetType {
+    nullable: bool,
+    element_type: Box<DataType>,
+}
+
+impl Display for MultisetType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MULTISET<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl MultisetType {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
+        Self {
+            nullable,
+            element_type: Box::new(element_type),
+        }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+}
+
+/// RowType for paimon.
+///
+/// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
+/// description. The most specific type of a row of a table is a row type. In this case, each column
+/// of the row corresponds to the field of the row type that has the same ordinal position as the
+/// column.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct RowType {
+    nullable: bool,
+    fields: Vec<DataField>,
+}
+
+impl Display for RowType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let fields = self
+            .fields
+            .iter()
+            .map(|field| field.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        write!(f, "ROW<{}>", fields)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl RowType {
+    pub const fn new(fields: Vec<DataField>) -> Self {
+        Self::with_nullable(true, fields)
+    }
+
+    pub const fn with_nullable(nullable: bool, fields: Vec<DataField>) -> Self {
+        Self { nullable, fields }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_data_type_to_string() {
+        assert_eq!(
+            DataType::Boolean(BooleanType::with_nullable(true)).to_string(),
+            "BOOLEAN"
+        );
+        assert_eq!(
+            DataType::Boolean(BooleanType::with_nullable(false)).to_string(),
+            "BOOLEAN NOT NULL"
+        );
+        assert_eq!(
+            DataType::TinyInt(TinyIntType::with_nullable(true)).to_string(),
+            "TINYINT"
+        );
+        assert_eq!(
+            DataType::TinyInt(TinyIntType::with_nullable(false)).to_string(),
+            "TINYINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::SmallInt(SmallIntType::with_nullable(true)).to_string(),
+            "SMALLINT"
+        );
+        assert_eq!(
+            DataType::SmallInt(SmallIntType::with_nullable(false)).to_string(),
+            "SMALLINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Int(IntType::with_nullable(true)).to_string(),
+            "INTEGER"
+        );
+        assert_eq!(
+            DataType::Int(IntType::with_nullable(false)).to_string(),
+            "INTEGER NOT NULL"
+        );
+        assert_eq!(
+            DataType::BigInt(BigIntType::with_nullable(true)).to_string(),
+            "BIGINT"
+        );
+        assert_eq!(
+            DataType::BigInt(BigIntType::with_nullable(false)).to_string(),
+            "BIGINT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap()).to_string(),
+            "DECIMAL(10, 2)"
+        );
+        assert_eq!(
+            DataType::Decimal(DecimalType::with_nullable(false, 10, 2).unwrap()).to_string(),
+            "DECIMAL(10, 2) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Double(DoubleType::with_nullable(true)).to_string(),
+            "DOUBLE"
+        );
+        assert_eq!(
+            DataType::Double(DoubleType::with_nullable(false)).to_string(),
+            "DOUBLE NOT NULL"
+        );
+        assert_eq!(
+            DataType::Float(FloatType::with_nullable(true)).to_string(),
+            "FLOAT"
+        );
+        assert_eq!(
+            DataType::Float(FloatType::with_nullable(false)).to_string(),
+            "FLOAT NOT NULL"
+        );
+        assert_eq!(
+            DataType::Binary(BinaryType::with_nullable(true, 10).unwrap()).to_string(),
+            "BINARY(10)"
+        );
+        assert_eq!(
+            DataType::Binary(BinaryType::with_nullable(false, 10).unwrap()).to_string(),
+            "BINARY(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::VarBinary(VarBinaryType::try_new(true, 10).unwrap()).to_string(),
+            "VARBINARY(10)"
+        );
+        assert_eq!(
+            DataType::VarBinary(VarBinaryType::try_new(false, 10).unwrap()).to_string(),
+            "VARBINARY(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Char(CharType::with_nullable(true, 10).unwrap()).to_string(),
+            "CHAR(10)"
+        );
+        assert_eq!(
+            DataType::Char(CharType::with_nullable(false, 10).unwrap()).to_string(),
+            "CHAR(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::VarChar(VarCharType::with_nullable(true, 10).unwrap()).to_string(),
+            "VARCHAR(10)"
+        );
+        assert_eq!(
+            DataType::VarChar(VarCharType::with_nullable(false, 10).unwrap()).to_string(),
+            "VARCHAR(10) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Date(DateType::with_nullable(true)).to_string(),
+            "DATE"
+        );
+        assert_eq!(
+            DataType::Date(DateType::with_nullable(false)).to_string(),
+            "DATE NOT NULL"
+        );
+        assert_eq!(
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::with_nullable(true, 6).unwrap())
+                .to_string(),
+            "TIMESTAMP WITH LOCAL TIME ZONE(6)"
+        );
+        assert_eq!(
+            DataType::LocalZonedTimestamp(
+                LocalZonedTimestampType::with_nullable(false, 6).unwrap()
+            )
+            .to_string(),
+            "TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Time(TimeType::with_nullable(true, 6).unwrap()).to_string(),
+            "TIME(6)"
+        );
+        assert_eq!(
+            DataType::Time(TimeType::with_nullable(false, 6).unwrap()).to_string(),
+            "TIME(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Timestamp(TimestampType::with_nullable(false, 6).unwrap()).to_string(),
+            "TIMESTAMP(6) NOT NULL"
+        );
+        assert_eq!(
+            DataType::Timestamp(TimestampType::with_nullable(true, 6).unwrap()).to_string(),
+            "TIMESTAMP(6)"
+        );
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let arr_type = DataType::Array(ArrayType::with_nullable(true, int_type.clone()));
+        assert_eq!(arr_type.to_string(), "ARRAY<INTEGER>");
+        assert_eq!(
+            DataType::Array(ArrayType::with_nullable(true, arr_type.clone())).to_string(),
+            "ARRAY<ARRAY<INTEGER>>"
+        );
+        let map_type = DataType::Map(MapType::with_nullable(
+            true,
+            int_type.clone(),
+            arr_type.clone(),
+        ));
+        assert_eq!(map_type.to_string(), "MAP<INTEGER, ARRAY<INTEGER>>");
+        let multiset_type = DataType::Multiset(MultisetType::with_nullable(true, int_type.clone()));
+        assert_eq!(multiset_type.to_string(), "MULTISET<INTEGER>");
+        let row_type = DataType::Row(RowType::with_nullable(
+            true,
+            vec![
+                DataField::new(1, "a".to_string(), int_type.clone()),
+                DataField::new(2, "b".to_string(), arr_type.clone()),
+            ],
+        ));
+        assert_eq!(row_type.to_string(), "ROW<INTEGER, ARRAY<INTEGER>>");
     }
 }
