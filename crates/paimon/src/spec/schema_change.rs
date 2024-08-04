@@ -208,8 +208,6 @@ impl SchemaChange {
 pub enum ColumnMoveType {
     FIRST,
     AFTER,
-    BEFORE,
-    LAST,
 }
 
 /// Represents a requested column move in a struct.
@@ -268,24 +266,6 @@ impl ColumnMove {
             field_name,
             referenced_field_name: Some(referenced_field_name),
             move_type: ColumnMoveType::AFTER,
-        }
-    }
-
-    /// Create a new `Move` with `BEFORE` move type.
-    pub fn before(field_name: String, referenced_field_name: String) -> Self {
-        ColumnMove {
-            field_name,
-            referenced_field_name: Some(referenced_field_name),
-            move_type: ColumnMoveType::BEFORE,
-        }
-    }
-
-    /// Create a new `Move` with `LAST` move type.
-    pub fn last(field_name: String) -> Self {
-        ColumnMove {
-            field_name,
-            referenced_field_name: None,
-            move_type: ColumnMoveType::LAST,
         }
     }
 }
@@ -535,29 +515,5 @@ mod tests {
             Some(referenced_field_name.as_str())
         );
         assert_eq!(move_.move_type(), &ColumnMoveType::AFTER);
-    }
-
-    #[test]
-    fn test_move_before() {
-        let field_name = "column1".to_string();
-        let referenced_field_name = "column2".to_string();
-        let move_ = ColumnMove::before(field_name.clone(), referenced_field_name.clone());
-
-        assert_eq!(move_.field_name(), field_name);
-        assert_eq!(
-            move_.referenced_field_name(),
-            Some(referenced_field_name.as_str())
-        );
-        assert_eq!(move_.move_type(), &ColumnMoveType::BEFORE);
-    }
-
-    #[test]
-    fn test_move_last() {
-        let field_name = "column1".to_string();
-        let move_ = ColumnMove::last(field_name.clone());
-
-        assert_eq!(move_.field_name(), field_name);
-        assert_eq!(move_.referenced_field_name(), None);
-        assert_eq!(move_.move_type(), &ColumnMoveType::LAST);
     }
 }
