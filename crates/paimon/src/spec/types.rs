@@ -225,11 +225,11 @@ impl BinaryType {
 
     pub const DEFAULT_LENGTH: usize = 1;
 
-    pub fn new(length: usize) -> Result<Self, DataTypeError> {
+    pub fn new(length: usize) -> Result<Self, Error> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, Error> {
         if length < Self::MIN_LENGTH {
             return DataTypeInvalidSnafu {
                 message: "Binary string length must be at least 1.".to_string(),
@@ -323,11 +323,11 @@ impl CharType {
 
     pub const MAX_LENGTH: usize = 255;
 
-    pub fn new(length: usize) -> Result<Self, DataTypeError> {
+    pub fn new(length: usize) -> Result<Self, Error> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, Error> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return DataTypeInvalidSnafu {
                 message: "Char string length must be between 1 and 255.".to_string(),
@@ -426,7 +426,7 @@ impl DecimalType {
 
     pub const DEFAULT_SCALE: u32 = 0;
 
-    pub fn new(precision: u32, scale: u32) -> Result<Self, DataTypeError> {
+    pub fn new(precision: u32, scale: u32) -> Result<Self, Error> {
         Self::with_nullable(true, precision, scale)
     }
 
@@ -434,7 +434,7 @@ impl DecimalType {
         nullable: bool,
         precision: u32,
         scale: u32,
-    ) -> Result<Self, DataTypeError> {
+    ) -> Result<Self, Error> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return DataTypeInvalidSnafu {
                 message: format!(
@@ -632,11 +632,11 @@ impl LocalZonedTimestampType {
 
     pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
 
-    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
+    pub fn new(precision: u32) -> Result<Self, Error> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return DataTypeInvalidSnafu {
                 message: format!(
@@ -744,11 +744,11 @@ impl TimeType {
 
     pub const DEFAULT_PRECISION: u32 = 0;
 
-    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
+    pub fn new(precision: u32) -> Result<Self, Error> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return DataTypeInvalidSnafu {
                 message: format!(
@@ -809,11 +809,11 @@ impl TimestampType {
 
     pub const DEFAULT_PRECISION: u32 = 6;
 
-    pub fn new(precision: u32) -> Result<Self, DataTypeError> {
+    pub fn new(precision: u32) -> Result<Self, Error> {
         Self::with_nullable(true, precision)
     }
 
-    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
         if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
             return DataTypeInvalidSnafu {
                 message: format!(
@@ -917,11 +917,11 @@ impl VarBinaryType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(length: u32) -> Result<Self, DataTypeError> {
+    pub fn new(length: u32) -> Result<Self, Error> {
         Self::try_new(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: u32) -> Result<Self, DataTypeError> {
+    pub fn try_new(nullable: bool, length: u32) -> Result<Self, Error> {
         if length < Self::MIN_LENGTH {
             return DataTypeInvalidSnafu {
                 message: "VarBinary string length must be at least 1.".to_string(),
@@ -975,11 +975,11 @@ impl VarCharType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
-    pub fn new(length: u32) -> Result<Self, DataTypeError> {
+    pub fn new(length: u32) -> Result<Self, Error> {
         Self::with_nullable(true, length)
     }
 
-    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, DataTypeError> {
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, Error> {
         if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
             return DataTypeInvalidSnafu {
                 message: format!(

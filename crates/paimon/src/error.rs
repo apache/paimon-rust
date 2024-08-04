@@ -31,19 +31,15 @@ pub enum Error {
     },
     #[snafu(
         visibility(pub(crate)),
+        display("Paimon data type invalid for {}", message)
+    )]
+    DataTypeInvalid { message: String },
+    #[snafu(
+        visibility(pub(crate)),
         display("Paimon hitting unexpected error {}: {:?}", message, source)
     )]
     IoUnexpected {
         message: String,
         source: opendal::Error,
     },
-}
-
-#[derive(Debug, Snafu)]
-pub enum DataTypeError {
-    #[snafu(
-        visibility(pub(crate)),
-        display("Paimon data type invalid for {}", message)
-    )]
-    DataTypeInvalid { message: String },
 }
