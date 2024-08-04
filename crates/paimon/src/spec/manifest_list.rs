@@ -15,26 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use snafu::prelude::*;
+use super::manifest_file_meta::ManifestFileMeta;
 
-/// Result type used in paimon.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+/// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
+pub struct ManifestList {}
 
-/// Error type for paimon.
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Paimon data invalid for {}: {:?}", message, source))]
-    DataInvalid {
-        message: String,
-        #[snafu(backtrace)]
-        source: snafu::Whatever,
-    },
-    #[snafu(
-        visibility(pub(crate)),
-        display("Paimon hitting unexpected error {}: {:?}", message, source)
-    )]
-    IoUnexpected {
-        message: String,
-        source: opendal::Error,
-    },
+impl ManifestList {
+    /// Write several [`ManifestFileMeta`]s into a manifest list.
+    ///
+    /// NOTE: This method is atomic.
+    pub fn write(&mut self, _metas: Vec<ManifestFileMeta>) -> &str {
+        todo!()
+    }
 }
