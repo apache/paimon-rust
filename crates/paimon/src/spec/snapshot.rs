@@ -146,16 +146,16 @@ mod tests {
             .version(1)
             .id(1001)
             .schema_id(2002)
-            .base_manifest_list("base_manifest".to_string())
-            .delta_manifest_list("delta_manifest".to_string())
+            .base_manifest_list("base_manifest_list".to_string())
+            .delta_manifest_list("delta_manifest_list".to_string())
             .commit_user("user1".to_string())
             .build();
 
         assert_eq!(snapshot.version(), 1);
         assert_eq!(snapshot.id(), 1001);
         assert_eq!(snapshot.schema_id(), 2002);
-        assert_eq!(snapshot.base_manifest_list(), "base_manifest");
-        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest");
+        assert_eq!(snapshot.base_manifest_list(), "base_manifest_list");
+        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest_list");
         assert_eq!(snapshot.commit_user(), "user1");
         assert!(snapshot.changelog_manifest_list().is_none());
         assert!(snapshot.index_manifest().is_none());
@@ -172,10 +172,10 @@ mod tests {
             .version(2)
             .id(1002)
             .schema_id(2003)
-            .base_manifest_list("base_manifest_v2".to_string())
-            .delta_manifest_list("delta_manifest_v2".to_string())
-            .changelog_manifest_list(Some("changelog_manifest_v2".to_string()))
-            .index_manifest(Some("index_manifest_v2".to_string()))
+            .base_manifest_list("base_manifest_list_v2".to_string())
+            .delta_manifest_list("delta_manifest_list_v2".to_string())
+            .changelog_manifest_list(Some("changelog_manifest_list_v2".to_string()))
+            .index_manifest(Some("index_manifest_list_v2".to_string()))
             .commit_user("user2".to_string())
             .total_record_count(Some(500))
             .delta_record_count(Some(200))
@@ -187,13 +187,13 @@ mod tests {
         assert_eq!(snapshot.version(), 2);
         assert_eq!(snapshot.id(), 1002);
         assert_eq!(snapshot.schema_id(), 2003);
-        assert_eq!(snapshot.base_manifest_list(), "base_manifest_v2");
-        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest_v2");
+        assert_eq!(snapshot.base_manifest_list(), "base_manifest_list_v2");
+        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest_list_v2");
         assert_eq!(
             snapshot.changelog_manifest_list(),
-            Some("changelog_manifest_v2")
+            Some("changelog_manifest_list_v2")
         );
-        assert_eq!(snapshot.index_manifest(), Some("index_manifest_v2"));
+        assert_eq!(snapshot.index_manifest(), Some("index_manifest_list_v2"));
         assert_eq!(snapshot.commit_user(), "user2");
         assert_eq!(snapshot.total_record_count(), Some(500));
         assert_eq!(snapshot.delta_record_count(), Some(200));
@@ -208,16 +208,16 @@ mod tests {
             .version(3)
             .id(1003)
             .schema_id(2004)
-            .base_manifest_list("base_manifest_v3".to_string())
-            .delta_manifest_list("delta_manifest_v3".to_string())
+            .base_manifest_list("base_manifest_list_v3".to_string())
+            .delta_manifest_list("delta_manifest_list_v3".to_string())
             .commit_user("user3".to_string())
             .build();
 
         assert_eq!(snapshot.version(), 3);
         assert_eq!(snapshot.id(), 1003);
         assert_eq!(snapshot.schema_id(), 2004);
-        assert_eq!(snapshot.base_manifest_list(), "base_manifest_v3");
-        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest_v3");
+        assert_eq!(snapshot.base_manifest_list(), "base_manifest_list_v3");
+        assert_eq!(snapshot.delta_manifest_list(), "delta_manifest_list_v3");
         assert_eq!(snapshot.commit_user(), "user3");
         assert!(snapshot.changelog_manifest_list().is_none());
         assert!(snapshot.index_manifest().is_none());
