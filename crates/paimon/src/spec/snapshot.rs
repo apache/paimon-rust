@@ -39,6 +39,16 @@ pub struct Snapshot {
     #[builder(default = None)]
     index_manifest: Option<String>,
     commit_user: String,
+    // Mainly for snapshot deduplication.
+    //
+    // If multiple snapshots have the same commitIdentifier, reading from any of these snapshots
+    // must produce the same table.
+    //
+    // If snapshot A has a smaller commitIdentifier than snapshot B, then snapshot A must be
+    // committed before snapshot B, and thus snapshot A must contain older records than snapshot B.
+    commit_identifier: i64,
+    commit_kind: CommitKind,
+    time_millis: u64,
     /// record count of all changes occurred in this snapshot
     #[builder(default = None)]
     total_record_count: Option<i64>,
@@ -134,4 +144,38 @@ impl Snapshot {
     pub fn statistics(&self) -> Option<&str> {
         self.statistics.as_deref()
     }
+
+    /// Get the commit time of this snapshot.
+    #[inline]
+    pub fn time_millis(&self) -> u64 {
+        self.time_millis
+    }
+
+    /// Get the commit identifier of this snapshot.
+    #[inline]
+    pub fn commit_identifier(&self) -> i64 {
+        self.commit_identifier
+    }
+
+    /// Get the commit kind of this snapshot.
+    #[inline]
+    pub fn commit_kind(&self) -> CommitKind {
+        self.commit_kind
+    }
+}
+
+/// Type of changes in this snapshot.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/Snapshot.java#L506>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommitKind {
+    /// Change flushed from the mem table.
+    Append,
+    /// Changes by compacting existing data files.
+    Compact,
+    /// Changes that clear up the whole partition and then add new records.
+    Overwrite,
+    /// Collect statistics.
+    Analyze,
 }
