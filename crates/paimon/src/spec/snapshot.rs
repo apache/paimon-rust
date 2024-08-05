@@ -139,6 +139,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json;
 
     #[test]
     fn test_snapshot_creation() {
@@ -233,5 +234,49 @@ mod tests {
         assert!(snapshot.changelog_record_count().is_none());
         assert!(snapshot.watermark().is_none());
         assert!(snapshot.statistics().is_none());
+    }
+
+    #[test]
+    fn test_snapshot_serialization_deserialization() {
+        let original_snapshot = Snapshot::builder()
+            .version(4)
+            .id(1004)
+            .schema_id(2005)
+            .base_manifest_list("base_manifest_list.json".to_string())
+            .delta_manifest_list("delta_manifest_list.json".to_string())
+            .changelog_manifest_list(Some("changelog_manifest_list.json".to_string()))
+            .index_manifest(Some("index_manifest.json".to_string()))
+            .commit_user("test_user".to_string())
+            .total_record_count(Some(1000))
+            .delta_record_count(Some(100))
+            .changelog_record_count(Some(50))
+            .watermark(Some(1234567890))
+            .statistics(Some("statistics.json".to_string()))
+            .build();
+
+        let serialized =
+            serde_json::to_string(&original_snapshot).expect("Failed to serialize Snapshot");
+
+        let deserialized: Snapshot =
+            serde_json::from_str(&serialized).expect("Failed to deserialize Snapshot");
+
+        assert_eq!(
+            original_snapshot, deserialized,
+            "Deserialized Snapshot does not match the original"
+        );
+
+        assert!(serialized.contains("\"version\":4"));
+        assert!(serialized.contains("\"id\":1004"));
+        assert!(serialized.contains("\"schemaId\":2005"));
+        assert!(serialized.contains("\"baseManifestList\":\"base_manifest_list.json\""));
+        assert!(serialized.contains("\"deltaManifestList\":\"delta_manifest_list.json\""));
+        assert!(serialized.contains("\"changelogManifestList\":\"changelog_manifest_list.json\""));
+        assert!(serialized.contains("\"indexManifest\":\"index_manifest.json\""));
+        assert!(serialized.contains("\"commitUser\":\"test_user\""));
+        assert!(serialized.contains("\"totalRecordCount\":1000"));
+        assert!(serialized.contains("\"deltaRecordCount\":100"));
+        assert!(serialized.contains("\"changelogRecordCount\":50"));
+        assert!(serialized.contains("\"watermark\":1234567890"));
+        assert!(serialized.contains("\"statistics\":\"statistics.json\""));
     }
 }
