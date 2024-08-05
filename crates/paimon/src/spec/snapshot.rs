@@ -203,14 +203,21 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_default_values() {
+    fn test_snapshot_with_none_fields() {
         let snapshot = Snapshot::builder()
             .version(3)
             .id(1003)
             .schema_id(2004)
             .base_manifest_list("base_manifest_list_v3".to_string())
             .delta_manifest_list("delta_manifest_list_v3".to_string())
+            .changelog_manifest_list(None)
+            .index_manifest(None)
             .commit_user("user3".to_string())
+            .total_record_count(None)
+            .delta_record_count(None)
+            .changelog_record_count(None)
+            .watermark(None)
+            .statistics(None)
             .build();
 
         assert_eq!(snapshot.version(), 3);
