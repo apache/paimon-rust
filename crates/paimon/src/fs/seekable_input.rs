@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use async_trait::async_trait;
+use std::io::{self, SeekFrom};
+use tokio::io::{AsyncRead, AsyncSeek};
 
-pub mod fileindex;
-pub mod fs;
-pub mod io;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+#[async_trait]
+pub trait SeekableInputStream: AsyncRead + AsyncSeek + Unpin {
+    async fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;
+
+    async fn get_pos(&mut self) -> io::Result<u64>;
+
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+
+    async fn close(&mut self) -> io::Result<()>;
+}

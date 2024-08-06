@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+pub struct LeafPredicate {}
 
-pub mod fileindex;
-pub mod fs;
-pub mod io;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+pub struct CompoundPredicate {}
+
+pub trait PredicateVisitor<T> {
+    fn visit_leaf(&self, predicate: &LeafPredicate) -> T;
+    fn visit_compound(&self, predicate: &CompoundPredicate) -> T;
+}

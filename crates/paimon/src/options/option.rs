@@ -15,13 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
-
-pub mod fileindex;
-pub mod fs;
-pub mod io;
-pub mod options;
-pub mod predicate;
-pub mod spec;
+// TODO:implement options
+pub struct Options {}
