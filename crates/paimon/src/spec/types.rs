@@ -18,9 +18,10 @@
 use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
-use std::fmt::{Debug, Display, Formatter};
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::json;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
@@ -48,7 +49,7 @@ bitflags! {
 /// Data type for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub enum DataType {
     /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
     Boolean(BooleanType),
@@ -125,6 +126,10 @@ impl DataType {
             DataType::Row(v) => v.nullable,
         }
     }
+
+    fn serde_json(&self) -> serde_json::Value {
+        json!(self.to_string())
+    }
 }
 
 impl Display for DataType {
@@ -157,78 +162,40 @@ impl Display for DataType {
 impl FromStr for DataType {
     type Err = Error;
 
-    fn from_str(v: &str) -> Result<Self, Self::Err> {
-        let v: String = v.to_uppercase();
-        match v.as_str() {
-            "BOOLEAN" => Ok(DataType::Boolean(BooleanType::new())),
-            "TINYINT" => Ok(DataType::TinyInt(TinyIntType::new())),
-            "SMALLINT" => Ok(DataType::SmallInt(SmallIntType::new())),
-            "INTEGER" => Ok(DataType::Int(IntType::new())),
-            "BIGINT" => Ok(DataType::BigInt(BigIntType::new())),
-            "DECIMAL" => Ok(DataType::Decimal(DecimalType::new(
-                DecimalType::DEFAULT_PRECISION,
-                DecimalType::DEFAULT_SCALE,
-            )?)),
-            "DOUBLE" => Ok(DataType::Double(DoubleType::new())),
-            "FLOAT" => Ok(DataType::Float(FloatType::new())),
-            "BINARY" => Ok(DataType::Binary(BinaryType::new(
-                BinaryType::DEFAULT_LENGTH,
-            )?)),
-            "VARBINARY" => Ok(DataType::VarBinary(VarBinaryType::new(
-                VarBinaryType::DEFAULT_LENGTH,
-            )?)),
-            "CHAR" => Ok(DataType::Char(CharType::new(CharType::DEFAULT_LENGTH)?)),
-            "VARCHAR" => Ok(DataType::VarChar(VarCharType::new(
-                VarCharType::DEFAULT_LENGTH,
-            )?)),
-            "DATE" => Ok(DataType::Date(DateType::new())),
-            "TIMESTAMP" => Ok(DataType::Timestamp(TimestampType::new(
-                TimestampType::DEFAULT_PRECISION,
-            )?)),
-            "TIME" => Ok(DataType::Time(TimeType::new(TimeType::DEFAULT_PRECISION)?)),
-            "TIMESTAMP WITH LOCAL TIME ZONE" => Ok(DataType::LocalZonedTimestamp(
-                LocalZonedTimestampType::new(LocalZonedTimestampType::DEFAULT_PRECISION)?,
-            )),
-            "ARRAY<INTEGER>" => Ok(DataType::Array(ArrayType::new(DataType::Int(
-                IntType::new(),
-            )))),
-            "ARRAY<BIGINT>" => Ok(DataType::Array(ArrayType::new(DataType::BigInt(
-                BigIntType::new(),
-            )))),
-            "ARRAY<BOOLEAN>" => Ok(DataType::Array(ArrayType::new(DataType::Boolean(
-                BooleanType::new(),
-            )))),
-            "ARRAY<CHAR>" => Ok(DataType::Array(ArrayType::new(DataType::Char(
-                CharType::new(CharType::DEFAULT_LENGTH)?,
-            )))),
-            "ARRAY<VARCHAR>" => Ok(DataType::Array(ArrayType::new(DataType::VarChar(
-                VarCharType::new(VarCharType::DEFAULT_LENGTH)?,
-            )))),
-            "ARRAY<VARBINARY>" => Ok(DataType::Array(ArrayType::new(DataType::VarBinary(
-                VarBinaryType::new(VarBinaryType::DEFAULT_LENGTH)?,
-            )))),
-            "ARRAY<DATE>" => Ok(DataType::Array(ArrayType::new(DataType::Date(
-                DateType::new(),
-            )))),
-            "ARRAY<TIMESTAMP>" => Ok(DataType::Array(ArrayType::new(DataType::Timestamp(
-                TimestampType::new(TimestampType::DEFAULT_PRECISION)?,
-            )))),
-            "ARRAY<TIME>" => Ok(DataType::Array(ArrayType::new(DataType::Time(
-                TimeType::new(TimeType::DEFAULT_PRECISION)?,
-            )))),
-            "ARRAY<DECIMAL>" => Ok(DataType::Array(ArrayType::new(DataType::Decimal(
-                DecimalType::new(DecimalType::DEFAULT_PRECISION, DecimalType::DEFAULT_SCALE)?,
-            )))),
-            "ARRAY<DOUBLE>" => Ok(DataType::Array(ArrayType::new(DataType::Double(
-                DoubleType::new(),
-            )))),
-            "ARRAY<FLOAT>" => Ok(DataType::Array(ArrayType::new(DataType::Float(
-                FloatType::new(),
-            )))),
-            _ => DataTypeInvalidSnafu {
-                message: format!("Invalid data type: {}", v),
-            }
-            .fail(),
+    fn from_str(_: &str) -> Result<Self, Self::Err> {
+        todo!();
+    }
+}
+
+impl Serialize for DataType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            DataType::Boolean(v) => v.serialize(serializer),
+            DataType::TinyInt(v) => v.serialize(serializer),
+            DataType::SmallInt(v) => v.serialize(serializer),
+            DataType::Int(v) => v.serialize(serializer),
+            DataType::BigInt(v) => v.serialize(serializer),
+            DataType::Decimal(v) => v.serialize(serializer),
+            DataType::Double(v) => v.serialize(serializer),
+            DataType::Float(v) => v.serialize(serializer),
+            DataType::Binary(v) => v.serialize(serializer),
+            DataType::VarBinary(v) => v.serialize(serializer),
+            DataType::Char(v) => v.serialize(serializer),
+            DataType::VarChar(v) => v.serialize(serializer),
+            DataType::Date(v) => v.serialize(serializer),
+            DataType::LocalZonedTimestamp(v) => v.serialize(serializer),
+            DataType::Time(v) => v.serialize(serializer),
+            DataType::Timestamp(v) => v.serialize(serializer),
+            DataType::Array(v) => v.serialize(serializer),
+            DataType::Map(v) => v.serialize(serializer),
+            DataType::Multiset(v) => v.serialize(serializer),
+            DataType::Row(v) => v.serialize(serializer),
         }
     }
 }
@@ -238,14 +205,10 @@ impl FromStr for DataType {
 /// Data type of an array of elements with same subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde(rename = "type")]
-    #[serde_as(as = "Box<DisplayFromStr>")]
     element_type: Box<DataType>,
 }
 
@@ -276,15 +239,25 @@ impl ArrayType {
     }
 }
 
+impl Serialize for ArrayType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// BigIntType for paimon.
 ///
 /// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BigIntType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -321,18 +294,57 @@ impl BigIntType {
     }
 }
 
+impl Serialize for BigIntType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for BigIntType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(BigIntTypeVisitor)
+    }
+}
+
+struct BigIntTypeVisitor;
+
+impl<'de> Visitor<'de> for BigIntTypeVisitor {
+    type Value = BigIntType;
+
+    fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
+        formatter.write_str("a string representing a BigIntType")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match v.trim().to_uppercase().as_str() {
+            "BIGINT" => Ok(BigIntType::with_nullable(true)),
+            "BIGINT NOT NULL" => Ok(BigIntType::with_nullable(false)),
+            _ => Err(E::custom(format!("Invalid BigIntType string: {}", v))),
+        }
+    }
+}
+
 /// BinaryType for paimon.
 ///
 /// Data type of a fixed-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     length: usize,
 }
 
@@ -382,15 +394,25 @@ impl BinaryType {
     }
 }
 
+impl Serialize for BinaryType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// BooleanType for paimon.
 ///
 /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct BooleanType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -424,18 +446,27 @@ impl BooleanType {
     }
 }
 
+impl Serialize for BooleanType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// CharType for paimon.
 ///
 /// Data type of a fixed-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CharType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     length: usize,
 }
 
@@ -485,15 +516,25 @@ impl CharType {
     }
 }
 
+impl Serialize for CharType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// DateType for paimon.
 ///
 /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize)]
 pub struct DateType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -527,19 +568,27 @@ impl DateType {
     }
 }
 
+impl Serialize for DateType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// DecimalType for paimon.
 ///
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct DecimalType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     precision: u32,
-    #[serde_as(as = "DisplayFromStr")]
     scale: u32,
 }
 
@@ -617,15 +666,25 @@ impl DecimalType {
     }
 }
 
+impl Serialize for DecimalType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// DoubleType for paimon.
 ///
 /// Data type of an 8-byte double precision floating point number.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct DoubleType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -659,13 +718,23 @@ impl DoubleType {
     }
 }
 
+impl Serialize for DoubleType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// FloatType for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct FloatType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -699,15 +768,25 @@ impl FloatType {
     }
 }
 
+impl Serialize for FloatType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// IntType for paimon.
 ///
 /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct IntType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -744,17 +823,26 @@ impl IntType {
     }
 }
 
+impl Serialize for IntType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// LocalZonedTimestampType for paimon.
 ///
 /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct LocalZonedTimestampType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     precision: u32,
 }
 
@@ -815,15 +903,25 @@ impl LocalZonedTimestampType {
     }
 }
 
+impl Serialize for LocalZonedTimestampType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// SmallIntType for paimon.
 ///
 /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct SmallIntType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -860,18 +958,27 @@ impl SmallIntType {
     }
 }
 
+impl Serialize for SmallIntType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// TimeType for paimon.
 ///
 /// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
 /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct TimeType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     precision: u32,
 }
 
@@ -929,17 +1036,26 @@ impl TimeType {
     }
 }
 
+impl Serialize for TimeType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// TimestampType for paimon.
 ///
 /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct TimestampType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     precision: u32,
 }
 
@@ -997,15 +1113,25 @@ impl TimestampType {
     }
 }
 
+impl Serialize for TimestampType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// TinyIntType for paimon.
 ///
 /// Data type of a 1-byte signed integer with values from -128 to 127.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct TinyIntType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
 }
 
@@ -1042,17 +1168,26 @@ impl TinyIntType {
     }
 }
 
+impl Serialize for TinyIntType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// VarBinaryType for paimon.
 ///
 /// Data type of a variable-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct VarBinaryType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     length: u32,
 }
 
@@ -1103,17 +1238,26 @@ impl VarBinaryType {
     }
 }
 
+impl Serialize for VarBinaryType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// VarCharType for paimon.
 ///
 /// Data type of a variable-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct VarCharType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "DisplayFromStr")]
     length: u32,
 }
 
@@ -1168,19 +1312,27 @@ impl VarCharType {
     }
 }
 
+impl Serialize for VarCharType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// MapType for paimon.
 ///
 /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct MapType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "Box<DisplayFromStr>")]
     key_type: Box<DataType>,
-    #[serde_as(as = "Box<DisplayFromStr>")]
     value_type: Box<DataType>,
 }
 
@@ -1212,18 +1364,27 @@ impl MapType {
     }
 }
 
+impl Serialize for MapType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// MultisetType for paimon.
 ///
 /// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
 /// elements with a common subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct MultisetType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "Box<DisplayFromStr>")]
     element_type: Box<DataType>,
 }
 
@@ -1254,6 +1415,18 @@ impl MultisetType {
     }
 }
 
+impl Serialize for MultisetType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 /// RowType for paimon.
 ///
 /// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
@@ -1262,12 +1435,9 @@ impl MultisetType {
 /// column.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
-#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
 pub struct RowType {
-    #[serde_as(as = "DisplayFromStr")]
     nullable: bool,
-    #[serde_as(as = "Vec<DisplayFromStr>")]
     fields: Vec<DataField>,
 }
 
@@ -1301,10 +1471,22 @@ impl RowType {
     }
 }
 
+impl Serialize for RowType {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use super::*;
 
@@ -1468,212 +1650,202 @@ mod tests {
     }
 
     #[test]
-    fn test_datatype_serialization_deserialization() {
-        // boolean
-        let boolean_type: DataType = DataType::Boolean(BooleanType::with_nullable(true));
-        let boolean_serialized: Value = serde_json::to_value(&boolean_type).unwrap();
-        assert_eq!(boolean_serialized, json!({"Boolean": {"nullable": "true"}}));
+    fn test_datatype_serialize() {
+        // BooleanType
+        let bool_type: BooleanType = BooleanType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&bool_type).unwrap();
+        assert_eq!(serialized, json!("BOOLEAN").to_string());
+        let bool_type: BooleanType = BooleanType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&bool_type).unwrap();
+        assert_eq!(serialized, json!("BOOLEAN NOT NULL").to_string());
 
-        let boolean_deserialized: DataType = serde_json::from_value(boolean_serialized).unwrap();
-        assert_eq!(boolean_deserialized, boolean_type);
+        // TinyIntType
+        let tiny_type: TinyIntType = TinyIntType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&tiny_type).unwrap();
+        assert_eq!(serialized, json!("TINYINT").to_string());
+        let tiny_type: TinyIntType = TinyIntType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&tiny_type).unwrap();
+        assert_eq!(serialized, json!("TINYINT NOT NULL").to_string());
 
-        // tinyint
-        let tinyint_type: DataType = DataType::TinyInt(TinyIntType::with_nullable(true));
-        let tinyint_serialized: Value = serde_json::to_value(&tinyint_type).unwrap();
-        assert_eq!(tinyint_serialized, json!({"TinyInt": {"nullable": "true"}}));
-        let tinyint_deserialized: DataType = serde_json::from_value(tinyint_serialized).unwrap();
-        assert_eq!(tinyint_deserialized, tinyint_type);
+        // SmallIntType
+        let small_type: SmallIntType = SmallIntType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&small_type).unwrap();
+        assert_eq!(serialized, json!("SMALLINT").to_string());
+        let small_type: SmallIntType = SmallIntType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&small_type).unwrap();
+        assert_eq!(serialized, json!("SMALLINT NOT NULL").to_string());
 
-        // smallint
-        let smallint_type: DataType = DataType::SmallInt(SmallIntType::with_nullable(true));
-        let smallint_serialized: Value = serde_json::to_value(&smallint_type).unwrap();
+        // IntType
+        let int_type: IntType = IntType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&int_type).unwrap();
+        assert_eq!(serialized, json!("INTEGER").to_string());
+        let int_type: IntType = IntType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&int_type).unwrap();
+        assert_eq!(serialized, json!("INTEGER NOT NULL").to_string());
+
+        // BigIntType
+        let big_type: BigIntType = BigIntType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&big_type).unwrap();
+        assert_eq!(serialized, json!("BIGINT").to_string());
+        let big_type: BigIntType = BigIntType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&big_type).unwrap();
+        assert_eq!(serialized, json!("BIGINT NOT NULL").to_string());
+
+        // DecimalType
+        let decimal_type: DecimalType = DecimalType::with_nullable(true, 10, 2).unwrap();
+        let serialized: String = serde_json::to_string(&decimal_type).unwrap();
+        assert_eq!(serialized, json!("DECIMAL(10, 2)").to_string());
+        let decimal_type: DecimalType = DecimalType::with_nullable(false, 10, 2).unwrap();
+        let serialized: String = serde_json::to_string(&decimal_type).unwrap();
+        assert_eq!(serialized, json!("DECIMAL(10, 2) NOT NULL").to_string());
+
+        // DoubleType
+        let double_type: DoubleType = DoubleType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&double_type).unwrap();
+        assert_eq!(serialized, json!("DOUBLE").to_string());
+        let double_type: DoubleType = DoubleType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&double_type).unwrap();
+        assert_eq!(serialized, json!("DOUBLE NOT NULL").to_string());
+
+        // FloatType
+        let float_type: FloatType = FloatType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&float_type).unwrap();
+        assert_eq!(serialized, json!("FLOAT").to_string());
+        let float_type: FloatType = FloatType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&float_type).unwrap();
+        assert_eq!(serialized, json!("FLOAT NOT NULL").to_string());
+
+        // BinaryType
+        let binary_type: BinaryType = BinaryType::with_nullable(true, 10).unwrap();
+        let serialized: String = serde_json::to_string(&binary_type).unwrap();
+        assert_eq!(serialized, json!("BINARY(10)").to_string());
+        let binary_type: BinaryType = BinaryType::with_nullable(false, 10).unwrap();
+        let serialized: String = serde_json::to_string(&binary_type).unwrap();
+        assert_eq!(serialized, json!("BINARY(10) NOT NULL").to_string());
+
+        // VarBinaryType
+        let varbinary_type: VarBinaryType = VarBinaryType::try_new(true, 10).unwrap();
+        let serialized: String = serde_json::to_string(&varbinary_type).unwrap();
+        assert_eq!(serialized, json!("VARBINARY(10)").to_string());
+        let varbinary_type: VarBinaryType = VarBinaryType::try_new(false, 10).unwrap();
+        let serialized: String = serde_json::to_string(&varbinary_type).unwrap();
+        assert_eq!(serialized, json!("VARBINARY(10) NOT NULL").to_string());
+
+        // CharType
+        let char_type: CharType = CharType::with_nullable(true, 10).unwrap();
+        let serialized: String = serde_json::to_string(&char_type).unwrap();
+        assert_eq!(serialized, json!("CHAR(10)").to_string());
+        let char_type: CharType = CharType::with_nullable(false, 10).unwrap();
+        let serialized: String = serde_json::to_string(&char_type).unwrap();
+        assert_eq!(serialized, json!("CHAR(10) NOT NULL").to_string());
+
+        // VarCharType
+        let varchar_type: VarCharType = VarCharType::with_nullable(true, 10).unwrap();
+        let serialized: String = serde_json::to_string(&varchar_type).unwrap();
+        assert_eq!(serialized, json!("VARCHAR(10)").to_string());
+        let varchar_type: VarCharType = VarCharType::with_nullable(false, 10).unwrap();
+        let serialized: String = serde_json::to_string(&varchar_type).unwrap();
+        assert_eq!(serialized, json!("VARCHAR(10) NOT NULL").to_string());
+
+        // DateType
+        let date_type: DateType = DateType::with_nullable(true);
+        let serialized: String = serde_json::to_string(&date_type).unwrap();
+        assert_eq!(serialized, json!("DATE").to_string());
+        let date_type: DateType = DateType::with_nullable(false);
+        let serialized: String = serde_json::to_string(&date_type).unwrap();
+        assert_eq!(serialized, json!("DATE NOT NULL").to_string());
+
+        // LocalZonedTimestampType
+        let localzoned_type: LocalZonedTimestampType =
+            LocalZonedTimestampType::with_nullable(true, 6).unwrap();
+        let serialized: String = serde_json::to_string(&localzoned_type).unwrap();
         assert_eq!(
-            smallint_serialized,
-            json!({"SmallInt": {"nullable": "true"}})
+            serialized,
+            json!("TIMESTAMP WITH LOCAL TIME ZONE(6)").to_string()
         );
-        let smallint_deserialized: DataType = serde_json::from_value(smallint_serialized).unwrap();
-        assert_eq!(smallint_deserialized, smallint_type);
+        let localzoned_type: LocalZonedTimestampType =
+            LocalZonedTimestampType::with_nullable(false, 6).unwrap();
+        let serialized: String = serde_json::to_string(&localzoned_type).unwrap();
+        assert_eq!(
+            serialized,
+            json!("TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL").to_string()
+        );
 
-        // int
+        // TimeType
+        let time_type: TimeType = TimeType::with_nullable(true, 6).unwrap();
+        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        assert_eq!(serialized, json!("TIME(6)").to_string());
+        let time_type: TimeType = TimeType::with_nullable(false, 6).unwrap();
+        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        assert_eq!(serialized, json!("TIME(6) NOT NULL").to_string());
+        let time_type: TimeType = TimeType::with_nullable(false, 6).unwrap();
+        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        assert_eq!(serialized, json!("TIME(6) NOT NULL").to_string());
+
+        // TimestampType
+        let timestamp_type: TimestampType = TimestampType::with_nullable(true, 6).unwrap();
+        let serialized: String = serde_json::to_string(&timestamp_type).unwrap();
+        assert_eq!(serialized, json!("TIMESTAMP(6)").to_string());
+        let timestamp_type: TimestampType = TimestampType::with_nullable(false, 6).unwrap();
+        let serialized: String = serde_json::to_string(&timestamp_type).unwrap();
+        assert_eq!(serialized, json!("TIMESTAMP(6) NOT NULL").to_string());
+
+        // ArrayType
         let int_type: DataType = DataType::Int(IntType::with_nullable(true));
-        let int_serialized: Value = serde_json::to_value(&int_type).unwrap();
-        assert_eq!(int_serialized, json!({"Int": {"nullable": "true"}}));
-        let int_deserialized: DataType = serde_json::from_value(int_serialized).unwrap();
-        assert_eq!(int_deserialized, int_type);
+        let array_type: ArrayType = ArrayType::with_nullable(true, int_type.clone());
+        let serialized: String = serde_json::to_string(&array_type).unwrap();
+        assert_eq!(serialized, json!("ARRAY<INTEGER>").to_string());
+        let array_type: ArrayType = ArrayType::with_nullable(false, int_type.clone());
+        let serialized: String = serde_json::to_string(&array_type).unwrap();
+        assert_eq!(serialized, json!("ARRAY<INTEGER> NOT NULL").to_string());
 
-        // bigint
-        let bigint_type: DataType = DataType::BigInt(BigIntType::with_nullable(true));
-        let bigint_serialized: Value = serde_json::to_value(&bigint_type).unwrap();
-        assert_eq!(bigint_serialized, json!({"BigInt": {"nullable": "true"}}));
-        let bigint_deserialized: DataType = serde_json::from_value(bigint_serialized).unwrap();
-        assert_eq!(bigint_deserialized, bigint_type);
-
-        // decimal
-        let decimal_type: DataType =
-            DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap());
-        let decimal_serialized: Value = serde_json::to_value(&decimal_type).unwrap();
+        // MapType
+        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
+        let map_type: MapType = MapType::with_nullable(true, int_type.clone(), int_type.clone());
+        let serialized: String = serde_json::to_string(&map_type).unwrap();
+        assert_eq!(serialized, json!("MAP<INTEGER, INTEGER>").to_string());
+        let map_type: MapType = MapType::with_nullable(false, int_type.clone(), int_type.clone());
+        let serialized: String = serde_json::to_string(&map_type).unwrap();
         assert_eq!(
-            decimal_serialized,
-            json!({"Decimal": {"nullable": "true", "precision": "10", "scale": "2"}})
-        );
-        let decimal_deserialized: DataType = serde_json::from_value(decimal_serialized).unwrap();
-        assert_eq!(decimal_deserialized, decimal_type);
-
-        // double
-        let double_type: DataType = DataType::Double(DoubleType::with_nullable(true));
-        let double_serialized: Value = serde_json::to_value(&double_type).unwrap();
-        assert_eq!(double_serialized, json!({"Double": {"nullable": "true"}}));
-        let double_deserialized: DataType = serde_json::from_value(double_serialized).unwrap();
-        assert_eq!(double_deserialized, double_type);
-
-        // float
-        let float_type: DataType = DataType::Float(FloatType::with_nullable(true));
-        let float_serialized: Value = serde_json::to_value(&float_type).unwrap();
-        assert_eq!(float_serialized, json!({"Float": {"nullable": "true"}}));
-        let float_deserialized: DataType = serde_json::from_value(float_serialized).unwrap();
-        assert_eq!(float_deserialized, float_type);
-
-        // binary
-        let binary_type: DataType = DataType::Binary(BinaryType::with_nullable(true, 10).unwrap());
-        let binary_serialized: Value = serde_json::to_value(&binary_type).unwrap();
-        assert_eq!(
-            binary_serialized,
-            json!({"Binary": {"nullable": "true", "length": "10"}})
-        );
-        let binary_deserialized: DataType = serde_json::from_value(binary_serialized).unwrap();
-        assert_eq!(binary_deserialized, binary_type);
-
-        // varbinary
-        let varbinary_type: DataType =
-            DataType::VarBinary(VarBinaryType::try_new(true, 10).unwrap());
-        let varbinary_serialized: Value = serde_json::to_value(&varbinary_type).unwrap();
-        assert_eq!(
-            varbinary_serialized,
-            json!({"VarBinary": {"nullable": "true", "length": "10"}})
-        );
-        let varbinary_deserialized: DataType =
-            serde_json::from_value(varbinary_serialized).unwrap();
-        assert_eq!(varbinary_deserialized, varbinary_type);
-
-        // char
-        let char_type: DataType = DataType::Char(CharType::with_nullable(true, 10).unwrap());
-        let char_serialized: Value = serde_json::to_value(&char_type).unwrap();
-        assert_eq!(
-            char_serialized,
-            json!({"Char": {"nullable": "true", "length": "10"}})
-        );
-        let char_deserialized: DataType = serde_json::from_value(char_serialized).unwrap();
-        assert_eq!(char_deserialized, char_type);
-
-        // varchar
-        let varchar_type: DataType =
-            DataType::VarChar(VarCharType::with_nullable(true, 10).unwrap());
-        let varchar_serialized: Value = serde_json::to_value(&varchar_type).unwrap();
-        assert_eq!(
-            varchar_serialized,
-            json!({"VarChar": {"nullable": "true", "length": "10"}})
-        );
-        let varchar_deserialized: DataType = serde_json::from_value(varchar_serialized).unwrap();
-        assert_eq!(varchar_deserialized, varchar_type);
-
-        // date
-        let date_type: DataType = DataType::Date(DateType::with_nullable(true));
-        let date_serialized: Value = serde_json::to_value(&date_type).unwrap();
-        assert_eq!(date_serialized, json!({"Date": {"nullable": "true"}}));
-        let date_deserialized: DataType = serde_json::from_value(date_serialized).unwrap();
-        assert_eq!(date_deserialized, date_type);
-
-        // localzonedtimestamp
-        let localzonedtimestamp_type: DataType =
-            DataType::LocalZonedTimestamp(LocalZonedTimestampType::with_nullable(true, 6).unwrap());
-        let localzonedtimestamp_serialized: Value =
-            serde_json::to_value(&localzonedtimestamp_type).unwrap();
-        assert_eq!(
-            localzonedtimestamp_serialized,
-            json!({"LocalZonedTimestamp": {"nullable": "true", "precision": "6"}})
-        );
-        let localzonedtimestamp_deserialized: DataType =
-            serde_json::from_value(localzonedtimestamp_serialized).unwrap();
-        assert_eq!(localzonedtimestamp_deserialized, localzonedtimestamp_type);
-
-        // time
-        let time_type: DataType = DataType::Time(TimeType::with_nullable(true, 6).unwrap());
-        let time_serialized: Value = serde_json::to_value(&time_type).unwrap();
-        assert_eq!(
-            time_serialized,
-            json!({"Time": {"nullable": "true", "precision": "6"}})
-        );
-        let time_deserialized: DataType = serde_json::from_value(time_serialized).unwrap();
-        assert_eq!(time_deserialized, time_type);
-
-        // timestamp
-        let timestamp_type: DataType =
-            DataType::Timestamp(TimestampType::with_nullable(true, 6).unwrap());
-        let timestamp_serialized: Value = serde_json::to_value(&timestamp_type).unwrap();
-        assert_eq!(
-            timestamp_serialized,
-            json!({"Timestamp": {"nullable": "true", "precision": "6"}})
-        );
-        let timestamp_deserialized: DataType =
-            serde_json::from_value(timestamp_serialized).unwrap();
-        assert_eq!(timestamp_deserialized, timestamp_type);
-
-        // array
-        let arr_type: DataType = DataType::Array(ArrayType::with_nullable(
-            true,
-            DataType::Int(IntType::with_nullable(true)),
-        ));
-        let arr_serialized: Value = serde_json::to_value(&arr_type).unwrap();
-        assert_eq!(
-            arr_serialized,
-            json!({"Array": {"nullable": "true", "type": "INTEGER"}})
+            serialized,
+            json!("MAP<INTEGER, INTEGER> NOT NULL").to_string()
         );
 
-        let arr_deserialized: DataType = serde_json::from_value(arr_serialized).unwrap();
-        assert_eq!(arr_deserialized, arr_type);
+        // MultisetType
+        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
+        let multiset_type: MultisetType = MultisetType::with_nullable(true, int_type.clone());
+        let serialized: String = serde_json::to_string(&multiset_type).unwrap();
+        assert_eq!(serialized, json!("MULTISET<INTEGER>").to_string());
+        let multiset_type: MultisetType = MultisetType::with_nullable(false, int_type.clone());
+        let serialized: String = serde_json::to_string(&multiset_type).unwrap();
+        assert_eq!(serialized, json!("MULTISET<INTEGER> NOT NULL").to_string());
 
-        // map
-        let map_type: DataType = DataType::Map(MapType::with_nullable(
-            true,
-            int_type.clone(),
-            arr_type.clone(),
-        ));
-        let map_serialized: Value = serde_json::to_value(&map_type).unwrap();
-        assert_eq!(
-            map_serialized,
-            json!({"Map": {"nullable": "true", "key_type": "INTEGER", "value_type": "ARRAY<INTEGER>"}})
-        );
-        let map_deserialized: DataType = serde_json::from_value(map_serialized).unwrap();
-        assert_eq!(map_deserialized, map_type);
-
-        // multiset
-        let multiset_type: DataType = DataType::Multiset(MultisetType::with_nullable(
-            true,
-            DataType::Int(IntType::with_nullable(true)),
-        ));
-        let multiset_serialized: Value = serde_json::to_value(&multiset_type).unwrap();
-        assert_eq!(
-            multiset_serialized,
-            json!({"Multiset": {"nullable": "true", "element_type": "INTEGER"}})
-        );
-        let multiset_deserialized: DataType = serde_json::from_value(multiset_serialized).unwrap();
-        assert_eq!(multiset_deserialized, multiset_type);
-
-        // row
-        let row_type: DataType = DataType::Row(RowType::with_nullable(
+        // RowType
+        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
+        let arr_type: DataType = DataType::Array(ArrayType::with_nullable(true, int_type.clone()));
+        let row_type: RowType = RowType::with_nullable(
             true,
             vec![
                 DataField::new(1, "a".to_string(), int_type.clone()),
                 DataField::new(2, "b".to_string(), arr_type.clone()),
             ],
-        ));
-        let row_serialized: Value = serde_json::to_value(&row_type).unwrap();
-        assert_eq!(
-            row_serialized,
-            json!({"Row": {"nullable": true, "fields": [{"description": serde_json::Value::Null,"id": 1, "name": "a", "type": "INTEGER"}, 
-            {"description": serde_json::Value::Null,"id": 2, "name": "b", "type": "ARRAY<INTEGER>"}]}})
         );
-        let row_deserialized: DataType = serde_json::from_value(row_serialized).unwrap();
-        assert_eq!(row_deserialized, row_type);
+        let serialized: String = serde_json::to_string(&row_type).unwrap();
+        assert_eq!(
+            serialized,
+            json!("ROW<INTEGER, ARRAY<INTEGER>>").to_string()
+        );
+        let row_type: RowType = RowType::with_nullable(
+            false,
+            vec![
+                DataField::new(1, "a".to_string(), int_type.clone()),
+                DataField::new(2, "b".to_string(), arr_type.clone()),
+            ],
+        );
+        let serialized: String = serde_json::to_string(&row_type).unwrap();
+        assert_eq!(
+            serialized,
+            json!("ROW<INTEGER, ARRAY<INTEGER>> NOT NULL").to_string()
+        );
     }
 }
