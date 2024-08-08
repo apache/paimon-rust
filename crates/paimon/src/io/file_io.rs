@@ -19,7 +19,7 @@ use crate::error::*;
 use std::collections::HashMap;
 
 use opendal::services::Fs;
-use opendal::{Builder, Metakey, Operator};
+use opendal::{Metakey, Operator};
 use snafu::ResultExt;
 
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ impl FileIO {
     ///
     /// TODO: Support building Operator from HashMap via options.
     pub fn new(_: HashMap<String, String>) -> Result<Self> {
-        let op =  Operator::new(Fs::default().root("/"))
+        let op = Operator::new(Fs::default().root("/"))
             .context(IoUnexpectedSnafu {
                 message: "Failed to create operator".to_string(),
             })?
@@ -74,7 +74,7 @@ impl FileIO {
             size: meta.content_length(),
             is_dir: meta.is_dir(),
             last_modification_time: meta.last_modified().map(|t| t.timestamp()).unwrap_or(0),
-            path: path.to_string()
+            path: path.to_string(),
         })
     }
 
@@ -98,8 +98,12 @@ impl FileIO {
             .map(|meta| FileStatus {
                 size: meta.metadata().content_length(),
                 is_dir: meta.metadata().is_dir(),
-                last_modification_time: meta.metadata().last_modified().map(|t| t.timestamp()).unwrap_or(0),
-                path: format!("{}{}", path, meta.name())
+                last_modification_time: meta
+                    .metadata()
+                    .last_modified()
+                    .map(|t| t.timestamp())
+                    .unwrap_or(0),
+                path: format!("{}{}", path, meta.name()),
             })
             .collect())
     }
@@ -164,7 +168,6 @@ pub struct FileStatus {
     pub is_dir: bool,
     pub path: String,
     pub last_modification_time: i64,
-
 }
 
 /// Input file represents a file that can be read from.
