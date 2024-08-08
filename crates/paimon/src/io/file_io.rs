@@ -18,6 +18,8 @@
 use crate::error::*;
 use std::collections::HashMap;
 
+use chrono::offset::Utc;
+use chrono::DateTime;
 use opendal::services::Fs;
 use opendal::{Metakey, Operator};
 use snafu::ResultExt;
@@ -73,7 +75,7 @@ impl FileIO {
         Ok(FileStatus {
             size: meta.content_length(),
             is_dir: meta.is_dir(),
-            last_modification_time: meta.last_modified().map(|t| t.timestamp()).unwrap_or(0),
+            last_modification_time: meta.last_modified(),
             path: path.to_string(),
         })
     }
@@ -98,11 +100,7 @@ impl FileIO {
             .map(|meta| FileStatus {
                 size: meta.metadata().content_length(),
                 is_dir: meta.metadata().is_dir(),
-                last_modification_time: meta
-                    .metadata()
-                    .last_modified()
-                    .map(|t| t.timestamp())
-                    .unwrap_or(0),
+                last_modification_time: meta.metadata().last_modified(),
                 path: format!("{}{}", path, meta.name()),
             })
             .collect())
@@ -167,7 +165,7 @@ pub struct FileStatus {
     pub size: u64,
     pub is_dir: bool,
     pub path: String,
-    pub last_modification_time: i64,
+    pub last_modification_time: Option<DateTime<Utc>>,
 }
 
 /// Input file represents a file that can be read from.
@@ -195,5 +193,20 @@ impl OutputFile {
     /// Get the path of given output file.
     pub fn path(&self) -> &str {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::io::*;
+
+    #[tokio::test]
+    async fn test_list() {
+        let io = FileIO::new(Default::default()).unwrap();
+        let status = io.list_status("/Users/aitozi/output/").await.unwrap();
+        println!("{:?}", status);
+        let status = io.get_status("/Users/aitozi/output/").await.unwrap();
+        println!("{:?}", status);
     }
 }
