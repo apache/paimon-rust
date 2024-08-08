@@ -195,18 +195,3 @@ impl OutputFile {
         &self.path
     }
 }
-
-#[cfg(test)]
-mod tests {
-
-    use crate::io::*;
-
-    #[tokio::test]
-    async fn test_list() {
-        let io = FileIO::new(Default::default()).unwrap();
-        let status = io.list_status("/Users/aitozi/output/").await.unwrap();
-        println!("{:?}", status);
-        let status = io.get_status("/Users/aitozi/output/").await.unwrap();
-        println!("{:?}", status);
-    }
-}
