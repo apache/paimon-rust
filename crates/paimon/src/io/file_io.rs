@@ -18,7 +18,9 @@
 use crate::error::*;
 use std::collections::HashMap;
 
-use opendal::services::MemoryConfig;
+use chrono::offset::Utc;
+use chrono::DateTime;
+use opendal::services::Fs;
 use opendal::{Metakey, Operator};
 use snafu::ResultExt;
 
@@ -34,7 +36,7 @@ impl FileIO {
     ///
     /// TODO: Support building Operator from HashMap via options.
     pub fn new(_: HashMap<String, String>) -> Result<Self> {
-        let op = Operator::from_config(MemoryConfig::default())
+        let op = Operator::new(Fs::default().root("/"))
             .context(IoUnexpectedSnafu {
                 message: "Failed to create operator".to_string(),
             })?
@@ -72,6 +74,9 @@ impl FileIO {
 
         Ok(FileStatus {
             size: meta.content_length(),
+            is_dir: meta.is_dir(),
+            last_modification_time: meta.last_modified(),
+            path: path.to_string(),
         })
     }
 
@@ -84,7 +89,7 @@ impl FileIO {
         let entries = self
             .op
             .list_with(path)
-            .metakey(Metakey::ContentLength)
+            .metakey(Metakey::ContentLength | Metakey::LastModified)
             .await
             .context(IoUnexpectedSnafu {
                 message: "Failed to list file status".to_string(),
@@ -94,6 +99,9 @@ impl FileIO {
             .into_iter()
             .map(|meta| FileStatus {
                 size: meta.metadata().content_length(),
+                is_dir: meta.metadata().is_dir(),
+                last_modification_time: meta.metadata().last_modified(),
+                path: format!("{}{}", path, meta.name()),
             })
             .collect())
     }
@@ -155,6 +163,9 @@ impl FileIO {
 #[derive(Clone, Debug)]
 pub struct FileStatus {
     pub size: u64,
+    pub is_dir: bool,
+    pub path: String,
+    pub last_modification_time: Option<DateTime<Utc>>,
 }
 
 /// Input file represents a file that can be read from.
