@@ -18,10 +18,8 @@
 use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
-use serde::de::Visitor;
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::json;
-use std::fmt::{self, Debug, Display, Formatter};
+use serde_with::{DeserializeFromStr, SerializeDisplay};
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
 bitflags! {
@@ -49,7 +47,7 @@ bitflags! {
 /// Data type for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub enum DataType {
     /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
     Boolean(BooleanType),
@@ -126,10 +124,6 @@ impl DataType {
             DataType::Row(v) => v.nullable,
         }
     }
-
-    fn serde_json(&self) -> serde_json::Value {
-        json!(self.to_string())
-    }
 }
 
 impl Display for DataType {
@@ -167,46 +161,12 @@ impl FromStr for DataType {
     }
 }
 
-impl Serialize for DataType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            DataType::Boolean(v) => v.serialize(serializer),
-            DataType::TinyInt(v) => v.serialize(serializer),
-            DataType::SmallInt(v) => v.serialize(serializer),
-            DataType::Int(v) => v.serialize(serializer),
-            DataType::BigInt(v) => v.serialize(serializer),
-            DataType::Decimal(v) => v.serialize(serializer),
-            DataType::Double(v) => v.serialize(serializer),
-            DataType::Float(v) => v.serialize(serializer),
-            DataType::Binary(v) => v.serialize(serializer),
-            DataType::VarBinary(v) => v.serialize(serializer),
-            DataType::Char(v) => v.serialize(serializer),
-            DataType::VarChar(v) => v.serialize(serializer),
-            DataType::Date(v) => v.serialize(serializer),
-            DataType::LocalZonedTimestamp(v) => v.serialize(serializer),
-            DataType::Time(v) => v.serialize(serializer),
-            DataType::Timestamp(v) => v.serialize(serializer),
-            DataType::Array(v) => v.serialize(serializer),
-            DataType::Map(v) => v.serialize(serializer),
-            DataType::Multiset(v) => v.serialize(serializer),
-            DataType::Row(v) => v.serialize(serializer),
-        }
-    }
-}
-
 /// ArrayType for paimon.
 ///
 /// Data type of an array of elements with same subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct ArrayType {
     nullable: bool,
     element_type: Box<DataType>,
@@ -219,6 +179,14 @@ impl Display for ArrayType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for ArrayType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -239,24 +207,12 @@ impl ArrayType {
     }
 }
 
-impl Serialize for ArrayType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// BigIntType for paimon.
 ///
 /// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct BigIntType {
     nullable: bool,
 }
@@ -268,6 +224,14 @@ impl Display for BigIntType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for BigIntType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -294,55 +258,12 @@ impl BigIntType {
     }
 }
 
-impl Serialize for BigIntType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for BigIntType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(BigIntTypeVisitor)
-    }
-}
-
-struct BigIntTypeVisitor;
-
-impl<'de> Visitor<'de> for BigIntTypeVisitor {
-    type Value = BigIntType;
-
-    fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
-        formatter.write_str("a string representing a BigIntType")
-    }
-
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        match v.trim().to_uppercase().as_str() {
-            "BIGINT" => Ok(BigIntType::with_nullable(true)),
-            "BIGINT NOT NULL" => Ok(BigIntType::with_nullable(false)),
-            _ => Err(E::custom(format!("Invalid BigIntType string: {}", v))),
-        }
-    }
-}
-
 /// BinaryType for paimon.
 ///
 /// Data type of a fixed-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct BinaryType {
     nullable: bool,
     length: usize,
@@ -355,6 +276,14 @@ impl Display for BinaryType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for BinaryType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -394,24 +323,12 @@ impl BinaryType {
     }
 }
 
-impl Serialize for BinaryType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// BooleanType for paimon.
 ///
 /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct BooleanType {
     nullable: bool,
 }
@@ -423,6 +340,14 @@ impl Display for BooleanType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for BooleanType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -446,25 +371,12 @@ impl BooleanType {
     }
 }
 
-impl Serialize for BooleanType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// CharType for paimon.
 ///
 /// Data type of a fixed-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, DeserializeFromStr, SerializeDisplay)]
 pub struct CharType {
     nullable: bool,
     length: usize,
@@ -477,6 +389,14 @@ impl Display for CharType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for CharType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -516,24 +436,12 @@ impl CharType {
     }
 }
 
-impl Serialize for CharType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// DateType for paimon.
 ///
 /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, DeserializeFromStr, SerializeDisplay)]
 pub struct DateType {
     nullable: bool,
 }
@@ -545,6 +453,14 @@ impl Display for DateType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for DateType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -568,24 +484,12 @@ impl DateType {
     }
 }
 
-impl Serialize for DateType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// DecimalType for paimon.
 ///
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct DecimalType {
     nullable: bool,
     precision: u32,
@@ -599,6 +503,14 @@ impl Display for DecimalType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for DecimalType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -666,24 +578,12 @@ impl DecimalType {
     }
 }
 
-impl Serialize for DecimalType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// DoubleType for paimon.
 ///
 /// Data type of an 8-byte double precision floating point number.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct DoubleType {
     nullable: bool,
 }
@@ -695,6 +595,14 @@ impl Display for DoubleType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for DoubleType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -718,22 +626,10 @@ impl DoubleType {
     }
 }
 
-impl Serialize for DoubleType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// FloatType for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct FloatType {
     nullable: bool,
 }
@@ -745,6 +641,14 @@ impl Display for FloatType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for FloatType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -768,24 +672,12 @@ impl FloatType {
     }
 }
 
-impl Serialize for FloatType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// IntType for paimon.
 ///
 /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct IntType {
     nullable: bool,
 }
@@ -797,6 +689,14 @@ impl Display for IntType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for IntType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -823,24 +723,12 @@ impl IntType {
     }
 }
 
-impl Serialize for IntType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// LocalZonedTimestampType for paimon.
 ///
 /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct LocalZonedTimestampType {
     nullable: bool,
     precision: u32,
@@ -853,6 +741,14 @@ impl Display for LocalZonedTimestampType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for LocalZonedTimestampType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -903,24 +799,12 @@ impl LocalZonedTimestampType {
     }
 }
 
-impl Serialize for LocalZonedTimestampType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// SmallIntType for paimon.
 ///
 /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct SmallIntType {
     nullable: bool,
 }
@@ -932,6 +816,14 @@ impl Display for SmallIntType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for SmallIntType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -958,25 +850,13 @@ impl SmallIntType {
     }
 }
 
-impl Serialize for SmallIntType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// TimeType for paimon.
 ///
 /// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
 /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct TimeType {
     nullable: bool,
     precision: u32,
@@ -989,6 +869,14 @@ impl Display for TimeType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for TimeType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1036,24 +924,12 @@ impl TimeType {
     }
 }
 
-impl Serialize for TimeType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// TimestampType for paimon.
 ///
 /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct TimestampType {
     nullable: bool,
     precision: u32,
@@ -1066,6 +942,14 @@ impl Display for TimestampType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for TimestampType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1113,24 +997,12 @@ impl TimestampType {
     }
 }
 
-impl Serialize for TimestampType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// TinyIntType for paimon.
 ///
 /// Data type of a 1-byte signed integer with values from -128 to 127.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct TinyIntType {
     nullable: bool,
 }
@@ -1142,6 +1014,14 @@ impl Display for TinyIntType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for TinyIntType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1168,24 +1048,12 @@ impl TinyIntType {
     }
 }
 
-impl Serialize for TinyIntType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// VarBinaryType for paimon.
 ///
 /// Data type of a variable-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct VarBinaryType {
     nullable: bool,
     length: u32,
@@ -1198,6 +1066,14 @@ impl Display for VarBinaryType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for VarBinaryType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1238,24 +1114,12 @@ impl VarBinaryType {
     }
 }
 
-impl Serialize for VarBinaryType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// VarCharType for paimon.
 ///
 /// Data type of a variable-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct VarCharType {
     nullable: bool,
     length: u32,
@@ -1268,6 +1132,14 @@ impl Display for VarCharType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for VarCharType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1312,24 +1184,12 @@ impl VarCharType {
     }
 }
 
-impl Serialize for VarCharType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// MapType for paimon.
 ///
 /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct MapType {
     nullable: bool,
     key_type: Box<DataType>,
@@ -1343,6 +1203,14 @@ impl Display for MapType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for MapType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1364,25 +1232,13 @@ impl MapType {
     }
 }
 
-impl Serialize for MapType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// MultisetType for paimon.
 ///
 /// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
 /// elements with a common subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct MultisetType {
     nullable: bool,
     element_type: Box<DataType>,
@@ -1395,6 +1251,14 @@ impl Display for MultisetType {
             write!(f, " NOT NULL")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for MultisetType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
     }
 }
 
@@ -1415,18 +1279,6 @@ impl MultisetType {
     }
 }
 
-impl Serialize for MultisetType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
 /// RowType for paimon.
 ///
 /// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
@@ -1435,7 +1287,7 @@ impl Serialize for MultisetType {
 /// column.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, Hash, SerializeDisplay)]
 pub struct RowType {
     nullable: bool,
     fields: Vec<DataField>,
@@ -1457,6 +1309,14 @@ impl Display for RowType {
     }
 }
 
+impl FromStr for RowType {
+    type Err = Error;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        todo!();
+    }
+}
+
 impl RowType {
     pub const fn new(fields: Vec<DataField>) -> Self {
         Self::with_nullable(true, fields)
@@ -1468,18 +1328,6 @@ impl RowType {
 
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED
-    }
-}
-
-impl Serialize for RowType {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -1650,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn test_datatype_serialize() {
+    fn test_datatype_serialize_deserialize() {
         // BooleanType
         let bool_type: BooleanType = BooleanType::with_nullable(true);
         let serialized: String = serde_json::to_string(&bool_type).unwrap();
