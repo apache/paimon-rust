@@ -1,0 +1,1 @@
+{"type":"ROW NOT NULL","fields":[{"id":0,"name":"a","type":"INT NOT NULL"},{"id":1,"name":"b","type":"VARCHAR(20) NOT NULL"}]}
