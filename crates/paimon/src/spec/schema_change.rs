@@ -39,6 +39,7 @@ pub enum SchemaChange {
     /// A SchemaChange to add a new field.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L201>
+    #[serde(rename_all = "camelCase")]
     AddColumn {
         field_name: String,
         data_type: DataType,
@@ -49,6 +50,7 @@ pub enum SchemaChange {
     /// A SchemaChange to rename a field.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L260>
+    #[serde(rename_all = "camelCase")]
     RenameColumn {
         field_name: String,
         new_name: String,
@@ -56,10 +58,12 @@ pub enum SchemaChange {
     /// A SchemaChange to drop a field.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L302>
+    #[serde(rename_all = "camelCase")]
     DropColumn { field_name: String },
     /// A SchemaChange to update the field's type.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L335>
+    #[serde(rename_all = "camelCase")]
     UpdateColumnType {
         field_name: String,
         data_type: DataType,
@@ -67,6 +71,7 @@ pub enum SchemaChange {
     /// A SchemaChange to update the field's position.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L377>
+    #[serde(rename_all = "camelCase")]
     UpdateColumnPosition {
         #[serde(rename = "move")]
         column_move: ColumnMove,
@@ -74,6 +79,7 @@ pub enum SchemaChange {
     /// A SchemaChange to update the field's nullability.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L470>
+    #[serde(rename_all = "camelCase")]
     UpdateColumnNullability {
         field_name: Vec<String>,
         nullable: bool,
@@ -81,6 +87,7 @@ pub enum SchemaChange {
     /// A SchemaChange to update the (nested) field's comment.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L512>
+    #[serde(rename_all = "camelCase")]
     UpdateColumnComment {
         field_names: Vec<String>,
         new_description: String,
@@ -264,185 +271,181 @@ mod tests {
 
     #[test]
     fn test_schema_change_serialize_deserialize() {
-        // SchemaChange: SetOption
-        let schema_change =
-            SchemaChange::set_option("snapshot.time-retained".to_string(), "2h".to_string());
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::set_option("snapshot.time-retained".to_string(), "2h".to_string())
-        );
+        let json_data = r#"
+        [
+          {
+            "setOption": {
+              "key": "snapshot.time-retained",
+              "value": "2h"
+            }
+          },
+          {
+            "removeOption": {
+              "key": "compaction.max.file-num"
+            }
+          },
+          {
+            "updateComment": {
+              "comment": "table.comment"
+            }
+          },
+          {
+            "addColumn": {
+              "fieldName": "col1",
+              "dataType": {
+                "Int": {
+                  "nullable": true
+                }
+              },
+              "description": "col1_description",
+              "move": {
+                "fieldName": "col1_first",
+                "referencedFieldName": null,
+                "type": "FIRST"
+              }
+            }
+          },
+          {
+            "renameColumn": {
+              "fieldName": "col3",
+              "newName": "col3_new_name"
+            }
+          },
+          {
+            "dropColumn": {
+              "fieldName": "col1"
+            }
+          },
+          {
+            "updateColumnType": {
+              "fieldName": "col14",
+              "dataType": {
+                "Double": {
+                  "nullable": true
+                }
+              }
+            }
+          },
+          {
+            "updateColumnPosition": {
+              "move": {
+                "fieldName": "col4_first",
+                "referencedFieldName": null,
+                "type": "FIRST"
+              }
+            }
+          },
+          {
+            "updateColumnNullability": {
+              "fieldName": [
+                "col5",
+                "f2"
+              ],
+              "nullable": false
+            }
+          },
+          {
+            "updateColumnComment": {
+              "fieldNames": [
+                "col5",
+                "f1"
+              ],
+              "newDescription": "col5 f1 field"
+            }
+          }
+        ]"#;
 
-        // SchemaChange: RemoveOption
-        let schema_change = SchemaChange::remove_option("compaction.max.file-num".to_string());
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::remove_option("compaction.max.file-num".to_string())
-        );
+        let schema_changes: Vec<SchemaChange> = serde_json::from_str(json_data).unwrap();
 
-        // SchemaChange: UpdateComment
-        let schema_change = SchemaChange::update_comment(Some("table.comment".to_string()));
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_comment(Some("table.comment".to_string()))
-        );
-
-        // SchemaChange: AddColumn
-        let schema_change =
-            SchemaChange::add_column("col1".to_string(), DataType::Int(IntType::new()));
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::add_column("col1".to_string(), DataType::Int(IntType::new()))
-        );
-
-        // SchemaChange: AddColumn with description
-        let schema_change = SchemaChange::add_column_with_description(
-            "col1".to_string(),
-            DataType::Int(IntType::new()),
-            "col1_description".to_string(),
-        );
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::add_column_with_description(
-                "col1".to_string(),
-                DataType::Int(IntType::new()),
-                "col1_description".to_string(),
-            )
-        );
-
-        // SchemaChange: AddColumn with description and column_move
-        let schema_change = SchemaChange::add_column_with_description_and_column_move(
-            "col1".to_string(),
-            DataType::Int(IntType::new()),
-            "col1_description".to_string(),
-            ColumnMove::move_first("col1_first".to_string()),
-        );
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::add_column_with_description_and_column_move(
-                "col1".to_string(),
-                DataType::Int(IntType::new()),
-                "col1_description".to_string(),
-                ColumnMove::move_first("col1_first".to_string()),
-            )
-        );
-
-        // SchemaChange: RenameColumn
-        let schema_change =
-            SchemaChange::rename_column("col3".to_string(), "col3_new_name".to_string());
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::rename_column("col3".to_string(), "col3_new_name".to_string())
-        );
-
-        // SchemaChange: DropColumn
-        let schema_change = SchemaChange::drop_column("col1".to_string());
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(schema_change, SchemaChange::drop_column("col1".to_string()));
-
-        // SchemaChange: UpdateColumnType
-        let schema_change = SchemaChange::update_column_type(
-            "col14".to_string(),
-            DataType::Double(DoubleType::new()),
-        );
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_column_type(
-                "col14".to_string(),
-                DataType::Double(DoubleType::new()),
-            )
-        );
-
-        // SchemaChange: UpdateColumnPosition
-        let schema_change =
-            SchemaChange::update_column_position(ColumnMove::move_first("col4_first".to_string()));
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_column_position(ColumnMove::move_first("col4_first".to_string()))
-        );
-
-        // SchemaChange: UpdateColumnNullability
-        let schema_change = SchemaChange::update_column_nullability("col4".to_string(), false);
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_column_nullability("col4".to_string(), false)
-        );
-
-        // SchemaChange: UpdateColumnsNullability
-        let schema_change = SchemaChange::update_columns_nullability(
-            vec!["col5".to_string(), "f2".to_string()],
-            false,
-        );
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_columns_nullability(
-                vec!["col5".to_string(), "f2".to_string()],
-                false
-            )
-        );
-
-        // SchemaChange: UpdateColumnComment
-        let schema_change =
-            SchemaChange::update_column_comment("col4".to_string(), "col4 field".to_string());
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_column_comment("col4".to_string(), "col4 field".to_string())
-        );
-        // SchemaChange: UpdateColumnsComment
-        let schema_change = SchemaChange::update_columns_comment(
-            vec!["col5".to_string(), "f1".to_string()],
-            "col5 f1 field".to_string(),
-        );
-        let json = serde_json::to_string(&schema_change).unwrap();
-        let schema_change = serde_json::from_str::<SchemaChange>(&json).unwrap();
-        assert_eq!(
-            schema_change,
-            SchemaChange::update_columns_comment(
-                vec!["col5".to_string(), "f1".to_string()],
-                "col5 f1 field".to_string()
-            )
-        );
+        for change in schema_changes {
+            match change {
+                SchemaChange::SetOption { key, value } => {
+                    assert_eq!(key, "snapshot.time-retained");
+                    assert_eq!(value, "2h");
+                }
+                SchemaChange::RemoveOption { key } => {
+                    assert_eq!(key, "compaction.max.file-num");
+                }
+                SchemaChange::UpdateComment { comment } => {
+                    assert_eq!(comment, Some("table.comment".to_string()));
+                }
+                SchemaChange::AddColumn {
+                    field_name,
+                    data_type,
+                    description,
+                    column_move,
+                } => {
+                    assert_eq!(field_name, "col1");
+                    assert_eq!(data_type, DataType::Int(IntType::new()));
+                    assert_eq!(description, Some("col1_description".to_string()));
+                    assert_eq!(
+                        column_move,
+                        Some(ColumnMove::move_first("col1_first".to_string()))
+                    );
+                }
+                SchemaChange::RenameColumn {
+                    field_name,
+                    new_name,
+                } => {
+                    assert_eq!(field_name, "col3");
+                    assert_eq!(new_name, "col3_new_name");
+                }
+                SchemaChange::DropColumn { field_name } => {
+                    assert_eq!(field_name, "col1");
+                }
+                SchemaChange::UpdateColumnType {
+                    field_name,
+                    data_type,
+                } => {
+                    assert_eq!(field_name, "col14");
+                    assert_eq!(data_type, DataType::Double(DoubleType::new()));
+                }
+                SchemaChange::UpdateColumnPosition { column_move } => {
+                    assert_eq!(column_move.field_name, "col4_first");
+                    assert_eq!(column_move.referenced_field_name, None);
+                    assert_eq!(column_move.move_type, ColumnMoveType::FIRST);
+                }
+                SchemaChange::UpdateColumnNullability {
+                    field_name,
+                    nullable,
+                } => {
+                    assert_eq!(field_name, vec!["col5", "f2"]);
+                    assert!(!nullable);
+                }
+                SchemaChange::UpdateColumnComment {
+                    field_names,
+                    new_description,
+                } => {
+                    assert_eq!(field_names, vec!["col5", "f1"]);
+                    assert_eq!(new_description, "col5 f1 field");
+                }
+            }
+        }
     }
 
     #[test]
     fn test_column_move_serialize_deserialize() {
-        // ColumnMoveType: FIRST
-        let column_move = ColumnMove::move_first("col1".to_string());
-        let json = serde_json::to_string(&column_move).unwrap();
-        let column_move = serde_json::from_str::<ColumnMove>(&json).unwrap();
-        assert_eq!(column_move.field_name(), "col1");
-        assert_eq!(column_move.referenced_field_name(), None);
-        assert_eq!(column_move.move_type(), &ColumnMoveType::FIRST);
-        // ColumnMoveType: AFTER
-        let column_move = ColumnMove::move_after("col2_after".to_string(), "col2".to_string());
-        let json = serde_json::to_string(&column_move).unwrap();
-        let column_move = serde_json::from_str::<ColumnMove>(&json).unwrap();
-        assert_eq!(column_move.field_name(), "col2_after");
-        assert_eq!(column_move.referenced_field_name(), Some("col2"));
-        assert_eq!(column_move.move_type(), &ColumnMoveType::AFTER);
+        let json_data = r#"
+        [
+          {
+            "fieldName": "col1",
+            "referencedFieldName": null,
+            "type": "FIRST"
+          },
+          {
+            "fieldName": "col2_after",
+            "referencedFieldName": "col2",
+            "type": "AFTER"
+          }
+        ]"#;
+
+        let column_moves: Vec<ColumnMove> = serde_json::from_str(json_data).unwrap();
+        assert_eq!(
+            column_moves,
+            vec![
+                ColumnMove::move_first("col1".to_string()),
+                ColumnMove::move_after("col2_after".to_string(), "col2".to_string())
+            ]
+        );
     }
 }
