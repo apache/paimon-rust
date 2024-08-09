@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod file_io;
-pub use file_io::*;
-
-mod storage;
-pub use storage::*;
+/// The storage carries all supported storage services in paimon
+#[derive(Debug)]
+pub(crate) enum Storage {
+    #[cfg(feature = "storage-memory")]
+    Memory,
+    #[cfg(feature = "storage-fs")]
+    LocalFs,
+}

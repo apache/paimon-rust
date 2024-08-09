@@ -17,29 +17,42 @@
 
 use crate::error::*;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use opendal::services::MemoryConfig;
 use opendal::{Metakey, Operator};
 use snafu::ResultExt;
+use url::Url;
+
+use super::Storage;
 
 #[derive(Clone, Debug)]
 pub struct FileIO {
-    op: Operator,
+    // op: Operator,
+    inner_stroage: Arc<Storage>,
 }
 
 impl FileIO {
-    /// Create a new FileIO.
+    /// Try to infer file io scheme from path.
     ///
     /// The input HashMap is paimon-java's [`Options`](https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/options/Options.java#L60)
-    ///
-    /// TODO: Support building Operator from HashMap via options.
-    pub fn new(_: HashMap<String, String>) -> Result<Self> {
-        let op = Operator::from_config(MemoryConfig::default())
-            .context(IoUnexpectedSnafu {
-                message: "Failed to create operator".to_string(),
-            })?
-            .finish();
-        Ok(Self { op })
+    pub fn from_path(path: impl AsRef<str>) -> Result<FileIOBuilder> {
+        let url = Url::parse(path.as_ref())
+            .map_err(Error::from)
+            .or_else(|e| {
+                Url::from_file_path(path.as_ref()).map_err(|_| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Input is neither a valid url nor path",
+                    )
+                    .with_context("input", path.as_ref().to_string())
+                    .with_source(e)
+                })
+            })?;
+
+        Ok(FileIOBuilder::new(url.scheme()))
     }
 
     /// Create a new input file to read data.
@@ -148,6 +161,82 @@ impl FileIO {
             message: "Failed to rename file".to_string(),
         })?;
         Ok(())
+    }
+}
+
+/// Builder for [`FileIO`].
+#[derive(Debug)]
+pub struct FileIOBuilder {
+    /// This is used to infer scheme of operator.
+    ///
+    /// If this is `None`, then [`FileIOBuilder::build`](FileIOBuilder::build) will build a local file io.
+    scheme_str: Option<String>,
+    /// Arguments for operator.
+    props: HashMap<String, String>,
+}
+
+impl FileIOBuilder {
+    /// Creates a new builder with scheme.
+    pub fn new(scheme_str: impl ToString) -> Self {
+        Self {
+            scheme_str: Some(scheme_str.to_string()),
+            props: HashMap::default(),
+        }
+    }
+
+    /// Creates a new builder for local file io.
+    pub fn new_fs_io() -> Self {
+        Self {
+            scheme_str: None,
+            props: HashMap::default(),
+        }
+    }
+
+    /// Fetch the scheme string.
+    ///
+    /// The scheme_str will be empty if it's None.
+    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
+        (self.scheme_str.unwrap_or_default(), self.props)
+    }
+
+    /// Add argument for operator.
+    pub fn with_prop(mut self, key: impl ToString, value: impl ToString) -> Self {
+        self.props.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Add argument for operator.
+    pub fn with_props(
+        mut self,
+        args: impl IntoIterator<Item = (impl ToString, impl ToString)>,
+    ) -> Self {
+        self.props
+            .extend(args.into_iter().map(|e| (e.0.to_string(), e.1.to_string())));
+        self
+    }
+
+    /// Builds [`FileIO`].
+    pub fn build(self) -> crate::Result<FileIO> {
+        let storage = Storage::build(self)?;
+        Ok(FileIO {
+            inner: Arc::new(storage),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+pub trait FileRead: Send + Unpin + 'static {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
+}
+
+#[async_trait::async_trait]
+impl FileRead for opendal::Reader {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        // TODO: build a error type
+        Ok(opendal::Reader::read(self, range)
+            .await
+            .expect("read error")
+            .to_bytes())
     }
 }
 

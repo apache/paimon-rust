@@ -43,3 +43,9 @@ pub enum Error {
         source: opendal::Error,
     },
 }
+
+impl From<Error> for &'static str {
+    fn from(_value: Error) -> Self {
+        todo!()
+    }
+}
