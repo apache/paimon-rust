@@ -25,6 +25,9 @@ pub use data_file::*;
 mod schema;
 pub use schema::*;
 
+mod schema_change;
+pub use schema_change::*;
+
 mod snapshot;
 pub use snapshot::*;
 
