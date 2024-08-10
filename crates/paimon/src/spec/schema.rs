@@ -17,9 +17,8 @@
 
 use crate::spec::types::DataType;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::serde_as;
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
 
 /// The table schema for paimon table.
 ///
@@ -48,7 +47,6 @@ pub struct DataField {
     id: i32,
     name: String,
     #[serde(rename = "type")]
-    #[serde_as(as = "DisplayFromStr")]
     typ: DataType,
     description: Option<String>,
 }
@@ -92,12 +90,6 @@ impl DataField {
     pub fn with_description(mut self, new_description: Option<String>) -> Self {
         self.description = new_description;
         self
-    }
-}
-
-impl Display for DataField {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.typ)
     }
 }
 
