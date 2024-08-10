@@ -868,14 +868,12 @@ impl DataTypeJsonParser {
                     fields,
                 )));
             } else {
-                // panic!("Can not parse: {:?}", json)
                 return DataTypeParsingSnafu {
                     message: format!("Can not parse: {:?}", json),
                 }
                 .fail();
             }
         } else {
-            // panic!("Can not parse: {:?}", json)
             return DataTypeParsingSnafu {
                 message: format!("Can not parse: {:?}", json),
             }
