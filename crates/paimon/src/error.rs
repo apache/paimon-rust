@@ -36,6 +36,11 @@ pub enum Error {
     DataTypeInvalid { message: String },
     #[snafu(
         visibility(pub(crate)),
+        display("Paimon data type parsing for {}", message)
+    )]
+    DataTypeParsingError { message: String },
+    #[snafu(
+        visibility(pub(crate)),
         display("Paimon hitting unexpected error {}: {:?}", message, source)
     )]
     IoUnexpected {

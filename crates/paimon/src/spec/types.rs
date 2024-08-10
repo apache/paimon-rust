@@ -124,6 +124,31 @@ impl DataType {
             DataType::Row(v) => v.nullable,
         }
     }
+
+    pub fn copy(&self, nullable: bool) -> Self {
+        match self {
+            DataType::Boolean(v) => DataType::Boolean(v.copy(nullable)),
+            DataType::TinyInt(v) => DataType::TinyInt(v.copy(nullable)),
+            DataType::SmallInt(v) => DataType::SmallInt(v.copy(nullable)),
+            DataType::Int(v) => DataType::Int(v.copy(nullable)),
+            DataType::BigInt(v) => DataType::BigInt(v.copy(nullable)),
+            DataType::Decimal(v) => DataType::Decimal(v.copy(nullable)),
+            DataType::Double(v) => DataType::Double(v.copy(nullable)),
+            DataType::Float(v) => DataType::Float(v.copy(nullable)),
+            DataType::Binary(v) => DataType::Binary(v.copy(nullable)),
+            DataType::VarBinary(v) => DataType::VarBinary(v.copy(nullable)),
+            DataType::Char(v) => DataType::Char(v.copy(nullable)),
+            DataType::VarChar(v) => DataType::VarChar(v.copy(nullable)),
+            DataType::Date(v) => DataType::Date(v.copy(nullable)),
+            DataType::LocalZonedTimestamp(v) => DataType::LocalZonedTimestamp(v.copy(nullable)),
+            DataType::Time(v) => DataType::Time(v.copy(nullable)),
+            DataType::Timestamp(v) => DataType::Timestamp(v.copy(nullable)),
+            DataType::Array(v) => DataType::Array(v.copy(nullable)),
+            DataType::Map(v) => DataType::Map(v.copy(nullable)),
+            DataType::Multiset(v) => DataType::Multiset(v.copy(nullable)),
+            DataType::Row(v) => DataType::Row(v.copy(nullable)),
+        }
+    }
 }
 
 impl Display for DataType {
@@ -202,6 +227,13 @@ impl ArrayType {
         }
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            element_type: self.element_type.clone(),
+        }
+    }
+
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
     }
@@ -247,6 +279,10 @@ impl BigIntType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -314,6 +350,13 @@ impl BinaryType {
         Ok(Self { nullable, length })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            length: self.length,
+        }
+    }
+
     pub fn length(&self) -> usize {
         self.length
     }
@@ -363,6 +406,10 @@ impl BooleanType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -427,6 +474,13 @@ impl CharType {
         Ok(CharType { nullable, length })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            length: self.length,
+        }
+    }
+
     pub fn length(&self) -> usize {
         self.length
     }
@@ -476,6 +530,10 @@ impl DateType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -565,6 +623,14 @@ impl DecimalType {
         })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            precision: self.precision,
+            scale: self.scale,
+        }
+    }
+
     pub fn precision(&self) -> u32 {
         self.precision
     }
@@ -621,6 +687,10 @@ impl DoubleType {
         Self { nullable }
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self { nullable }
+    }
+
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::APPROXIMATE_NUMERIC
     }
@@ -664,6 +734,10 @@ impl FloatType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -712,6 +786,10 @@ impl IntType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -787,6 +865,13 @@ impl LocalZonedTimestampType {
         })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            precision: self.precision,
+        }
+    }
+
     pub fn precision(&self) -> u32 {
         self.precision
     }
@@ -839,6 +924,10 @@ impl SmallIntType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -915,6 +1004,13 @@ impl TimeType {
         })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            precision: self.precision,
+        }
+    }
+
     pub fn precision(&self) -> u32 {
         self.precision
     }
@@ -988,6 +1084,13 @@ impl TimestampType {
         })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            precision: self.precision,
+        }
+    }
+
     pub fn precision(&self) -> u32 {
         self.precision
     }
@@ -1037,6 +1140,10 @@ impl TinyIntType {
     }
 
     pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -1091,10 +1198,10 @@ impl VarBinaryType {
     pub const DEFAULT_LENGTH: u32 = 1;
 
     pub fn new(length: u32) -> Result<Self, Error> {
-        Self::try_new(true, length)
+        Self::with_nullable(true, length)
     }
 
-    pub fn try_new(nullable: bool, length: u32) -> Result<Self, Error> {
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, Error> {
         if length < Self::MIN_LENGTH {
             return DataTypeInvalidSnafu {
                 message: "VarBinary string length must be at least 1.".to_string(),
@@ -1103,6 +1210,13 @@ impl VarBinaryType {
         }
 
         Ok(VarBinaryType { nullable, length })
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            length: self.length,
+        }
     }
 
     pub fn length(&self) -> u32 {
@@ -1175,6 +1289,13 @@ impl VarCharType {
         Ok(VarCharType { nullable, length })
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            length: self.length,
+        }
+    }
+
     pub fn length(&self) -> u32 {
         self.length
     }
@@ -1227,6 +1348,14 @@ impl MapType {
         }
     }
 
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            key_type: self.key_type.clone(),
+            value_type: self.value_type.clone(),
+        }
+    }
+
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
     }
@@ -1271,6 +1400,13 @@ impl MultisetType {
         Self {
             nullable,
             element_type: Box::new(element_type),
+        }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            element_type: self.element_type.clone(),
         }
     }
 
@@ -1324,6 +1460,13 @@ impl RowType {
 
     pub const fn with_nullable(nullable: bool, fields: Vec<DataField>) -> Self {
         Self { nullable, fields }
+    }
+
+    pub fn copy(&self, nullable: bool) -> Self {
+        Self {
+            nullable,
+            fields: self.fields.clone(),
+        }
     }
 
     pub fn family(&self) -> DataTypeFamily {
@@ -1413,11 +1556,11 @@ mod tests {
             "BINARY(10) NOT NULL"
         );
         assert_eq!(
-            DataType::VarBinary(VarBinaryType::try_new(true, 10).unwrap()).to_string(),
+            DataType::VarBinary(VarBinaryType::with_nullable(true, 10).unwrap()).to_string(),
             "VARBINARY(10)"
         );
         assert_eq!(
-            DataType::VarBinary(VarBinaryType::try_new(false, 10).unwrap()).to_string(),
+            DataType::VarBinary(VarBinaryType::with_nullable(false, 10).unwrap()).to_string(),
             "VARBINARY(10) NOT NULL"
         );
         assert_eq!(
@@ -1500,197 +1643,195 @@ mod tests {
     #[test]
     fn test_datatype_serialize_deserialize() {
         // BooleanType
-        let bool_type: BooleanType = BooleanType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&bool_type).unwrap();
+        let bool_type = BooleanType::with_nullable(true);
+        let serialized = serde_json::to_string(&bool_type).unwrap();
         assert_eq!(serialized, json!("BOOLEAN").to_string());
-        let bool_type: BooleanType = BooleanType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&bool_type).unwrap();
+        let bool_type = BooleanType::with_nullable(false);
+        let serialized = serde_json::to_string(&bool_type).unwrap();
         assert_eq!(serialized, json!("BOOLEAN NOT NULL").to_string());
 
         // TinyIntType
-        let tiny_type: TinyIntType = TinyIntType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&tiny_type).unwrap();
+        let tiny_type = TinyIntType::with_nullable(true);
+        let serialized = serde_json::to_string(&tiny_type).unwrap();
         assert_eq!(serialized, json!("TINYINT").to_string());
-        let tiny_type: TinyIntType = TinyIntType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&tiny_type).unwrap();
+        let tiny_type = TinyIntType::with_nullable(false);
+        let serialized = serde_json::to_string(&tiny_type).unwrap();
         assert_eq!(serialized, json!("TINYINT NOT NULL").to_string());
 
         // SmallIntType
-        let small_type: SmallIntType = SmallIntType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&small_type).unwrap();
+        let small_type = SmallIntType::with_nullable(true);
+        let serialized = serde_json::to_string(&small_type).unwrap();
         assert_eq!(serialized, json!("SMALLINT").to_string());
-        let small_type: SmallIntType = SmallIntType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&small_type).unwrap();
+        let small_type = SmallIntType::with_nullable(false);
+        let serialized = serde_json::to_string(&small_type).unwrap();
         assert_eq!(serialized, json!("SMALLINT NOT NULL").to_string());
 
         // IntType
-        let int_type: IntType = IntType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&int_type).unwrap();
+        let int_type = IntType::with_nullable(true);
+        let serialized = serde_json::to_string(&int_type).unwrap();
         assert_eq!(serialized, json!("INTEGER").to_string());
-        let int_type: IntType = IntType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&int_type).unwrap();
+        let int_type = IntType::with_nullable(false);
+        let serialized = serde_json::to_string(&int_type).unwrap();
         assert_eq!(serialized, json!("INTEGER NOT NULL").to_string());
 
         // BigIntType
-        let big_type: BigIntType = BigIntType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&big_type).unwrap();
+        let big_type = BigIntType::with_nullable(true);
+        let serialized = serde_json::to_string(&big_type).unwrap();
         assert_eq!(serialized, json!("BIGINT").to_string());
-        let big_type: BigIntType = BigIntType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&big_type).unwrap();
+        let big_type = BigIntType::with_nullable(false);
+        let serialized = serde_json::to_string(&big_type).unwrap();
         assert_eq!(serialized, json!("BIGINT NOT NULL").to_string());
 
         // DecimalType
-        let decimal_type: DecimalType = DecimalType::with_nullable(true, 10, 2).unwrap();
-        let serialized: String = serde_json::to_string(&decimal_type).unwrap();
+        let decimal_type = DecimalType::with_nullable(true, 10, 2).unwrap();
+        let serialized = serde_json::to_string(&decimal_type).unwrap();
         assert_eq!(serialized, json!("DECIMAL(10, 2)").to_string());
-        let decimal_type: DecimalType = DecimalType::with_nullable(false, 10, 2).unwrap();
-        let serialized: String = serde_json::to_string(&decimal_type).unwrap();
+        let decimal_type = DecimalType::with_nullable(false, 10, 2).unwrap();
+        let serialized = serde_json::to_string(&decimal_type).unwrap();
         assert_eq!(serialized, json!("DECIMAL(10, 2) NOT NULL").to_string());
 
         // DoubleType
-        let double_type: DoubleType = DoubleType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&double_type).unwrap();
+        let double_type = DoubleType::with_nullable(true);
+        let serialized = serde_json::to_string(&double_type).unwrap();
         assert_eq!(serialized, json!("DOUBLE").to_string());
-        let double_type: DoubleType = DoubleType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&double_type).unwrap();
+        let double_type = DoubleType::with_nullable(false);
+        let serialized = serde_json::to_string(&double_type).unwrap();
         assert_eq!(serialized, json!("DOUBLE NOT NULL").to_string());
 
         // FloatType
-        let float_type: FloatType = FloatType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&float_type).unwrap();
+        let float_type = FloatType::with_nullable(true);
+        let serialized = serde_json::to_string(&float_type).unwrap();
         assert_eq!(serialized, json!("FLOAT").to_string());
-        let float_type: FloatType = FloatType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&float_type).unwrap();
+        let float_type = FloatType::with_nullable(false);
+        let serialized = serde_json::to_string(&float_type).unwrap();
         assert_eq!(serialized, json!("FLOAT NOT NULL").to_string());
 
         // BinaryType
-        let binary_type: BinaryType = BinaryType::with_nullable(true, 10).unwrap();
-        let serialized: String = serde_json::to_string(&binary_type).unwrap();
+        let binary_type = BinaryType::with_nullable(true, 10).unwrap();
+        let serialized = serde_json::to_string(&binary_type).unwrap();
         assert_eq!(serialized, json!("BINARY(10)").to_string());
-        let binary_type: BinaryType = BinaryType::with_nullable(false, 10).unwrap();
-        let serialized: String = serde_json::to_string(&binary_type).unwrap();
+        let binary_type = BinaryType::with_nullable(false, 10).unwrap();
+        let serialized = serde_json::to_string(&binary_type).unwrap();
         assert_eq!(serialized, json!("BINARY(10) NOT NULL").to_string());
 
         // VarBinaryType
-        let varbinary_type: VarBinaryType = VarBinaryType::try_new(true, 10).unwrap();
-        let serialized: String = serde_json::to_string(&varbinary_type).unwrap();
+        let varbinary_type = VarBinaryType::with_nullable(true, 10).unwrap();
+        let serialized = serde_json::to_string(&varbinary_type).unwrap();
         assert_eq!(serialized, json!("VARBINARY(10)").to_string());
-        let varbinary_type: VarBinaryType = VarBinaryType::try_new(false, 10).unwrap();
-        let serialized: String = serde_json::to_string(&varbinary_type).unwrap();
+        let varbinary_type = VarBinaryType::with_nullable(false, 10).unwrap();
+        let serialized = serde_json::to_string(&varbinary_type).unwrap();
         assert_eq!(serialized, json!("VARBINARY(10) NOT NULL").to_string());
 
         // CharType
-        let char_type: CharType = CharType::with_nullable(true, 10).unwrap();
-        let serialized: String = serde_json::to_string(&char_type).unwrap();
+        let char_type = CharType::with_nullable(true, 10).unwrap();
+        let serialized = serde_json::to_string(&char_type).unwrap();
         assert_eq!(serialized, json!("CHAR(10)").to_string());
-        let char_type: CharType = CharType::with_nullable(false, 10).unwrap();
-        let serialized: String = serde_json::to_string(&char_type).unwrap();
+        let char_type = CharType::with_nullable(false, 10).unwrap();
+        let serialized = serde_json::to_string(&char_type).unwrap();
         assert_eq!(serialized, json!("CHAR(10) NOT NULL").to_string());
 
         // VarCharType
-        let varchar_type: VarCharType = VarCharType::with_nullable(true, 10).unwrap();
-        let serialized: String = serde_json::to_string(&varchar_type).unwrap();
+        let varchar_type = VarCharType::with_nullable(true, 10).unwrap();
+        let serialized = serde_json::to_string(&varchar_type).unwrap();
         assert_eq!(serialized, json!("VARCHAR(10)").to_string());
-        let varchar_type: VarCharType = VarCharType::with_nullable(false, 10).unwrap();
-        let serialized: String = serde_json::to_string(&varchar_type).unwrap();
+        let varchar_type = VarCharType::with_nullable(false, 10).unwrap();
+        let serialized = serde_json::to_string(&varchar_type).unwrap();
         assert_eq!(serialized, json!("VARCHAR(10) NOT NULL").to_string());
 
         // DateType
-        let date_type: DateType = DateType::with_nullable(true);
-        let serialized: String = serde_json::to_string(&date_type).unwrap();
+        let date_type = DateType::with_nullable(true);
+        let serialized = serde_json::to_string(&date_type).unwrap();
         assert_eq!(serialized, json!("DATE").to_string());
-        let date_type: DateType = DateType::with_nullable(false);
-        let serialized: String = serde_json::to_string(&date_type).unwrap();
+        let date_type = DateType::with_nullable(false);
+        let serialized = serde_json::to_string(&date_type).unwrap();
         assert_eq!(serialized, json!("DATE NOT NULL").to_string());
 
         // LocalZonedTimestampType
-        let localzoned_type: LocalZonedTimestampType =
-            LocalZonedTimestampType::with_nullable(true, 6).unwrap();
-        let serialized: String = serde_json::to_string(&localzoned_type).unwrap();
+        let localzoned_type = LocalZonedTimestampType::with_nullable(true, 6).unwrap();
+        let serialized = serde_json::to_string(&localzoned_type).unwrap();
         assert_eq!(
             serialized,
             json!("TIMESTAMP WITH LOCAL TIME ZONE(6)").to_string()
         );
-        let localzoned_type: LocalZonedTimestampType =
-            LocalZonedTimestampType::with_nullable(false, 6).unwrap();
-        let serialized: String = serde_json::to_string(&localzoned_type).unwrap();
+        let localzoned_type = LocalZonedTimestampType::with_nullable(false, 6).unwrap();
+        let serialized = serde_json::to_string(&localzoned_type).unwrap();
         assert_eq!(
             serialized,
             json!("TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL").to_string()
         );
 
         // TimeType
-        let time_type: TimeType = TimeType::with_nullable(true, 6).unwrap();
-        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        let time_type = TimeType::with_nullable(true, 6).unwrap();
+        let serialized = serde_json::to_string(&time_type).unwrap();
         assert_eq!(serialized, json!("TIME(6)").to_string());
-        let time_type: TimeType = TimeType::with_nullable(false, 6).unwrap();
-        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        let time_type = TimeType::with_nullable(false, 6).unwrap();
+        let serialized = serde_json::to_string(&time_type).unwrap();
         assert_eq!(serialized, json!("TIME(6) NOT NULL").to_string());
-        let time_type: TimeType = TimeType::with_nullable(false, 6).unwrap();
-        let serialized: String = serde_json::to_string(&time_type).unwrap();
+        let time_type = TimeType::with_nullable(false, 6).unwrap();
+        let serialized = serde_json::to_string(&time_type).unwrap();
         assert_eq!(serialized, json!("TIME(6) NOT NULL").to_string());
 
         // TimestampType
-        let timestamp_type: TimestampType = TimestampType::with_nullable(true, 6).unwrap();
-        let serialized: String = serde_json::to_string(&timestamp_type).unwrap();
+        let timestamp_type = TimestampType::with_nullable(true, 6).unwrap();
+        let serialized = serde_json::to_string(&timestamp_type).unwrap();
         assert_eq!(serialized, json!("TIMESTAMP(6)").to_string());
-        let timestamp_type: TimestampType = TimestampType::with_nullable(false, 6).unwrap();
-        let serialized: String = serde_json::to_string(&timestamp_type).unwrap();
+        let timestamp_type = TimestampType::with_nullable(false, 6).unwrap();
+        let serialized = serde_json::to_string(&timestamp_type).unwrap();
         assert_eq!(serialized, json!("TIMESTAMP(6) NOT NULL").to_string());
 
         // ArrayType
-        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
-        let array_type: ArrayType = ArrayType::with_nullable(true, int_type.clone());
-        let serialized: String = serde_json::to_string(&array_type).unwrap();
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let array_type = ArrayType::with_nullable(true, int_type.clone());
+        let serialized = serde_json::to_string(&array_type).unwrap();
         assert_eq!(serialized, json!("ARRAY<INTEGER>").to_string());
-        let array_type: ArrayType = ArrayType::with_nullable(false, int_type.clone());
-        let serialized: String = serde_json::to_string(&array_type).unwrap();
+        let array_type = ArrayType::with_nullable(false, int_type.clone());
+        let serialized = serde_json::to_string(&array_type).unwrap();
         assert_eq!(serialized, json!("ARRAY<INTEGER> NOT NULL").to_string());
 
         // MapType
-        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
-        let map_type: MapType = MapType::with_nullable(true, int_type.clone(), int_type.clone());
-        let serialized: String = serde_json::to_string(&map_type).unwrap();
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let map_type = MapType::with_nullable(true, int_type.clone(), int_type.clone());
+        let serialized = serde_json::to_string(&map_type).unwrap();
         assert_eq!(serialized, json!("MAP<INTEGER, INTEGER>").to_string());
-        let map_type: MapType = MapType::with_nullable(false, int_type.clone(), int_type.clone());
-        let serialized: String = serde_json::to_string(&map_type).unwrap();
+        let map_type = MapType::with_nullable(false, int_type.clone(), int_type.clone());
+        let serialized = serde_json::to_string(&map_type).unwrap();
         assert_eq!(
             serialized,
             json!("MAP<INTEGER, INTEGER> NOT NULL").to_string()
         );
 
         // MultisetType
-        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
-        let multiset_type: MultisetType = MultisetType::with_nullable(true, int_type.clone());
-        let serialized: String = serde_json::to_string(&multiset_type).unwrap();
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let multiset_type = MultisetType::with_nullable(true, int_type.clone());
+        let serialized = serde_json::to_string(&multiset_type).unwrap();
         assert_eq!(serialized, json!("MULTISET<INTEGER>").to_string());
-        let multiset_type: MultisetType = MultisetType::with_nullable(false, int_type.clone());
-        let serialized: String = serde_json::to_string(&multiset_type).unwrap();
+        let multiset_type = MultisetType::with_nullable(false, int_type.clone());
+        let serialized = serde_json::to_string(&multiset_type).unwrap();
         assert_eq!(serialized, json!("MULTISET<INTEGER> NOT NULL").to_string());
 
         // RowType
-        let int_type: DataType = DataType::Int(IntType::with_nullable(true));
-        let arr_type: DataType = DataType::Array(ArrayType::with_nullable(true, int_type.clone()));
-        let row_type: RowType = RowType::with_nullable(
+        let int_type = DataType::Int(IntType::with_nullable(true));
+        let arr_type = DataType::Array(ArrayType::with_nullable(true, int_type.clone()));
+        let row_type = RowType::with_nullable(
             true,
             vec![
                 DataField::new(1, "a".to_string(), int_type.clone()),
                 DataField::new(2, "b".to_string(), arr_type.clone()),
             ],
         );
-        let serialized: String = serde_json::to_string(&row_type).unwrap();
+        let serialized = serde_json::to_string(&row_type).unwrap();
         assert_eq!(
             serialized,
             json!("ROW<INTEGER, ARRAY<INTEGER>>").to_string()
         );
-        let row_type: RowType = RowType::with_nullable(
+        let row_type = RowType::with_nullable(
             false,
             vec![
                 DataField::new(1, "a".to_string(), int_type.clone()),
                 DataField::new(2, "b".to_string(), arr_type.clone()),
             ],
         );
-        let serialized: String = serde_json::to_string(&row_type).unwrap();
+        let serialized = serde_json::to_string(&row_type).unwrap();
         assert_eq!(
             serialized,
             json!("ROW<INTEGER, ARRAY<INTEGER>> NOT NULL").to_string()
