@@ -18,13 +18,9 @@
 use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
-use serde::de::{MapAccess, Visitor};
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{DeserializeFromStr, SerializeDisplay};
-use std::fmt;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, FromInto, SerializeDisplay};
 use std::fmt::{Debug, Display, Formatter};
-use std::str::FromStr;
 
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
@@ -136,9 +132,13 @@ impl DataType {
 /// Data type of an array of elements with same subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArrayType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ARRAY>>")]
     nullable: bool,
+    #[serde(rename = "element")]
     element_type: Box<DataType>,
 }
 
@@ -156,88 +156,6 @@ impl ArrayType {
 
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
-    }
-}
-
-impl Serialize for ArrayType {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("ArrayType", 2)?;
-        let typ = if self.nullable {
-            "ARRAY"
-        } else {
-            "ARRAY NOT NULL"
-        };
-        s.serialize_field("type", typ)?;
-        s.serialize_field("element", &self.element_type)?;
-        s.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ArrayType {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Type,
-            Element,
-        }
-
-        struct ArrayTypeVisitor;
-
-        impl<'de> Visitor<'de> for ArrayTypeVisitor {
-            type Value = ArrayType;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("ArrayType")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> std::result::Result<ArrayType, V::Error>
-            where
-                V: MapAccess<'de>,
-            {
-                let mut nullable = None;
-                let mut element: Option<DataType> = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Type => {
-                            if nullable.is_some() {
-                                return Err(serde::de::Error::duplicate_field("type"));
-                            }
-                            match map.next_value()? {
-                                "ARRAY" => nullable = Some(true),
-                                "ARRAY NOT NULL" => nullable = Some(false),
-                                v => Err(serde::de::Error::invalid_value(
-                                    serde::de::Unexpected::Str(v),
-                                    &"ARRAY or ARRAY NOT NULL",
-                                ))?,
-                            }
-                        }
-                        Field::Element => {
-                            if element.is_some() {
-                                return Err(serde::de::Error::duplicate_field("element"));
-                            }
-                            element = Some(map.next_value()?);
-                        }
-                    }
-                }
-
-                Ok(ArrayType {
-                    nullable: nullable.ok_or_else(|| serde::de::Error::missing_field("type"))?,
-                    element_type: element
-                        .ok_or_else(|| serde::de::Error::missing_field("element"))?
-                        .into(),
-                })
-            }
-        }
-
-        const FIELDS: &[&str] = &["type", "element"];
-        deserializer.deserialize_struct("ArrayType", FIELDS, ArrayTypeVisitor)
     }
 }
 
@@ -347,33 +265,12 @@ impl BinaryType {
 /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BooleanType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BOOLEAN>>")]
     nullable: bool,
-}
-
-impl Display for BooleanType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BOOLEAN")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for BooleanType {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "BOOLEAN" => Ok(Self { nullable: true }),
-            "BOOLEAN NOT NULL" => Ok(Self { nullable: false }),
-            v => Err(Error::DataTypeInvalid {
-                message: format!("invalid boolean type: {v}"),
-            })?,
-        }
-    }
 }
 
 impl Default for BooleanType {
@@ -459,19 +356,12 @@ impl CharType {
 /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, SerializeDisplay)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DateType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DATE>>")]
     nullable: bool,
-}
-
-impl Display for DateType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DATE")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for DateType {
@@ -499,7 +389,7 @@ impl DateType {
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DecimalType {
     nullable: bool,
 
@@ -586,8 +476,11 @@ impl DecimalType {
 /// Data type of an 8-byte double precision floating point number.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct DoubleType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DOUBLE>>")]
     nullable: bool,
 }
 
@@ -624,19 +517,12 @@ impl DoubleType {
 /// FloatType for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct FloatType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::FLOAT>>")]
     nullable: bool,
-}
-
-impl Display for FloatType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FLOAT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for FloatType {
@@ -664,19 +550,12 @@ impl FloatType {
 /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct IntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::INTEGER>>")]
     nullable: bool,
-}
-
-impl Display for IntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "INTEGER")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for IntType {
@@ -775,19 +654,12 @@ impl LocalZonedTimestampType {
 /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct SmallIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::SMALLINT>>")]
     nullable: bool,
-}
-
-impl Display for SmallIntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SMALLINT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for SmallIntType {
@@ -949,19 +821,12 @@ impl TimestampType {
 /// Data type of a 1-byte signed integer with values from -128 to 127.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct TinyIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::TINYINT>>")]
     nullable: bool,
-}
-
-impl Display for TinyIntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TINYINT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for TinyIntType {
@@ -1112,10 +977,15 @@ impl VarCharType {
 /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct MapType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MAP>>")]
     nullable: bool,
+    #[serde(rename = "key")]
     key_type: Box<DataType>,
+    #[serde(rename = "value")]
     value_type: Box<DataType>,
 }
 
@@ -1143,9 +1013,13 @@ impl MapType {
 /// elements with a common subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct MultisetType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MAP>>")]
     nullable: bool,
+    #[serde(rename = "element")]
     element_type: Box<DataType>,
 }
 
@@ -1174,8 +1048,11 @@ impl MultisetType {
 /// column.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct RowType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ROW>>")]
     nullable: bool,
     fields: Vec<DataField>,
 }
@@ -1194,121 +1071,133 @@ impl RowType {
     }
 }
 
+mod serde_utils {
+    // We use name like `BOOLEAN` by design to avoid conflict.
+    #![allow(clippy::upper_case_acronyms)]
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::marker::PhantomData;
+
+    pub trait DataTypeName {
+        const NAME: &'static str;
+    }
+
+    pub struct BOOLEAN;
+    impl DataTypeName for BOOLEAN {
+        const NAME: &'static str = "BOOLEAN";
+    }
+
+    pub struct ARRAY;
+    impl DataTypeName for ARRAY {
+        const NAME: &'static str = "ARRAY";
+    }
+
+    pub struct DATE;
+    impl DataTypeName for DATE {
+        const NAME: &'static str = "DATE";
+    }
+
+    pub struct DOUBLE;
+    impl DataTypeName for DOUBLE {
+        const NAME: &'static str = "DOUBLE";
+    }
+
+    pub struct FLOAT;
+    impl DataTypeName for FLOAT {
+        const NAME: &'static str = "FLOAT";
+    }
+
+    pub struct INTEGER;
+    impl DataTypeName for INTEGER {
+        const NAME: &'static str = "INTEGER";
+    }
+
+    pub struct SMALLINT;
+    impl DataTypeName for SMALLINT {
+        const NAME: &'static str = "SMALLINT";
+    }
+
+    pub struct TINYINT;
+    impl DataTypeName for TINYINT {
+        const NAME: &'static str = "TINYINT";
+    }
+
+    pub struct MAP;
+    impl DataTypeName for MAP {
+        const NAME: &'static str = "MAP";
+    }
+
+    pub struct MULTISET;
+    impl DataTypeName for MULTISET {
+        const NAME: &'static str = "MULTISET";
+    }
+
+    pub struct ROW;
+    impl DataTypeName for ROW {
+        const NAME: &'static str = "ROW";
+    }
+
+    pub struct NullableType<T: DataTypeName> {
+        nullable: bool,
+        value: PhantomData<T>,
+    }
+
+    impl<T: DataTypeName> From<bool> for NullableType<T> {
+        fn from(value: bool) -> Self {
+            Self {
+                nullable: value,
+                value: PhantomData,
+            }
+        }
+    }
+    impl<T: DataTypeName> From<NullableType<T>> for bool {
+        fn from(value: NullableType<T>) -> Self {
+            value.nullable
+        }
+    }
+
+    impl<T: DataTypeName> Serialize for NullableType<T> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            if self.nullable {
+                serializer.serialize_str(T::NAME)
+            } else {
+                serializer.serialize_str(&format!("{} NOT NULL", T::NAME))
+            }
+        }
+    }
+
+    /// TODO: we should support more edge cases.
+    impl<'de, T: DataTypeName> Deserialize<'de> for NullableType<T> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let s = String::deserialize(deserializer)?;
+
+            let (name, nullable) = s.split_once(" ").unwrap_or((s.as_str(), ""));
+
+            if name == T::NAME && nullable.is_empty() {
+                Ok(NullableType::from(true))
+            } else if name == T::NAME && nullable == "NOT NULL" {
+                Ok(NullableType::from(false))
+            } else {
+                let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
+                Err(serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Str(s.as_str()),
+                    &expect.as_str(),
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
-
-    #[test]
-    fn test_data_type_to_string() {
-        assert_eq!(BooleanType::with_nullable(true).to_string(), "BOOLEAN");
-        assert_eq!(
-            BooleanType::with_nullable(false).to_string(),
-            "BOOLEAN NOT NULL"
-        );
-        assert_eq!(TinyIntType::with_nullable(true).to_string(), "TINYINT");
-        assert_eq!(
-            TinyIntType::with_nullable(false).to_string(),
-            "TINYINT NOT NULL"
-        );
-        assert_eq!(SmallIntType::with_nullable(true).to_string(), "SMALLINT");
-        assert_eq!(
-            SmallIntType::with_nullable(false).to_string(),
-            "SMALLINT NOT NULL"
-        );
-        assert_eq!(IntType::with_nullable(true).to_string(), "INTEGER");
-        assert_eq!(
-            IntType::with_nullable(false).to_string(),
-            "INTEGER NOT NULL"
-        );
-        assert_eq!(BigIntType::with_nullable(true).to_string(), "BIGINT");
-        assert_eq!(
-            BigIntType::with_nullable(false).to_string(),
-            "BIGINT NOT NULL"
-        );
-        assert_eq!(
-            DecimalType::with_nullable(true, 10, 2).unwrap().to_string(),
-            "DECIMAL(10, 2)"
-        );
-        assert_eq!(
-            DecimalType::with_nullable(false, 10, 2)
-                .unwrap()
-                .to_string(),
-            "DECIMAL(10, 2) NOT NULL"
-        );
-        assert_eq!(DoubleType::with_nullable(true).to_string(), "DOUBLE");
-        assert_eq!(
-            DoubleType::with_nullable(false).to_string(),
-            "DOUBLE NOT NULL"
-        );
-        assert_eq!(FloatType::with_nullable(true).to_string(), "FLOAT");
-        assert_eq!(
-            FloatType::with_nullable(false).to_string(),
-            "FLOAT NOT NULL"
-        );
-        assert_eq!(
-            BinaryType::with_nullable(true, 10).unwrap().to_string(),
-            "BINARY(10)"
-        );
-        assert_eq!(
-            BinaryType::with_nullable(false, 10).unwrap().to_string(),
-            "BINARY(10) NOT NULL"
-        );
-        assert_eq!(
-            VarBinaryType::try_new(true, 10).unwrap().to_string(),
-            "VARBINARY(10)"
-        );
-        assert_eq!(
-            VarBinaryType::try_new(false, 10).unwrap().to_string(),
-            "VARBINARY(10) NOT NULL"
-        );
-        assert_eq!(
-            CharType::with_nullable(true, 10).unwrap().to_string(),
-            "CHAR(10)"
-        );
-        assert_eq!(
-            CharType::with_nullable(false, 10).unwrap().to_string(),
-            "CHAR(10) NOT NULL"
-        );
-        assert_eq!(
-            VarCharType::with_nullable(true, 10).unwrap().to_string(),
-            "VARCHAR(10)"
-        );
-        assert_eq!(
-            VarCharType::with_nullable(false, 10).unwrap().to_string(),
-            "VARCHAR(10) NOT NULL"
-        );
-        assert_eq!(DateType::with_nullable(true).to_string(), "DATE");
-        assert_eq!(DateType::with_nullable(false).to_string(), "DATE NOT NULL");
-        assert_eq!(
-            LocalZonedTimestampType::with_nullable(true, 6)
-                .unwrap()
-                .to_string(),
-            "TIMESTAMP WITH LOCAL TIME ZONE(6)"
-        );
-        assert_eq!(
-            LocalZonedTimestampType::with_nullable(false, 6)
-                .unwrap()
-                .to_string(),
-            "TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL"
-        );
-        assert_eq!(
-            TimeType::with_nullable(true, 6).unwrap().to_string(),
-            "TIME(6)"
-        );
-        assert_eq!(
-            TimeType::with_nullable(false, 6).unwrap().to_string(),
-            "TIME(6) NOT NULL"
-        );
-        assert_eq!(
-            TimestampType::with_nullable(false, 6).unwrap().to_string(),
-            "TIMESTAMP(6) NOT NULL"
-        );
-        assert_eq!(
-            TimestampType::with_nullable(true, 6).unwrap().to_string(),
-            "TIMESTAMP(6)"
-        );
-    }
 
     /// TODO: replace expect with exist fixture.
     #[test]
