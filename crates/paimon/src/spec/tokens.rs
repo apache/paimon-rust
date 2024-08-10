@@ -924,7 +924,7 @@ mod tests {
 
     /// DataTypeJsonParser tests
     ///
-    /// Impl Reference: https://github.com/apache/paimon/blob/master/paimon-core/src/test/java/org/apache/paimon/schema/DataTypeJsonParserTest.java
+    /// Impl Reference: https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/test/java/org/apache/paimon/schema/DataTypeJsonParserTest.java
     fn test_data() -> Vec<TestSpec> {
         let mut tests = Vec::new();
         tests.push(
