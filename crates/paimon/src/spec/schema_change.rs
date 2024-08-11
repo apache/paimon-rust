@@ -357,70 +357,57 @@ mod tests {
 
         let schema_changes: Vec<SchemaChange> = serde_json::from_str(json_data).unwrap();
 
-        for change in schema_changes {
-            match change {
-                SchemaChange::SetOption { key, value } => {
-                    assert_eq!(key, "snapshot.time-retained");
-                    assert_eq!(value, "2h");
-                }
-                SchemaChange::RemoveOption { key } => {
-                    assert_eq!(key, "compaction.max.file-num");
-                }
-                SchemaChange::UpdateComment { comment } => {
-                    assert_eq!(comment, Some("table.comment".to_string()));
-                }
+        assert_eq!(
+            schema_changes,
+            vec![
+                SchemaChange::SetOption {
+                    key: "snapshot.time-retained".to_string(),
+                    value: "2h".to_string(),
+                },
+                SchemaChange::RemoveOption {
+                    key: "compaction.max.file-num".to_string(),
+                },
+                SchemaChange::UpdateComment {
+                    comment: Some("table.comment".to_string()),
+                },
                 SchemaChange::AddColumn {
-                    field_name,
-                    data_type,
-                    description,
-                    column_move,
-                } => {
-                    assert_eq!(field_name, "col1");
-                    assert_eq!(data_type, DataType::Int(IntType::new()));
-                    assert_eq!(description, Some("col1_description".to_string()));
-                    assert_eq!(
-                        column_move,
-                        Some(ColumnMove::move_first("col1_first".to_string()))
-                    );
-                }
+                    field_name: "col1".to_string(),
+                    data_type: DataType::Int(IntType::new()),
+                    description: Some("col1_description".to_string()),
+                    column_move: Some(ColumnMove {
+                        field_name: "col1_first".to_string(),
+                        referenced_field_name: None,
+                        move_type: ColumnMoveType::FIRST,
+                    }),
+                },
                 SchemaChange::RenameColumn {
-                    field_name,
-                    new_name,
-                } => {
-                    assert_eq!(field_name, "col3");
-                    assert_eq!(new_name, "col3_new_name");
-                }
-                SchemaChange::DropColumn { field_name } => {
-                    assert_eq!(field_name, "col1");
-                }
+                    field_name: "col3".to_string(),
+                    new_name: "col3_new_name".to_string(),
+                },
+                SchemaChange::DropColumn {
+                    field_name: "col1".to_string(),
+                },
                 SchemaChange::UpdateColumnType {
-                    field_name,
-                    data_type,
-                } => {
-                    assert_eq!(field_name, "col14");
-                    assert_eq!(data_type, DataType::Double(DoubleType::new()));
-                }
-                SchemaChange::UpdateColumnPosition { column_move } => {
-                    assert_eq!(column_move.field_name, "col4_first");
-                    assert_eq!(column_move.referenced_field_name, None);
-                    assert_eq!(column_move.move_type, ColumnMoveType::FIRST);
-                }
+                    field_name: "col14".to_string(),
+                    data_type: DataType::Double(DoubleType::new()),
+                },
+                SchemaChange::UpdateColumnPosition {
+                    column_move: ColumnMove {
+                        field_name: "col4_first".to_string(),
+                        referenced_field_name: None,
+                        move_type: ColumnMoveType::FIRST,
+                    },
+                },
                 SchemaChange::UpdateColumnNullability {
-                    field_name,
-                    nullable,
-                } => {
-                    assert_eq!(field_name, vec!["col5", "f2"]);
-                    assert!(!nullable);
-                }
+                    field_name: vec!["col5".to_string(), "f2".to_string()],
+                    nullable: false,
+                },
                 SchemaChange::UpdateColumnComment {
-                    field_names,
-                    new_description,
-                } => {
-                    assert_eq!(field_names, vec!["col5", "f1"]);
-                    assert_eq!(new_description, "col5 f1 field");
-                }
-            }
-        }
+                    field_names: vec!["col5".to_string(), "f1".to_string()],
+                    new_description: "col5 f1 field".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -444,7 +431,7 @@ mod tests {
             column_moves,
             vec![
                 ColumnMove::move_first("col1".to_string()),
-                ColumnMove::move_after("col2_after".to_string(), "col2".to_string())
+                ColumnMove::move_after("col2_after".to_string(), "col2".to_string()),
             ]
         );
     }
