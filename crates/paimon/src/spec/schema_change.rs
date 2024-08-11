@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// Schema change to table.
 ///
 /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L36>
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SchemaChange {
     /// A SchemaChange to set a table option.
@@ -292,11 +292,7 @@ mod tests {
           {
             "addColumn": {
               "fieldName": "col1",
-              "dataType": {
-                "Int": {
-                  "nullable": true
-                }
-              },
+              "dataType": "INTEGER",
               "description": "col1_description",
               "move": {
                 "fieldName": "col1_first",
@@ -319,11 +315,7 @@ mod tests {
           {
             "updateColumnType": {
               "fieldName": "col14",
-              "dataType": {
-                "Double": {
-                  "nullable": true
-                }
-              }
+              "dataType": "DOUBLE"
             }
           },
           {
@@ -355,7 +347,8 @@ mod tests {
           }
         ]"#;
 
-        let schema_changes: Vec<SchemaChange> = serde_json::from_str(json_data).unwrap();
+        let schema_changes: Vec<SchemaChange> =
+            serde_json::from_str(json_data).expect("Failed to deserialize SchemaChange.");
 
         assert_eq!(
             schema_changes,
