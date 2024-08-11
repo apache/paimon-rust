@@ -23,11 +23,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Error type for paimon.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Paimon data invalid for {}: {:?}", message, source))]
+    #[snafu(display("Paimon data invalid for {}", message))]
     DataInvalid {
         message: String,
-        #[snafu(backtrace)]
-        source: snafu::Whatever,
+        // #[snafu(backtrace)]
+        // source: snafu::Whatever,
     },
     #[snafu(
         visibility(pub(crate)),
@@ -42,10 +42,21 @@ pub enum Error {
         message: String,
         source: opendal::Error,
     },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting unsupported io error {}", message)
+    )]
+    IoUnsupported { message: String },
+    #[snafu(visibility(pub(crate)), display("Failed to parse URL: {:?}", source))]
+    UrlParse { source: url::ParseError },
 }
 
-impl From<Error> for &'static str {
-    fn from(_value: Error) -> Self {
-        todo!()
+impl From<opendal::Error> for Error {
+    fn from(source: opendal::Error) -> Self {
+        // TODO: Simple use IoUnexpected for now
+        Error::IoUnexpected {
+            message: "IO operation failed in opendal".to_string(),
+            source,
+        }
     }
 }
