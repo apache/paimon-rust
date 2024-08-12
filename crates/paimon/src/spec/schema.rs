@@ -48,6 +48,7 @@ pub struct DataField {
     name: String,
     #[serde(rename = "type")]
     typ: DataType,
+    #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
 }
 
