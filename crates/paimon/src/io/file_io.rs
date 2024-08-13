@@ -75,7 +75,7 @@ impl FileIO {
         Ok(FileStatus {
             size: meta.content_length(),
             is_dir: meta.is_dir(),
-            last_modification_time: meta.last_modified(),
+            last_modified: meta.last_modified(),
             path: path.to_string(),
         })
     }
@@ -100,7 +100,7 @@ impl FileIO {
             .map(|meta| FileStatus {
                 size: meta.metadata().content_length(),
                 is_dir: meta.metadata().is_dir(),
-                last_modification_time: meta.metadata().last_modified(),
+                last_modified: meta.metadata().last_modified(),
                 path: format!("{}{}", path, meta.name()),
             })
             .collect())
@@ -165,7 +165,7 @@ pub struct FileStatus {
     pub size: u64,
     pub is_dir: bool,
     pub path: String,
-    pub last_modification_time: Option<DateTime<Utc>>,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 /// Input file represents a file that can be read from.
