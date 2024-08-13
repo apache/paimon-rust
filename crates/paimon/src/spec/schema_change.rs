@@ -292,7 +292,7 @@ mod tests {
           {
             "addColumn": {
               "fieldName": "col1",
-              "dataType": "INTEGER",
+              "dataType": "INT",
               "description": "col1_description",
               "move": {
                 "fieldName": "col1_first",
