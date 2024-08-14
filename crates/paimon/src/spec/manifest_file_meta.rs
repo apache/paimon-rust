@@ -16,7 +16,6 @@
 // under the License.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_bytes::Bytes;
 use std::fmt::{Display, Formatter};
 
 /// Metadata of a manifest file.
@@ -159,16 +158,14 @@ where
     for &num in value {
         bytes.extend_from_slice(&num.to_le_bytes());
     }
-
-    let bytes = Bytes::new(bytes.as_slice());
-    serializer.serialize_bytes(bytes)
+    serializer.serialize_bytes(&bytes)
 }
 
 fn deserialize_null_counts<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let bytes = Deserialize::deserialize(deserializer).map(Bytes::new)?;
+    let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
 
     let size_of_i64 = std::mem::size_of::<i64>();
     let i64_count = bytes.len() / size_of_i64;
@@ -179,4 +176,39 @@ where
         ));
     }
     Ok(i64s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_file_meta_serialize_deserialize() {
+        let data_json = r#"
+        {
+           "_FILE_NAME":"manifest_file_meta.avro",
+           "_FILE_SIZE":1024,
+           "_NUM_ADDED_FILES":5,
+           "_NUM_DELETED_FILES":6,
+           "_PARTITION_STATS":{
+              "_MIN_VALUES":[0, 1, 2],
+              "_MAX_VALUES":[3, 4, 5],
+              "_NULL_COUNTS":[6, 7, 8]
+           },
+           "_SCHEMA_ID":1
+        }
+        "#;
+
+        let manifest_file_meta: ManifestFileMeta =
+            serde_json::from_str(data_json).expect("Failed to deserialize ManifestFileMeta.");
+
+        assert_eq!(manifest_file_meta.file_name(), "manifest_file_meta.avro");
+        assert_eq!(manifest_file_meta.file_size, 1024);
+        assert_eq!(manifest_file_meta.num_added_files, 5);
+        assert_eq!(manifest_file_meta.num_deleted_files, 6);
+        assert_eq!(manifest_file_meta.partition_stats.min_values, vec![0, 1, 2]);
+        assert_eq!(manifest_file_meta.partition_stats.max_values, vec![3, 4, 5]);
+        assert_eq!(manifest_file_meta.partition_stats.null_counts.len(), 0);
+        assert_eq!(manifest_file_meta.schema_id, 1);
+    }
 }

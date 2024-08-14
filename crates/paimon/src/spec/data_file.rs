@@ -212,8 +212,8 @@ mod tests {
         }
         "#;
 
-        let data_file_meta = serde_json::from_str::<DataFileMeta>(json_data)
-            .expect("Failed to deserialize DataFileMeta");
+        let data_file_meta: DataFileMeta =
+            serde_json::from_str(json_data).expect("Failed to deserialize DataFileMeta");
 
         assert_eq!(data_file_meta.file_name, "test.avro");
         assert_eq!(data_file_meta.file_size, 1024);
