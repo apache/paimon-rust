@@ -35,5 +35,5 @@ serde_json = "1.0.120"
 serde_with = "3.9.0"
 snafu = "0.8.3"
 typed-builder = "^0.19"
-opendal = "0.48"
+opendal = { version = "0.48",features = ["services-fs"] }
 pretty_assertions = "1"
