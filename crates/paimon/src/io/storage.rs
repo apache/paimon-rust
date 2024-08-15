@@ -46,11 +46,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn create_operator<'a>(
-        &self,
-        path: &'a impl AsRef<str>,
-    ) -> crate::Result<(Operator, &'a str)> {
-        let path = path.as_ref();
+    pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, &'a str)> {
         match self {
             #[cfg(feature = "storage-memory")]
             Storage::Memory => {
