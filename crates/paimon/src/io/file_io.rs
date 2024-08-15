@@ -87,6 +87,9 @@ impl FileIO {
 
         Ok(FileStatus {
             size: meta.content_length(),
+            is_dir: meta.is_dir(),
+            last_modified: meta.last_modified(),
+            path: path.to_string(),
         })
     }
 
@@ -272,6 +275,9 @@ impl FileWrite for opendal::Writer {
 #[derive(Clone, Debug)]
 pub struct FileStatus {
     pub size: u64,
+    pub is_dir: bool,
+    pub path: String,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]

@@ -18,13 +18,9 @@
 use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
-use serde::de::{MapAccess, Visitor};
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{DeserializeFromStr, SerializeDisplay};
-use std::fmt;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, FromInto, SerializeDisplay};
 use std::fmt::{Debug, Display, Formatter};
-use std::str::FromStr;
 
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
@@ -136,9 +132,13 @@ impl DataType {
 /// Data type of an array of elements with same subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArrayType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ARRAY>>")]
     nullable: bool,
+    #[serde(rename = "element")]
     element_type: Box<DataType>,
 }
 
@@ -159,106 +159,17 @@ impl ArrayType {
     }
 }
 
-impl Serialize for ArrayType {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("ArrayType", 2)?;
-        let typ = if self.nullable {
-            "ARRAY"
-        } else {
-            "ARRAY NOT NULL"
-        };
-        s.serialize_field("type", typ)?;
-        s.serialize_field("element", &self.element_type)?;
-        s.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ArrayType {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Type,
-            Element,
-        }
-
-        struct ArrayTypeVisitor;
-
-        impl<'de> Visitor<'de> for ArrayTypeVisitor {
-            type Value = ArrayType;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("ArrayType")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> std::result::Result<ArrayType, V::Error>
-            where
-                V: MapAccess<'de>,
-            {
-                let mut nullable = None;
-                let mut element: Option<DataType> = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Type => {
-                            if nullable.is_some() {
-                                return Err(serde::de::Error::duplicate_field("type"));
-                            }
-                            match map.next_value()? {
-                                "ARRAY" => nullable = Some(true),
-                                "ARRAY NOT NULL" => nullable = Some(false),
-                                v => Err(serde::de::Error::invalid_value(
-                                    serde::de::Unexpected::Str(v),
-                                    &"ARRAY or ARRAY NOT NULL",
-                                ))?,
-                            }
-                        }
-                        Field::Element => {
-                            if element.is_some() {
-                                return Err(serde::de::Error::duplicate_field("element"));
-                            }
-                            element = Some(map.next_value()?);
-                        }
-                    }
-                }
-
-                Ok(ArrayType {
-                    nullable: nullable.ok_or_else(|| serde::de::Error::missing_field("type"))?,
-                    element_type: element
-                        .ok_or_else(|| serde::de::Error::missing_field("element"))?
-                        .into(),
-                })
-            }
-        }
-
-        const FIELDS: &[&str] = &["type", "element"];
-        deserializer.deserialize_struct("ArrayType", FIELDS, ArrayTypeVisitor)
-    }
-}
-
 /// BigIntType for paimon.
 ///
 /// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct BigIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BIGINT>>")]
     nullable: bool,
-}
-
-impl Display for BigIntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BIGINT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for BigIntType {
@@ -347,33 +258,12 @@ impl BinaryType {
 /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BooleanType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BOOLEAN>>")]
     nullable: bool,
-}
-
-impl Display for BooleanType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BOOLEAN")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
-}
-
-impl FromStr for BooleanType {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "BOOLEAN" => Ok(Self { nullable: true }),
-            "BOOLEAN NOT NULL" => Ok(Self { nullable: false }),
-            v => Err(Error::DataTypeInvalid {
-                message: format!("invalid boolean type: {v}"),
-            })?,
-        }
-    }
 }
 
 impl Default for BooleanType {
@@ -459,19 +349,12 @@ impl CharType {
 /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, SerializeDisplay)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DateType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DATE>>")]
     nullable: bool,
-}
-
-impl Display for DateType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DATE")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for DateType {
@@ -499,7 +382,7 @@ impl DateType {
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct DecimalType {
     nullable: bool,
 
@@ -586,8 +469,11 @@ impl DecimalType {
 /// Data type of an 8-byte double precision floating point number.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct DoubleType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DOUBLE>>")]
     nullable: bool,
 }
 
@@ -624,19 +510,12 @@ impl DoubleType {
 /// FloatType for paimon.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct FloatType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::FLOAT>>")]
     nullable: bool,
-}
-
-impl Display for FloatType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FLOAT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for FloatType {
@@ -664,19 +543,12 @@ impl FloatType {
 /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct IntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::INT>>")]
     nullable: bool,
-}
-
-impl Display for IntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "INTEGER")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for IntType {
@@ -775,19 +647,12 @@ impl LocalZonedTimestampType {
 /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct SmallIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::SMALLINT>>")]
     nullable: bool,
-}
-
-impl Display for SmallIntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SMALLINT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for SmallIntType {
@@ -949,19 +814,12 @@ impl TimestampType {
 /// Data type of a 1-byte signed integer with values from -128 to 127.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
 pub struct TinyIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::TINYINT>>")]
     nullable: bool,
-}
-
-impl Display for TinyIntType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TINYINT")?;
-        if !self.nullable {
-            write!(f, " NOT NULL")?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for TinyIntType {
@@ -1112,10 +970,15 @@ impl VarCharType {
 /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct MapType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MAP>>")]
     nullable: bool,
+    #[serde(rename = "key")]
     key_type: Box<DataType>,
+    #[serde(rename = "value")]
     value_type: Box<DataType>,
 }
 
@@ -1143,9 +1006,13 @@ impl MapType {
 /// elements with a common subtype.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct MultisetType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MULTISET>>")]
     nullable: bool,
+    #[serde(rename = "element")]
     element_type: Box<DataType>,
 }
 
@@ -1174,8 +1041,11 @@ impl MultisetType {
 /// column.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct RowType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ROW>>")]
     nullable: bool,
     fields: Vec<DataField>,
 }
@@ -1194,177 +1064,444 @@ impl RowType {
     }
 }
 
-#[cfg(test)]
-mod tests {
+mod serde_utils {
+    // We use name like `BOOLEAN` by design to avoid conflict.
+    #![allow(clippy::upper_case_acronyms)]
 
-    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::marker::PhantomData;
 
-    #[test]
-    fn test_data_type_to_string() {
-        assert_eq!(BooleanType::with_nullable(true).to_string(), "BOOLEAN");
-        assert_eq!(
-            BooleanType::with_nullable(false).to_string(),
-            "BOOLEAN NOT NULL"
-        );
-        assert_eq!(TinyIntType::with_nullable(true).to_string(), "TINYINT");
-        assert_eq!(
-            TinyIntType::with_nullable(false).to_string(),
-            "TINYINT NOT NULL"
-        );
-        assert_eq!(SmallIntType::with_nullable(true).to_string(), "SMALLINT");
-        assert_eq!(
-            SmallIntType::with_nullable(false).to_string(),
-            "SMALLINT NOT NULL"
-        );
-        assert_eq!(IntType::with_nullable(true).to_string(), "INTEGER");
-        assert_eq!(
-            IntType::with_nullable(false).to_string(),
-            "INTEGER NOT NULL"
-        );
-        assert_eq!(BigIntType::with_nullable(true).to_string(), "BIGINT");
-        assert_eq!(
-            BigIntType::with_nullable(false).to_string(),
-            "BIGINT NOT NULL"
-        );
-        assert_eq!(
-            DecimalType::with_nullable(true, 10, 2).unwrap().to_string(),
-            "DECIMAL(10, 2)"
-        );
-        assert_eq!(
-            DecimalType::with_nullable(false, 10, 2)
-                .unwrap()
-                .to_string(),
-            "DECIMAL(10, 2) NOT NULL"
-        );
-        assert_eq!(DoubleType::with_nullable(true).to_string(), "DOUBLE");
-        assert_eq!(
-            DoubleType::with_nullable(false).to_string(),
-            "DOUBLE NOT NULL"
-        );
-        assert_eq!(FloatType::with_nullable(true).to_string(), "FLOAT");
-        assert_eq!(
-            FloatType::with_nullable(false).to_string(),
-            "FLOAT NOT NULL"
-        );
-        assert_eq!(
-            BinaryType::with_nullable(true, 10).unwrap().to_string(),
-            "BINARY(10)"
-        );
-        assert_eq!(
-            BinaryType::with_nullable(false, 10).unwrap().to_string(),
-            "BINARY(10) NOT NULL"
-        );
-        assert_eq!(
-            VarBinaryType::try_new(true, 10).unwrap().to_string(),
-            "VARBINARY(10)"
-        );
-        assert_eq!(
-            VarBinaryType::try_new(false, 10).unwrap().to_string(),
-            "VARBINARY(10) NOT NULL"
-        );
-        assert_eq!(
-            CharType::with_nullable(true, 10).unwrap().to_string(),
-            "CHAR(10)"
-        );
-        assert_eq!(
-            CharType::with_nullable(false, 10).unwrap().to_string(),
-            "CHAR(10) NOT NULL"
-        );
-        assert_eq!(
-            VarCharType::with_nullable(true, 10).unwrap().to_string(),
-            "VARCHAR(10)"
-        );
-        assert_eq!(
-            VarCharType::with_nullable(false, 10).unwrap().to_string(),
-            "VARCHAR(10) NOT NULL"
-        );
-        assert_eq!(DateType::with_nullable(true).to_string(), "DATE");
-        assert_eq!(DateType::with_nullable(false).to_string(), "DATE NOT NULL");
-        assert_eq!(
-            LocalZonedTimestampType::with_nullable(true, 6)
-                .unwrap()
-                .to_string(),
-            "TIMESTAMP WITH LOCAL TIME ZONE(6)"
-        );
-        assert_eq!(
-            LocalZonedTimestampType::with_nullable(false, 6)
-                .unwrap()
-                .to_string(),
-            "TIMESTAMP WITH LOCAL TIME ZONE(6) NOT NULL"
-        );
-        assert_eq!(
-            TimeType::with_nullable(true, 6).unwrap().to_string(),
-            "TIME(6)"
-        );
-        assert_eq!(
-            TimeType::with_nullable(false, 6).unwrap().to_string(),
-            "TIME(6) NOT NULL"
-        );
-        assert_eq!(
-            TimestampType::with_nullable(false, 6).unwrap().to_string(),
-            "TIMESTAMP(6) NOT NULL"
-        );
-        assert_eq!(
-            TimestampType::with_nullable(true, 6).unwrap().to_string(),
-            "TIMESTAMP(6)"
-        );
+    pub trait DataTypeName {
+        const NAME: &'static str;
     }
 
-    /// TODO: replace expect with exist fixture.
-    #[test]
-    fn test_data_type_serialize() {
-        // name, input, expect.
-        let cases = vec![
+    pub struct BOOLEAN;
+    impl DataTypeName for BOOLEAN {
+        const NAME: &'static str = "BOOLEAN";
+    }
+
+    pub struct ARRAY;
+    impl DataTypeName for ARRAY {
+        const NAME: &'static str = "ARRAY";
+    }
+
+    pub struct DATE;
+    impl DataTypeName for DATE {
+        const NAME: &'static str = "DATE";
+    }
+
+    pub struct DOUBLE;
+    impl DataTypeName for DOUBLE {
+        const NAME: &'static str = "DOUBLE";
+    }
+
+    pub struct FLOAT;
+    impl DataTypeName for FLOAT {
+        const NAME: &'static str = "FLOAT";
+    }
+
+    pub struct INT;
+    impl DataTypeName for INT {
+        const NAME: &'static str = "INT";
+    }
+
+    pub struct BIGINT;
+    impl DataTypeName for BIGINT {
+        const NAME: &'static str = "BIGINT";
+    }
+
+    pub struct SMALLINT;
+    impl DataTypeName for SMALLINT {
+        const NAME: &'static str = "SMALLINT";
+    }
+
+    pub struct TINYINT;
+    impl DataTypeName for TINYINT {
+        const NAME: &'static str = "TINYINT";
+    }
+
+    pub struct MAP;
+    impl DataTypeName for MAP {
+        const NAME: &'static str = "MAP";
+    }
+
+    pub struct MULTISET;
+    impl DataTypeName for MULTISET {
+        const NAME: &'static str = "MULTISET";
+    }
+
+    pub struct ROW;
+    impl DataTypeName for ROW {
+        const NAME: &'static str = "ROW";
+    }
+
+    pub struct NullableType<T: DataTypeName> {
+        nullable: bool,
+        value: PhantomData<T>,
+    }
+
+    impl<T: DataTypeName> From<bool> for NullableType<T> {
+        fn from(value: bool) -> Self {
+            Self {
+                nullable: value,
+                value: PhantomData,
+            }
+        }
+    }
+    impl<T: DataTypeName> From<NullableType<T>> for bool {
+        fn from(value: NullableType<T>) -> Self {
+            value.nullable
+        }
+    }
+
+    impl<T: DataTypeName> Serialize for NullableType<T> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            if self.nullable {
+                serializer.serialize_str(T::NAME)
+            } else {
+                serializer.serialize_str(&format!("{} NOT NULL", T::NAME))
+            }
+        }
+    }
+
+    /// TODO: we should support more edge cases.
+    impl<'de, T: DataTypeName> Deserialize<'de> for NullableType<T> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let s = String::deserialize(deserializer)?;
+
+            let (name, nullable) = s.split_once(" ").unwrap_or((s.as_str(), ""));
+
+            if name == T::NAME && nullable.is_empty() {
+                Ok(NullableType::from(true))
+            } else if name == T::NAME && nullable == "NOT NULL" {
+                Ok(NullableType::from(false))
+            } else {
+                let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
+                Err(serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Str(s.as_str()),
+                    &expect.as_str(),
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn load_fixture(name: &str) -> String {
+        let workdir =
+            std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));
+        let path = workdir.join(format!("tests/fixtures/{name}.json"));
+
+        let content = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("fixtures {path:?} load failed: {err}"));
+        String::from_utf8(content).expect("fixtures content must be valid utf8")
+    }
+
+    fn test_cases() -> Vec<(&'static str, DataType)> {
+        vec![
             (
-                "boolean",
-                DataType::Boolean(BooleanType::with_nullable(true)),
-                r#""BOOLEAN""#,
-            ),
-            (
-                "array with boolean",
+                "array_type",
                 DataType::Array(ArrayType {
                     nullable: false,
-                    element_type: DataType::Boolean(BooleanType::with_nullable(false)).into(),
+                    element_type: DataType::Int(IntType::with_nullable(false)).into(),
                 }),
-                r#"{"type":"ARRAY NOT NULL","element":"BOOLEAN NOT NULL"}"#,
             ),
-        ];
+            (
+                "array_type_nullable",
+                DataType::Array(ArrayType {
+                    nullable: true,
+                    element_type: DataType::Int(IntType::with_nullable(true)).into(),
+                }),
+            ),
+            (
+                "bigint_type",
+                DataType::BigInt(BigIntType { nullable: false }),
+            ),
+            (
+                "bigint_type_nullable",
+                DataType::BigInt(BigIntType { nullable: true }),
+            ),
+            // FIXME: binary doesn't implement deserialize.
+            // (
+            //     "binary_type",
+            //     DataType::Binary(BinaryType {
+            //         nullable: false,
+            //         length: 22,
+            //     }),
+            // ),
+            // (
+            //     "binary_type_nullable",
+            //     DataType::Binary(BinaryType {
+            //         nullable: true,
+            //         length: 22,
+            //     }),
+            // ),
+            (
+                "boolean_type",
+                DataType::Boolean(BooleanType { nullable: false }),
+            ),
+            (
+                "boolean_type_nullable",
+                DataType::Boolean(BooleanType { nullable: true }),
+            ),
+            // FIXME: binary doesn't implement deserialize.
+            // (
+            //     "char_type",
+            //     DataType::Char(CharType {
+            //         nullable: false,
+            //         length: 33,
+            //     }),
+            // ),
+            // (
+            //     "char_type_nullable",
+            //     DataType::Char(CharType {
+            //         nullable: true,
+            //         length: 33,
+            //     }),
+            // ),
+            ("date_type", DataType::Date(DateType { nullable: false })),
+            (
+                "date_type_nullable",
+                DataType::Date(DateType { nullable: true }),
+            ),
+            // FIXME: DecimalType serialize failed.
+            // (
+            //     "decimal_type",
+            //     DataType::Decimal(DecimalType {
+            //         nullable: false,
+            //         precision: 10,
+            //         scale: 2,
+            //     }),
+            // ),
+            // (
+            //     "decimal_type_nullable",
+            //     DataType::Decimal(DecimalType {
+            //         nullable: true,
+            //         precision: 10,
+            //         scale: 2,
+            //     }),
+            // ),
+            (
+                "double_type",
+                DataType::Double(DoubleType { nullable: false }),
+            ),
+            (
+                "double_type_nullable",
+                DataType::Double(DoubleType { nullable: true }),
+            ),
+            ("float_type", DataType::Float(FloatType { nullable: false })),
+            (
+                "float_type_nullable",
+                DataType::Float(FloatType { nullable: true }),
+            ),
+            ("int_type", DataType::Int(IntType { nullable: false })),
+            (
+                "int_type_nullable",
+                DataType::Int(IntType { nullable: true }),
+            ),
+            // FIXME: LocalZonedTimestampType serialize failed.
+            // (
+            //     "local_zoned_timestamp_type",
+            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+            //         nullable: false,
+            //         precision: 3,
+            //     }),
+            // ),
+            // (
+            //     "local_zoned_timestamp_type_nullable",
+            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+            //         nullable: true,
+            //         precision: 3,
+            //     }),
+            // ),
+            // FIXME: VarCharType doesn't support deserialize.
+            // (
+            //     "map_type",
+            //     DataType::Map(MapType {
+            //         nullable: false,
+            //         key_type: DataType::VarChar(VarCharType {
+            //             nullable: true,
+            //             length: 20,
+            //         })
+            //         .into(),
+            //         value_type: DataType::Int(IntType { nullable: false }).into(),
+            //     }),
+            // ),
+            // (
+            //     "map_type_nullable",
+            //     DataType::Map(MapType {
+            //         nullable: true,
+            //         key_type: DataType::VarChar(VarCharType {
+            //             nullable: true,
+            //             length: 20,
+            //         })
+            //         .into(),
+            //         value_type: DataType::Int(IntType { nullable: true }).into(),
+            //     }),
+            // ),
+            (
+                "multiset_type",
+                DataType::Multiset(MultisetType {
+                    nullable: false,
+                    element_type: DataType::Int(IntType { nullable: false }).into(),
+                }),
+            ),
+            (
+                "multiset_type_nullable",
+                DataType::Multiset(MultisetType {
+                    nullable: true,
+                    element_type: DataType::Int(IntType { nullable: true }).into(),
+                }),
+            ),
+            // FIXME: VarChar doesn't support deserialize.
+            // (
+            //     "row_type",
+            //     DataType::Row(RowType {
+            //         nullable: false,
+            //         fields: vec![
+            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
+            //             DataField::new(
+            //                 1,
+            //                 "b".into(),
+            //                 DataType::VarChar(VarCharType {
+            //                     nullable: false,
+            //                     length: 20,
+            //                 }),
+            //             ),
+            //         ],
+            //     }),
+            // ),
+            // (
+            //     "row_type_nullable",
+            //     DataType::Row(RowType {
+            //         nullable: true,
+            //         fields: vec![
+            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
+            //             DataField::new(
+            //                 1,
+            //                 "b".into(),
+            //                 DataType::VarChar(VarCharType {
+            //                     nullable: true,
+            //                     length: 20,
+            //                 }),
+            //             ),
+            //         ],
+            //     }),
+            // ),
+            (
+                "smallint_type",
+                DataType::SmallInt(SmallIntType { nullable: false }),
+            ),
+            (
+                "smallint_type_nullable",
+                DataType::SmallInt(SmallIntType { nullable: true }),
+            ),
+            // FIXME: time and timestamp doesn't implement deserialize.
+            // (
+            //     "time_type",
+            //     DataType::Time(TimeType {
+            //         nullable: false,
+            //         precision: 9,
+            //     }),
+            // ),
+            // (
+            //     "time_type_nullable",
+            //     DataType::Time(TimeType {
+            //         nullable: true,
+            //         precision: 0,
+            //     }),
+            // ),
+            // (
+            //     "timestamp_type",
+            //     DataType::Timestamp(TimestampType {
+            //         nullable: false,
+            //         precision: 6,
+            //     }),
+            // ),
+            // (
+            //     "timestamp_type_nullable",
+            //     DataType::Timestamp(TimestampType {
+            //         nullable: true,
+            //         precision: 6,
+            //     }),
+            // ),
+            (
+                "tinyint_type",
+                DataType::TinyInt(TinyIntType { nullable: false }),
+            ),
+            (
+                "tinyint_type_nullable",
+                DataType::TinyInt(TinyIntType { nullable: true }),
+            ),
+            // FIXME: varbinary & varchar doesn't implement deserialize.
+            // (
+            //     "varbinary_type",
+            //     DataType::VarBinary(VarBinaryType {
+            //         nullable: false,
+            //         length: 233,
+            //     }),
+            // ),
+            // (
+            //     "varbinary_type_nullable",
+            //     DataType::VarBinary(VarBinaryType {
+            //         nullable: true,
+            //         length: 233,
+            //     }),
+            // ),
+            // (
+            //     "varchar_type",
+            //     DataType::VarChar(VarCharType {
+            //         nullable: false,
+            //         length: 33,
+            //     }),
+            // ),
+            // (
+            //     "varchar_type_nullable",
+            //     DataType::VarChar(VarCharType {
+            //         nullable: true,
+            //         length: 33,
+            //     }),
+            // ),
+        ]
+    }
 
-        for (name, input, expect) in cases {
+    /// Test data type serialize against with test fixtures.
+    ///
+    /// The name is the test fixtures file name.
+    #[test]
+    fn test_data_type_serialize() {
+        for (name, input) in test_cases() {
+            let actual = serde_json::to_string(&input)
+                .unwrap_or_else(|err| panic!("serialize failed for {name}: {err}"));
+
             assert_eq!(
-                serde_json::to_string(&input).unwrap(),
-                expect,
+                actual,
+                load_fixture(name),
                 "test data type serialize for {name}"
             )
         }
     }
 
-    /// TODO: replace expect with exist fixture.
+    /// Test data type serialize against with test fixtures.
+    ///
+    /// The name is the test fixtures file name.
     #[test]
     fn test_data_type_deserialize() {
-        // name, input, expect.
-        let cases = vec![
-            (
-                "boolean",
-                r#""BOOLEAN""#,
-                DataType::Boolean(BooleanType::with_nullable(true)),
-            ),
-            (
-                "array with boolean",
-                r#"{"type":"ARRAY NOT NULL","element":"BOOLEAN NOT NULL"}"#,
-                DataType::Array(ArrayType {
-                    nullable: false,
-                    element_type: DataType::Boolean(BooleanType::with_nullable(false)).into(),
-                }),
-            ),
-        ];
+        for (name, expect) in test_cases() {
+            let actual = serde_json::from_str::<DataType>(&load_fixture(name))
+                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
 
-        for (name, input, expect) in cases {
-            assert_eq!(
-                serde_json::from_str::<DataType>(input).unwrap(),
-                expect,
-                "test data type deserialize for {name}"
-            )
+            assert_eq!(actual, expect, "test data type deserialize for {name}")
         }
     }
 }
