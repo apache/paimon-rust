@@ -15,18 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod file_io;
-pub use file_io::*;
+use opendal::services::MemoryConfig;
+use opendal::Operator;
 
-mod storage;
-pub use storage::*;
+use crate::Result;
 
-#[cfg(feature = "storage-fs")]
-mod storage_fs;
-#[cfg(feature = "storage-fs")]
-use storage_fs::*;
-
-#[cfg(feature = "storage-memory")]
-mod storage_memory;
-#[cfg(feature = "storage-memory")]
-use storage_memory::*;
+pub(crate) fn memory_config_build() -> Result<Operator> {
+    Ok(Operator::from_config(MemoryConfig::default())?.finish())
+}

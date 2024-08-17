@@ -1175,7 +1175,7 @@ mod serde_utils {
         {
             let s = String::deserialize(deserializer)?;
 
-            let (name, nullable) = s.split_once(" ").unwrap_or((s.as_str(), ""));
+            let (name, nullable) = s.split_once(' ').unwrap_or((s.as_str(), ""));
 
             if name == T::NAME && nullable.is_empty() {
                 Ok(NullableType::from(true))

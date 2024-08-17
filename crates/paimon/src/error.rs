@@ -42,4 +42,24 @@ pub enum Error {
         message: String,
         source: opendal::Error,
     },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting unsupported io error {}", message)
+    )]
+    IoUnsupported { message: String },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting invalid config: {}", message)
+    )]
+    ConfigInvalid { message: String },
+}
+
+impl From<opendal::Error> for Error {
+    fn from(source: opendal::Error) -> Self {
+        // TODO: Simple use IoUnexpected for now
+        Error::IoUnexpected {
+            message: "IO operation failed on underlying storage".to_string(),
+            source,
+        }
+    }
 }

@@ -15,18 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod file_io;
-pub use file_io::*;
+use opendal::services::FsConfig;
+use opendal::Operator;
 
-mod storage;
-pub use storage::*;
+use crate::Result;
 
-#[cfg(feature = "storage-fs")]
-mod storage_fs;
-#[cfg(feature = "storage-fs")]
-use storage_fs::*;
+/// Build new opendal operator from give path.
+pub(crate) fn fs_config_build() -> Result<Operator> {
+    let mut cfg = FsConfig::default();
+    cfg.root = Some("/".to_string());
 
-#[cfg(feature = "storage-memory")]
-mod storage_memory;
-#[cfg(feature = "storage-memory")]
-use storage_memory::*;
+    Ok(Operator::from_config(cfg)?.finish())
+}
