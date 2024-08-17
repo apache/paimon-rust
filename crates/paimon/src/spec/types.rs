@@ -19,8 +19,12 @@ use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, FromInto, SerializeDisplay};
-use std::fmt::{Debug, Display, Formatter};
+use serde_utils::DataTypeName;
+use serde_with::{serde_as, DeserializeFromStr, FromInto, SerializeDisplay};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    str::FromStr,
+};
 
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
@@ -200,8 +204,8 @@ impl BigIntType {
 /// Data type of a fixed-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
-#[serde(rename_all = "camelCase")]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
 pub struct BinaryType {
     nullable: bool,
     length: usize,
@@ -220,6 +224,44 @@ impl Display for BinaryType {
 impl Default for BinaryType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for BinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::BINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if length_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY length and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let length = length_and_nullable[0].parse::<usize>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(BinaryType {
+            nullable,
+            length: length.unwrap(),
+        })
     }
 }
 
@@ -291,8 +333,8 @@ impl BooleanType {
 /// Data type of a fixed-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, SerializeDisplay)]
-#[serde(rename_all = "camelCase")]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, SerializeDisplay, DeserializeFromStr)]
 pub struct CharType {
     nullable: bool,
     length: usize,
@@ -311,6 +353,44 @@ impl Display for CharType {
 impl Default for CharType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for CharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::CHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if length_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR length and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let length = length_and_nullable[0].parse::<usize>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(CharType {
+            nullable,
+            length: length.unwrap(),
+        })
     }
 }
 
@@ -382,7 +462,8 @@ impl DateType {
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct DecimalType {
     nullable: bool,
 
@@ -403,6 +484,39 @@ impl Display for DecimalType {
 impl Default for DecimalType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE).unwrap()
+    }
+}
+
+impl FromStr for DecimalType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(|c: char| c == '(' || c == ')').collect();
+
+        if !parts[0].contains(serde_utils::DECIMAL::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL type.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision_and_scale: Vec<&str> = parts[1].split(',').collect::<Vec<&str>>();
+        if precision_and_scale.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL precision and scale.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision = precision_and_scale[0].trim().parse::<u32>().unwrap();
+        let scale = precision_and_scale[1].trim().parse::<u32>().unwrap();
+        let nullable = !parts[2].contains("NOT");
+
+        Ok(DecimalType {
+            nullable,
+            precision,
+            scale,
+        })
     }
 }
 
@@ -579,7 +693,8 @@ impl IntType {
 /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct LocalZonedTimestampType {
     nullable: bool,
     precision: u32,
@@ -587,7 +702,7 @@ pub struct LocalZonedTimestampType {
 
 impl Display for LocalZonedTimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)?;
+        write!(f, "TIMESTAMP({}) WITH LOCAL TIME ZONE", self.precision)?;
         if !self.nullable {
             write!(f, " NOT NULL")?;
         }
@@ -598,6 +713,44 @@ impl Display for LocalZonedTimestampType {
 impl Default for LocalZonedTimestampType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for LocalZonedTimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::TIMESTAMP::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if precision_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP precision and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision = precision_and_nullable[0].parse::<u32>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(LocalZonedTimestampType {
+            nullable,
+            precision: precision.unwrap(),
+        })
     }
 }
 
@@ -684,7 +837,8 @@ impl SmallIntType {
 /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct TimeType {
     nullable: bool,
     precision: u32,
@@ -703,6 +857,44 @@ impl Display for TimeType {
 impl Default for TimeType {
     fn default() -> Self {
         Self::new(TimeType::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimeType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::TIME::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if precision_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME precision and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision = precision_and_nullable[0].parse::<u32>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(TimeType {
+            nullable,
+            precision: precision.unwrap(),
+        })
     }
 }
 
@@ -749,7 +941,8 @@ impl TimeType {
 /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct TimestampType {
     nullable: bool,
     precision: u32,
@@ -768,6 +961,44 @@ impl Display for TimestampType {
 impl Default for TimestampType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::TIMESTAMP::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if precision_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP precision and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let precision = precision_and_nullable[0].parse::<u32>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(TimestampType {
+            nullable,
+            precision: precision.unwrap(),
+        })
     }
 }
 
@@ -850,7 +1081,8 @@ impl TinyIntType {
 /// Data type of a variable-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct VarBinaryType {
     nullable: bool,
     length: u32,
@@ -869,6 +1101,44 @@ impl Display for VarBinaryType {
 impl Default for VarBinaryType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for VarBinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::VARBINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if length_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY length and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let length = length_and_nullable[0].parse::<u32>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(VarBinaryType {
+            nullable,
+            length: length.unwrap(),
+        })
     }
 }
 
@@ -908,7 +1178,8 @@ impl VarBinaryType {
 /// Data type of a variable-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct VarCharType {
     nullable: bool,
     length: u32,
@@ -927,6 +1198,44 @@ impl Display for VarCharType {
 impl Default for VarCharType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for VarCharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if !parts[0].contains(serde_utils::VARCHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARCHAR type.".to_string(),
+            }
+            .fail();
+        }
+
+        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
+        if bracket_parts.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARCHAR specification.".to_string(),
+            }
+            .fail();
+        }
+
+        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
+        if length_and_nullable.len() != 2 {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARCHAR length and nullable.".to_string(),
+            }
+            .fail();
+        }
+
+        let length = length_and_nullable[0].parse::<u32>();
+        let nullable = !parts.contains(&"NOT");
+
+        Ok(VarCharType {
+            nullable,
+            length: length.unwrap(),
+        })
     }
 }
 
@@ -1075,14 +1384,44 @@ mod serde_utils {
         const NAME: &'static str;
     }
 
+    pub struct ARRAY;
+    impl DataTypeName for ARRAY {
+        const NAME: &'static str = "ARRAY";
+    }
+
+    pub struct BIGINT;
+    impl DataTypeName for BIGINT {
+        const NAME: &'static str = "BIGINT";
+    }
+
     pub struct BOOLEAN;
     impl DataTypeName for BOOLEAN {
         const NAME: &'static str = "BOOLEAN";
     }
 
-    pub struct ARRAY;
-    impl DataTypeName for ARRAY {
-        const NAME: &'static str = "ARRAY";
+    pub struct BINARY;
+    impl DataTypeName for BINARY {
+        const NAME: &'static str = "BINARY";
+    }
+
+    pub struct VARBINARY;
+    impl DataTypeName for VARBINARY {
+        const NAME: &'static str = "VARBINARY";
+    }
+
+    pub struct CHAR;
+    impl DataTypeName for CHAR {
+        const NAME: &'static str = "CHAR";
+    }
+
+    pub struct VARCHAR;
+    impl DataTypeName for VARCHAR {
+        const NAME: &'static str = "VARCHAR";
+    }
+
+    pub struct DECIMAL;
+    impl DataTypeName for DECIMAL {
+        const NAME: &'static str = "DECIMAL";
     }
 
     pub struct DATE;
@@ -1105,14 +1444,19 @@ mod serde_utils {
         const NAME: &'static str = "INT";
     }
 
-    pub struct BIGINT;
-    impl DataTypeName for BIGINT {
-        const NAME: &'static str = "BIGINT";
-    }
-
     pub struct SMALLINT;
     impl DataTypeName for SMALLINT {
         const NAME: &'static str = "SMALLINT";
+    }
+
+    pub struct TIME;
+    impl DataTypeName for TIME {
+        const NAME: &'static str = "TIME";
+    }
+
+    pub struct TIMESTAMP;
+    impl DataTypeName for TIMESTAMP {
+        const NAME: &'static str = "TIMESTAMP";
     }
 
     pub struct TINYINT;
@@ -1175,14 +1519,15 @@ mod serde_utils {
         {
             let s = String::deserialize(deserializer)?;
 
-            let (name, nullable) = s.split_once(" ").unwrap_or((s.as_str(), ""));
+            let (name, nullable) = s.split_once(' ').unwrap_or((s.as_str(), ""));
 
             if name == T::NAME && nullable.is_empty() {
                 Ok(NullableType::from(true))
-            } else if name == T::NAME && nullable == "NOT NULL" {
+            } else if name == T::NAME && nullable.contains("NOT") {
                 Ok(NullableType::from(false))
             } else {
                 let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
+
                 Err(serde::de::Error::invalid_value(
                     serde::de::Unexpected::Str(s.as_str()),
                     &expect.as_str(),
@@ -1231,21 +1576,20 @@ mod tests {
                 "bigint_type_nullable",
                 DataType::BigInt(BigIntType { nullable: true }),
             ),
-            // FIXME: binary doesn't implement deserialize.
-            // (
-            //     "binary_type",
-            //     DataType::Binary(BinaryType {
-            //         nullable: false,
-            //         length: 22,
-            //     }),
-            // ),
-            // (
-            //     "binary_type_nullable",
-            //     DataType::Binary(BinaryType {
-            //         nullable: true,
-            //         length: 22,
-            //     }),
-            // ),
+            (
+                "binary_type",
+                DataType::Binary(BinaryType {
+                    nullable: false,
+                    length: 22,
+                }),
+            ),
+            (
+                "binary_type_nullable",
+                DataType::Binary(BinaryType {
+                    nullable: true,
+                    length: 22,
+                }),
+            ),
             (
                 "boolean_type",
                 DataType::Boolean(BooleanType { nullable: false }),
@@ -1254,43 +1598,41 @@ mod tests {
                 "boolean_type_nullable",
                 DataType::Boolean(BooleanType { nullable: true }),
             ),
-            // FIXME: binary doesn't implement deserialize.
-            // (
-            //     "char_type",
-            //     DataType::Char(CharType {
-            //         nullable: false,
-            //         length: 33,
-            //     }),
-            // ),
-            // (
-            //     "char_type_nullable",
-            //     DataType::Char(CharType {
-            //         nullable: true,
-            //         length: 33,
-            //     }),
-            // ),
+            (
+                "char_type",
+                DataType::Char(CharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "char_type_nullable",
+                DataType::Char(CharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
             ("date_type", DataType::Date(DateType { nullable: false })),
             (
                 "date_type_nullable",
                 DataType::Date(DateType { nullable: true }),
             ),
-            // FIXME: DecimalType serialize failed.
-            // (
-            //     "decimal_type",
-            //     DataType::Decimal(DecimalType {
-            //         nullable: false,
-            //         precision: 10,
-            //         scale: 2,
-            //     }),
-            // ),
-            // (
-            //     "decimal_type_nullable",
-            //     DataType::Decimal(DecimalType {
-            //         nullable: true,
-            //         precision: 10,
-            //         scale: 2,
-            //     }),
-            // ),
+            (
+                "decimal_type",
+                DataType::Decimal(DecimalType {
+                    nullable: false,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
+            (
+                "decimal_type_nullable",
+                DataType::Decimal(DecimalType {
+                    nullable: true,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
             (
                 "double_type",
                 DataType::Double(DoubleType { nullable: false }),
@@ -1309,22 +1651,20 @@ mod tests {
                 "int_type_nullable",
                 DataType::Int(IntType { nullable: true }),
             ),
-            // FIXME: LocalZonedTimestampType serialize failed.
-            // (
-            //     "local_zoned_timestamp_type",
-            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
-            //         nullable: false,
-            //         precision: 3,
-            //     }),
-            // ),
-            // (
-            //     "local_zoned_timestamp_type_nullable",
-            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
-            //         nullable: true,
-            //         precision: 3,
-            //     }),
-            // ),
-            // FIXME: VarCharType doesn't support deserialize.
+            (
+                "local_zoned_timestamp_type",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: false,
+                    precision: 3,
+                }),
+            ),
+            (
+                "local_zoned_timestamp_type_nullable",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: true,
+                    precision: 3,
+                }),
+            ),
             // (
             //     "map_type",
             //     DataType::Map(MapType {
@@ -1363,7 +1703,6 @@ mod tests {
                     element_type: DataType::Int(IntType { nullable: true }).into(),
                 }),
             ),
-            // FIXME: VarChar doesn't support deserialize.
             // (
             //     "row_type",
             //     DataType::Row(RowType {
@@ -1406,21 +1745,20 @@ mod tests {
                 "smallint_type_nullable",
                 DataType::SmallInt(SmallIntType { nullable: true }),
             ),
-            // FIXME: time and timestamp doesn't implement deserialize.
-            // (
-            //     "time_type",
-            //     DataType::Time(TimeType {
-            //         nullable: false,
-            //         precision: 9,
-            //     }),
-            // ),
-            // (
-            //     "time_type_nullable",
-            //     DataType::Time(TimeType {
-            //         nullable: true,
-            //         precision: 0,
-            //     }),
-            // ),
+            (
+                "time_type",
+                DataType::Time(TimeType {
+                    nullable: false,
+                    precision: 9,
+                }),
+            ),
+            (
+                "time_type_nullable",
+                DataType::Time(TimeType {
+                    nullable: true,
+                    precision: 0,
+                }),
+            ),
             // (
             //     "timestamp_type",
             //     DataType::Timestamp(TimestampType {
@@ -1443,7 +1781,6 @@ mod tests {
                 "tinyint_type_nullable",
                 DataType::TinyInt(TinyIntType { nullable: true }),
             ),
-            // FIXME: varbinary & varchar doesn't implement deserialize.
             // (
             //     "varbinary_type",
             //     DataType::VarBinary(VarBinaryType {
@@ -1503,5 +1840,156 @@ mod tests {
 
             assert_eq!(actual, expect, "test data type deserialize for {name}")
         }
+    }
+
+    #[test]
+    fn test_data_type_deserialize2() {
+        // let map_type_test = vec![
+        //     (
+        //         "map_type",
+        //         MapType {
+        //             nullable: false,
+        //             key_type: DataType::VarChar(VarCharType {
+        //                 nullable: true,
+        //                 length: 20,
+        //             })
+        //             .into(),
+        //             value_type: DataType::Int(IntType { nullable: false }).into(),
+        //         },
+        //     ),
+        //     (
+        //         "map_type_nullable",
+        //         MapType {
+        //             nullable: true,
+        //             key_type: DataType::VarChar(VarCharType {
+        //                 nullable: true,
+        //                 length: 20,
+        //             })
+        //             .into(),
+        //             value_type: DataType::Int(IntType { nullable: true }).into(),
+        //         },
+        //     ),
+        // ];
+
+        // let row_type_test = vec![
+        //     (
+        //         "row_type",
+        //         RowType {
+        //             nullable: false,
+        //             fields: vec![
+        //                 DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
+        //                 DataField::new(
+        //                     1,
+        //                     "b".into(),
+        //                     DataType::VarChar(VarCharType {
+        //                         nullable: false,
+        //                         length: 20,
+        //                     }),
+        //                 ),
+        //             ],
+        //         },
+        //     ),
+        //     (
+        //         "row_type_nullable",
+        //         RowType {
+        //             nullable: true,
+        //             fields: vec![
+        //                 DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
+        //                 DataField::new(
+        //                     1,
+        //                     "b".into(),
+        //                     DataType::VarChar(VarCharType {
+        //                         nullable: true,
+        //                         length: 20,
+        //                     }),
+        //                 ),
+        //             ],
+        //         },
+        //     ),
+        // ];
+
+        let timestamp_type_test = vec![
+            (
+                "timestamp_type",
+                TimestampType {
+                    nullable: false,
+                    precision: 6,
+                },
+            ),
+            (
+                "timestamp_type_nullable",
+                TimestampType {
+                    nullable: true,
+                    precision: 6,
+                },
+            ),
+        ];
+
+        let varbinary_type_test = vec![
+            (
+                "varbinary_type",
+                VarBinaryType {
+                    nullable: false,
+                    length: 233,
+                },
+            ),
+            (
+                "varbinary_type_nullable",
+                VarBinaryType {
+                    nullable: true,
+                    length: 233,
+                },
+            ),
+        ];
+
+        let varchar_type_test = vec![
+            (
+                "varchar_type",
+                VarCharType {
+                    nullable: false,
+                    length: 33,
+                },
+            ),
+            (
+                "varchar_type_nullable",
+                VarCharType {
+                    nullable: true,
+                    length: 33,
+                },
+            ),
+        ];
+
+        for (name, expect) in varchar_type_test {
+            let actual = serde_json::from_str::<VarCharType>(&load_fixture(name))
+                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
+
+            assert_eq!(actual, expect, "test data type deserialize for {name}")
+        }
+
+        for (name, expect) in timestamp_type_test {
+            let actual = serde_json::from_str::<TimestampType>(&load_fixture(name))
+                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
+
+            assert_eq!(actual, expect, "test data type deserialize for {name}")
+        }
+
+        for (name, expect) in varbinary_type_test {
+            let actual = serde_json::from_str::<VarBinaryType>(&load_fixture(name))
+                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
+
+            assert_eq!(actual, expect, "test data type deserialize for {name}")
+        }
+
+        // for (name, expect) in map_type_test {
+        //     let actual = serde_json::from_str::<MapType>(&load_fixture(name)).unwrap();
+
+        //     assert_eq!(actual, expect, "test data type deserialize for {name}")
+        // }
+
+        // for (name, expect) in row_type_test {
+        //     let actual = serde_json::from_str::<RowType>(&load_fixture(name)).unwrap();
+
+        //     assert_eq!(actual, expect, "test data type deserialize for {name}")
+        // }
     }
 }
