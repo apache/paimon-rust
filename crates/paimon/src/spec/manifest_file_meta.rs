@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 /// Metadata of a manifest file.
@@ -24,6 +23,9 @@ use std::fmt::{Display, Formatter};
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFileMeta.java>
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFileMeta {
+    #[serde(rename = "_VERSION")]
+    version: i32,
+
     /// manifest file name
     #[serde(rename = "_FILE_NAME")]
     file_name: String,
@@ -84,6 +86,12 @@ impl ManifestFileMeta {
     pub fn schema_id(&self) -> i64 {
         self.schema_id
     }
+
+    /// Get the version of this manifest file
+    #[inline]
+    pub fn version(&self) -> i32 {
+        self.version
+    }
 }
 
 impl Display for ManifestFileMeta {
@@ -117,11 +125,7 @@ pub struct BinaryTableStats {
     max_values: Vec<u8>,
 
     /// the number of nulls of the columns
-    #[serde(
-        rename = "_NULL_COUNTS",
-        serialize_with = "serialize_null_counts",
-        deserialize_with = "deserialize_null_counts"
-    )]
+    #[serde(rename = "_NULL_COUNTS")]
     null_counts: Vec<i64>,
 }
 
@@ -149,34 +153,4 @@ impl Display for BinaryTableStats {
     fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
-}
-
-fn serialize_null_counts<S>(value: &Vec<i64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut bytes = Vec::new();
-    for &num in value {
-        bytes.extend_from_slice(&num.to_le_bytes());
-    }
-
-    let bytes = Bytes::new(bytes.as_slice());
-    serializer.serialize_bytes(bytes)
-}
-
-fn deserialize_null_counts<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let bytes = Deserialize::deserialize(deserializer).map(Bytes::new)?;
-
-    let size_of_i64 = std::mem::size_of::<i64>();
-    let i64_count = bytes.len() / size_of_i64;
-    let mut i64s = Vec::with_capacity(i64_count);
-    for chunk in bytes.chunks_exact(size_of_i64) {
-        i64s.push(i64::from_le_bytes(
-            chunk.try_into().expect("Chunk must be 8 bytes long"),
-        ));
-    }
-    Ok(i64s)
 }
