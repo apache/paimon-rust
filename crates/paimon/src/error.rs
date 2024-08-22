@@ -17,6 +17,8 @@
 
 use snafu::prelude::*;
 
+use crate::catalog::Identifier;
+
 /// Result type used in paimon.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -52,6 +54,36 @@ pub enum Error {
         display("Paimon hitting invalid config: {}", message)
     )]
     ConfigInvalid { message: String },
+
+    #[snafu(display("Database {} is not empty.", database))]
+    DatabaseNotEmpty { database: String },
+
+    #[snafu(display("Database {} already exists.", database))]
+    DatabaseAlreadyExist { database: String },
+
+    #[snafu(display("Database {} does not exist.", database))]
+    DatabaseNotExist { database: String },
+
+    #[snafu(display("Can't do operation on system database."))]
+    ProcessSystemDatabase,
+
+    #[snafu(display("Table {} already exists.", identifier.full_name()))]
+    TableAlreadyExist { identifier: Identifier },
+
+    #[snafu(display("Table {} does not exist.", identifier.full_name()))]
+    TableNotExist { identifier: Identifier },
+
+    #[snafu(display("Partition {} do not exist in the table {}.", identifier.full_name(), partitions))]
+    PartitionNotExist {
+        identifier: Identifier,
+        partitions: String,
+    },
+
+    #[snafu(display("Column {} already exists.", column_name))]
+    ColumnAlreadyExist { column_name: String },
+
+    #[snafu(display("Column {} does not exist.", column_name))]
+    ColumnNotExist { column_name: String },
 }
 
 impl From<opendal::Error> for Error {
