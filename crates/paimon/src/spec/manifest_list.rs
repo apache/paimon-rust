@@ -85,11 +85,11 @@ mod tests {
         assert_eq!(res.entries().len(), 2);
         assert_eq!(
             res.entries().first().unwrap().file_name(),
-            "manifest-0d7f646b-ae34-44ae-a60d-940aef93cbeb"
+            "manifest-7ff677cc-46c0-497d-8feb-1c6785707a4b"
         );
         assert_eq!(res.entries().first().unwrap().version(), 2);
-        assert_eq!(res.entries().first().unwrap().file_size(), 700);
-        assert_eq!(res.entries().first().unwrap().num_added_files(), 7);
+        assert_eq!(res.entries().first().unwrap().file_size(), 100);
+        assert_eq!(res.entries().first().unwrap().num_added_files(), 1);
         assert_eq!(res.entries().first().unwrap().num_deleted_files(), 0);
         assert_eq!(res.entries().first().unwrap().schema_id(), 0);
         // todo verify the max value, min value
@@ -117,12 +117,12 @@ mod tests {
 
         assert_eq!(
             res.entries().get(1).unwrap().file_name(),
-            "manifest-88fe5442-3374-4385-a08f-022abd823a27"
+            "manifest-0452c830-473e-4da4-b7d5-9b94da8ace8e"
         );
         assert_eq!(res.entries().get(1).unwrap().version(), 2);
-        assert_eq!(res.entries().get(1).unwrap().file_size(), 600);
-        assert_eq!(res.entries().get(1).unwrap().num_added_files(), 6);
-        assert_eq!(res.entries().get(1).unwrap().num_deleted_files(), 0);
+        assert_eq!(res.entries().get(1).unwrap().file_size(), 500);
+        assert_eq!(res.entries().get(1).unwrap().num_added_files(), 0);
+        assert_eq!(res.entries().get(1).unwrap().num_deleted_files(), 5);
         assert_eq!(res.entries().get(1).unwrap().schema_id(), 0);
         assert!(!res
             .entries()
