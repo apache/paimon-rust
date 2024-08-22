@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-/// List of manifest file.
+/// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
 pub struct ManifestList {
     entries: Vec<ManifestFileMeta>,
 }
@@ -44,7 +44,6 @@ impl ManifestList {
     }
 }
 
-/// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
 pub struct ManifestListFactory {
     file_io: FileIO,
 }
