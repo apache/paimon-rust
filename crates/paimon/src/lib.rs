@@ -19,5 +19,6 @@ mod error;
 pub use error::Error;
 pub use error::Result;
 
+pub mod catalog;
 pub mod io;
 pub mod spec;

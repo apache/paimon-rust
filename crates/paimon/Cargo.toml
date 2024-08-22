@@ -34,8 +34,8 @@ storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 
 [dependencies]
+async-trait = "0.1"
 url = "2.5.2"
-async-trait = "0.1.81"
 bytes = "1.7.1"
 bitflags = "2.6.0"
 tokio = { version = "1.39.2", features = ["macros"] }
