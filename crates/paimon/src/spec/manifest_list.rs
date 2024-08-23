@@ -22,7 +22,7 @@ use apache_avro::types::Value;
 use apache_avro::{from_value, Reader};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 /// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
 pub struct ManifestList {
