@@ -205,13 +205,6 @@ impl FileIOBuilder {
         }
     }
 
-    pub fn new_fs_io_builder() -> Self {
-        Self {
-            scheme_str: None,
-            props: HashMap::default(),
-        }
-    }
-
     pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
         (self.scheme_str.unwrap_or_default(), self.props)
     }
@@ -246,11 +239,7 @@ pub trait FileRead: Send + Unpin + 'static {
 #[async_trait::async_trait]
 impl FileRead for opendal::Reader {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        // TODO: build a error type
-        Ok(opendal::Reader::read(self, range)
-            .await
-            .expect("read error")
-            .to_bytes())
+        Ok(opendal::Reader::read(self, range).await?.to_bytes())
     }
 }
 
@@ -323,7 +312,7 @@ impl InputFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OutputFile {
     op: Operator,
     path: String,
@@ -386,7 +375,9 @@ mod file_action_test {
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let status = file_io.get_status(path).await.unwrap();
         assert_eq!(status.size, 11);
@@ -396,7 +387,9 @@ mod file_action_test {
 
     async fn common_test_exists(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let exists = file_io.exists(path).await.unwrap();
         assert!(exists);
@@ -406,7 +399,9 @@ mod file_action_test {
 
     async fn common_test_delete_file(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         file_io.delete_file(path).await.unwrap();
 
@@ -425,7 +420,9 @@ mod file_action_test {
 
     async fn common_test_rename(file_io: &FileIO, src: &str, dst: &str) {
         let output = file_io.new_output(src).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         file_io.rename(src, dst).await.unwrap();
 
@@ -500,7 +497,9 @@ mod input_output_test {
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let input = output.to_input_file();
         let content = input.read().await.unwrap();
@@ -512,7 +511,9 @@ mod input_output_test {
 
     async fn common_test_output_file_exists(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let exists = output.exists().await.unwrap();
         assert!(exists);
@@ -522,7 +523,9 @@ mod input_output_test {
 
     async fn common_test_input_file_metadata(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let input = output.to_input_file();
         let metadata = input.metadata().await.unwrap();
@@ -534,11 +537,13 @@ mod input_output_test {
 
     async fn common_test_input_file_partial_read(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
-        output.write(Bytes::from("hello world")).await.unwrap();
+        let mut writer = output.writer().await.unwrap();
+        writer.write(Bytes::from("hello world")).await.unwrap();
+        writer.close().await.unwrap();
 
         let input = output.to_input_file();
         let reader = input.reader().await.unwrap();
-        let partial_content = reader.read(0..5).await.unwrap(); // 读取 "hello"
+        let partial_content = reader.read(0..5).await.unwrap(); // read "hello"
 
         assert_eq!(&partial_content[..], b"hello");
 

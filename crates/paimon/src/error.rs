@@ -52,6 +52,11 @@ pub enum Error {
         display("Paimon hitting invalid config: {}", message)
     )]
     ConfigInvalid { message: String },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting invalid file index format: {}", message)
+    )]
+    FileIndexFormatInvalid { message: String },
 }
 
 impl From<opendal::Error> for Error {

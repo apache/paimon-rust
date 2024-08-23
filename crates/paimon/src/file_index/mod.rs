@@ -15,10 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
-
-pub mod file_index;
-pub mod io;
-pub mod spec;
+mod file_index_format;
+pub use file_index_format::*;

@@ -48,3 +48,6 @@ snafu = "0.8.3"
 typed-builder = "^0.19"
 opendal = { version = "0.48",features = ["services-fs"] }
 pretty_assertions = "1"
+
+[dev-dependencies]
+rand = "0.8.5"
