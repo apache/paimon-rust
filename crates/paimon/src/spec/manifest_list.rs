@@ -71,7 +71,7 @@ impl ManifestListFactory {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::ManifestList;
+    use crate::spec::{BinaryTableStats, ManifestFileMeta, ManifestList};
 
     #[tokio::test]
     async fn test_read_manifest_list() {
@@ -81,68 +81,31 @@ mod tests {
             .join("tests/fixtures/manifest/manifest-list-5c7399a0-46ae-4a5e-9c13-3ab07212cdb6-0");
         let v = std::fs::read(path.to_str().unwrap()).unwrap();
         let res = ManifestList::from_avro_bytes(&v).unwrap();
-        assert_eq!(res.entries().len(), 2);
+        let value_bytes = vec![
+            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129,
+        ];
         assert_eq!(
-            res.entries().first().unwrap().file_name(),
-            "manifest-7ff677cc-46c0-497d-8feb-1c6785707a4b"
+            res,
+            ManifestList {
+                entries: vec![
+                    ManifestFileMeta::new(
+                        "manifest-19d138df-233f-46f7-beb6-fadaf4741c0e".to_string(),
+                        10,
+                        10,
+                        10,
+                        BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                        1
+                    ),
+                    ManifestFileMeta::new(
+                        "manifest-a703ee48-c411-413e-b84e-c03bdb179631".to_string(),
+                        11,
+                        0,
+                        10,
+                        BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                        2
+                    )
+                ],
+            }
         );
-        assert_eq!(res.entries().first().unwrap().version(), 2);
-        assert_eq!(res.entries().first().unwrap().file_size(), 100);
-        assert_eq!(res.entries().first().unwrap().num_added_files(), 1);
-        assert_eq!(res.entries().first().unwrap().num_deleted_files(), 0);
-        assert_eq!(res.entries().first().unwrap().schema_id(), 0);
-        // todo verify the max value, min value
-        assert!(!res
-            .entries()
-            .first()
-            .unwrap()
-            .partition_stats()
-            .max_values()
-            .is_empty());
-        assert!(!res
-            .entries()
-            .first()
-            .unwrap()
-            .partition_stats()
-            .min_values()
-            .is_empty());
-        assert!(!res
-            .entries()
-            .first()
-            .unwrap()
-            .partition_stats()
-            .null_counts()
-            .is_empty());
-
-        assert_eq!(
-            res.entries().get(1).unwrap().file_name(),
-            "manifest-0452c830-473e-4da4-b7d5-9b94da8ace8e"
-        );
-        assert_eq!(res.entries().get(1).unwrap().version(), 2);
-        assert_eq!(res.entries().get(1).unwrap().file_size(), 500);
-        assert_eq!(res.entries().get(1).unwrap().num_added_files(), 0);
-        assert_eq!(res.entries().get(1).unwrap().num_deleted_files(), 5);
-        assert_eq!(res.entries().get(1).unwrap().schema_id(), 0);
-        assert!(!res
-            .entries()
-            .get(1)
-            .unwrap()
-            .partition_stats()
-            .max_values()
-            .is_empty());
-        assert!(!res
-            .entries()
-            .get(1)
-            .unwrap()
-            .partition_stats()
-            .min_values()
-            .is_empty());
-        assert!(!res
-            .entries()
-            .get(1)
-            .unwrap()
-            .partition_stats()
-            .null_counts()
-            .is_empty());
     }
 }

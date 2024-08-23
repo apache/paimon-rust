@@ -92,6 +92,26 @@ impl ManifestFileMeta {
     pub fn version(&self) -> i32 {
         self.version
     }
+
+    #[inline]
+    pub fn new(
+        file_name: String,
+        file_size: i64,
+        num_added_files: i64,
+        num_deleted_files: i64,
+        partition_stats: BinaryTableStats,
+        schema_id: i64,
+    ) -> ManifestFileMeta {
+        Self {
+            version: 2,
+            file_name,
+            file_size,
+            num_added_files,
+            num_deleted_files,
+            partition_stats,
+            schema_id,
+        }
+    }
 }
 
 impl Display for ManifestFileMeta {
@@ -146,6 +166,18 @@ impl BinaryTableStats {
     #[inline]
     pub fn null_counts(&self) -> &Vec<i64> {
         &self.null_counts
+    }
+
+    pub fn new(
+        min_values: Vec<u8>,
+        max_values: Vec<u8>,
+        null_counts: Vec<i64>,
+    ) -> BinaryTableStats {
+        Self {
+            min_values,
+            max_values,
+            null_counts,
+        }
     }
 }
 

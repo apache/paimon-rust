@@ -56,7 +56,7 @@ pub enum Error {
         visibility(pub(crate)),
         display("Paimon hitting unexpected avro error {}: {:?}", message, source)
     )]
-    AvroFailed {
+    DataUnexpected {
         message: String,
         source: apache_avro::Error,
     },
@@ -74,7 +74,7 @@ impl From<opendal::Error> for Error {
 
 impl From<apache_avro::Error> for Error {
     fn from(source: apache_avro::Error) -> Self {
-        Error::AvroFailed {
+        Error::DataUnexpected {
             message: "".to_string(),
             source,
         }
