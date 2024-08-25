@@ -44,7 +44,7 @@ pub struct Snapshot {
     /// version of snapshot
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<i32>,
+    version: i32,
     id: i64,
     schema_id: i64,
     /// a manifest list recording all changes from the previous snapshots
@@ -99,7 +99,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Get the version of this snapshot.
     #[inline]
-    pub fn version(&self) -> Option<i32> {
+    pub fn version(&self) -> i32 {
         self.version
     }
 
@@ -215,7 +215,7 @@ mod tests {
             (
                 "snapshot-v3",
                 Snapshot::builder()
-                    .version(Some(3))
+                    .version(3)
                     .id(2)
                     .schema_id(0)
                     .base_manifest_list(
@@ -241,7 +241,7 @@ mod tests {
             (
                 "snapshot-v3-none-field",
                 Snapshot::builder()
-                    .version(Some(3))
+                    .version(3)
                     .id(2)
                     .schema_id(0)
                     .base_manifest_list(
