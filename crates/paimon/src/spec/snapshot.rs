@@ -42,8 +42,6 @@ pub enum CommitKind {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     /// version of snapshot
-    #[builder(default = None)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     version: i32,
     id: i64,
     schema_id: i64,
