@@ -1668,7 +1668,7 @@ mod tests {
                 "local_zoned_timestamp_type_nullable",
                 DataType::LocalZonedTimestamp(LocalZonedTimestampType {
                     nullable: true,
-                    precision: 3,
+                    precision: 6,
                 }),
             ),
             (
