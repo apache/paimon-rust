@@ -232,7 +232,7 @@ impl FromStr for BinaryType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::BINARY::NAME) {
+        if !parts[0].starts_with(serde_utils::BINARY::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid BINARY type.".to_string(),
             }
@@ -361,7 +361,7 @@ impl FromStr for CharType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::CHAR::NAME) {
+        if !parts[0].starts_with(serde_utils::CHAR::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid CHAR type.".to_string(),
             }
@@ -493,7 +493,7 @@ impl FromStr for DecimalType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split(|c: char| c == '(' || c == ')').collect();
 
-        if !parts[0].contains(serde_utils::DECIMAL::NAME) {
+        if !parts[0].starts_with(serde_utils::DECIMAL::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid DECIMAL type.".to_string(),
             }
@@ -721,7 +721,8 @@ impl FromStr for LocalZonedTimestampType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::TIMESTAMP::NAME) {
+        if !parts[0].starts_with(serde_utils::LocalZonedTimestamp::NAME) || !parts.contains(&"WITH")
+        {
             return DataTypeInvalidSnafu {
                 message: "Invalid TIMESTAMP type.".to_string(),
             }
@@ -865,7 +866,7 @@ impl FromStr for TimeType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::TIME::NAME) {
+        if !parts[0].starts_with(serde_utils::TIME::NAME) || parts[0].contains("STAMP") {
             return DataTypeInvalidSnafu {
                 message: "Invalid TIME type.".to_string(),
             }
@@ -969,7 +970,7 @@ impl FromStr for TimestampType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::TIMESTAMP::NAME) {
+        if !parts[0].starts_with(serde_utils::TIMESTAMP::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid TIMESTAMP type.".to_string(),
             }
@@ -1109,7 +1110,7 @@ impl FromStr for VarBinaryType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::VARBINARY::NAME) {
+        if !parts[0].starts_with(serde_utils::VARBINARY::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid VARBINARY type.".to_string(),
             }
@@ -1206,7 +1207,7 @@ impl FromStr for VarCharType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].contains(serde_utils::VARCHAR::NAME) {
+        if !parts[0].starts_with(serde_utils::VARCHAR::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid VARCHAR type.".to_string(),
             }
@@ -1459,6 +1460,11 @@ mod serde_utils {
         const NAME: &'static str = "TIMESTAMP";
     }
 
+    pub struct LocalZonedTimestamp;
+    impl DataTypeName for LocalZonedTimestamp {
+        const NAME: &'static str = "TIMESTAMP";
+    }
+
     pub struct TINYINT;
     impl DataTypeName for TINYINT {
         const NAME: &'static str = "TINYINT";
@@ -1665,30 +1671,30 @@ mod tests {
                     precision: 3,
                 }),
             ),
-            // (
-            //     "map_type",
-            //     DataType::Map(MapType {
-            //         nullable: false,
-            //         key_type: DataType::VarChar(VarCharType {
-            //             nullable: true,
-            //             length: 20,
-            //         })
-            //         .into(),
-            //         value_type: DataType::Int(IntType { nullable: false }).into(),
-            //     }),
-            // ),
-            // (
-            //     "map_type_nullable",
-            //     DataType::Map(MapType {
-            //         nullable: true,
-            //         key_type: DataType::VarChar(VarCharType {
-            //             nullable: true,
-            //             length: 20,
-            //         })
-            //         .into(),
-            //         value_type: DataType::Int(IntType { nullable: true }).into(),
-            //     }),
-            // ),
+            (
+                "map_type",
+                DataType::Map(MapType {
+                    nullable: false,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: false }).into(),
+                }),
+            ),
+            (
+                "map_type_nullable",
+                DataType::Map(MapType {
+                    nullable: true,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: true }).into(),
+                }),
+            ),
             (
                 "multiset_type",
                 DataType::Multiset(MultisetType {
@@ -1703,40 +1709,40 @@ mod tests {
                     element_type: DataType::Int(IntType { nullable: true }).into(),
                 }),
             ),
-            // (
-            //     "row_type",
-            //     DataType::Row(RowType {
-            //         nullable: false,
-            //         fields: vec![
-            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
-            //             DataField::new(
-            //                 1,
-            //                 "b".into(),
-            //                 DataType::VarChar(VarCharType {
-            //                     nullable: false,
-            //                     length: 20,
-            //                 }),
-            //             ),
-            //         ],
-            //     }),
-            // ),
-            // (
-            //     "row_type_nullable",
-            //     DataType::Row(RowType {
-            //         nullable: true,
-            //         fields: vec![
-            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
-            //             DataField::new(
-            //                 1,
-            //                 "b".into(),
-            //                 DataType::VarChar(VarCharType {
-            //                     nullable: true,
-            //                     length: 20,
-            //                 }),
-            //             ),
-            //         ],
-            //     }),
-            // ),
+            (
+                "row_type",
+                DataType::Row(RowType {
+                    nullable: false,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: false,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
+            (
+                "row_type_nullable",
+                DataType::Row(RowType {
+                    nullable: true,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: true,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
             (
                 "smallint_type",
                 DataType::SmallInt(SmallIntType { nullable: false }),
@@ -1759,20 +1765,20 @@ mod tests {
                     precision: 0,
                 }),
             ),
-            // (
-            //     "timestamp_type",
-            //     DataType::Timestamp(TimestampType {
-            //         nullable: false,
-            //         precision: 6,
-            //     }),
-            // ),
-            // (
-            //     "timestamp_type_nullable",
-            //     DataType::Timestamp(TimestampType {
-            //         nullable: true,
-            //         precision: 6,
-            //     }),
-            // ),
+            (
+                "timestamp_type",
+                DataType::Timestamp(TimestampType {
+                    nullable: false,
+                    precision: 6,
+                }),
+            ),
+            (
+                "timestamp_type_nullable",
+                DataType::Timestamp(TimestampType {
+                    nullable: true,
+                    precision: 6,
+                }),
+            ),
             (
                 "tinyint_type",
                 DataType::TinyInt(TinyIntType { nullable: false }),
@@ -1781,34 +1787,34 @@ mod tests {
                 "tinyint_type_nullable",
                 DataType::TinyInt(TinyIntType { nullable: true }),
             ),
-            // (
-            //     "varbinary_type",
-            //     DataType::VarBinary(VarBinaryType {
-            //         nullable: false,
-            //         length: 233,
-            //     }),
-            // ),
-            // (
-            //     "varbinary_type_nullable",
-            //     DataType::VarBinary(VarBinaryType {
-            //         nullable: true,
-            //         length: 233,
-            //     }),
-            // ),
-            // (
-            //     "varchar_type",
-            //     DataType::VarChar(VarCharType {
-            //         nullable: false,
-            //         length: 33,
-            //     }),
-            // ),
-            // (
-            //     "varchar_type_nullable",
-            //     DataType::VarChar(VarCharType {
-            //         nullable: true,
-            //         length: 33,
-            //     }),
-            // ),
+            (
+                "varbinary_type",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: false,
+                    length: 233,
+                }),
+            ),
+            (
+                "varbinary_type_nullable",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: true,
+                    length: 233,
+                }),
+            ),
+            (
+                "varchar_type",
+                DataType::VarChar(VarCharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "varchar_type_nullable",
+                DataType::VarChar(VarCharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
         ]
     }
 
@@ -1840,156 +1846,5 @@ mod tests {
 
             assert_eq!(actual, expect, "test data type deserialize for {name}")
         }
-    }
-
-    #[test]
-    fn test_data_type_deserialize2() {
-        // let map_type_test = vec![
-        //     (
-        //         "map_type",
-        //         MapType {
-        //             nullable: false,
-        //             key_type: DataType::VarChar(VarCharType {
-        //                 nullable: true,
-        //                 length: 20,
-        //             })
-        //             .into(),
-        //             value_type: DataType::Int(IntType { nullable: false }).into(),
-        //         },
-        //     ),
-        //     (
-        //         "map_type_nullable",
-        //         MapType {
-        //             nullable: true,
-        //             key_type: DataType::VarChar(VarCharType {
-        //                 nullable: true,
-        //                 length: 20,
-        //             })
-        //             .into(),
-        //             value_type: DataType::Int(IntType { nullable: true }).into(),
-        //         },
-        //     ),
-        // ];
-
-        // let row_type_test = vec![
-        //     (
-        //         "row_type",
-        //         RowType {
-        //             nullable: false,
-        //             fields: vec![
-        //                 DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
-        //                 DataField::new(
-        //                     1,
-        //                     "b".into(),
-        //                     DataType::VarChar(VarCharType {
-        //                         nullable: false,
-        //                         length: 20,
-        //                     }),
-        //                 ),
-        //             ],
-        //         },
-        //     ),
-        //     (
-        //         "row_type_nullable",
-        //         RowType {
-        //             nullable: true,
-        //             fields: vec![
-        //                 DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
-        //                 DataField::new(
-        //                     1,
-        //                     "b".into(),
-        //                     DataType::VarChar(VarCharType {
-        //                         nullable: true,
-        //                         length: 20,
-        //                     }),
-        //                 ),
-        //             ],
-        //         },
-        //     ),
-        // ];
-
-        let timestamp_type_test = vec![
-            (
-                "timestamp_type",
-                TimestampType {
-                    nullable: false,
-                    precision: 6,
-                },
-            ),
-            (
-                "timestamp_type_nullable",
-                TimestampType {
-                    nullable: true,
-                    precision: 6,
-                },
-            ),
-        ];
-
-        let varbinary_type_test = vec![
-            (
-                "varbinary_type",
-                VarBinaryType {
-                    nullable: false,
-                    length: 233,
-                },
-            ),
-            (
-                "varbinary_type_nullable",
-                VarBinaryType {
-                    nullable: true,
-                    length: 233,
-                },
-            ),
-        ];
-
-        let varchar_type_test = vec![
-            (
-                "varchar_type",
-                VarCharType {
-                    nullable: false,
-                    length: 33,
-                },
-            ),
-            (
-                "varchar_type_nullable",
-                VarCharType {
-                    nullable: true,
-                    length: 33,
-                },
-            ),
-        ];
-
-        for (name, expect) in varchar_type_test {
-            let actual = serde_json::from_str::<VarCharType>(&load_fixture(name))
-                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
-
-            assert_eq!(actual, expect, "test data type deserialize for {name}")
-        }
-
-        for (name, expect) in timestamp_type_test {
-            let actual = serde_json::from_str::<TimestampType>(&load_fixture(name))
-                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
-
-            assert_eq!(actual, expect, "test data type deserialize for {name}")
-        }
-
-        for (name, expect) in varbinary_type_test {
-            let actual = serde_json::from_str::<VarBinaryType>(&load_fixture(name))
-                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
-
-            assert_eq!(actual, expect, "test data type deserialize for {name}")
-        }
-
-        // for (name, expect) in map_type_test {
-        //     let actual = serde_json::from_str::<MapType>(&load_fixture(name)).unwrap();
-
-        //     assert_eq!(actual, expect, "test data type deserialize for {name}")
-        // }
-
-        // for (name, expect) in row_type_test {
-        //     let actual = serde_json::from_str::<RowType>(&load_fixture(name)).unwrap();
-
-        //     assert_eq!(actual, expect, "test data type deserialize for {name}")
-        // }
     }
 }
