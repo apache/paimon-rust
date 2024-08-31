@@ -541,13 +541,13 @@ impl FromStr for DecimalType {
             let precision = precision_str
                 .parse::<u32>()
                 .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL precision. Unable to parse precision as a usize."
+                    message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
                         .to_string(),
                 })?;
             let scale = scale_str
                 .parse::<u32>()
                 .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL scale. Unable to parse scale as a usize.".to_string(),
+                    message: "Invalid DECIMAL scale. Unable to parse scale as a u32.".to_string(),
                 })?;
             (precision, scale)
         } else {
@@ -555,7 +555,7 @@ impl FromStr for DecimalType {
             let precision = precision_str
                 .parse::<u32>()
                 .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL precision. Unable to parse precision as a usize."
+                    message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
                         .to_string(),
                 })?;
             (precision, DecimalType::DEFAULT_SCALE)
