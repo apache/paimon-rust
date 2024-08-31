@@ -1627,7 +1627,7 @@ mod serde_utils {
 
             if name == T::NAME && nullable.is_empty() {
                 Ok(NullableType::from(true))
-            } else if name == T::NAME && nullable.contains("NOT") {
+            } else if name == T::NAME && nullable.contains("NOT NULL") {
                 Ok(NullableType::from(false))
             } else {
                 let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
