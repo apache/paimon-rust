@@ -260,6 +260,7 @@ impl FromStr for BinaryType {
 
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
+            .trim()
             .parse::<usize>()
             .map_err(|_| Error::DataTypeInvalid {
                 message: "Invalid BINARY length. Unable to parse length as a usize.".to_string(),
@@ -395,6 +396,7 @@ impl FromStr for CharType {
 
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
+            .trim()
             .parse::<usize>()
             .map_err(|_| Error::DataTypeInvalid {
                 message: "Invalid CHAR length. Unable to parse length as a usize.".to_string(),
@@ -796,12 +798,14 @@ impl FromStr for LocalZonedTimestampType {
         }
 
         let precision_str = &s[open_bracket + 1..close_bracket];
-        let precision = precision_str
-            .parse::<u32>()
-            .map_err(|_| Error::DataTypeInvalid {
-                message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
-                    .to_string(),
-            })?;
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
+                        .to_string(),
+                })?;
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
 
@@ -950,11 +954,13 @@ impl FromStr for TimeType {
         }
 
         let precision_str = &s[open_bracket + 1..close_bracket];
-        let precision = precision_str
-            .parse::<u32>()
-            .map_err(|_| Error::DataTypeInvalid {
-                message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
-            })?;
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
+                })?;
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
 
@@ -1063,12 +1069,14 @@ impl FromStr for TimestampType {
         }
 
         let precision_str = &s[open_bracket + 1..close_bracket];
-        let precision = precision_str
-            .parse::<u32>()
-            .map_err(|_| Error::DataTypeInvalid {
-                message: "Invalid TIMESTAMP precision. Unable to parse precision as a u32."
-                    .to_string(),
-            })?;
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIMESTAMP precision. Unable to parse precision as a u32."
+                        .to_string(),
+                })?;
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
 
@@ -1214,6 +1222,7 @@ impl FromStr for VarBinaryType {
 
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
+            .trim()
             .parse::<u32>()
             .map_err(|_| Error::DataTypeInvalid {
                 message: "Invalid VARBINARY length. Unable to parse length as a u32.".to_string(),
@@ -1317,6 +1326,7 @@ impl FromStr for VarCharType {
 
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
+            .trim()
             .parse::<u32>()
             .map_err(|_| Error::DataTypeInvalid {
                 message: "Invalid VARCHAR length. Unable to parse length as a u32.".to_string(),
