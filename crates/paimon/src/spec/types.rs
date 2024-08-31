@@ -231,37 +231,43 @@ impl FromStr for BinaryType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::BINARY::NAME) {
+        if !s.starts_with(serde_utils::BINARY::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid BINARY type.".to_string(),
+                message: "Invalid BINARY type. Expected string to start with 'BINARY'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid BINARY specification.".to_string(),
+                message: "Invalid BINARY specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if length_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid BINARY length and nullable.".to_string(),
+                message: "Invalid BINARY specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY specification. Opening bracket appears after or at the same position as closing bracket.".to_string(),
+            }
+           .fail();
         }
 
-        let length = length_and_nullable[0].parse::<usize>();
-        let nullable = !parts.contains(&"NOT");
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid BINARY length. Unable to parse length as a usize.".to_string(),
+            })?;
 
-        Ok(BinaryType {
-            nullable,
-            length: length.unwrap(),
-        })
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(BinaryType { nullable, length })
     }
 }
 
@@ -360,37 +366,43 @@ impl FromStr for CharType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::CHAR::NAME) {
+        if !s.starts_with(serde_utils::CHAR::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid CHAR type.".to_string(),
+                message: "Invalid CHAR type. Expected string to start with 'CHAR'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid CHAR specification.".to_string(),
+                message: "Invalid CHAR specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if length_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid CHAR length and nullable.".to_string(),
+                message: "Invalid CHAR specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let length = length_and_nullable[0].parse::<usize>();
-        let nullable = !parts.contains(&"NOT");
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid CHAR length. Unable to parse length as a usize.".to_string(),
+            })?;
 
-        Ok(CharType {
-            nullable,
-            length: length.unwrap(),
-        })
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(CharType { nullable, length })
     }
 }
 
@@ -491,26 +503,61 @@ impl FromStr for DecimalType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(|c: char| c == '(' || c == ')').collect();
-
-        if !parts[0].starts_with(serde_utils::DECIMAL::NAME) {
+        if !s.starts_with(serde_utils::DECIMAL::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid DECIMAL type.".to_string(),
+                message: "Invalid DECIMAL type. Expected string to start with 'DECIMAL'.",
             }
             .fail();
         }
 
-        let precision_and_scale: Vec<&str> = parts[1].split(',').collect::<Vec<&str>>();
-        if precision_and_scale.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid DECIMAL precision and scale.".to_string(),
+                message: "Invalid DECIMAL specification. Missing opening bracket.",
             }
             .fail();
+        };
+        let Some(close_bracket) = s.find(')') else {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL specification. Missing closing bracket.",
+            }
+            .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let precision = precision_and_scale[0].trim().parse::<u32>().unwrap();
-        let scale = precision_and_scale[1].trim().parse::<u32>().unwrap();
-        let nullable = !parts[2].contains("NOT");
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+        let precision_scale_str = &s[open_bracket + 1..close_bracket];
+        let parts = precision_scale_str.split(',').collect::<Vec<&str>>();
+        let (precision, scale) = if parts.len() == 2 {
+            let precision_str = parts[0].trim();
+            let scale_str = parts[1].trim();
+            let precision = precision_str
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid DECIMAL precision. Unable to parse precision as a usize."
+                        .to_string(),
+                })?;
+            let scale = scale_str
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid DECIMAL scale. Unable to parse scale as a usize.".to_string(),
+                })?;
+            (precision, scale)
+        } else {
+            let precision_str = precision_scale_str.trim();
+            let precision = precision_str
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid DECIMAL precision. Unable to parse precision as a usize."
+                        .to_string(),
+                })?;
+            (precision, DecimalType::DEFAULT_SCALE)
+        };
 
         Ok(DecimalType {
             nullable,
@@ -720,37 +767,47 @@ impl FromStr for LocalZonedTimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::LocalZonedTimestamp::NAME) || !parts.contains(&"WITH")
-        {
+        if !s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH") {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP type.".to_string(),
+                message:
+                    "Invalid LocalZonedTimestamp type. Expected string to start with 'TIMESTAMP'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP specification.".to_string(),
+                message: "Invalid LocalZonedTimestamp specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if precision_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP precision and nullable.".to_string(),
+                message: "Invalid LocalZonedTimestamp specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid LocalZonedTimestamp specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let precision = precision_and_nullable[0].parse::<u32>();
-        let nullable = !parts.contains(&"NOT");
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision = precision_str
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
+                    .to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
 
         Ok(LocalZonedTimestampType {
             nullable,
-            precision: precision.unwrap(),
+            precision,
         })
     }
 }
@@ -865,36 +922,45 @@ impl FromStr for TimeType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::TIME::NAME) || parts[0].contains("STAMP") {
+        if !s.starts_with(serde_utils::TIME::NAME) || s.contains("STAMP") {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIME type.".to_string(),
+                message: "Invalid TIME type. Expected string to start with 'TIME'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIME specification.".to_string(),
+                message: "Invalid TIME specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if precision_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIME precision and nullable.".to_string(),
+                message: "Invalid TIME specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let precision = precision_and_nullable[0].parse::<u32>();
-        let nullable = !parts.contains(&"NOT");
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision = precision_str
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
 
         Ok(TimeType {
             nullable,
-            precision: precision.unwrap(),
+            precision,
         })
     }
 }
@@ -969,36 +1035,46 @@ impl FromStr for TimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::TIMESTAMP::NAME) {
+        if !s.starts_with(serde_utils::TIMESTAMP::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP type.".to_string(),
+                message: "Invalid TIMESTAMP type. Expected string to start with 'TIMESTAMP'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP specification.".to_string(),
+                message: "Invalid TIMESTAMP specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let precision_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if precision_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP precision and nullable.".to_string(),
+                message: "Invalid TIMESTAMP specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let precision = precision_and_nullable[0].parse::<u32>();
-        let nullable = !parts.contains(&"NOT");
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision = precision_str
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid TIMESTAMP precision. Unable to parse precision as a u32."
+                    .to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
 
         Ok(TimestampType {
             nullable,
-            precision: precision.unwrap(),
+            precision,
         })
     }
 }
@@ -1109,37 +1185,43 @@ impl FromStr for VarBinaryType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::VARBINARY::NAME) {
+        if !s.starts_with(serde_utils::VARBINARY::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY type.".to_string(),
+                message: "Invalid VARBINARY type. Expected string to start with 'VARBINARY'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY specification.".to_string(),
+                message: "Invalid VARBINARY specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if length_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY length and nullable.".to_string(),
+                message: "Invalid VARBINARY specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let length = length_and_nullable[0].parse::<u32>();
-        let nullable = !parts.contains(&"NOT");
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARBINARY length. Unable to parse length as a u32.".to_string(),
+            })?;
 
-        Ok(VarBinaryType {
-            nullable,
-            length: length.unwrap(),
-        })
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarBinaryType { nullable, length })
     }
 }
 
@@ -1206,37 +1288,43 @@ impl FromStr for VarCharType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if !parts[0].starts_with(serde_utils::VARCHAR::NAME) {
+        if !s.starts_with(serde_utils::VARCHAR::NAME) {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR type.".to_string(),
+                message: "Invalid VARCHAR type. Expected string to start with 'VARCHAR'.",
             }
             .fail();
         }
 
-        let bracket_parts: Vec<&str> = parts[0].split('(').collect();
-        if bracket_parts.len() != 2 {
+        let Some(open_bracket) = s.find('(') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR specification.".to_string(),
+                message: "Invalid VARCHAR specification. Missing opening bracket.",
             }
             .fail();
-        }
-
-        let length_and_nullable: Vec<&str> = bracket_parts[1].split(')').collect::<Vec<&str>>();
-        if length_and_nullable.len() != 2 {
+        };
+        let Some(close_bracket) = s.find(')') else {
             return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR length and nullable.".to_string(),
+                message: "Invalid VARCHAR specification. Missing closing bracket.",
             }
             .fail();
+        };
+
+        if open_bracket >= close_bracket {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARCHAR specification. Opening bracket appears after or at the same position as closing bracket.",
+            }
+           .fail();
         }
 
-        let length = length_and_nullable[0].parse::<u32>();
-        let nullable = !parts.contains(&"NOT");
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARCHAR length. Unable to parse length as a u32.".to_string(),
+            })?;
 
-        Ok(VarCharType {
-            nullable,
-            length: length.unwrap(),
-        })
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarCharType { nullable, length })
     }
 }
 
