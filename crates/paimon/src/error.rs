@@ -54,6 +54,14 @@ pub enum Error {
     ConfigInvalid { message: String },
     #[snafu(
         visibility(pub(crate)),
+        display("Paimon hitting unexpected avro error {}: {:?}", message, source)
+    )]
+    DataUnexpected {
+        message: String,
+        source: apache_avro::Error,
+    },
+    #[snafu(
+        visibility(pub(crate)),
         display("Paimon hitting invalid file index format: {}", message)
     )]
     FileIndexFormatInvalid { message: String },

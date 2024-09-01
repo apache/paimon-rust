@@ -48,6 +48,7 @@ snafu = "0.8.3"
 typed-builder = "^0.19"
 opendal = { version = "0.48", features = ["services-fs"] }
 pretty_assertions = "1"
+apache-avro = { version = "0.17", features = ["snappy"] }
 
 [dev-dependencies]
-rand = "0.8.5"apache-avro = { version = "0.17", features = ["snappy"] }
+rand = "0.8.5"
