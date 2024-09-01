@@ -68,3 +68,12 @@ impl From<opendal::Error> for Error {
         }
     }
 }
+
+impl From<apache_avro::Error> for Error {
+    fn from(source: apache_avro::Error) -> Self {
+        Error::DataUnexpected {
+            message: "".to_string(),
+            source,
+        }
+    }
+}
