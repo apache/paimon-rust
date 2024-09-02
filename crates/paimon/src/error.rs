@@ -60,6 +60,11 @@ pub enum Error {
         message: String,
         source: apache_avro::Error,
     },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting invalid file index format: {}", message)
+    )]
+    FileIndexFormatInvalid { message: String },
 }
 
 impl From<opendal::Error> for Error {
