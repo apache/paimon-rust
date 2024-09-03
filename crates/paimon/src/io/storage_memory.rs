@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use opendal::services::MemoryConfig;
+use opendal::Operator;
 
-pub mod file_index;
-pub mod io;
-pub mod spec;
+use crate::Result;
+
+pub(crate) fn memory_config_build() -> Result<Operator> {
+    Ok(Operator::from_config(MemoryConfig::default())?.finish())
+}

@@ -17,3 +17,16 @@
 
 mod file_io;
 pub use file_io::*;
+
+mod storage;
+pub use storage::*;
+
+#[cfg(feature = "storage-fs")]
+mod storage_fs;
+#[cfg(feature = "storage-fs")]
+use storage_fs::*;
+
+#[cfg(feature = "storage-memory")]
+mod storage_memory;
+#[cfg(feature = "storage-memory")]
+use storage_memory::*;

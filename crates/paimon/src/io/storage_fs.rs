@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use opendal::services::FsConfig;
+use opendal::Operator;
 
-pub mod file_index;
-pub mod io;
-pub mod spec;
+use crate::Result;
+
+/// Build new opendal operator from give path.
+pub(crate) fn fs_config_build() -> Result<Operator> {
+    let mut cfg = FsConfig::default();
+    cfg.root = Some("/".to_string());
+
+    Ok(Operator::from_config(cfg)?.finish())
+}
