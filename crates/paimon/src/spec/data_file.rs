@@ -75,29 +75,8 @@ pub struct DataFileMeta {
 }
 
 impl Display for DataFileMeta {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{fileName: {}, fileSize: {}, rowCount: {}, embeddedIndex: {:?}, \
-            minKey: {:?}, maxKey: {:?}, keyStats: {:?}, valueStats: {:?}, \
-            minSequenceNumber: {}, maxSequenceNumber: {}, \
-            schemaId: {}, level: {}, extraFiles: {:?}, creationTime: {}, deleteRowCount: {:?}}}",
-            self.file_name,
-            self.file_size,
-            self.row_count,
-            self.embedded_index,
-            self.min_key,
-            self.max_key,
-            self.key_stats,
-            self.value_stats,
-            self.min_sequence_number,
-            self.max_sequence_number,
-            self.schema_id,
-            self.level,
-            self.extra_files,
-            self.creation_time,
-            self.delete_row_count
-        )
+    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
     }
 }
 
