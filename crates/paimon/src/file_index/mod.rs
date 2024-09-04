@@ -17,3 +17,18 @@
 
 mod file_index_format;
 pub use file_index_format::*;
+
+mod file_index_writer;
+pub use file_index_writer::*;
+
+mod file_index_result;
+pub use file_index_result::*;
+
+mod file_indexer;
+pub use file_indexer::*;
+
+mod file_index_reader;
+pub use file_index_reader::*;
+
+mod file_index_factory;
+pub use file_index_factory::*;

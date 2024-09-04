@@ -65,6 +65,12 @@ pub enum Error {
         display("Paimon hitting invalid file index format: {}", message)
     )]
     FileIndexFormatInvalid { message: String },
+
+    #[snafu(display("File index factory already exists for type: {}", identifier))]
+    FactoryAlreadyExists { identifier: String },
+
+    #[snafu(display("Can't find file index factory for type: {}", identifier))]
+    FactoryNotFound { identifier: String },
 }
 
 impl From<opendal::Error> for Error {

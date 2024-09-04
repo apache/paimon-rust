@@ -15,11 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use std::sync::Arc;
 
-pub mod file_index;
-pub mod io;
-pub mod options;
-pub mod spec;
+use crate::{io::InputFile, options::Options, spec::DataType};
+
+use super::{load_factory, FileIndexReader, FileIndexWriter};
+
+pub trait FileIndexer {
+    fn create_writer(&self) -> Arc<dyn FileIndexWriter>;
+    fn create_reader(
+        &self,
+        input_file: InputFile,
+        start: usize,
+        length: usize,
+    ) -> Box<dyn FileIndexReader>;
+}
+
+pub async fn create_file_indexer(
+    typ: &str,
+    data_type: DataType,
+    options: Options,
+) -> crate::Result<Box<dyn FileIndexer>> {
+    let factory = load_factory(typ)?;
+    factory.create(data_type, options)
+}

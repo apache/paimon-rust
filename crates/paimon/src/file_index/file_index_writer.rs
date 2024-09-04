@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use bytes::Bytes;
 
-pub mod file_index;
-pub mod io;
-pub mod options;
-pub mod spec;
+use crate::io::FileWrite;
+
+#[async_trait::async_trait]
+pub trait FileIndexWriter: FileWrite {
+    async fn write(&self, key: Bytes) -> crate::Result<()>;
+
+    async fn serialized_bytes(&self) -> crate::Result<Bytes>;
+}
