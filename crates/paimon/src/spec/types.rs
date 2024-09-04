@@ -238,26 +238,7 @@ impl FromStr for BinaryType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid BINARY specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid BINARY specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid BINARY specification. Opening bracket appears after or at the same position as closing bracket.".to_string(),
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -374,26 +355,7 @@ impl FromStr for CharType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid CHAR specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid CHAR specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid CHAR specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -512,26 +474,7 @@ impl FromStr for DecimalType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid DECIMAL specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid DECIMAL specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid DECIMAL specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let precision_scale_str = &s[open_bracket + 1..close_bracket];
         let parts = precision_scale_str.split(',').collect::<Vec<&str>>();
         let (precision, scale) = if parts.len() == 2 {
@@ -778,26 +721,7 @@ impl FromStr for LocalZonedTimestampType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid LocalZonedTimestamp specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid LocalZonedTimestamp specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid LocalZonedTimestamp specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -934,26 +858,7 @@ impl FromStr for TimeType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIME specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIME specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIME specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -1049,26 +954,7 @@ impl FromStr for TimestampType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid TIMESTAMP specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -1201,26 +1087,7 @@ impl FromStr for VarBinaryType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARBINARY specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -1305,26 +1172,7 @@ impl FromStr for VarCharType {
             .fail();
         }
 
-        let Some(open_bracket) = s.find('(') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR specification. Missing opening bracket.",
-            }
-            .fail();
-        };
-        let Some(close_bracket) = s.find(')') else {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR specification. Missing closing bracket.",
-            }
-            .fail();
-        };
-
-        if open_bracket >= close_bracket {
-            return DataTypeInvalidSnafu {
-                message: "Invalid VARCHAR specification. Opening bracket appears after or at the same position as closing bracket.",
-            }
-           .fail();
-        }
-
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s)?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -1477,6 +1325,7 @@ mod serde_utils {
     // We use name like `BOOLEAN` by design to avoid conflict.
     #![allow(clippy::upper_case_acronyms)]
 
+    use crate::Error;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::marker::PhantomData;
 
@@ -1639,6 +1488,27 @@ mod serde_utils {
                 ))
             }
         }
+    }
+
+    pub(crate) fn extract_brackets_pos(s: &str) -> crate::Result<(usize, usize), Error> {
+        let Some(open_bracket) = s.find('(') else {
+            return Err(Error::DataTypeInvalid {
+                message: "Invalid specification. Missing opening bracket.".to_string(),
+            });
+        };
+        let Some(close_bracket) = s.find(')') else {
+            return Err(Error::DataTypeInvalid {
+                message: "Invalid specification. Missing closing bracket.".to_string(),
+            });
+        };
+
+        if open_bracket >= close_bracket {
+            return Err(Error::DataTypeInvalid {
+                message: "Invalid specification. Opening bracket appears after or at the same position as closing bracket.".to_string(),
+            });
+        }
+
+        Ok((open_bracket, close_bracket))
     }
 }
 
