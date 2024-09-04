@@ -238,8 +238,7 @@ impl FromStr for BinaryType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::BINARY::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "BinaryType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -356,8 +355,7 @@ impl FromStr for CharType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::CHAR::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "CharType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -476,8 +474,7 @@ impl FromStr for DecimalType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::DECIMAL::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "DecimalType")?;
         let precision_scale_str = &s[open_bracket + 1..close_bracket];
         let parts = precision_scale_str.split(',').collect::<Vec<&str>>();
         let (precision, scale) = if parts.len() == 2 {
@@ -725,7 +722,7 @@ impl FromStr for LocalZonedTimestampType {
         }
 
         let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::LocalZonedTimestamp::NAME)?;
+            serde_utils::extract_brackets_pos(s, "LocalZonedTimestampType")?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -862,8 +859,7 @@ impl FromStr for TimeType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::TIME::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimeType")?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -959,8 +955,7 @@ impl FromStr for TimestampType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::TIMESTAMP::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimestampType")?;
         let precision_str = &s[open_bracket + 1..close_bracket];
         let precision =
             precision_str
@@ -1093,8 +1088,7 @@ impl FromStr for VarBinaryType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::VARBINARY::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarBinaryType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -1179,8 +1173,7 @@ impl FromStr for VarCharType {
             .fail();
         }
 
-        let (open_bracket, close_bracket) =
-            serde_utils::extract_brackets_pos(s, serde_utils::VARCHAR::NAME)?;
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarCharType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
             .trim()
@@ -1500,24 +1493,35 @@ mod serde_utils {
 
     pub(crate) fn extract_brackets_pos(
         s: &str,
-        name: &str,
+        type_name: &str,
     ) -> crate::Result<(usize, usize), Error> {
         let Some(open_bracket) = s.find('(') else {
             return Err(Error::DataTypeInvalid {
-                message: format!("Invalid {} specification. Missing opening bracket.", name)
-                    .to_string(),
+                message: format!(
+                    "Invalid {} specification. Missing opening bracket.",
+                    type_name
+                )
+                .to_string(),
             });
         };
         let Some(close_bracket) = s.find(')') else {
             return Err(Error::DataTypeInvalid {
-                message: format!("Invalid {} specification. Missing closing bracket.", name)
-                    .to_string(),
+                message: format!(
+                    "Invalid {} specification. Missing closing bracket.",
+                    type_name
+                )
+                .to_string(),
             });
         };
 
         if open_bracket >= close_bracket {
             return Err(Error::DataTypeInvalid {
-                message: format!("Invalid {} specification. Opening bracket appears after or at the same position as closing bracket.", name).to_string(),
+                message: format!(
+                    "Invalid {} specification. Opening bracket \
+                appears after or at the same position as closing bracket.",
+                    type_name
+                )
+                .to_string(),
             });
         }
 
