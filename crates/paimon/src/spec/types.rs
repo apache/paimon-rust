@@ -532,7 +532,6 @@ impl FromStr for DecimalType {
            .fail();
         }
 
-        let nullable = !s[close_bracket..].contains("NOT NULL");
         let precision_scale_str = &s[open_bracket + 1..close_bracket];
         let parts = precision_scale_str.split(',').collect::<Vec<&str>>();
         let (precision, scale) = if parts.len() == 2 {
@@ -560,6 +559,8 @@ impl FromStr for DecimalType {
                 })?;
             (precision, DecimalType::DEFAULT_SCALE)
         };
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
 
         Ok(DecimalType {
             nullable,
@@ -1912,6 +1913,244 @@ mod tests {
                     nullable: true,
                     length: 33,
                 }),
+            ),
+            (
+                "highly_complex_nested_row_type",
+                DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        0,
+                        "outer_row1".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle1_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 12, 3).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle1_inner_row1".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner1_boolean".to_string(),
+                                        DataType::Boolean(BooleanType::new()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner1_int".to_string(),
+                                        DataType::Int(IntType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner1_varchar".to_string(),
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 100).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle1_array".to_string(),
+                                DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                    DataType::VarChar(
+                                        VarCharType::with_nullable(true, 50).unwrap(),
+                                    ),
+                                    DataType::Int(IntType::new()),
+                                )))),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        1,
+                        "outer_row2".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        2,
+                        "outer_map".to_string(),
+                        DataType::Map(MapType::new(
+                            DataType::VarChar(VarCharType::with_nullable(true, 30).unwrap()),
+                            DataType::Row(RowType::new(vec![
+                                DataField::new(
+                                    0,
+                                    "middle1_decimal".to_string(),
+                                    DataType::Decimal(
+                                        DecimalType::with_nullable(true, 12, 3).unwrap(),
+                                    ),
+                                ),
+                                DataField::new(
+                                    1,
+                                    "middle1_inner_row1".to_string(),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                ),
+                                DataField::new(
+                                    2,
+                                    "middle1_array".to_string(),
+                                    DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 50).unwrap(),
+                                        ),
+                                        DataType::Int(IntType::new()),
+                                    )))),
+                                ),
+                            ])),
+                        )),
+                    ),
+                    DataField::new(
+                        3,
+                        "outer_array".to_string(),
+                        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])))),
+                    ),
+                    DataField::new(
+                        4,
+                        "outer_multiset".to_string(),
+                        DataType::Multiset(MultisetType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "deep_inner_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "deep_inner_varbinary".to_string(),
+                                DataType::VarBinary(VarBinaryType::try_new(true, 128).unwrap()),
+                            ),
+                        ])))),
+                    ),
+                ])),
             ),
         ]
     }
