@@ -109,65 +109,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_data_field() {
-        let id = 1;
-        let name = "field1".to_string();
-        let typ = DataType::Int(IntType::new());
-        let description = "test description".to_string();
+    fn test_table_schema_serialize_deserialize() {
+        let json_data = r#"
+        {
+          "version" : 2,
+          "id" : 1,
+          "fields" : [ {
+            "id" : 0,
+            "name" : "f0",
+            "type" : "INT"
+          }, {
+            "id" : 1,
+            "name" : "f1",
+            "type" : "INT"
+          }, {
+            "id" : 2,
+            "name" : "f2",
+            "type" : "INT"
+          } ],
+          "highestFieldId" : 10,
+          "partitionKeys" : [ "f0" ],
+          "primaryKeys" : [ "f1" ],
+          "options" : { },
+          "comment" : "",
+          "timeMillis" : 1723440320019
+        }"#;
 
-        let data_field = DataField::new(id, name.clone(), typ.clone())
-            .with_description(Some(description.clone()));
+        let table_schema: TableSchema =
+            serde_json::from_str(json_data).expect("Failed to deserialize TableSchema");
 
-        assert_eq!(data_field.id(), id);
-        assert_eq!(data_field.name(), name);
-        assert_eq!(data_field.data_type(), &typ);
-        assert_eq!(data_field.description(), Some(description).as_deref());
-    }
+        assert_eq!(table_schema.version, 2);
+        assert_eq!(table_schema.id, 1);
+        assert_eq!(table_schema.highest_field_id, 10);
+        assert_eq!(table_schema.partition_keys, vec!["f0"]);
+        assert_eq!(table_schema.primary_keys, vec!["f1"]);
+        assert_eq!(table_schema.options, HashMap::new());
+        assert_eq!(table_schema.comment, Some("".to_string()));
+        assert_eq!(table_schema.time_millis, 1723440320019);
 
-    #[test]
-    fn test_new_id() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field = DataField::new(1, "field1".to_string(), d_type.clone()).with_id(2);
+        assert_eq!(table_schema.fields.len(), 3);
+        assert_eq!(table_schema.fields[0].id, 0);
+        assert_eq!(table_schema.fields[0].name, "f0");
+        assert_eq!(
+            table_schema.fields[0].data_type(),
+            &DataType::Int(IntType::new())
+        );
 
-        assert_eq!(new_data_field.id(), 2);
-        assert_eq!(new_data_field.name(), "field1");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), None);
-    }
+        assert_eq!(table_schema.fields[1].id, 1);
+        assert_eq!(table_schema.fields[1].name, "f1");
+        assert_eq!(
+            table_schema.fields[1].data_type(),
+            &DataType::Int(IntType::new())
+        );
 
-    #[test]
-    fn test_new_name() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field =
-            DataField::new(1, "field1".to_string(), d_type.clone()).with_name("field2".to_string());
-
-        assert_eq!(new_data_field.id(), 1);
-        assert_eq!(new_data_field.name(), "field2");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), None);
-    }
-
-    #[test]
-    fn test_new_description() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field = DataField::new(1, "field1".to_string(), d_type.clone())
-            .with_description(Some("new description".to_string()));
-
-        assert_eq!(new_data_field.id(), 1);
-        assert_eq!(new_data_field.name(), "field1");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), Some("new description"));
-    }
-
-    #[test]
-    fn test_escape_identifier() {
-        let escaped_identifier = escape_identifier("\"identifier\"");
-        assert_eq!(escaped_identifier, "\"\"identifier\"\"");
-    }
-
-    #[test]
-    fn test_escape_single_quotes() {
-        let escaped_text = escape_single_quotes("text with 'single' quotes");
-        assert_eq!(escaped_text, "text with ''single'' quotes");
+        assert_eq!(table_schema.fields[2].id, 2);
+        assert_eq!(table_schema.fields[2].name, "f2");
+        assert_eq!(
+            table_schema.fields[2].data_type(),
+            &DataType::Int(IntType::new())
+        );
     }
 }

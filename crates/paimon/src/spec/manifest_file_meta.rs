@@ -186,3 +186,45 @@ impl Display for BinaryTableStats {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_file_meta_serialize_deserialize() {
+        let data_json = r#"
+        {
+            "_VERSION":2,
+            "_FILE_NAME":"manifest_file_meta.avro",
+            "_FILE_SIZE":1024,
+            "_NUM_ADDED_FILES":5,
+            "_NUM_DELETED_FILES":6,
+            "_PARTITION_STATS":{"_MIN_VALUES":[0,1,2],"_MAX_VALUES":[3,4,5],"_NULL_COUNTS":[6,7,8]},
+            "_SCHEMA_ID":1
+        }
+        "#;
+
+        let manifest_file_meta: ManifestFileMeta =
+            serde_json::from_str(data_json).expect("Failed to deserialize ManifestFileMeta.");
+
+        assert_eq!(manifest_file_meta.file_name(), "manifest_file_meta.avro");
+        assert_eq!(manifest_file_meta.file_size(), 1024);
+        assert_eq!(manifest_file_meta.num_added_files(), 5);
+        assert_eq!(manifest_file_meta.num_deleted_files(), 6);
+        assert_eq!(manifest_file_meta.schema_id(), 1);
+        assert_eq!(manifest_file_meta.version(), 2);
+        assert_eq!(
+            manifest_file_meta.partition_stats().min_values(),
+            &[0, 1, 2]
+        );
+        assert_eq!(
+            manifest_file_meta.partition_stats().max_values(),
+            &[3, 4, 5]
+        );
+        assert_eq!(
+            manifest_file_meta.partition_stats().null_counts(),
+            &[6, 7, 8]
+        );
+    }
+}
