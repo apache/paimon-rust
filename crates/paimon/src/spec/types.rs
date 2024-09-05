@@ -19,8 +19,12 @@ use crate::error::*;
 use crate::spec::DataField;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, FromInto, SerializeDisplay};
-use std::fmt::{Debug, Display, Formatter};
+use serde_utils::DataTypeName;
+use serde_with::{serde_as, DeserializeFromStr, FromInto, SerializeDisplay};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    str::FromStr,
+};
 
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
@@ -200,8 +204,8 @@ impl BigIntType {
 /// Data type of a fixed-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
-#[serde(rename_all = "camelCase")]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
 pub struct BinaryType {
     nullable: bool,
     length: usize,
@@ -220,6 +224,32 @@ impl Display for BinaryType {
 impl Default for BinaryType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for BinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::BINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY type. Expected string to start with 'BINARY'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "BinaryType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid BINARY length. Unable to parse length as a usize.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(BinaryType { nullable, length })
     }
 }
 
@@ -291,8 +321,8 @@ impl BooleanType {
 /// Data type of a fixed-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, SerializeDisplay)]
-#[serde(rename_all = "camelCase")]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, SerializeDisplay, DeserializeFromStr)]
 pub struct CharType {
     nullable: bool,
     length: usize,
@@ -311,6 +341,32 @@ impl Display for CharType {
 impl Default for CharType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for CharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::CHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR type. Expected string to start with 'CHAR'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "CharType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid CHAR length. Unable to parse length as a usize.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(CharType { nullable, length })
     }
 }
 
@@ -382,7 +438,8 @@ impl DateType {
 /// Data type of a decimal number with fixed precision and scale.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct DecimalType {
     nullable: bool,
 
@@ -403,6 +460,65 @@ impl Display for DecimalType {
 impl Default for DecimalType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE).unwrap()
+    }
+}
+
+impl FromStr for DecimalType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::DECIMAL::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL type. Expected string to start with 'DECIMAL'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "DecimalType")?;
+        let precision_scale_str = &s[open_bracket + 1..close_bracket];
+        let (precision, scale) = match precision_scale_str
+            .split(',')
+            .collect::<Vec<&str>>()
+            .as_slice()
+        {
+            [precision_str, scale_str] => {
+                let precision =
+                    precision_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message:
+                                "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                                    .to_string(),
+                        })?;
+                let scale =
+                    scale_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message: "Invalid DECIMAL scale. Unable to parse scale as a u32."
+                                .to_string(),
+                        })?;
+                (precision, scale)
+            }
+            _ => {
+                let precision = precision_scale_str.trim().parse::<u32>().map_err(|_| {
+                    Error::DataTypeInvalid {
+                        message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                            .to_string(),
+                    }
+                })?;
+                (precision, DecimalType::DEFAULT_SCALE)
+            }
+        };
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(DecimalType {
+            nullable,
+            precision,
+            scale,
+        })
     }
 }
 
@@ -579,7 +695,8 @@ impl IntType {
 /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct LocalZonedTimestampType {
     nullable: bool,
     precision: u32,
@@ -587,7 +704,7 @@ pub struct LocalZonedTimestampType {
 
 impl Display for LocalZonedTimestampType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TIMESTAMP WITH LOCAL TIME ZONE({})", self.precision)?;
+        write!(f, "TIMESTAMP({}) WITH LOCAL TIME ZONE", self.precision)?;
         if !self.nullable {
             write!(f, " NOT NULL")?;
         }
@@ -598,6 +715,39 @@ impl Display for LocalZonedTimestampType {
 impl Default for LocalZonedTimestampType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for LocalZonedTimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH") {
+            return DataTypeInvalidSnafu {
+                message:
+                    "Invalid LocalZonedTimestamp type. Expected string to start with 'TIMESTAMP'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) =
+            serde_utils::extract_brackets_pos(s, "LocalZonedTimestampType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
+                        .to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(LocalZonedTimestampType {
+            nullable,
+            precision,
+        })
     }
 }
 
@@ -684,7 +834,8 @@ impl SmallIntType {
 /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct TimeType {
     nullable: bool,
     precision: u32,
@@ -703,6 +854,36 @@ impl Display for TimeType {
 impl Default for TimeType {
     fn default() -> Self {
         Self::new(TimeType::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimeType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::TIME::NAME) || s.contains("STAMP") {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME type. Expected string to start with 'TIME'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimeType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(TimeType {
+            nullable,
+            precision,
+        })
     }
 }
 
@@ -749,7 +930,8 @@ impl TimeType {
 /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct TimestampType {
     nullable: bool,
     precision: u32,
@@ -768,6 +950,37 @@ impl Display for TimestampType {
 impl Default for TimestampType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::TIMESTAMP::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP type. Expected string to start with 'TIMESTAMP'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimestampType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIMESTAMP precision. Unable to parse precision as a u32."
+                        .to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(TimestampType {
+            nullable,
+            precision,
+        })
     }
 }
 
@@ -850,7 +1063,8 @@ impl TinyIntType {
 /// Data type of a variable-length binary string (=a sequence of bytes).
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct VarBinaryType {
     nullable: bool,
     length: u32,
@@ -869,6 +1083,32 @@ impl Display for VarBinaryType {
 impl Default for VarBinaryType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for VarBinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::VARBINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY type. Expected string to start with 'VARBINARY'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarBinaryType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARBINARY length. Unable to parse length as a u32.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarBinaryType { nullable, length })
     }
 }
 
@@ -908,7 +1148,8 @@ impl VarBinaryType {
 /// Data type of a variable-length character string.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, SerializeDisplay, Hash)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
 pub struct VarCharType {
     nullable: bool,
     length: u32,
@@ -927,6 +1168,32 @@ impl Display for VarCharType {
 impl Default for VarCharType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for VarCharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::VARCHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARCHAR type. Expected string to start with 'VARCHAR'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarCharType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARCHAR length. Unable to parse length as a u32.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarCharType { nullable, length })
     }
 }
 
@@ -1068,6 +1335,7 @@ mod serde_utils {
     // We use name like `BOOLEAN` by design to avoid conflict.
     #![allow(clippy::upper_case_acronyms)]
 
+    use crate::Error;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::marker::PhantomData;
 
@@ -1075,14 +1343,44 @@ mod serde_utils {
         const NAME: &'static str;
     }
 
+    pub struct ARRAY;
+    impl DataTypeName for ARRAY {
+        const NAME: &'static str = "ARRAY";
+    }
+
+    pub struct BIGINT;
+    impl DataTypeName for BIGINT {
+        const NAME: &'static str = "BIGINT";
+    }
+
     pub struct BOOLEAN;
     impl DataTypeName for BOOLEAN {
         const NAME: &'static str = "BOOLEAN";
     }
 
-    pub struct ARRAY;
-    impl DataTypeName for ARRAY {
-        const NAME: &'static str = "ARRAY";
+    pub struct BINARY;
+    impl DataTypeName for BINARY {
+        const NAME: &'static str = "BINARY";
+    }
+
+    pub struct VARBINARY;
+    impl DataTypeName for VARBINARY {
+        const NAME: &'static str = "VARBINARY";
+    }
+
+    pub struct CHAR;
+    impl DataTypeName for CHAR {
+        const NAME: &'static str = "CHAR";
+    }
+
+    pub struct VARCHAR;
+    impl DataTypeName for VARCHAR {
+        const NAME: &'static str = "VARCHAR";
+    }
+
+    pub struct DECIMAL;
+    impl DataTypeName for DECIMAL {
+        const NAME: &'static str = "DECIMAL";
     }
 
     pub struct DATE;
@@ -1105,14 +1403,24 @@ mod serde_utils {
         const NAME: &'static str = "INT";
     }
 
-    pub struct BIGINT;
-    impl DataTypeName for BIGINT {
-        const NAME: &'static str = "BIGINT";
-    }
-
     pub struct SMALLINT;
     impl DataTypeName for SMALLINT {
         const NAME: &'static str = "SMALLINT";
+    }
+
+    pub struct TIME;
+    impl DataTypeName for TIME {
+        const NAME: &'static str = "TIME";
+    }
+
+    pub struct TIMESTAMP;
+    impl DataTypeName for TIMESTAMP {
+        const NAME: &'static str = "TIMESTAMP";
+    }
+
+    pub struct LocalZonedTimestamp;
+    impl DataTypeName for LocalZonedTimestamp {
+        const NAME: &'static str = "TIMESTAMP";
     }
 
     pub struct TINYINT;
@@ -1179,16 +1487,54 @@ mod serde_utils {
 
             if name == T::NAME && nullable.is_empty() {
                 Ok(NullableType::from(true))
-            } else if name == T::NAME && nullable == "NOT NULL" {
+            } else if name == T::NAME && nullable.contains("NOT NULL") {
                 Ok(NullableType::from(false))
             } else {
                 let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
+
                 Err(serde::de::Error::invalid_value(
                     serde::de::Unexpected::Str(s.as_str()),
                     &expect.as_str(),
                 ))
             }
         }
+    }
+
+    pub(crate) fn extract_brackets_pos(
+        s: &str,
+        type_name: &str,
+    ) -> crate::Result<(usize, usize), Error> {
+        let Some(open_bracket) = s.find('(') else {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Invalid {} specification. Missing opening bracket.",
+                    type_name
+                )
+                .to_string(),
+            });
+        };
+        let Some(close_bracket) = s.find(')') else {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Invalid {} specification. Missing closing bracket.",
+                    type_name
+                )
+                .to_string(),
+            });
+        };
+
+        if open_bracket >= close_bracket {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Invalid {} specification. Opening bracket \
+                appears after or at the same position as closing bracket.",
+                    type_name
+                )
+                .to_string(),
+            });
+        }
+
+        Ok((open_bracket, close_bracket))
     }
 }
 
@@ -1231,21 +1577,20 @@ mod tests {
                 "bigint_type_nullable",
                 DataType::BigInt(BigIntType { nullable: true }),
             ),
-            // FIXME: binary doesn't implement deserialize.
-            // (
-            //     "binary_type",
-            //     DataType::Binary(BinaryType {
-            //         nullable: false,
-            //         length: 22,
-            //     }),
-            // ),
-            // (
-            //     "binary_type_nullable",
-            //     DataType::Binary(BinaryType {
-            //         nullable: true,
-            //         length: 22,
-            //     }),
-            // ),
+            (
+                "binary_type",
+                DataType::Binary(BinaryType {
+                    nullable: false,
+                    length: 22,
+                }),
+            ),
+            (
+                "binary_type_nullable",
+                DataType::Binary(BinaryType {
+                    nullable: true,
+                    length: 22,
+                }),
+            ),
             (
                 "boolean_type",
                 DataType::Boolean(BooleanType { nullable: false }),
@@ -1254,43 +1599,41 @@ mod tests {
                 "boolean_type_nullable",
                 DataType::Boolean(BooleanType { nullable: true }),
             ),
-            // FIXME: binary doesn't implement deserialize.
-            // (
-            //     "char_type",
-            //     DataType::Char(CharType {
-            //         nullable: false,
-            //         length: 33,
-            //     }),
-            // ),
-            // (
-            //     "char_type_nullable",
-            //     DataType::Char(CharType {
-            //         nullable: true,
-            //         length: 33,
-            //     }),
-            // ),
+            (
+                "char_type",
+                DataType::Char(CharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "char_type_nullable",
+                DataType::Char(CharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
             ("date_type", DataType::Date(DateType { nullable: false })),
             (
                 "date_type_nullable",
                 DataType::Date(DateType { nullable: true }),
             ),
-            // FIXME: DecimalType serialize failed.
-            // (
-            //     "decimal_type",
-            //     DataType::Decimal(DecimalType {
-            //         nullable: false,
-            //         precision: 10,
-            //         scale: 2,
-            //     }),
-            // ),
-            // (
-            //     "decimal_type_nullable",
-            //     DataType::Decimal(DecimalType {
-            //         nullable: true,
-            //         precision: 10,
-            //         scale: 2,
-            //     }),
-            // ),
+            (
+                "decimal_type",
+                DataType::Decimal(DecimalType {
+                    nullable: false,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
+            (
+                "decimal_type_nullable",
+                DataType::Decimal(DecimalType {
+                    nullable: true,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
             (
                 "double_type",
                 DataType::Double(DoubleType { nullable: false }),
@@ -1309,46 +1652,44 @@ mod tests {
                 "int_type_nullable",
                 DataType::Int(IntType { nullable: true }),
             ),
-            // FIXME: LocalZonedTimestampType serialize failed.
-            // (
-            //     "local_zoned_timestamp_type",
-            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
-            //         nullable: false,
-            //         precision: 3,
-            //     }),
-            // ),
-            // (
-            //     "local_zoned_timestamp_type_nullable",
-            //     DataType::LocalZonedTimestamp(LocalZonedTimestampType {
-            //         nullable: true,
-            //         precision: 3,
-            //     }),
-            // ),
-            // FIXME: VarCharType doesn't support deserialize.
-            // (
-            //     "map_type",
-            //     DataType::Map(MapType {
-            //         nullable: false,
-            //         key_type: DataType::VarChar(VarCharType {
-            //             nullable: true,
-            //             length: 20,
-            //         })
-            //         .into(),
-            //         value_type: DataType::Int(IntType { nullable: false }).into(),
-            //     }),
-            // ),
-            // (
-            //     "map_type_nullable",
-            //     DataType::Map(MapType {
-            //         nullable: true,
-            //         key_type: DataType::VarChar(VarCharType {
-            //             nullable: true,
-            //             length: 20,
-            //         })
-            //         .into(),
-            //         value_type: DataType::Int(IntType { nullable: true }).into(),
-            //     }),
-            // ),
+            (
+                "local_zoned_timestamp_type",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: false,
+                    precision: 3,
+                }),
+            ),
+            (
+                "local_zoned_timestamp_type_nullable",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: true,
+                    precision: 6,
+                }),
+            ),
+            (
+                "map_type",
+                DataType::Map(MapType {
+                    nullable: false,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: false }).into(),
+                }),
+            ),
+            (
+                "map_type_nullable",
+                DataType::Map(MapType {
+                    nullable: true,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: true }).into(),
+                }),
+            ),
             (
                 "multiset_type",
                 DataType::Multiset(MultisetType {
@@ -1363,41 +1704,40 @@ mod tests {
                     element_type: DataType::Int(IntType { nullable: true }).into(),
                 }),
             ),
-            // FIXME: VarChar doesn't support deserialize.
-            // (
-            //     "row_type",
-            //     DataType::Row(RowType {
-            //         nullable: false,
-            //         fields: vec![
-            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
-            //             DataField::new(
-            //                 1,
-            //                 "b".into(),
-            //                 DataType::VarChar(VarCharType {
-            //                     nullable: false,
-            //                     length: 20,
-            //                 }),
-            //             ),
-            //         ],
-            //     }),
-            // ),
-            // (
-            //     "row_type_nullable",
-            //     DataType::Row(RowType {
-            //         nullable: true,
-            //         fields: vec![
-            //             DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
-            //             DataField::new(
-            //                 1,
-            //                 "b".into(),
-            //                 DataType::VarChar(VarCharType {
-            //                     nullable: true,
-            //                     length: 20,
-            //                 }),
-            //             ),
-            //         ],
-            //     }),
-            // ),
+            (
+                "row_type",
+                DataType::Row(RowType {
+                    nullable: false,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: false,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
+            (
+                "row_type_nullable",
+                DataType::Row(RowType {
+                    nullable: true,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: true,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
             (
                 "smallint_type",
                 DataType::SmallInt(SmallIntType { nullable: false }),
@@ -1406,35 +1746,34 @@ mod tests {
                 "smallint_type_nullable",
                 DataType::SmallInt(SmallIntType { nullable: true }),
             ),
-            // FIXME: time and timestamp doesn't implement deserialize.
-            // (
-            //     "time_type",
-            //     DataType::Time(TimeType {
-            //         nullable: false,
-            //         precision: 9,
-            //     }),
-            // ),
-            // (
-            //     "time_type_nullable",
-            //     DataType::Time(TimeType {
-            //         nullable: true,
-            //         precision: 0,
-            //     }),
-            // ),
-            // (
-            //     "timestamp_type",
-            //     DataType::Timestamp(TimestampType {
-            //         nullable: false,
-            //         precision: 6,
-            //     }),
-            // ),
-            // (
-            //     "timestamp_type_nullable",
-            //     DataType::Timestamp(TimestampType {
-            //         nullable: true,
-            //         precision: 6,
-            //     }),
-            // ),
+            (
+                "time_type",
+                DataType::Time(TimeType {
+                    nullable: false,
+                    precision: 9,
+                }),
+            ),
+            (
+                "time_type_nullable",
+                DataType::Time(TimeType {
+                    nullable: true,
+                    precision: 0,
+                }),
+            ),
+            (
+                "timestamp_type",
+                DataType::Timestamp(TimestampType {
+                    nullable: false,
+                    precision: 6,
+                }),
+            ),
+            (
+                "timestamp_type_nullable",
+                DataType::Timestamp(TimestampType {
+                    nullable: true,
+                    precision: 6,
+                }),
+            ),
             (
                 "tinyint_type",
                 DataType::TinyInt(TinyIntType { nullable: false }),
@@ -1443,35 +1782,272 @@ mod tests {
                 "tinyint_type_nullable",
                 DataType::TinyInt(TinyIntType { nullable: true }),
             ),
-            // FIXME: varbinary & varchar doesn't implement deserialize.
-            // (
-            //     "varbinary_type",
-            //     DataType::VarBinary(VarBinaryType {
-            //         nullable: false,
-            //         length: 233,
-            //     }),
-            // ),
-            // (
-            //     "varbinary_type_nullable",
-            //     DataType::VarBinary(VarBinaryType {
-            //         nullable: true,
-            //         length: 233,
-            //     }),
-            // ),
-            // (
-            //     "varchar_type",
-            //     DataType::VarChar(VarCharType {
-            //         nullable: false,
-            //         length: 33,
-            //     }),
-            // ),
-            // (
-            //     "varchar_type_nullable",
-            //     DataType::VarChar(VarCharType {
-            //         nullable: true,
-            //         length: 33,
-            //     }),
-            // ),
+            (
+                "varbinary_type",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: false,
+                    length: 233,
+                }),
+            ),
+            (
+                "varbinary_type_nullable",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: true,
+                    length: 233,
+                }),
+            ),
+            (
+                "varchar_type",
+                DataType::VarChar(VarCharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "varchar_type_nullable",
+                DataType::VarChar(VarCharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
+            (
+                "highly_complex_nested_row_type",
+                DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        0,
+                        "outer_row1".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle1_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 12, 3).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle1_inner_row1".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner1_boolean".to_string(),
+                                        DataType::Boolean(BooleanType::new()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner1_int".to_string(),
+                                        DataType::Int(IntType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner1_varchar".to_string(),
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 100).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle1_array".to_string(),
+                                DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                    DataType::VarChar(
+                                        VarCharType::with_nullable(true, 50).unwrap(),
+                                    ),
+                                    DataType::Int(IntType::new()),
+                                )))),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        1,
+                        "outer_row2".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        2,
+                        "outer_map".to_string(),
+                        DataType::Map(MapType::new(
+                            DataType::VarChar(VarCharType::with_nullable(true, 30).unwrap()),
+                            DataType::Row(RowType::new(vec![
+                                DataField::new(
+                                    0,
+                                    "middle1_decimal".to_string(),
+                                    DataType::Decimal(
+                                        DecimalType::with_nullable(true, 12, 3).unwrap(),
+                                    ),
+                                ),
+                                DataField::new(
+                                    1,
+                                    "middle1_inner_row1".to_string(),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                ),
+                                DataField::new(
+                                    2,
+                                    "middle1_array".to_string(),
+                                    DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 50).unwrap(),
+                                        ),
+                                        DataType::Int(IntType::new()),
+                                    )))),
+                                ),
+                            ])),
+                        )),
+                    ),
+                    DataField::new(
+                        3,
+                        "outer_array".to_string(),
+                        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])))),
+                    ),
+                    DataField::new(
+                        4,
+                        "outer_multiset".to_string(),
+                        DataType::Multiset(MultisetType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "deep_inner_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "deep_inner_varbinary".to_string(),
+                                DataType::VarBinary(VarBinaryType::try_new(true, 128).unwrap()),
+                            ),
+                        ])))),
+                    ),
+                ])),
+            ),
         ]
     }
 
