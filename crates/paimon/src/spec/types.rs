@@ -476,31 +476,40 @@ impl FromStr for DecimalType {
 
         let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "DecimalType")?;
         let precision_scale_str = &s[open_bracket + 1..close_bracket];
-        let parts = precision_scale_str.split(',').collect::<Vec<&str>>();
-        let (precision, scale) = if parts.len() == 2 {
-            let precision_str = parts[0].trim();
-            let scale_str = parts[1].trim();
-            let precision = precision_str
-                .parse::<u32>()
-                .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
-                        .to_string(),
+        let (precision, scale) = match precision_scale_str
+            .split(',')
+            .collect::<Vec<&str>>()
+            .as_slice()
+        {
+            [precision_str, scale_str] => {
+                let precision =
+                    precision_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message:
+                                "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                                    .to_string(),
+                        })?;
+                let scale =
+                    scale_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message: "Invalid DECIMAL scale. Unable to parse scale as a u32."
+                                .to_string(),
+                        })?;
+                (precision, scale)
+            }
+            _ => {
+                let precision = precision_scale_str.trim().parse::<u32>().map_err(|_| {
+                    Error::DataTypeInvalid {
+                        message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                            .to_string(),
+                    }
                 })?;
-            let scale = scale_str
-                .parse::<u32>()
-                .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL scale. Unable to parse scale as a u32.".to_string(),
-                })?;
-            (precision, scale)
-        } else {
-            let precision_str = precision_scale_str.trim();
-            let precision = precision_str
-                .parse::<u32>()
-                .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
-                        .to_string(),
-                })?;
-            (precision, DecimalType::DEFAULT_SCALE)
+                (precision, DecimalType::DEFAULT_SCALE)
+            }
         };
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
