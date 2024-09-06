@@ -32,42 +32,6 @@ pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T
     from_value::<Vec<T>>(&values).map_err(Error::from)
 }
 
-pub struct ObjectsFileFactory {
-    file_io: FileIO,
-}
-
-/// The factory to read and write [`ObjectsFile`]
-#[allow(dead_code)]
-impl ObjectsFileFactory {
-    pub fn new(file_io: FileIO) -> ObjectsFileFactory {
-        Self { file_io }
-    }
-
-    /// Write several [`ManifestFileMeta`]s into a manifest list.
-    ///
-    /// NOTE: This method is atomic.
-    pub fn write(&mut self, _metas: Vec<ManifestFileMeta>) -> &str {
-        todo!()
-    }
-
-    /// Read [`ManifestList`] from the manifest file.
-    pub async fn read_manifest_file_meta(
-        &self,
-        path: &str,
-    ) -> crate::Result<Vec<ManifestFileMeta>> {
-        let bs = self.file_io.new_input(path)?.read().await?;
-        // todo support other formats
-        from_avro_bytes::<ManifestFileMeta>(bs.as_ref())
-    }
-
-    /// Read [`ManifestEntry`] from the manifest file.
-    pub async fn read_manifest_entry(&self, path: &str) -> crate::Result<Vec<ManifestEntry>> {
-        let bs = self.file_io.new_input(path)?.read().await?;
-        // todo support other formats
-        from_avro_bytes::<ManifestEntry>(bs.as_ref())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::spec::manifest_entry::{FileKind, ManifestEntry};
