@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::RowType;
 use chrono::serde::ts_milliseconds::deserialize as from_millis;
 use chrono::serde::ts_milliseconds::serialize as to_millis;
 use chrono::{DateTime, Utc};
@@ -114,44 +113,5 @@ impl Display for DataFileMeta {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-impl DataFileMeta {
-    // TODO: implement me
-    pub const SCHEMA: RowType = RowType::new(vec![]);
-
-    pub fn new(
-        file_name: String,
-        file_size: i64,
-        row_count: i64,
-        min_key: Vec<u8>,
-        max_key: Vec<u8>,
-        key_stats: BinaryTableStats,
-        value_stats: BinaryTableStats,
-        min_sequence_number: i64,
-        max_sequence_number: i64,
-        schema_id: i64,
-        level: i32,
-        extra_files: Vec<String>,
-        creation_time: DateTime<Utc>,
-        delete_row_count: Option<i64>,
-        embedded_index: Option<Vec<u8>>,
-    ) -> Self {
-        DataFileMeta {
-            file_name,
-            file_size,
-            row_count,
-            min_key,
-            max_key,
-            key_stats,
-            value_stats,
-            min_sequence_number,
-            max_sequence_number,
-            schema_id,
-            level,
-            extra_files,
-            creation_time,
-            delete_row_count,
-            embedded_index,
-        }
-    }
-}
+#[allow(dead_code)]
+impl DataFileMeta {}
