@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::io::FileIO;
-use crate::spec::manifest_entry::ManifestEntry;
-use crate::spec::ManifestFileMeta;
 use crate::Error;
 use apache_avro::types::Value;
 use apache_avro::{from_value, Reader};
 use serde::de::DeserializeOwned;
 
+#[allow(dead_code)]
 pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T>> {
     let reader = Reader::new(bytes).map_err(Error::from)?;
     let records = reader
