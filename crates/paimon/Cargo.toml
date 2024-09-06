@@ -44,6 +44,7 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11.15"
 serde_json = "1.0.120"
 serde_with = "3.9.0"
+serde_repr = "0.1"
 snafu = "0.8.3"
 typed-builder = "^0.19"
 opendal = { version = "0.49", features = ["services-fs"] }
