@@ -20,28 +20,6 @@ use serde::Deserialize;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_derive::Serialize;
 
-/// Entry representing a file.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java>
-#[allow(dead_code)]
-pub trait FileEntry {
-    fn kind(&self) -> &FileKind;
-
-    fn partition(&self) -> &Vec<u8>;
-
-    fn bucket(&self) -> i32;
-
-    fn level(&self) -> i32;
-
-    fn file_name(&self) -> &str;
-
-    fn min_key(&self) -> &Vec<u8>;
-
-    fn max_key(&self) -> &Vec<u8>;
-
-    fn identifier(&self) -> Identifier;
-}
-
 /// The same {@link Identifier} indicates that the {@link ManifestEntry} refers to the same data file.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java#L58>
@@ -52,6 +30,7 @@ pub struct Identifier {
     pub level: i32,
     pub file_name: String,
 }
+
 /// Kind of a file.
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java>
 #[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
@@ -85,7 +64,7 @@ pub struct ManifestEntry {
 }
 
 #[allow(dead_code)]
-impl FileEntry for ManifestEntry {
+impl ManifestEntry {
     fn kind(&self) -> &FileKind {
         &self.kind
     }
@@ -122,10 +101,7 @@ impl FileEntry for ManifestEntry {
             file_name: self.file.file_name.clone(),
         }
     }
-}
 
-#[allow(dead_code)]
-impl ManifestEntry {
     pub fn total_buckets(&self) -> i32 {
         self.total_buckets
     }
