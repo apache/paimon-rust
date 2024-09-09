@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::RowType;
+use crate::spec::stats::BinaryTableStats;
+use chrono::serde::ts_milliseconds::deserialize as from_millis;
+use chrono::serde::ts_milliseconds::serialize as to_millis;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -48,12 +50,6 @@ impl BinaryRow {
     }
 }
 
-/// TODO: implement me.
-/// The statistics for columns, supports the following stats.
-///
-/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/stats/SimpleStats.java>
-type SimpleStats = ();
-
 /// The Source of a file.
 /// TODO: move me to the manifest module.
 ///
@@ -72,25 +68,43 @@ pub enum FileSource {
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFileMeta {
+    #[serde(rename = "_FILE_NAME")]
     pub file_name: String,
+    #[serde(rename = "_FILE_SIZE")]
     pub file_size: i64,
     // row_count tells the total number of rows (including add & delete) in this file.
+    #[serde(rename = "_ROW_COUNT")]
     pub row_count: i64,
-    pub min_key: BinaryRow,
-    pub max_key: BinaryRow,
-    pub key_stats: SimpleStats,
-    pub value_stats: SimpleStats,
+    #[serde(rename = "_MIN_KEY", with = "serde_bytes")]
+    pub min_key: Vec<u8>,
+    #[serde(rename = "_MAX_KEY", with = "serde_bytes")]
+    pub max_key: Vec<u8>,
+    #[serde(rename = "_KEY_STATS")]
+    pub key_stats: BinaryTableStats,
+    #[serde(rename = "_VALUE_STATS")]
+    pub value_stats: BinaryTableStats,
+    #[serde(rename = "_MIN_SEQUENCE_NUMBER")]
     pub min_sequence_number: i64,
+    #[serde(rename = "_MAX_SEQUENCE_NUMBER")]
     pub max_sequence_number: i64,
+    #[serde(rename = "_SCHEMA_ID")]
     pub schema_id: i64,
+    #[serde(rename = "_LEVEL")]
     pub level: i32,
+    #[serde(rename = "_EXTRA_FILES")]
     pub extra_files: Vec<String>,
+    #[serde(
+        rename = "_CREATION_TIME",
+        serialize_with = "to_millis",
+        deserialize_with = "from_millis"
+    )]
     pub creation_time: DateTime<Utc>,
+    #[serde(rename = "_DELETE_ROW_COUNT")]
     // rowCount = add_row_count + delete_row_count.
     pub delete_row_count: Option<i64>,
     // file index filter bytes, if it is small, store in data file meta
+    #[serde(rename = "_EMBEDDED_FILE_INDEX", with = "serde_bytes")]
     pub embedded_index: Option<Vec<u8>>,
-    pub file_source: Option<FileSource>,
 }
 
 impl Display for DataFileMeta {
@@ -99,7 +113,5 @@ impl Display for DataFileMeta {
     }
 }
 
-impl DataFileMeta {
-    // TODO: implement me
-    pub const SCHEMA: RowType = RowType::new(vec![]);
-}
+#[allow(dead_code)]
+impl DataFileMeta {}
