@@ -15,29 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Spec module for paimon.
-//!
-//! All paimon specs types are defined here.
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-mod data_file;
-pub use data_file::*;
+/// Kind of a file.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java>
+#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum FileKind {
+    Add = 0,
+    Delete = 1,
+}
 
-mod schema;
-pub use schema::*;
-
-mod schema_change;
-pub use schema_change::*;
-
-mod snapshot;
-pub use snapshot::*;
-
-mod manifest_file_meta;
-pub use manifest_file_meta::*;
-
-mod manifest_common;
-mod manifest_entry;
-mod objects_file;
-mod stats;
-mod types;
-
-pub use types::*;
+/// The Source of a file.
+/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
+#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum FileSource {
+    Append = 0,
+    Compact = 1,
+}

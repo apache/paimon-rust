@@ -50,18 +50,6 @@ impl BinaryRow {
     }
 }
 
-/// The Source of a file.
-/// TODO: move me to the manifest module.
-///
-/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FileSource {
-    Append = 0,
-    Compact = 1,
-}
-
 /// Metadata of a data file.
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
