@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::spec::manifest_common::FileKind;
 use crate::spec::DataFileMeta;
 use serde::Deserialize;
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_derive::Serialize;
 
 /// The same {@link Identifier} indicates that the {@link ManifestEntry} refers to the same data file.
@@ -29,15 +29,6 @@ pub struct Identifier {
     pub bucket: i32,
     pub level: i32,
     pub file_name: String,
-}
-
-/// Kind of a file.
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java>
-#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
-pub enum FileKind {
-    Add = 0,
-    Delete = 1,
 }
 
 /// Entry of a manifest file, representing an addition / deletion of a data file.

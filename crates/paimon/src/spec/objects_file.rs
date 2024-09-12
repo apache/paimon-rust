@@ -32,7 +32,8 @@ pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::manifest_entry::{FileKind, ManifestEntry};
+    use crate::spec::manifest_common::FileKind;
+    use crate::spec::manifest_entry::ManifestEntry;
     use crate::spec::objects_file::from_avro_bytes;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataFileMeta, ManifestFileMeta};
