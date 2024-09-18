@@ -17,3 +17,6 @@
 
 mod file_index_format;
 pub use file_index_format::*;
+
+mod bitmap_index;
+pub use bitmap_index::*;
