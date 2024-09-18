@@ -65,6 +65,20 @@ pub enum Error {
         display("Paimon hitting invalid file index format: {}", message)
     )]
     FileIndexFormatInvalid { message: String },
+    #[snafu(visibility(pub(crate)), display("Serialization error: {}", source))]
+    SerializationError { source: serde_json::Error },
+    #[snafu(visibility(pub(crate)), display("Deserialization error: {}", source))]
+    DeserializationError { source: serde_json::Error },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Roaring bitmap serialization error: {}", source)
+    )]
+    BitmapSerializationError { source: std::io::Error },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Bitmap deserialization error: {}", source)
+    )]
+    BitmapDeserializationError { source: std::io::Error },
 }
 
 impl From<opendal::Error> for Error {
