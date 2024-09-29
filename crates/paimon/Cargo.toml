@@ -37,6 +37,7 @@ storage-fs = ["opendal/services-fs"]
 url = "2.5.2"
 async-trait = "0.1.81"
 bytes = "1.7.1"
+bloomfilter = "1.0.14"
 bitflags = "2.6.0"
 tokio = { version = "1.39.2", features = ["macros"] }
 chrono = { version = "0.4.38", features = ["serde"] }

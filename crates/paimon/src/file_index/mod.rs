@@ -17,3 +17,6 @@
 
 mod file_index_format;
 pub use file_index_format::*;
+
+mod bloom_filter_file_index;
+pub use bloom_filter_file_index::*;
