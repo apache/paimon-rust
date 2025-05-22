@@ -34,8 +34,14 @@ pub use snapshot::*;
 mod manifest_file_meta;
 pub use manifest_file_meta::*;
 
-mod manifest_list;
-pub use manifest_list::*;
+mod index_file_meta;
+pub use index_file_meta::*;
 
+mod index_manifest;
+mod manifest_common;
+mod manifest_entry;
+mod objects_file;
+mod stats;
 mod types;
+
 pub use types::*;

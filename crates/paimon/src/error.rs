@@ -54,36 +54,19 @@ pub enum Error {
         display("Paimon hitting invalid config: {}", message)
     )]
     ConfigInvalid { message: String },
-
-    #[snafu(display("Database {} is not empty.", database))]
-    DatabaseNotEmpty { database: String },
-
-    #[snafu(display("Database {} already exists.", database))]
-    DatabaseAlreadyExist { database: String },
-
-    #[snafu(display("Database {} does not exist.", database))]
-    DatabaseNotExist { database: String },
-
-    #[snafu(display("Can't do operation on system database."))]
-    ProcessSystemDatabase,
-
-    #[snafu(display("Table {} already exists.", identifier.full_name()))]
-    TableAlreadyExist { identifier: Identifier },
-
-    #[snafu(display("Table {} does not exist.", identifier.full_name()))]
-    TableNotExist { identifier: Identifier },
-
-    #[snafu(display("Partition {} do not exist in the table {}.", identifier.full_name(), partitions))]
-    PartitionNotExist {
-        identifier: Identifier,
-        partitions: String,
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting unexpected avro error {}: {:?}", message, source)
+    )]
+    DataUnexpected {
+        message: String,
+        source: apache_avro::Error,
     },
-
-    #[snafu(display("Column {} already exists.", column_name))]
-    ColumnAlreadyExist { column_name: String },
-
-    #[snafu(display("Column {} does not exist.", column_name))]
-    ColumnNotExist { column_name: String },
+    #[snafu(
+        visibility(pub(crate)),
+        display("Paimon hitting invalid file index format: {}", message)
+    )]
+    FileIndexFormatInvalid { message: String },
 }
 
 impl From<opendal::Error> for Error {
@@ -91,6 +74,15 @@ impl From<opendal::Error> for Error {
         // TODO: Simple use IoUnexpected for now
         Error::IoUnexpected {
             message: "IO operation failed on underlying storage".to_string(),
+            source,
+        }
+    }
+}
+
+impl From<apache_avro::Error> for Error {
+    fn from(source: apache_avro::Error) -> Self {
+        Error::DataUnexpected {
+            message: "".to_string(),
             source,
         }
     }

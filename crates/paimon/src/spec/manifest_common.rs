@@ -15,16 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::manifest_file_meta::ManifestFileMeta;
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-/// This file includes several [`ManifestFileMeta`], representing all data of the whole table at the corresponding snapshot.
-pub struct ManifestList {}
+/// Kind of a file.
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java>
+#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum FileKind {
+    Add = 0,
+    Delete = 1,
+}
 
-impl ManifestList {
-    /// Write several [`ManifestFileMeta`]s into a manifest list.
-    ///
-    /// NOTE: This method is atomic.
-    pub fn write(&mut self, _metas: Vec<ManifestFileMeta>) -> &str {
-        todo!()
-    }
+/// The Source of a file.
+/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
+#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum FileSource {
+    Append = 0,
+    Compact = 1,
 }

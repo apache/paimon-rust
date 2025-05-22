@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_bytes::Bytes;
+use crate::spec::stats::BinaryTableStats;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 /// Metadata of a manifest file.
@@ -24,6 +24,9 @@ use std::fmt::{Display, Formatter};
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFileMeta.java>
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFileMeta {
+    #[serde(rename = "_VERSION")]
+    version: i32,
+
     /// manifest file name
     #[serde(rename = "_FILE_NAME")]
     file_name: String,
@@ -84,6 +87,32 @@ impl ManifestFileMeta {
     pub fn schema_id(&self) -> i64 {
         self.schema_id
     }
+
+    /// Get the version of this manifest file
+    #[inline]
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    #[inline]
+    pub fn new(
+        file_name: String,
+        file_size: i64,
+        num_added_files: i64,
+        num_deleted_files: i64,
+        partition_stats: BinaryTableStats,
+        schema_id: i64,
+    ) -> ManifestFileMeta {
+        Self {
+            version: 2,
+            file_name,
+            file_size,
+            num_added_files,
+            num_deleted_files,
+            partition_stats,
+            schema_id,
+        }
+    }
 }
 
 impl Display for ManifestFileMeta {
@@ -99,84 +128,4 @@ impl Display for ManifestFileMeta {
             self.schema_id
         )
     }
-}
-
-/// The statistics for columns, supports the following stats.
-///
-/// All statistics are stored in the form of a Binary, which can significantly reduce its memory consumption, but the cost is that the column type needs to be known when getting.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/stats/FieldStatsArraySerializer.java#L111>
-#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
-pub struct BinaryTableStats {
-    /// the minimum values of the columns
-    #[serde(rename = "_MIN_VALUES", with = "serde_bytes")]
-    min_values: Vec<u8>,
-
-    /// the maximum values of the columns
-    #[serde(rename = "_MAX_VALUES", with = "serde_bytes")]
-    max_values: Vec<u8>,
-
-    /// the number of nulls of the columns
-    #[serde(
-        rename = "_NULL_COUNTS",
-        serialize_with = "serialize_null_counts",
-        deserialize_with = "deserialize_null_counts"
-    )]
-    null_counts: Vec<i64>,
-}
-
-impl BinaryTableStats {
-    /// Get the minimum values of the columns
-    #[inline]
-    pub fn min_values(&self) -> &[u8] {
-        &self.min_values
-    }
-
-    /// Get the maximum values of the columns
-    #[inline]
-    pub fn max_values(&self) -> &[u8] {
-        &self.max_values
-    }
-
-    /// Get the number of nulls of the columns
-    #[inline]
-    pub fn null_counts(&self) -> &Vec<i64> {
-        &self.null_counts
-    }
-}
-
-impl Display for BinaryTableStats {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
-    }
-}
-
-fn serialize_null_counts<S>(value: &Vec<i64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut bytes = Vec::new();
-    for &num in value {
-        bytes.extend_from_slice(&num.to_le_bytes());
-    }
-
-    let bytes = Bytes::new(bytes.as_slice());
-    serializer.serialize_bytes(bytes)
-}
-
-fn deserialize_null_counts<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let bytes = Deserialize::deserialize(deserializer).map(Bytes::new)?;
-
-    let size_of_i64 = std::mem::size_of::<i64>();
-    let i64_count = bytes.len() / size_of_i64;
-    let mut i64s = Vec::with_capacity(i64_count);
-    for chunk in bytes.chunks_exact(size_of_i64) {
-        i64s.push(i64::from_le_bytes(
-            chunk.try_into().expect("Chunk must be 8 bytes long"),
-        ));
-    }
-    Ok(i64s)
 }
