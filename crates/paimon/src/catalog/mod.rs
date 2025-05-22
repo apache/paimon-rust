@@ -26,14 +26,33 @@ use crate::error::Result;
 use crate::io::FileIO;
 use crate::spec::{RowType, SchemaChange, TableSchema};
 
+/// Information about a catalog's default values and system settings
+#[derive(Debug, Clone)]
+pub struct CatalogInfo {
+    pub default_database: String,
+    pub system_table_splitter: String,
+    pub system_database_name: String,
+}
+
+impl Default for CatalogInfo {
+    fn default() -> Self {
+        Self {
+            default_database: "default".to_string(),
+            system_table_splitter: "$".to_string(),
+            system_database_name: "sys".to_string(),
+        }
+    }
+}
+
 /// This interface is responsible for reading and writing metadata such as database/table from a paimon catalog.
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/catalog/Catalog.java#L42>
 #[async_trait]
 pub trait Catalog: Send + Sync {
-    const DEFAULT_DATABASE: &'static str = "default";
-    const SYSTEM_TABLE_SPLITTER: &'static str = "$";
-    const SYSTEM_DATABASE_NAME: &'static str = "sys";
+    /// Returns information about the catalog's default values and system settings
+    fn info(&self) -> CatalogInfo {
+        CatalogInfo::default()
+    }
 
     /// Returns the warehouse root path containing all database directories in this catalog.
     fn warehouse(&self) -> &str;
@@ -70,7 +89,7 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()>;
 
     /// Returns a Table instance for the specified identifier.
-    async fn get_table(&self, identifier: &Identifier) -> Result<impl Table>;
+    async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
 
     /// Lists all tables in the specified database.
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>>;
@@ -190,65 +209,125 @@ impl fmt::Display for Identifier {
 /// A table provides basic abstraction for a table type and table scan, and table read.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/table/Table.java#L41>
-pub trait Table {
-    // ================== Table Metadata =====================
+pub struct Table {
+    name: String,
+    row_type: RowType,
+    partition_keys: Vec<String>,
+    primary_keys: Vec<String>,
+    options: HashMap<String, String>,
+    comment: Option<String>,
+}
+
+impl Table {
+    /// Create a new table instance
+    pub fn new(
+        name: String,
+        row_type: RowType,
+        partition_keys: Vec<String>,
+        primary_keys: Vec<String>,
+        options: HashMap<String, String>,
+        comment: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            row_type,
+            partition_keys,
+            primary_keys,
+            options,
+            comment,
+        }
+    }
 
     /// A name to identify this table.
-    fn name(&self) -> &str;
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
     /// Returns the row type of this table.
-    fn row_type(&self) -> &RowType;
+    pub fn row_type(&self) -> &RowType {
+        &self.row_type
+    }
 
     /// Partition keys of this table.
-    fn partition_keys(&self) -> Vec<String>;
+    pub fn partition_keys(&self) -> &[String] {
+        &self.partition_keys
+    }
 
     /// Primary keys of this table.
-    fn primary_keys(&self) -> Vec<String>;
+    pub fn primary_keys(&self) -> &[String] {
+        &self.primary_keys
+    }
 
     /// Options of this table.
-    fn options(&self) -> HashMap<String, String>;
+    pub fn options(&self) -> &HashMap<String, String> {
+        &self.options
+    }
 
     /// Optional comment of this table.
-    fn comment(&self) -> Option<&String>;
-
-    // ================= Table Operations ====================
+    pub fn comment(&self) -> Option<&String> {
+        self.comment.as_ref()
+    }
 
     /// Copy this table with adding dynamic options.
-    fn copy(&self, dynamic_options: HashMap<String, String>) -> Box<dyn Table>;
+    pub fn copy(&self, dynamic_options: HashMap<String, String>) -> Self {
+        let mut options = self.options.clone();
+        options.extend(dynamic_options);
+        Self {
+            name: self.name.clone(),
+            row_type: self.row_type.clone(),
+            partition_keys: self.partition_keys.clone(),
+            primary_keys: self.primary_keys.clone(),
+            options,
+            comment: self.comment.clone(),
+        }
+    }
+}
 
+/// Experimental operations for tables that support snapshots, tags, and branches.
+///
+/// These operations are marked as experimental and may change in future releases.
+/// Not all table implementations may support these operations.
+#[async_trait]
+pub trait TableOperations: Send + Sync {
     /// Rollback table's state to a specific snapshot.
-    fn rollback_to(&mut self, snapshot_id: u64);
+    async fn rollback_to(&mut self, snapshot_id: u64) -> Result<()>;
 
     /// Create a tag from given snapshot.
-    fn create_tag(&mut self, tag_name: &str, from_snapshot_id: u64);
+    async fn create_tag(&mut self, tag_name: &str, from_snapshot_id: u64) -> Result<()>;
 
-    fn create_tag_with_retention(
+    /// Create a tag from given snapshot with retention period.
+    async fn create_tag_with_retention(
         &mut self,
         tag_name: &str,
         from_snapshot_id: u64,
         time_retained: Duration,
-    );
+    ) -> Result<()>;
 
     /// Create a tag from the latest snapshot.
-    fn create_tag_from_latest(&mut self, tag_name: &str);
+    async fn create_tag_from_latest(&mut self, tag_name: &str) -> Result<()>;
 
-    fn create_tag_from_latest_with_retention(&mut self, tag_name: &str, time_retained: Duration);
+    /// Create a tag from the latest snapshot with retention period.
+    async fn create_tag_from_latest_with_retention(
+        &mut self,
+        tag_name: &str,
+        time_retained: Duration,
+    ) -> Result<()>;
 
     /// Delete a tag by name.
-    fn delete_tag(&mut self, tag_name: &str);
+    async fn delete_tag(&mut self, tag_name: &str) -> Result<()>;
 
     /// Rollback table's state to a specific tag.
-    fn rollback_to_tag(&mut self, tag_name: &str);
+    async fn rollback_to_tag(&mut self, tag_name: &str) -> Result<()>;
 
     /// Create an empty branch.
-    fn create_branch(&mut self, branch_name: &str);
+    async fn create_branch(&mut self, branch_name: &str) -> Result<()>;
 
     /// Create a branch from given snapshot.
-    fn create_branch_from_snapshot(&mut self, branch_name: &str, snapshot_id: u64);
+    async fn create_branch_from_snapshot(&mut self, branch_name: &str, snapshot_id: u64) -> Result<()>;
 
     /// Create a branch from given tag.
-    fn create_branch_from_tag(&mut self, branch_name: &str, tag_name: &str);
+    async fn create_branch_from_tag(&mut self, branch_name: &str, tag_name: &str) -> Result<()>;
 
     /// Delete a branch by branchName.
-    fn delete_branch(&mut self, branch_name: &str);
+    async fn delete_branch(&mut self, branch_name: &str) -> Result<()>;
 }
