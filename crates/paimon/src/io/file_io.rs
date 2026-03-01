@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use opendal::Operator;
+use opendal::{Metakey, Operator};
 use snafu::ResultExt;
 use url::Url;
 
@@ -97,10 +97,15 @@ impl FileIO {
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
         let (op, relative_path) = self.storage.create(path)?;
+        let base_path = &path[..path.len() - relative_path.len()];
 
-        let entries = op.list(relative_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to list files in '{path}'"),
-        })?;
+        let entries = op
+            .list_with(relative_path)
+            .metakey(Metakey::ContentLength | Metakey::LastModified)
+            .await
+            .context(IoUnexpectedSnafu {
+                message: format!("Failed to list files in '{path}'"),
+            })?;
 
         let mut statuses = Vec::new();
 
@@ -109,7 +114,7 @@ impl FileIO {
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: meta.is_dir(),
-                path: path.to_string(),
+                path: format!("{base_path}{}", entry.path()),
                 last_modified: meta.last_modified(),
             });
         }
@@ -354,23 +359,18 @@ impl OutputFile {
 
 #[cfg(test)]
 mod file_action_test {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     use super::*;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
-        let storage = Storage::Memory;
-        FileIO {
-            storage: Arc::new(storage),
-        }
+        FileIOBuilder::new("memory").build().unwrap()
     }
 
     fn setup_fs_file_io() -> FileIO {
-        let storage = Storage::LocalFs;
-        FileIO {
-            storage: Arc::new(storage),
-        }
+        FileIOBuilder::new("file").build().unwrap()
     }
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
@@ -434,6 +434,55 @@ mod file_action_test {
         file_io.delete_file(dst).await.unwrap();
     }
 
+    async fn common_test_list_status_paths(file_io: &FileIO, dir_path: &str) {
+        if let Some(local_dir) = dir_path.strip_prefix("file:/") {
+            let _ = fs::remove_dir_all(local_dir);
+        }
+
+        file_io.mkdirs(dir_path).await.unwrap();
+
+        let file_a = format!("{dir_path}a.txt");
+        let file_b = format!("{dir_path}b.txt");
+        file_io
+            .new_output(&file_a)
+            .unwrap()
+            .write(Bytes::from("a"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&file_b)
+            .unwrap()
+            .write(Bytes::from("b"))
+            .await
+            .unwrap();
+
+        let statuses = file_io.list_status(dir_path).await.unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        let expected_paths: BTreeSet<String> =
+            [file_a.clone(), file_b.clone()].into_iter().collect();
+        let actual_paths: BTreeSet<String> =
+            statuses.iter().map(|status| status.path.clone()).collect();
+        assert_eq!(
+            actual_paths, expected_paths,
+            "list_status should return exact entry paths"
+        );
+
+        assert!(
+            statuses.iter().all(|status| !status.is_dir),
+            "listed entries should be files in this test"
+        );
+
+        let sizes_by_path: BTreeMap<String, u64> = statuses
+            .iter()
+            .map(|status| (status.path.clone(), status.size))
+            .collect();
+        assert_eq!(sizes_by_path.get(&file_a), Some(&1));
+        assert_eq!(sizes_by_path.get(&file_b), Some(&1));
+
+        file_io.delete_dir(dir_path).await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_delete_file_memory() {
         let file_io = setup_memory_file_io();
@@ -474,6 +523,18 @@ mod file_action_test {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn test_list_status_fs_should_return_entry_paths() {
+        let file_io = setup_fs_file_io();
+        common_test_list_status_paths(&file_io, "file:/tmp/test_list_status_paths_fs/").await;
+    }
+
+    #[tokio::test]
+    async fn test_list_status_memory_should_return_entry_paths() {
+        let file_io = setup_memory_file_io();
+        common_test_list_status_paths(&file_io, "memory:/test_list_status_paths_memory/").await;
+    }
 }
 
 #[cfg(test)]
@@ -482,17 +543,11 @@ mod input_output_test {
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
-        let storage = Storage::Memory;
-        FileIO {
-            storage: Arc::new(storage),
-        }
+        FileIOBuilder::new("memory").build().unwrap()
     }
 
     fn setup_fs_file_io() -> FileIO {
-        let storage = Storage::LocalFs;
-        FileIO {
-            storage: Arc::new(storage),
-        }
+        FileIOBuilder::new("file").build().unwrap()
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {

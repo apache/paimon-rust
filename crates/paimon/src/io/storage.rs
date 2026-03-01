@@ -25,9 +25,9 @@ use super::FileIOBuilder;
 #[derive(Debug)]
 pub enum Storage {
     #[cfg(feature = "storage-memory")]
-    Memory,
+    Memory(Operator),
     #[cfg(feature = "storage-fs")]
-    LocalFs,
+    LocalFs(Operator),
 }
 
 impl Storage {
@@ -37,9 +37,9 @@ impl Storage {
 
         match scheme {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory),
+            Scheme::Memory => Ok(Self::Memory(super::memory_config_build()?)),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs),
+            Scheme::Fs => Ok(Self::LocalFs(super::fs_config_build()?)),
             _ => Err(error::Error::IoUnsupported {
                 message: "Unsupported storage feature".to_string(),
             }),
@@ -49,23 +49,19 @@ impl Storage {
     pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, &'a str)> {
         match self {
             #[cfg(feature = "storage-memory")]
-            Storage::Memory => {
-                let op = super::memory_config_build()?;
-
+            Storage::Memory(op) => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
-                    Ok((op, stripped))
+                    Ok((op.clone(), stripped))
                 } else {
-                    Ok((op, &path[1..]))
+                    Ok((op.clone(), &path[1..]))
                 }
             }
             #[cfg(feature = "storage-fs")]
-            Storage::LocalFs => {
-                let op = super::fs_config_build()?;
-
+            Storage::LocalFs(op) => {
                 if let Some(stripped) = path.strip_prefix("file:/") {
-                    Ok((op, stripped))
+                    Ok((op.clone(), stripped))
                 } else {
-                    Ok((op, &path[1..]))
+                    Ok((op.clone(), &path[1..]))
                 }
             }
         }
