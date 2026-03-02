@@ -38,6 +38,71 @@ pub struct TableSchema {
     time_millis: i64,
 }
 
+impl TableSchema {
+    pub const CURRENT_VERSION: i32 = 3;
+
+    /// Create a TableSchema from a Schema with the given ID.
+    ///
+    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/TableSchema.java#L373>
+    pub fn new(id: i64, schema: &Schema) -> Self {
+        let fields = schema.fields().to_vec();
+        let highest_field_id = Self::current_highest_field_id(&fields);
+
+        Self {
+            version: Self::CURRENT_VERSION,
+            id,
+            fields,
+            highest_field_id,
+            partition_keys: schema.partition_keys().to_vec(),
+            primary_keys: schema.primary_keys().to_vec(),
+            options: schema.options().clone(),
+            comment: schema.comment().map(|s| s.to_string()),
+            time_millis: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Get the highest field ID from a list of fields.
+    pub fn current_highest_field_id(fields: &[DataField]) -> i32 {
+        fields.iter().map(|f| f.id()).max().unwrap_or(-1)
+    }
+
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn fields(&self) -> &[DataField] {
+        &self.fields
+    }
+
+    pub fn highest_field_id(&self) -> i32 {
+        self.highest_field_id
+    }
+
+    pub fn partition_keys(&self) -> &[String] {
+        &self.partition_keys
+    }
+
+    pub fn primary_keys(&self) -> &[String] {
+        &self.primary_keys
+    }
+
+    pub fn options(&self) -> &HashMap<String, String> {
+        &self.options
+    }
+
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
+
+    pub fn time_millis(&self) -> i64 {
+        self.time_millis
+    }
+}
+
 /// Data field for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>

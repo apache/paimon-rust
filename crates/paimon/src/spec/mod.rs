@@ -38,10 +38,10 @@ mod index_file_meta;
 pub use index_file_meta::*;
 
 mod index_manifest;
+mod manifest;
 mod manifest_common;
 mod manifest_entry;
 mod objects_file;
 mod stats;
 mod types;
-
 pub use types::*;

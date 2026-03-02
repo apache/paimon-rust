@@ -1270,6 +1270,14 @@ impl VarCharType {
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
+    /// Variable-length string type with maximum length (Java: `VarCharType.STRING_TYPE`).
+    ///
+    /// Reference: [VarCharType.STRING_TYPE](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/types/VarCharType.java).
+    #[inline]
+    pub fn string_type() -> Self {
+        Self::with_nullable(true, Self::MAX_LENGTH).unwrap()
+    }
+
     pub fn new(length: u32) -> Result<Self, Error> {
         Self::with_nullable(true, length)
     }

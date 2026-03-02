@@ -101,7 +101,7 @@ pub async fn write_column_indexes(
     path: &str,
     indexes: HashMap<String, HashMap<String, Bytes>>,
 ) -> crate::Result<OutputFile> {
-    let file_io = FileIO::from_url(path)?.build()?;
+    let file_io = FileIO::from_path(path)?.build()?;
     let output = file_io.new_output(path)?;
     let mut writer = output.writer().await?;
 

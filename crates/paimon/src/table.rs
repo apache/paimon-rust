@@ -17,6 +17,53 @@
 
 //! Table API for Apache Paimon
 
+use crate::catalog::Identifier;
+use crate::io::FileIO;
+use crate::spec::TableSchema;
+
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
-pub struct Table {}
+pub struct Table {
+    file_io: FileIO,
+    identifier: Identifier,
+    location: String,
+    schema: TableSchema,
+}
+
+#[allow(dead_code)]
+impl Table {
+    /// Create a new table.
+    pub fn new(
+        file_io: FileIO,
+        identifier: Identifier,
+        location: String,
+        schema: TableSchema,
+    ) -> Self {
+        Self {
+            file_io,
+            identifier,
+            location,
+            schema,
+        }
+    }
+
+    /// Get the table's identifier.
+    pub fn identifier(&self) -> &Identifier {
+        &self.identifier
+    }
+
+    /// Get the table's location.
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    /// Get the table's schema.
+    pub fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    /// Get the FileIO instance for this table.
+    pub fn file_io(&self) -> &FileIO {
+        &self.file_io
+    }
+}
