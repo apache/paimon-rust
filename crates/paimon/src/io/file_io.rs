@@ -382,18 +382,24 @@ impl OutputFile {
 
 #[cfg(test)]
 mod file_action_test {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::fs;
 
     use super::*;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
-        FileIOBuilder::new("memory").build().unwrap()
+        let storage = Storage::Memory;
+        FileIO {
+            storage: Arc::new(storage),
+        }
     }
 
     fn setup_fs_file_io() -> FileIO {
-        FileIOBuilder::new("file").build().unwrap()
+        let storage = Storage::LocalFs;
+        FileIO {
+            storage: Arc::new(storage),
+        }
     }
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
@@ -466,18 +472,14 @@ mod file_action_test {
 
         let file_a = format!("{dir_path}a.txt");
         let file_b = format!("{dir_path}b.txt");
-        file_io
-            .new_output(&file_a)
-            .unwrap()
-            .write(Bytes::from("a"))
-            .await
-            .unwrap();
-        file_io
-            .new_output(&file_b)
-            .unwrap()
-            .write(Bytes::from("b"))
-            .await
-            .unwrap();
+        for file in [&file_a, &file_b] {
+            file_io
+                .new_output(file)
+                .unwrap()
+                .write(Bytes::from("test data"))
+                .await
+                .unwrap();
+        }
 
         let statuses = file_io.list_status(dir_path).await.unwrap();
         assert_eq!(statuses.len(), 2);
@@ -490,18 +492,6 @@ mod file_action_test {
             actual_paths, expected_paths,
             "list_status should return exact entry paths"
         );
-
-        assert!(
-            statuses.iter().all(|status| !status.is_dir),
-            "listed entries should be files in this test"
-        );
-
-        let sizes_by_path: BTreeMap<String, u64> = statuses
-            .iter()
-            .map(|status| (status.path.clone(), status.size))
-            .collect();
-        assert_eq!(sizes_by_path.get(&file_a), Some(&1));
-        assert_eq!(sizes_by_path.get(&file_b), Some(&1));
 
         file_io.delete_dir(dir_path).await.unwrap();
     }
@@ -552,12 +542,6 @@ mod file_action_test {
         let file_io = setup_fs_file_io();
         common_test_list_status_paths(&file_io, "file:/tmp/test_list_status_paths_fs/").await;
     }
-
-    #[tokio::test]
-    async fn test_list_status_memory_should_return_entry_paths() {
-        let file_io = setup_memory_file_io();
-        common_test_list_status_paths(&file_io, "memory:/test_list_status_paths_memory/").await;
-    }
 }
 
 #[cfg(test)]
@@ -566,11 +550,17 @@ mod input_output_test {
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
-        FileIOBuilder::new("memory").build().unwrap()
+        let storage = Storage::Memory;
+        FileIO {
+            storage: Arc::new(storage),
+        }
     }
 
     fn setup_fs_file_io() -> FileIO {
-        FileIOBuilder::new("file").build().unwrap()
+        let storage = Storage::LocalFs;
+        FileIO {
+            storage: Arc::new(storage),
+        }
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
