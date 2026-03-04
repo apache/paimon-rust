@@ -68,26 +68,35 @@ impl Storage {
         }
     }
 
-    pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, &'a str)> {
+    pub(crate) fn build_operator(&self) -> crate::Result<Operator> {
+        match self {
+            #[cfg(feature = "storage-memory")]
+            Storage::Memory => super::memory_config_build(),
+            #[cfg(feature = "storage-fs")]
+            Storage::LocalFs => super::fs_config_build(),
+        }
+    }
+
+    pub(crate) fn relative_path<'a>(&self, path: &'a str) -> crate::Result<&'a str> {
         match self {
             #[cfg(feature = "storage-memory")]
             Storage::Memory => {
-                let op = super::memory_config_build()?;
-
                 if let Some(stripped) = path.strip_prefix("memory:/") {
-                    Ok((op, stripped))
+                    Ok(stripped)
                 } else {
-                    Ok((op, &path[1..]))
+                    path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
+                        message: format!("Invalid memory path: {path}"),
+                    })
                 }
             }
             #[cfg(feature = "storage-fs")]
             Storage::LocalFs => {
-                let op = super::fs_config_build()?;
-
                 if let Some(stripped) = path.strip_prefix("file:/") {
-                    Ok((op, stripped))
+                    Ok(stripped)
                 } else {
-                    Ok((op, &path[1..]))
+                    path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
+                        message: format!("Invalid file path: {path}"),
+                    })
                 }
             }
             #[cfg(feature = "storage-oss")]
