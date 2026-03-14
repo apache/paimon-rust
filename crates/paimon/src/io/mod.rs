@@ -30,3 +30,8 @@ use storage_fs::*;
 mod storage_memory;
 #[cfg(feature = "storage-memory")]
 use storage_memory::*;
+
+#[cfg(feature = "storage-oss")]
+mod storage_oss;
+#[cfg(feature = "storage-oss")]
+use storage_oss::*;

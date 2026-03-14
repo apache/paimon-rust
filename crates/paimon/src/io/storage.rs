@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "storage-oss")]
+use opendal::services::OssConfig;
 use opendal::{Operator, Scheme};
 
 use crate::error;
@@ -28,11 +30,13 @@ pub enum Storage {
     Memory,
     #[cfg(feature = "storage-fs")]
     LocalFs,
+    #[cfg(feature = "storage-oss")]
+    Oss { config: Box<OssConfig> },
 }
 
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
-        let (scheme_str, _) = file_io_builder.into_parts();
+        let (scheme_str, _props) = file_io_builder.into_parts();
         let scheme = Self::parse_scheme(&scheme_str)?;
 
         match scheme {
@@ -40,6 +44,13 @@ impl Storage {
             Scheme::Memory => Ok(Self::Memory),
             #[cfg(feature = "storage-fs")]
             Scheme::Fs => Ok(Self::LocalFs),
+            #[cfg(feature = "storage-oss")]
+            Scheme::Oss => {
+                let config = super::oss_config_parse(_props)?;
+                Ok(Self::Oss {
+                    config: Box::new(config),
+                })
+            }
             _ => Err(error::Error::IoUnsupported {
                 message: "Unsupported storage feature".to_string(),
             }),
@@ -66,6 +77,18 @@ impl Storage {
                     Ok((op, stripped))
                 } else {
                     Ok((op, &path[1..]))
+                }
+            }
+            #[cfg(feature = "storage-oss")]
+            Storage::Oss { config } => {
+                let op = super::oss_config_build(config, path)?;
+                let prefix = format!("oss://{}/", op.info().name());
+                if let Some(stripped) = path.strip_prefix(&prefix) {
+                    Ok((op, stripped))
+                } else {
+                    Err(error::Error::ConfigInvalid {
+                        message: format!("Invalid OSS url: {path}, should start with {prefix}"),
+                    })
                 }
             }
         }

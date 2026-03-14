@@ -28,10 +28,11 @@ version.workspace = true
 
 [features]
 default = ["storage-memory", "storage-fs"]
-storage-all = ["storage-memory", "storage-fs"]
+storage-all = ["storage-memory", "storage-fs", "storage-oss"]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
+storage-oss = ["opendal/services-oss"]
 
 [dependencies]
 url = "2.5.2"
