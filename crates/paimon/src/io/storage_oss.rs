@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use opendal::services::OssConfig;
-use opendal::Operator;
+use opendal::{Configurator, Operator};
 use url::Url;
 
 use crate::error::Error;
@@ -44,18 +44,34 @@ const OSS_ACCESS_KEY_SECRET: &str = "fs.oss.accessKeySecret";
 /// Extracts OSS-related configuration keys (endpoint, access key, secret key)
 /// from the provided properties map and maps them to the corresponding
 /// [`OssConfig`] fields.
+///
+/// Returns an error if any required configuration key is missing.
 pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<OssConfig> {
     let mut cfg = OssConfig::default();
 
-    if let Some(endpoint) = props.remove(OSS_ENDPOINT) {
-        cfg.endpoint = Some(endpoint);
-    }
-    if let Some(access_key_id) = props.remove(OSS_ACCESS_KEY_ID) {
-        cfg.access_key_id = Some(access_key_id);
-    }
-    if let Some(access_key_secret) = props.remove(OSS_ACCESS_KEY_SECRET) {
-        cfg.access_key_secret = Some(access_key_secret);
-    }
+    cfg.endpoint = Some(
+        props
+            .remove(OSS_ENDPOINT)
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: format!("Missing required OSS config: {OSS_ENDPOINT}"),
+            })?,
+    );
+    cfg.access_key_id =
+        Some(
+            props
+                .remove(OSS_ACCESS_KEY_ID)
+                .ok_or_else(|| Error::ConfigInvalid {
+                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_ID}"),
+                })?,
+        );
+    cfg.access_key_secret =
+        Some(
+            props
+                .remove(OSS_ACCESS_KEY_SECRET)
+                .ok_or_else(|| Error::ConfigInvalid {
+                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_SECRET}"),
+                })?,
+        );
 
     Ok(cfg)
 }
@@ -73,10 +89,8 @@ pub(crate) fn oss_config_build(cfg: &OssConfig, path: &str) -> Result<Operator> 
         message: format!("Invalid OSS url: {path}, missing bucket"),
     })?;
 
-    let mut builder_cfg = cfg.clone();
-    builder_cfg.bucket = bucket.to_string();
-
-    Ok(Operator::from_config(builder_cfg)?.finish())
+    let builder = cfg.clone().into_builder().bucket(bucket);
+    Ok(Operator::new(builder)?.finish())
 }
 
 #[cfg(test)]
