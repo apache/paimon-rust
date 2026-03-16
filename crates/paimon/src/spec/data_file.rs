@@ -58,7 +58,7 @@ pub struct BinaryRow {
 
     /// Raw binary data backing this row. Empty when constructed via `new()`.
     /// Populated via `from_bytes()` for partition data from manifest entries.
-    #[serde(skip)]
+    #[serde(with = "serde_bytes")]
     data: Vec<u8>,
 }
 
@@ -524,13 +524,29 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip_backward_compat() {
-        // Verify BinaryRow::new(0) serde roundtrip is stable.
+    fn test_serde_roundtrip_empty() {
+        // Verify empty BinaryRow serde roundtrip is stable.
         let row = BinaryRow::new(0);
         let json = serde_json::to_string(&row).unwrap();
         let deserialized: BinaryRow = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.arity(), 0);
         assert!(deserialized.is_empty());
+    }
+
+    #[test]
+    fn test_serde_roundtrip_populated() {
+        // Verify a populated BinaryRow roundtrips correctly with data intact.
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_int(0, 42);
+        builder.write_string(1, "hello");
+        let row = builder.build();
+
+        let json = serde_json::to_string(&row).unwrap();
+        let deserialized: BinaryRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.arity(), row.arity());
+        assert_eq!(deserialized.data(), row.data());
+        assert_eq!(deserialized.get_int(0), 42);
+        assert_eq!(deserialized.get_string(1), "hello");
     }
 
     #[test]
