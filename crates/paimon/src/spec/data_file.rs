@@ -212,14 +212,122 @@ impl BinaryRow {
         }
     }
 
+    /// Bounds-checked version of [`resolve_var_length_field`].
+    ///
+    /// Returns `Err` if the decoded byte range falls outside the backing data.
+    fn resolve_var_length_field_checked(&self, pos: usize) -> crate::Result<(usize, usize)> {
+        let (start, len) = self.resolve_var_length_field(pos);
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: var-len field at pos {pos}: offset {start} + len {len} overflows"
+                ),
+                source: None,
+            })?;
+        if end > self.data.len() {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: var-len field at pos {pos}: range [{start}..{end}) exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            });
+        }
+        Ok((start, len))
+    }
+
     pub fn get_binary(&self, pos: usize) -> &[u8] {
         let (start, len) = self.resolve_var_length_field(pos);
         &self.data[start..start + len]
     }
 
+    /// Bounds-checked version of [`get_binary`]. Returns `Err` on corrupted offset/len.
+    pub(crate) fn try_get_binary(&self, pos: usize) -> crate::Result<&[u8]> {
+        let (start, len) = self.resolve_var_length_field_checked(pos)?;
+        Ok(&self.data[start..start + len])
+    }
+
     pub fn get_string(&self, pos: usize) -> &str {
         let bytes = self.get_binary(pos);
         std::str::from_utf8(bytes).expect("BinaryRow: invalid UTF-8 in string field")
+    }
+
+    /// Bounds-checked version of [`get_string`]. Returns `Err` on corrupted data or invalid UTF-8.
+    pub(crate) fn try_get_string(&self, pos: usize) -> crate::Result<&str> {
+        let bytes = self.try_get_binary(pos)?;
+        std::str::from_utf8(bytes).map_err(|e| crate::Error::UnexpectedError {
+            message: format!("BinaryRow: invalid UTF-8 in string field at pos {pos}: {e}"),
+            source: None,
+        })
+    }
+
+    /// Read the unscaled value of a Decimal field as `i128`.
+    ///
+    /// - `precision <= 18` (compact): stored as `i64` in the fixed part.
+    /// - `precision > 18`: stored as big-endian two's complement bytes in the variable-length part.
+    ///
+    /// Reference: `BinaryRow.getDecimal` and `DecimalData.isCompact` in Java Paimon.
+    pub(crate) fn get_decimal_unscaled(&self, pos: usize, precision: u32) -> crate::Result<i128> {
+        if precision <= 18 {
+            Ok(self.get_long(pos) as i128)
+        } else {
+            let bytes = self.try_get_binary(pos)?;
+            if bytes.is_empty() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!("BinaryRow: empty bytes for non-compact Decimal at pos {pos}"),
+                    source: None,
+                });
+            }
+            // Big-endian two's complement, same as Java BigInteger.toByteArray().
+            let negative = bytes[0] & 0x80 != 0;
+            let mut val: i128 = if negative { -1 } else { 0 };
+            for &b in bytes {
+                val = (val << 8) | (b as i128);
+            }
+            Ok(val)
+        }
+    }
+
+    /// Read the raw components of a Timestamp / LocalZonedTimestamp field.
+    ///
+    /// Returns `(epoch_millis, nano_of_milli)`.
+    ///
+    /// - `precision <= 3` (compact): stored as epoch millis `i64` in the fixed part,
+    ///   `nano_of_milli` is 0.
+    /// - `precision > 3` (non-compact): the fixed 8-byte slot stores
+    ///   `(offset << 32) | nanoOfMillisecond`; the variable area at `offset` contains
+    ///   an 8-byte `i64` millisecond value.
+    ///
+    /// Reference: `AbstractBinaryWriter.writeTimestamp` and
+    /// `MemorySegmentUtils.readTimestampData` in Java Paimon.
+    pub(crate) fn get_timestamp_raw(
+        &self,
+        pos: usize,
+        precision: u32,
+    ) -> crate::Result<(i64, i32)> {
+        if precision <= 3 {
+            Ok((self.get_long(pos), 0))
+        } else {
+            // Read the raw 8-byte fixed slot: high 32 bits = offset, low 32 bits = nanoOfMillisecond.
+            let field_off = self.field_offset(pos);
+            let offset_and_nano = self.read_i64_at(field_off) as u64;
+            let offset = (offset_and_nano >> 32) as usize;
+            let nano_of_milli = offset_and_nano as i32;
+
+            // Read the 8-byte millisecond value from the variable area.
+            if offset + 8 > self.data.len() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "BinaryRow: non-compact Timestamp at pos {pos}: offset {offset} + 8 exceeds data length {}",
+                        self.data.len()
+                    ),
+                    source: None,
+                });
+            }
+            let millis = i64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap());
+            Ok((millis, nano_of_milli))
+        }
     }
 }
 
@@ -401,6 +509,62 @@ mod tests {
             self.data[offset..offset + value.len()].copy_from_slice(value);
             // Write mark + length into the highest byte (byte 7 in LE = offset+7).
             self.data[offset + 7] = 0x80 | (value.len() as u8);
+        }
+
+        /// Write a compact Decimal (precision <= 18) as its unscaled i64 value.
+        fn write_decimal_compact(&mut self, pos: usize, unscaled: i64) {
+            self.write_long(pos, unscaled);
+        }
+
+        /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes.
+        fn write_decimal_var_len(&mut self, pos: usize, unscaled: i128) {
+            // Convert i128 to minimal big-endian two's complement.
+            let be_bytes = unscaled.to_be_bytes();
+            // Find the first significant byte (skip redundant sign-extension bytes).
+            let mut start = 0;
+            while start < 15 {
+                let b = be_bytes[start];
+                let next = be_bytes[start + 1];
+                // Safe to skip if byte is pure sign extension.
+                if (b == 0x00 && next & 0x80 == 0) || (b == 0xFF && next & 0x80 != 0) {
+                    start += 1;
+                } else {
+                    break;
+                }
+            }
+            let minimal = &be_bytes[start..];
+
+            let var_offset = self.data.len();
+            self.data.extend_from_slice(minimal);
+            let len = minimal.len();
+            let encoded = ((var_offset as u64) << 32) | (len as u64);
+            let offset = self.field_offset(pos);
+            self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+
+        /// Write a compact Timestamp (precision <= 3) as epoch millis.
+        fn write_timestamp_compact(&mut self, pos: usize, epoch_millis: i64) {
+            self.write_long(pos, epoch_millis);
+        }
+
+        /// Write a non-compact Timestamp (precision > 3).
+        ///
+        /// Matches Java `AbstractBinaryWriter.writeTimestamp`:
+        /// - Fixed slot: `(offset << 32) | nanoOfMillisecond`
+        /// - Variable area: 8-byte `millisecond` (LE)
+        fn write_timestamp_non_compact(
+            &mut self,
+            pos: usize,
+            epoch_millis: i64,
+            nano_of_milli: i32,
+        ) {
+            let var_offset = self.data.len();
+            // Variable area: only the 8-byte millis value.
+            self.data.extend_from_slice(&epoch_millis.to_le_bytes());
+            // Fixed slot: (offset << 32) | nano_of_milli
+            let encoded = ((var_offset as u64) << 32) | (nano_of_milli as u32 as u64);
+            let offset = self.field_offset(pos);
+            self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
         }
 
         fn build(self) -> BinaryRow {
@@ -594,5 +758,63 @@ mod tests {
         let row = builder.build();
 
         assert_eq!(row.get_binary(0), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_get_decimal_compact() {
+        // precision <= 18: stored as i64 unscaled value.
+        let mut builder = BinaryRowBuilder::new(3);
+        builder.write_decimal_compact(0, 12345); // 12.345 with scale=3
+        builder.write_decimal_compact(1, -100); // -0.100 with scale=3
+        builder.write_decimal_compact(2, 0); // 0.000 with scale=3
+        let row = builder.build();
+
+        assert_eq!(row.get_decimal_unscaled(0, 10).unwrap(), 12345);
+        assert_eq!(row.get_decimal_unscaled(1, 10).unwrap(), -100);
+        assert_eq!(row.get_decimal_unscaled(2, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_decimal_var_len() {
+        // precision > 18: stored as big-endian two's complement in var-len part.
+        let mut builder = BinaryRowBuilder::new(2);
+        // Large positive: 10^19 = 10_000_000_000_000_000_000
+        let large_pos: i128 = 10_000_000_000_000_000_000;
+        builder.write_decimal_var_len(0, large_pos);
+        // Large negative
+        let large_neg: i128 = -10_000_000_000_000_000_000;
+        builder.write_decimal_var_len(1, large_neg);
+        let row = builder.build();
+
+        assert_eq!(row.get_decimal_unscaled(0, 20).unwrap(), large_pos);
+        assert_eq!(row.get_decimal_unscaled(1, 20).unwrap(), large_neg);
+    }
+
+    #[test]
+    fn test_get_timestamp_compact() {
+        // precision <= 3: stored as epoch millis i64.
+        let epoch_millis: i64 = 1_704_067_200_000; // 2024-01-01 00:00:00 UTC
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_timestamp_compact(0, epoch_millis);
+        let row = builder.build();
+
+        let (millis, nano) = row.get_timestamp_raw(0, 3).unwrap();
+        assert_eq!(millis, epoch_millis);
+        assert_eq!(nano, 0);
+    }
+
+    #[test]
+    fn test_get_timestamp_non_compact() {
+        // precision > 3: fixed slot = (offset << 32 | nano_of_milli),
+        // variable area = 8 bytes millis.
+        let epoch_millis: i64 = 1_704_067_200_123;
+        let nano_of_milli: i32 = 456_000;
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_timestamp_non_compact(0, epoch_millis, nano_of_milli);
+        let row = builder.build();
+
+        let (millis, nano) = row.get_timestamp_raw(0, 6).unwrap();
+        assert_eq!(millis, epoch_millis);
+        assert_eq!(nano, nano_of_milli);
     }
 }
