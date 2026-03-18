@@ -35,18 +35,127 @@ pub const DEFAULT_PARTITION_NAME: &str = "__DEFAULT_PARTITION__";
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
-/// Generate the partition directory path from a partition `BinaryRow`.
+/// Computes partition string values and directory paths from a partition `BinaryRow`.
 ///
-/// Returns a path like `dt=2024-01-01/hr=12/` with escaped key=value segments.
-/// Returns an empty string if `partition_keys` is empty.
+/// Mirrors Java `InternalRowPartitionComputer` — holds resolved partition field metadata
+/// and provides both `generate_part_values` (key-value pairs) and `generate_partition_path`
+/// (escaped directory path).
 ///
-/// # Arguments
-///
-/// * `partition_keys` - Partition column names, defining the order.
-/// * `schema_fields` - All fields from the table schema, used to look up types.
-/// * `row` - The partition `BinaryRow` whose arity matches `partition_keys.len()`.
-/// * `default_partition_name` - Value for null or blank partition values (e.g. `__DEFAULT_PARTITION__`).
-/// * `legacy_partition_name` - Whether to use legacy (Java `toString()`) formatting for timestamps.
+/// Reference: `org.apache.paimon.utils.InternalRowPartitionComputer` in Java Paimon.
+// TODO: remove after #131 consumes the pub(crate) API.
+#[allow(dead_code)]
+pub(crate) struct PartitionComputer {
+    partition_keys: Vec<String>,
+    partition_fields: Vec<DataField>,
+    default_partition_name: String,
+    legacy_partition_name: bool,
+}
+
+#[allow(dead_code)]
+impl PartitionComputer {
+    /// Create a new `PartitionComputer`.
+    ///
+    /// Resolves partition key names to their `DataField` definitions from `schema_fields`.
+    /// Returns an error if any partition key is not found in the schema.
+    pub(crate) fn new(
+        partition_keys: &[String],
+        schema_fields: &[DataField],
+        default_partition_name: &str,
+        legacy_partition_name: bool,
+    ) -> crate::Result<Self> {
+        let partition_fields = resolve_partition_fields(partition_keys, schema_fields)?
+            .into_iter()
+            .cloned()
+            .collect();
+        Ok(Self {
+            partition_keys: partition_keys.to_vec(),
+            partition_fields,
+            default_partition_name: default_partition_name.to_string(),
+            legacy_partition_name,
+        })
+    }
+
+    /// Generate partition key-value pairs from a `BinaryRow`.
+    ///
+    /// Returns an ordered list of `(key, value)` tuples, e.g. `[("dt", "2024-01-01"), ("hr", "12")]`.
+    /// Null or blank values are replaced by `default_partition_name`.
+    ///
+    /// This is the Rust equivalent of Java `InternalRowPartitionComputer.generatePartValues()`.
+    pub(crate) fn generate_part_values(
+        &self,
+        row: &BinaryRow,
+    ) -> crate::Result<Vec<(String, String)>> {
+        self.validate_row(row)?;
+
+        self.partition_keys
+            .iter()
+            .zip(self.partition_fields.iter())
+            .enumerate()
+            .map(|(i, (key, field))| {
+                let value = format_partition_value(
+                    row,
+                    i,
+                    field.data_type(),
+                    &self.default_partition_name,
+                    self.legacy_partition_name,
+                )?;
+                Ok((key.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Generate the partition directory path from a `BinaryRow`.
+    ///
+    /// Returns a path like `dt=2024-01-01/hr=12/` with escaped key=value segments.
+    /// Returns an empty string if `partition_keys` is empty.
+    pub(crate) fn generate_partition_path(&self, row: &BinaryRow) -> crate::Result<String> {
+        if self.partition_keys.is_empty() {
+            return Ok(String::new());
+        }
+
+        let part_values = self.generate_part_values(row)?;
+        Ok(assemble_partition_path(&part_values))
+    }
+
+    /// Validate that the `BinaryRow` is compatible with this computer's partition keys.
+    fn validate_row(&self, row: &BinaryRow) -> crate::Result<()> {
+        if self.partition_keys.len() != row.arity() as usize {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Partition keys length ({}) does not match row arity ({})",
+                    self.partition_keys.len(),
+                    row.arity()
+                ),
+                source: None,
+            });
+        }
+
+        if row.is_empty() {
+            return Err(Error::UnexpectedError {
+                message: "Partition row has no backing data but arity > 0".to_string(),
+                source: None,
+            });
+        }
+
+        // Validate that the backing data is large enough for null-bits + fixed-part.
+        let min_size = BinaryRow::cal_bit_set_width_in_bytes(row.arity()) as usize
+            + (row.arity() as usize) * 8;
+        if row.data().len() < min_size {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Partition BinaryRow data too short: need at least {} bytes, got {}",
+                    min_size,
+                    row.data().len()
+                ),
+                source: None,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Backward-compatible free function that delegates to `PartitionComputer`.
 // TODO: remove after #131 consumes the pub(crate) API.
 #[allow(dead_code)]
 pub(crate) fn generate_partition_path(
@@ -59,63 +168,13 @@ pub(crate) fn generate_partition_path(
     if partition_keys.is_empty() {
         return Ok(String::new());
     }
-
-    if partition_keys.len() != row.arity() as usize {
-        return Err(Error::UnexpectedError {
-            message: format!(
-                "Partition keys length ({}) does not match row arity ({})",
-                partition_keys.len(),
-                row.arity()
-            ),
-            source: None,
-        });
-    }
-
-    if row.is_empty() {
-        return Err(Error::UnexpectedError {
-            message: "Partition row has no backing data but arity > 0".to_string(),
-            source: None,
-        });
-    }
-
-    // Validate that the backing data is large enough for null-bits + fixed-part.
-    let min_size =
-        BinaryRow::cal_bit_set_width_in_bytes(row.arity()) as usize + (row.arity() as usize) * 8;
-    if row.data().len() < min_size {
-        return Err(Error::UnexpectedError {
-            message: format!(
-                "Partition BinaryRow data too short: need at least {} bytes, got {}",
-                min_size,
-                row.data().len()
-            ),
-            source: None,
-        });
-    }
-
-    let partition_fields = resolve_partition_fields(partition_keys, schema_fields)?;
-
-    let mut path = String::new();
-    for (i, (key, field)) in partition_keys
-        .iter()
-        .zip(partition_fields.iter())
-        .enumerate()
-    {
-        if i > 0 {
-            path.push('/');
-        }
-        let value = format_partition_value(
-            row,
-            i,
-            field.data_type(),
-            default_partition_name,
-            legacy_partition_name,
-        )?;
-        path.push_str(&escape_path_name(key));
-        path.push('=');
-        path.push_str(&escape_path_name(&value));
-    }
-    path.push('/');
-    Ok(path)
+    let computer = PartitionComputer::new(
+        partition_keys,
+        schema_fields,
+        default_partition_name,
+        legacy_partition_name,
+    )?;
+    computer.generate_partition_path(row)
 }
 
 /// Resolve the `DataField` for each partition key from the schema fields, preserving order.
@@ -137,6 +196,21 @@ fn resolve_partition_fields<'a>(
         .collect()
 }
 
+/// Assemble escaped `key=value/...` path from partition key-value pairs.
+fn assemble_partition_path(part_values: &[(String, String)]) -> String {
+    let mut path = String::new();
+    for (i, (key, value)) in part_values.iter().enumerate() {
+        if i > 0 {
+            path.push('/');
+        }
+        path.push_str(&escape_path_name(key));
+        path.push('=');
+        path.push_str(&escape_path_name(value));
+    }
+    path.push('/');
+    path
+}
+
 /// Format a single partition field value to its string representation.
 fn format_partition_value(
     row: &BinaryRow,
@@ -150,18 +224,14 @@ fn format_partition_value(
     }
 
     let value = match data_type {
-        DataType::Boolean(_) => row.get_boolean(pos).to_string(),
-        DataType::TinyInt(_) => row.get_byte(pos).to_string(),
-        DataType::SmallInt(_) => row.get_short(pos).to_string(),
-        DataType::Int(_) => row.get_int(pos).to_string(),
-        DataType::BigInt(_) => row.get_long(pos).to_string(),
-        // NOTE: Rust f32/f64 Display may differ from Java Float/Double.toString()
-        // on edge-case values. Acceptable since float partition keys are rare.
-        DataType::Float(_) => row.get_float(pos).to_string(),
-        DataType::Double(_) => row.get_double(pos).to_string(),
+        DataType::Boolean(_) => row.get_boolean(pos)?.to_string(),
+        DataType::TinyInt(_) => row.get_byte(pos)?.to_string(),
+        DataType::SmallInt(_) => row.get_short(pos)?.to_string(),
+        DataType::Int(_) => row.get_int(pos)?.to_string(),
+        DataType::BigInt(_) => row.get_long(pos)?.to_string(),
 
         DataType::Char(_) | DataType::VarChar(_) => {
-            let s = row.try_get_string(pos)?;
+            let s = row.get_string(pos)?;
             if s.trim().is_empty() {
                 return Ok(default_partition_name.to_string());
             }
@@ -171,9 +241,9 @@ fn format_partition_value(
         DataType::Date(_) => {
             if legacy {
                 // Legacy: field.toString() on the epoch-day Integer → raw int value.
-                row.get_int(pos).to_string()
+                row.get_int(pos)?.to_string()
             } else {
-                format_date(row.get_int(pos))
+                format_date(row.get_int(pos)?)
             }
         }
 
@@ -210,14 +280,18 @@ fn format_partition_value(
         DataType::Time(t) => {
             if legacy {
                 // Legacy: field.toString() on the internal int (millis since midnight).
-                row.get_int(pos).to_string()
+                row.get_int(pos)?.to_string()
             } else {
-                format_time(row.get_int(pos), t.precision())
+                format_time(row.get_int(pos)?, t.precision())
             }
         }
 
-        // Complex / binary types are not valid as partition keys.
-        DataType::Binary(_)
+        // Float/Double: Rust f32/f64 Display differs from Java Float/Double.toString()
+        // on edge-case values. This could silently produce wrong partition paths.
+        // Since float partition keys are extremely rare, reject them explicitly.
+        DataType::Float(_)
+        | DataType::Double(_)
+        | DataType::Binary(_)
         | DataType::VarBinary(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -276,6 +350,7 @@ fn format_time(millis_of_day: i32, precision: u32) -> String {
 
     format!("{}.{}", hms, frac)
 }
+
 /// Format an unscaled i128 value with the given scale to a plain decimal string.
 ///
 /// Matches Java `BigDecimal.toPlainString()` semantics: no scientific notation,
@@ -473,8 +548,8 @@ mod tests {
     use crate::spec::types::*;
     use crate::spec::DataField;
 
-    // TODO: consider extracting a shared test utility for BinaryRow building
-    // once a third module also needs it. Currently duplicated with BinaryRowBuilder in data_file.
+    // ======================== Test helpers ========================
+
     struct TestRowBuilder {
         arity: i32,
         null_bits_size: usize,
@@ -547,6 +622,41 @@ mod tests {
         DataField::new(0, name.to_string(), data_type)
     }
 
+    /// Helper: assert single-column partition path for a given type and row writer.
+    fn assert_single_partition<F>(
+        name: &str,
+        data_type: DataType,
+        write_fn: F,
+        expected: &str,
+        legacy: bool,
+    ) where
+        F: FnOnce(&mut TestRowBuilder),
+    {
+        let fields = vec![make_field(name, data_type)];
+        let keys = vec![name.to_string()];
+        let mut builder = TestRowBuilder::new(1);
+        write_fn(&mut builder);
+        let row = builder.build();
+        let result =
+            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, legacy).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    /// Helper: assert single-column partition path returns an error.
+    fn assert_single_partition_err<F>(name: &str, data_type: DataType, write_fn: F, legacy: bool)
+    where
+        F: FnOnce(&mut TestRowBuilder),
+    {
+        let fields = vec![make_field(name, data_type)];
+        let keys = vec![name.to_string()];
+        let mut builder = TestRowBuilder::new(1);
+        write_fn(&mut builder);
+        let row = builder.build();
+        assert!(
+            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, legacy).is_err()
+        );
+    }
+
     // ======================== Escape tests ========================
 
     #[test]
@@ -569,6 +679,48 @@ mod tests {
         assert_eq!(escape_path_name("a\x7Fb"), "a%7Fb");
     }
 
+    // ======================== PartitionComputer tests ========================
+
+    #[test]
+    fn test_partition_computer_generate_part_values() {
+        let fields = vec![
+            make_field("dt", DataType::VarChar(VarCharType::default())),
+            make_field("hr", DataType::Int(IntType::new())),
+        ];
+        let keys = vec!["dt".to_string(), "hr".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, DEFAULT_PARTITION_NAME, true).unwrap();
+
+        let mut builder = TestRowBuilder::new(2);
+        builder.write_string(0, "2024-01-01");
+        builder.write_int(1, 12);
+        let row = builder.build();
+
+        let values = computer.generate_part_values(&row).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], ("dt".to_string(), "2024-01-01".to_string()));
+        assert_eq!(values[1], ("hr".to_string(), "12".to_string()));
+    }
+
+    #[test]
+    fn test_partition_computer_generate_path() {
+        let fields = vec![
+            make_field("dt", DataType::VarChar(VarCharType::default())),
+            make_field("hr", DataType::Int(IntType::new())),
+        ];
+        let keys = vec!["dt".to_string(), "hr".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, DEFAULT_PARTITION_NAME, true).unwrap();
+
+        let mut builder = TestRowBuilder::new(2);
+        builder.write_string(0, "2024-01-01");
+        builder.write_int(1, 12);
+        let row = builder.build();
+
+        let path = computer.generate_partition_path(&row).unwrap();
+        assert_eq!(path, "dt=2024-01-01/hr=12/");
+    }
+
     // ======================== Path generation tests ========================
 
     #[test]
@@ -580,16 +732,13 @@ mod tests {
 
     #[test]
     fn test_single_string_partition() {
-        let fields = vec![make_field("dt", DataType::VarChar(VarCharType::default()))];
-        let keys = vec!["dt".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_string(0, "2024-01-01");
-        let row = builder.build();
-
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "dt=2024-01-01/");
+        assert_single_partition(
+            "dt",
+            DataType::VarChar(VarCharType::default()),
+            |b| b.write_string(0, "2024-01-01"),
+            "dt=2024-01-01/",
+            true,
+        );
     }
 
     #[test]
@@ -626,38 +775,33 @@ mod tests {
 
     #[test]
     fn test_blank_string_partition() {
-        let fields = vec![make_field("dt", DataType::VarChar(VarCharType::default()))];
-        let keys = vec!["dt".to_string()];
-
         // Empty string
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_string(0, "");
-        let row = builder.build();
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "dt=__DEFAULT_PARTITION__/");
-
+        assert_single_partition(
+            "dt",
+            DataType::VarChar(VarCharType::default()),
+            |b| b.write_string(0, ""),
+            "dt=__DEFAULT_PARTITION__/",
+            true,
+        );
         // Whitespace only
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_string(0, "   ");
-        let row = builder.build();
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "dt=__DEFAULT_PARTITION__/");
+        assert_single_partition(
+            "dt",
+            DataType::VarChar(VarCharType::default()),
+            |b| b.write_string(0, "   "),
+            "dt=__DEFAULT_PARTITION__/",
+            true,
+        );
     }
 
     #[test]
     fn test_boolean_partition() {
-        let fields = vec![make_field("flag", DataType::Boolean(BooleanType::new()))];
-        let keys = vec!["flag".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_boolean(0, true);
-        let row = builder.build();
-
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "flag=true/");
+        assert_single_partition(
+            "flag",
+            DataType::Boolean(BooleanType::new()),
+            |b| b.write_boolean(0, true),
+            "flag=true/",
+            true,
+        );
     }
 
     // ======================== Date formatting tests ========================
@@ -670,32 +814,24 @@ mod tests {
 
     #[test]
     fn test_date_partition_legacy() {
-        let fields = vec![make_field("dt", DataType::Date(DateType::new()))];
-        let keys = vec!["dt".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 19723); // 2024-01-01
-        let row = builder.build();
-
-        // Legacy: field.toString() on epoch-day Integer → raw int value.
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "dt=19723/");
+        assert_single_partition(
+            "dt",
+            DataType::Date(DateType::new()),
+            |b| b.write_int(0, 19723), // 2024-01-01
+            "dt=19723/",
+            true,
+        );
     }
 
     #[test]
     fn test_date_partition_non_legacy() {
-        let fields = vec![make_field("dt", DataType::Date(DateType::new()))];
-        let keys = vec!["dt".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 19723); // 2024-01-01
-        let row = builder.build();
-
-        // Non-legacy: formatted as yyyy-MM-dd.
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, false).unwrap();
-        assert_eq!(result, "dt=2024-01-01/");
+        assert_single_partition(
+            "dt",
+            DataType::Date(DateType::new()),
+            |b| b.write_int(0, 19723), // 2024-01-01
+            "dt=2024-01-01/",
+            false,
+        );
     }
 
     // ======================== Decimal formatting tests ========================
@@ -714,19 +850,13 @@ mod tests {
 
     #[test]
     fn test_decimal_partition() {
-        let fields = vec![make_field(
+        assert_single_partition(
             "amount",
             DataType::Decimal(DecimalType::new(10, 3).unwrap()),
-        )];
-        let keys = vec!["amount".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_decimal_compact(0, 12345); // 12.345
-        let row = builder.build();
-
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "amount=12.345/");
+            |b| b.write_decimal_compact(0, 12345), // 12.345
+            "amount=12.345/",
+            true,
+        );
     }
 
     // ======================== Timestamp formatting tests ========================
@@ -776,12 +906,6 @@ mod tests {
 
     #[test]
     fn test_timestamp_partition_legacy() {
-        let fields = vec![make_field(
-            "ts",
-            DataType::Timestamp(TimestampType::new(3).unwrap()),
-        )];
-        let keys = vec!["ts".to_string()];
-
         // 2024-01-01 12:34:00 UTC = epoch millis 1704110040000
         let millis = NaiveDate::from_ymd_opt(2024, 1, 1)
             .unwrap()
@@ -790,23 +914,17 @@ mod tests {
             .and_utc()
             .timestamp_millis();
 
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_timestamp_compact(0, millis);
-        let row = builder.build();
-
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "ts=2024-01-01T12%3A34/");
+        assert_single_partition(
+            "ts",
+            DataType::Timestamp(TimestampType::new(3).unwrap()),
+            |b| b.write_timestamp_compact(0, millis),
+            "ts=2024-01-01T12%3A34/",
+            true,
+        );
     }
 
     #[test]
     fn test_timestamp_partition_non_legacy() {
-        let fields = vec![make_field(
-            "ts",
-            DataType::Timestamp(TimestampType::new(3).unwrap()),
-        )];
-        let keys = vec!["ts".to_string()];
-
         let millis = NaiveDate::from_ymd_opt(2024, 1, 1)
             .unwrap()
             .and_hms_nano_opt(12, 34, 56, 123_000_000)
@@ -814,13 +932,13 @@ mod tests {
             .and_utc()
             .timestamp_millis();
 
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_timestamp_compact(0, millis);
-        let row = builder.build();
-
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, false).unwrap();
-        assert_eq!(result, "ts=2024-01-01 12%3A34%3A56.123/");
+        assert_single_partition(
+            "ts",
+            DataType::Timestamp(TimestampType::new(3).unwrap()),
+            |b| b.write_timestamp_compact(0, millis),
+            "ts=2024-01-01 12%3A34%3A56.123/",
+            false,
+        );
     }
 
     // ======================== Error path tests ========================
@@ -854,26 +972,32 @@ mod tests {
     #[test]
     fn test_unsupported_types() {
         // Binary
-        let fields = vec![make_field(
+        assert_single_partition_err(
             "data",
             DataType::Binary(BinaryType::new(10).unwrap()),
-        )];
-        let keys = vec!["data".to_string()];
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 0);
-        let row = builder.build();
-        assert!(
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).is_err()
+            |b| b.write_int(0, 0),
+            true,
         );
-
         // Array
-        let fields = vec![make_field(
+        assert_single_partition_err(
             "arr",
             DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
-        )];
-        let keys = vec!["arr".to_string()];
-        assert!(
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).is_err()
+            |b| b.write_int(0, 0),
+            true,
+        );
+        // Float
+        assert_single_partition_err(
+            "f",
+            DataType::Float(FloatType::new()),
+            |b| b.write_int(0, 0),
+            true,
+        );
+        // Double
+        assert_single_partition_err(
+            "d",
+            DataType::Double(DoubleType::new()),
+            |b| b.write_int(0, 0),
+            true,
         );
     }
 
@@ -909,32 +1033,24 @@ mod tests {
 
     #[test]
     fn test_time_partition_legacy() {
-        let fields = vec![make_field("t", DataType::Time(TimeType::new(3).unwrap()))];
-        let keys = vec!["t".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 45_296_123); // 12:34:56.123
-        let row = builder.build();
-
-        // Legacy: raw int toString.
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
-        assert_eq!(result, "t=45296123/");
+        assert_single_partition(
+            "t",
+            DataType::Time(TimeType::new(3).unwrap()),
+            |b| b.write_int(0, 45_296_123), // 12:34:56.123
+            "t=45296123/",
+            true,
+        );
     }
 
     #[test]
     fn test_time_partition_non_legacy() {
-        let fields = vec![make_field("t", DataType::Time(TimeType::new(3).unwrap()))];
-        let keys = vec!["t".to_string()];
-
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 45_296_123); // 12:34:56.123
-        let row = builder.build();
-
-        // Non-legacy: formatted as HH:mm:ss.SSS with precision=3.
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, false).unwrap();
-        assert_eq!(result, "t=12%3A34%3A56.123/");
+        assert_single_partition(
+            "t",
+            DataType::Time(TimeType::new(3).unwrap()),
+            |b| b.write_int(0, 45_296_123), // 12:34:56.123
+            "t=12%3A34%3A56.123/",
+            false,
+        );
     }
 
     // ======================== Corrupted row tests ========================

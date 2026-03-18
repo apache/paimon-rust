@@ -124,67 +124,82 @@ impl BinaryRow {
         (self.data[byte_index] & (1 << bit_offset)) != 0
     }
 
-    // ======================== Fixed-length getters ========================
+    // ======================== Internal read helpers ========================
 
     /// Byte offset of the field value at position `pos` within `self.data`.
     fn field_offset(&self, pos: usize) -> usize {
         self.null_bits_size_in_bytes as usize + pos * 8
     }
 
+    /// Bounds-checked slice read. Returns exactly `N` bytes starting at `offset`.
+    fn read_slice<const N: usize>(&self, offset: usize) -> crate::Result<[u8; N]> {
+        self.data
+            .get(offset..offset + N)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: read {N} bytes at offset {offset} exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            })
+    }
+
+    /// Bounds-checked single byte read.
+    fn read_byte_at(&self, offset: usize) -> crate::Result<u8> {
+        self.data
+            .get(offset)
+            .copied()
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: read 1 byte at offset {offset} exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            })
+    }
+
     /// Read a little-endian i64 from `self.data` at the given byte offset.
-    fn read_i64_at(&self, offset: usize) -> i64 {
-        let bytes: [u8; 8] = self.data[offset..offset + 8]
-            .try_into()
-            .expect("BinaryRow: insufficient data for i64 read");
-        i64::from_le_bytes(bytes)
+    fn read_i64_at(&self, offset: usize) -> crate::Result<i64> {
+        self.read_slice::<8>(offset).map(i64::from_le_bytes)
     }
 
     /// Read a little-endian i32 from `self.data` at the given byte offset.
-    fn read_i32_at(&self, offset: usize) -> i32 {
-        let bytes: [u8; 4] = self.data[offset..offset + 4]
-            .try_into()
-            .expect("BinaryRow: insufficient data for i32 read");
-        i32::from_le_bytes(bytes)
+    fn read_i32_at(&self, offset: usize) -> crate::Result<i32> {
+        self.read_slice::<4>(offset).map(i32::from_le_bytes)
     }
 
-    pub fn get_boolean(&self, pos: usize) -> bool {
-        self.data[self.field_offset(pos)] != 0
+    // ======================== Fixed-length getters ========================
+
+    pub fn get_boolean(&self, pos: usize) -> crate::Result<bool> {
+        self.read_byte_at(self.field_offset(pos)).map(|b| b != 0)
     }
 
-    pub fn get_byte(&self, pos: usize) -> i8 {
-        self.data[self.field_offset(pos)] as i8
+    pub fn get_byte(&self, pos: usize) -> crate::Result<i8> {
+        self.read_byte_at(self.field_offset(pos)).map(|b| b as i8)
     }
 
-    pub fn get_short(&self, pos: usize) -> i16 {
-        let offset = self.field_offset(pos);
-        let bytes: [u8; 2] = self.data[offset..offset + 2]
-            .try_into()
-            .expect("BinaryRow: insufficient data for i16 read");
-        i16::from_le_bytes(bytes)
+    pub fn get_short(&self, pos: usize) -> crate::Result<i16> {
+        self.read_slice::<2>(self.field_offset(pos))
+            .map(i16::from_le_bytes)
     }
 
-    pub fn get_int(&self, pos: usize) -> i32 {
+    pub fn get_int(&self, pos: usize) -> crate::Result<i32> {
         self.read_i32_at(self.field_offset(pos))
     }
 
-    pub fn get_long(&self, pos: usize) -> i64 {
+    pub fn get_long(&self, pos: usize) -> crate::Result<i64> {
         self.read_i64_at(self.field_offset(pos))
     }
 
-    pub fn get_float(&self, pos: usize) -> f32 {
-        let offset = self.field_offset(pos);
-        let bytes: [u8; 4] = self.data[offset..offset + 4]
-            .try_into()
-            .expect("BinaryRow: insufficient data for f32 read");
-        f32::from_le_bytes(bytes)
+    pub fn get_float(&self, pos: usize) -> crate::Result<f32> {
+        self.read_slice::<4>(self.field_offset(pos))
+            .map(f32::from_le_bytes)
     }
 
-    pub fn get_double(&self, pos: usize) -> f64 {
-        let offset = self.field_offset(pos);
-        let bytes: [u8; 8] = self.data[offset..offset + 8]
-            .try_into()
-            .expect("BinaryRow: insufficient data for f64 read");
-        f64::from_le_bytes(bytes)
+    pub fn get_double(&self, pos: usize) -> crate::Result<f64> {
+        self.read_slice::<8>(self.field_offset(pos))
+            .map(f64::from_le_bytes)
     }
 
     // ======================== Variable-length getters ========================
@@ -196,11 +211,13 @@ impl BinaryRow {
     ///   Actual position = base_offset(0) + offset.
     /// - Highest bit = 1: data inline in fixed part (≤7 bytes). len = bits[62:56].
     ///   Data starts at `field_offset` (little-endian: right after the length/mark byte).
-    fn resolve_var_length_field(&self, pos: usize) -> (usize, usize) {
+    ///
+    /// Returns `Err` if the decoded byte range falls outside the backing data.
+    fn resolve_var_length_field(&self, pos: usize) -> crate::Result<(usize, usize)> {
         let field_off = self.field_offset(pos);
-        let raw = self.read_i64_at(field_off) as u64;
+        let raw = self.read_i64_at(field_off)? as u64;
 
-        if raw & HIGHEST_FIRST_BIT == 0 {
+        let (start, len) = if raw & HIGHEST_FIRST_BIT == 0 {
             // Variable-length part: offset in upper 32 bits, length in lower 32 bits.
             let offset = (raw >> 32) as usize;
             let len = (raw & 0xFFFF_FFFF) as usize;
@@ -209,14 +226,8 @@ impl BinaryRow {
             // Inline: length in bits [62:56], data starts at field_offset (LE).
             let len = ((raw & HIGHEST_SECOND_TO_EIGHTH_BIT) >> 56) as usize;
             (field_off, len)
-        }
-    }
+        };
 
-    /// Bounds-checked version of [`resolve_var_length_field`].
-    ///
-    /// Returns `Err` if the decoded byte range falls outside the backing data.
-    fn resolve_var_length_field_checked(&self, pos: usize) -> crate::Result<(usize, usize)> {
-        let (start, len) = self.resolve_var_length_field(pos);
         let end = start
             .checked_add(len)
             .ok_or_else(|| crate::Error::UnexpectedError {
@@ -237,28 +248,16 @@ impl BinaryRow {
         Ok((start, len))
     }
 
-    pub fn get_binary(&self, pos: usize) -> &[u8] {
-        let (start, len) = self.resolve_var_length_field(pos);
-        &self.data[start..start + len]
-    }
-
-    /// Bounds-checked version of [`get_binary`]. Returns `Err` on corrupted offset/len.
-    pub(crate) fn try_get_binary(&self, pos: usize) -> crate::Result<&[u8]> {
-        let (start, len) = self.resolve_var_length_field_checked(pos)?;
+    pub fn get_binary(&self, pos: usize) -> crate::Result<&[u8]> {
+        let (start, len) = self.resolve_var_length_field(pos)?;
         Ok(&self.data[start..start + len])
     }
 
-    pub fn get_string(&self, pos: usize) -> &str {
-        let bytes = self.get_binary(pos);
-        std::str::from_utf8(bytes).expect("BinaryRow: invalid UTF-8 in string field")
-    }
-
-    /// Bounds-checked version of [`get_string`]. Returns `Err` on corrupted data or invalid UTF-8.
-    pub(crate) fn try_get_string(&self, pos: usize) -> crate::Result<&str> {
-        let bytes = self.try_get_binary(pos)?;
+    pub fn get_string(&self, pos: usize) -> crate::Result<&str> {
+        let bytes = self.get_binary(pos)?;
         std::str::from_utf8(bytes).map_err(|e| crate::Error::UnexpectedError {
             message: format!("BinaryRow: invalid UTF-8 in string field at pos {pos}: {e}"),
-            source: None,
+            source: Some(Box::new(e)),
         })
     }
 
@@ -270,9 +269,9 @@ impl BinaryRow {
     /// Reference: `BinaryRow.getDecimal` and `DecimalData.isCompact` in Java Paimon.
     pub(crate) fn get_decimal_unscaled(&self, pos: usize, precision: u32) -> crate::Result<i128> {
         if precision <= 18 {
-            Ok(self.get_long(pos) as i128)
+            Ok(self.get_long(pos)? as i128)
         } else {
-            let bytes = self.try_get_binary(pos)?;
+            let bytes = self.get_binary(pos)?;
             if bytes.is_empty() {
                 return Err(crate::Error::UnexpectedError {
                     message: format!("BinaryRow: empty bytes for non-compact Decimal at pos {pos}"),
@@ -307,11 +306,11 @@ impl BinaryRow {
         precision: u32,
     ) -> crate::Result<(i64, i32)> {
         if precision <= 3 {
-            Ok((self.get_long(pos), 0))
+            Ok((self.get_long(pos)?, 0))
         } else {
             // Read the raw 8-byte fixed slot: high 32 bits = offset, low 32 bits = nanoOfMillisecond.
             let field_off = self.field_offset(pos);
-            let offset_and_nano = self.read_i64_at(field_off) as u64;
+            let offset_and_nano = self.read_i64_at(field_off)? as u64;
             let offset = (offset_and_nano >> 32) as usize;
             let nano_of_milli = offset_and_nano as i32;
 
@@ -325,7 +324,7 @@ impl BinaryRow {
                     source: None,
                 });
             }
-            let millis = i64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap());
+            let millis = i64::from_le_bytes(self.read_slice::<8>(offset)?);
             Ok((millis, nano_of_milli))
         }
     }
@@ -603,8 +602,8 @@ mod tests {
         assert_eq!(row.arity(), 2);
         assert!(!row.is_null_at(0));
         assert!(!row.is_null_at(1));
-        assert_eq!(row.get_int(0), 42);
-        assert_eq!(row.get_int(1), -100);
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_int(1).unwrap(), -100);
     }
 
     #[test]
@@ -613,7 +612,7 @@ mod tests {
         builder.write_long(0, i64::MAX);
         let row = builder.build();
 
-        assert_eq!(row.get_long(0), i64::MAX);
+        assert_eq!(row.get_long(0).unwrap(), i64::MAX);
     }
 
     #[test]
@@ -624,9 +623,9 @@ mod tests {
         builder.write_boolean(2, true);
         let row = builder.build();
 
-        assert_eq!(row.get_short(0), -32768);
-        assert_eq!(row.get_byte(1), -1);
-        assert!(row.get_boolean(2));
+        assert_eq!(row.get_short(0).unwrap(), -32768);
+        assert_eq!(row.get_byte(1).unwrap(), -1);
+        assert!(row.get_boolean(2).unwrap());
     }
 
     #[test]
@@ -636,8 +635,8 @@ mod tests {
         builder.write_double(1, std::f64::consts::PI);
         let row = builder.build();
 
-        assert!((row.get_float(0) - 1.5_f32).abs() < f32::EPSILON);
-        assert!((row.get_double(1) - std::f64::consts::PI).abs() < f64::EPSILON);
+        assert!((row.get_float(0).unwrap() - 1.5_f32).abs() < f32::EPSILON);
+        assert!((row.get_double(1).unwrap() - std::f64::consts::PI).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -651,8 +650,8 @@ mod tests {
         assert!(!row.is_null_at(0));
         assert!(row.is_null_at(1));
         assert!(!row.is_null_at(2));
-        assert_eq!(row.get_int(0), 42);
-        assert_eq!(row.get_int(2), 99);
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_int(2).unwrap(), 99);
     }
 
     #[test]
@@ -662,8 +661,8 @@ mod tests {
         builder.write_string(1, "world!");
         let row = builder.build();
 
-        assert_eq!(row.get_string(0), "hello");
-        assert_eq!(row.get_string(1), "world!");
+        assert_eq!(row.get_string(0).unwrap(), "hello");
+        assert_eq!(row.get_string(1).unwrap(), "world!");
     }
 
     #[test]
@@ -672,7 +671,7 @@ mod tests {
         builder.write_string(0, "\x00\x01\x02\x03");
         let row = builder.build();
 
-        assert_eq!(row.get_binary(0), &[0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(row.get_binary(0).unwrap(), &[0x00, 0x01, 0x02, 0x03]);
     }
 
     #[test]
@@ -683,8 +682,8 @@ mod tests {
         builder.write_int(1, 12);
         let row = builder.build();
 
-        assert_eq!(row.get_string(0), "2024-01-01");
-        assert_eq!(row.get_int(1), 12);
+        assert_eq!(row.get_string(0).unwrap(), "2024-01-01");
+        assert_eq!(row.get_int(1).unwrap(), 12);
     }
 
     #[test]
@@ -709,8 +708,8 @@ mod tests {
         let deserialized: BinaryRow = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.arity(), row.arity());
         assert_eq!(deserialized.data(), row.data());
-        assert_eq!(deserialized.get_int(0), 42);
-        assert_eq!(deserialized.get_string(1), "hello");
+        assert_eq!(deserialized.get_int(0).unwrap(), 42);
+        assert_eq!(deserialized.get_string(1).unwrap(), "hello");
     }
 
     #[test]
@@ -746,8 +745,8 @@ mod tests {
         builder.write_string_inline(1, "7_bytes"); // exactly 7 bytes
         let row = builder.build();
 
-        assert_eq!(row.get_string(0), "hi");
-        assert_eq!(row.get_string(1), "7_bytes");
+        assert_eq!(row.get_string(0).unwrap(), "hi");
+        assert_eq!(row.get_string(1).unwrap(), "7_bytes");
     }
 
     #[test]
@@ -757,7 +756,7 @@ mod tests {
         builder.write_binary_inline(0, &[0xDE, 0xAD]);
         let row = builder.build();
 
-        assert_eq!(row.get_binary(0), &[0xDE, 0xAD]);
+        assert_eq!(row.get_binary(0).unwrap(), &[0xDE, 0xAD]);
     }
 
     #[test]
