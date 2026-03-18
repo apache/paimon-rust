@@ -57,6 +57,19 @@ arrow-array = { workspace = true }
 futures = "0.3"
 parquet = { workspace = true, features = ["async", "zstd"] }
 async-stream = "0.3.6"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-util = "0.7"
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
+# DLF authentication dependencies
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2.1"
 
 [dev-dependencies]
 rand = "0.8.5"

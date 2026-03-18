@@ -15,28 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+//! Authentication module for REST API.
 
-pub mod common;
-pub use common::{CatalogOptions, Options};
+mod base;
+mod bear_provider;
+mod dlf_provider;
+mod dlf_signer;
+mod factory;
 
-pub mod api;
-pub use api::rest_api::RESTApi;
-
-mod arrow;
-pub mod catalog;
-mod deletion_vector;
-pub mod file_index;
-pub mod io;
-pub mod spec;
-pub mod table;
-
-pub use catalog::Catalog;
-pub use catalog::FileSystemCatalog;
-
-pub use table::{
-    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, ReadBuilder, SnapshotManager,
-    Table, TableRead, TableScan,
-};
+pub use base::{AuthProvider, NoOpAuthProvider, RESTAuthFunction, RESTAuthParameter};
+pub use bear_provider::BearerTokenAuthProvider;
+pub use dlf_provider::{DLFAuthProvider, DLFToken};
+pub use dlf_signer::{DLFDefaultSigner, DLFOpenApiSigner, DLFRequestSigner, DLFSignerFactory};
+pub use factory::AuthProviderFactory;

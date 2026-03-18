@@ -15,28 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+//! Common utilities for Paimon.
 
-pub mod common;
-pub use common::{CatalogOptions, Options};
+pub mod options;
 
-pub mod api;
-pub use api::rest_api::RESTApi;
-
-mod arrow;
-pub mod catalog;
-mod deletion_vector;
-pub mod file_index;
-pub mod io;
-pub mod spec;
-pub mod table;
-
-pub use catalog::Catalog;
-pub use catalog::FileSystemCatalog;
-
-pub use table::{
-    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, ReadBuilder, SnapshotManager,
-    Table, TableRead, TableScan,
-};
+pub use options::{CatalogOptions, Options};
