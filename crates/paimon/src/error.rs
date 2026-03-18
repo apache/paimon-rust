@@ -108,6 +108,13 @@ pub enum Error {
     ColumnNotExist { full_name: String, column: String },
     #[snafu(display("Invalid identifier: {}", message))]
     IdentifierInvalid { message: String },
+
+    // ======================= REST API errors ===============================
+    #[snafu(display("{}", source))]
+    RestApi {
+        #[snafu(source)]
+        source: crate::api::rest_error::RestError,
+    },
 }
 
 impl From<opendal::Error> for Error {
@@ -135,5 +142,11 @@ impl From<parquet::errors::ParquetError> for Error {
             message: format!("Failed to read a Parquet file: {source}"),
             source: Box::new(source),
         }
+    }
+}
+
+impl From<crate::api::rest_error::RestError> for Error {
+    fn from(source: crate::api::rest_error::RestError) -> Self {
+        Error::RestApi { source }
     }
 }
