@@ -19,6 +19,7 @@
 
 use crate::deletion_vector::core::DeletionVector;
 use crate::io::{FileIO, FileRead};
+use crate::spec::DataFileMeta;
 use crate::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,23 +40,27 @@ impl DeletionVectorFactory {
     /// has a DeletionFile, reads path/offset/length and loads the DV.
     pub async fn new(
         file_io: &FileIO,
-        entries: Vec<(String, Option<crate::DeletionFile>)>,
+        data_files: &[DataFileMeta],
+        data_deletion_files: Option<&[Option<crate::DeletionFile>]>,
     ) -> Result<Self> {
         let mut deletion_vectors = HashMap::new();
-        for (data_file_name, opt_df) in entries {
-            let df = match &opt_df {
-                Some(d) => d,
-                _ => continue,
+        let Some(data_deletion_files) = data_deletion_files else {
+            return Ok(DeletionVectorFactory { deletion_vectors });
+        };
+
+        for (data_file, opt_df) in data_files.iter().zip(data_deletion_files.iter()) {
+            let Some(df) = opt_df.as_ref() else {
+                continue;
             };
             let dv = Self::read(file_io, df).await?;
-            deletion_vectors.insert(data_file_name, Arc::new(dv));
+            deletion_vectors.insert(data_file.file_name.clone(), Arc::new(dv));
         }
         Ok(DeletionVectorFactory { deletion_vectors })
     }
 
-    /// Get the deletion vector for a specific data file
-    pub fn get_deletion_vector(&self, data_file_name: &str) -> Option<Arc<DeletionVector>> {
-        self.deletion_vectors.get(data_file_name).cloned()
+    /// Get the deletion vector for a specific data file.
+    pub fn get_deletion_vector(&self, data_file_name: &str) -> Option<&Arc<DeletionVector>> {
+        self.deletion_vectors.get(data_file_name)
     }
 
     /// Read a single DeletionVector from storage using DeletionFile (path/offset/length).
@@ -65,7 +70,10 @@ impl DeletionVectorFactory {
         let reader = input.reader().await?;
         let offset = df.offset() as u64;
         let len = df.length() as u64;
-        let bytes = reader.read(offset..offset.saturating_add(len)).await?;
+        let bytes = reader
+            // 4 bytes for bitmap length, 4 bytes for magic number
+            .read(offset..offset.saturating_add(len).saturating_add(8))
+            .await?;
         DeletionVector::read_from_bytes(&bytes, Some(len))
     }
 }

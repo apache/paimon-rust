@@ -22,8 +22,8 @@
 
 use super::Table;
 use crate::io::FileIO;
-use crate::spec::{BinaryRow, FileKind, IndexManifest, ManifestEntry, Snapshot};
-use crate::table::bin_pack::{read_split_config, split_for_batch};
+use crate::spec::{BinaryRow, CoreOptions, FileKind, IndexManifest, ManifestEntry, Snapshot};
+use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
 use crate::Error;
@@ -76,6 +76,16 @@ async fn read_all_manifest_entries(
     Ok(all_entries)
 }
 
+fn filter_manifest_entries(
+    entries: Vec<ManifestEntry>,
+    deletion_vectors_enabled: bool,
+) -> Vec<ManifestEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| !(deletion_vectors_enabled && entry.file().level == 0))
+        .collect()
+}
+
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
 /// Only considers ADD entries with index_type "DELETION_VECTORS" and their deletion_vectors_ranges.
 fn build_deletion_files_map(
@@ -116,33 +126,26 @@ fn build_deletion_files_map(
     map
 }
 
-/// Merges add/delete manifest entries: keeps only ADD entries whose (partition, bucket, file_name) is not in DELETE set.
+/// Merges add/delete manifest entries following pypaimon's `adds - deletes` behavior.
+///
+/// The identifier must be rich enough to match Paimon's file identity, otherwise a delete
+/// for one file version can incorrectly remove another with the same file name.
 fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
-    let mut deleted = HashSet::new();
-    let mut added = Vec::new();
-    for e in entries {
-        // follow python code to use partition, bucket, filename as duplicator
-        let key = (
-            e.partition().to_vec(),
-            e.bucket(),
-            e.file().file_name.clone(),
-        );
-        match e.kind() {
-            FileKind::Add => added.push(e),
+    let mut deleted_entry_keys = HashSet::new();
+    let mut added_entries = Vec::new();
+
+    for entry in entries {
+        match entry.kind() {
+            FileKind::Add => added_entries.push(entry),
             FileKind::Delete => {
-                deleted.insert(key);
+                deleted_entry_keys.insert(entry.identifier());
             }
         }
     }
-    added
+
+    added_entries
         .into_iter()
-        .filter(|e| {
-            !deleted.contains(&(
-                e.partition().to_vec(),
-                e.bucket(),
-                e.file().file_name.clone(),
-            ))
-        })
+        .filter(|entry| !deleted_entry_keys.contains(&entry.identifier()))
         .collect()
 }
 
@@ -169,13 +172,17 @@ impl<'a> TableScan<'a> {
             Some(s) => s,
             None => return Ok(Plan::new(Vec::new())),
         };
-        let (target_split_size, open_file_cost) = read_split_config(self.table.schema().options());
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let target_split_size = core_options.source_split_target_size();
+        let open_file_cost = core_options.source_split_open_file_cost();
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         Self::plan_snapshot(
             snapshot,
             file_io,
             table_path,
             target_split_size,
             open_file_cost,
+            deletion_vectors_enabled,
         )
         .await
     }
@@ -186,8 +193,10 @@ impl<'a> TableScan<'a> {
         table_path: &str,
         target_split_size: i64,
         open_file_cost: i64,
+        deletion_vectors_enabled: bool,
     ) -> crate::Result<Plan> {
         let entries = read_all_manifest_entries(file_io, table_path, &snapshot).await?;
+        let entries = filter_manifest_entries(entries, deletion_vectors_enabled);
         let entries = merge_manifest_entries(entries);
         if entries.is_empty() {
             return Ok(Plan::new(Vec::new()));

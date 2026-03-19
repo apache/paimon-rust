@@ -62,6 +62,18 @@ impl DeletionVector {
         Ok(self.bitmap.contains(row_position as u32))
     }
 
+    /// Returns an iterator over deleted positions that supports [DeletionVectorIterator::advance_to].
+    /// Required for efficient row selection building when skipping row groups (avoid re-scanning
+    /// deletes in skipped ranges).
+    ///
+    /// Ideally we would wrap `roaring::RoaringBitmap::iter()` directly, but that iterator does not
+    /// expose `advance_to`. There is a PR open on roaring to add this
+    /// (<https://github.com/RoaringBitmap/roaring-rs/pull/314>); once merged we can simplify
+    /// by delegating `advance_to` to the underlying iterator.
+    pub fn iter(&self) -> DeletionVectorIterator {
+        DeletionVectorIterator::new(self.bitmap.iter().map(u64::from).collect())
+    }
+
     /// Get the number of deleted rows (cardinality)
     pub fn deleted_count(&self) -> u64 {
         self.bitmap.len()
@@ -123,7 +135,6 @@ impl DeletionVector {
 
         // Read bitmap data (bitmapLength - 4 bytes, since magic is already included in bitmapLength)
         let bitmap_data_size = bitmap_length - MAGIC_NUMBER_SIZE_BYTES;
-
         // 4(bitmap_length) + 4(magic_number) + bitmap_data_size + 4(crc)
         if bytes.len() < 8 + bitmap_data_size + 4 {
             return Err(crate::Error::DataInvalid {
@@ -156,6 +167,40 @@ impl DeletionVector {
 impl Default for DeletionVector {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Iterator over deleted row positions with [advance_to](DeletionVectorIterator::advance_to) support.
+///
+/// See [DeletionVector::iter] for why we use an internal sorted vec instead of wrapping
+/// `roaring::RoaringBitmap::iter()` (which does not provide `advance_to`).
+#[derive(Debug)]
+pub struct DeletionVectorIterator {
+    /// Sorted deleted positions (from bitmap.iter()).
+    positions: Vec<u64>,
+    cursor: usize,
+}
+
+impl DeletionVectorIterator {
+    pub(crate) fn new(positions: Vec<u64>) -> Self {
+        Self {
+            positions,
+            cursor: 0,
+        }
+    }
+}
+
+impl Iterator for DeletionVectorIterator {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor < self.positions.len() {
+            let v = self.positions[self.cursor];
+            self.cursor += 1;
+            Some(v)
+        } else {
+            None
+        }
     }
 }
 

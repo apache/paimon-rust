@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration tests for reading Paimon log tables (system tables).
-//!
-//! Paimon log tables are system tables that contain metadata about the table,
-//! such as snapshots, manifests, schemas, etc. They are stored as Parquet files
-//! and can be read using the Arrow reader.
+//! Integration tests for reading Paimon tables provisioned by Spark.
 
 use arrow_array::{Int32Array, StringArray};
 use futures::TryStreamExt;
@@ -31,30 +27,21 @@ fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
 }
 
-/// Test reading a table and verifying the data matches expected values.
-///
-/// The table was populated with: (1, 'alice'), (2, 'bob'), (3, 'carol')
-#[tokio::test]
-async fn test_read_log_table() {
+async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
     let warehouse = get_test_warehouse();
     let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
 
-    // Get the table
-    let identifier = Identifier::new("default", "simple_log_table");
-
+    let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)
         .await
         .expect("Failed to get table");
 
-    // Scan the table
     let read_builder = table.new_read_builder();
     let read = read_builder.new_read().expect("Failed to create read");
     let scan = read_builder.new_scan();
-
     let plan = scan.plan().await.expect("Failed to plan scan");
 
-    // Read to Arrow
     let stream = read
         .to_arrow(plan.splits())
         .expect("Failed to create arrow stream");
@@ -66,10 +53,9 @@ async fn test_read_log_table() {
 
     assert!(
         !batches.is_empty(),
-        "Expected at least one batch from table"
+        "Expected at least one batch from table {table_name}"
     );
 
-    // Collect all rows as (id, name) tuples
     let mut actual_rows: Vec<(i32, String)> = Vec::new();
 
     for batch in &batches {
@@ -87,18 +73,39 @@ async fn test_read_log_table() {
         }
     }
 
-    // Expected data: (1, 'alice'), (2, 'bob'), (3, 'carol')
+    actual_rows.sort_by_key(|(id, _)| *id);
+    actual_rows
+}
+
+#[tokio::test]
+async fn test_read_log_table() {
+    let actual_rows = read_rows("simple_log_table").await;
     let expected_rows = vec![
         (1, "alice".to_string()),
         (2, "bob".to_string()),
         (3, "carol".to_string()),
     ];
 
-    // Sort for consistent comparison
-    actual_rows.sort_by_key(|(id, _)| *id);
-
     assert_eq!(
         actual_rows, expected_rows,
         "Rows should match expected values"
+    );
+}
+
+#[tokio::test]
+async fn test_read_dv_primary_key_table() {
+    let actual_rows = read_rows("simple_dv_pk_table").await;
+    let expected_rows = vec![
+        (1, "alice-v2".to_string()),
+        (2, "bob-v2".to_string()),
+        (3, "carol-v2".to_string()),
+        (4, "dave-v2".to_string()),
+        (5, "eve-v2".to_string()),
+        (6, "frank-v1".to_string()),
+    ];
+
+    assert_eq!(
+        actual_rows, expected_rows,
+        "DV-enabled PK table should only expose the latest row per key"
     );
 }

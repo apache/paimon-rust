@@ -22,7 +22,7 @@
 
 use super::{ArrowRecordBatchStream, Table, TableScan};
 use crate::arrow::ArrowReaderBuilder;
-use crate::spec::DataField;
+use crate::spec::{CoreOptions, DataField};
 use crate::Result;
 use crate::{DataSplit, Error};
 
@@ -77,14 +77,19 @@ impl<'a> TableRead<'a> {
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         // todo: consider get read batch size from table
-        if !self.table.schema.primary_keys().is_empty() {
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
+        let core_options = CoreOptions::new(self.table.schema.options());
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+
+        if has_primary_keys && !deletion_vectors_enabled {
             return Err(Error::Unsupported {
                 message: format!(
-                    "Reading tables with primary keys is not yet supported. Primary keys: {:?}",
+                    "Reading primary-key tables without deletion vectors is not yet supported. Primary keys: {:?}",
                     self.table.schema.primary_keys()
                 ),
             });
         }
+
         if !self.table.schema.partition_keys().is_empty() {
             return Err(Error::Unsupported {
                 message: format!(
@@ -93,7 +98,8 @@ impl<'a> TableRead<'a> {
                 ),
             });
         }
-        let arrow_reader_builder = ArrowReaderBuilder::new(self.table.file_io.clone()).build();
-        arrow_reader_builder.read(data_splits)
+        let reader =
+            ArrowReaderBuilder::new(self.table.file_io.clone()).build(self.read_type().to_vec());
+        reader.read(data_splits)
     }
 }

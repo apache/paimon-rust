@@ -84,7 +84,7 @@ impl ManifestEntry {
         &self.file.max_key
     }
 
-    fn identifier(&self) -> Identifier {
+    pub(crate) fn identifier(&self) -> Identifier {
         Identifier {
             partition: self.partition.clone(),
             bucket: self.bucket,
