@@ -102,8 +102,8 @@ impl RESTApi {
                 .get_with_params(&ResourcePaths::config(), &query_params)
                 .await?;
 
-            // Merge config response with options
-            options.merge(&config_response.to_options());
+            // Merge config response with options (client config takes priority)
+            options = config_response.merge_options(&options);
 
             // Update base headers from merged options and recreate auth function
             base_headers.extend(RESTUtil::extract_prefix_map(&options, Self::HEADER_PREFIX));

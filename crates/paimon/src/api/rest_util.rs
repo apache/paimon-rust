@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_string() {
-        let original = "hello world/测试";
+        let original = "hello world=/&?#";
         let encoded = RESTUtil::encode_string(original);
         let decoded = RESTUtil::decode_string(&encoded);
         assert_eq!(decoded, original);

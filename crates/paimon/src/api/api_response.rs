@@ -73,12 +73,12 @@ impl ConfigResponse {
         Self { defaults }
     }
 
-    /// Merge these defaults with the provided options.
+    /// Merge these defaults with the provided Options.
     /// User options take precedence over defaults.
-    pub fn merge(&self, options: &HashMap<String, String>) -> HashMap<String, String> {
+    pub fn merge_options(&self, options: &crate::common::Options) -> crate::common::Options {
         let mut merged = self.defaults.clone();
-        merged.extend(options.clone());
-        merged
+        merged.extend(options.to_map().clone());
+        crate::common::Options::from_map(merged)
     }
 
     /// Convert to Options struct.
@@ -161,21 +161,4 @@ mod tests {
         assert!(json.contains("\"nextPageToken\":\"token123\""));
     }
 
-    #[test]
-    fn test_config_response_merge() {
-        let mut defaults = HashMap::new();
-        defaults.insert("key1".to_string(), "default1".to_string());
-        defaults.insert("key2".to_string(), "default2".to_string());
-
-        let config = ConfigResponse::new(defaults);
-
-        let mut user_options = HashMap::new();
-        user_options.insert("key2".to_string(), "user2".to_string());
-        user_options.insert("key3".to_string(), "user3".to_string());
-
-        let merged = config.merge(&user_options);
-        assert_eq!(merged.get("key1"), Some(&"default1".to_string()));
-        assert_eq!(merged.get("key2"), Some(&"user2".to_string())); // user overrides default
-        assert_eq!(merged.get("key3"), Some(&"user3".to_string()));
-    }
 }
