@@ -75,7 +75,10 @@ impl Options {
 
     /// Get a value by key with a default.
     pub fn get_or_default(&self, key: &str, default: &str) -> String {
-        self.data.get(key).cloned().unwrap_or_else(|| default.to_string())
+        self.data
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Set a key-value pair.
