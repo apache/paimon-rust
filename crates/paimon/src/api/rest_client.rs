@@ -42,11 +42,7 @@ impl HttpClient {
     /// # Returns
     /// A new HttpClient instance.
     pub fn new(base_url: &str, auth_function: Option<RESTAuthFunction>) -> Result<Self> {
-        if base_url.trim().is_empty() {
-            return Err(Error::ConfigInvalid {
-                message: "base_url is empty".to_string(),
-            });
-        }
+        let final_url = Self::normalize_uri(base_url)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -57,9 +53,36 @@ impl HttpClient {
 
         Ok(HttpClient {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: final_url,
             auth_function,
         })
+    }
+
+    /// Normalize and validate a URI.
+    ///
+    /// # Arguments
+    /// * `uri` - The URI to normalize.
+    ///
+    /// # Returns
+    /// A normalized URI string, or an error if the URI is invalid.
+    fn normalize_uri(uri: &str) -> Result<String> {
+        let uri = uri.trim();
+
+        if uri.is_empty() {
+            return Err(Error::ConfigInvalid {
+                message: "uri is empty which must be defined".to_string(),
+            });
+        }
+
+        // Add http:// prefix if missing
+        let normalized_url = if uri.starts_with("http://") || uri.starts_with("https://") {
+            uri.to_string()
+        } else {
+            format!("http://{}", uri)
+        };
+
+        // Remove trailing slash
+        Ok(normalized_url.trim_end_matches('/').to_string())
     }
 
     /// Perform a GET request and parse the response as JSON.

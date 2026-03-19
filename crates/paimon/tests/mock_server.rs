@@ -32,8 +32,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
-use super::api_response::{ConfigResponse, ErrorResponse, ListDatabasesResponse};
-use super::resource_paths::ResourcePaths;
+use paimon::api::{ConfigResponse, ErrorResponse, ListDatabasesResponse, ResourcePaths};
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
@@ -77,34 +76,6 @@ impl RESTServer {
         }
     }
 
-    /// Get the warehouse path.
-    pub fn warehouse(&self) -> &str {
-        &self.warehouse
-    }
-
-    /// Get the resource paths.
-    pub fn resource_paths(&self) -> &ResourcePaths {
-        &self.resource_paths
-    }
-
-    /// Add a database to the server state.
-    pub fn add_database(&self, name: &str) {
-        let mut s = self.inner.lock().unwrap();
-        if !s.databases.contains_key(name) {
-            s.databases.insert(name.to_string(), ());
-        }
-    }
-
-    /// Get the server URL.
-    pub fn url(&self) -> Option<String> {
-        self.addr.map(|a| format!("http://{}", a))
-    }
-
-    /// Get the server address.
-    pub fn addr(&self) -> Option<SocketAddr> {
-        self.addr
-    }
-
     // ==================== HTTP Handlers ====================
 
     /// Handle GET /v1/config - return config for RESTApi initialization.
@@ -135,6 +106,37 @@ impl RESTServer {
         dbs.sort();
         let response = ListDatabasesResponse::new(dbs, None);
         (StatusCode::OK, Json(response))
+    }
+
+    // ====================== Server Control ====================
+    /// Get the warehouse path.
+    #[allow(dead_code)]
+    pub fn warehouse(&self) -> &str {
+        &self.warehouse
+    }
+
+    /// Get the resource paths.
+    pub fn resource_paths(&self) -> &ResourcePaths {
+        &self.resource_paths
+    }
+
+    /// Add a database to the server state.
+    pub fn add_database(&self, name: &str) {
+        let mut s = self.inner.lock().unwrap();
+        if !s.databases.contains_key(name) {
+            s.databases.insert(name.to_string(), ());
+        }
+    }
+
+    /// Get the server URL.
+    pub fn url(&self) -> Option<String> {
+        self.addr.map(|a| format!("http://{}", a))
+    }
+
+    /// Get the server address.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> Option<SocketAddr> {
+        self.addr
     }
 }
 

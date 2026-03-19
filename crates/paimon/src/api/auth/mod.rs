@@ -21,6 +21,6 @@ mod base;
 mod bear_provider;
 mod factory;
 
-pub use base::{AuthProvider, NoOpAuthProvider, RESTAuthFunction, RESTAuthParameter};
+pub use base::{AuthProvider, RESTAuthFunction, RESTAuthParameter};
 pub use bear_provider::BearerTokenAuthProvider;
 pub use factory::AuthProviderFactory;

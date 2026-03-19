@@ -22,8 +22,11 @@
 use std::collections::HashMap;
 
 use paimon::api::rest_api::RESTApi;
-use paimon::api::{start_mock_server, ConfigResponse, RESTServer};
+use paimon::api::ConfigResponse;
 use paimon::common::Options;
+
+mod mock_server;
+use mock_server::{start_mock_server, RESTServer};
 
 /// Helper struct to hold test resources.
 struct TestContext {
