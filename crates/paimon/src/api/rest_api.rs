@@ -18,7 +18,7 @@
 //! REST API implementation for Paimon.
 //!
 //! This module provides a REST API client for interacting with
-//! Paimon catalog services, supporting database operations.
+//! Paimon rest catalog services, supporting database operations.
 
 use std::collections::HashMap;
 
@@ -99,10 +99,8 @@ impl RESTApi {
             }
 
             let warehouse_encoded = RESTUtil::encode_string(warehouse);
-            let query_params: Vec<(&str, String)> = vec![(
-                CatalogOptions::WAREHOUSE,
-                warehouse_encoded,
-            )];
+            let query_params: Vec<(&str, String)> =
+                vec![(CatalogOptions::WAREHOUSE, warehouse_encoded)];
             let config_response: ConfigResponse = client
                 .get_with_params(&ResourcePaths::config(), &query_params)
                 .await?;

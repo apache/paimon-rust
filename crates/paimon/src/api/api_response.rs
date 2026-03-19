@@ -30,16 +30,12 @@ pub trait RESTResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct ErrorResponse {
     /// The type of resource that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
     /// The name of the resource that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_name: Option<String>,
     /// The error message.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The error code.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<i32>,
 }
 
@@ -98,7 +94,6 @@ pub struct ListDatabasesResponse {
     /// List of database names.
     pub databases: Vec<String>,
     /// Token for the next page.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
 
@@ -121,7 +116,6 @@ pub struct PagedList<T> {
     /// The list of elements on this page.
     pub elements: Vec<T>,
     /// Token to retrieve the next page, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
 

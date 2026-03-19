@@ -41,7 +41,10 @@ impl ResourcePaths {
 
     /// Create ResourcePaths from catalog options.
     pub fn for_catalog_properties(options: &Options) -> Self {
-        let prefix = options.get(CatalogOptions::PREFIX).map(|s| s.as_str()).unwrap_or("");
+        let prefix = options
+            .get(CatalogOptions::PREFIX)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         Self::new(prefix)
     }
 

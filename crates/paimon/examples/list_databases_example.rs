@@ -39,7 +39,7 @@ async fn main() {
     options.set(CatalogOptions::URI, "http://localhost:8080/");
 
     // Bearer token authentication (optional)
-    // options.set(CatalogOptions::TOKEN_PROVIDER, "bearer");
+    // options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
     // options.set(CatalogOptions::TOKEN, "your_token");
 
     // Create RESTApi instance

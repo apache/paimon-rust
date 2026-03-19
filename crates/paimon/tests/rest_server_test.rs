@@ -22,12 +22,12 @@
 use std::collections::HashMap;
 
 use paimon::api::rest_api::RESTApi;
-use paimon::api::{start_mock_server, ConfigResponse, MockServerHandle};
+use paimon::api::{start_mock_server, ConfigResponse, RESTServer};
 use paimon::common::Options;
 
 /// Helper struct to hold test resources.
 struct TestContext {
-    server: MockServerHandle,
+    server: RESTServer,
     api: RESTApi,
 }
 
@@ -49,7 +49,7 @@ async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
     )
     .await;
     let token = "test_token";
-    let url = server.url();
+    let url = server.url().expect("server url");
     let mut options = Options::new();
     options.set("uri", &url);
     options.set("warehouse", "test_warehouse");

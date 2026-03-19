@@ -25,25 +25,25 @@ pub struct CatalogOptions;
 impl CatalogOptions {
     /// Catalog URI.
     pub const URI: &'static str = "uri";
-    
+
     /// Metastore type (default: "filesystem").
     pub const METASTORE: &'static str = "metastore";
-    
+
     /// Warehouse path.
     pub const WAREHOUSE: &'static str = "warehouse";
-    
+
     /// Token provider type.
     pub const TOKEN_PROVIDER: &'static str = "token.provider";
-    
+
     /// Authentication token.
     pub const TOKEN: &'static str = "token";
-    
+
     /// Prefix for catalog resources.
     pub const PREFIX: &'static str = "prefix";
 }
 
 /// Configuration options container.
-/// 
+///
 /// This is a simple key-value store for catalog configuration.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -75,7 +75,10 @@ impl Options {
 
     /// Get a value by key with a default.
     pub fn get_or_default(&self, key: &str, default: &str) -> String {
-        self.data.get(key).map(|s| s.clone()).unwrap_or_else(|| default.to_string())
+        self.data
+            .get(key)
+            .map(|s| s.clone())
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Set a key-value pair.
@@ -136,8 +139,14 @@ mod tests {
         options.set("uri", "http://localhost:8080");
         options.set("warehouse", "/data/warehouse");
 
-        assert_eq!(options.get("uri"), Some(&"http://localhost:8080".to_string()));
-        assert_eq!(options.get("warehouse"), Some(&"/data/warehouse".to_string()));
+        assert_eq!(
+            options.get("uri"),
+            Some(&"http://localhost:8080".to_string())
+        );
+        assert_eq!(
+            options.get("warehouse"),
+            Some(&"/data/warehouse".to_string())
+        );
         assert!(!options.contains("nonexistent"));
     }
 
@@ -150,21 +159,27 @@ mod tests {
 
         let headers = options.extract_prefix_map("header.");
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("Content-Type"), Some(&"application/json".to_string()));
-        assert_eq!(headers.get("Authorization"), Some(&"Bearer token".to_string()));
+        assert_eq!(
+            headers.get("Content-Type"),
+            Some(&"application/json".to_string())
+        );
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&"Bearer token".to_string())
+        );
     }
 
     #[test]
     fn test_options_merge() {
         let mut options1 = Options::new();
         options1.set("key1", "value1");
-        
+
         let mut options2 = Options::new();
         options2.set("key2", "value2");
         options2.set("key1", "overwritten");
 
         options1.merge(&options2);
-        
+
         assert_eq!(options1.get("key1"), Some(&"overwritten".to_string()));
         assert_eq!(options1.get("key2"), Some(&"value2".to_string()));
     }

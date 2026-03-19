@@ -64,6 +64,9 @@ mod tests {
 
         let headers = RESTUtil::extract_prefix_map(&options, "header.");
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("Content-Type"), Some(&"application/json".to_string()));
+        assert_eq!(
+            headers.get("Content-Type"),
+            Some(&"application/json".to_string())
+        );
     }
 }

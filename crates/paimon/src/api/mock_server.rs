@@ -48,6 +48,8 @@ pub struct RESTServer {
     config: ConfigResponse,
     inner: Arc<Mutex<MockState>>,
     resource_paths: ResourcePaths,
+    addr: Option<SocketAddr>,
+    server_handle: Option<Arc<JoinHandle<()>>>,
 }
 
 impl RESTServer {
@@ -58,26 +60,20 @@ impl RESTServer {
         config: ConfigResponse,
         initial_dbs: Vec<String>,
     ) -> Self {
-        let prefix = config
-            .defaults
-            .get("prefix")
-            .cloned()
-            .unwrap_or_default();
+        let prefix = config.defaults.get("prefix").cloned().unwrap_or_default();
 
         // Create database set for initial databases
-        let databases: HashMap<String, ()> = initial_dbs
-            .into_iter()
-            .map(|name| (name, ()))
-            .collect();
+        let databases: HashMap<String, ()> =
+            initial_dbs.into_iter().map(|name| (name, ())).collect();
 
         RESTServer {
             data_path,
             config,
             warehouse,
-            inner: Arc::new(Mutex::new(MockState {
-                databases,
-            })),
-            resource_paths: ResourcePaths::new(&prefix)
+            inner: Arc::new(Mutex::new(MockState { databases })),
+            resource_paths: ResourcePaths::new(&prefix),
+            addr: None,
+            server_handle: None,
         }
     }
 
@@ -97,6 +93,16 @@ impl RESTServer {
         if !s.databases.contains_key(name) {
             s.databases.insert(name.to_string(), ());
         }
+    }
+
+    /// Get the server URL.
+    pub fn url(&self) -> Option<String> {
+        self.addr.map(|a| format!("http://{}", a))
+    }
+
+    /// Get the server address.
+    pub fn addr(&self) -> Option<SocketAddr> {
+        self.addr
     }
 
     // ==================== HTTP Handlers ====================
@@ -132,32 +138,11 @@ impl RESTServer {
     }
 }
 
-pub struct MockServerHandle {
-    pub addr: SocketAddr,
-    server_handle: JoinHandle<()>,
-    state: Arc<RESTServer>,
-}
-
-impl Drop for MockServerHandle {
+impl Drop for RESTServer {
     fn drop(&mut self) {
-        self.server_handle.abort();
-    }
-}
-
-impl MockServerHandle {
-    /// Add a database to the server state.
-    pub fn add_database(&self, name: &str) {
-        self.state.add_database(name);
-    }
-
-    /// Get the warehouse path.
-    pub fn warehouse(&self) -> &str {
-        self.state.warehouse()
-    }
-
-    /// Get the server URL.
-    pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        if let Some(handle) = &self.server_handle {
+            handle.abort();
+        }
     }
 }
 
@@ -170,17 +155,18 @@ impl MockServerHandle {
 /// * `initial_dbs` - Initial databases to create.
 ///
 /// # Returns
-/// A MockServerHandle with address and control.
+/// A RESTServer with address and control.
 pub async fn start_mock_server(
     warehouse: String,
     data_path: String,
     config: ConfigResponse,
     initial_dbs: Vec<String>,
-) -> MockServerHandle {
-    let state = Arc::new(RESTServer::new(warehouse, data_path, config, initial_dbs));
+) -> RESTServer {
+    let mut server = RESTServer::new(warehouse, data_path, config, initial_dbs);
 
     // Build routes based on prefix from config
-    let prefix = state.resource_paths().base_path();
+    let prefix = server.resource_paths().base_path();
+    let state = Arc::new(server.clone());
     let app = Router::new()
         // Config endpoint (for RESTApi initialization)
         .route("/v1/config", get(RESTServer::get_config))
@@ -189,24 +175,20 @@ pub async fn start_mock_server(
             &format!("{}/databases", prefix),
             get(RESTServer::list_databases),
         )
-        .layer(Extension(state.clone()));
+        .layer(Extension(state));
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("bind failed");
     let addr = listener.local_addr().unwrap();
 
-    let server = axum::serve(listener, app.into_make_service());
-
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server.await {
+        if let Err(e) = axum::serve(listener, app.into_make_service()).await {
             eprintln!("mock server error: {}", e);
         }
     });
 
-    MockServerHandle {
-        addr,
-        server_handle,
-        state,
-    }
+    server.addr = Some(addr);
+    server.server_handle = Some(Arc::new(server_handle));
+    server
 }

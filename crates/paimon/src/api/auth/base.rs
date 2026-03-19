@@ -196,7 +196,7 @@ mod tests {
     fn test_noop_auth_provider_with_headers() {
         let mut initial_headers = HashMap::new();
         initial_headers.insert("X-Custom-Header".to_string(), "value".to_string());
-        
+
         let provider = NoOpAuthProvider::with_headers(initial_headers);
         let base_header = HashMap::new();
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());

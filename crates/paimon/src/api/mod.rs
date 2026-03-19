@@ -28,7 +28,7 @@ pub mod rest_error;
 pub mod rest_util;
 
 // Re-export mock server functions
-pub use mock_server::{start_mock_server, MockServerHandle};
+pub use mock_server::{start_mock_server, RESTServer};
 
 mod api_response;
 
@@ -38,7 +38,7 @@ pub use api_response::{
 };
 
 // Re-export error types
-pub use rest_error::{ErrorInfo, RestError};
+pub use rest_error::RestError;
 
 // Re-export utility types
 pub use resource_paths::ResourcePaths;
