@@ -58,10 +58,10 @@ futures = "0.3"
 parquet = { workspace = true, features = ["async", "zstd"] }
 async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["json"] }
-tokio-util = "0.7"
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 
 [dev-dependencies]
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 rand = "0.8.5"
 serde_avro_fast = { version = "1.1.2", features = ["snappy"] }
 tempfile = "3"
