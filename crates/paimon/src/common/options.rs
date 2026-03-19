@@ -75,10 +75,7 @@ impl Options {
 
     /// Get a value by key with a default.
     pub fn get_or_default(&self, key: &str, default: &str) -> String {
-        self.data
-            .get(key)
-            .map(|s| s.clone())
-            .unwrap_or_else(|| default.to_string())
+        self.data.get(key).cloned().unwrap_or_else(|| default.to_string())
     }
 
     /// Set a key-value pair.
@@ -114,9 +111,8 @@ impl Options {
     pub fn extract_prefix_map(&self, prefix: &str) -> HashMap<String, String> {
         let mut result = HashMap::new();
         for (key, value) in &self.data {
-            if key.starts_with(prefix) {
-                let new_key = key[prefix.len()..].to_string();
-                result.insert(new_key, value.clone());
+            if let Some(stripped) = key.strip_prefix(prefix) {
+                result.insert(stripped.to_string(), value.clone());
             }
         }
         result
