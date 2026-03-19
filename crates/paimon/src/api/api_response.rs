@@ -160,5 +160,4 @@ mod tests {
         assert!(json.contains("\"databases\":[\"db1\",\"db2\"]"));
         assert!(json.contains("\"nextPageToken\":\"token123\""));
     }
-
 }
