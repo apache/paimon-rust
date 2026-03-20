@@ -85,7 +85,6 @@ pub trait AuthProvider {
     ) -> HashMap<String, String>;
 }
 
-
 /// Function wrapper for REST authentication.
 ///
 /// This struct combines an initial set of headers with an authentication provider

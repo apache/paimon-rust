@@ -24,6 +24,6 @@ mod dlf_signer;
 mod factory;
 
 pub use base::{AuthProvider, RESTAuthFunction, RESTAuthParameter};
-pub use bear_provider::BearTokenAuthProvider;
+pub use bear_provider::BearerTokenAuthProvider;
 pub use dlf_provider::{DLFAuthProvider, DLFToken};
 pub use factory::AuthProviderFactory;

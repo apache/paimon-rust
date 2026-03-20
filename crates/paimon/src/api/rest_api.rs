@@ -32,8 +32,8 @@ use super::api_request::{
     AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RenameTableRequest,
 };
 use super::api_response::{
-    ConfigResponse, GetDatabaseResponse, GetTableResponse,
-    ListDatabasesResponse, ListTablesResponse, PagedList,
+    ConfigResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
+    ListTablesResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::resource_paths::ResourcePaths;

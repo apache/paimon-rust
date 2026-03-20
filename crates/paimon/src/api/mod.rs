@@ -31,14 +31,13 @@ mod api_response;
 
 // Re-export request types
 pub use api_request::{
-    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest,
-    RenameTableRequest,
+    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RenameTableRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse, GetTableResponse,
-    ListDatabasesResponse, ListTablesResponse, PagedList
+    ListDatabasesResponse, ListTablesResponse, PagedList,
 };
 
 // Re-export error types
@@ -50,5 +49,5 @@ pub use rest_util::RESTUtil;
 
 // Re-export auth types
 pub use auth::{
-    AuthProvider, AuthProviderFactory, BearTokenAuthProvider, RESTAuthFunction, RESTAuthParameter,
+    AuthProvider, AuthProviderFactory, BearerTokenAuthProvider, RESTAuthFunction, RESTAuthParameter,
 };
