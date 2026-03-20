@@ -31,15 +31,14 @@ mod api_response;
 
 // Re-export request types
 pub use api_request::{
-    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RESTRequest,
+    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest,
     RenameTableRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse, GetTableResponse,
-    GetTableTokenResponse, ListDatabasesResponse, ListTablesResponse, PagedList, PagedResponse,
-    RESTResponse,
+    ListDatabasesResponse, ListTablesResponse, PagedList
 };
 
 // Re-export error types

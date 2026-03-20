@@ -229,28 +229,6 @@ impl ConfigResponse {
     }
 }
 
-/// Response containing a table token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetTableTokenResponse {
-    /// The token data.
-    pub token: Option<HashMap<String, String>>,
-    /// Expiration timestamp in milliseconds.
-    pub expires_at_millis: Option<i64>,
-}
-
-impl RESTResponse for GetTableTokenResponse {}
-
-impl GetTableTokenResponse {
-    /// Create a new GetTableTokenResponse.
-    pub fn new(token: Option<HashMap<String, String>>, expires_at_millis: Option<i64>) -> Self {
-        Self {
-            token,
-            expires_at_millis,
-        }
-    }
-}
-
 /// A paged response with data and optional next page token.
 pub trait PagedResponse<T>: RESTResponse {
     /// Get the data elements.

@@ -32,7 +32,7 @@ use super::api_request::{
     AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RenameTableRequest,
 };
 use super::api_response::{
-    ConfigResponse, GetDatabaseResponse, GetTableResponse, GetTableTokenResponse,
+    ConfigResponse, GetDatabaseResponse, GetTableResponse,
     ListDatabasesResponse, ListTablesResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
@@ -373,24 +373,5 @@ impl RESTApi {
         let path = self.resource_paths.table(database, table);
         let _resp: serde_json::Value = self.client.delete(&path).await?;
         Ok(())
-    }
-
-    // ==================== Token & Config Operations ====================
-
-    /// Get table token for authentication.
-    pub async fn get_table_token(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Result<GetTableTokenResponse> {
-        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
-        let path = self.resource_paths.table_token(database, table);
-        self.client.get(&path).await
-    }
-
-    /// Get configuration defaults.
-    pub async fn get_config(&self) -> Result<ConfigResponse> {
-        let path = ResourcePaths::config();
-        self.client.get(&path).await
     }
 }

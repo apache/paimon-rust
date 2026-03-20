@@ -98,6 +98,7 @@ impl DLFToken {
     }
 
     /// Check if the token is expired or about to expire.
+    #[allow(dead_code)]
     pub fn is_expired(&self, safe_time_millis: i64) -> bool {
         if let Some(expiration) = self.expiration_at_millis {
             let now = Utc::now().timestamp_millis();
