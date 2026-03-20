@@ -17,10 +17,59 @@
 
 //! Authentication provider factory.
 
+use regex::Regex;
+
 use crate::common::{CatalogOptions, Options};
 use crate::Error;
 
+use super::base::AUTHORIZATION_HEADER_KEY;
+use super::dlf_provider::DLFToken;
 use super::{AuthProvider, BearerTokenAuthProvider, DLFAuthProvider};
+
+/// Factory for creating DLF authentication providers.
+pub struct DLFAuthProviderFactory;
+
+impl DLFAuthProviderFactory {
+    /// OpenAPI identifier.
+    pub const OPENAPI_IDENTIFIER: &'static str = "openapi";
+    /// Default identifier.
+    pub const DEFAULT_IDENTIFIER: &'static str = "default";
+    /// Region pattern for parsing from URI.
+    const REGION_PATTERN: &'static str = r"(?:pre-)?([a-z]+-[a-z]+(?:-\d+)?)";
+
+    /// Parse region from DLF endpoint URI.
+    ///
+    /// Extracts the region from URIs like:
+    /// - `http://cn-hangzhou-vpc.dlf.aliyuncs.com` → `cn-hangzhou`
+    /// - `http://dlfnext.cn-hangzhou.aliyuncs.com` → `cn-hangzhou`
+    /// - `http://pre-cn-hangzhou.dlf.aliyuncs.com` → `cn-hangzhou`
+    pub fn parse_region_from_uri(uri: Option<&str>) -> Option<String> {
+        let uri = uri?;
+        let re = Regex::new(Self::REGION_PATTERN).ok()?;
+        let caps = re.captures(uri)?;
+        caps.get(1).map(|m| m.as_str().to_string())
+    }
+
+    /// Parse signing algorithm from URI.
+    ///
+    /// Returns "openapi" for public endpoints (dlfnext or openapi in host),
+    /// otherwise returns "default".
+    pub fn parse_signing_algo_from_uri(uri: Option<&str>) -> &'static str {
+        if let Some(uri) = uri {
+            let host = uri.to_lowercase();
+            let host = host
+                .strip_prefix("http://")
+                .unwrap_or(host.strip_prefix("https://").unwrap_or(&host));
+            let host = host.split('/').next().unwrap_or("");
+            let host = host.split(':').next().unwrap_or("");
+
+            if host.starts_with("dlfnext") || host.contains("openapi") {
+                return Self::OPENAPI_IDENTIFIER;
+            }
+        }
+        Self::DEFAULT_IDENTIFIER
+    }
+}
 
 /// Factory for creating authentication providers.
 pub struct AuthProviderFactory;
@@ -50,11 +99,42 @@ impl AuthProviderFactory {
                 Ok(Box::new(BearerTokenAuthProvider::new(token)))
             }
             Some("dlf") => {
-                let dlf_provider = DLFAuthProvider::from_options(options).ok_or_else(|| {
-                    Error::ConfigInvalid {
-                        message: "DLF authentication requires uri, region, access-key-id and access-key-secret".to_string(),
-                    }
-                })?;
+                let uri = options
+                    .get(CatalogOptions::URI)
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: "URI is required for DLF authentication".to_string(),
+                    })?
+                    .clone();
+
+                // Get region from options or parse from URI
+                let region = options
+                    .get(CatalogOptions::DLF_REGION)
+                    .cloned()
+                    .or_else(|| DLFAuthProviderFactory::parse_region_from_uri(Some(&uri)))
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: "Could not get region from config or URI. Please set 'dlf.region' or use a standard DLF endpoint URI.".to_string(),
+                    })?;
+
+                // Get signing algorithm from options, or auto-detect from URI
+                let signing_algorithm = options
+                    .get(CatalogOptions::DLF_SIGNING_ALGORITHM)
+                    .map(|s| s.as_str())
+                    .filter(|s| *s != "default")
+                    .unwrap_or_else(|| {
+                        DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(&uri))
+                    })
+                    .to_string();
+
+                let dlf_provider = DLFAuthProvider::new(
+                    uri,
+                    region,
+                    signing_algorithm,
+                    DLFToken::from_options(options).ok_or_else(|| Error::ConfigInvalid {
+                        message: "DLF authentication requires access-key-id and access-key-secret"
+                            .to_string(),
+                    })?,
+                );
+
                 Ok(Box::new(dlf_provider))
             }
             None => Err(Error::ConfigInvalid {
@@ -105,5 +185,59 @@ mod tests {
 
         let result = AuthProviderFactory::create_auth_provider(&options);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_dlf_provider() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+        options.set(
+            CatalogOptions::URI,
+            "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/",
+        );
+        options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
+        options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
+        options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
+
+        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+
+        let base_header = HashMap::new();
+        let param = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
+        let result = provider.merge_auth_header(base_header, &param);
+
+        assert!(result.contains_key(AUTHORIZATION_HEADER_KEY));
+    }
+
+    #[test]
+    fn test_dlf_provider_missing_region() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+        options.set(CatalogOptions::URI, "http://example.com/");
+        options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
+        options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
+
+        let result = AuthProviderFactory::create_auth_provider(&options);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_region_from_uri() {
+        let region = DLFAuthProviderFactory::parse_region_from_uri(Some(
+            "http://cn-hangzhou-vpc.dlf.aliyuncs.com",
+        ));
+        assert_eq!(region, Some("cn-hangzhou".to_string()));
+    }
+
+    #[test]
+    fn test_parse_signing_algo_from_uri() {
+        let algo = DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(
+            "http://dlfnext.cn-hangzhou.aliyuncs.com",
+        ));
+        assert_eq!(algo, "openapi");
+
+        let algo = DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(
+            "http://cn-hangzhou-vpc.dlf.aliyuncs.com",
+        ));
+        assert_eq!(algo, "default");
     }
 }

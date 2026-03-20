@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use paimon::api::ConfigResponse;
-use paimon::common::Options;
+use paimon::common::{DLFToken, Options};
 use paimon::{api::rest_api::RESTApi, CatalogOptions};
 use serde_json::json;
 
@@ -387,4 +387,70 @@ async fn test_rename_table() {
     // Get the renamed table
     let table_resp = ctx.api.get_table("default", "new_table").await.unwrap();
     assert_eq!(table_resp.name, Some("new_table".to_string()));
+}
+
+// ==================== Token Loader Tests ====================
+
+#[tokio::test]
+async fn test_ecs_loader_token() {
+    use paimon::common::token_loader::DLFECSTokenLoader;
+
+    let prefix = "mock-test";
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), prefix.to_string());
+    let config = ConfigResponse::new(defaults);
+
+    let initial: Vec<String> = vec!["default".to_string()];
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        "/tmp/test_warehouse".to_string(),
+        config,
+        initial,
+    )
+    .await;
+
+    let role_name = "test_role";
+    let token_json = json!({
+        "AccessKeyId": "AccessKeyId",
+        "AccessKeySecret": "AccessKeySecret",
+        "SecurityToken": "AQoDYXdzEJr...<remainder of security token>",
+        "Expiration": "2023-12-01T12:00:00Z"
+    });
+
+    server.set_ecs_metadata(role_name, token_json.clone());
+
+    let ecs_metadata_url = format!("{}/ram/security-credentials/", server.url().unwrap());
+
+    // Test without role name
+    let mut options = Options::new();
+    options.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
+    options.set(CatalogOptions::DLF_TOKEN_ECS_METADATA_URL, &ecs_metadata_url);
+
+    let loader = DLFECSTokenLoader::new(&ecs_metadata_url, None);
+    let load_token: DLFToken = loader.load_token_async().await.unwrap();
+
+    assert_eq!(load_token.access_key_id, "AccessKeyId");
+    assert_eq!(load_token.access_key_secret, "AccessKeySecret");
+    assert_eq!(
+        load_token.security_token,
+        Some("AQoDYXdzEJr...<remainder of security token>".to_string())
+    );
+    assert_eq!(load_token.expiration, Some("2023-12-01T12:00:00Z".to_string()));
+
+    // Test with role name
+    let mut options_with_role = Options::new();
+    options_with_role.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
+    options_with_role.set(CatalogOptions::DLF_TOKEN_ECS_METADATA_URL, &ecs_metadata_url);
+    options_with_role.set(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME, role_name);
+
+    let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name.to_string()));
+    let token: DLFToken = loader_with_role.load_token_async().await.unwrap();
+
+    assert_eq!(token.access_key_id, "AccessKeyId");
+    assert_eq!(token.access_key_secret, "AccessKeySecret");
+    assert_eq!(
+        token.security_token,
+        Some("AQoDYXdzEJr...<remainder of security token>".to_string())
+    );
+    assert_eq!(token.expiration, Some("2023-12-01T12:00:00Z".to_string()));
 }

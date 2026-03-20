@@ -18,12 +18,12 @@
 //! Authentication module for REST API.
 
 mod base;
-mod bear_provider;
+mod bearer_provider;
 mod dlf_provider;
 mod dlf_signer;
 mod factory;
 
 pub use base::{AuthProvider, RESTAuthFunction, RESTAuthParameter};
-pub use bear_provider::BearerTokenAuthProvider;
+pub use bearer_provider::BearerTokenAuthProvider;
 pub use dlf_provider::{DLFAuthProvider, DLFToken};
-pub use factory::AuthProviderFactory;
+pub use factory::{AuthProviderFactory, DLFAuthProviderFactory};

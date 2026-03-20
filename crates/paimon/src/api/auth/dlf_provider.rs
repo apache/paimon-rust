@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use super::base::{AuthProvider, RESTAuthParameter};
+use super::base::{AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
 use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
 use crate::common::{CatalogOptions, Options};
 
@@ -51,18 +51,30 @@ impl DLFToken {
     const TOKEN_DATE_FORMAT: &'static str = "%Y-%m-%dT%H:%M:%SZ";
 
     /// Create a new DLFToken.
+    ///
+    /// # Arguments
+    /// * `access_key_id` - The access key ID
+    /// * `access_key_secret` - The access key secret
+    /// * `security_token` - Optional security token
+    /// * `expiration` - Optional expiration time string (ISO 8601 format)
+    /// * `expiration_at_millis` - Optional expiration timestamp in milliseconds.
+    ///   If provided, this value is used directly. Otherwise, it will be parsed from `expiration`.
     pub fn new(
         access_key_id: impl Into<String>,
         access_key_secret: impl Into<String>,
         security_token: Option<String>,
         expiration: Option<String>,
+        expiration_at_millis: Option<i64>,
     ) -> Self {
         let access_key_id = access_key_id.into();
         let access_key_secret = access_key_secret.into();
 
-        let expiration_at_millis = expiration
-            .as_ref()
-            .and_then(|exp| Self::parse_expiration_to_millis(exp));
+        // Use provided expiration_at_millis, or parse from expiration string if not provided
+        let expiration_at_millis = expiration_at_millis.or_else(|| {
+            expiration
+                .as_ref()
+                .and_then(|exp| Self::parse_expiration_to_millis(exp))
+        });
 
         Self {
             access_key_id,
@@ -86,6 +98,7 @@ impl DLFToken {
             access_key_secret.clone(),
             security_token,
             None,
+            None,
         ))
     }
 
@@ -96,25 +109,11 @@ impl DLFToken {
             .and_utc();
         Some(datetime.timestamp_millis())
     }
-
-    /// Check if the token is expired or about to expire.
-    #[allow(dead_code)]
-    pub fn is_expired(&self, safe_time_millis: i64) -> bool {
-        if let Some(expiration) = self.expiration_at_millis {
-            let now = Utc::now().timestamp_millis();
-            expiration - now < safe_time_millis
-        } else {
-            false
-        }
-    }
 }
 
 // ============================================================================
 // DLF Auth Provider
 // ============================================================================
-
-/// DLF Authorization header key.
-const DLF_AUTHORIZATION_HEADER_KEY: &str = "Authorization";
 
 /// DLF Authentication Provider for Alibaba Cloud Data Lake Formation.
 ///
@@ -171,14 +170,18 @@ impl DLFAuthProvider {
         let region = options
             .get(CatalogOptions::DLF_REGION)
             .cloned()
-            .or_else(|| DLFSignerFactory::parse_region_from_uri(Some(&uri)))?;
+            .or_else(|| {
+                super::factory::DLFAuthProviderFactory::parse_region_from_uri(Some(&uri))
+            })?;
 
         // Get signing algorithm from options or auto-detect from URI
         let signing_algorithm = options
             .get(CatalogOptions::DLF_SIGNING_ALGORITHM)
             .map(|s| s.as_str())
             .filter(|s| *s != "default")
-            .unwrap_or_else(|| DLFSignerFactory::parse_signing_algo_from_uri(Some(&uri)))
+            .unwrap_or_else(|| {
+                super::factory::DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(&uri))
+            })
             .to_string();
 
         // Get token from options
@@ -228,7 +231,7 @@ impl AuthProvider for DLFAuthProvider {
 
         // Merge all headers
         base_header.extend(sign_headers);
-        base_header.insert(DLF_AUTHORIZATION_HEADER_KEY.to_string(), authorization);
+        base_header.insert(AUTHORIZATION_HEADER_KEY.to_string(), authorization);
 
         base_header
     }

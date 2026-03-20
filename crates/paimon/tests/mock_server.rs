@@ -27,6 +27,7 @@ use axum::{
     routing::get,
     Router,
 };
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,10 @@ struct MockState {
     tables: HashMap<String, GetTableResponse>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
+    /// ECS metadata role name (for token loader testing)
+    ecs_role_name: Option<String>,
+    /// ECS metadata token (for token loader testing)
+    ecs_token: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -591,6 +596,46 @@ impl RESTServer {
     pub fn addr(&self) -> Option<SocketAddr> {
         self.addr
     }
+
+    /// Set ECS metadata role name and token for token loader testing.
+    #[allow(dead_code)]
+    pub fn set_ecs_metadata(&self, role_name: &str, token: serde_json::Value) {
+        let mut s = self.inner.lock().unwrap();
+        s.ecs_role_name = Some(role_name.to_string());
+        s.ecs_token = Some(token);
+    }
+
+    /// Handle GET /ram/security-credential/:role - ECS metadata endpoint.
+    pub async fn get_ecs_metadata(
+        Path(role): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+
+        // If role_name is set and matches, return the token
+        if let Some(expected_role) = &s.ecs_role_name {
+            if &role == expected_role {
+                if let Some(token) = &s.ecs_token {
+                    return (StatusCode::OK, Json(token.clone())).into_response();
+                }
+            }
+        }
+
+        (StatusCode::NOT_FOUND, Json(json!({"error": "Role not found"}))).into_response()
+    }
+
+    /// Handle GET /ram/security-credential/ - ECS metadata endpoint (list roles).
+    pub async fn list_ecs_roles(
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+
+        if let Some(role_name) = &s.ecs_role_name {
+            (StatusCode::OK, role_name.clone()).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "No role configured"}))).into_response()
+        }
+    }
 }
 
 impl Drop for RESTServer {
@@ -647,6 +692,15 @@ pub async fn start_mock_server(
         .route(
             &format!("{}/tables/rename", prefix),
             axum::routing::post(RESTServer::rename_table),
+        )
+        // ECS metadata endpoints (for token loader testing)
+        .route(
+            "/ram/security-credentials/",
+            get(RESTServer::list_ecs_roles),
+        )
+        .route(
+            "/ram/security-credentials/:role",
+            get(RESTServer::get_ecs_metadata),
         )
         .layer(Extension(state));
 

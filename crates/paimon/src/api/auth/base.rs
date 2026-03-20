@@ -84,7 +84,8 @@ pub trait AuthProvider {
         parameter: &RESTAuthParameter,
     ) -> HashMap<String, String>;
 }
-
+/// Authorization header key.
+pub const AUTHORIZATION_HEADER_KEY: &str = "Authorization";
 /// Function wrapper for REST authentication.
 ///
 /// This struct combines an initial set of headers with an authentication provider

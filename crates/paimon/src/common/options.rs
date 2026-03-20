@@ -60,6 +60,15 @@ impl CatalogOptions {
 
     /// DLF signing algorithm (default or openapi).
     pub const DLF_SIGNING_ALGORITHM: &'static str = "dlf.signing-algorithm";
+
+    /// DLF token loader type (e.g., "ecs").
+    pub const DLF_TOKEN_LOADER: &'static str = "dlf.token-loader";
+
+    /// DLF ECS metadata URL.
+    pub const DLF_TOKEN_ECS_METADATA_URL: &'static str = "dlf.token-ecs-metadata-url";
+
+    /// DLF ECS role name.
+    pub const DLF_TOKEN_ECS_ROLE_NAME: &'static str = "dlf.token-ecs-role-name";
 }
 
 /// Configuration options container.
