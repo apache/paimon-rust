@@ -70,56 +70,6 @@ async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
 
 // ==================== Database Tests ====================
 #[tokio::test]
-async fn test_remote() {
-    let mut options = Options::new();
-
-    // Basic configuration - replace with your actual server URL
-    options.set(CatalogOptions::METASTORE, "rest");
-    options.set(CatalogOptions::WAREHOUSE, "pypaimon_test1");
-    options.set(
-        CatalogOptions::URI,
-        "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/",
-    );
-
-    // Bearer token authentication (optional)
-    // options.set(CatalogOptions::TOKEN_PROVIDER, "bearer");
-
-    // DLF authentication (optional, for Alibaba Cloud)
-    options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
-    options.set("dlf.region", "cn-hangzhou");
-    options.set(
-        "dlf.access-key-id",
-        std::env::var("DLF_ACCESS_KEY_ID").expect("DLF_ACCESS_KEY_ID env var not set"),
-    );
-    options.set(
-        "dlf.access-key-secret",
-        std::env::var("DLF_ACCESS_KEY_SECRET").expect("DLF_ACCESS_KEY_SECRET env var not set"),
-    );
-
-    // Create RESTApi instance
-    // config_required = true means it will fetch config from server
-    println!("Creating RESTApi instance...");
-    let api = match RESTApi::new(options, true).await {
-        Ok(api) => api,
-        Err(e) => {
-            eprintln!("Failed to create RESTApi: {}", e);
-            return;
-        }
-    };
-
-    // Create database
-    println!("\nCreating database 'example_db'...");
-    match api
-        .create_database("example_db", Some(HashMap::new()))
-        .await
-    {
-        Ok(()) => println!("Database created successfully"),
-        Err(e) => eprintln!("Failed to create database: {}", e),
-    }
-    println!("\nCreating database 'example_db'...");
-}
-
-#[tokio::test]
 async fn test_list_databases() {
     let ctx = setup_test_server(vec!["default", "test_db1", "prod_db"]).await;
 

@@ -58,7 +58,7 @@ pub struct RESTServer {
 }
 
 impl RESTServer {
-    /// Create a new RESTServer with initial databases).
+    /// Create a new RESTServer with initial databases.
     pub fn new(
         warehouse: String,
         data_path: String,
