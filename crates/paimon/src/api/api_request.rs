@@ -80,7 +80,10 @@ impl RESTRequest for RenameTableRequest {}
 impl RenameTableRequest {
     /// Create a new RenameTableRequest.
     pub fn new(source: Identifier, destination: Identifier) -> Self {
-        Self { source, destination }
+        Self {
+            source,
+            destination,
+        }
     }
 }
 

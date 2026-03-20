@@ -23,7 +23,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::base::{AuthProvider, RESTAuthParameter};
-use super::dlf_signer::{DLFSignerFactory, DLFRequestSigner};
+use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
 use crate::common::{CatalogOptions, Options};
 
 // ============================================================================
@@ -59,10 +59,10 @@ impl DLFToken {
     ) -> Self {
         let access_key_id = access_key_id.into();
         let access_key_secret = access_key_secret.into();
-        
-        let expiration_at_millis = expiration.as_ref().and_then(|exp| {
-            Self::parse_expiration_to_millis(exp)
-        });
+
+        let expiration_at_millis = expiration
+            .as_ref()
+            .and_then(|exp| Self::parse_expiration_to_millis(exp));
 
         Self {
             access_key_id,
@@ -77,7 +77,9 @@ impl DLFToken {
     pub fn from_options(options: &Options) -> Option<Self> {
         let access_key_id = options.get(CatalogOptions::DLF_ACCESS_KEY_ID)?;
         let access_key_secret = options.get(CatalogOptions::DLF_ACCESS_KEY_SECRET)?;
-        let security_token = options.get(CatalogOptions::DLF_ACCESS_SECURITY_TOKEN).cloned();
+        let security_token = options
+            .get(CatalogOptions::DLF_ACCESS_SECURITY_TOKEN)
+            .cloned();
 
         Some(Self::new(
             access_key_id.clone(),
@@ -219,7 +221,9 @@ impl AuthProvider for DLFAuthProvider {
         );
 
         // Generate authorization header
-        let authorization = self.signer.authorization(rest_auth_parameter, token, &host, &sign_headers);
+        let authorization =
+            self.signer
+                .authorization(rest_auth_parameter, token, &host, &sign_headers);
 
         // Merge all headers
         base_header.extend(sign_headers);
@@ -260,7 +264,10 @@ mod tests {
     #[test]
     fn test_dlf_auth_provider_from_options() {
         let mut options = Options::new();
-        options.set(CatalogOptions::URI, "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/");
+        options.set(
+            CatalogOptions::URI,
+            "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/",
+        );
         options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
         options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
@@ -278,12 +285,18 @@ mod tests {
         let mut options = Options::new();
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
         options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
-        options.set(CatalogOptions::DLF_ACCESS_SECURITY_TOKEN, "test_security_token");
+        options.set(
+            CatalogOptions::DLF_ACCESS_SECURITY_TOKEN,
+            "test_security_token",
+        );
 
         let token = DLFToken::from_options(&options).unwrap();
         assert_eq!(token.access_key_id, "test_key_id");
         assert_eq!(token.access_key_secret, "test_key_secret");
-        assert_eq!(token.security_token, Some("test_security_token".to_string()));
+        assert_eq!(
+            token.security_token,
+            Some("test_security_token".to_string())
+        );
     }
 
     #[test]

@@ -256,15 +256,10 @@ impl RESTApi {
     }
 
     /// Drop a database.
-    pub async fn drop_database(&self, name: &str, cascade: bool) -> Result<()> {
+    pub async fn drop_database(&self, name: &str) -> Result<()> {
         validate_non_empty(name, "database name")?;
         let path = self.resource_paths.database(name);
-        let params = if cascade {
-            vec![("cascade", "true")]
-        } else {
-            vec![]
-        };
-        let _resp: serde_json::Value = self.client.delete_with_params(&path, &params).await?;
+        let _resp: serde_json::Value = self.client.delete(&path).await?;
         Ok(())
     }
 

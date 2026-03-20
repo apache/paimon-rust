@@ -150,7 +150,7 @@ impl HttpClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = self.url(path);
+        let url = self.request_url(path);
         let body_str = serde_json::to_string(body).ok();
         let headers = self.build_auth_headers("POST", path, body_str.as_deref(), HashMap::new());
         let request = self.client.post(&url).json(body);
@@ -170,7 +170,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.url(path);
+        let url = self.request_url(path);
         let headers = self.build_auth_headers("DELETE", path, None, HashMap::new());
         let request = self.client.delete(&url);
         let request = Self::apply_headers(request, &headers);
@@ -194,7 +194,7 @@ impl HttpClient {
         path: &str,
         params: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<T> {
-        let url = self.url(path);
+        let url = self.request_url(path);
         let params_map: HashMap<String, String> = params
             .iter()
             .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
@@ -279,6 +279,14 @@ impl HttpClient {
             message: "failed to read response".to_string(),
             source: Some(Box::new(e)),
         })?;
+
+        // Handle empty response body - return null as default for types like serde_json::Value
+        if text.trim().is_empty() {
+            return serde_json::from_str("null").map_err(|e| Error::UnexpectedError {
+                message: "failed to parse empty response".to_string(),
+                source: Some(Box::new(e)),
+            });
+        }
 
         serde_json::from_str(&text).map_err(|e| Error::UnexpectedError {
             message: "failed to parse json".to_string(),

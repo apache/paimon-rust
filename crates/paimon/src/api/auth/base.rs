@@ -70,6 +70,7 @@ impl RESTAuthParameter {
 ///
 /// Implement this trait to provide custom authentication mechanisms
 /// for REST API requests.
+pub trait AuthProvider: Send + Sync {
     /// Merge authentication headers into the base headers.
     ///
     /// # Arguments
@@ -82,6 +83,15 @@ impl RESTAuthParameter {
         base_header: HashMap<String, String>,
         parameter: &RESTAuthParameter,
     ) -> HashMap<String, String>;
+
+    /// Clone the provider into a boxed trait object.
+    fn clone_box(&self) -> Box<dyn AuthProvider>;
+}
+
+impl Clone for Box<dyn AuthProvider> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 /// Function wrapper for REST authentication.

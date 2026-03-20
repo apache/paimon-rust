@@ -20,8 +20,6 @@
 //! This module provides error types for REST API operations,
 //! mapping HTTP status codes to specific error variants.
 
-use reqwest::StatusCode;
-use serde_json::Value;
 use snafu::Snafu;
 
 /// REST API error type.

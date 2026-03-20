@@ -231,7 +231,8 @@ impl DLFDefaultSigner {
             rest_auth_parameter.path.clone(),
         ];
 
-        let canonical_query_string = self.build_canonical_query_string(&rest_auth_parameter.parameters);
+        let canonical_query_string =
+            self.build_canonical_query_string(&rest_auth_parameter.parameters);
         parts.push(canonical_query_string);
 
         let sorted_headers = self.build_sorted_signed_headers_map(headers);
@@ -272,7 +273,10 @@ impl DLFDefaultSigner {
         query_parts.join("&")
     }
 
-    fn build_sorted_signed_headers_map(&self, headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    fn build_sorted_signed_headers_map(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
         let mut sorted_headers: Vec<(String, String)> = headers
             .iter()
             .filter(|(key, _)| {
@@ -343,10 +347,16 @@ impl DLFRequestSigner for DLFDefaultSigner {
 
         let canonical_request = self.get_canonical_request(rest_auth_parameter, sign_headers);
 
-        let string_to_sign = vec![
+        let string_to_sign = [
             Self::SIGNATURE_ALGORITHM.to_string(),
             date_time.clone(),
-            format!("{}/{}/{}/{}", date, self.region, Self::PRODUCT, Self::REQUEST_TYPE),
+            format!(
+                "{}/{}/{}/{}",
+                date,
+                self.region,
+                Self::PRODUCT,
+                Self::REQUEST_TYPE
+            ),
             Self::sha256_hex(&canonical_request),
         ]
         .join(Self::NEW_LINE);
@@ -450,7 +460,8 @@ impl DLFOpenApiSigner {
     }
 
     fn hmac_sha1_base64(key: &str, data: &str) -> String {
-        let mut mac = HmacSha1::new_from_slice(key.as_bytes()).expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha1::new_from_slice(key.as_bytes()).expect("HMAC can take key of any size");
         mac.update(data.as_bytes());
         BASE64_STANDARD.encode(mac.finalize().into_bytes())
     }
@@ -507,11 +518,20 @@ impl DLFOpenApiSigner {
         canonicalized_headers: &str,
         canonicalized_resource: &str,
     ) -> String {
-        let parts = vec![
+        let parts = [
             rest_auth_parameter.method.clone(),
-            headers.get(Self::ACCEPT_HEADER).cloned().unwrap_or_default(),
-            headers.get(Self::CONTENT_MD5_HEADER).cloned().unwrap_or_default(),
-            headers.get(Self::CONTENT_TYPE_HEADER).cloned().unwrap_or_default(),
+            headers
+                .get(Self::ACCEPT_HEADER)
+                .cloned()
+                .unwrap_or_default(),
+            headers
+                .get(Self::CONTENT_MD5_HEADER)
+                .cloned()
+                .unwrap_or_default(),
+            headers
+                .get(Self::CONTENT_TYPE_HEADER)
+                .cloned()
+                .unwrap_or_default(),
             headers.get(Self::DATE_HEADER).cloned().unwrap_or_default(),
             canonicalized_headers.to_string(),
         ];
@@ -531,16 +551,28 @@ impl DLFRequestSigner for DLFOpenApiSigner {
         let mut headers = HashMap::new();
 
         // Date header in RFC 1123 format
-        headers.insert(Self::DATE_HEADER.to_string(), now.format(Self::DATE_FORMAT).to_string());
+        headers.insert(
+            Self::DATE_HEADER.to_string(),
+            now.format(Self::DATE_FORMAT).to_string(),
+        );
 
         // Accept header
-        headers.insert(Self::ACCEPT_HEADER.to_string(), Self::ACCEPT_VALUE.to_string());
+        headers.insert(
+            Self::ACCEPT_HEADER.to_string(),
+            Self::ACCEPT_VALUE.to_string(),
+        );
 
         // Content-MD5 and Content-Type (if body exists)
         if let Some(body_content) = body {
             if !body_content.is_empty() {
-                headers.insert(Self::CONTENT_MD5_HEADER.to_string(), Self::md5_base64(body_content));
-                headers.insert(Self::CONTENT_TYPE_HEADER.to_string(), Self::CONTENT_TYPE_VALUE.to_string());
+                headers.insert(
+                    Self::CONTENT_MD5_HEADER.to_string(),
+                    Self::md5_base64(body_content),
+                );
+                headers.insert(
+                    Self::CONTENT_TYPE_HEADER.to_string(),
+                    Self::CONTENT_TYPE_VALUE.to_string(),
+                );
             }
         }
 
@@ -548,10 +580,22 @@ impl DLFRequestSigner for DLFOpenApiSigner {
         headers.insert(Self::HOST_HEADER.to_string(), host.to_string());
 
         // x-acs-* headers
-        headers.insert(Self::X_ACS_SIGNATURE_METHOD.to_string(), Self::SIGNATURE_METHOD_VALUE.to_string());
-        headers.insert(Self::X_ACS_SIGNATURE_NONCE.to_string(), Uuid::new_v4().to_string());
-        headers.insert(Self::X_ACS_SIGNATURE_VERSION.to_string(), Self::SIGNATURE_VERSION_VALUE.to_string());
-        headers.insert(Self::X_ACS_VERSION.to_string(), Self::API_VERSION.to_string());
+        headers.insert(
+            Self::X_ACS_SIGNATURE_METHOD.to_string(),
+            Self::SIGNATURE_METHOD_VALUE.to_string(),
+        );
+        headers.insert(
+            Self::X_ACS_SIGNATURE_NONCE.to_string(),
+            Uuid::new_v4().to_string(),
+        );
+        headers.insert(
+            Self::X_ACS_SIGNATURE_VERSION.to_string(),
+            Self::SIGNATURE_VERSION_VALUE.to_string(),
+        );
+        headers.insert(
+            Self::X_ACS_VERSION.to_string(),
+            Self::API_VERSION.to_string(),
+        );
 
         // Security token (if present)
         if let Some(token) = security_token {
@@ -628,7 +672,8 @@ impl DLFSignerFactory {
     pub fn parse_signing_algo_from_uri(uri: Option<&str>) -> &'static str {
         if let Some(uri) = uri {
             let host = uri.to_lowercase();
-            let host = host.strip_prefix("http://")
+            let host = host
+                .strip_prefix("http://")
                 .unwrap_or(host.strip_prefix("https://").unwrap_or(&host));
             let host = host.split('/').next().unwrap_or("");
             let host = host.split(':').next().unwrap_or("");

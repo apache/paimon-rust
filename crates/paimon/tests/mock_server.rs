@@ -21,22 +21,28 @@
 //! for testing purposes.
 
 use axum::{
-    extract::{Extension, Json, Query},
+    extract::{Extension, Json, Path, Query},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
     Router,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
-use paimon::api::{ConfigResponse, ErrorResponse, ListDatabasesResponse, ResourcePaths};
+use paimon::api::{
+    AlterDatabaseRequest, AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
+    GetTableResponse, ListDatabasesResponse, ListTablesResponse, RenameTableRequest, ResourcePaths,
+};
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
-    databases: HashMap<String, ()>,
+    databases: HashMap<String, GetDatabaseResponse>,
+    tables: HashMap<String, GetTableResponse>,
+    no_permission_databases: HashSet<String>,
+    no_permission_tables: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -62,14 +68,28 @@ impl RESTServer {
         let prefix = config.defaults.get("prefix").cloned().unwrap_or_default();
 
         // Create database set for initial databases
-        let databases: HashMap<String, ()> =
-            initial_dbs.into_iter().map(|name| (name, ())).collect();
+        let databases: HashMap<String, GetDatabaseResponse> = initial_dbs
+            .into_iter()
+            .map(|name| {
+                let response = GetDatabaseResponse::new(
+                    Some(name.clone()),
+                    Some(name.clone()),
+                    None,
+                    HashMap::new(),
+                    AuditRESTResponse::new(None, None, None, None, None),
+                );
+                (name, response)
+            })
+            .collect();
 
         RESTServer {
             data_path,
             config,
             warehouse,
-            inner: Arc::new(Mutex::new(MockState { databases })),
+            inner: Arc::new(Mutex::new(MockState {
+                databases,
+                ..Default::default()
+            })),
             resource_paths: ResourcePaths::new(&prefix),
             addr: None,
             server_handle: None,
@@ -107,8 +127,455 @@ impl RESTServer {
         let response = ListDatabasesResponse::new(dbs, None);
         (StatusCode::OK, Json(response))
     }
+    /// Handle POST /databases - create a new database.
+    pub async fn create_database(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let name = match payload.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                let err =
+                    ErrorResponse::new(None, None, Some("Missing name".to_string()), Some(400));
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
 
+        let mut s = state.inner.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(e) = s.databases.entry(name.clone()) {
+            let response = GetDatabaseResponse::new(
+                Some(name.clone()),
+                Some(name.clone()),
+                None,
+                HashMap::new(),
+                AuditRESTResponse::new(None, None, None, None, None),
+            );
+            e.insert(response);
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name),
+                Some("Already Exists".to_string()),
+                Some(409),
+            );
+            (StatusCode::CONFLICT, Json(err)).into_response()
+        }
+    }
+    /// Handle GET /databases/:name - get a specific database.
+    pub async fn get_database(
+        Path(name): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+
+        if s.no_permission_databases.contains(&name) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if let Some(response) = s.databases.get(&name) {
+            (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle POST /databases/:name - alter database configuration.
+    pub async fn alter_database(
+        Path(name): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<AlterDatabaseRequest>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+
+        if s.no_permission_databases.contains(&name) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if let Some(response) = s.databases.get_mut(&name) {
+            // Apply removals
+            for key in &request.removals {
+                response.options.remove(key);
+            }
+            // Apply updates
+            response.options.extend(request.updates);
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle DELETE /databases/:name - drop a database.
+    pub async fn drop_database(
+        Path(name): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+
+        if s.no_permission_databases.contains(&name) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if s.databases.remove(&name).is_some() {
+            // Also remove all tables in this database
+            let prefix = format!("{}.", name);
+            s.tables.retain(|key, _| !key.starts_with(&prefix));
+            s.no_permission_tables
+                .retain(|key| !key.starts_with(&prefix));
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(name.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle GET /databases/:db/tables - list all tables in a database.
+    pub async fn list_tables(
+        Path(db): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+
+        if s.no_permission_databases.contains(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if !s.databases.contains_key(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        }
+
+        let prefix = format!("{}.", db);
+        let mut tables: Vec<String> = s
+            .tables
+            .keys()
+            .filter_map(|key| {
+                if key.starts_with(&prefix) {
+                    Some(key[prefix.len()..].to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        tables.sort();
+
+        let response = ListTablesResponse::new(Some(tables), None);
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    /// Handle POST /databases/:db/tables - create a new table.
+    pub async fn create_table(
+        Path(db): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        // Extract table name from payload
+        let table_name = payload
+            .get("identifier")
+            .and_then(|id| id.get("object"))
+            .and_then(|o| o.as_str())
+            .map(|s| s.to_string());
+
+        let table_name = match table_name {
+            Some(name) => name,
+            None => {
+                let err = ErrorResponse::new(
+                    None,
+                    None,
+                    Some("Missing table name in identifier".to_string()),
+                    Some(400),
+                );
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
+
+        let mut s = state.inner.lock().unwrap();
+
+        // Check database exists
+        if !s.databases.contains_key(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        }
+
+        let key = format!("{}.{}", db, table_name);
+        if s.tables.contains_key(&key) {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table_name),
+                Some("Already Exists".to_string()),
+                Some(409),
+            );
+            return (StatusCode::CONFLICT, Json(err)).into_response();
+        }
+
+        // Create table response
+        let response = GetTableResponse::new(
+            Some(table_name.clone()),
+            Some(table_name),
+            None,
+            Some(true),
+            None,
+            None,
+            AuditRESTResponse::new(None, None, None, None, None),
+        );
+        s.tables.insert(key, response);
+        (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+    }
+
+    /// Handle GET /databases/:db/tables/:table - get a specific table.
+    pub async fn get_table(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+
+        let key = format!("{}.{}", db, table);
+        if s.no_permission_tables.contains(&key) {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if let Some(response) = s.tables.get(&key) {
+            return (StatusCode::OK, Json(response.clone())).into_response();
+        }
+
+        if !s.databases.contains_key(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        }
+
+        let err = ErrorResponse::new(
+            Some("table".to_string()),
+            Some(table),
+            Some("Not Found".to_string()),
+            Some(404),
+        );
+        (StatusCode::NOT_FOUND, Json(err)).into_response()
+    }
+
+    /// Handle DELETE /databases/:db/tables/:table - drop a table.
+    pub async fn drop_table(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+
+        let key = format!("{}.{}", db, table);
+        if s.no_permission_tables.contains(&key) {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table.clone()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if s.tables.remove(&key).is_some() {
+            s.no_permission_tables.remove(&key);
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle POST /rename-table - rename a table.
+    pub async fn rename_table(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<RenameTableRequest>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+
+        let source_key = format!("{}.{}", request.source.database(), request.source.object());
+        let dest_key = format!(
+            "{}.{}",
+            request.destination.database(),
+            request.destination.object()
+        );
+
+        // Check source table permission
+        if s.no_permission_tables.contains(&source_key) {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(request.source.object().to_string()),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        // Check if source table exists
+        if let Some(table_response) = s.tables.remove(&source_key) {
+            // Check if destination already exists
+            if s.tables.contains_key(&dest_key) {
+                // Restore source table
+                s.tables.insert(source_key, table_response);
+                let err = ErrorResponse::new(
+                    Some("table".to_string()),
+                    Some(dest_key.clone()),
+                    Some("Already Exists".to_string()),
+                    Some(409),
+                );
+                return (StatusCode::CONFLICT, Json(err)).into_response();
+            }
+
+            // Update the table name in response and insert at new location
+            let new_table_response = GetTableResponse::new(
+                Some(request.destination.object().to_string()),
+                Some(request.destination.object().to_string()),
+                table_response.path,
+                table_response.is_external,
+                table_response.schema_id,
+                table_response.schema,
+                table_response.audit,
+            );
+            s.tables.insert(dest_key.clone(), new_table_response);
+
+            // Update permission tracking if needed
+            if s.no_permission_tables.remove(&source_key) {
+                s.no_permission_tables.insert(dest_key.clone());
+            }
+
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(source_key),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
     // ====================== Server Control ====================
+    /// Add a database to the server state.
+    #[allow(dead_code)]
+    pub fn add_database(&self, name: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.databases.entry(name.to_string()).or_insert_with(|| {
+            GetDatabaseResponse::new(
+                Some(name.to_string()),
+                Some(name.to_string()),
+                None,
+                HashMap::new(),
+                AuditRESTResponse::new(None, None, None, None, None),
+            )
+        });
+    }
+    /// Add a no-permission database to the server state.
+    #[allow(dead_code)]
+    pub fn add_no_permission_database(&self, name: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.no_permission_databases.insert(name.to_string());
+    }
+
+    /// Add a table to the server state.
+    #[allow(dead_code)]
+    pub fn add_table(&self, database: &str, table: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.databases.entry(database.to_string()).or_insert_with(|| {
+            // Auto-create database if not exists
+            GetDatabaseResponse::new(
+                Some(database.to_string()),
+                Some(database.to_string()),
+                None,
+                HashMap::new(),
+                AuditRESTResponse::new(None, None, None, None, None),
+            )
+        });
+
+        let key = format!("{}.{}", database, table);
+        s.tables.entry(key).or_insert_with(|| {
+            GetTableResponse::new(
+                Some(table.to_string()),
+                Some(table.to_string()),
+                None,
+                Some(true),
+                None,
+                None,
+                AuditRESTResponse::new(None, None, None, None, None),
+            )
+        });
+    }
+
+    /// Add a no-permission table to the server state.
+    #[allow(dead_code)]
+    pub fn add_no_permission_table(&self, database: &str, table: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.no_permission_tables
+            .insert(format!("{}.{}", database, table));
+    }
+    /// Get the server URL.
+    pub fn url(&self) -> Option<String> {
+        self.addr.map(|a| format!("http://{}", a))
+    }
     /// Get the warehouse path.
     #[allow(dead_code)]
     pub fn warehouse(&self) -> &str {
@@ -119,20 +586,6 @@ impl RESTServer {
     pub fn resource_paths(&self) -> &ResourcePaths {
         &self.resource_paths
     }
-
-    /// Add a database to the server state.
-    pub fn add_database(&self, name: &str) {
-        let mut s = self.inner.lock().unwrap();
-        if !s.databases.contains_key(name) {
-            s.databases.insert(name.to_string(), ());
-        }
-    }
-
-    /// Get the server URL.
-    pub fn url(&self) -> Option<String> {
-        self.addr.map(|a| format!("http://{}", a))
-    }
-
     /// Get the server address.
     #[allow(dead_code)]
     pub fn addr(&self) -> Option<SocketAddr> {
@@ -175,7 +628,25 @@ pub async fn start_mock_server(
         // Database routes
         .route(
             &format!("{}/databases", prefix),
-            get(RESTServer::list_databases),
+            get(RESTServer::list_databases).post(RESTServer::create_database),
+        )
+        .route(
+            &format!("{}/databases/:name", prefix),
+            get(RESTServer::get_database)
+                .post(RESTServer::alter_database)
+                .delete(RESTServer::drop_database),
+        )
+        .route(
+            &format!("{}/databases/:db/tables", prefix),
+            get(RESTServer::list_tables).post(RESTServer::create_table),
+        )
+        .route(
+            &format!("{}/databases/:db/tables/:table", prefix),
+            get(RESTServer::get_table).delete(RESTServer::drop_table),
+        )
+        .route(
+            &format!("{}/tables/rename", prefix),
+            axum::routing::post(RESTServer::rename_table),
         )
         .layer(Extension(state));
 

@@ -148,7 +148,10 @@ mod tests {
     fn test_resource_paths_with_prefix() {
         let paths = ResourcePaths::new("my-catalog");
         assert_eq!(paths.databases(), "/v1/my-catalog/databases");
-        assert_eq!(paths.database("test-db"), "/v1/my-catalog/databases/test-db");
+        assert_eq!(
+            paths.database("test-db"),
+            "/v1/my-catalog/databases/test-db"
+        );
     }
 
     #[test]

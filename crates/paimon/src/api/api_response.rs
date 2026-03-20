@@ -325,7 +325,7 @@ impl RESTResponse for ListTablesResponse {}
 impl PagedResponse<String> for ListTablesResponse {
     fn data(&self) -> &[String] {
         static EMPTY: &[String] = &[];
-        self.tables.as_ref().map(|v| v.as_slice()).unwrap_or(EMPTY)
+        self.tables.as_deref().unwrap_or(EMPTY)
     }
 
     fn get_next_page_token(&self) -> Option<&str> {
@@ -393,7 +393,6 @@ mod tests {
         assert!(json.contains("\"databases\":[\"db1\",\"db2\"]"));
         assert!(json.contains("\"nextPageToken\":\"token123\""));
     }
-
 
     #[test]
     fn test_audit_response_options() {

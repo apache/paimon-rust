@@ -53,6 +53,12 @@ impl AuthProvider for BearerTokenAuthProvider {
         );
         base_header
     }
+
+    fn clone_box(&self) -> Box<dyn AuthProvider> {
+        Box::new(Self {
+            token: self.token.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

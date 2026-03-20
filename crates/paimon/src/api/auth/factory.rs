@@ -27,13 +27,13 @@ pub struct AuthProviderFactory;
 
 impl AuthProviderFactory {
     /// Create an authentication provider based on the given options.
-    /// 
+    ///
     /// # Arguments
     /// * `options` - The configuration options.
-    /// 
+    ///
     /// # Returns
     /// A boxed AuthProvider trait object.
-    /// 
+    ///
     /// # Errors
     /// Returns an error if the provider type is unknown or required configuration is missing.
     pub fn create_auth_provider(options: &Options) -> Result<Box<dyn AuthProvider>, Error> {
