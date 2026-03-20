@@ -18,13 +18,11 @@
 //! Authentication provider factory.
 
 use regex::Regex;
-
-use crate::common::{CatalogOptions, Options};
+use crate::api::auth::dlf_provider::DLFTokenLoaderFactory;
+use crate::api::AuthProvider;
 use crate::Error;
-
-use super::base::AUTHORIZATION_HEADER_KEY;
-use super::dlf_provider::DLFToken;
-use super::{AuthProvider, BearerTokenAuthProvider, DLFAuthProvider};
+use crate::api::auth::{BearerTokenAuthProvider, DLFAuthProvider, DLFToken};
+use crate::common::{CatalogOptions, Options};
 
 /// Factory for creating DLF authentication providers.
 pub struct DLFAuthProviderFactory;
@@ -129,10 +127,8 @@ impl AuthProviderFactory {
                     uri,
                     region,
                     signing_algorithm,
-                    DLFToken::from_options(options).ok_or_else(|| Error::ConfigInvalid {
-                        message: "DLF authentication requires access-key-id and access-key-secret"
-                            .to_string(),
-                    })?,
+                    DLFToken::from_options(options),
+                    DLFTokenLoaderFactory::create_token_loader(options),
                 );
 
                 Ok(Box::new(dlf_provider))
@@ -149,6 +145,8 @@ impl AuthProviderFactory {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::auth::base::AUTHORIZATION_HEADER_KEY;
+
     use super::super::RESTAuthParameter;
     use super::*;
     use std::collections::HashMap;

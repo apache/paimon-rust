@@ -23,7 +23,8 @@
 use std::collections::HashMap;
 
 use paimon::api::ConfigResponse;
-use paimon::common::{DLFToken, Options};
+use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
+use paimon::common::Options;
 use paimon::{api::rest_api::RESTApi, CatalogOptions};
 use serde_json::json;
 
@@ -393,8 +394,6 @@ async fn test_rename_table() {
 
 #[tokio::test]
 async fn test_ecs_loader_token() {
-    use paimon::common::token_loader::DLFECSTokenLoader;
-
     let prefix = "mock-test";
     let mut defaults = HashMap::new();
     defaults.insert("prefix".to_string(), prefix.to_string());
@@ -427,7 +426,7 @@ async fn test_ecs_loader_token() {
     options.set(CatalogOptions::DLF_TOKEN_ECS_METADATA_URL, &ecs_metadata_url);
 
     let loader = DLFECSTokenLoader::new(&ecs_metadata_url, None);
-    let load_token: DLFToken = loader.load_token_async().await.unwrap();
+    let load_token: DLFToken = loader.load_token().await.unwrap();
 
     assert_eq!(load_token.access_key_id, "AccessKeyId");
     assert_eq!(load_token.access_key_secret, "AccessKeySecret");
@@ -444,7 +443,7 @@ async fn test_ecs_loader_token() {
     options_with_role.set(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME, role_name);
 
     let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name.to_string()));
-    let token: DLFToken = loader_with_role.load_token_async().await.unwrap();
+    let token: DLFToken = loader_with_role.load_token().await.unwrap();
 
     assert_eq!(token.access_key_id, "AccessKeyId");
     assert_eq!(token.access_key_secret, "AccessKeySecret");
