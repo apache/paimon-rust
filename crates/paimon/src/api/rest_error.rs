@@ -81,12 +81,6 @@ pub enum RestError {
 }
 
 use super::api_response::ErrorResponse;
-/// Parsed error information from HTTP response
-pub struct ErrorInfo {
-    pub message: Option<String>,
-    pub resource_type: Option<String>,
-    pub resource_name: Option<String>,
-}
 
 impl RestError {
     /// Parse error response body to ErrorResponse

@@ -64,19 +64,14 @@ impl ErrorResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AuditRESTResponse {
     /// The owner of the resource.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// Timestamp when the resource was created.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
     /// User who created the resource.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
     /// Timestamp when the resource was last updated.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
     /// User who last updated the resource.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
 }
 
@@ -127,22 +122,16 @@ pub struct GetTableResponse {
     #[serde(flatten)]
     pub audit: AuditRESTResponse,
     /// The unique identifier of the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// The name of the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The path to the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Whether the table is external.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_external: Option<bool>,
     /// The schema ID of the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_id: Option<i64>,
     /// The schema of the table.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<Schema>,
 }
 
@@ -180,16 +169,12 @@ pub struct GetDatabaseResponse {
     #[serde(flatten)]
     pub audit: AuditRESTResponse,
     /// The unique identifier of the database.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// The name of the database.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The location of the database.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// Configuration options for the database.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, String>,
 }
 
@@ -249,10 +234,8 @@ impl ConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GetTableTokenResponse {
     /// The token data.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<HashMap<String, String>>,
     /// Expiration timestamp in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_millis: Option<i64>,
 }
 
@@ -313,10 +296,8 @@ impl ListDatabasesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ListTablesResponse {
     /// List of table names.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tables: Option<Vec<String>>,
     /// Token for the next page.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
 

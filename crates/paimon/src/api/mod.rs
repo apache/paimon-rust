@@ -43,7 +43,7 @@ pub use api_response::{
 };
 
 // Re-export error types
-pub use rest_error::{ErrorInfo, RestError};
+pub use rest_error::RestError;
 
 // Re-export utility types
 pub use resource_paths::ResourcePaths;
@@ -51,5 +51,5 @@ pub use rest_util::RESTUtil;
 
 // Re-export auth types
 pub use auth::{
-    AuthProvider, AuthProviderFactory, BearerTokenAuthProvider, RESTAuthFunction, RESTAuthParameter,
+    AuthProvider, AuthProviderFactory, BearTokenAuthProvider, RESTAuthFunction, RESTAuthParameter,
 };

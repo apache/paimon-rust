@@ -25,11 +25,11 @@ use super::base::{AuthProvider, RESTAuthParameter};
 ///
 /// This provider adds an `Authorization: Bearer <token>` header
 /// to all requests.
-pub struct BearerTokenAuthProvider {
+pub struct BearTokenAuthProvider {
     token: String,
 }
 
-impl BearerTokenAuthProvider {
+impl BearTokenAuthProvider {
     /// Create a new BearerTokenAuthProvider.
     ///
     /// # Arguments
@@ -41,7 +41,7 @@ impl BearerTokenAuthProvider {
     }
 }
 
-impl AuthProvider for BearerTokenAuthProvider {
+impl AuthProvider for BearTokenAuthProvider {
     fn merge_auth_header(
         &self,
         mut base_header: HashMap<String, String>,
@@ -53,12 +53,6 @@ impl AuthProvider for BearerTokenAuthProvider {
         );
         base_header
     }
-
-    fn clone_box(&self) -> Box<dyn AuthProvider> {
-        Box::new(Self {
-            token: self.token.clone(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -67,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_bearer_token_auth() {
-        let provider = BearerTokenAuthProvider::new("test-token");
+        let provider = BearTokenAuthProvider::new("test-token");
         let base_header = HashMap::new();
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
 
@@ -81,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_bearer_token_with_base_headers() {
-        let provider = BearerTokenAuthProvider::new("my-token");
+        let provider = BearTokenAuthProvider::new("my-token");
         let mut base_header = HashMap::new();
         base_header.insert("Content-Type".to_string(), "application/json".to_string());
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());

@@ -36,8 +36,7 @@ pub struct Identifier {
     /// The object (table) name.
     #[serde(rename = "object")]
     pub object_name: String,
-    /// Optional branch name.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// branch name.
     pub branch: Option<String>,
 }
 
