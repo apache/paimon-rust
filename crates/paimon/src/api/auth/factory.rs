@@ -20,7 +20,7 @@
 use crate::common::{CatalogOptions, Options};
 use crate::Error;
 
-use super::{AuthProvider, BearerTokenAuthProvider, DLFAuthProvider};
+use super::{AuthProvider, BearTokenAuthProvider, DLFAuthProvider};
 
 /// Factory for creating authentication providers.
 pub struct AuthProviderFactory;
@@ -47,7 +47,7 @@ impl AuthProviderFactory {
                         .ok_or_else(|| Error::ConfigInvalid {
                             message: "token is required for bearer authentication".to_string(),
                         })?;
-                Ok(Box::new(BearerTokenAuthProvider::new(token)))
+                Ok(Box::new(BearTokenAuthProvider::new(token)))
             }
             Some("dlf") => {
                 let dlf_provider = DLFAuthProvider::from_options(options).ok_or_else(|| {

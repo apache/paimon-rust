@@ -231,16 +231,6 @@ impl AuthProvider for DLFAuthProvider {
 
         base_header
     }
-
-    fn clone_box(&self) -> Box<dyn AuthProvider> {
-        Box::new(Self {
-            uri: self.uri.clone(),
-            region: self.region.clone(),
-            signing_algorithm: self.signing_algorithm.clone(),
-            token: self.token.clone(),
-            signer: DLFSignerFactory::create_signer(&self.signing_algorithm, &self.region),
-        })
-    }
 }
 
 #[cfg(test)]
