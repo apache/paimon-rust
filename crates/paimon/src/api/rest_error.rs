@@ -40,7 +40,12 @@ pub enum RestError {
     Forbidden { message: String },
 
     /// Resource not found error (HTTP 404)
-    #[snafu(display("Resource not found: {:?} named {:?}: {}", resource_type, resource_name, message))]
+    #[snafu(display(
+        "Resource not found: {:?} named {:?}: {}",
+        resource_type,
+        resource_name,
+        message
+    ))]
     NoSuchResource {
         resource_type: Option<String>,
         resource_name: Option<String>,
@@ -48,7 +53,12 @@ pub enum RestError {
     },
 
     /// Resource already exists error (HTTP 409)
-    #[snafu(display("Resource already exists: {:?} named {:?}: {}", resource_type, resource_name, message))]
+    #[snafu(display(
+        "Resource already exists: {:?} named {:?}: {}",
+        resource_type,
+        resource_name,
+        message
+    ))]
     AlreadyExists {
         resource_type: Option<String>,
         resource_name: Option<String>,
@@ -72,6 +82,7 @@ pub enum RestError {
     Unexpected { message: String },
 }
 
+use super::api_response::ErrorResponse;
 /// Parsed error information from HTTP response
 pub struct ErrorInfo {
     pub message: Option<String>,
@@ -80,55 +91,63 @@ pub struct ErrorInfo {
 }
 
 impl RestError {
-    /// Parse error response body to extract error details
-    pub fn parse_error_response(text: &str) -> ErrorInfo {
-        let maybe_json: serde_json::Result<Value> = serde_json::from_str(text);
-
-        if let Ok(json) = maybe_json {
-            ErrorInfo {
-                message: json
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string()),
-                resource_type: json
-                    .get("resourceType")
-                    .or_else(|| json.get("resource_type"))
-                    .and_then(|r| r.as_str())
-                    .map(|s| s.to_string()),
-                resource_name: json
-                    .get("resourceName")
-                    .or_else(|| json.get("resource_name"))
-                    .and_then(|r| r.as_str())
-                    .map(|s| s.to_string()),
+    /// Parse error response body to ErrorResponse
+    ///
+    /// If the response body cannot be parsed as JSON, or if the message is missing,
+    /// creates an ErrorResponse with the raw response body as the message and the
+    /// HTTP status code as the code.
+    pub fn parse_error_response(text: &str, status_code: u16) -> ErrorResponse {
+        if let Ok(error) = serde_json::from_str::<ErrorResponse>(text) {
+            if error.message.is_some() {
+                return error;
             }
-        } else {
-            ErrorInfo {
-                message: None,
-                resource_type: None,
-                resource_name: None,
-            }
+            // If message is missing, create a new ErrorResponse with the raw text
+            return ErrorResponse::new(
+                error.resource_type,
+                error.resource_name,
+                Some(text.to_string()),
+                error.code.or(Some(status_code as i32)),
+            );
         }
+
+        // Failed to parse JSON, create ErrorResponse from raw text
+        ErrorResponse::new(
+            None,
+            None,
+            Some(if text.is_empty() {
+                "response body is null".to_string()
+            } else {
+                text.to_string()
+            }),
+            Some(status_code as i32),
+        )
     }
 
-    /// Map HTTP status code to corresponding error type
-    pub fn from_status(status: StatusCode, message: String, error_info: ErrorInfo) -> Self {
-        match status {
-            StatusCode::BAD_REQUEST => RestError::BadRequest { message },
-            StatusCode::UNAUTHORIZED => RestError::NotAuthorized { message },
-            StatusCode::FORBIDDEN => RestError::Forbidden { message },
-            StatusCode::NOT_FOUND => RestError::NoSuchResource {
-                resource_type: error_info.resource_type,
-                resource_name: error_info.resource_name,
+    /// Map ErrorResponse code to corresponding error type
+    pub fn from_error_response(error: ErrorResponse) -> Self {
+        let code = error.code.unwrap_or(500);
+        let message = error
+            .message
+            .clone()
+            .unwrap_or_else(|| "Unknown error".to_string());
+
+        match code {
+            400 => RestError::BadRequest { message },
+            401 => RestError::NotAuthorized { message },
+            403 => RestError::Forbidden { message },
+            404 => RestError::NoSuchResource {
+                resource_type: error.resource_type,
+                resource_name: error.resource_name,
                 message,
             },
-            StatusCode::CONFLICT => RestError::AlreadyExists {
-                resource_type: error_info.resource_type,
-                resource_name: error_info.resource_name,
+            409 => RestError::AlreadyExists {
+                resource_type: error.resource_type,
+                resource_name: error.resource_name,
                 message,
             },
-            StatusCode::INTERNAL_SERVER_ERROR => RestError::ServiceFailure { message },
-            StatusCode::NOT_IMPLEMENTED => RestError::NotImplemented { message },
-            StatusCode::SERVICE_UNAVAILABLE => RestError::ServiceUnavailable { message },
+            500 => RestError::ServiceFailure { message },
+            501 => RestError::NotImplemented { message },
+            503 => RestError::ServiceUnavailable { message },
             _ => RestError::Unexpected { message },
         }
     }

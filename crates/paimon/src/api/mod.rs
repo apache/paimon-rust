@@ -20,17 +20,12 @@
 //! This module provides REST API client, request, and response types.
 
 pub mod auth;
-pub mod mock_server;
 pub mod resource_paths;
 pub mod rest_api;
 pub mod rest_client;
 pub mod rest_error;
 pub mod rest_util;
 
-// Re-export mock server functions
-pub use mock_server::{start_mock_server, MockServerHandle};
-
-mod api_request;
 mod api_response;
 
 // Re-export request types
@@ -47,6 +42,7 @@ pub use api_response::{
 };
 
 // Re-export error types
+pub use rest_error::RestError;
 pub use rest_error::{ErrorInfo, RestError};
 
 // Re-export utility types
@@ -55,6 +51,6 @@ pub use rest_util::RESTUtil;
 
 // Re-export auth types
 pub use auth::{
-    AuthProvider, AuthProviderFactory, BearerTokenAuthProvider, NoOpAuthProvider, RESTAuthFunction,
+    AuthProvider, AuthProviderFactory, BearerTokenAuthProvider, RESTAuthFunction,
     RESTAuthParameter,
 };

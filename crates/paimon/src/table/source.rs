@@ -97,7 +97,7 @@ impl PartitionBucket {
 /// Input split for reading: partition + bucket + list of data files and optional deletion files.
 ///
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataSplit {
     snapshot_id: i64,
     partition: BinaryRow,
@@ -273,6 +273,18 @@ impl DataSplitBuilder {
                 message: "DataSplit requires bucket != -1".to_string(),
                 source: None,
             });
+        }
+        if let Some(ref data_deletion_files) = self.data_deletion_files {
+            if data_deletion_files.len() != data_files.len() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "DataSplit deletion files length {} must match data_files length {}",
+                        data_deletion_files.len(),
+                        data_files.len()
+                    ),
+                    source: None,
+                });
+            }
         }
         Ok(DataSplit {
             snapshot_id: self.snapshot_id,

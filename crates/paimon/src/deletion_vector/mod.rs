@@ -16,4 +16,8 @@
 // under the License.
 
 mod core;
+
+pub use core::DeletionVector;
 mod factory;
+
+pub use factory::DeletionVectorFactory;

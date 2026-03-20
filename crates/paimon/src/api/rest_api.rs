@@ -17,8 +17,8 @@
 
 //! REST API implementation for Paimon.
 //!
-//! This module provides a comprehensive REST API client for interacting with
-//! Paimon catalog services, supporting database and table operations.
+//! This module provides a REST API client for interacting with
+//! Paimon rest catalog services, supporting database operations.
 
 use std::collections::HashMap;
 
@@ -101,12 +101,12 @@ impl RESTApi {
     ///
     /// # Errors
     /// Returns an error if required options are missing or if config fetch fails.
-    pub async fn new(options: Options, config_required: bool) -> Result<Self> {
-        let uri = options.get(CatalogOptions::URI).cloned().ok_or_else(|| {
-            crate::Error::ConfigInvalid {
+    pub async fn new(mut options: Options, config_required: bool) -> Result<Self> {
+        let uri = options
+            .get(CatalogOptions::URI)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "URI cannot be empty".to_string(),
-            }
-        })?;
+            })?;
 
         if uri.trim().is_empty() {
             return Err(crate::Error::ConfigInvalid {
@@ -117,14 +117,10 @@ impl RESTApi {
         let auth_provider = AuthProviderFactory::create_auth_provider(&options)?;
         let mut base_headers: HashMap<String, String> =
             RESTUtil::extract_prefix_map(&options, Self::HEADER_PREFIX);
-        let final_uri = options
-            .get(CatalogOptions::URI)
-            .map(|s| s.as_str())
-            .unwrap_or(uri.as_str());
-
         // Create auth function first, before making any requests
         let rest_auth_function = RESTAuthFunction::new(base_headers.clone(), auth_provider);
-        let mut client = HttpClient::new(final_uri, Some(rest_auth_function))?;
+
+        let mut client = HttpClient::new(uri, Some(rest_auth_function))?;
 
         let options = if config_required {
             let warehouse = options.get(CatalogOptions::WAREHOUSE).ok_or_else(|| {
@@ -139,31 +135,26 @@ impl RESTApi {
                 });
             }
 
-            let warehouse_encoded = RESTUtil::encode_string(warehouse);
             let query_params: Vec<(&str, String)> = vec![(
                 CatalogOptions::WAREHOUSE,
-                warehouse_encoded,
+                RESTUtil::encode_string(warehouse),
             )];
             let config_response: ConfigResponse = client
                 .get_with_params(&ResourcePaths::config(), &query_params)
                 .await?;
 
-            // Merge config response with options
-            let mut merged_options = options.copy();
-            merged_options.merge(&config_response.to_options());
+            // Merge config response with options (client config takes priority)
+            options = config_response.merge_options(&options);
 
             // Update base headers from merged options and recreate auth function
-            base_headers.extend(RESTUtil::extract_prefix_map(
-                &merged_options,
-                Self::HEADER_PREFIX,
-            ));
-
+            base_headers.extend(RESTUtil::extract_prefix_map(&options, Self::HEADER_PREFIX));
             // Recreate auth function with updated headers if needed
-            let auth_provider = AuthProviderFactory::create_auth_provider(&merged_options)?;
+            let auth_provider = AuthProviderFactory::create_auth_provider(&options)?;
             let rest_auth_function = RESTAuthFunction::new(base_headers, auth_provider);
+
             client.set_auth_function(rest_auth_function);
 
-            merged_options
+            options
         } else {
             options
         };

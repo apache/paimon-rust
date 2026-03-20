@@ -42,11 +42,7 @@ impl HttpClient {
     /// # Returns
     /// A new HttpClient instance.
     pub fn new(base_url: &str, auth_function: Option<RESTAuthFunction>) -> Result<Self> {
-        if base_url.trim().is_empty() {
-            return Err(Error::ConfigInvalid {
-                message: "base_url is empty".to_string(),
-            });
-        }
+        let final_url = Self::normalize_uri(base_url)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -57,9 +53,36 @@ impl HttpClient {
 
         Ok(HttpClient {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: final_url,
             auth_function,
         })
+    }
+
+    /// Normalize and validate a URI.
+    ///
+    /// # Arguments
+    /// * `uri` - The URI to normalize.
+    ///
+    /// # Returns
+    /// A normalized URI string, or an error if the URI is invalid.
+    fn normalize_uri(uri: &str) -> Result<String> {
+        let uri = uri.trim();
+
+        if uri.is_empty() {
+            return Err(Error::ConfigInvalid {
+                message: "uri is empty which must be defined".to_string(),
+            });
+        }
+
+        // Add http:// prefix if missing
+        let normalized_url = if uri.starts_with("http://") || uri.starts_with("https://") {
+            uri.to_string()
+        } else {
+            format!("http://{}", uri)
+        };
+
+        // Remove trailing slash
+        Ok(normalized_url.trim_end_matches('/').to_string())
     }
 
     /// Perform a GET request and parse the response as JSON.
@@ -70,7 +93,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.url(path);
+        let url = self.request_url(path);
         let headers = self.build_auth_headers("GET", path, None, HashMap::new());
         let request = self.client.get(&url);
         let request = Self::apply_headers(request, &headers);
@@ -94,7 +117,7 @@ impl HttpClient {
         path: &str,
         params: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<T> {
-        let url = self.url(path);
+        let url = self.request_url(path);
         let params_map: HashMap<String, String> = params
             .iter()
             .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
@@ -225,7 +248,7 @@ impl HttpClient {
         request
     }
 
-    fn url(&self, path: &str) -> String {
+    fn request_url(&self, path: &str) -> String {
         if path.is_empty() || path == "/" {
             self.base_url.clone()
         } else if path.starts_with('/') {
@@ -244,14 +267,10 @@ impl HttpClient {
                 source: Some(Box::new(e)),
             })?;
 
-            // Try to parse error response as JSON to extract message and resource info
-            let error_info = RestError::parse_error_response(&text);
-            let message = error_info
-                .message
-                .clone()
-                .unwrap_or_else(|| format!("HTTP {}: {}", status, text));
-
-            let rest_error = RestError::from_status(status, message, error_info);
+            // Parse error response as ErrorResponse and map code to corresponding error
+            let error_response: super::ErrorResponse =
+                RestError::parse_error_response(&text, status.as_u16());
+            let rest_error: RestError = RestError::from_error_response(error_response);
             return Err(Error::from(rest_error));
         }
 

@@ -70,7 +70,6 @@ impl RESTAuthParameter {
 ///
 /// Implement this trait to provide custom authentication mechanisms
 /// for REST API requests.
-pub trait AuthProvider: Send + Sync {
     /// Merge authentication headers into the base headers.
     ///
     /// # Arguments
@@ -78,21 +77,11 @@ pub trait AuthProvider: Send + Sync {
     /// * `parameter` - Information about the request being authenticated
     ///
     /// # Returns
-    /// A new HashMap containing the merged headers.
     fn merge_auth_header(
         &self,
         base_header: HashMap<String, String>,
         parameter: &RESTAuthParameter,
     ) -> HashMap<String, String>;
-
-    /// Clone this provider into a boxed trait object.
-    fn clone_box(&self) -> Box<dyn AuthProvider>;
-}
-
-impl Clone for Box<dyn AuthProvider> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
 }
 
 /// Function wrapper for REST authentication.
@@ -127,81 +116,5 @@ impl RESTAuthFunction {
     pub fn apply(&self, parameter: &RESTAuthParameter) -> HashMap<String, String> {
         self.auth_provider
             .merge_auth_header(self.init_header.clone(), parameter)
-    }
-}
-
-// ============================================================================
-// NoOp Auth Provider
-// ============================================================================
-
-/// A no-operation authentication provider that returns headers unchanged.
-///
-/// This provider is used when no authentication is required.
-pub struct NoOpAuthProvider {
-    initial_headers: HashMap<String, String>,
-}
-
-impl NoOpAuthProvider {
-    /// Create a new NoOpAuthProvider.
-    pub fn new() -> Self {
-        NoOpAuthProvider {
-            initial_headers: HashMap::new(),
-        }
-    }
-
-    /// Create a NoOpAuthProvider with initial headers.
-    pub fn with_headers(initial_headers: HashMap<String, String>) -> Self {
-        NoOpAuthProvider { initial_headers }
-    }
-}
-
-impl Default for NoOpAuthProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AuthProvider for NoOpAuthProvider {
-    fn merge_auth_header(
-        &self,
-        mut base_header: HashMap<String, String>,
-        _parameter: &RESTAuthParameter,
-    ) -> HashMap<String, String> {
-        for (key, value) in &self.initial_headers {
-            base_header.insert(key.clone(), value.clone());
-        }
-        base_header
-    }
-
-    fn clone_box(&self) -> Box<dyn AuthProvider> {
-        Box::new(NoOpAuthProvider::with_headers(self.initial_headers.clone()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_noop_auth_provider() {
-        let provider = NoOpAuthProvider::new();
-        let base_header = HashMap::new();
-        let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
-
-        let headers = provider.merge_auth_header(base_header, &parameter);
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn test_noop_auth_provider_with_headers() {
-        let mut initial_headers = HashMap::new();
-        initial_headers.insert("X-Custom-Header".to_string(), "value".to_string());
-        
-        let provider = NoOpAuthProvider::with_headers(initial_headers);
-        let base_header = HashMap::new();
-        let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
-
-        let headers = provider.merge_auth_header(base_header, &parameter);
-        assert_eq!(headers.get("X-Custom-Header"), Some(&"value".to_string()));
     }
 }

@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_string() {
-        let original = "hello world/测试";
+        let original = "hello world=/&?#";
         let encoded = RESTUtil::encode_string(original);
         let decoded = RESTUtil::decode_string(&encoded);
         assert_eq!(decoded, original);
@@ -64,6 +64,9 @@ mod tests {
 
         let headers = RESTUtil::extract_prefix_map(&options, "header.");
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("Content-Type"), Some(&"application/json".to_string()));
+        assert_eq!(
+            headers.get("Content-Type"),
+            Some(&"application/json".to_string())
+        );
     }
 }

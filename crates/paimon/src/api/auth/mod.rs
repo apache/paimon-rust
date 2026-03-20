@@ -23,7 +23,7 @@ mod dlf_provider;
 mod dlf_signer;
 mod factory;
 
-pub use base::{AuthProvider, NoOpAuthProvider, RESTAuthFunction, RESTAuthParameter};
+pub use base::{AuthProvider, RESTAuthFunction, RESTAuthParameter};
 pub use bear_provider::BearerTokenAuthProvider;
 pub use dlf_provider::{DLFAuthProvider, DLFToken};
 pub use dlf_signer::{DLFDefaultSigner, DLFOpenApiSigner, DLFRequestSigner, DLFSignerFactory};

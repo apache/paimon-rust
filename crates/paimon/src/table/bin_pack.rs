@@ -21,20 +21,6 @@
 
 use crate::spec::DataFileMeta;
 use std::cmp;
-use std::collections::HashMap;
-
-/// Option key for target size of a source split when scanning a bucket.
-pub const SOURCE_SPLIT_TARGET_SIZE: &str = "source.split.target-size";
-
-/// Option key for open file cost of a source file, used as the minimum weight per file
-/// to avoid reading too many files with a source split.
-pub const SOURCE_SPLIT_OPEN_FILE_COST: &str = "source.split.open-file-cost";
-
-/// Default target split size: 128 MB.
-const DEFAULT_TARGET_SPLIT_SIZE: i64 = 128 * 1024 * 1024;
-
-/// Default open file cost: 4 MB.
-const DEFAULT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 
 /// Greedy order-preserving bin packing.
 ///
@@ -85,47 +71,6 @@ pub fn split_for_batch(
     files.sort_by_key(|f| f.min_sequence_number);
     let weight_func = move |f: &DataFileMeta| cmp::max(f.file_size, open_file_cost);
     pack_for_ordered(files, weight_func, target_split_size)
-}
-
-/// Read split configuration from table options, returning `(target_split_size, open_file_cost)`.
-pub fn read_split_config(options: &HashMap<String, String>) -> (i64, i64) {
-    let target_size = options
-        .get(SOURCE_SPLIT_TARGET_SIZE)
-        .and_then(|v| parse_memory_size(v))
-        .unwrap_or(DEFAULT_TARGET_SPLIT_SIZE);
-    let open_cost = options
-        .get(SOURCE_SPLIT_OPEN_FILE_COST)
-        .and_then(|v| parse_memory_size(v))
-        .unwrap_or(DEFAULT_OPEN_FILE_COST);
-    (target_size, open_cost)
-}
-
-/// Parse a memory size string to bytes using binary (1024-based) semantics.
-///
-/// Supports formats like `"128 mb"`, `"128mb"`, `"4 gb"`, `"1024"` (plain bytes).
-/// Uses binary units: `kb` = 1024, `mb` = 1024², `gb` = 1024³, matching Java Paimon's `MemorySize`.
-///
-/// NOTE: Java Paimon's `MemorySize` also accepts long unit names such as `"bytes"`,
-/// `"kibibytes"`, `"mebibytes"`, `"gibibytes"`, and `"tebibytes"`. This implementation
-/// only supports short units (`b`, `kb`, `mb`, `gb`, `tb`), which covers all practical usage.
-fn parse_memory_size(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Split into numeric part and optional unit suffix.
-    let pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num_str, unit_str) = s.split_at(pos);
-    let num: i64 = num_str.trim().parse().ok()?;
-    let multiplier: i64 = match unit_str.trim().to_lowercase().as_str() {
-        "" | "b" => 1,
-        "kb" | "k" => 1024,
-        "mb" | "m" => 1024 * 1024,
-        "gb" | "g" => 1024 * 1024 * 1024,
-        "tb" | "t" => 1024 * 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    Some(num * multiplier)
 }
 
 #[cfg(test)]
@@ -237,36 +182,5 @@ mod tests {
     fn test_split_for_batch_empty() {
         let groups = split_for_batch(vec![], 128, 4);
         assert!(groups.is_empty());
-    }
-
-    #[test]
-    fn test_parse_memory_size() {
-        assert_eq!(parse_memory_size("1024"), Some(1024));
-        assert_eq!(parse_memory_size("128 mb"), Some(128 * 1024 * 1024));
-        assert_eq!(parse_memory_size("128mb"), Some(128 * 1024 * 1024));
-        assert_eq!(parse_memory_size("4MB"), Some(4 * 1024 * 1024));
-        assert_eq!(parse_memory_size("1 gb"), Some(1024 * 1024 * 1024));
-        assert_eq!(parse_memory_size("1024 kb"), Some(1024 * 1024));
-        assert_eq!(parse_memory_size("100 b"), Some(100));
-        assert_eq!(parse_memory_size(""), None);
-        assert_eq!(parse_memory_size("abc"), None);
-    }
-
-    #[test]
-    fn test_read_split_config_defaults() {
-        let options = HashMap::new();
-        let (target, open_cost) = read_split_config(&options);
-        assert_eq!(target, 128 * 1024 * 1024);
-        assert_eq!(open_cost, 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_read_split_config_custom() {
-        let mut options = HashMap::new();
-        options.insert(SOURCE_SPLIT_TARGET_SIZE.to_string(), "256 mb".to_string());
-        options.insert(SOURCE_SPLIT_OPEN_FILE_COST.to_string(), "8 mb".to_string());
-        let (target, open_cost) = read_split_config(&options);
-        assert_eq!(target, 256 * 1024 * 1024);
-        assert_eq!(open_cost, 8 * 1024 * 1024);
     }
 }

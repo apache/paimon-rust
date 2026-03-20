@@ -32,16 +32,12 @@ pub trait RESTResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct ErrorResponse {
     /// The type of resource that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
     /// The name of the resource that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_name: Option<String>,
     /// The error message.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The error code.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<i32>,
 }
 
@@ -234,12 +230,12 @@ impl ConfigResponse {
         Self { defaults }
     }
 
-    /// Merge these defaults with the provided options.
+    /// Merge these defaults with the provided Options.
     /// User options take precedence over defaults.
-    pub fn merge(&self, options: &HashMap<String, String>) -> HashMap<String, String> {
+    pub fn merge_options(&self, options: &crate::common::Options) -> crate::common::Options {
         let mut merged = self.defaults.clone();
-        merged.extend(options.clone());
-        merged
+        merged.extend(options.to_map().clone());
+        crate::common::Options::from_map(merged)
     }
 
     /// Convert to Options struct.
@@ -287,7 +283,6 @@ pub struct ListDatabasesResponse {
     /// List of database names.
     pub databases: Vec<String>,
     /// Token for the next page.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
 
@@ -355,7 +350,6 @@ pub struct PagedList<T> {
     /// The list of elements on this page.
     pub elements: Vec<T>,
     /// Token to retrieve the next page, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
 
@@ -400,23 +394,6 @@ mod tests {
         assert!(json.contains("\"nextPageToken\":\"token123\""));
     }
 
-    #[test]
-    fn test_config_response_merge() {
-        let mut defaults = HashMap::new();
-        defaults.insert("key1".to_string(), "default1".to_string());
-        defaults.insert("key2".to_string(), "default2".to_string());
-
-        let config = ConfigResponse::new(defaults);
-
-        let mut user_options = HashMap::new();
-        user_options.insert("key2".to_string(), "user2".to_string());
-        user_options.insert("key3".to_string(), "user3".to_string());
-
-        let merged = config.merge(&user_options);
-        assert_eq!(merged.get("key1"), Some(&"default1".to_string()));
-        assert_eq!(merged.get("key2"), Some(&"user2".to_string())); // user overrides default
-        assert_eq!(merged.get("key3"), Some(&"user3".to_string()));
-    }
 
     #[test]
     fn test_audit_response_options() {
