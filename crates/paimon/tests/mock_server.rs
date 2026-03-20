@@ -621,19 +621,25 @@ impl RESTServer {
             }
         }
 
-        (StatusCode::NOT_FOUND, Json(json!({"error": "Role not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Role not found"})),
+        )
+            .into_response()
     }
 
     /// Handle GET /ram/security-credential/ - ECS metadata endpoint (list roles).
-    pub async fn list_ecs_roles(
-        Extension(state): Extension<Arc<RESTServer>>,
-    ) -> impl IntoResponse {
+    pub async fn list_ecs_roles(Extension(state): Extension<Arc<RESTServer>>) -> impl IntoResponse {
         let s = state.inner.lock().unwrap();
 
         if let Some(role_name) = &s.ecs_role_name {
             (StatusCode::OK, role_name.clone()).into_response()
         } else {
-            (StatusCode::NOT_FOUND, Json(json!({"error": "No role configured"}))).into_response()
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "No role configured"})),
+            )
+                .into_response()
         }
     }
 }

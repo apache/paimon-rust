@@ -150,8 +150,7 @@ impl DLFECSTokenLoader {
     /// Get the token from ECS metadata service.
     async fn get_token(&self, url: &str) -> Result<DLFToken, String> {
         let token_json = self.http_client.get(url).await?;
-        serde_json::from_str(&token_json)
-            .map_err(|e| format!("Failed to parse token JSON: {}", e))
+        serde_json::from_str(&token_json).map_err(|e| format!("Failed to parse token JSON: {}", e))
     }
 
     /// Build the token URL from base URL and role name.
@@ -168,7 +167,9 @@ impl DLFTokenLoader for DLFECSTokenLoader {
                 Some(name) => name.clone(),
                 None => {
                     // Fetch role name from metadata service
-                    self.get_role().await.map_err(|e| format!("Get role failed, error: {}", e))?
+                    self.get_role()
+                        .await
+                        .map_err(|e| format!("Get role failed, error: {}", e))?
                 }
             };
 
@@ -176,7 +177,9 @@ impl DLFTokenLoader for DLFECSTokenLoader {
             let token_url = self.build_token_url(&role_name);
 
             // Get token
-            self.get_token(&token_url).await.map_err(|e| format!("Get token failed, error: {}", e))
+            self.get_token(&token_url)
+                .await
+                .map_err(|e| format!("Get token failed, error: {}", e))
         })
     }
 
@@ -202,10 +205,10 @@ impl DLFTokenLoaderFactory {
             let role_name = options
                 .get(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME)
                 .cloned();
-            Some(Arc::new(DLFECSTokenLoader::new(
-                ecs_metadata_url,
-                role_name,
-            )) as Arc<dyn DLFTokenLoader>)
+            Some(
+                Arc::new(DLFECSTokenLoader::new(ecs_metadata_url, role_name))
+                    as Arc<dyn DLFTokenLoader>,
+            )
         } else {
             None
         }
@@ -373,7 +376,7 @@ impl TokenHTTPClient {
     /// Create a new HTTP client with default settings.
     fn new() -> Self {
         let connect_timeout = std::time::Duration::from_secs(180); // 3 minutes
-        let read_timeout = std::time::Duration::from_secs(180);    // 3 minutes
+        let read_timeout = std::time::Duration::from_secs(180); // 3 minutes
 
         let client = Client::builder()
             .timeout(read_timeout)
@@ -393,7 +396,10 @@ impl TokenHTTPClient {
         for attempt in 0..self.max_retries {
             match self.client.get(url).send().await {
                 Ok(response) if response.status().is_success() => {
-                    return response.text().await.map_err(|e| format!("Failed to read response: {}", e));
+                    return response
+                        .text()
+                        .await
+                        .map_err(|e| format!("Failed to read response: {}", e));
                 }
                 Ok(response) => {
                     last_error = format!("HTTP error: {}", response.status());

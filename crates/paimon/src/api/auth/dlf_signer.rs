@@ -655,36 +655,6 @@ impl DLFRequestSigner for DLFOpenApiSigner {
 pub struct DLFSignerFactory;
 
 impl DLFSignerFactory {
-    /// Parse region from DLF endpoint URI.
-    ///
-    /// Extracts the region from URIs like:
-    /// - `http://cn-hangzhou-vpc.dlf.aliyuncs.com` → `cn-hangzhou`
-    /// - `http://dlfnext.cn-hangzhou.aliyuncs.com` → `cn-hangzhou`
-    /// - `http://pre-cn-hangzhou.dlf.aliyuncs.com` → `cn-hangzhou`
-    pub fn parse_region_from_uri(uri: Option<&str>) -> Option<String> {
-        let uri = uri?;
-        let re = Regex::new(r"(?:pre-)?([a-z]+-[a-z]+(?:-\d+)?)").ok()?;
-        let caps = re.captures(uri)?;
-        caps.get(1).map(|m| m.as_str().to_string())
-    }
-
-    /// Parse signing algorithm from URI.
-    pub fn parse_signing_algo_from_uri(uri: Option<&str>) -> &'static str {
-        if let Some(uri) = uri {
-            let host = uri.to_lowercase();
-            let host = host
-                .strip_prefix("http://")
-                .unwrap_or(host.strip_prefix("https://").unwrap_or(&host));
-            let host = host.split('/').next().unwrap_or("");
-            let host = host.split(':').next().unwrap_or("");
-
-            if host.starts_with("dlfnext") || host.contains("openapi") {
-                return DLFOpenApiSigner::IDENTIFIER;
-            }
-        }
-        DLFDefaultSigner::IDENTIFIER
-    }
-
     /// Create a signer based on the signing algorithm.
     pub fn create_signer(signing_algorithm: &str, region: &str) -> Box<dyn DLFRequestSigner> {
         if signing_algorithm == DLFOpenApiSigner::IDENTIFIER {
@@ -692,31 +662,5 @@ impl DLFSignerFactory {
         } else {
             Box::new(DLFDefaultSigner::new(region))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_region_from_uri() {
-        let uri = "http://cn-hangzhou-vpc.dlf.aliyuncs.com";
-        let region = DLFSignerFactory::parse_region_from_uri(Some(uri));
-        assert_eq!(region, Some("cn-hangzhou".to_string()));
-    }
-
-    #[test]
-    fn test_parse_signing_algo_openapi() {
-        let uri = "http://dlfnext.cn-hangzhou.aliyuncs.com";
-        let algo = DLFSignerFactory::parse_signing_algo_from_uri(Some(uri));
-        assert_eq!(algo, "openapi");
-    }
-
-    #[test]
-    fn test_parse_signing_algo_default() {
-        let uri = "http://cn-hangzhou-vpc.dlf.aliyuncs.com";
-        let algo = DLFSignerFactory::parse_signing_algo_from_uri(Some(uri));
-        assert_eq!(algo, "default");
     }
 }

@@ -17,12 +17,12 @@
 
 //! Authentication provider factory.
 
-use regex::Regex;
 use crate::api::auth::dlf_provider::DLFTokenLoaderFactory;
-use crate::api::AuthProvider;
-use crate::Error;
 use crate::api::auth::{BearerTokenAuthProvider, DLFAuthProvider, DLFToken};
+use crate::api::AuthProvider;
 use crate::common::{CatalogOptions, Options};
+use crate::Error;
+use regex::Regex;
 
 /// Factory for creating DLF authentication providers.
 pub struct DLFAuthProviderFactory;
