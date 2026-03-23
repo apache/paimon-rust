@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
 use paimon::api::rest_api::RESTApi;
 use paimon::api::ConfigResponse;
+use paimon::catalog::Identifier;
 use paimon::common::Options;
 use serde_json::json;
 
@@ -40,13 +41,13 @@ struct TestContext {
 /// Helper function to set up a test environment with a custom prefix.
 async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
     let prefix = "mock-test";
-    // Create config with prefix (similar to Python: ConfigResponse(defaults={"prefix": "mock-test"}))
+    // Create config with prefix
     let mut defaults = HashMap::new();
     defaults.insert("prefix".to_string(), prefix.to_string());
     let config = ConfigResponse::new(defaults);
 
     let initial: Vec<String> = initial_dbs.iter().map(|s| s.to_string()).collect();
-    // Start server with config (similar to Python: RESTCatalogServer(data_path=..., config=config, warehouse=...))
+    // Start server with config
     let server = start_mock_server(
         "test_warehouse".to_string(),      // warehouse
         "/tmp/test_warehouse".to_string(), // data_path
@@ -173,7 +174,11 @@ async fn test_list_tables_and_get_table() {
     assert!(tables.contains(&"table2".to_string()));
 
     // Get table
-    let table_resp = ctx.api.get_table("default", "table1").await.unwrap();
+    let table_resp = ctx
+        .api
+        .get_table(&Identifier::new("default", "table1"))
+        .await
+        .unwrap();
     assert_eq!(table_resp.id.unwrap_or_default(), "table1");
 }
 
@@ -181,7 +186,10 @@ async fn test_list_tables_and_get_table() {
 async fn test_get_table_not_found() {
     let ctx = setup_test_server(vec!["default"]).await;
 
-    let result = ctx.api.get_table("default", "non_existent_table").await;
+    let result = ctx
+        .api
+        .get_table(&Identifier::new("default", "non_existent_table"))
+        .await;
     assert!(result.is_err(), "getting non-existent table should fail");
 }
 
@@ -316,7 +324,10 @@ async fn test_create_table() {
         .build()
         .expect("Failed to build schema");
 
-    let result = ctx.api.create_table("default", "new_table", schema).await;
+    let result = ctx
+        .api
+        .create_table(&Identifier::new("default", "new_table"), schema)
+        .await;
     assert!(result.is_ok(), "failed to create table: {:?}", result);
 
     // Verify table exists
@@ -324,7 +335,11 @@ async fn test_create_table() {
     assert!(tables.contains(&"new_table".to_string()));
 
     // Get the table
-    let table_resp = ctx.api.get_table("default", "new_table").await.unwrap();
+    let table_resp = ctx
+        .api
+        .get_table(&Identifier::new("default", "new_table"))
+        .await
+        .unwrap();
     assert_eq!(table_resp.name, Some("new_table".to_string()));
 }
 
@@ -340,7 +355,10 @@ async fn test_drop_table() {
     assert!(tables.contains(&"table_to_drop".to_string()));
 
     // Drop table
-    let result = ctx.api.drop_table("default", "table_to_drop").await;
+    let result = ctx
+        .api
+        .drop_table(&Identifier::new("default", "table_to_drop"))
+        .await;
     assert!(result.is_ok(), "failed to drop table: {:?}", result);
 
     // Verify table is gone
@@ -348,7 +366,10 @@ async fn test_drop_table() {
     assert!(!tables.contains(&"table_to_drop".to_string()));
 
     // Dropping non-existent table should fail
-    let result = ctx.api.drop_table("default", "table_to_drop").await;
+    let result = ctx
+        .api
+        .drop_table(&Identifier::new("default", "table_to_drop"))
+        .await;
     assert!(result.is_err(), "dropping non-existent table should fail");
 }
 
@@ -358,7 +379,10 @@ async fn test_drop_table_no_permission() {
     ctx.server
         .add_no_permission_table("default", "secret_table");
 
-    let result = ctx.api.drop_table("default", "secret_table").await;
+    let result = ctx
+        .api
+        .drop_table(&Identifier::new("default", "secret_table"))
+        .await;
     assert!(result.is_err(), "dropping no-permission table should fail");
 }
 
@@ -374,7 +398,10 @@ async fn test_rename_table() {
     // Rename table
     let result = ctx
         .api
-        .rename_table("default", "old_table", "default", "new_table")
+        .rename_table(
+            &Identifier::new("default", "old_table"),
+            &Identifier::new("default", "new_table"),
+        )
         .await;
     assert!(result.is_ok(), "failed to rename table: {:?}", result);
 
@@ -386,7 +413,11 @@ async fn test_rename_table() {
     assert!(tables.contains(&"new_table".to_string()));
 
     // Get the renamed table
-    let table_resp = ctx.api.get_table("default", "new_table").await.unwrap();
+    let table_resp = ctx
+        .api
+        .get_table(&Identifier::new("default", "new_table"))
+        .await
+        .unwrap();
     assert_eq!(table_resp.name, Some("new_table".to_string()));
 }
 

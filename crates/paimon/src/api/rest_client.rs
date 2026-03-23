@@ -85,48 +85,36 @@ impl HttpClient {
         Ok(normalized_url.trim_end_matches('/').to_string())
     }
 
-    /// Perform a GET request and parse the response as JSON.
+    /// Perform a GET request with optional query parameters.
     ///
     /// # Arguments
     /// * `path` - The path to append to the base URL.
+    /// * `params` - Optional query parameters as key-value pairs.
     ///
     /// # Returns
     /// The parsed JSON response.
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.request_url(path);
-        let headers = self.build_auth_headers("GET", path, None, HashMap::new());
-        let request = self.client.get(&url);
-        let request = Self::apply_headers(request, &headers);
-        let resp = request.send().await.map_err(|e| Error::UnexpectedError {
-            message: "http get failed".to_string(),
-            source: Some(Box::new(e)),
-        })?;
-        self.parse_response(resp).await
-    }
-
-    /// Perform a GET request with query parameters.
-    ///
-    /// # Arguments
-    /// * `path` - The path to append to the base URL.
-    /// * `params` - Query parameters as key-value pairs (supports both `&str` and `String`).
-    ///
-    /// # Returns
-    /// The parsed JSON response.
-    pub async fn get_with_params<T: DeserializeOwned>(
+    pub async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
-        params: &[(impl AsRef<str>, impl AsRef<str>)],
+        params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
         let url = self.request_url(path);
-        let params_map: HashMap<String, String> = params
-            .iter()
-            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
-            .collect();
-        let headers = self.build_auth_headers("GET", path, None, params_map.clone());
+
+        let params_map: HashMap<String, String> = match params {
+            Some(p) => p
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+                .collect(),
+            None => HashMap::new(),
+        };
+
+        let headers = self.build_auth_headers("GET", path, None, params_map);
 
         let mut request = self.client.get(&url);
-        for (key, value) in params {
-            request = request.query(&[(key.as_ref(), value.as_ref())]);
+        if let Some(p) = params {
+            for (key, value) in p {
+                request = request.query(&[(key.as_ref(), value.as_ref())]);
+            }
         }
 
         let request = Self::apply_headers(request, &headers);
@@ -162,48 +150,36 @@ impl HttpClient {
         self.parse_response(resp).await
     }
 
-    /// Perform a DELETE request.
+    /// Perform a DELETE request with optional query parameters.
     ///
     /// # Arguments
     /// * `path` - The path to append to the base URL.
+    /// * `params` - Optional query parameters as key-value pairs.
     ///
     /// # Returns
     /// The parsed JSON response.
-    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.request_url(path);
-        let headers = self.build_auth_headers("DELETE", path, None, HashMap::new());
-        let request = self.client.delete(&url);
-        let request = Self::apply_headers(request, &headers);
-        let resp = request.send().await.map_err(|e| Error::UnexpectedError {
-            message: "http delete failed".to_string(),
-            source: Some(Box::new(e)),
-        })?;
-        self.parse_response(resp).await
-    }
-
-    /// Perform a DELETE request with query parameters.
-    ///
-    /// # Arguments
-    /// * `path` - The path to append to the base URL.
-    /// * `params` - Query parameters as key-value pairs (supports both `&str` and `String`).
-    ///
-    /// # Returns
-    /// The parsed JSON response.
-    pub async fn delete_with_params<T: DeserializeOwned>(
+    pub async fn delete<T: DeserializeOwned>(
         &self,
         path: &str,
-        params: &[(impl AsRef<str>, impl AsRef<str>)],
+        params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
         let url = self.request_url(path);
-        let params_map: HashMap<String, String> = params
-            .iter()
-            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
-            .collect();
-        let headers = self.build_auth_headers("DELETE", path, None, params_map.clone());
+
+        let params_map: HashMap<String, String> = match params {
+            Some(p) => p
+                .iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+                .collect(),
+            None => HashMap::new(),
+        };
+
+        let headers = self.build_auth_headers("DELETE", path, None, params_map);
 
         let mut request = self.client.delete(&url);
-        for (key, value) in params {
-            request = request.query(&[(key.as_ref(), value.as_ref())]);
+        if let Some(p) = params {
+            for (key, value) in p {
+                request = request.query(&[(key.as_ref(), value.as_ref())]);
+            }
         }
 
         let request = Self::apply_headers(request, &headers);

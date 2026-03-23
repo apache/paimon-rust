@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 
 use paimon::api::rest_api::RESTApi;
+use paimon::catalog::Identifier;
 use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{DataType, IntType, Schema, VarCharType};
 
@@ -104,7 +105,10 @@ async fn main() {
     // Create table
     println!("Creating table 'example_db.users'...");
     let schema = create_test_schema();
-    match api.create_table("example_db", "users", schema).await {
+    match api
+        .create_table(&Identifier::new("example_db", "users"), schema)
+        .await
+    {
         Ok(()) => println!("Table created successfully"),
         Err(e) => eprintln!("Failed to create table: {}", e),
     }
@@ -122,7 +126,7 @@ async fn main() {
 
     // Get table info
     println!("\nGetting table info for 'example_db.users'...");
-    match api.get_table("example_db", "users").await {
+    match api.get_table(&Identifier::new("example_db", "users")).await {
         Ok(table) => println!("Table: {:?}", table),
         Err(e) => eprintln!("Failed to get table: {}", e),
     }
@@ -130,7 +134,10 @@ async fn main() {
     // Rename table
     println!("\nRenaming table 'users' to 'users_renamed'...");
     match api
-        .rename_table("example_db", "users", "example_db", "users_renamed")
+        .rename_table(
+            &Identifier::new("example_db", "users"),
+            &Identifier::new("example_db", "users_renamed"),
+        )
         .await
     {
         Ok(()) => println!("Table renamed successfully"),
@@ -139,7 +146,10 @@ async fn main() {
 
     // Drop table
     println!("\nDropping table 'example_db.users_renamed'...");
-    match api.drop_table("example_db", "users_renamed").await {
+    match api
+        .drop_table(&Identifier::new("example_db", "users_renamed"))
+        .await
+    {
         Ok(()) => println!("Table dropped successfully"),
         Err(e) => eprintln!("Failed to drop table: {}", e),
     }

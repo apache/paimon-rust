@@ -140,7 +140,7 @@ impl RESTApi {
                 RESTUtil::encode_string(warehouse),
             )];
             let config_response: ConfigResponse = client
-                .get_with_params(&ResourcePaths::config(), &query_params)
+                .get(&ResourcePaths::config(), Some(&query_params))
                 .await?;
 
             // Merge config response with options (client config takes priority)
@@ -213,9 +213,9 @@ impl RESTApi {
         }
 
         let response: ListDatabasesResponse = if params.is_empty() {
-            self.client.get(&path).await?
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
         } else {
-            self.client.get_with_params(&path, &params).await?
+            self.client.get(&path, Some(&params)).await?
         };
 
         Ok(PagedList::new(response.databases, response.next_page_token))
@@ -238,7 +238,7 @@ impl RESTApi {
     pub async fn get_database(&self, name: &str) -> Result<GetDatabaseResponse> {
         validate_non_empty(name, "database name")?;
         let path = self.resource_paths.database(name);
-        self.client.get(&path).await
+        self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
     /// Alter database configuration.
@@ -259,7 +259,7 @@ impl RESTApi {
     pub async fn drop_database(&self, name: &str) -> Result<()> {
         validate_non_empty(name, "database name")?;
         let path = self.resource_paths.database(name);
-        let _resp: serde_json::Value = self.client.delete(&path).await?;
+        let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
     }
 
@@ -317,9 +317,9 @@ impl RESTApi {
         }
 
         let response: ListTablesResponse = if params.is_empty() {
-            self.client.get(&path).await?
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
         } else {
-            self.client.get_with_params(&path, &params).await?
+            self.client.get(&path, Some(&params)).await?
         };
 
         Ok(PagedList::new(
@@ -329,49 +329,46 @@ impl RESTApi {
     }
 
     /// Create a new table.
-    pub async fn create_table(&self, database: &str, table: &str, schema: Schema) -> Result<()> {
+    pub async fn create_table(&self, identifier: &Identifier, schema: Schema) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.tables(Some(database));
-        let identifier = Identifier::new(database.to_string(), table.to_string());
-        let request = CreateTableRequest::new(identifier, schema);
+        let request = CreateTableRequest::new(identifier.clone(), schema);
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())
     }
 
     /// Get table information.
-    pub async fn get_table(&self, database: &str, table: &str) -> Result<GetTableResponse> {
+    pub async fn get_table(&self, identifier: &Identifier) -> Result<GetTableResponse> {
+        let database = identifier.database();
+        let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.table(database, table);
-        self.client.get(&path).await
+        self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
     /// Rename a table.
-    pub async fn rename_table(
-        &self,
-        source_database: &str,
-        source_table: &str,
-        dest_database: &str,
-        dest_table: &str,
-    ) -> Result<()> {
+    pub async fn rename_table(&self, source: &Identifier, destination: &Identifier) -> Result<()> {
         validate_non_empty_multi(&[
-            (source_database, "source database name"),
-            (source_table, "source table name"),
-            (dest_database, "destination database name"),
-            (dest_table, "destination table name"),
+            (source.database(), "source database name"),
+            (source.object(), "source table name"),
+            (destination.database(), "destination database name"),
+            (destination.object(), "destination table name"),
         ])?;
         let path = self.resource_paths.rename_table();
-        let source = Identifier::new(source_database.to_string(), source_table.to_string());
-        let destination = Identifier::new(dest_database.to_string(), dest_table.to_string());
-        let request = RenameTableRequest::new(source, destination);
+        let request = RenameTableRequest::new(source.clone(), destination.clone());
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())
     }
 
     /// Drop a table.
-    pub async fn drop_table(&self, database: &str, table: &str) -> Result<()> {
+    pub async fn drop_table(&self, identifier: &Identifier) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.table(database, table);
-        let _resp: serde_json::Value = self.client.delete(&path).await?;
+        let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
     }
 }
