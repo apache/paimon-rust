@@ -21,4 +21,3 @@
 .vscode
 **/.DS_Store
 dist/*
-crates/paimon/examples/dlf_*.rs
