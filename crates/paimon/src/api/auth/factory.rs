@@ -36,11 +36,6 @@ impl DLFAuthProviderFactory {
     const REGION_PATTERN: &'static str = r"(?:pre-)?([a-z]+-[a-z]+(?:-\d+)?)";
 
     /// Parse region from DLF endpoint URI.
-    ///
-    /// Extracts the region from URIs like:
-    /// - `http://cn-hangzhou-vpc.dlf.aliyuncs.com` → `cn-hangzhou`
-    /// - `http://dlfnext.cn-hangzhou.aliyuncs.com` → `cn-hangzhou`
-    /// - `http://pre-cn-hangzhou.dlf.aliyuncs.com` → `cn-hangzhou`
     pub fn parse_region_from_uri(uri: Option<&str>) -> Option<String> {
         let uri = uri?;
         let re = Regex::new(Self::REGION_PATTERN).ok()?;
@@ -201,7 +196,7 @@ mod tests {
         options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
         options.set(
             CatalogOptions::URI,
-            "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/",
+            "http://dlf-asdaswfnb.net/",
         );
         options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");

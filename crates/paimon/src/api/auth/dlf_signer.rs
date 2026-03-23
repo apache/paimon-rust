@@ -393,7 +393,7 @@ impl DLFRequestSigner for DLFDefaultSigner {
 /// DLF OpenAPI signer using HMAC-SHA1 algorithm.
 ///
 /// This signer follows the Alibaba Cloud ROA v2 signature style and is used
-/// for public network endpoints (e.g., `dlfnext.cn-hangzhou.aliyuncs.com`).
+/// for public network endpoints (e.g., `dlfnext.cn-asdnbhwf.aliyuncs.com`).
 ///
 /// # Algorithm Details
 ///
@@ -648,7 +648,7 @@ impl DLFRequestSigner for DLFOpenApiSigner {
 ///
 /// // Auto-detect from URI
 /// let signer = DLFSignerFactory::create_signer("default", "cn-hangzhou");
-/// let algo = DLFSignerFactory::parse_signing_algo_from_uri(Some("http://dlfnext.cn-hangzhou.aliyuncs.com"));
+/// let algo = DLFSignerFactory::parse_signing_algo_from_uri(Some("http://dlfnext.ajinnbjug.aliyuncs.com"));
 /// assert_eq!(algo, "openapi");
 /// ```
 pub struct DLFSignerFactory;

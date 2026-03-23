@@ -433,16 +433,16 @@ mod tests {
 
     #[test]
     fn test_extract_host() {
-        let uri = "http://dlf-regres-test-cn-hangzhou-vpc.taobao.net/api/v1";
+        let uri = "http://dlf-abcdfgerrf.net/api/v1";
         let host = DLFAuthProvider::extract_host(uri);
-        assert_eq!(host, "dlf-regres-test-cn-hangzhou-vpc.taobao.net");
+        assert_eq!(host, "dlf-abcdfgerrf.net");
     }
 
     #[test]
     fn test_extract_host_no_path() {
-        let uri = "https://dlf.cn-hangzhou.aliyuncs.com";
+        let uri = "https://dlf.cn-abcdfgerrf.aliyuncs.com";
         let host = DLFAuthProvider::extract_host(uri);
-        assert_eq!(host, "dlf.cn-hangzhou.aliyuncs.com");
+        assert_eq!(host, "dlf.cn-abcdfgerrf.aliyuncs.com");
     }
 
     #[test]
