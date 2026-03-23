@@ -36,19 +36,3 @@ docker-up:
 # Stop and remove Docker containers, networks, and volumes.
 docker-down:
 	docker compose -f dev/docker-compose.yaml down -v
-
-# Code quality checks
-check:
-	./dev/check.sh
-
-check-fix:
-	./dev/check.sh --fix
-
-check-fmt:
-	cargo fmt --all -- --check
-
-check-clippy:
-	cargo clippy --all-targets --all-features --workspace -- -D warnings
-
-test:
-	cargo test --workspace
