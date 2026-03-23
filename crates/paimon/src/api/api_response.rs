@@ -24,7 +24,11 @@ use std::collections::HashMap;
 
 use crate::spec::Schema;
 
-/// Base trait for REST responses.
+/// Marker trait for REST API responses.
+///
+/// All REST response types should implement this trait
+/// to indicate they are valid REST API responses.
+#[allow(dead_code)]
 pub trait RESTResponse {}
 
 /// Error response from REST API calls.

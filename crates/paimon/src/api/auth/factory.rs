@@ -194,10 +194,7 @@ mod tests {
     fn test_create_dlf_provider() {
         let mut options = Options::new();
         options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
-        options.set(
-            CatalogOptions::URI,
-            "http://dlf-asdaswfnb.net/",
-        );
+        options.set(CatalogOptions::URI, "http://dlf-asdaswfnb.net/");
         options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
         options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");

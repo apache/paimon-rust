@@ -72,12 +72,12 @@ fi
 # 3. Run clippy (with auto-fix)
 echo ""
 echo "[3/4] Running clippy..."
-if ! cargo clippy --all-targets --all-features --workspace 2>&1; then
+if ! cargo clippy --all-targets --all-features --workspace -- -D warnings 2>&1; then
     if [ "$AUTO_FIX" = true ]; then
         echo "Attempting to fix clippy issues..."
         cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features --workspace
         echo "✓ Clippy fixes applied. Re-running clippy..."
-        if ! cargo clippy --all-targets --all-features --workspace; then
+        if ! cargo clippy --all-targets --all-features --workspace -- -D warnings; then
             echo "✗ Some clippy issues could not be auto-fixed. Please fix manually."
             exit 1
         fi

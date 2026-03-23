@@ -116,7 +116,7 @@ pub trait DLFRequestSigner {
         host: &str,
         sign_headers: &HashMap<String, String>,
     ) -> String;
-
+    #[allow(dead_code)]
     /// Get the identifier for this signer.
     fn identifier(&self) -> &str;
 }
