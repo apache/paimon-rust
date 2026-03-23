@@ -50,8 +50,7 @@ if command -v license-eye &> /dev/null; then
     license-eye header check
     echo "✓ License check passed"
 else
-    echo "⚠ license-eye not installed, skipping license check"
-    echo "  Install with: go install github.com/apache/skywalking-eyes/cmd/license-eye@latest"
+    echo "⚠ Failed to check license headers. license-eye not installed, skipping license check"
 fi
 
 # 2. Check code formatting (with auto-fix)

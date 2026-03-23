@@ -27,4 +27,7 @@ header:
     - "**/*.json"
     - "target"
     - "Cargo.lock"
+    - ".github/*.md"
+    - "bindings/go/**/go.mod"
+    - "bindings/go/**/go.sum"
   comment: on-failure
