@@ -23,9 +23,9 @@
 use std::collections::HashMap;
 
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
+use paimon::api::rest_api::RESTApi;
 use paimon::api::ConfigResponse;
 use paimon::common::Options;
-use paimon::{api::rest_api::RESTApi, CatalogOptions};
 use serde_json::json;
 
 mod mock_server;
@@ -420,16 +420,14 @@ async fn test_ecs_loader_token() {
 
     let ecs_metadata_url = format!("{}/ram/security-credentials/", server.url().unwrap());
 
-    // Test without role name
-    let mut options = Options::new();
-    options.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
-    options.set(
-        CatalogOptions::DLF_TOKEN_ECS_METADATA_URL,
-        &ecs_metadata_url,
-    );
-
-    let loader = DLFECSTokenLoader::new(&ecs_metadata_url, None);
-    let load_token: DLFToken = loader.load_token().await.unwrap();
+    // Test without role name (use spawn_blocking for sync load_token)
+    let ecs_metadata_url_clone = ecs_metadata_url.clone();
+    let load_token: DLFToken = tokio::task::spawn_blocking(move || {
+        let loader = DLFECSTokenLoader::new(&ecs_metadata_url_clone, None);
+        loader.load_token().unwrap()
+    })
+    .await
+    .unwrap();
 
     assert_eq!(load_token.access_key_id, "AccessKeyId");
     assert_eq!(load_token.access_key_secret, "AccessKeySecret");
@@ -442,17 +440,14 @@ async fn test_ecs_loader_token() {
         Some("2023-12-01T12:00:00Z".to_string())
     );
 
-    // Test with role name
-    let mut options_with_role = Options::new();
-    options_with_role.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
-    options_with_role.set(
-        CatalogOptions::DLF_TOKEN_ECS_METADATA_URL,
-        &ecs_metadata_url,
-    );
-    options_with_role.set(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME, role_name);
-
-    let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name.to_string()));
-    let token: DLFToken = loader_with_role.load_token().await.unwrap();
+    // Test with role name (use spawn_blocking for sync load_token)
+    let role_name_owned = role_name.to_string();
+    let token: DLFToken = tokio::task::spawn_blocking(move || {
+        let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name_owned));
+        loader_with_role.load_token().unwrap()
+    })
+    .await
+    .unwrap();
 
     assert_eq!(token.access_key_id, "AccessKeyId");
     assert_eq!(token.access_key_secret, "AccessKeySecret");

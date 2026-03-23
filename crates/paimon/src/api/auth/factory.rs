@@ -67,6 +67,52 @@ impl DLFAuthProviderFactory {
         }
         Self::DEFAULT_IDENTIFIER
     }
+
+    /// Create a DLF authentication provider from options.
+    ///
+    /// # Arguments
+    /// * `options` - The configuration options.
+    ///
+    /// # Returns
+    /// A boxed AuthProvider trait object.
+    ///
+    /// # Errors
+    /// Returns an error if required configuration is missing.
+    pub fn create_provider(options: &Options) -> Result<Box<dyn AuthProvider>, Error> {
+        let uri = options
+            .get(CatalogOptions::URI)
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: "URI is required for DLF authentication".to_string(),
+            })?
+            .clone();
+
+        // Get region from options or parse from URI
+        let region = options
+            .get(CatalogOptions::DLF_REGION)
+            .cloned()
+            .or_else(|| Self::parse_region_from_uri(Some(&uri)))
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: "Could not get region from config or URI. Please set 'dlf.region' or use a standard DLF endpoint URI.".to_string(),
+            })?;
+
+        // Get signing algorithm from options, or auto-detect from URI
+        let signing_algorithm = options
+            .get(CatalogOptions::DLF_SIGNING_ALGORITHM)
+            .map(|s| s.as_str())
+            .filter(|s| *s != "default")
+            .unwrap_or_else(|| Self::parse_signing_algo_from_uri(Some(&uri)))
+            .to_string();
+
+        let dlf_provider = DLFAuthProvider::new(
+            uri,
+            region,
+            signing_algorithm,
+            DLFToken::from_options(options),
+            DLFTokenLoaderFactory::create_token_loader(options),
+        );
+
+        Ok(Box::new(dlf_provider))
+    }
 }
 
 /// Factory for creating authentication providers.
@@ -96,48 +142,12 @@ impl AuthProviderFactory {
                         })?;
                 Ok(Box::new(BearerTokenAuthProvider::new(token)))
             }
-            Some("dlf") => {
-                let uri = options
-                    .get(CatalogOptions::URI)
-                    .ok_or_else(|| Error::ConfigInvalid {
-                        message: "URI is required for DLF authentication".to_string(),
-                    })?
-                    .clone();
-
-                // Get region from options or parse from URI
-                let region = options
-                    .get(CatalogOptions::DLF_REGION)
-                    .cloned()
-                    .or_else(|| DLFAuthProviderFactory::parse_region_from_uri(Some(&uri)))
-                    .ok_or_else(|| Error::ConfigInvalid {
-                        message: "Could not get region from config or URI. Please set 'dlf.region' or use a standard DLF endpoint URI.".to_string(),
-                    })?;
-
-                // Get signing algorithm from options, or auto-detect from URI
-                let signing_algorithm = options
-                    .get(CatalogOptions::DLF_SIGNING_ALGORITHM)
-                    .map(|s| s.as_str())
-                    .filter(|s| *s != "default")
-                    .unwrap_or_else(|| {
-                        DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(&uri))
-                    })
-                    .to_string();
-
-                let dlf_provider = DLFAuthProvider::new(
-                    uri,
-                    region,
-                    signing_algorithm,
-                    DLFToken::from_options(options),
-                    DLFTokenLoaderFactory::create_token_loader(options),
-                );
-
-                Ok(Box::new(dlf_provider))
-            }
-            None => Err(Error::ConfigInvalid {
-                message: "auth provider is required".to_string(),
-            }),
+            Some("dlf") => DLFAuthProviderFactory::create_provider(options),
             Some(unknown) => Err(Error::ConfigInvalid {
                 message: format!("Unknown auth provider: {}", unknown),
+            }),
+            None => Err(Error::ConfigInvalid {
+                message: "auth provider is required".to_string(),
             }),
         }
     }

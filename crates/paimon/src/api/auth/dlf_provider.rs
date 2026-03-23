@@ -1,15 +1,29 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 //! DLF Authentication Provider for Alibaba Cloud Data Lake Formation.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::Utc;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
 
 use super::base::{AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
 use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
@@ -108,9 +122,9 @@ impl DLFToken {
     }
 }
 /// Trait for DLF token loaders.
-pub trait DLFTokenLoader: Send + Sync {
-    /// Load a DLF token (async version).
-    fn load_token(&self) -> Pin<Box<dyn Future<Output = Result<DLFToken, String>> + Send + '_>>;
+pub trait DLFTokenLoader {
+    /// Load a DLF token (sync version).
+    fn load_token(&self) -> Result<DLFToken, String>;
 
     /// Get a description of the loader.
     fn description(&self) -> &str;
@@ -143,13 +157,13 @@ impl DLFECSTokenLoader {
     }
 
     /// Get the role name from ECS metadata service.
-    async fn get_role(&self) -> Result<String, String> {
-        self.http_client.get(&self.ecs_metadata_url).await
+    fn get_role(&self) -> Result<String, String> {
+        self.http_client.get(&self.ecs_metadata_url)
     }
 
     /// Get the token from ECS metadata service.
-    async fn get_token(&self, url: &str) -> Result<DLFToken, String> {
-        let token_json = self.http_client.get(url).await?;
+    fn get_token(&self, url: &str) -> Result<DLFToken, String> {
+        let token_json = self.http_client.get(url)?;
         serde_json::from_str(&token_json).map_err(|e| format!("Failed to parse token JSON: {}", e))
     }
 
@@ -161,26 +175,22 @@ impl DLFECSTokenLoader {
 }
 
 impl DLFTokenLoader for DLFECSTokenLoader {
-    fn load_token(&self) -> Pin<Box<dyn Future<Output = Result<DLFToken, String>> + Send + '_>> {
-        Box::pin(async move {
-            let role_name = match &self.role_name {
-                Some(name) => name.clone(),
-                None => {
-                    // Fetch role name from metadata service
-                    self.get_role()
-                        .await
-                        .map_err(|e| format!("Get role failed, error: {}", e))?
-                }
-            };
+    fn load_token(&self) -> Result<DLFToken, String> {
+        let role_name = match &self.role_name {
+            Some(name) => name.clone(),
+            None => {
+                // Fetch role name from metadata service
+                self.get_role()
+                    .map_err(|e| format!("Get role failed, error: {}", e))?
+            }
+        };
 
-            // Build token URL
-            let token_url = self.build_token_url(&role_name);
+        // Build token URL
+        let token_url = self.build_token_url(&role_name);
 
-            // Get token
-            self.get_token(&token_url)
-                .await
-                .map_err(|e| format!("Get token failed, error: {}", e))
-        })
+        // Get token
+        self.get_token(&token_url)
+            .map_err(|e| format!("Get token failed, error: {}", e))
     }
 
     fn description(&self) -> &str {
@@ -229,12 +239,9 @@ const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 /// (ROA v2 HMAC-SHA1).
 pub struct DLFAuthProvider {
     uri: String,
-    region: String,
-    signing_algorithm: String,
     token: RefCell<Option<DLFToken>>,
     token_loader: Option<Arc<dyn DLFTokenLoader>>,
     signer: Box<dyn DLFRequestSigner>,
-    runtime: Runtime,
 }
 
 impl DLFAuthProvider {
@@ -242,8 +249,6 @@ impl DLFAuthProvider {
     ///
     /// # Arguments
     /// * `uri` - The DLF service URI
-    /// * `region` - The DLF region (e.g., "cn-hangzhou")
-    /// * `signing_algorithm` - The signing algorithm ("default" or "openapi")
     /// * `token` - Optional DLF token containing access credentials
     /// * `token_loader` - Optional token loader for dynamic token retrieval
     ///
@@ -267,12 +272,9 @@ impl DLFAuthProvider {
 
         Self {
             uri,
-            region,
-            signing_algorithm,
             token: RefCell::new(token),
             token_loader,
             signer,
-            runtime: Runtime::new().expect("Failed to create tokio runtime"),
         }
     }
 
@@ -300,7 +302,7 @@ impl DLFAuthProvider {
             };
 
             if need_reload {
-                let new_token = self.runtime.block_on(loader.load_token())?;
+                let new_token = loader.load_token()?;
                 *self.token.borrow_mut() = Some(new_token);
             }
         }
@@ -390,15 +392,14 @@ impl TokenHTTPClient {
         }
     }
 
-    /// Perform HTTP GET request with retry logic (async version).
-    async fn get(&self, url: &str) -> Result<String, String> {
+    /// Perform HTTP GET request with retry logic (sync version).
+    fn get(&self, url: &str) -> Result<String, String> {
         let mut last_error = String::new();
         for attempt in 0..self.max_retries {
-            match self.client.get(url).send().await {
+            match self.client.get(url).send() {
                 Ok(response) if response.status().is_success() => {
                     return response
                         .text()
-                        .await
                         .map_err(|e| format!("Failed to read response: {}", e));
                 }
                 Ok(response) => {
@@ -412,7 +413,7 @@ impl TokenHTTPClient {
             if attempt < self.max_retries - 1 {
                 // Exponential backoff
                 let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
-                tokio::time::sleep(delay).await;
+                std::thread::sleep(delay);
             }
         }
 

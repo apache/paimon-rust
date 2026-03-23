@@ -229,14 +229,6 @@ impl ConfigResponse {
     }
 }
 
-/// A paged response with data and optional next page token.
-pub trait PagedResponse<T>: RESTResponse {
-    /// Get the data elements.
-    fn data(&self) -> &[T];
-    /// Get the next page token.
-    fn get_next_page_token(&self) -> Option<&str>;
-}
-
 /// Response for listing databases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,16 +240,6 @@ pub struct ListDatabasesResponse {
 }
 
 impl RESTResponse for ListDatabasesResponse {}
-
-impl PagedResponse<String> for ListDatabasesResponse {
-    fn data(&self) -> &[String] {
-        &self.databases
-    }
-
-    fn get_next_page_token(&self) -> Option<&str> {
-        self.next_page_token.as_deref()
-    }
-}
 
 impl ListDatabasesResponse {
     /// Create a new ListDatabasesResponse.
@@ -280,17 +262,6 @@ pub struct ListTablesResponse {
 }
 
 impl RESTResponse for ListTablesResponse {}
-
-impl PagedResponse<String> for ListTablesResponse {
-    fn data(&self) -> &[String] {
-        static EMPTY: &[String] = &[];
-        self.tables.as_deref().unwrap_or(EMPTY)
-    }
-
-    fn get_next_page_token(&self) -> Option<&str> {
-        self.next_page_token.as_deref()
-    }
-}
 
 impl ListTablesResponse {
     /// Create a new ListTablesResponse.

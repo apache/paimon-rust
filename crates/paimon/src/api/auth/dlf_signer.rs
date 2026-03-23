@@ -79,7 +79,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use md5::Md5;
-use regex::Regex;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -99,7 +98,7 @@ type HmacSha1 = Hmac<Sha1>;
 ///
 /// - [`DLFDefaultSigner`]: Uses DLF4-HMAC-SHA256 for VPC endpoints
 /// - [`DLFOpenApiSigner`]: Uses HMAC-SHA1 for public endpoints
-pub trait DLFRequestSigner: Send + Sync {
+pub trait DLFRequestSigner {
     /// Generate signature headers for the request.
     fn sign_headers(
         &self,
