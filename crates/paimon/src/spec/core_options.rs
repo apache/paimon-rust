@@ -20,8 +20,11 @@ use std::collections::HashMap;
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
+const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
+const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
+const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 
 /// Typed accessors for common table options.
 ///
@@ -39,7 +42,7 @@ impl<'a> CoreOptions<'a> {
     pub fn deletion_vectors_enabled(&self) -> bool {
         self.options
             .get(DELETION_VECTORS_ENABLED_OPTION)
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true"))
+            .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
 
@@ -55,6 +58,27 @@ impl<'a> CoreOptions<'a> {
             .get(SOURCE_SPLIT_OPEN_FILE_COST_OPTION)
             .and_then(|value| parse_memory_size(value))
             .unwrap_or(DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST)
+    }
+
+    /// The default partition name for null/blank partition values.
+    ///
+    /// Corresponds to Java `CoreOptions.PARTITION_DEFAULT_NAME`.
+    pub fn partition_default_name(&self) -> &str {
+        self.options
+            .get(PARTITION_DEFAULT_NAME_OPTION)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_PARTITION_DEFAULT_NAME)
+    }
+
+    /// Whether to use legacy partition name formatting (toString semantics).
+    ///
+    /// Corresponds to Java `CoreOptions.PARTITION_GENERATE_LEGACY_NAME`.
+    /// Default: `true` to match Java Paimon.
+    pub fn legacy_partition_name(&self) -> bool {
+        self.options
+            .get(PARTITION_LEGACY_NAME_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
     }
 }
 
@@ -130,5 +154,30 @@ mod tests {
         assert_eq!(parse_memory_size("100 b"), Some(100));
         assert_eq!(parse_memory_size(""), None);
         assert_eq!(parse_memory_size("abc"), None);
+    }
+
+    #[test]
+    fn test_partition_options_defaults() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.partition_default_name(), "__DEFAULT_PARTITION__");
+        assert!(core.legacy_partition_name());
+    }
+
+    #[test]
+    fn test_partition_options_custom() {
+        let options = HashMap::from([
+            (
+                PARTITION_DEFAULT_NAME_OPTION.to_string(),
+                "NULL_PART".to_string(),
+            ),
+            (
+                PARTITION_LEGACY_NAME_OPTION.to_string(),
+                "false".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.partition_default_name(), "NULL_PART");
+        assert!(!core.legacy_partition_name());
     }
 }

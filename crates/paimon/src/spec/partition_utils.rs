@@ -29,10 +29,6 @@ use crate::spec::BinaryRow;
 use crate::spec::DataField;
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 
-// TODO: remove after #131 consumes the pub(crate) API.
-#[allow(dead_code)]
-pub const DEFAULT_PARTITION_NAME: &str = "__DEFAULT_PARTITION__";
-
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// Computes partition string values and directory paths from a partition `BinaryRow`.
@@ -42,8 +38,6 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// (escaped directory path).
 ///
 /// Reference: `org.apache.paimon.utils.InternalRowPartitionComputer` in Java Paimon.
-// TODO: remove after #131 consumes the pub(crate) API.
-#[allow(dead_code)]
 pub(crate) struct PartitionComputer {
     partition_keys: Vec<String>,
     partition_fields: Vec<DataField>,
@@ -51,7 +45,6 @@ pub(crate) struct PartitionComputer {
     legacy_partition_name: bool,
 }
 
-#[allow(dead_code)]
 impl PartitionComputer {
     /// Create a new `PartitionComputer`.
     ///
@@ -153,28 +146,6 @@ impl PartitionComputer {
 
         Ok(())
     }
-}
-
-/// Backward-compatible free function that delegates to `PartitionComputer`.
-// TODO: remove after #131 consumes the pub(crate) API.
-#[allow(dead_code)]
-pub(crate) fn generate_partition_path(
-    partition_keys: &[String],
-    schema_fields: &[DataField],
-    row: &BinaryRow,
-    default_partition_name: &str,
-    legacy_partition_name: bool,
-) -> crate::Result<String> {
-    if partition_keys.is_empty() {
-        return Ok(String::new());
-    }
-    let computer = PartitionComputer::new(
-        partition_keys,
-        schema_fields,
-        default_partition_name,
-        legacy_partition_name,
-    )?;
-    computer.generate_partition_path(row)
 }
 
 /// Resolve the `DataField` for each partition key from the schema fields, preserving order.
@@ -622,6 +593,8 @@ mod tests {
         DataField::new(0, name.to_string(), data_type)
     }
 
+    const TEST_DEFAULT_PARTITION_NAME: &str = "__DEFAULT_PARTITION__";
+
     /// Helper: assert single-column partition path for a given type and row writer.
     fn assert_single_partition<F>(
         name: &str,
@@ -634,11 +607,12 @@ mod tests {
     {
         let fields = vec![make_field(name, data_type)];
         let keys = vec![name.to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, legacy).unwrap();
         let mut builder = TestRowBuilder::new(1);
         write_fn(&mut builder);
         let row = builder.build();
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, legacy).unwrap();
+        let result = computer.generate_partition_path(&row).unwrap();
         assert_eq!(result, expected);
     }
 
@@ -649,12 +623,12 @@ mod tests {
     {
         let fields = vec![make_field(name, data_type)];
         let keys = vec![name.to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, legacy).unwrap();
         let mut builder = TestRowBuilder::new(1);
         write_fn(&mut builder);
         let row = builder.build();
-        assert!(
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, legacy).is_err()
-        );
+        assert!(computer.generate_partition_path(&row).is_err());
     }
 
     // ======================== Escape tests ========================
@@ -689,7 +663,7 @@ mod tests {
         ];
         let keys = vec!["dt".to_string(), "hr".to_string()];
         let computer =
-            PartitionComputer::new(&keys, &fields, DEFAULT_PARTITION_NAME, true).unwrap();
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
 
         let mut builder = TestRowBuilder::new(2);
         builder.write_string(0, "2024-01-01");
@@ -710,7 +684,7 @@ mod tests {
         ];
         let keys = vec!["dt".to_string(), "hr".to_string()];
         let computer =
-            PartitionComputer::new(&keys, &fields, DEFAULT_PARTITION_NAME, true).unwrap();
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
 
         let mut builder = TestRowBuilder::new(2);
         builder.write_string(0, "2024-01-01");
@@ -726,7 +700,8 @@ mod tests {
     #[test]
     fn test_empty_partition_keys() {
         let row = BinaryRow::new(0);
-        let result = generate_partition_path(&[], &[], &row, DEFAULT_PARTITION_NAME, true).unwrap();
+        let computer = PartitionComputer::new(&[], &[], TEST_DEFAULT_PARTITION_NAME, true).unwrap();
+        let result = computer.generate_partition_path(&row).unwrap();
         assert_eq!(result, "");
     }
 
@@ -748,14 +723,15 @@ mod tests {
             make_field("hr", DataType::Int(IntType::new())),
         ];
         let keys = vec!["dt".to_string(), "hr".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
 
         let mut builder = TestRowBuilder::new(2);
         builder.write_string(0, "2024-01-01");
         builder.write_int(1, 12);
         let row = builder.build();
 
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
+        let result = computer.generate_partition_path(&row).unwrap();
         assert_eq!(result, "dt=2024-01-01/hr=12/");
     }
 
@@ -763,13 +739,14 @@ mod tests {
     fn test_null_partition_value() {
         let fields = vec![make_field("dt", DataType::VarChar(VarCharType::default()))];
         let keys = vec!["dt".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
 
         let mut builder = TestRowBuilder::new(1);
         builder.set_null_at(0);
         let row = builder.build();
 
-        let result =
-            generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true).unwrap();
+        let result = computer.generate_partition_path(&row).unwrap();
         assert_eq!(result, "dt=__DEFAULT_PARTITION__/");
     }
 
@@ -952,8 +929,12 @@ mod tests {
         builder.write_int(0, 1);
         let row = builder.build();
 
-        let result = generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true);
-        assert!(result.is_err());
+        let result = PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true);
+        // Construction succeeds (field resolution fails for hr), or path generation fails due to arity mismatch
+        match result {
+            Err(_) => {} // field resolution failed — expected
+            Ok(computer) => assert!(computer.generate_partition_path(&row).is_err()),
+        }
     }
 
     #[test]
@@ -961,11 +942,7 @@ mod tests {
         let fields = vec![make_field("other", DataType::Int(IntType::new()))];
         let keys = vec!["dt".to_string()];
 
-        let mut builder = TestRowBuilder::new(1);
-        builder.write_int(0, 1);
-        let row = builder.build();
-
-        let result = generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true);
+        let result = PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true);
         assert!(result.is_err());
     }
 
@@ -1005,9 +982,11 @@ mod tests {
     fn test_empty_row_with_partition_keys() {
         let fields = vec![make_field("dt", DataType::Int(IntType::new()))];
         let keys = vec!["dt".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
         let row = BinaryRow::new(1); // empty backing data
 
-        let result = generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true);
+        let result = computer.generate_partition_path(&row);
         assert!(result.is_err());
     }
 
@@ -1059,11 +1038,13 @@ mod tests {
     fn test_truncated_row_returns_error() {
         let fields = vec![make_field("dt", DataType::Int(IntType::new()))];
         let keys = vec!["dt".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
 
         // Create a BinaryRow with arity=1 but truncated backing data (too short).
         let row = BinaryRow::from_bytes(1, vec![0u8; 4]); // needs >= 16 bytes
 
-        let result = generate_partition_path(&keys, &fields, &row, DEFAULT_PARTITION_NAME, true);
+        let result = computer.generate_partition_path(&row);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("too short"), "Expected 'too short' in: {msg}");

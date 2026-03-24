@@ -90,14 +90,6 @@ impl<'a> TableRead<'a> {
             });
         }
 
-        if !self.table.schema.partition_keys().is_empty() {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Reading partitioned tables is not yet supported. Partition keys: {:?}",
-                    self.table.schema.partition_keys()
-                ),
-            });
-        }
         let reader =
             ArrowReaderBuilder::new(self.table.file_io.clone()).build(self.read_type().to_vec());
         reader.read(data_splits)
