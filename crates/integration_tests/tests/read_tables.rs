@@ -77,7 +77,19 @@ fn extract_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
 
 #[tokio::test]
 async fn test_read_log_table() {
-    let (_, batches) = scan_and_read("simple_log_table").await;
+    let (plan, batches) = scan_and_read("simple_log_table").await;
+
+    // Non-partitioned table: partition should be a valid arity=0 BinaryRow
+    // deserialized from manifest bytes, not a stub without backing data.
+    for split in plan.splits() {
+        let partition = split.partition();
+        assert_eq!(partition.arity(), 0);
+        assert!(
+            !partition.is_empty(),
+            "Non-partitioned split should have backing data from manifest deserialization"
+        );
+    }
+
     let actual = extract_id_name(&batches);
     let expected = vec![
         (1, "alice".to_string()),
@@ -268,7 +280,7 @@ async fn test_read_partitioned_dv_pk_table() {
             rows.push((id.value(i), name.value(i).into(), dt.value(i).into()));
         }
     }
-    rows.sort_by_key(|(id, _, _)| *id);
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
 
     assert_eq!(
         rows,

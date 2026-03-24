@@ -225,11 +225,7 @@ impl<'a> TableScan<'a> {
         };
 
         for ((partition, bucket), group_entries) in groups {
-            let partition_row = if !partition_keys.is_empty() {
-                Some(BinaryRow::from_serialized_bytes(&partition)?)
-            } else {
-                None
-            };
+            let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
 
             let total_buckets = group_entries
                 .first()
@@ -247,8 +243,7 @@ impl<'a> TableScan<'a> {
                 .collect();
 
             let bucket_path = if let Some(ref computer) = partition_computer {
-                let partition_path =
-                    computer.generate_partition_path(partition_row.as_ref().unwrap())?;
+                let partition_path = computer.generate_partition_path(&partition_row)?;
                 format!("{base_path}/{partition_path}bucket-{bucket}")
             } else {
                 format!("{base_path}/bucket-{bucket}")
@@ -270,7 +265,7 @@ impl<'a> TableScan<'a> {
 
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
-                    .with_partition(partition_row.clone().unwrap_or_else(|| BinaryRow::new(0)))
+                    .with_partition(partition_row.clone())
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)

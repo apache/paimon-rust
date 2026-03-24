@@ -169,9 +169,6 @@ def main():
         """
     )
 
-    # Round 1: initial rows across two partitions.
-    # id=1 appears in both partitions to verify PK (id, dt)
-    # isolation: updates to id=1 in one partition must not affect the other.
     spark.sql(
         """
         INSERT INTO partitioned_dv_pk_table VALUES
