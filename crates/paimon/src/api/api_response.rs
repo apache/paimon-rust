@@ -24,13 +24,6 @@ use std::collections::HashMap;
 
 use crate::spec::Schema;
 
-/// Marker trait for REST API responses.
-///
-/// All REST response types should implement this trait
-/// to indicate they are valid REST API responses.
-#[allow(dead_code)]
-pub trait RESTResponse {}
-
 /// Error response from REST API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,7 +38,6 @@ pub struct ErrorResponse {
     pub code: Option<i32>,
 }
 
-impl RESTResponse for ErrorResponse {}
 impl ErrorResponse {
     /// Create a new ErrorResponse.
     pub fn new(
@@ -79,7 +71,6 @@ pub struct AuditRESTResponse {
     pub updated_by: Option<String>,
 }
 
-impl RESTResponse for AuditRESTResponse {}
 impl AuditRESTResponse {
     /// Create a new AuditRESTResponse.
     pub fn new(
@@ -139,8 +130,6 @@ pub struct GetTableResponse {
     pub schema: Option<Schema>,
 }
 
-impl RESTResponse for GetTableResponse {}
-
 impl GetTableResponse {
     /// Create a new GetTableResponse.
     #[allow(clippy::too_many_arguments)]
@@ -182,8 +171,6 @@ pub struct GetDatabaseResponse {
     pub options: HashMap<String, String>,
 }
 
-impl RESTResponse for GetDatabaseResponse {}
-
 impl GetDatabaseResponse {
     /// Create a new GetDatabaseResponse.
     pub fn new(
@@ -210,8 +197,6 @@ pub struct ConfigResponse {
     /// Default configuration values.
     pub defaults: HashMap<String, String>,
 }
-
-impl RESTResponse for ConfigResponse {}
 
 impl ConfigResponse {
     /// Create a new ConfigResponse.
@@ -243,8 +228,6 @@ pub struct ListDatabasesResponse {
     pub next_page_token: Option<String>,
 }
 
-impl RESTResponse for ListDatabasesResponse {}
-
 impl ListDatabasesResponse {
     /// Create a new ListDatabasesResponse.
     pub fn new(databases: Vec<String>, next_page_token: Option<String>) -> Self {
@@ -264,8 +247,6 @@ pub struct ListTablesResponse {
     /// Token for the next page.
     pub next_page_token: Option<String>,
 }
-
-impl RESTResponse for ListTablesResponse {}
 
 impl ListTablesResponse {
     /// Create a new ListTablesResponse.

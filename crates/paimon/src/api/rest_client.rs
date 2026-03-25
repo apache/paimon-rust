@@ -94,7 +94,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn get<T: DeserializeOwned>(
-        &self,
+        &mut self,
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
@@ -108,7 +108,9 @@ impl HttpClient {
             None => HashMap::new(),
         };
 
-        let headers = self.build_auth_headers("GET", path, None, params_map);
+        let headers = self
+            .build_auth_headers("GET", path, None, params_map)
+            .await?;
 
         let mut request = self.client.get(&url);
         if let Some(p) = params {
@@ -134,13 +136,15 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn post<T: DeserializeOwned, B: serde::Serialize>(
-        &self,
+        &mut self,
         path: &str,
         body: &B,
     ) -> Result<T> {
         let url = self.request_url(path);
         let body_str = serde_json::to_string(body).ok();
-        let headers = self.build_auth_headers("POST", path, body_str.as_deref(), HashMap::new());
+        let headers = self
+            .build_auth_headers("POST", path, body_str.as_deref(), HashMap::new())
+            .await?;
         let request = self.client.post(&url).json(body);
         let request = Self::apply_headers(request, &headers);
         let resp = request.send().await.map_err(|e| Error::UnexpectedError {
@@ -159,7 +163,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn delete<T: DeserializeOwned>(
-        &self,
+        &mut self,
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
@@ -173,7 +177,9 @@ impl HttpClient {
             None => HashMap::new(),
         };
 
-        let headers = self.build_auth_headers("DELETE", path, None, params_map);
+        let headers = self
+            .build_auth_headers("DELETE", path, None, params_map)
+            .await?;
 
         let mut request = self.client.delete(&url);
         if let Some(p) = params {
@@ -196,19 +202,19 @@ impl HttpClient {
     }
 
     /// Build auth headers for a request.
-    fn build_auth_headers(
-        &self,
+    async fn build_auth_headers(
+        &mut self,
         method: &str,
         path: &str,
         data: Option<&str>,
         params: HashMap<String, String>,
-    ) -> HashMap<String, String> {
-        if let Some(ref auth_fn) = self.auth_function {
+    ) -> Result<HashMap<String, String>> {
+        if let Some(ref mut auth_fn) = self.auth_function {
             let parameter =
                 RESTAuthParameter::new(method, path, data.map(|s| s.to_string()), params);
-            auth_fn.apply(&parameter)
+            auth_fn.apply(&parameter).await
         } else {
-            HashMap::new()
+            Ok(HashMap::new())
         }
     }
 

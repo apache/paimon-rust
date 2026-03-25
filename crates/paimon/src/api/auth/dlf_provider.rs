@@ -17,17 +17,19 @@
 
 //! DLF Authentication Provider for Alibaba Cloud Data Lake Formation.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::base::{AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
 use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
 use crate::common::{CatalogOptions, Options};
+use crate::error::Error;
+use crate::Result;
 
 // ============================================================================
 // DLF Token and Token Loader
@@ -74,8 +76,8 @@ impl DLFToken {
         access_key_id: impl Into<String>,
         access_key_secret: impl Into<String>,
         security_token: Option<String>,
-        expiration: Option<String>,
         expiration_at_millis: Option<i64>,
+        expiration: Option<String>,
     ) -> Self {
         let access_key_id = access_key_id.into();
         let access_key_secret = access_key_secret.into();
@@ -91,8 +93,8 @@ impl DLFToken {
             access_key_id,
             access_key_secret,
             security_token,
-            expiration,
             expiration_at_millis,
+            expiration,
         }
     }
 
@@ -122,9 +124,10 @@ impl DLFToken {
     }
 }
 /// Trait for DLF token loaders.
-pub trait DLFTokenLoader {
-    /// Load a DLF token (sync version).
-    fn load_token(&self) -> Result<DLFToken, String>;
+#[async_trait]
+pub trait DLFTokenLoader: Send + Sync {
+    /// Load a DLF token.
+    async fn load_token(&self) -> Result<DLFToken>;
 
     /// Get a description of the loader.
     fn description(&self) -> &str;
@@ -157,14 +160,17 @@ impl DLFECSTokenLoader {
     }
 
     /// Get the role name from ECS metadata service.
-    fn get_role(&self) -> Result<String, String> {
-        self.http_client.get(&self.ecs_metadata_url)
+    async fn get_role(&self) -> Result<String> {
+        self.http_client.get(&self.ecs_metadata_url).await
     }
 
     /// Get the token from ECS metadata service.
-    fn get_token(&self, url: &str) -> Result<DLFToken, String> {
-        let token_json = self.http_client.get(url)?;
-        serde_json::from_str(&token_json).map_err(|e| format!("Failed to parse token JSON: {}", e))
+    async fn get_token(&self, url: &str) -> Result<DLFToken> {
+        let token_json = self.http_client.get(url).await?;
+        serde_json::from_str(&token_json).map_err(|e| Error::DataInvalid {
+            message: format!("Failed to parse token JSON: {}", e),
+            source: None,
+        })
     }
 
     /// Build the token URL from base URL and role name.
@@ -174,14 +180,14 @@ impl DLFECSTokenLoader {
     }
 }
 
+#[async_trait]
 impl DLFTokenLoader for DLFECSTokenLoader {
-    fn load_token(&self) -> Result<DLFToken, String> {
+    async fn load_token(&self) -> Result<DLFToken> {
         let role_name = match &self.role_name {
             Some(name) => name.clone(),
             None => {
                 // Fetch role name from metadata service
-                self.get_role()
-                    .map_err(|e| format!("Get role failed, error: {}", e))?
+                self.get_role().await?
             }
         };
 
@@ -189,8 +195,7 @@ impl DLFTokenLoader for DLFECSTokenLoader {
         let token_url = self.build_token_url(&role_name);
 
         // Get token
-        self.get_token(&token_url)
-            .map_err(|e| format!("Get token failed, error: {}", e))
+        self.get_token(&token_url).await
     }
 
     fn description(&self) -> &str {
@@ -239,7 +244,7 @@ const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 /// (ROA v2 HMAC-SHA1).
 pub struct DLFAuthProvider {
     uri: String,
-    token: RefCell<Option<DLFToken>>,
+    token: Option<DLFToken>,
     token_loader: Option<Arc<dyn DLFTokenLoader>>,
     signer: Box<dyn DLFRequestSigner>,
 }
@@ -252,17 +257,19 @@ impl DLFAuthProvider {
     /// * `token` - Optional DLF token containing access credentials
     /// * `token_loader` - Optional token loader for dynamic token retrieval
     ///
-    /// # Panics
-    /// Panics if both `token` and `token_loader` are `None`.
+    /// # Errors
+    /// Returns an error if both `token` and `token_loader` are `None`.
     pub fn new(
         uri: impl Into<String>,
         region: impl Into<String>,
         signing_algorithm: impl Into<String>,
         token: Option<DLFToken>,
         token_loader: Option<Arc<dyn DLFTokenLoader>>,
-    ) -> Self {
+    ) -> Result<Self> {
         if token.is_none() && token_loader.is_none() {
-            panic!("Either token or token_loader must be provided");
+            return Err(Error::ConfigInvalid {
+                message: "Either token or token_loader must be provided".to_string(),
+            });
         }
 
         let uri = uri.into();
@@ -270,12 +277,12 @@ impl DLFAuthProvider {
         let signing_algorithm = signing_algorithm.into();
         let signer = DLFSignerFactory::create_signer(&signing_algorithm, &region);
 
-        Self {
+        Ok(Self {
             uri,
-            token: RefCell::new(token),
+            token,
             token_loader,
             signer,
-        }
+        })
     }
 
     /// Get or refresh the token.
@@ -283,34 +290,29 @@ impl DLFAuthProvider {
     /// If token_loader is configured, this method will:
     /// - Load a new token if current token is None
     /// - Refresh the token if it's about to expire (within TOKEN_EXPIRATION_SAFE_TIME_MILLIS)
-    fn get_token(&self) -> Result<DLFToken, String> {
-        if let Some(ref loader) = self.token_loader {
-            let need_reload = {
-                let token_ref = self.token.borrow();
-                if token_ref.is_none() {
-                    true
-                } else if let Some(ref token) = *token_ref {
-                    if let Some(expiration_at_millis) = token.expiration_at_millis {
+    async fn get_or_refresh_token(&mut self) -> Result<DLFToken> {
+        if let Some(loader) = &self.token_loader {
+            let need_reload = match &self.token {
+                None => true,
+                Some(token) => match token.expiration_at_millis {
+                    Some(expiration_at_millis) => {
                         let now = chrono::Utc::now().timestamp_millis();
                         expiration_at_millis - now < TOKEN_EXPIRATION_SAFE_TIME_MILLIS
-                    } else {
-                        false
                     }
-                } else {
-                    false
-                }
+                    None => false,
+                },
             };
 
             if need_reload {
-                let new_token = loader.load_token()?;
-                *self.token.borrow_mut() = Some(new_token);
+                let new_token = loader.load_token().await?;
+                self.token = Some(new_token);
             }
         }
 
-        self.token
-            .borrow()
-            .clone()
-            .ok_or_else(|| "Either token or token_loader must be provided".to_string())
+        self.token.clone().ok_or_else(|| Error::DataInvalid {
+            message: "Either token or token_loader must be provided".to_string(),
+            source: None,
+        })
     }
 
     /// Extract host from URI.
@@ -325,20 +327,15 @@ impl DLFAuthProvider {
     }
 }
 
+#[async_trait]
 impl AuthProvider for DLFAuthProvider {
-    fn merge_auth_header(
-        &self,
+    async fn merge_auth_header(
+        &mut self,
         mut base_header: HashMap<String, String>,
         rest_auth_parameter: &RESTAuthParameter,
-    ) -> HashMap<String, String> {
+    ) -> crate::Result<HashMap<String, String>> {
         // Get token (will auto-refresh if needed via token_loader)
-        let token = match self.get_token() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to get token: {}", e);
-                return base_header;
-            }
-        };
+        let token = self.get_or_refresh_token().await?;
 
         let now = Utc::now();
         let host = Self::extract_host(&self.uri);
@@ -360,7 +357,7 @@ impl AuthProvider for DLFAuthProvider {
         base_header.extend(sign_headers);
         base_header.insert(AUTHORIZATION_HEADER_KEY.to_string(), authorization);
 
-        base_header
+        Ok(base_header)
     }
 }
 
@@ -392,15 +389,16 @@ impl TokenHTTPClient {
         }
     }
 
-    /// Perform HTTP GET request with retry logic (sync version).
-    fn get(&self, url: &str) -> Result<String, String> {
+    /// Perform HTTP GET request with retry logic.
+    async fn get(&self, url: &str) -> Result<String> {
         let mut last_error = String::new();
         for attempt in 0..self.max_retries {
-            match self.client.get(url).send() {
+            match self.client.get(url).send().await {
                 Ok(response) if response.status().is_success() => {
-                    return response
-                        .text()
-                        .map_err(|e| format!("Failed to read response: {}", e));
+                    return response.text().await.map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to read response: {}", e),
+                        source: None,
+                    });
                 }
                 Ok(response) => {
                     last_error = format!("HTTP error: {}", response.status());
@@ -413,17 +411,14 @@ impl TokenHTTPClient {
             if attempt < self.max_retries - 1 {
                 // Exponential backoff
                 let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
-                std::thread::sleep(delay);
+                tokio::time::sleep(delay).await;
             }
         }
 
-        Err(last_error)
-    }
-}
-
-impl Default for TokenHTTPClient {
-    fn default() -> Self {
-        Self::new()
+        Err(Error::DataInvalid {
+            message: last_error,
+            source: None,
+        })
     }
 }
 

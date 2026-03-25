@@ -110,7 +110,7 @@ impl ResourcePaths {
             "{}/{}/{}/{}",
             self.base_path,
             Self::DATABASES,
-            database_name,
+            RESTUtil::encode_string(database_name),
             Self::TABLE_DETAILS
         )
     }

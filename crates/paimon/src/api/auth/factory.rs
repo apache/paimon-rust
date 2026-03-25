@@ -56,7 +56,7 @@ impl DLFAuthProviderFactory {
             let host = host.split('/').next().unwrap_or("");
             let host = host.split(':').next().unwrap_or("");
 
-            if host.starts_with("dlfnext") || host.contains("openapi") {
+            if host.starts_with("dlfnext") {
                 return Self::OPENAPI_IDENTIFIER;
             }
         }
@@ -104,7 +104,7 @@ impl DLFAuthProviderFactory {
             signing_algorithm,
             DLFToken::from_options(options),
             DLFTokenLoaderFactory::create_token_loader(options),
-        );
+        )?;
 
         Ok(Box::new(dlf_provider))
     }
@@ -156,17 +156,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    #[test]
-    fn test_create_bearer_provider() {
+    #[tokio::test]
+    async fn test_create_bearer_provider() {
         let mut options = Options::new();
         options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
         options.set(CatalogOptions::TOKEN, "test-token");
 
-        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let mut provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
 
         let base_header = HashMap::new();
         let param = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
-        let result = provider.merge_auth_header(base_header, &param);
+        let result = provider
+            .merge_auth_header(base_header, &param)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.get("Authorization"),
@@ -190,8 +193,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_create_dlf_provider() {
+    #[tokio::test]
+    async fn test_create_dlf_provider() {
         let mut options = Options::new();
         options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
         options.set(CatalogOptions::URI, "http://dlf-asdaswfnb.net/");
@@ -199,11 +202,14 @@ mod tests {
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
         options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
 
-        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let mut provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
 
         let base_header = HashMap::new();
         let param = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
-        let result = provider.merge_auth_header(base_header, &param);
+        let result = provider
+            .merge_auth_header(base_header, &param)
+            .await
+            .unwrap();
 
         assert!(result.contains_key(AUTHORIZATION_HEADER_KEY));
     }

@@ -24,9 +24,6 @@ use std::collections::HashMap;
 
 use crate::{catalog::Identifier, spec::Schema};
 
-/// Base trait for REST requests.
-pub trait RESTRequest {}
-
 /// Request to create a new database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,8 +33,6 @@ pub struct CreateDatabaseRequest {
     /// Optional configuration options for the database.
     pub options: HashMap<String, String>,
 }
-
-impl RESTRequest for CreateDatabaseRequest {}
 
 impl CreateDatabaseRequest {
     /// Create a new CreateDatabaseRequest.
@@ -56,8 +51,6 @@ pub struct AlterDatabaseRequest {
     pub updates: HashMap<String, String>,
 }
 
-impl RESTRequest for AlterDatabaseRequest {}
-
 impl AlterDatabaseRequest {
     /// Create a new AlterDatabaseRequest.
     pub fn new(removals: Vec<String>, updates: HashMap<String, String>) -> Self {
@@ -74,8 +67,6 @@ pub struct RenameTableRequest {
     /// The destination table identifier.
     pub destination: Identifier,
 }
-
-impl RESTRequest for RenameTableRequest {}
 
 impl RenameTableRequest {
     /// Create a new RenameTableRequest.
@@ -96,8 +87,6 @@ pub struct CreateTableRequest {
     /// The schema definition for the table.
     pub schema: Schema,
 }
-
-impl RESTRequest for CreateTableRequest {}
 
 impl CreateTableRequest {
     /// Create a new CreateTableRequest.

@@ -73,7 +73,7 @@ async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
 // ==================== Database Tests ====================
 #[tokio::test]
 async fn test_list_databases() {
-    let ctx = setup_test_server(vec!["default", "test_db1", "prod_db"]).await;
+    let mut ctx = setup_test_server(vec!["default", "test_db1", "prod_db"]).await;
 
     let dbs = ctx.api.list_databases().await.unwrap();
 
@@ -84,7 +84,7 @@ async fn test_list_databases() {
 
 #[tokio::test]
 async fn test_create_database() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Create new database
     let result = ctx.api.create_database("new_db", None).await;
@@ -101,7 +101,7 @@ async fn test_create_database() {
 
 #[tokio::test]
 async fn test_get_database() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     let db_resp = ctx.api.get_database("default").await.unwrap();
     assert_eq!(db_resp.name, Some("default".to_string()));
@@ -162,7 +162,7 @@ async fn test_error_responses_status_mapping() {
 
 #[tokio::test]
 async fn test_list_tables_and_get_table() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Add tables
     ctx.server.add_table("default", "table1");
@@ -184,7 +184,7 @@ async fn test_list_tables_and_get_table() {
 
 #[tokio::test]
 async fn test_get_table_not_found() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     let result = ctx
         .api
@@ -195,7 +195,7 @@ async fn test_get_table_not_found() {
 
 #[tokio::test]
 async fn test_list_tables_empty_database() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     let tables = ctx.api.list_tables("default").await.unwrap();
     assert!(
@@ -207,7 +207,7 @@ async fn test_list_tables_empty_database() {
 
 #[tokio::test]
 async fn test_multiple_databases_with_tables() {
-    let ctx = setup_test_server(vec!["db1", "db2"]).await;
+    let mut ctx = setup_test_server(vec!["db1", "db2"]).await;
 
     // Add tables to different databases
     ctx.server.add_table("db1", "table1_db1");
@@ -230,7 +230,7 @@ async fn test_multiple_databases_with_tables() {
 
 #[tokio::test]
 async fn test_alter_database() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Alter database with updates
     let mut updates = HashMap::new();
@@ -259,7 +259,7 @@ async fn test_alter_database() {
 
 #[tokio::test]
 async fn test_alter_database_not_found() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     let result = ctx
         .api
@@ -273,7 +273,7 @@ async fn test_alter_database_not_found() {
 
 #[tokio::test]
 async fn test_drop_database() {
-    let ctx = setup_test_server(vec!["default", "to_drop"]).await;
+    let mut ctx = setup_test_server(vec!["default", "to_drop"]).await;
 
     // Verify database exists
     let dbs = ctx.api.list_databases().await.unwrap();
@@ -297,7 +297,7 @@ async fn test_drop_database() {
 
 #[tokio::test]
 async fn test_drop_database_no_permission() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
     ctx.server.add_no_permission_database("secret");
 
     let result = ctx.api.drop_database("secret").await;
@@ -311,7 +311,7 @@ async fn test_drop_database_no_permission() {
 
 #[tokio::test]
 async fn test_create_table() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Create a simple schema using builder
     use paimon::spec::{DataType, Schema};
@@ -345,7 +345,7 @@ async fn test_create_table() {
 
 #[tokio::test]
 async fn test_drop_table() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Add a table
     ctx.server.add_table("default", "table_to_drop");
@@ -375,7 +375,7 @@ async fn test_drop_table() {
 
 #[tokio::test]
 async fn test_drop_table_no_permission() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
     ctx.server
         .add_no_permission_table("default", "secret_table");
 
@@ -390,7 +390,7 @@ async fn test_drop_table_no_permission() {
 
 #[tokio::test]
 async fn test_rename_table() {
-    let ctx = setup_test_server(vec!["default"]).await;
+    let mut ctx = setup_test_server(vec!["default"]).await;
 
     // Add a table
     ctx.server.add_table("default", "old_table");
@@ -451,14 +451,9 @@ async fn test_ecs_loader_token() {
 
     let ecs_metadata_url = format!("{}/ram/security-credentials/", server.url().unwrap());
 
-    // Test without role name (use spawn_blocking for sync load_token)
-    let ecs_metadata_url_clone = ecs_metadata_url.clone();
-    let load_token: DLFToken = tokio::task::spawn_blocking(move || {
-        let loader = DLFECSTokenLoader::new(&ecs_metadata_url_clone, None);
-        loader.load_token().unwrap()
-    })
-    .await
-    .unwrap();
+    // Test without role name
+    let loader = DLFECSTokenLoader::new(&ecs_metadata_url, None);
+    let load_token: DLFToken = loader.load_token().await.unwrap();
 
     assert_eq!(load_token.access_key_id, "AccessKeyId");
     assert_eq!(load_token.access_key_secret, "AccessKeySecret");
@@ -471,14 +466,9 @@ async fn test_ecs_loader_token() {
         Some("2023-12-01T12:00:00Z".to_string())
     );
 
-    // Test with role name (use spawn_blocking for sync load_token)
-    let role_name_owned = role_name.to_string();
-    let token: DLFToken = tokio::task::spawn_blocking(move || {
-        let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name_owned));
-        loader_with_role.load_token().unwrap()
-    })
-    .await
-    .unwrap();
+    // Test with role name
+    let loader_with_role = DLFECSTokenLoader::new(&ecs_metadata_url, Some(role_name.to_string()));
+    let token: DLFToken = loader_with_role.load_token().await.unwrap();
 
     assert_eq!(token.access_key_id, "AccessKeyId");
     assert_eq!(token.access_key_secret, "AccessKeySecret");

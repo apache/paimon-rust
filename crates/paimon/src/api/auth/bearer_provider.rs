@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 use super::base::{AuthProvider, RESTAuthParameter};
 
 /// Authentication provider using Bearer token.
@@ -41,17 +43,18 @@ impl BearerTokenAuthProvider {
     }
 }
 
+#[async_trait]
 impl AuthProvider for BearerTokenAuthProvider {
-    fn merge_auth_header(
-        &self,
+    async fn merge_auth_header(
+        &mut self,
         mut base_header: HashMap<String, String>,
         _parameter: &RESTAuthParameter,
-    ) -> HashMap<String, String> {
+    ) -> crate::Result<HashMap<String, String>> {
         base_header.insert(
             "Authorization".to_string(),
             format!("Bearer {}", self.token),
         );
-        base_header
+        Ok(base_header)
     }
 }
 
@@ -59,13 +62,16 @@ impl AuthProvider for BearerTokenAuthProvider {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_bearer_token_auth() {
-        let provider = BearerTokenAuthProvider::new("test-token");
+    #[tokio::test]
+    async fn test_bearer_token_auth() {
+        let mut provider = BearerTokenAuthProvider::new("test-token");
         let base_header = HashMap::new();
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
 
-        let headers = provider.merge_auth_header(base_header, &parameter);
+        let headers = provider
+            .merge_auth_header(base_header, &parameter)
+            .await
+            .unwrap();
 
         assert_eq!(
             headers.get("Authorization"),
@@ -73,14 +79,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bearer_token_with_base_headers() {
-        let provider = BearerTokenAuthProvider::new("my-token");
+    #[tokio::test]
+    async fn test_bearer_token_with_base_headers() {
+        let mut provider = BearerTokenAuthProvider::new("my-token");
         let mut base_header = HashMap::new();
         base_header.insert("Content-Type".to_string(), "application/json".to_string());
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
 
-        let headers = provider.merge_auth_header(base_header, &parameter);
+        let headers = provider
+            .merge_auth_header(base_header, &parameter)
+            .await
+            .unwrap();
 
         assert_eq!(
             headers.get("Authorization"),

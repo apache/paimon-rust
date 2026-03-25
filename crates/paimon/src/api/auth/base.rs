@@ -19,6 +19,10 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
+use crate::Result;
+
 /// Parameter for REST authentication.
 ///
 /// Contains information about the request being authenticated.
@@ -70,7 +74,8 @@ impl RESTAuthParameter {
 ///
 /// Implement this trait to provide custom authentication mechanisms
 /// for REST API requests.
-pub trait AuthProvider {
+#[async_trait]
+pub trait AuthProvider: Send {
     /// Merge authentication headers into the base headers.
     ///
     /// # Arguments
@@ -78,11 +83,11 @@ pub trait AuthProvider {
     /// * `parameter` - Information about the request being authenticated
     ///
     /// # Returns
-    fn merge_auth_header(
-        &self,
+    async fn merge_auth_header(
+        &mut self,
         base_header: HashMap<String, String>,
         parameter: &RESTAuthParameter,
-    ) -> HashMap<String, String>;
+    ) -> Result<HashMap<String, String>>;
 }
 /// Authorization header key.
 pub const AUTHORIZATION_HEADER_KEY: &str = "Authorization";
@@ -115,8 +120,12 @@ impl RESTAuthFunction {
     ///
     /// # Returns
     /// A HashMap containing the authenticated headers.
-    pub fn apply(&self, parameter: &RESTAuthParameter) -> HashMap<String, String> {
+    pub async fn apply(
+        &mut self,
+        parameter: &RESTAuthParameter,
+    ) -> Result<HashMap<String, String>> {
         self.auth_provider
             .merge_auth_header(self.init_header.clone(), parameter)
+            .await
     }
 }

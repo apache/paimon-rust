@@ -98,7 +98,7 @@ type HmacSha1 = Hmac<Sha1>;
 ///
 /// - [`DLFDefaultSigner`]: Uses DLF4-HMAC-SHA256 for VPC endpoints
 /// - [`DLFOpenApiSigner`]: Uses HMAC-SHA1 for public endpoints
-pub trait DLFRequestSigner {
+pub trait DLFRequestSigner: Send + Sync {
     /// Generate signature headers for the request.
     fn sign_headers(
         &self,
