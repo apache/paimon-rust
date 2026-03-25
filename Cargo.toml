@@ -17,7 +17,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/paimon", "crates/integration_tests", "bindings/c"]
+members = ["crates/paimon", "crates/integration_tests", "bindings/c", "crates/integrations/datafusion"]
 
 [workspace.package]
 version = "0.0.0"

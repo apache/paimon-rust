@@ -48,7 +48,7 @@ impl HttpClient {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| Error::ConfigInvalid {
-                message: format!("Failed to create HTTP client: {}", e),
+                message: format!("Failed to create HTTP client: {e}"),
             })?;
 
         Ok(HttpClient {
@@ -78,7 +78,7 @@ impl HttpClient {
         let normalized_url = if uri.starts_with("http://") || uri.starts_with("https://") {
             uri.to_string()
         } else {
-            format!("http://{}", uri)
+            format!("http://{uri}")
         };
 
         // Remove trailing slash

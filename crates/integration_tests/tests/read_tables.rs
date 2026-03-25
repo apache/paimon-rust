@@ -9,28 +9,27 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on
-// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
 //! Integration tests for reading Paimon tables provisioned by Spark.
 
-use arrow_array::{Int32Array, StringArray};
+use arrow_array::{Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::catalog::Identifier;
-use paimon::{Catalog, FileSystemCatalog};
+use paimon::{Catalog, FileSystemCatalog, Plan};
+use std::collections::HashSet;
 
-/// Get the test warehouse path from environment variable or use default.
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
 }
 
-async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
+async fn scan_and_read(table_name: &str) -> (Plan, Vec<RecordBatch>) {
     let warehouse = get_test_warehouse();
     let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
-
     let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)
@@ -38,14 +37,13 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
         .expect("Failed to get table");
 
     let read_builder = table.new_read_builder();
-    let read = read_builder.new_read().expect("Failed to create read");
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
 
+    let read = read_builder.new_read().expect("Failed to create read");
     let stream = read
         .to_arrow(plan.splits())
         .expect("Failed to create arrow stream");
-
     let batches: Vec<_> = stream
         .try_collect()
         .await
@@ -55,47 +53,57 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
         !batches.is_empty(),
         "Expected at least one batch from table {table_name}"
     );
+    (plan, batches)
+}
 
-    let mut actual_rows: Vec<(i32, String)> = Vec::new();
-
-    for batch in &batches {
-        let id_array = batch
+fn extract_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let id = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .expect("Expected Int32Array for id column");
-        let name_array = batch
+            .expect("Expected Int32Array for id");
+        let name = batch
             .column_by_name("name")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .expect("Expected StringArray for name column");
-
+            .expect("Expected StringArray for name");
         for i in 0..batch.num_rows() {
-            actual_rows.push((id_array.value(i), name_array.value(i).to_string()));
+            rows.push((id.value(i), name.value(i).to_string()));
         }
     }
-
-    actual_rows.sort_by_key(|(id, _)| *id);
-    actual_rows
+    rows.sort_by_key(|(id, _)| *id);
+    rows
 }
 
 #[tokio::test]
 async fn test_read_log_table() {
-    let actual_rows = read_rows("simple_log_table").await;
-    let expected_rows = vec![
+    let (plan, batches) = scan_and_read("simple_log_table").await;
+
+    // Non-partitioned table: partition should be a valid arity=0 BinaryRow
+    // deserialized from manifest bytes, not a stub without backing data.
+    for split in plan.splits() {
+        let partition = split.partition();
+        assert_eq!(partition.arity(), 0);
+        assert!(
+            !partition.is_empty(),
+            "Non-partitioned split should have backing data from manifest deserialization"
+        );
+    }
+
+    let actual = extract_id_name(&batches);
+    let expected = vec![
         (1, "alice".to_string()),
         (2, "bob".to_string()),
         (3, "carol".to_string()),
     ];
-
-    assert_eq!(
-        actual_rows, expected_rows,
-        "Rows should match expected values"
-    );
+    assert_eq!(actual, expected, "Rows should match expected values");
 }
 
 #[tokio::test]
 async fn test_read_dv_primary_key_table() {
-    let actual_rows = read_rows("simple_dv_pk_table").await;
-    let expected_rows = vec![
+    let (_, batches) = scan_and_read("simple_dv_pk_table").await;
+    let actual = extract_id_name(&batches);
+    let expected = vec![
         (1, "alice-v2".to_string()),
         (2, "bob-v2".to_string()),
         (3, "carol-v2".to_string()),
@@ -103,9 +111,185 @@ async fn test_read_dv_primary_key_table() {
         (5, "eve-v2".to_string()),
         (6, "frank-v1".to_string()),
     ];
+    assert_eq!(
+        actual, expected,
+        "DV-enabled PK table should only expose the latest row per key"
+    );
+}
+
+#[tokio::test]
+async fn test_read_partitioned_log_table() {
+    let (plan, batches) = scan_and_read("partitioned_log_table").await;
+
+    let mut seen_partitions: HashSet<String> = HashSet::new();
+    for split in plan.splits() {
+        let partition = split.partition();
+        assert_eq!(partition.arity(), 1);
+        assert!(!partition.is_empty());
+        let dt = partition.get_string(0).expect("Failed to decode dt");
+        let expected_suffix = format!("dt={dt}/bucket-{}", split.bucket());
+        assert!(
+            split.bucket_path().ends_with(&expected_suffix),
+            "bucket_path should end with '{expected_suffix}', got: {}",
+            split.bucket_path()
+        );
+        seen_partitions.insert(dt.to_string());
+    }
+    assert_eq!(
+        seen_partitions,
+        HashSet::from(["2024-01-01".into(), "2024-01-02".into()])
+    );
+
+    let mut rows: Vec<(i32, String, String)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let dt = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("dt");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).into(), dt.value(i).into()));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
 
     assert_eq!(
-        actual_rows, expected_rows,
-        "DV-enabled PK table should only expose the latest row per key"
+        rows,
+        vec![
+            (1, "alice".into(), "2024-01-01".into()),
+            (2, "bob".into(), "2024-01-01".into()),
+            (3, "carol".into(), "2024-01-02".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_read_multi_partitioned_log_table() {
+    let (plan, batches) = scan_and_read("multi_partitioned_log_table").await;
+
+    let mut seen_partitions: HashSet<(String, i32)> = HashSet::new();
+    for split in plan.splits() {
+        let partition = split.partition();
+        assert_eq!(partition.arity(), 2);
+        assert!(!partition.is_empty());
+        let dt = partition.get_string(0).expect("Failed to decode dt");
+        let hr = partition.get_int(1).expect("Failed to decode hr");
+        let expected_suffix = format!("dt={dt}/hr={hr}/bucket-{}", split.bucket());
+        assert!(
+            split.bucket_path().ends_with(&expected_suffix),
+            "bucket_path should end with '{expected_suffix}', got: {}",
+            split.bucket_path()
+        );
+        seen_partitions.insert((dt.to_string(), hr));
+    }
+    assert_eq!(
+        seen_partitions,
+        HashSet::from([
+            ("2024-01-01".into(), 10),
+            ("2024-01-01".into(), 20),
+            ("2024-01-02".into(), 10),
+        ])
+    );
+
+    let mut rows: Vec<(i32, String, String, i32)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let dt = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("dt");
+        let hr = batch
+            .column_by_name("hr")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("hr");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                id.value(i),
+                name.value(i).into(),
+                dt.value(i).into(),
+                hr.value(i),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".into(), "2024-01-01".into(), 10),
+            (2, "bob".into(), "2024-01-01".into(), 10),
+            (3, "carol".into(), "2024-01-01".into(), 20),
+            (4, "dave".into(), "2024-01-02".into(), 10),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_read_partitioned_dv_pk_table() {
+    let (plan, batches) = scan_and_read("partitioned_dv_pk_table").await;
+
+    // Verify partition metadata on each split.
+    let mut seen_partitions: HashSet<String> = HashSet::new();
+    for split in plan.splits() {
+        let partition = split.partition();
+        assert_eq!(partition.arity(), 1);
+        assert!(!partition.is_empty());
+        let dt = partition.get_string(0).expect("Failed to decode dt");
+        let expected_suffix = format!("dt={dt}/bucket-{}", split.bucket());
+        assert!(
+            split.bucket_path().ends_with(&expected_suffix),
+            "bucket_path should end with '{expected_suffix}', got: {}",
+            split.bucket_path()
+        );
+        seen_partitions.insert(dt.to_string());
+    }
+    assert_eq!(
+        seen_partitions,
+        HashSet::from(["2024-01-01".into(), "2024-01-02".into()])
+    );
+
+    let mut rows: Vec<(i32, String, String)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let dt = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("dt");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).into(), dt.value(i).into()));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".into(), "2024-01-01".into()),
+            (1, "alice-v1".into(), "2024-01-02".into()),
+            (2, "bob-v2".into(), "2024-01-01".into()),
+            (3, "carol-v2".into(), "2024-01-02".into()),
+            (4, "dave-v2".into(), "2024-01-02".into()),
+        ]
     );
 }

@@ -54,3 +54,4 @@ pub(crate) mod stats;
 mod types;
 pub use types::*;
 mod partition_utils;
+pub(crate) use partition_utils::PartitionComputer;

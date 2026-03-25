@@ -83,10 +83,11 @@ impl BinaryRow {
         }
     }
 
-    /// Create a BinaryRow from raw binary bytes (e.g. from `ManifestEntry._PARTITION`).
+    /// Create a BinaryRow from raw binary bytes.
     ///
     /// The `data` must contain the full binary row content:
     /// header + null bit set + fixed-length part + variable-length part.
+    /// Does NOT include the 4-byte arity prefix (use `from_serialized_bytes` for that).
     pub fn from_bytes(arity: i32, data: Vec<u8>) -> Self {
         let null_bits_size_in_bytes = Self::cal_bit_set_width_in_bytes(arity);
         Self {
@@ -94,6 +95,28 @@ impl BinaryRow {
             null_bits_size_in_bytes,
             data,
         }
+    }
+
+    /// Create a BinaryRow from Paimon's serialized format (e.g. `ManifestEntry._PARTITION`).
+    ///
+    /// Java `SerializationUtils.serializeBinaryRow()` prepends a 4-byte big-endian arity
+    /// before the raw BinaryRow content. This method reads that prefix and strips it,
+    /// matching Java `SerializationUtils.deserializeBinaryRow()`.
+    ///
+    /// Variable-length field offsets inside the BinaryRow content are relative to the
+    /// BinaryRow base, so they remain valid after stripping the 4-byte prefix.
+    pub fn from_serialized_bytes(data: &[u8]) -> crate::Result<Self> {
+        if data.len() < 4 {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: serialized data too short for arity prefix: {} bytes",
+                    data.len()
+                ),
+                source: None,
+            });
+        }
+        let arity = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        Ok(Self::from_bytes(arity, data[4..].to_vec()))
     }
 
     /// Number of fields in this row.
@@ -589,6 +612,30 @@ mod tests {
         assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(56), 8);
         // arity=57: ((57 + 63 + 8) / 64) * 8 = (128/64)*8 = 2*8 = 16
         assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(57), 16);
+    }
+
+    #[test]
+    fn test_from_serialized_bytes() {
+        // Build a raw BinaryRow with arity=1, int value 42, then prepend 4-byte BE arity prefix
+        // to simulate Java SerializationUtils.serializeBinaryRow() format.
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_int(0, 42);
+        let raw_row = builder.build();
+        let raw_data = raw_row.data();
+
+        let mut serialized = Vec::with_capacity(4 + raw_data.len());
+        serialized.extend_from_slice(&1_i32.to_be_bytes());
+        serialized.extend_from_slice(raw_data);
+
+        let row = BinaryRow::from_serialized_bytes(&serialized).unwrap();
+        assert_eq!(row.arity(), 1);
+        assert!(!row.is_null_at(0));
+        assert_eq!(row.get_int(0).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_too_short() {
+        assert!(BinaryRow::from_serialized_bytes(&[0, 0]).is_err());
     }
 
     #[test]

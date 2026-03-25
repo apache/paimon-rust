@@ -139,7 +139,7 @@ impl AuthProviderFactory {
             }
             Some("dlf") => DLFAuthProviderFactory::create_provider(options),
             Some(unknown) => Err(Error::ConfigInvalid {
-                message: format!("Unknown auth provider: {}", unknown),
+                message: format!("Unknown auth provider: {unknown}"),
             }),
             None => Err(Error::ConfigInvalid {
                 message: "auth provider is required".to_string(),

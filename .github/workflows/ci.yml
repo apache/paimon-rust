@@ -96,6 +96,12 @@ jobs:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
+      - name: DataFusion Integration Test
+        run: cargo test -p paimon-datafusion --test read_tables
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
       - name: Go Integration Test
         working-directory: bindings/go
         run: make test

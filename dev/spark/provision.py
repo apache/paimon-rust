@@ -110,6 +110,92 @@ def main():
         """
     )
 
+    # ===== Partitioned table: single partition key (dt) =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS partitioned_log_table (
+            id INT,
+            name STRING,
+            dt STRING
+        ) USING paimon
+        PARTITIONED BY (dt)
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_log_table VALUES
+            (1, 'alice', '2024-01-01'),
+            (2, 'bob', '2024-01-01'),
+            (3, 'carol', '2024-01-02')
+        """
+    )
+
+    # ===== Partitioned table: multiple partition keys (dt, hr) =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS multi_partitioned_log_table (
+            id INT,
+            name STRING,
+            dt STRING,
+            hr INT
+        ) USING paimon
+        PARTITIONED BY (dt, hr)
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO multi_partitioned_log_table VALUES
+            (1, 'alice', '2024-01-01', 10),
+            (2, 'bob', '2024-01-01', 10),
+            (3, 'carol', '2024-01-01', 20),
+            (4, 'dave', '2024-01-02', 10)
+    """
+    )
+
+    # ===== Partitioned table: PK + DV enabled =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS partitioned_dv_pk_table (
+            id INT,
+            name STRING,
+            dt STRING
+        ) USING paimon
+        PARTITIONED BY (dt)
+        TBLPROPERTIES (
+            'primary-key' = 'id,dt',
+            'bucket' = '1',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+
+    spark.sql(
+        """
+        INSERT INTO partitioned_dv_pk_table VALUES
+            (1, 'alice-v1', '2024-01-01'),
+            (2, 'bob-v1', '2024-01-01'),
+            (1, 'alice-v1', '2024-01-02'),
+            (3, 'carol-v1', '2024-01-02')
+        """
+    )
+
+    spark.sql(
+        """
+        INSERT INTO partitioned_dv_pk_table VALUES
+            (1, 'alice-v2', '2024-01-01'),
+            (3, 'carol-v2', '2024-01-02'),
+            (4, 'dave-v1', '2024-01-02')
+        """
+    )
+
+    spark.sql(
+        """
+        INSERT INTO partitioned_dv_pk_table VALUES
+            (2, 'bob-v2', '2024-01-01'),
+            (4, 'dave-v2', '2024-01-02')
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

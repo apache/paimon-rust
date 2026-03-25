@@ -17,6 +17,8 @@
 
 #[cfg(feature = "storage-oss")]
 use opendal::services::OssConfig;
+#[cfg(feature = "storage-s3")]
+use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
 
 use crate::error;
@@ -32,6 +34,8 @@ pub enum Storage {
     LocalFs,
     #[cfg(feature = "storage-oss")]
     Oss { config: Box<OssConfig> },
+    #[cfg(feature = "storage-s3")]
+    S3 { config: Box<S3Config> },
 }
 
 impl Storage {
@@ -48,6 +52,13 @@ impl Storage {
             Scheme::Oss => {
                 let config = super::oss_config_parse(_props)?;
                 Ok(Self::Oss {
+                    config: Box::new(config),
+                })
+            }
+            #[cfg(feature = "storage-s3")]
+            Scheme::S3 => {
+                let config = super::s3_config_parse(_props)?;
+                Ok(Self::S3 {
                     config: Box::new(config),
                 })
             }
@@ -91,6 +102,26 @@ impl Storage {
                     })
                 }
             }
+            #[cfg(feature = "storage-s3")]
+            Storage::S3 { config } => {
+                let op = super::s3_config_build(config, path)?;
+                // Support both s3:// and s3a:// URL prefixes.
+                let info = op.info();
+                let bucket = info.name();
+                let s3_prefix = format!("s3://{}/", bucket);
+                let s3a_prefix = format!("s3a://{}/", bucket);
+                if let Some(stripped) = path.strip_prefix(&s3_prefix) {
+                    Ok((op, stripped))
+                } else if let Some(stripped) = path.strip_prefix(&s3a_prefix) {
+                    Ok((op, stripped))
+                } else {
+                    Err(error::Error::ConfigInvalid {
+                        message: format!(
+                            "Invalid S3 url: {path}, should start with {s3_prefix} or {s3a_prefix}"
+                        ),
+                    })
+                }
+            }
         }
     }
 
@@ -98,6 +129,7 @@ impl Storage {
         match scheme {
             "memory" => Ok(Scheme::Memory),
             "file" | "" => Ok(Scheme::Fs),
+            "s3" | "s3a" => Ok(Scheme::S3),
             s => Ok(s.parse::<Scheme>()?),
         }
     }

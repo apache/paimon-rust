@@ -15,28 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod file_io;
-pub use file_io::*;
+use datafusion::common::error::GenericError;
 
-mod storage;
-pub use storage::*;
-
-#[cfg(feature = "storage-fs")]
-mod storage_fs;
-#[cfg(feature = "storage-fs")]
-use storage_fs::*;
-
-#[cfg(feature = "storage-memory")]
-mod storage_memory;
-#[cfg(feature = "storage-memory")]
-use storage_memory::*;
-
-#[cfg(feature = "storage-oss")]
-mod storage_oss;
-#[cfg(feature = "storage-oss")]
-use storage_oss::*;
-
-#[cfg(feature = "storage-s3")]
-mod storage_s3;
-#[cfg(feature = "storage-s3")]
-use storage_s3::*;
+/// Converts a Paimon error into a DataFusion error.
+pub fn to_datafusion_error(error: paimon::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(GenericError::from(error))
+}

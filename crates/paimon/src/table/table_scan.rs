@@ -22,7 +22,9 @@
 
 use super::Table;
 use crate::io::FileIO;
-use crate::spec::{BinaryRow, CoreOptions, FileKind, IndexManifest, ManifestEntry, Snapshot};
+use crate::spec::{
+    BinaryRow, CoreOptions, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Snapshot,
+};
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
@@ -172,29 +174,16 @@ impl<'a> TableScan<'a> {
             Some(s) => s,
             None => return Ok(Plan::new(Vec::new())),
         };
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let target_split_size = core_options.source_split_target_size();
-        let open_file_cost = core_options.source_split_open_file_cost();
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
-        Self::plan_snapshot(
-            snapshot,
-            file_io,
-            table_path,
-            target_split_size,
-            open_file_cost,
-            deletion_vectors_enabled,
-        )
-        .await
+        self.plan_snapshot(snapshot).await
     }
 
-    async fn plan_snapshot(
-        snapshot: Snapshot,
-        file_io: &FileIO,
-        table_path: &str,
-        target_split_size: i64,
-        open_file_cost: i64,
-        deletion_vectors_enabled: bool,
-    ) -> crate::Result<Plan> {
+    async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
+        let file_io = self.table.file_io();
+        let table_path = self.table.location();
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let target_split_size = core_options.source_split_target_size();
+        let open_file_cost = core_options.source_split_open_file_cost();
         let entries = read_all_manifest_entries(file_io, table_path, &snapshot).await?;
         let entries = filter_manifest_entries(entries, deletion_vectors_enabled);
         let entries = merge_manifest_entries(entries);
@@ -210,13 +199,24 @@ impl<'a> TableScan<'a> {
         }
 
         let snapshot_id = snapshot.id();
-        let base_path = table_path;
+        let base_path = table_path.trim_end_matches('/');
         let mut splits = Vec::new();
+
+        let partition_keys = self.table.schema().partition_keys();
+        let partition_computer = if !partition_keys.is_empty() {
+            Some(PartitionComputer::new(
+                partition_keys,
+                self.table.schema().fields(),
+                core_options.partition_default_name(),
+                core_options.legacy_partition_name(),
+            )?)
+        } else {
+            None
+        };
 
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
         let deletion_files_map = if let Some(index_manifest_name) = snapshot.index_manifest() {
-            let index_manifest_path =
-                format!("{}/{}", base_path.trim_end_matches('/'), MANIFEST_DIR);
+            let index_manifest_path = format!("{base_path}/{MANIFEST_DIR}");
             let path = format!("{index_manifest_path}/{index_manifest_name}");
             let index_entries = IndexManifest::read(file_io, &path).await?;
             Some(build_deletion_files_map(&index_entries, base_path))
@@ -225,6 +225,8 @@ impl<'a> TableScan<'a> {
         };
 
         for ((partition, bucket), group_entries) in groups {
+            let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
+
             let total_buckets = group_entries
                 .first()
                 .map(|e| e.total_buckets())
@@ -240,18 +242,20 @@ impl<'a> TableScan<'a> {
                 })
                 .collect();
 
-            // todo: consider partitioned table
-            let bucket_path = format!("{base_path}/bucket-{bucket}");
+            let bucket_path = if let Some(ref computer) = partition_computer {
+                let partition_path = computer.generate_partition_path(&partition_row)?;
+                format!("{base_path}/{partition_path}bucket-{bucket}")
+            } else {
+                format!("{base_path}/bucket-{bucket}")
+            };
 
-            // Get the per-bucket deletion file map for looking up by file name after bin packing.
+            // Original `partition` Vec consumed by PartitionBucket for DV map lookup.
             let per_bucket_deletion_map = deletion_files_map
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
             let file_groups = split_for_batch(data_files, target_split_size, open_file_cost);
             for file_group in file_groups {
-                // Build deletion files list for this specific file group (by file name lookup),
-                // matching Python's _get_deletion_files_for_split.
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
@@ -261,8 +265,7 @@ impl<'a> TableScan<'a> {
 
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
-                    // todo: consider pass real partition
-                    .with_partition(BinaryRow::new(0))
+                    .with_partition(partition_row.clone())
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
