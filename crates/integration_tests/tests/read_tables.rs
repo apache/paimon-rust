@@ -20,7 +20,7 @@
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::catalog::Identifier;
-use paimon::{Catalog, FileSystemCatalog, Plan};
+use paimon::{Catalog, Error, FileSystemCatalog, Plan};
 use std::collections::HashSet;
 
 fn get_test_warehouse() -> String {
@@ -291,5 +291,174 @@ async fn test_read_partitioned_dv_pk_table() {
             (3, "carol-v2".into(), "2024-01-02".into()),
             (4, "dave-v2".into(), "2024-01-02".into()),
         ]
+    );
+}
+
+async fn get_test_table(table_name: &str) -> paimon::Table {
+    let warehouse = get_test_warehouse();
+    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
+    let identifier = Identifier::new("default", table_name);
+    catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table")
+}
+
+#[tokio::test]
+async fn test_read_with_column_projection() {
+    let table = get_test_table("partitioned_log_table").await;
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("Failed to plan scan");
+
+    // Input order ["name", "id"] — output must preserve this order (not schema order).
+    let read = table
+        .new_read_builder()
+        .with_projection(&["name", "id"])
+        .new_read()
+        .expect("Failed to create projected read");
+
+    let field_names: Vec<&str> = read.read_type().iter().map(|f| f.name()).collect();
+    assert_eq!(
+        field_names,
+        vec!["name", "id"],
+        "read_type should preserve caller-specified order"
+    );
+
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+    assert!(!batches.is_empty());
+
+    for batch in &batches {
+        let schema = batch.schema();
+        let batch_field_names: Vec<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            batch_field_names,
+            vec!["name", "id"],
+            "RecordBatch schema should preserve caller-specified order"
+        );
+        assert!(
+            batch.column_by_name("dt").is_none(),
+            "Non-projected column 'dt' should be absent"
+        );
+    }
+
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_read_projection_empty() {
+    let table = get_test_table("simple_log_table").await;
+
+    let read = table
+        .new_read_builder()
+        .with_projection(&[])
+        .new_read()
+        .expect("Empty projection should succeed");
+
+    assert_eq!(
+        read.read_type().len(),
+        0,
+        "Empty projection should produce empty read_type"
+    );
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("Failed to plan scan");
+
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+    assert!(!batches.is_empty());
+
+    for batch in &batches {
+        assert_eq!(
+            batch.num_columns(),
+            0,
+            "Empty projection should produce 0-column batches"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_read_projection_unknown_column() {
+    let table = get_test_table("simple_log_table").await;
+
+    let err = table
+        .new_read_builder()
+        .with_projection(&["id", "nonexistent_column"])
+        .new_read()
+        .expect_err("Unknown columns should fail");
+
+    assert!(
+        matches!(
+            &err,
+            Error::ColumnNotExist {
+                full_name,
+                column,
+            } if full_name == "default.simple_log_table" && column == "nonexistent_column"
+        ),
+        "Expected ColumnNotExist for nonexistent_column, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_read_projection_all_invalid() {
+    let table = get_test_table("simple_log_table").await;
+
+    let err = table
+        .new_read_builder()
+        .with_projection(&["nonexistent_a", "nonexistent_b"])
+        .new_read()
+        .expect_err("All-invalid projection should fail");
+
+    assert!(
+        matches!(
+            &err,
+            Error::ColumnNotExist {
+                full_name,
+                column,
+            } if full_name == "default.simple_log_table" && column == "nonexistent_a"
+        ),
+        "Expected ColumnNotExist for nonexistent_a, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_read_projection_duplicate_column() {
+    let table = get_test_table("simple_log_table").await;
+
+    let err = table
+        .new_read_builder()
+        .with_projection(&["id", "id"])
+        .new_read()
+        .expect_err("Duplicate projection should fail");
+
+    assert!(
+        matches!(&err, Error::ConfigInvalid { message } if message.contains("Duplicate projection column 'id'")),
+        "Expected ConfigInvalid for duplicate projection, got: {err:?}"
     );
 }

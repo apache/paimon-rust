@@ -85,12 +85,10 @@ impl ArrowReader {
         // Owned list of splits so the stream does not hold references.
         let splits: Vec<DataSplit> = data_splits.to_vec();
         let read_type = self.read_type;
-        let projected_column_names = (!read_type.is_empty()).then(|| {
-            read_type
-                .iter()
-                .map(|field| field.name().to_string())
-                .collect::<Vec<_>>()
-        });
+        let projected_column_names: Vec<String> = read_type
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
         Ok(try_stream! {
             for split in splits {
                 // Create DV factory for this split only (like Java createReader(partition, bucket, files, deletionFiles)).
@@ -134,15 +132,13 @@ impl ArrowReader {
                     let mut batch_stream_builder =
                         ParquetRecordBatchStreamBuilder::new(arrow_file_reader)
                             .await?;
-                    // Clip to read type columns; file-only columns are dropped.
-                    if let Some(projected_column_names) = projected_column_names.as_ref() {
-                        let parquet_schema = batch_stream_builder.parquet_schema();
-                        let mask = ProjectionMask::columns(
-                            parquet_schema,
-                            projected_column_names.iter().map(String::as_str),
-                        );
-                        batch_stream_builder = batch_stream_builder.with_projection(mask);
-                    }
+                    // ProjectionMask preserves parquet-schema order; read_type order is restored below.
+                    let parquet_schema = batch_stream_builder.parquet_schema().clone();
+                    let mask = ProjectionMask::columns(
+                        &parquet_schema,
+                        projected_column_names.iter().map(String::as_str),
+                    );
+                    batch_stream_builder = batch_stream_builder.with_projection(mask);
 
                     if let Some(dv) = dv {
                         if !dv.is_empty() {
@@ -157,7 +153,30 @@ impl ArrowReader {
                     let mut batch_stream = batch_stream_builder.build()?;
 
                     while let Some(batch) = batch_stream.next().await {
-                        yield batch?
+                        let batch = batch?;
+                        // Reorder columns from parquet-schema order to read_type order.
+                        // Every projected column must exist in the batch; a missing
+                        // column indicates schema mismatch and must not be silenced.
+                        let reorder_indices: Vec<usize> = projected_column_names
+                            .iter()
+                            .map(|name| {
+                                batch.schema().index_of(name).map_err(|_| {
+                                    Error::UnexpectedError {
+                                        message: format!(
+                                            "Projected column '{}' not found in Parquet batch schema",
+                                            name
+                                        ),
+                                        source: None,
+                                    }
+                                })
+                            })
+                            .collect::<crate::Result<Vec<_>>>()?;
+                        yield batch.project(&reorder_indices).map_err(|e| {
+                            Error::UnexpectedError {
+                                message: "Failed to reorder projected columns".to_string(),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
                     }
                 }
             }

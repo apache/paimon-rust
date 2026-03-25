@@ -17,26 +17,40 @@
 
 //! ReadBuilder and TableRead for table read API.
 //!
-//! Reference: [pypaimon.read.read_builder.ReadBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/read_builder.py)
-//! and [pypaimon.table.file_store_table.FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
+//! Reference: [Java ReadBuilder.withProjection](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/ReadBuilder.java)
+//! and [TypeUtils.project](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/utils/TypeUtils.java).
 
 use super::{ArrowRecordBatchStream, Table, TableScan};
 use crate::arrow::ArrowReaderBuilder;
 use crate::spec::{CoreOptions, DataField};
 use crate::Result;
 use crate::{DataSplit, Error};
+use std::collections::{HashMap, HashSet};
 
 /// Builder for table scan and table read (new_scan, new_read).
 ///
-/// Reference: [pypaimon.read.read_builder.ReadBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/read_builder.py)
+/// Rust keeps a names-based projection API for ergonomics, while aligning the
+/// resulting read semantics with Java Paimon's order-preserving projection.
 #[derive(Debug, Clone)]
 pub struct ReadBuilder<'a> {
     table: &'a Table,
+    projected_fields: Option<Vec<String>>,
 }
 
 impl<'a> ReadBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            projected_fields: None,
+        }
+    }
+
+    /// Set column projection by name. Output order follows the caller-specified order.
+    /// Unknown or duplicate names cause `new_read()` to fail; an empty list is a valid
+    /// zero-column projection.
+    pub fn with_projection(mut self, columns: &[&str]) -> Self {
+        self.projected_fields = Some(columns.iter().map(|c| (*c).to_string()).collect());
+        self
     }
 
     /// Create a table scan. Call [TableScan::plan] to get splits.
@@ -46,11 +60,54 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        let read_type = self.table.schema.fields();
+        let read_type = match &self.projected_fields {
+            None => self.table.schema.fields().to_vec(),
+            Some(projected) => self.resolve_projected_fields(projected)?,
+        };
+
         Ok(TableRead {
             table: self.table,
             read_type,
         })
+    }
+
+    fn resolve_projected_fields(&self, projected_fields: &[String]) -> Result<Vec<DataField>> {
+        if projected_fields.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let full_name = self.table.identifier().full_name();
+        let field_map: HashMap<&str, &DataField> = self
+            .table
+            .schema
+            .fields()
+            .iter()
+            .map(|field| (field.name(), field))
+            .collect();
+
+        let mut seen = HashSet::with_capacity(projected_fields.len());
+        let mut resolved = Vec::with_capacity(projected_fields.len());
+
+        for name in projected_fields {
+            if !seen.insert(name.as_str()) {
+                return Err(Error::ConfigInvalid {
+                    message: format!(
+                        "Duplicate projection column '{}' for table {}",
+                        name, full_name
+                    ),
+                });
+            }
+
+            let field = field_map
+                .get(name.as_str())
+                .ok_or_else(|| Error::ColumnNotExist {
+                    full_name: full_name.clone(),
+                    column: name.clone(),
+                })?;
+            resolved.push((*field).clone());
+        }
+
+        Ok(resolved)
     }
 }
 
@@ -60,13 +117,13 @@ impl<'a> ReadBuilder<'a> {
 #[derive(Debug, Clone)]
 pub struct TableRead<'a> {
     table: &'a Table,
-    read_type: &'a [DataField],
+    read_type: Vec<DataField>,
 }
 
 impl<'a> TableRead<'a> {
     /// Schema (fields) that this read will produce.
     pub fn read_type(&self) -> &[DataField] {
-        self.read_type
+        &self.read_type
     }
 
     /// Table for this read.
