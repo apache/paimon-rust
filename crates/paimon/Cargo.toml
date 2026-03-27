@@ -58,7 +58,7 @@ arrow-array = { workspace = true }
 futures = "0.3"
 parquet = { workspace = true, features = ["async", "zstd"] }
 async-stream = "0.3.6"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json"] }
 # DLF authentication dependencies
 base64 = "0.22"
 hex = "0.4"

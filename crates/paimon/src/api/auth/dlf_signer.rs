@@ -629,21 +629,6 @@ impl DLFRequestSigner for DLFOpenApiSigner {
     }
 }
 
-/// Factory for creating DLF signers based on endpoint configuration.
-///
-/// This factory automatically selects the appropriate signer based on the
-/// endpoint URI:
-///
-/// | Endpoint Pattern | Signer | Algorithm |
-/// |-----------------|--------|-----------|
-/// | `*-vpc.dlf.aliyuncs.com` | `DLFDefaultSigner` | DLF4-HMAC-SHA256 |
-/// | `dlfnext.*.aliyuncs.com` | `DLFOpenApiSigner` | HMAC-SHA1 |
-/// | `*openapi*` | `DLFOpenApiSigner` | HMAC-SHA1 |
-/// | Other | `DLFDefaultSigner` | DLF4-HMAC-SHA256 |
-///
-/// # Example
-///
-/// ```ignore
 /// use paimon::api::auth::DLFSignerFactory;
 ///
 /// // Auto-detect from URI

@@ -158,76 +158,6 @@ async fn test_error_responses_status_mapping() {
     assert_eq!(j2.get("code").and_then(|v| v.as_u64()), Some(409));
 }
 
-// ==================== Table Tests ====================
-
-#[tokio::test]
-async fn test_list_tables_and_get_table() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
-
-    // Add tables
-    ctx.server.add_table("default", "table1");
-    ctx.server.add_table("default", "table2");
-
-    // List tables
-    let tables = ctx.api.list_tables("default").await.unwrap();
-    assert!(tables.contains(&"table1".to_string()));
-    assert!(tables.contains(&"table2".to_string()));
-
-    // Get table
-    let table_resp = ctx
-        .api
-        .get_table(&Identifier::new("default", "table1"))
-        .await
-        .unwrap();
-    assert_eq!(table_resp.id.unwrap_or_default(), "table1");
-}
-
-#[tokio::test]
-async fn test_get_table_not_found() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
-
-    let result = ctx
-        .api
-        .get_table(&Identifier::new("default", "non_existent_table"))
-        .await;
-    assert!(result.is_err(), "getting non-existent table should fail");
-}
-
-#[tokio::test]
-async fn test_list_tables_empty_database() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
-
-    let tables = ctx.api.list_tables("default").await.unwrap();
-    assert!(
-        tables.is_empty(),
-        "expected empty tables list, got: {:?}",
-        tables
-    );
-}
-
-#[tokio::test]
-async fn test_multiple_databases_with_tables() {
-    let mut ctx = setup_test_server(vec!["db1", "db2"]).await;
-
-    // Add tables to different databases
-    ctx.server.add_table("db1", "table1_db1");
-    ctx.server.add_table("db1", "table2_db1");
-    ctx.server.add_table("db2", "table1_db2");
-
-    // Verify db1 tables
-    let tables_db1 = ctx.api.list_tables("db1").await.unwrap();
-    assert_eq!(tables_db1.len(), 2);
-    assert!(tables_db1.contains(&"table1_db1".to_string()));
-    assert!(tables_db1.contains(&"table2_db1".to_string()));
-
-    // Verify db2 tables
-    let tables_db2 = ctx.api.list_tables("db2").await.unwrap();
-    assert_eq!(tables_db2.len(), 1);
-    assert!(tables_db2.contains(&"table1_db2".to_string()));
-}
-
-// ==================== Database Alter/Drop Tests ====================
-
 #[tokio::test]
 async fn test_alter_database() {
     let mut ctx = setup_test_server(vec!["default"]).await;
@@ -306,8 +236,73 @@ async fn test_drop_database_no_permission() {
         "dropping no-permission database should fail"
     );
 }
+// ==================== Table Tests ====================
 
-// ==================== Table Create/Drop Tests ====================
+#[tokio::test]
+async fn test_list_tables_and_get_table() {
+    let mut ctx = setup_test_server(vec!["default"]).await;
+
+    // Add tables
+    ctx.server.add_table("default", "table1");
+    ctx.server.add_table("default", "table2");
+
+    // List tables
+    let tables = ctx.api.list_tables("default").await.unwrap();
+    assert!(tables.contains(&"table1".to_string()));
+    assert!(tables.contains(&"table2".to_string()));
+
+    // Get table
+    let table_resp = ctx
+        .api
+        .get_table(&Identifier::new("default", "table1"))
+        .await
+        .unwrap();
+    assert_eq!(table_resp.id.unwrap_or_default(), "table1");
+}
+
+#[tokio::test]
+async fn test_get_table_not_found() {
+    let mut ctx = setup_test_server(vec!["default"]).await;
+
+    let result = ctx
+        .api
+        .get_table(&Identifier::new("default", "non_existent_table"))
+        .await;
+    assert!(result.is_err(), "getting non-existent table should fail");
+}
+
+#[tokio::test]
+async fn test_list_tables_empty_database() {
+    let mut ctx = setup_test_server(vec!["default"]).await;
+
+    let tables = ctx.api.list_tables("default").await.unwrap();
+    assert!(
+        tables.is_empty(),
+        "expected empty tables list, got: {:?}",
+        tables
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_databases_with_tables() {
+    let mut ctx = setup_test_server(vec!["db1", "db2"]).await;
+
+    // Add tables to different databases
+    ctx.server.add_table("db1", "table1_db1");
+    ctx.server.add_table("db1", "table2_db1");
+    ctx.server.add_table("db2", "table1_db2");
+
+    // Verify db1 tables
+    let tables_db1 = ctx.api.list_tables("db1").await.unwrap();
+    assert_eq!(tables_db1.len(), 2);
+    assert!(tables_db1.contains(&"table1_db1".to_string()));
+    assert!(tables_db1.contains(&"table2_db1".to_string()));
+
+    // Verify db2 tables
+    let tables_db2 = ctx.api.list_tables("db2").await.unwrap();
+    assert_eq!(tables_db2.len(), 1);
+    assert!(tables_db2.contains(&"table1_db2".to_string()));
+}
 
 #[tokio::test]
 async fn test_create_table() {

@@ -45,7 +45,7 @@ impl DLFAuthProviderFactory {
 
     /// Parse signing algorithm from URI.
     ///
-    /// Returns "openapi" for public endpoints (dlfnext or openapi in host),
+    /// Returns "openapi" for public endpoints (dlfnext in host),
     /// otherwise returns "default".
     pub fn parse_signing_algo_from_uri(uri: Option<&str>) -> &'static str {
         if let Some(uri) = uri {

@@ -47,6 +47,9 @@ pub struct DLFToken {
     /// Security token for temporary credentials (optional).
     #[serde(rename = "SecurityToken")]
     pub security_token: Option<String>,
+    /// Expiration timestamp in milliseconds.
+    #[serde(rename = "ExpirationAt", default, skip_serializing)]
+    pub expiration_at_millis: Option<i64>,
     /// Expiration time string (ISO 8601 format).
     #[serde(
         rename = "Expiration",
@@ -54,9 +57,6 @@ pub struct DLFToken {
         skip_serializing_if = "Option::is_none"
     )]
     pub expiration: Option<String>,
-    /// Expiration timestamp in milliseconds.
-    #[serde(rename = "ExpirationAt", default)]
-    pub expiration_at_millis: Option<i64>,
 }
 
 impl DLFToken {
@@ -85,8 +85,8 @@ impl DLFToken {
         // Use provided expiration_at_millis, or parse from expiration string if not provided
         let expiration_at_millis = expiration_at_millis.or_else(|| {
             expiration
-                .as_ref()
-                .and_then(|exp| Self::parse_expiration_to_millis(exp))
+                .as_deref()
+                .and_then(Self::parse_expiration_to_millis)
         });
 
         Self {
@@ -100,15 +100,15 @@ impl DLFToken {
 
     /// Create a DLFToken from configuration options.
     pub fn from_options(options: &Options) -> Option<Self> {
-        let access_key_id = options.get(CatalogOptions::DLF_ACCESS_KEY_ID)?;
-        let access_key_secret = options.get(CatalogOptions::DLF_ACCESS_KEY_SECRET)?;
+        let access_key_id = options.get(CatalogOptions::DLF_ACCESS_KEY_ID)?.clone();
+        let access_key_secret = options.get(CatalogOptions::DLF_ACCESS_KEY_SECRET)?.clone();
         let security_token = options
             .get(CatalogOptions::DLF_ACCESS_SECURITY_TOKEN)
             .cloned();
 
         Some(Self::new(
-            access_key_id.clone(),
-            access_key_secret.clone(),
+            access_key_id,
+            access_key_secret,
             security_token,
             None,
             None,
