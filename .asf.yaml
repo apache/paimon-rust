@@ -46,8 +46,3 @@ notifications:
   commits: commits@paimon.apache.org
   issues: issues@paimon.apache.org
   pullrequests: issues@paimon.apache.org
-
-protected_branches:
-  main:
-    required_pull_request_reviews:
-      required_approving_review_count: 0
