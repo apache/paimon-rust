@@ -37,7 +37,13 @@ use std::fmt;
 /// Each variant corresponds to one or more Paimon `DataType`s and carries the
 /// internal representation used by `BinaryRow`. This avoids untyped `Object`
 /// boxing (as in Java Paimon) and provides compile-time safety.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq` is manually implemented so that `Decimal` uses mathematical
+/// equivalence (matching Java Paimon's `Decimal` which uses `compareTo() == 0`
+/// rather than `BigDecimal.equals` which is scale-sensitive),
+/// e.g. `Decimal(10, scale=1)` == `Decimal(100, scale=2)`
+/// because both represent `1.0`.
+#[derive(Debug, Clone)]
 pub enum Datum {
     Bool(bool),
     TinyInt(i8),
@@ -92,7 +98,96 @@ impl fmt::Display for Datum {
     }
 }
 
-// ---------------------------------------------------------------------------
+impl PartialEq for Datum {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::TinyInt(a), Self::TinyInt(b)) => a == b,
+            (Self::SmallInt(a), Self::SmallInt(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Long(a), Self::Long(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Double(a), Self::Double(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (
+                Self::Timestamp {
+                    millis: ma,
+                    nanos: na,
+                },
+                Self::Timestamp {
+                    millis: mb,
+                    nanos: nb,
+                },
+            ) => ma == mb && na == nb,
+            (
+                Self::LocalZonedTimestamp {
+                    millis: ma,
+                    nanos: na,
+                },
+                Self::LocalZonedTimestamp {
+                    millis: mb,
+                    nanos: nb,
+                },
+            ) => ma == mb && na == nb,
+            // Decimal: mathematical equivalence — normalize to common scale
+            // before comparing.  Matches Java Paimon's Decimal which uses
+            // compareTo() == 0 (not BigDecimal.equals which is scale-sensitive).
+            (
+                Self::Decimal {
+                    unscaled: ua,
+                    scale: sa,
+                    ..
+                },
+                Self::Decimal {
+                    unscaled: ub,
+                    scale: sb,
+                    ..
+                },
+            ) => decimal_eq(*ua, *sa, *ub, *sb),
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Compare two decimals by mathematical value.
+///
+/// Normalizes both to the larger scale, then compares unscaled values.
+/// E.g. `(10, scale=1)` vs `(100, scale=2)` → both represent 1.0 → equal.
+fn decimal_eq(ua: i128, sa: u32, ub: i128, sb: u32) -> bool {
+    if sa == sb {
+        return ua == ub;
+    }
+    // Scale up the side with the smaller scale.
+    let (na, nb) = if sa < sb {
+        match ua.checked_mul(pow10_i128(sb - sa)) {
+            Some(scaled) => (scaled, ub),
+            None => return false,
+        }
+    } else {
+        match ub.checked_mul(pow10_i128(sa - sb)) {
+            Some(scaled) => (ua, scaled),
+            None => return false,
+        }
+    };
+    na == nb
+}
+
+/// 10^exp as i128.  Returns i128::MAX for exponents that would overflow.
+fn pow10_i128(exp: u32) -> i128 {
+    const MAX_EXP: u32 = 38; // 10^38 fits in i128
+    if exp > MAX_EXP {
+        return i128::MAX;
+    }
+    let mut result: i128 = 1;
+    for _ in 0..exp {
+        result = result.saturating_mul(10);
+    }
+    result
+}
+
 // PredicateOperator
 // ---------------------------------------------------------------------------
 
@@ -895,5 +990,69 @@ mod tests {
             Predicate::negate(Predicate::AlwaysFalse),
             Predicate::AlwaysTrue
         );
+    }
+
+    // ======================== Decimal equivalence ========================
+
+    #[test]
+    fn test_decimal_eq_same_scale() {
+        let a = Datum::Decimal {
+            unscaled: 100,
+            precision: 10,
+            scale: 2,
+        };
+        let b = Datum::Decimal {
+            unscaled: 100,
+            precision: 10,
+            scale: 2,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decimal_eq_different_scale_same_value() {
+        // 10 / 10^1 = 1.0, 100 / 10^2 = 1.00 — mathematically equal
+        let a = Datum::Decimal {
+            unscaled: 10,
+            precision: 10,
+            scale: 1,
+        };
+        let b = Datum::Decimal {
+            unscaled: 100,
+            precision: 10,
+            scale: 2,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decimal_ne_different_value() {
+        let a = Datum::Decimal {
+            unscaled: 10,
+            precision: 10,
+            scale: 1,
+        };
+        let b = Datum::Decimal {
+            unscaled: 20,
+            precision: 10,
+            scale: 1,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_decimal_eq_zero_different_scale() {
+        // 0 at any scale is still 0
+        let a = Datum::Decimal {
+            unscaled: 0,
+            precision: 10,
+            scale: 0,
+        };
+        let b = Datum::Decimal {
+            unscaled: 0,
+            precision: 10,
+            scale: 5,
+        };
+        assert_eq!(a, b);
     }
 }
