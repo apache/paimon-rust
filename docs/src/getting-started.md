@@ -111,8 +111,10 @@ let table = catalog.get_table(&Identifier::new("my_db", "my_table")).await?;
 let read_builder = table.new_read_builder();
 
 // Step 1: Scan — produces a Plan containing DataSplits
-let scan = read_builder.new_scan();
-let plan = scan.plan().await?;
+let plan = {
+    let scan = read_builder.new_scan();
+    scan.plan().await?
+};
 
 // Step 2: Read — consumes splits and returns Arrow RecordBatches
 let reader = read_builder.new_read()?;
@@ -120,7 +122,7 @@ let mut stream = reader.to_arrow(plan.splits())?;
 
 while let Some(batch) = stream.next().await {
     let batch = batch?;
-    println!("Got batch with {} rows", batch.num_rows());
+    println!("RecordBatch: {batch:#?}");
 }
 ```
 
@@ -132,7 +134,7 @@ Query Paimon tables using SQL with [Apache DataFusion](https://datafusion.apache
 [dependencies]
 paimon = "0.0.0"
 paimon-datafusion = "0.0.0"
-datafusion = "46"
+datafusion = "52"
 ```
 
 Register a Paimon table and run SQL queries:

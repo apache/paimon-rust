@@ -19,7 +19,7 @@ under the License.
 
 # Documentation
 
-This directory contains the source files for the Apache Paimon Rust documentation site, built with [MkDocs](https://www.mkdocs.org/) and the [Material for MkDocs](https://squidfun.github.io/mkdocs-material/) theme.
+This directory contains the source files for the Apache Paimon Rust documentation site, built with [MkDocs](https://www.mkdocs.org/) and the [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/) theme.
 
 ## Prerequisites
 

@@ -17,7 +17,7 @@
 
 site_name: Apache Paimon Rust
 site_description: The Rust implementation of Apache Paimon
-site_url: https://paimon.apache.org/paimon-rust/
+site_url: https://apache.github.io/paimon-rust/
 repo_url: https://github.com/apache/paimon-rust
 repo_name: apache/paimon-rust
 

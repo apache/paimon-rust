@@ -32,11 +32,12 @@ The first release of Apache Paimon Rust. Track progress at the [0.1.0 milestone]
 Planned features:
 
 - Paimon table format reader
-- Local filesystem and S3 storage backends
+- Local filesystem, S3, and OSS storage backends
 - REST Catalog client
 - Apache DataFusion integration
 - Partitioned table support
 - C FFI bindings
+- Go bindings
 
 ## Past Releases
 

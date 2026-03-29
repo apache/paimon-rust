@@ -45,8 +45,8 @@ cargo test
 # Format code
 cargo fmt
 
-# Lint
-cargo clippy
+# Lint (matches CI)
+cargo clippy --all-targets --workspace -- -D warnings
 ```
 
 ## Finding Issues

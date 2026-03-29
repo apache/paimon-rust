@@ -29,7 +29,7 @@ Apache Paimon Rust is organized as a Cargo workspace with multiple crates, each 
 
 The core crate implements the Paimon table format, including:
 
-- **Catalog** — REST Catalog client for discovering and managing databases and tables
+- **Catalog** — Catalog client for discovering and managing databases and tables
 - **Table** — Table abstraction for reading Paimon tables
 - **Snapshot & Manifest** — Reading snapshot and manifest metadata
 - **Schema** — Table schema management and evolution
