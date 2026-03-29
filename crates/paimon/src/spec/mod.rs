@@ -55,3 +55,7 @@ mod types;
 pub use types::*;
 mod partition_utils;
 pub(crate) use partition_utils::PartitionComputer;
+mod predicate;
+pub use predicate::{
+    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
+};
