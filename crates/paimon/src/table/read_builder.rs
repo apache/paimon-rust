@@ -48,7 +48,7 @@ impl<'a> ReadBuilder<'a> {
     /// Set column projection by name. Output order follows the caller-specified order.
     /// Unknown or duplicate names cause `new_read()` to fail; an empty list is a valid
     /// zero-column projection.
-    pub fn with_projection(mut self, columns: &[&str]) -> Self {
+    pub fn with_projection(&mut self, columns: &[&str]) -> &mut Self {
         self.projected_fields = Some(columns.iter().map(|c| (*c).to_string()).collect());
         self
     }

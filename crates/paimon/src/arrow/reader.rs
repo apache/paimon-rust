@@ -133,11 +133,13 @@ impl ArrowReader {
                         ParquetRecordBatchStreamBuilder::new(arrow_file_reader)
                             .await?;
                     // ProjectionMask preserves parquet-schema order; read_type order is restored below.
-                    let parquet_schema = batch_stream_builder.parquet_schema().clone();
-                    let mask = ProjectionMask::columns(
-                        &parquet_schema,
-                        projected_column_names.iter().map(String::as_str),
-                    );
+                    let mask = {
+                        let parquet_schema = batch_stream_builder.parquet_schema();
+                        ProjectionMask::columns(
+                            parquet_schema,
+                            projected_column_names.iter().map(String::as_str),
+                        )
+                    };
                     batch_stream_builder = batch_stream_builder.with_projection(mask);
 
                     if let Some(dv) = dv {
@@ -163,8 +165,8 @@ impl ArrowReader {
                                 batch.schema().index_of(name).map_err(|_| {
                                     Error::UnexpectedError {
                                         message: format!(
-                                            "Projected column '{}' not found in Parquet batch schema",
-                                            name
+                                            "Projected column '{}' not found in Parquet batch schema of file {}",
+                                            name, path_to_read
                                         ),
                                         source: None,
                                     }

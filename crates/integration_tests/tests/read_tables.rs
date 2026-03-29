@@ -28,15 +28,19 @@ fn get_test_warehouse() -> String {
 }
 
 async fn scan_and_read(table_name: &str) -> (Plan, Vec<RecordBatch>) {
-    let warehouse = get_test_warehouse();
-    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
-    let identifier = Identifier::new("default", table_name);
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table");
+    scan_and_read_with_projection(table_name, None).await
+}
 
-    let read_builder = table.new_read_builder();
+async fn scan_and_read_with_projection(
+    table_name: &str,
+    projection: Option<&[&str]>,
+) -> (Plan, Vec<RecordBatch>) {
+    let table = get_test_table(table_name).await;
+
+    let mut read_builder = table.new_read_builder();
+    if let Some(cols) = projection {
+        read_builder.with_projection(cols);
+    }
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
 
@@ -306,38 +310,10 @@ async fn get_test_table(table_name: &str) -> paimon::Table {
 
 #[tokio::test]
 async fn test_read_with_column_projection() {
-    let table = get_test_table("partitioned_log_table").await;
+    let (_, batches) =
+        scan_and_read_with_projection("partitioned_log_table", Some(&["name", "id"])).await;
 
-    let plan = table
-        .new_read_builder()
-        .new_scan()
-        .plan()
-        .await
-        .expect("Failed to plan scan");
-
-    // Input order ["name", "id"] — output must preserve this order (not schema order).
-    let read = table
-        .new_read_builder()
-        .with_projection(&["name", "id"])
-        .new_read()
-        .expect("Failed to create projected read");
-
-    let field_names: Vec<&str> = read.read_type().iter().map(|f| f.name()).collect();
-    assert_eq!(
-        field_names,
-        vec!["name", "id"],
-        "read_type should preserve caller-specified order"
-    );
-
-    let stream = read
-        .to_arrow(plan.splits())
-        .expect("Failed to create arrow stream");
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .expect("Failed to collect batches");
-    assert!(!batches.is_empty());
-
+    // Verify that output schema preserves caller-specified column order.
     for batch in &batches {
         let schema = batch.schema();
         let batch_field_names: Vec<&str> =
@@ -366,9 +342,9 @@ async fn test_read_with_column_projection() {
 async fn test_read_projection_empty() {
     let table = get_test_table("simple_log_table").await;
 
-    let read = table
-        .new_read_builder()
-        .with_projection(&[])
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&[]);
+    let read = read_builder
         .new_read()
         .expect("Empty projection should succeed");
 
@@ -407,9 +383,9 @@ async fn test_read_projection_empty() {
 async fn test_read_projection_unknown_column() {
     let table = get_test_table("simple_log_table").await;
 
-    let err = table
-        .new_read_builder()
-        .with_projection(&["id", "nonexistent_column"])
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["id", "nonexistent_column"]);
+    let err = read_builder
         .new_read()
         .expect_err("Unknown columns should fail");
 
@@ -429,9 +405,9 @@ async fn test_read_projection_unknown_column() {
 async fn test_read_projection_all_invalid() {
     let table = get_test_table("simple_log_table").await;
 
-    let err = table
-        .new_read_builder()
-        .with_projection(&["nonexistent_a", "nonexistent_b"])
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["nonexistent_a", "nonexistent_b"]);
+    let err = read_builder
         .new_read()
         .expect_err("All-invalid projection should fail");
 
@@ -451,9 +427,9 @@ async fn test_read_projection_all_invalid() {
 async fn test_read_projection_duplicate_column() {
     let table = get_test_table("simple_log_table").await;
 
-    let err = table
-        .new_read_builder()
-        .with_projection(&["id", "id"])
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["id", "id"]);
+    let err = read_builder
         .new_read()
         .expect_err("Duplicate projection should fail");
 
