@@ -39,6 +39,15 @@ Apache Paimon Rust is an exciting project currently under active development. Wh
 - Start discussion thread at [dev mailing list](mailto:dev@paimon.apache.org) ([subscribe](<mailto:dev-subscribe@paimon.apache.org?subject=(send%20this%20email%20to%20subscribe)>) / [unsubscribe](<mailto:dev-unsubscribe@paimon.apache.org?subject=(send%20this%20email%20to%20unsubscribe)>) / [archives](https://lists.apache.org/list.html?dev@paimon.apache.org))
 - Talk to community directly at [Slack #paimon channel](https://join.slack.com/t/the-asf/shared_invite/zt-2l9rns8pz-H8PE2Xnz6KraVd2Ap40z4g).
 
+## Documentation
+
+The project documentation is built with [MkDocs](https://www.mkdocs.org/). See [docs/README.md](docs/README.md) for details.
+
+```bash
+pip3 install mkdocs-material
+cd docs && mkdocs serve
+```
+
 ## Getting help
 
 Submit [issues](https://github.com/apache/paimon-rust/issues/new/choose) for bug report or asking questions in [discussion](https://github.com/apache/paimon-rust/discussions/new?category=q-a).

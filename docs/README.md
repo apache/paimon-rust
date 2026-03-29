@@ -5,12 +5,12 @@ This directory contains the source files for the Apache Paimon Rust documentatio
 ## Prerequisites
 
 - Python 3.8+
-- pip
+- pip3
 
 ## Setup
 
 ```bash
-pip install mkdocs-material
+pip3 install mkdocs-material
 ```
 
 ## Development
@@ -34,17 +34,3 @@ mkdocs build
 ```
 
 The output will be in the `docs/site/` directory.
-
-## Structure
-
-```
-docs/
-├── mkdocs.yml          # Site configuration
-├── README.md           # This file
-└── src/
-    ├── index.md        # Home page
-    ├── getting-started.md
-    ├── architecture.md
-    ├── releases.md
-    └── contributing.md
-```
