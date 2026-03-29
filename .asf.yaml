@@ -39,6 +39,10 @@ github:
     projects: false
     gh-pages:
       whatever: Just a placeholder to make it take effects
+  protected_branches:
+    main:
+      required_pull_request_reviews:
+        required_approving_review_count: 0
   collaborators:
     - Xuanwo
 
