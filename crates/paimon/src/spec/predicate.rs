@@ -24,8 +24,10 @@
 //! - Java `PredicateBuilder` / `LeafPredicate` / `CompoundPredicate`
 
 use crate::error::*;
+use crate::spec::data_file::BinaryRow;
 use crate::spec::types::DataType;
 use crate::spec::DataField;
+use std::cmp::Ordering;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +45,7 @@ use std::fmt;
 /// rather than `BigDecimal.equals` which is scale-sensitive),
 /// e.g. `Decimal(10, scale=1)` == `Decimal(100, scale=2)`
 /// because both represent `1.0`.
+///
 #[derive(Debug, Clone)]
 pub enum Datum {
     Bool(bool),
@@ -100,55 +103,66 @@ impl fmt::Display for Datum {
 
 impl PartialEq for Datum {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::TinyInt(a), Self::TinyInt(b)) => a == b,
-            (Self::SmallInt(a), Self::SmallInt(b)) => a == b,
-            (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Long(a), Self::Long(b)) => a == b,
-            (Self::Float(a), Self::Float(b)) => a == b,
-            (Self::Double(a), Self::Double(b)) => a == b,
-            (Self::String(a), Self::String(b)) => a == b,
-            (Self::Date(a), Self::Date(b)) => a == b,
-            (Self::Time(a), Self::Time(b)) => a == b,
-            (
-                Self::Timestamp {
-                    millis: ma,
-                    nanos: na,
-                },
-                Self::Timestamp {
-                    millis: mb,
-                    nanos: nb,
-                },
-            ) => ma == mb && na == nb,
-            (
-                Self::LocalZonedTimestamp {
-                    millis: ma,
-                    nanos: na,
-                },
-                Self::LocalZonedTimestamp {
-                    millis: mb,
-                    nanos: nb,
-                },
-            ) => ma == mb && na == nb,
-            // Decimal: mathematical equivalence — normalize to common scale
-            // before comparing.  Matches Java Paimon's Decimal which uses
-            // compareTo() == 0 (not BigDecimal.equals which is scale-sensitive).
-            (
-                Self::Decimal {
-                    unscaled: ua,
-                    scale: sa,
-                    ..
-                },
-                Self::Decimal {
-                    unscaled: ub,
-                    scale: sb,
-                    ..
-                },
-            ) => decimal_eq(*ua, *sa, *ub, *sb),
-            (Self::Bytes(a), Self::Bytes(b)) => a == b,
-            _ => false,
-        }
+        datum_eq(self, other)
+    }
+}
+
+impl PartialOrd for Datum {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        datum_cmp(self, other)
+    }
+}
+
+fn datum_eq(lhs: &Datum, rhs: &Datum) -> bool {
+    datum_cmp(lhs, rhs) == Some(Ordering::Equal)
+}
+
+fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
+    match (lhs, rhs) {
+        (Datum::Bool(a), Datum::Bool(b)) => a.partial_cmp(b),
+        (Datum::TinyInt(a), Datum::TinyInt(b)) => a.partial_cmp(b),
+        (Datum::SmallInt(a), Datum::SmallInt(b)) => a.partial_cmp(b),
+        (Datum::Int(a), Datum::Int(b)) => a.partial_cmp(b),
+        (Datum::Long(a), Datum::Long(b)) => a.partial_cmp(b),
+        (Datum::Float(a), Datum::Float(b)) => a.partial_cmp(b),
+        (Datum::Double(a), Datum::Double(b)) => a.partial_cmp(b),
+        (Datum::String(a), Datum::String(b)) => a.partial_cmp(b),
+        (Datum::Date(a), Datum::Date(b)) => a.partial_cmp(b),
+        (Datum::Time(a), Datum::Time(b)) => a.partial_cmp(b),
+        (
+            Datum::Timestamp {
+                millis: ma,
+                nanos: na,
+            },
+            Datum::Timestamp {
+                millis: mb,
+                nanos: nb,
+            },
+        ) => (ma, na).partial_cmp(&(mb, nb)),
+        (
+            Datum::LocalZonedTimestamp {
+                millis: ma,
+                nanos: na,
+            },
+            Datum::LocalZonedTimestamp {
+                millis: mb,
+                nanos: nb,
+            },
+        ) => (ma, na).partial_cmp(&(mb, nb)),
+        (
+            Datum::Decimal {
+                unscaled: ua,
+                scale: sa,
+                ..
+            },
+            Datum::Decimal {
+                unscaled: ub,
+                scale: sb,
+                ..
+            },
+        ) => decimal_cmp(*ua, *sa, *ub, *sb),
+        (Datum::Bytes(a), Datum::Bytes(b)) => Some(java_bytes_cmp(a, b)),
+        _ => None,
     }
 }
 
@@ -156,23 +170,28 @@ impl PartialEq for Datum {
 ///
 /// Normalizes both to the larger scale, then compares unscaled values.
 /// E.g. `(10, scale=1)` vs `(100, scale=2)` → both represent 1.0 → equal.
-fn decimal_eq(ua: i128, sa: u32, ub: i128, sb: u32) -> bool {
+fn decimal_cmp(ua: i128, sa: u32, ub: i128, sb: u32) -> Option<Ordering> {
     if sa == sb {
-        return ua == ub;
+        return ua.partial_cmp(&ub);
     }
-    // Scale up the side with the smaller scale.
     let (na, nb) = if sa < sb {
-        match ua.checked_mul(pow10_i128(sb - sa)) {
-            Some(scaled) => (scaled, ub),
-            None => return false,
-        }
+        (ua.checked_mul(pow10_i128(sb - sa))?, ub)
     } else {
-        match ub.checked_mul(pow10_i128(sa - sb)) {
-            Some(scaled) => (ua, scaled),
-            None => return false,
-        }
+        (ua, ub.checked_mul(pow10_i128(sa - sb))?)
     };
-    na == nb
+    na.partial_cmp(&nb)
+}
+
+/// Match Java `CompareUtils.compare(byte[], byte[])`, which compares signed
+/// bytes lexicographically.
+fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    for (&lhs, &rhs) in a.iter().zip(b.iter()) {
+        let cmp = (lhs as i8).cmp(&(rhs as i8));
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// 10^exp as i128.  Returns i128::MAX for exponents that would overflow.
@@ -262,23 +281,16 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// Combine predicates with AND, with flattening and constant absorption.
+    /// Combine predicates with AND, with recursive flattening and constant absorption.
     ///
     /// - `AND(p, AlwaysTrue)` → `p` (identity element filtered out)
     /// - `AND(p, AlwaysFalse)` → `AlwaysFalse` (annihilator short-circuits)
-    /// - Nested `And` nodes are flattened
+    /// - Nested `And` nodes are recursively flattened
     /// - Empty input → `AlwaysTrue`
     /// - Single element → unwrapped
     pub fn and(predicates: Vec<Predicate>) -> Predicate {
         let mut flat = Vec::with_capacity(predicates.len());
-        for p in predicates {
-            match p {
-                Predicate::AlwaysTrue => {}
-                Predicate::AlwaysFalse => return Predicate::AlwaysFalse,
-                Predicate::And(children) => flat.extend(children),
-                other => flat.push(other),
-            }
-        }
+        Self::flatten_and(predicates, &mut flat);
         match flat.len() {
             0 => Predicate::AlwaysTrue,
             1 => flat.into_iter().next().unwrap(),
@@ -286,27 +298,59 @@ impl Predicate {
         }
     }
 
-    /// Combine predicates with OR, with flattening and constant absorption.
+    /// Recursively collect non-And children, absorbing constants.
+    fn flatten_and(predicates: Vec<Predicate>, out: &mut Vec<Predicate>) {
+        for p in predicates {
+            match p {
+                Predicate::AlwaysTrue => {}
+                Predicate::AlwaysFalse => {
+                    out.clear();
+                    out.push(Predicate::AlwaysFalse);
+                    return;
+                }
+                Predicate::And(children) => Self::flatten_and(children, out),
+                other => out.push(other),
+            }
+            // Check if a nested flatten hit AlwaysFalse
+            if out.first() == Some(&Predicate::AlwaysFalse) {
+                return;
+            }
+        }
+    }
+
+    /// Combine predicates with OR, with recursive flattening and constant absorption.
     ///
     /// - `OR(p, AlwaysFalse)` → `p` (identity element filtered out)
     /// - `OR(p, AlwaysTrue)` → `AlwaysTrue` (annihilator short-circuits)
-    /// - Nested `Or` nodes are flattened
+    /// - Nested `Or` nodes are recursively flattened
     /// - Empty input → `AlwaysFalse`
     /// - Single element → unwrapped
     pub fn or(predicates: Vec<Predicate>) -> Predicate {
         let mut flat = Vec::with_capacity(predicates.len());
-        for p in predicates {
-            match p {
-                Predicate::AlwaysFalse => {}
-                Predicate::AlwaysTrue => return Predicate::AlwaysTrue,
-                Predicate::Or(children) => flat.extend(children),
-                other => flat.push(other),
-            }
-        }
+        Self::flatten_or(predicates, &mut flat);
         match flat.len() {
             0 => Predicate::AlwaysFalse,
             1 => flat.into_iter().next().unwrap(),
             _ => Predicate::Or(flat),
+        }
+    }
+
+    /// Recursively collect non-Or children, absorbing constants.
+    fn flatten_or(predicates: Vec<Predicate>, out: &mut Vec<Predicate>) {
+        for p in predicates {
+            match p {
+                Predicate::AlwaysFalse => {}
+                Predicate::AlwaysTrue => {
+                    out.clear();
+                    out.push(Predicate::AlwaysTrue);
+                    return;
+                }
+                Predicate::Or(children) => Self::flatten_or(children, out),
+                other => out.push(other),
+            }
+            if out.first() == Some(&Predicate::AlwaysTrue) {
+                return;
+            }
         }
     }
 
@@ -321,6 +365,70 @@ impl Predicate {
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
             other => Predicate::Not(Box::new(other)),
+        }
+    }
+
+    /// Split a predicate at AND boundaries into conjuncts (recursive).
+    ///
+    /// Unlike a simple one-level unwrap, this recursively flattens nested
+    /// `And` nodes — necessary because `Predicate` is a public enum and
+    /// callers may construct `And(vec![And(...), ...])` directly without
+    /// going through `Predicate::and()` which auto-flattens.
+    ///
+    /// Reference: Java `PredicateBuilder.splitAnd` which recursively
+    /// splits `CompoundPredicate(And, children)`.
+    pub(crate) fn split_and(self) -> Vec<Predicate> {
+        match self {
+            Predicate::And(children) => children.into_iter().flat_map(|c| c.split_and()).collect(),
+            other => vec![other],
+        }
+    }
+
+    /// Remap leaf field indices from table schema space to partition row space.
+    ///
+    /// Returns `Some(remapped)` if *all* leaf nodes in this subtree reference
+    /// partition columns; `None` otherwise. This guarantees safety under NOT/OR:
+    /// a mixed predicate is never partially remapped.
+    ///
+    /// `mapping` is the output of `field_idx_to_partition_idx`.
+    pub(crate) fn remap_field_index(self, mapping: &[Option<usize>]) -> Option<Predicate> {
+        match self {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                literals,
+            } => {
+                let new_index = (*mapping.get(index)?)?;
+                Some(Predicate::Leaf {
+                    column,
+                    index: new_index,
+                    data_type,
+                    op,
+                    literals,
+                })
+            }
+            Predicate::And(children) => {
+                let remapped: Option<Vec<_>> = children
+                    .into_iter()
+                    .map(|c| c.remap_field_index(mapping))
+                    .collect();
+                Some(Predicate::and(remapped?))
+            }
+            Predicate::Or(children) => {
+                let remapped: Option<Vec<_>> = children
+                    .into_iter()
+                    .map(|c| c.remap_field_index(mapping))
+                    .collect();
+                Some(Predicate::or(remapped?))
+            }
+            Predicate::Not(inner) => {
+                let remapped = inner.remap_field_index(mapping)?;
+                Some(Predicate::negate(remapped))
+            }
+            Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
+            Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
         }
     }
 }
@@ -592,6 +700,145 @@ pub fn field_idx_to_partition_idx(
 }
 
 // ---------------------------------------------------------------------------
+// extract_datum
+// ---------------------------------------------------------------------------
+
+/// Extract a typed `Datum` from a `BinaryRow` field based on `DataType`.
+///
+/// Returns `Ok(None)` if the field is null, `Ok(Some(datum))` on success,
+/// or `Err` if the binary data is malformed.
+pub(crate) fn extract_datum(
+    row: &BinaryRow,
+    pos: usize,
+    data_type: &DataType,
+) -> Result<Option<Datum>> {
+    if row.is_null_at(pos) {
+        return Ok(None);
+    }
+    let datum = match data_type {
+        DataType::Boolean(_) => Datum::Bool(row.get_boolean(pos)?),
+        DataType::TinyInt(_) => Datum::TinyInt(row.get_byte(pos)?),
+        DataType::SmallInt(_) => Datum::SmallInt(row.get_short(pos)?),
+        DataType::Int(_) => Datum::Int(row.get_int(pos)?),
+        DataType::BigInt(_) => Datum::Long(row.get_long(pos)?),
+        DataType::Float(_) => Datum::Float(row.get_float(pos)?),
+        DataType::Double(_) => Datum::Double(row.get_double(pos)?),
+        DataType::Char(_) | DataType::VarChar(_) => Datum::String(row.get_string(pos)?.to_string()),
+        DataType::Date(_) => Datum::Date(row.get_int(pos)?),
+        DataType::Time(_) => Datum::Time(row.get_int(pos)?),
+        DataType::Timestamp(ts) => {
+            let (millis, nanos) = row.get_timestamp_raw(pos, ts.precision())?;
+            Datum::Timestamp { millis, nanos }
+        }
+        DataType::LocalZonedTimestamp(ts) => {
+            let (millis, nanos) = row.get_timestamp_raw(pos, ts.precision())?;
+            Datum::LocalZonedTimestamp { millis, nanos }
+        }
+        DataType::Decimal(dec) => {
+            let precision = dec.precision();
+            let scale = dec.scale();
+            let unscaled = row.get_decimal_unscaled(pos, precision)?;
+            Datum::Decimal {
+                unscaled,
+                precision,
+                scale,
+            }
+        }
+        DataType::Binary(_) | DataType::VarBinary(_) => Datum::Bytes(row.get_binary(pos)?.to_vec()),
+        other => {
+            return Err(Error::Unsupported {
+                message: format!("extract_datum: unsupported DataType {other:?}"),
+            });
+        }
+    };
+    Ok(Some(datum))
+}
+
+// ---------------------------------------------------------------------------
+// eval_row
+// ---------------------------------------------------------------------------
+
+/// Evaluate a predicate tree against a `BinaryRow`.
+///
+/// Each `Leaf` carries its own `data_type` (preserved through `remap_field_index`),
+/// so no external type list is needed.
+///
+/// SQL null semantics: null compared to any value yields `false`.
+pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
+    match predicate {
+        Predicate::AlwaysTrue => Ok(true),
+        Predicate::AlwaysFalse => Ok(false),
+        Predicate::And(children) => {
+            for child in children {
+                if !eval_row(child, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Or(children) => {
+            for child in children {
+                if eval_row(child, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Predicate::Not(inner) => Ok(!eval_row(inner, row)?),
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => {
+            let datum = extract_datum(row, *index, data_type)?;
+            Ok(eval_leaf(*op, datum.as_ref(), literals))
+        }
+    }
+}
+
+/// Evaluate a single leaf predicate.
+///
+/// This function is infallible: all type decoding happens in `extract_datum`
+/// before this point, and the operator match is exhaustive.
+fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> bool {
+    match op {
+        PredicateOperator::IsNull => datum.is_none(),
+        PredicateOperator::IsNotNull => datum.is_some(),
+        _ => {
+            // SQL null semantics: NULL op value → false
+            let val = match datum {
+                Some(v) => v,
+                None => return false,
+            };
+            match op {
+                PredicateOperator::Eq => literals.first().is_some_and(|lit| datum_eq(val, lit)),
+                PredicateOperator::NotEq => literals.first().is_some_and(|lit| !datum_eq(val, lit)),
+                PredicateOperator::Lt => {
+                    literals.first().and_then(|lit| datum_cmp(val, lit)) == Some(Ordering::Less)
+                }
+                PredicateOperator::LtEq => matches!(
+                    literals.first().and_then(|lit| datum_cmp(val, lit)),
+                    Some(Ordering::Less | Ordering::Equal)
+                ),
+                PredicateOperator::Gt => {
+                    literals.first().and_then(|lit| datum_cmp(val, lit)) == Some(Ordering::Greater)
+                }
+                PredicateOperator::GtEq => matches!(
+                    literals.first().and_then(|lit| datum_cmp(val, lit)),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ),
+                PredicateOperator::In => literals.iter().any(|lit| datum_eq(val, lit)),
+                PredicateOperator::NotIn => !literals.iter().any(|lit| datum_eq(val, lit)),
+                // IsNull/IsNotNull are handled in the outer match above.
+                PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -776,6 +1023,34 @@ mod tests {
     }
 
     #[test]
+    fn test_and_flattens_deep_nesting() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p1 = pb.equal("id", Datum::Int(1)).unwrap();
+        let p2 = pb.equal("id", Datum::Int(2)).unwrap();
+        let p3 = pb.equal("id", Datum::Int(3)).unwrap();
+        let p4 = pb.equal("id", Datum::Int(4)).unwrap();
+
+        // Directly construct nested And via enum (bypassing Predicate::and flatten).
+        let deep = Predicate::And(vec![Predicate::And(vec![
+            Predicate::And(vec![p1.clone(), p2.clone()]),
+            p3.clone(),
+        ])]);
+        // Now flatten through Predicate::and.
+        let flat = Predicate::and(vec![deep, p4.clone()]);
+
+        match &flat {
+            Predicate::And(children) => {
+                assert_eq!(children.len(), 4);
+                assert_eq!(children[0], p1);
+                assert_eq!(children[1], p2);
+                assert_eq!(children[2], p3);
+                assert_eq!(children[3], p4);
+            }
+            other => panic!("expected And with 4 children, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_or_empty() {
         assert_eq!(Predicate::or(vec![]), Predicate::AlwaysFalse);
     }
@@ -803,6 +1078,29 @@ mod tests {
                 assert_eq!(children.len(), 3);
             }
             other => panic!("expected Or, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_or_flattens_deep_nesting() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p1 = pb.equal("id", Datum::Int(1)).unwrap();
+        let p2 = pb.equal("id", Datum::Int(2)).unwrap();
+        let p3 = pb.equal("id", Datum::Int(3)).unwrap();
+        let p4 = pb.equal("id", Datum::Int(4)).unwrap();
+
+        // Directly construct nested Or via enum (bypassing Predicate::or flatten).
+        let deep = Predicate::Or(vec![Predicate::Or(vec![
+            Predicate::Or(vec![p1.clone(), p2.clone()]),
+            p3.clone(),
+        ])]);
+        let flat = Predicate::or(vec![deep, p4.clone()]);
+
+        match &flat {
+            Predicate::Or(children) => {
+                assert_eq!(children.len(), 4);
+            }
+            other => panic!("expected Or with 4 children, got {other:?}"),
         }
     }
 
@@ -917,7 +1215,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ======================== Empty IN handling ========================
+    // ======================== Empty IN / NOT IN handling ========================
 
     #[test]
     fn test_in_empty_returns_always_false() {
@@ -1054,5 +1352,365 @@ mod tests {
             scale: 5,
         };
         assert_eq!(a, b);
+    }
+
+    // ======================== PartialOrd ========================
+
+    #[test]
+    fn test_datum_partial_ord_int() {
+        assert!(Datum::Int(1) < Datum::Int(2));
+        assert!(Datum::Int(2) > Datum::Int(1));
+        assert!(Datum::Int(1) <= Datum::Int(1));
+        assert!(Datum::Int(1) >= Datum::Int(1));
+    }
+
+    #[test]
+    fn test_datum_partial_ord_string() {
+        assert!(Datum::String("a".into()) < Datum::String("b".into()));
+        assert!(Datum::String("b".into()) > Datum::String("a".into()));
+    }
+
+    #[test]
+    fn test_datum_partial_ord_decimal_cross_scale() {
+        // 10 / 10^1 = 1.0 < 200 / 10^2 = 2.0
+        let a = Datum::Decimal {
+            unscaled: 10,
+            precision: 10,
+            scale: 1,
+        };
+        let b = Datum::Decimal {
+            unscaled: 200,
+            precision: 10,
+            scale: 2,
+        };
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_datum_partial_ord_bytes_matches_java_signed_byte_order() {
+        assert!(Datum::Bytes(vec![0xFF]) < Datum::Bytes(vec![0x00]));
+    }
+
+    #[test]
+    fn test_datum_partial_ord_cross_variant_is_none() {
+        assert_eq!(Datum::Int(1).partial_cmp(&Datum::Long(1)), None);
+    }
+
+    // ======================== eval_row ========================
+
+    /// Minimal BinaryRow builder for predicate evaluation tests.
+    struct TestBinaryRowBuilder {
+        arity: i32,
+        null_bits_size: usize,
+        data: Vec<u8>,
+    }
+
+    impl TestBinaryRowBuilder {
+        fn new(arity: i32) -> Self {
+            let null_bits_size = BinaryRow::cal_bit_set_width_in_bytes(arity) as usize;
+            let fixed_part_size = null_bits_size + (arity as usize) * 8;
+            Self {
+                arity,
+                null_bits_size,
+                data: vec![0u8; fixed_part_size],
+            }
+        }
+
+        fn field_offset(&self, pos: usize) -> usize {
+            self.null_bits_size + pos * 8
+        }
+
+        fn set_null_at(&mut self, pos: usize) {
+            let bit_index = pos + BinaryRow::HEADER_SIZE_IN_BYTES as usize;
+            let byte_index = bit_index / 8;
+            let bit_offset = bit_index % 8;
+            self.data[byte_index] |= 1 << bit_offset;
+            let offset = self.field_offset(pos);
+            self.data[offset..offset + 8].fill(0);
+        }
+
+        fn write_int(&mut self, pos: usize, value: i32) {
+            let offset = self.field_offset(pos);
+            self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn build(self) -> BinaryRow {
+            BinaryRow::from_bytes(self.arity, self.data)
+        }
+    }
+
+    fn make_leaf(col: &str, idx: usize, op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
+        Predicate::Leaf {
+            column: col.into(),
+            index: idx,
+            data_type: DataType::Int(IntType::new()),
+            op,
+            literals,
+        }
+    }
+
+    #[test]
+    fn test_eval_leaf_operators() {
+        // row: [x=10]
+        let mut b = TestBinaryRowBuilder::new(1);
+        b.write_int(0, 10);
+        let row = b.build();
+
+        // Eq
+        assert!(eval_row(
+            &make_leaf("x", 0, PredicateOperator::Eq, vec![Datum::Int(10)]),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &make_leaf("x", 0, PredicateOperator::Eq, vec![Datum::Int(99)]),
+            &row
+        )
+        .unwrap());
+        // NotEq
+        assert!(eval_row(
+            &make_leaf("x", 0, PredicateOperator::NotEq, vec![Datum::Int(99)]),
+            &row
+        )
+        .unwrap());
+        // Lt / LtEq / Gt / GtEq
+        assert!(eval_row(
+            &make_leaf("x", 0, PredicateOperator::Lt, vec![Datum::Int(20)]),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &make_leaf("x", 0, PredicateOperator::Gt, vec![Datum::Int(20)]),
+            &row
+        )
+        .unwrap());
+        assert!(eval_row(
+            &make_leaf("x", 0, PredicateOperator::LtEq, vec![Datum::Int(10)]),
+            &row
+        )
+        .unwrap());
+        assert!(eval_row(
+            &make_leaf("x", 0, PredicateOperator::GtEq, vec![Datum::Int(10)]),
+            &row
+        )
+        .unwrap());
+        // In / NotIn
+        assert!(eval_row(
+            &make_leaf(
+                "x",
+                0,
+                PredicateOperator::In,
+                vec![Datum::Int(1), Datum::Int(10)]
+            ),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &make_leaf(
+                "x",
+                0,
+                PredicateOperator::In,
+                vec![Datum::Int(1), Datum::Int(2)]
+            ),
+            &row
+        )
+        .unwrap());
+        // NotIn: 10 not in {1, 2} → true; 10 not in {10, 20} → false
+        assert!(eval_row(
+            &make_leaf(
+                "x",
+                0,
+                PredicateOperator::NotIn,
+                vec![Datum::Int(1), Datum::Int(2)]
+            ),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &make_leaf(
+                "x",
+                0,
+                PredicateOperator::NotIn,
+                vec![Datum::Int(10), Datum::Int(20)]
+            ),
+            &row
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_eval_null_semantics() {
+        let mut b = TestBinaryRowBuilder::new(1);
+        b.set_null_at(0);
+        let row = b.build();
+
+        // NULL compared to any value → false (SQL null semantics)
+        assert!(!eval_row(
+            &make_leaf("x", 0, PredicateOperator::Eq, vec![Datum::Int(42)]),
+            &row
+        )
+        .unwrap());
+        // IsNull / IsNotNull
+        assert!(eval_row(&make_leaf("x", 0, PredicateOperator::IsNull, vec![]), &row).unwrap());
+        assert!(!eval_row(
+            &make_leaf("x", 0, PredicateOperator::IsNotNull, vec![]),
+            &row
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_eval_compound_and_constants() {
+        let mut b = TestBinaryRowBuilder::new(2);
+        b.write_int(0, 10);
+        b.write_int(1, 20);
+        let row = b.build();
+
+        let p_true = make_leaf("a", 0, PredicateOperator::Eq, vec![Datum::Int(10)]);
+        let p_false = make_leaf("b", 1, PredicateOperator::Eq, vec![Datum::Int(99)]);
+
+        assert!(!eval_row(&Predicate::and(vec![p_true.clone(), p_false.clone()]), &row).unwrap());
+        assert!(eval_row(&Predicate::or(vec![p_true.clone(), p_false.clone()]), &row).unwrap());
+        assert!(!eval_row(&Predicate::negate(p_true), &row).unwrap());
+
+        // Constants
+        let empty_row = TestBinaryRowBuilder::new(0).build();
+        assert!(eval_row(&Predicate::AlwaysTrue, &empty_row).unwrap());
+        assert!(!eval_row(&Predicate::AlwaysFalse, &empty_row).unwrap());
+    }
+
+    // ======================== split_and ========================
+
+    #[test]
+    fn test_split_and() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p1 = pb.equal("id", Datum::Int(1)).unwrap();
+        let p2 = pb.equal("dt", Datum::Date(19723)).unwrap();
+
+        // AND → children
+        let parts = Predicate::and(vec![p1.clone(), p2.clone()]).split_and();
+        assert_eq!(parts, vec![p1.clone(), p2]);
+        // Non-AND → single-element vec
+        assert_eq!(p1.clone().split_and(), vec![p1]);
+    }
+
+    #[test]
+    fn test_split_and_recursive_nested() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p1 = pb.equal("id", Datum::Int(1)).unwrap();
+        let p2 = pb.equal("dt", Datum::Date(19723)).unwrap();
+        let p3 = pb.equal("hr", Datum::Int(10)).unwrap();
+
+        // Manually construct nested And (bypassing Predicate::and which flattens).
+        // And(And(p1, p2), p3) should still flatten to [p1, p2, p3].
+        let inner = Predicate::And(vec![p1.clone(), p2.clone()]);
+        let outer = Predicate::And(vec![inner, p3.clone()]);
+        let parts = outer.split_and();
+        assert_eq!(parts, vec![p1, p2, p3]);
+    }
+
+    // ======================== remap_field_index ========================
+
+    #[test]
+    fn test_remap_pure_partition_leaf() {
+        let pb = PredicateBuilder::new(&test_fields()); // [id(0), name(1), dt(2), hr(3)]
+        let p = pb.equal("dt", Datum::Date(19723)).unwrap(); // index=2
+        let mapping = vec![None, None, Some(0), Some(1)]; // dt→0, hr→1
+
+        let remapped = p.remap_field_index(&mapping).unwrap();
+        match &remapped {
+            Predicate::Leaf { index, column, .. } => {
+                assert_eq!(column, "dt");
+                assert_eq!(*index, 0); // remapped to partition index
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remap_non_partition_leaf_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p = pb.equal("id", Datum::Int(1)).unwrap(); // index=0, not a partition key
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        assert!(p.remap_field_index(&mapping).is_none());
+    }
+
+    #[test]
+    fn test_remap_and_all_partition() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p1 = pb.equal("dt", Datum::Date(19723)).unwrap();
+        let p2 = pb.equal("hr", Datum::Int(10)).unwrap();
+        let combined = Predicate::and(vec![p1, p2]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        let remapped = combined.remap_field_index(&mapping).unwrap();
+        match &remapped {
+            Predicate::And(children) => {
+                assert_eq!(children.len(), 2);
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remap_or_with_mixed_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p_partition = pb.equal("dt", Datum::Date(19723)).unwrap();
+        let p_data = pb.equal("id", Datum::Int(1)).unwrap();
+        let combined = Predicate::or(vec![p_partition, p_data]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        // OR with mixed columns → cannot safely extract → None
+        assert!(combined.remap_field_index(&mapping).is_none());
+    }
+
+    /// Regression test: `eval_row` must propagate errors from `extract_datum`
+    /// as `Err` (fail-fast), not swallow them into `Ok(true)` (fail-open).
+    ///
+    /// This guards the invariant at `table_scan.rs` partition pruning where
+    /// `eval_row(pred, &row)?` was intentionally changed from fail-open to
+    /// fail-fast.  An unsupported DataType in a leaf triggers `Err` from
+    /// `extract_datum`; we verify it surfaces through `eval_row`.
+    #[test]
+    fn test_eval_row_propagates_extract_error() {
+        let mut b = TestBinaryRowBuilder::new(1);
+        b.write_int(0, 42);
+        let row = b.build();
+
+        // Leaf with unsupported DataType → extract_datum returns Err.
+        let unsupported_leaf = Predicate::Leaf {
+            column: "arr".into(),
+            index: 0,
+            data_type: DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(42)],
+        };
+
+        // Must be Err, not Ok(true).
+        assert!(eval_row(&unsupported_leaf, &row).is_err());
+
+        // Also verify error propagates through compound predicates (And/Or/Not).
+        let and_pred = Predicate::And(vec![Predicate::AlwaysTrue, unsupported_leaf.clone()]);
+        assert!(eval_row(&and_pred, &row).is_err());
+
+        let or_pred = Predicate::Or(vec![Predicate::AlwaysFalse, unsupported_leaf.clone()]);
+        assert!(eval_row(&or_pred, &row).is_err());
+
+        let not_pred = Predicate::Not(Box::new(unsupported_leaf));
+        assert!(eval_row(&not_pred, &row).is_err());
+    }
+
+    #[test]
+    fn test_remap_not_with_mixed_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p_partition = pb.equal("dt", Datum::Date(19723)).unwrap();
+        let p_data = pb.greater_than("id", Datum::Int(10)).unwrap();
+        let inner = Predicate::and(vec![p_partition, p_data]);
+        let negated = Predicate::negate(inner);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        // NOT(partition AND data) → mixed under NOT → None
+        assert!(negated.remap_field_index(&mapping).is_none());
     }
 }

@@ -22,7 +22,7 @@
 
 use super::{ArrowRecordBatchStream, Table, TableScan};
 use crate::arrow::ArrowReaderBuilder;
-use crate::spec::{CoreOptions, DataField};
+use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::Result;
 use crate::{DataSplit, Error};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 pub struct ReadBuilder<'a> {
     table: &'a Table,
     projected_fields: Option<Vec<String>>,
+    filter: Option<Predicate>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -42,6 +43,7 @@ impl<'a> ReadBuilder<'a> {
         Self {
             table,
             projected_fields: None,
+            filter: None,
         }
     }
 
@@ -53,9 +55,26 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Set a filter predicate for scan planning.
+    ///
+    /// The predicate should use table schema field indices (as produced by
+    /// [`PredicateBuilder`]).  During [`TableScan::plan`] the filter is
+    /// decomposed at AND boundaries: partition-only conjuncts are extracted
+    /// and used to prune partitions; all other conjuncts are currently
+    /// **ignored** (neither `TableScan` nor `TableRead` applies data-level
+    /// predicates yet).
+    ///
+    /// This means rows returned by `TableRead` may **not** satisfy the full
+    /// filter — callers must apply remaining predicates themselves until
+    /// data-level pushdown is implemented.
+    pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        self.filter = Some(filter);
+        self
+    }
+
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
-        TableScan::new(self.table)
+        TableScan::new(self.table, self.filter.clone())
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).

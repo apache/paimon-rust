@@ -23,7 +23,8 @@
 use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
-    BinaryRow, CoreOptions, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Snapshot,
+    eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, FileKind, IndexManifest,
+    ManifestEntry, PartitionComputer, Predicate, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
@@ -151,17 +152,32 @@ fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
         .collect()
 }
 
+/// Evaluate a partition predicate against serialized manifest partition bytes.
+///
+/// - `BinaryRow::from_serialized_bytes` failure → fail-open (`Ok(true)`)
+/// - `eval_row` failure → fail-fast (`Err(_)`)
+fn partition_matches_predicate(
+    serialized_partition: &[u8],
+    predicate: &Predicate,
+) -> crate::Result<bool> {
+    match BinaryRow::from_serialized_bytes(serialized_partition) {
+        Ok(row) => eval_row(predicate, &row),
+        Err(_) => Ok(true),
+    }
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
 #[derive(Debug, Clone)]
 pub struct TableScan<'a> {
     table: &'a Table,
+    filter: Option<Predicate>,
 }
 
 impl<'a> TableScan<'a> {
-    pub fn new(table: &'a Table) -> Self {
-        Self { table }
+    pub fn new(table: &'a Table, filter: Option<Predicate>) -> Self {
+        Self { table, filter }
     }
 
     /// Plan the full scan: read latest snapshot, manifest list, manifest entries, then build DataSplits using bin packing.
@@ -191,6 +207,58 @@ impl<'a> TableScan<'a> {
             return Ok(Plan::new(Vec::new()));
         }
 
+        // --- Partition predicate extraction ---
+        let partition_keys = self.table.schema().partition_keys();
+        let partition_predicate = if !partition_keys.is_empty() {
+            self.filter.clone().and_then(|filter| {
+                let mapping =
+                    field_idx_to_partition_idx(self.table.schema().fields(), partition_keys);
+                let conjuncts = filter.split_and();
+                let remapped: Vec<Predicate> = conjuncts
+                    .into_iter()
+                    .filter_map(|c| c.remap_field_index(&mapping))
+                    .collect();
+                if remapped.is_empty() {
+                    None
+                } else {
+                    Some(Predicate::and(remapped))
+                }
+            })
+        } else {
+            None
+        };
+
+        // --- Partition pruning: filter manifest entries before grouping ---
+        //
+        // Note: split construction later still requires a decodable BinaryRow
+        // and will fail on corrupt partition bytes. Pruning is intentionally
+        // best-effort; split construction is mandatory.
+        let entries = if let Some(ref pred) = partition_predicate {
+            let mut kept = Vec::with_capacity(entries.len());
+            // Cache: partition bytes → accept/reject to avoid re-decoding.
+            let mut cache: HashMap<Vec<u8>, bool> = HashMap::new();
+            for e in entries {
+                let accept = match cache.get(e.partition()) {
+                    Some(&cached) => cached,
+                    None => {
+                        let partition_bytes = e.partition();
+                        let accept = partition_matches_predicate(partition_bytes, pred)?;
+                        cache.insert(partition_bytes.to_vec(), accept);
+                        accept
+                    }
+                };
+                if accept {
+                    kept.push(e);
+                }
+            }
+            kept
+        } else {
+            entries
+        };
+        if entries.is_empty() {
+            return Ok(Plan::new(Vec::new()));
+        }
+
         // Group by (partition, bucket). Key = (partition_bytes, bucket).
         let mut groups: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>> = HashMap::new();
         for e in entries {
@@ -202,7 +270,6 @@ impl<'a> TableScan<'a> {
         let base_path = table_path.trim_end_matches('/');
         let mut splits = Vec::new();
 
-        let partition_keys = self.table.schema().partition_keys();
         let partition_computer = if !partition_keys.is_empty() {
             Some(PartitionComputer::new(
                 partition_keys,
@@ -277,5 +344,92 @@ impl<'a> TableScan<'a> {
             }
         }
         Ok(Plan::new(splits))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partition_matches_predicate;
+    use crate::spec::{
+        ArrayType, DataField, DataType, Datum, IntType, Predicate, PredicateBuilder,
+        PredicateOperator, VarCharType,
+    };
+    use crate::Error;
+
+    struct SerializedBinaryRowBuilder {
+        arity: i32,
+        null_bits_size: usize,
+        data: Vec<u8>,
+    }
+
+    impl SerializedBinaryRowBuilder {
+        fn new(arity: i32) -> Self {
+            let null_bits_size = crate::spec::BinaryRow::cal_bit_set_width_in_bytes(arity) as usize;
+            let fixed_part_size = null_bits_size + (arity as usize) * 8;
+            Self {
+                arity,
+                null_bits_size,
+                data: vec![0u8; fixed_part_size],
+            }
+        }
+
+        fn field_offset(&self, pos: usize) -> usize {
+            self.null_bits_size + pos * 8
+        }
+
+        fn write_string(&mut self, pos: usize, value: &str) {
+            let var_offset = self.data.len();
+            self.data.extend_from_slice(value.as_bytes());
+            let encoded = ((var_offset as u64) << 32) | (value.len() as u64);
+            let offset = self.field_offset(pos);
+            self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+
+        fn build_serialized(self) -> Vec<u8> {
+            let mut serialized = Vec::with_capacity(4 + self.data.len());
+            serialized.extend_from_slice(&self.arity.to_be_bytes());
+            serialized.extend_from_slice(&self.data);
+            serialized
+        }
+    }
+
+    fn partition_string_field() -> Vec<DataField> {
+        vec![DataField::new(
+            0,
+            "dt".to_string(),
+            DataType::VarChar(VarCharType::default()),
+        )]
+    }
+
+    #[test]
+    fn test_partition_matches_predicate_decode_failure_fails_open() {
+        let predicate = PredicateBuilder::new(&partition_string_field())
+            .equal("dt", Datum::String("2024-01-01".into()))
+            .unwrap();
+
+        assert!(partition_matches_predicate(&[0xFF, 0x00], &predicate).unwrap());
+    }
+
+    #[test]
+    fn test_partition_matches_predicate_eval_error_fails_fast() {
+        let mut builder = SerializedBinaryRowBuilder::new(1);
+        builder.write_string(0, "2024-01-01");
+        let serialized = builder.build_serialized();
+
+        let predicate = Predicate::Leaf {
+            column: "dt".into(),
+            index: 0,
+            data_type: DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(42)],
+        };
+
+        let err = partition_matches_predicate(&serialized, &predicate)
+            .expect_err("eval_row error should propagate");
+
+        assert!(
+            matches!(&err, Error::Unsupported { message } if message.contains("extract_datum")),
+            "Expected extract_datum unsupported error, got: {err:?}"
+        );
     }
 }
