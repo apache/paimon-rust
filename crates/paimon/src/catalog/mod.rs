@@ -20,12 +20,16 @@
 //! Design aligns with [Paimon Java Catalog](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/catalog/Catalog.java)
 //! and follows API patterns from Apache Iceberg Rust.
 
+mod database;
 mod filesystem;
+mod rest;
 
 use std::collections::HashMap;
 use std::fmt;
 
+pub use database::*;
 pub use filesystem::*;
+pub use rest::*;
 use serde::{Deserialize, Serialize};
 
 /// Splitter for system table names (e.g. `table$snapshots`).
@@ -145,6 +149,12 @@ pub trait Catalog: Send + Sync {
         ignore_if_exists: bool,
         properties: HashMap<String, String>,
     ) -> Result<()>;
+
+    /// Get a database by name.
+    ///
+    /// # Errors
+    /// * [`crate::Error::DatabaseNotExist`] - database does not exist.
+    async fn get_database(&self, name: &str) -> Result<Database>;
 
     /// Drop a database.
     ///

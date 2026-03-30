@@ -75,7 +75,7 @@ impl RESTAuthParameter {
 /// Implement this trait to provide custom authentication mechanisms
 /// for REST API requests.
 #[async_trait]
-pub trait AuthProvider: Send {
+pub trait AuthProvider: Send + Sync {
     /// Merge authentication headers into the base headers.
     ///
     /// # Arguments

@@ -37,7 +37,7 @@ pub use api_request::{
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse, GetTableResponse,
-    ListDatabasesResponse, ListTablesResponse, PagedList,
+    GetTableTokenResponse, ListDatabasesResponse, ListTablesResponse, PagedList,
 };
 
 // Re-export error types

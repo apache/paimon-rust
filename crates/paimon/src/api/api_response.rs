@@ -277,6 +277,17 @@ impl<T> PagedList<T> {
         }
     }
 }
+
+/// Response for getting table token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTableTokenResponse {
+    /// Token key-value pairs (e.g. access_key_id, access_key_secret, etc.)
+    pub token: HashMap<String, String>,
+    /// Token expiration time in milliseconds since epoch.
+    pub expires_at_millis: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

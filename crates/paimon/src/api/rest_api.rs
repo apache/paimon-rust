@@ -77,7 +77,6 @@ fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
 pub struct RESTApi {
     client: HttpClient,
     resource_paths: ResourcePaths,
-    #[allow(dead_code)]
     options: Options,
 }
 
@@ -166,6 +165,11 @@ impl RESTApi {
             resource_paths,
             options,
         })
+    }
+
+    /// Get the options (potentially merged with server config).
+    pub fn options(&self) -> &Options {
+        &self.options
     }
 
     // ==================== Database Operations ====================
@@ -374,5 +378,21 @@ impl RESTApi {
         let path = self.resource_paths.table(database, table);
         let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== Token Operations ====================
+
+    /// Load table token for data access.
+    ///
+    /// Corresponds to Python `RESTApi.load_table_token`.
+    pub async fn load_table_token(
+        &mut self,
+        identifier: &Identifier,
+    ) -> Result<super::api_response::GetTableTokenResponse> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.table_token(database, table);
+        self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 }

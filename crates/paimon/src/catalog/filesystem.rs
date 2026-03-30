@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::{Catalog, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
+use crate::catalog::{Catalog, DB_LOCATION_PROP, DB_SUFFIX, Database, Identifier};
 use crate::error::{Error, Result};
 use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
@@ -235,6 +235,20 @@ impl Catalog for FileSystemCatalog {
         }
 
         Ok(())
+    }
+
+    async fn get_database(&self, name: &str) -> Result<Database> {
+        if !self.database_exists(name).await? {
+            return Err(Error::DatabaseNotExist {
+                database: name.to_string(),
+            });
+        }
+
+        Ok(Database::new(
+            name.to_string(),
+            HashMap::new(),
+            None,
+        ))
     }
 
     async fn drop_database(

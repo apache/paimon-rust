@@ -19,9 +19,16 @@
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
-use paimon::catalog::Identifier;
+use paimon::api::ConfigResponse;
+use paimon::catalog::{Identifier, RestCatalog};
+use paimon::common::Options;
+use paimon::spec::{DataType, IntType, Schema, VarCharType};
 use paimon::{Catalog, Error, FileSystemCatalog, Plan};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+#[path = "../../paimon/tests/mock_server.rs"]
+mod mock_server;
+use mock_server::start_mock_server;
 
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
@@ -436,5 +443,185 @@ async fn test_read_projection_duplicate_column() {
     assert!(
         matches!(&err, Error::ConfigInvalid { message } if message.contains("Duplicate projection column 'id'")),
         "Expected ConfigInvalid for duplicate projection, got: {err:?}"
+    );
+}
+
+// ======================= REST Catalog read tests ===============================
+
+/// Build a simple test schema matching the Spark-provisioned tables (id INT, name VARCHAR).
+fn simple_log_schema() -> Schema {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )
+        .build()
+        .expect("Failed to build schema")
+}
+
+/// Build a DV-enabled primary key schema (id INT NOT NULL as PK, name VARCHAR).
+fn simple_dv_pk_schema() -> Schema {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column(
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )
+        .primary_key(["id"])
+        .option("deletion-vectors.enabled", "true")
+        .build()
+        .expect("Failed to build schema")
+}
+
+/// Start a mock REST server backed by Spark-provisioned data on disk,
+/// register the given tables, and return a connected `RestCatalog`.
+async fn setup_rest_catalog_with_tables(
+    table_configs: &[(&str, &str, Schema)],
+) -> (mock_server::RESTServer, RestCatalog) {
+    let data_path = get_test_warehouse();
+    // Use a simple warehouse name (no slashes) to avoid URL-encoding issues
+    let warehouse_name = "test_warehouse";
+    let prefix = "mock-test";
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), prefix.to_string());
+    let config = ConfigResponse::new(defaults);
+
+    let server = start_mock_server(
+        warehouse_name.to_string(),
+        data_path.clone(),
+        config,
+        vec!["default".to_string()],
+    )
+    .await;
+
+    // Register each table with its schema and the real on-disk path
+    for (database, table_name, schema) in table_configs {
+        let table_path = format!("{}/{}.db/{}", data_path, database, table_name);
+        server.add_table_with_schema(database, table_name, schema.clone(), &table_path);
+    }
+
+    let url = server.url().expect("Failed to get server URL");
+    let mut options = Options::new();
+    options.set("uri", &url);
+    options.set("warehouse", warehouse_name);
+    options.set("token.provider", "bear");
+    options.set("token", "test_token");
+
+    let catalog = RestCatalog::new(options, true)
+        .await
+        .expect("Failed to create RestCatalog");
+
+    (server, catalog)
+}
+
+/// Test reading an append-only (log) table via REST catalog backed by mock server.
+///
+/// The mock server returns table metadata pointing to Spark-provisioned data on disk.
+#[tokio::test]
+async fn test_rest_catalog_read_append_table() {
+    let table_name = "simple_log_table";
+    let (_server, catalog) = setup_rest_catalog_with_tables(&[(
+        "default",
+        table_name,
+        simple_log_schema(),
+    )])
+    .await;
+
+    let identifier = Identifier::new("default", table_name);
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table from REST catalog");
+
+    let read_builder = table.new_read_builder();
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    assert!(
+        !plan.splits().is_empty(),
+        "REST append table should have at least one split"
+    );
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<_> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    assert!(
+        !batches.is_empty(),
+        "REST append table should produce at least one batch"
+    );
+
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "REST catalog append table rows should match expected values"
+    );
+}
+
+/// Test reading a primary-key table with deletion vectors via REST catalog backed by mock server.
+///
+/// The mock server returns table metadata pointing to Spark-provisioned data on disk.
+#[tokio::test]
+async fn test_rest_catalog_read_pk_table() {
+    let table_name = "simple_dv_pk_table";
+    let (_server, catalog) = setup_rest_catalog_with_tables(&[(
+        "default",
+        table_name,
+        simple_dv_pk_schema(),
+    )])
+    .await;
+
+    let identifier = Identifier::new("default", table_name);
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table from REST catalog");
+
+    let read_builder = table.new_read_builder();
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    assert!(
+        !plan.splits().is_empty(),
+        "REST PK table should have at least one split"
+    );
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<_> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    assert!(
+        !batches.is_empty(),
+        "REST PK table should produce at least one batch"
+    );
+
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice-v2".to_string()),
+        (2, "bob-v2".to_string()),
+        (3, "carol-v2".to_string()),
+        (4, "dave-v2".to_string()),
+        (5, "eve-v2".to_string()),
+        (6, "frank-v1".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "REST catalog DV-enabled PK table should only expose the latest row per key"
     );
 }

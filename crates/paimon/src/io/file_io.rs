@@ -21,9 +21,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use opendal::raw::normalize_root;
-use opendal::{Metakey, Operator};
+use opendal::raw::Timestamp;
+use opendal::Operator;
 use snafu::ResultExt;
 use url::Url;
 
@@ -122,10 +122,8 @@ impl FileIO {
         // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path);
 
-        // Request ContentLength and LastModified so accessing meta.content_length() / last_modified()
         let entries = op
             .list_with(&list_path)
-            .metakey(Metakey::ContentLength | Metakey::LastModified)
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to list files in '{path}'"),
@@ -152,7 +150,7 @@ impl FileIO {
     pub async fn exists(&self, path: &str) -> Result<bool> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.is_exist(relative_path).await.context(IoUnexpectedSnafu {
+        op.exists(relative_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to check existence of '{path}'"),
         })
     }
@@ -285,7 +283,8 @@ impl FileWrite for opendal::Writer {
     }
 
     async fn close(&mut self) -> crate::Result<()> {
-        Ok(opendal::Writer::close(self).await?)
+        opendal::Writer::close(self).await?;
+        Ok(())
     }
 }
 
@@ -294,7 +293,7 @@ pub struct FileStatus {
     pub size: u64,
     pub is_dir: bool,
     pub path: String,
-    pub last_modified: Option<DateTime<Utc>>,
+    pub last_modified: Option<Timestamp>,
 }
 
 #[derive(Debug)]
@@ -312,7 +311,7 @@ impl InputFile {
     pub async fn exists(&self) -> crate::Result<bool> {
         Ok(self
             .op
-            .is_exist(&self.path[self.relative_path_pos..])
+            .exists(&self.path[self.relative_path_pos..])
             .await?)
     }
 
@@ -355,7 +354,7 @@ impl OutputFile {
     pub async fn exists(&self) -> crate::Result<bool> {
         Ok(self
             .op
-            .is_exist(&self.path[self.relative_path_pos..])
+            .exists(&self.path[self.relative_path_pos..])
             .await?)
     }
 

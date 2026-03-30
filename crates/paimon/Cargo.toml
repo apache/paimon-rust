@@ -27,7 +27,7 @@ license.workspace = true
 version.workspace = true
 
 [features]
-default = ["storage-memory", "storage-fs"]
+default = ["storage-memory", "storage-fs", "storage-oss"]
 storage-all = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"]
 
 storage-memory = ["opendal/services-memory"]
@@ -49,7 +49,7 @@ serde_with = "3.9.0"
 serde_repr = "0.1"
 snafu = "0.8.3"
 typed-builder = "^0.19"
-opendal = { version = "0.49", features = ["services-fs"] }
+opendal = { version = "0.55", features = ["services-fs"] }
 pretty_assertions = "1"
 apache-avro = { version = "0.17", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
@@ -75,3 +75,7 @@ axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 rand = "0.8.5"
 serde_avro_fast = { version = "1.1.2", features = ["snappy"] }
 tempfile = "3"
+
+[[example]]
+name = "rest_catalog_example"
+path = "examples/rest_catalog_example.rs"
