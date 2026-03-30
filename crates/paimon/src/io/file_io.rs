@@ -129,6 +129,15 @@ impl FileIO {
         let mut statuses = Vec::new();
 
         for entry in entries {
+            // opendal list_with includes the root directory itself as the first entry.
+            // The root entry's path equals list_path (with or without leading slash).
+            // Skip it so callers only see the direct children.
+            let entry_path = entry.path();
+            let entry_path_normalized = entry_path.trim_start_matches('/');
+            let list_path_normalized = list_path.trim_start_matches('/');
+            if entry_path_normalized == list_path_normalized {
+                continue;
+            }
             let meta = entry.metadata();
             statuses.push(FileStatus {
                 size: meta.content_length(),
