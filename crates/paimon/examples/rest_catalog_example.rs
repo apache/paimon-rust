@@ -17,7 +17,7 @@
 
 //! Example: REST Catalog Operations
 //!
-//! This example demonstrates how to use `RestCatalog` for database and table operations
+//! This example demonstrates how to use `RESTCatalog` for database and table operations
 //! via the Paimon REST catalog API.
 //!
 //! # Usage
@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use paimon::catalog::{Catalog, Identifier, RestCatalog};
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{DataType, IntType, Schema, VarCharType};
 
@@ -54,10 +54,7 @@ async fn main() {
     // Basic configuration — replace with your actual server URL and warehouse
     options.set(CatalogOptions::METASTORE, "rest");
     options.set(CatalogOptions::WAREHOUSE, "pypaimon_catalog");
-    options.set(
-        CatalogOptions::URI,
-        "http://sample.net/",
-    );
+    options.set(CatalogOptions::URI, "http://sample.net/");
 
     // --- Authentication (choose one) ---
 
@@ -78,12 +75,12 @@ async fn main() {
     // options.set("token", std::env::var("PAIMON_REST_TOKEN")
     //     .expect("PAIMON_REST_TOKEN env var not set"));
 
-    // ==================== Create RestCatalog ====================
-    println!("Creating RestCatalog instance...");
-    let catalog = match RestCatalog::new(options, true).await {
+    // ==================== Create RESTCatalog ====================
+    println!("Creating RESTCatalog instance...");
+    let catalog = match RESTCatalog::new(options, true).await {
         Ok(catalog) => catalog,
         Err(err) => {
-            eprintln!("Failed to create RestCatalog: {}", err);
+            eprintln!("Failed to create RESTCatalog: {}", err);
             return;
         }
     };
@@ -127,10 +124,7 @@ async fn main() {
     let table_identifier = Identifier::new("example_db", "users");
     println!("Creating table '{}'...", table_identifier);
     let schema = create_test_schema();
-    match catalog
-        .create_table(&table_identifier, schema, false)
-        .await
-    {
+    match catalog.create_table(&table_identifier, schema, false).await {
         Ok(()) => println!("Table created successfully"),
         Err(err) => eprintln!("Failed to create table: {}", err),
     }

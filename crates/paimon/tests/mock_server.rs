@@ -24,8 +24,8 @@ use axum::{
     extract::{Extension, Json, Path, Query},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    serve, Router,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -572,7 +572,7 @@ impl RESTServer {
 
     /// Add a table with schema and path to the server state.
     ///
-    /// This is needed for `RestCatalog::get_table` which requires
+    /// This is needed for `RESTCatalog::get_table` which requires
     /// the response to contain `schema` and `path`.
     #[allow(dead_code)]
     pub fn add_table_with_schema(
@@ -734,7 +734,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/tables/rename"),
-            axum::routing::post(RESTServer::rename_table),
+            post(RESTServer::rename_table),
         )
         // ECS metadata endpoints (for token loader testing)
         .route(
@@ -753,7 +753,7 @@ pub async fn start_mock_server(
     let addr = listener.local_addr().unwrap();
 
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+        if let Err(e) = serve(listener, app.into_make_service()).await {
             eprintln!("mock server error: {e}");
         }
     });

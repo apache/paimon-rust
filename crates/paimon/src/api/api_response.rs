@@ -279,7 +279,7 @@ impl<T> PagedList<T> {
 }
 
 /// Response for getting table token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTableTokenResponse {
     /// Token key-value pairs (e.g. access_key_id, access_key_secret, etc.)

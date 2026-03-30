@@ -20,7 +20,7 @@
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
-use paimon::catalog::{Identifier, RestCatalog};
+use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Schema, VarCharType};
 use paimon::{Catalog, Error, FileSystemCatalog, Plan};
@@ -452,10 +452,7 @@ async fn test_read_projection_duplicate_column() {
 fn simple_log_schema() -> Schema {
     Schema::builder()
         .column("id", DataType::Int(IntType::new()))
-        .column(
-            "name",
-            DataType::VarChar(VarCharType::string_type()),
-        )
+        .column("name", DataType::VarChar(VarCharType::string_type()))
         .build()
         .expect("Failed to build schema")
 }
@@ -464,10 +461,7 @@ fn simple_log_schema() -> Schema {
 fn simple_dv_pk_schema() -> Schema {
     Schema::builder()
         .column("id", DataType::Int(IntType::with_nullable(false)))
-        .column(
-            "name",
-            DataType::VarChar(VarCharType::string_type()),
-        )
+        .column("name", DataType::VarChar(VarCharType::string_type()))
         .primary_key(["id"])
         .option("deletion-vectors.enabled", "true")
         .build()
@@ -475,10 +469,10 @@ fn simple_dv_pk_schema() -> Schema {
 }
 
 /// Start a mock REST server backed by Spark-provisioned data on disk,
-/// register the given tables, and return a connected `RestCatalog`.
+/// register the given tables, and return a connected `RESTCatalog`.
 async fn setup_rest_catalog_with_tables(
     table_configs: &[(&str, &str, Schema)],
-) -> (mock_server::RESTServer, RestCatalog) {
+) -> (mock_server::RESTServer, RESTCatalog) {
     let data_path = get_test_warehouse();
     // Use a simple warehouse name (no slashes) to avoid URL-encoding issues
     let warehouse_name = "test_warehouse";
@@ -508,9 +502,9 @@ async fn setup_rest_catalog_with_tables(
     options.set("token.provider", "bear");
     options.set("token", "test_token");
 
-    let catalog = RestCatalog::new(options, true)
+    let catalog = RESTCatalog::new(options, true)
         .await
-        .expect("Failed to create RestCatalog");
+        .expect("Failed to create RESTCatalog");
 
     (server, catalog)
 }
@@ -521,12 +515,8 @@ async fn setup_rest_catalog_with_tables(
 #[tokio::test]
 async fn test_rest_catalog_read_append_table() {
     let table_name = "simple_log_table";
-    let (_server, catalog) = setup_rest_catalog_with_tables(&[(
-        "default",
-        table_name,
-        simple_log_schema(),
-    )])
-    .await;
+    let (_server, catalog) =
+        setup_rest_catalog_with_tables(&[("default", table_name, simple_log_schema())]).await;
 
     let identifier = Identifier::new("default", table_name);
     let table = catalog
@@ -575,12 +565,8 @@ async fn test_rest_catalog_read_append_table() {
 #[tokio::test]
 async fn test_rest_catalog_read_pk_table() {
     let table_name = "simple_dv_pk_table";
-    let (_server, catalog) = setup_rest_catalog_with_tables(&[(
-        "default",
-        table_name,
-        simple_dv_pk_schema(),
-    )])
-    .await;
+    let (_server, catalog) =
+        setup_rest_catalog_with_tables(&[("default", table_name, simple_dv_pk_schema())]).await;
 
     let identifier = Identifier::new("default", table_name);
     let table = catalog

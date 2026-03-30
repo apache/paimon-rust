@@ -79,7 +79,7 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
                 })?,
         );
 
-    cfg.security_token = props.get(OSS_SECURITY_TOKEN).cloned();
+    cfg.security_token = props.remove(OSS_SECURITY_TOKEN);
     Ok(cfg)
 }
 

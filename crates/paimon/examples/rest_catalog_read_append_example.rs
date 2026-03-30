@@ -17,7 +17,7 @@
 
 //! Example: REST Catalog — Read Append Table Data
 //!
-//! This example demonstrates how to use `RestCatalog` to read data from an
+//! This example demonstrates how to use `RESTCatalog` to read data from an
 //! append-only table with the following schema:
 //!
 //! | Column   | Type    |
@@ -45,7 +45,7 @@
 
 use futures::TryStreamExt;
 
-use paimon::catalog::{Catalog, Identifier, RestCatalog};
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::{CatalogOptions, Options};
 
 #[tokio::main]
@@ -56,10 +56,7 @@ async fn main() {
     // Basic configuration — replace with your actual server URL and warehouse
     options.set(CatalogOptions::METASTORE, "rest");
     options.set(CatalogOptions::WAREHOUSE, "pypaimon_catalog");
-    options.set(
-        CatalogOptions::URI,
-        "http://sample.net/",
-    );
+    options.set(CatalogOptions::URI, "http://sample.net/");
 
     // --- Authentication (choose one) ---
 
@@ -80,12 +77,12 @@ async fn main() {
     // options.set("token", std::env::var("PAIMON_REST_TOKEN")
     //     .expect("PAIMON_REST_TOKEN env var not set"));
 
-    // ==================== Create RestCatalog ====================
-    println!("Creating RestCatalog instance...");
-    let catalog = match RestCatalog::new(options, true).await {
+    // ==================== Create RESTCatalog ====================
+    println!("Creating RESTCatalog instance...");
+    let catalog = match RESTCatalog::new(options, true).await {
         Ok(catalog) => catalog,
         Err(err) => {
-            eprintln!("Failed to create RestCatalog: {}", err);
+            eprintln!("Failed to create RESTCatalog: {}", err);
             return;
         }
     };

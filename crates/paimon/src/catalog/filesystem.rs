@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::{Catalog, DB_LOCATION_PROP, DB_SUFFIX, Database, Identifier};
+use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::error::{Error, Result};
 use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
@@ -244,11 +244,7 @@ impl Catalog for FileSystemCatalog {
             });
         }
 
-        Ok(Database::new(
-            name.to_string(),
-            HashMap::new(),
-            None,
-        ))
+        Ok(Database::new(name.to_string(), HashMap::new(), None))
     }
 
     async fn drop_database(

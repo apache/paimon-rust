@@ -41,6 +41,34 @@ impl RESTUtil {
     pub fn extract_prefix_map(options: &Options, prefix: &str) -> HashMap<String, String> {
         options.extract_prefix_map(prefix)
     }
+
+    /// Merge two property maps, with `override_properties` taking precedence.
+    ///
+    /// For keys present in both maps, the value from `override_properties` wins.
+    /// `None` values are skipped (only relevant at the map level; individual
+    /// entries are always `String`).
+    ///
+    /// Corresponds to Python `RESTUtil.merge`.
+    pub fn merge(
+        base_properties: Option<&HashMap<String, String>>,
+        override_properties: Option<&HashMap<String, String>>,
+    ) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+
+        if let Some(base) = base_properties {
+            for (key, value) in base {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+
+        if let Some(overrides) = override_properties {
+            for (key, value) in overrides {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]

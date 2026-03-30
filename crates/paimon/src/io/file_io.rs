@@ -122,12 +122,9 @@ impl FileIO {
         // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path);
 
-        let entries = op
-            .list_with(&list_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to list files in '{path}'"),
-            })?;
+        let entries = op.list_with(&list_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to list files in '{path}'"),
+        })?;
 
         let mut statuses = Vec::new();
 
@@ -309,10 +306,7 @@ impl InputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self
-            .op
-            .exists(&self.path[self.relative_path_pos..])
-            .await?)
+        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
@@ -352,10 +346,7 @@ impl OutputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self
-            .op
-            .exists(&self.path[self.relative_path_pos..])
-            .await?)
+        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
     }
 
     pub fn to_input_file(self) -> InputFile {

@@ -47,16 +47,3 @@ impl PartialEq for RESTToken {
 }
 
 impl Eq for RESTToken {}
-
-impl std::hash::Hash for RESTToken {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.expire_at_millis.hash(state);
-        // Sort keys for deterministic hashing
-        let mut pairs: Vec<_> = self.token.iter().collect();
-        pairs.sort_by_key(|(k, _)| (*k).clone());
-        for (k, v) in pairs {
-            k.hash(state);
-            v.hash(state);
-        }
-    }
-}

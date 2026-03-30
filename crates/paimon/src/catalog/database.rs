@@ -22,7 +22,7 @@ use std::collections::HashMap;
 /// Structure representing a database in a Paimon catalog.
 ///
 /// Corresponds to Python `Database` in `pypaimon/catalog/rest/rest_catalog.py`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Database {
     /// Database name.
     pub name: String,
@@ -34,11 +34,7 @@ pub struct Database {
 
 impl Database {
     /// Create a new Database.
-    pub fn new(
-        name: String,
-        options: HashMap<String, String>,
-        comment: Option<String>,
-    ) -> Self {
+    pub fn new(name: String, options: HashMap<String, String>, comment: Option<String>) -> Self {
         Self {
             name,
             options,

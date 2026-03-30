@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration tests for RestCatalog.
+//! Integration tests for RESTCatalog.
 //!
-//! These tests use a mock server to verify the RestCatalog behavior
+//! These tests use a mock server to verify the RESTCatalog behavior
 //! through the Catalog trait interface.
 
 use std::collections::HashMap;
 
 use paimon::api::ConfigResponse;
-use paimon::catalog::{Catalog, Identifier, RestCatalog};
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{BigIntType, DataType, Schema, VarCharType};
 
@@ -33,10 +33,10 @@ use mock_server::{start_mock_server, RESTServer};
 /// Helper struct to hold test resources.
 struct TestContext {
     server: RESTServer,
-    catalog: RestCatalog,
+    catalog: RESTCatalog,
 }
 
-/// Helper function to set up a test environment with RestCatalog.
+/// Helper function to set up a test environment with RESTCatalog.
 async fn setup_catalog(initial_dbs: Vec<&str>) -> TestContext {
     let prefix = "mock-test";
     let mut defaults = HashMap::new();
@@ -59,9 +59,9 @@ async fn setup_catalog(initial_dbs: Vec<&str>) -> TestContext {
     options.set("token.provider", "bear");
     options.set("token", "test_token");
 
-    let catalog = RestCatalog::new(options, true)
+    let catalog = RESTCatalog::new(options, true)
         .await
-        .expect("Failed to create RestCatalog");
+        .expect("Failed to create RESTCatalog");
 
     TestContext { server, catalog }
 }
@@ -156,10 +156,7 @@ async fn test_catalog_drop_database_not_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
 
     // Dropping non-existent database with ignore_if_not_exists=false should fail
-    let result = ctx
-        .catalog
-        .drop_database("non_existent", false, true)
-        .await;
+    let result = ctx.catalog.drop_database("non_existent", false, true).await;
     assert!(
         result.is_err(),
         "dropping non-existent database should fail when ignore_if_not_exists=false"
@@ -171,10 +168,7 @@ async fn test_catalog_drop_database_ignore_if_not_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
 
     // Dropping non-existent database with ignore_if_not_exists=true should succeed
-    let result = ctx
-        .catalog
-        .drop_database("non_existent", true, true)
-        .await;
+    let result = ctx.catalog.drop_database("non_existent", true, true).await;
     assert!(
         result.is_ok(),
         "dropping non-existent database should succeed when ignore_if_not_exists=true"
@@ -249,8 +243,12 @@ async fn test_catalog_get_table() {
 
     // Add a table with schema and path so get_table can build a Table object
     let schema = test_schema();
-    ctx.server
-        .add_table_with_schema("default", "my_table", schema, "/tmp/test_warehouse/default.db/my_table");
+    ctx.server.add_table_with_schema(
+        "default",
+        "my_table",
+        schema,
+        "/tmp/test_warehouse/default.db/my_table",
+    );
 
     let identifier = Identifier::new("default", "my_table");
     let table = ctx.catalog.get_table(&identifier).await;

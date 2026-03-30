@@ -100,7 +100,7 @@ impl RESTApi {
     ///
     /// # Errors
     /// Returns an error if required options are missing or if config fetch fails.
-    pub async fn new(mut options: Options, config_required: bool) -> Result<Self> {
+    pub async fn new(options: Options, config_required: bool) -> Result<Self> {
         let uri = options
             .get(CatalogOptions::URI)
             .ok_or_else(|| crate::Error::ConfigInvalid {
@@ -143,17 +143,17 @@ impl RESTApi {
                 .await?;
 
             // Merge config response with options (client config takes priority)
-            options = config_response.merge_options(&options);
+            let merged = config_response.merge_options(&options);
 
             // Update base headers from merged options and recreate auth function
-            base_headers.extend(RESTUtil::extract_prefix_map(&options, Self::HEADER_PREFIX));
+            base_headers.extend(RESTUtil::extract_prefix_map(&merged, Self::HEADER_PREFIX));
             // Recreate auth function with updated headers if needed
-            let auth_provider = AuthProviderFactory::create_auth_provider(&options)?;
+            let auth_provider = AuthProviderFactory::create_auth_provider(&merged)?;
             let rest_auth_function = RESTAuthFunction::new(base_headers, auth_provider);
 
             client.set_auth_function(rest_auth_function);
 
-            options
+            merged
         } else {
             options
         };
