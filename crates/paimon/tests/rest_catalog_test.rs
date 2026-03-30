@@ -247,7 +247,7 @@ async fn test_catalog_get_table() {
         "default",
         "my_table",
         schema,
-        "/tmp/test_warehouse/default.db/my_table",
+        "file:///tmp/test_warehouse/default.db/my_table",
     );
 
     let identifier = Identifier::new("default", "my_table");
