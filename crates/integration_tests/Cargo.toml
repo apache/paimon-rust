@@ -29,3 +29,6 @@ arrow-array = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 serde_json = "1"
+
+[dev-dependencies]
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
