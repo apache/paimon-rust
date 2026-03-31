@@ -190,6 +190,7 @@ async fn main() {
 }
 
 /// Format a single cell value from an Arrow array at the given row index.
+/// Supports INT (Int32), BIGINT (Int64), and VARCHAR (String/LargeString).
 fn array_value_to_string(array: &dyn arrow_array::Array, row: usize) -> String {
     use arrow_array::*;
 
@@ -208,24 +209,6 @@ fn array_value_to_string(array: &dyn arrow_array::Array, row: usize) -> String {
     }
     if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
         return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
-        return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-        return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-        return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<Date32Array>() {
-        return arr.value(row).to_string();
-    }
-    if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
-        return format!("{:?}", arr.value(row));
     }
 
     format!("<unsupported type: {:?}>", array.data_type())
