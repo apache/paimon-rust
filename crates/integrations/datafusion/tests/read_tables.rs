@@ -156,3 +156,55 @@ async fn test_projection_via_datafusion() {
         "Projected id values should match"
     );
 }
+
+/// Verifies that `PaimonTableProvider::scan()` produces more than one
+/// execution partition for a multi-partition table, and that the reported
+/// partition count is still capped by `target_partitions`.
+#[tokio::test]
+async fn test_scan_partition_count_respects_session_config() {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionConfig;
+
+    let warehouse = get_test_warehouse();
+    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
+    let identifier = Identifier::new("default", "partitioned_log_table");
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table");
+
+    let provider = PaimonTableProvider::try_new(table).expect("Failed to create table provider");
+
+    // With generous target_partitions, the plan should expose more than one partition.
+    let config = SessionConfig::new().with_target_partitions(8);
+    let ctx = SessionContext::new_with_config(config);
+    let state = ctx.state();
+    let plan = provider
+        .scan(&state, None, &[], None)
+        .await
+        .expect("scan() should succeed");
+
+    let partition_count = plan.properties().output_partitioning().partition_count();
+    assert!(
+        partition_count > 1,
+        "partitioned_log_table should produce >1 partitions, got {partition_count}"
+    );
+
+    // With target_partitions=1, all splits must be coalesced into a single partition
+    let config_single = SessionConfig::new().with_target_partitions(1);
+    let ctx_single = SessionContext::new_with_config(config_single);
+    let state_single = ctx_single.state();
+    let plan_single = provider
+        .scan(&state_single, None, &[], None)
+        .await
+        .expect("scan() should succeed with target_partitions=1");
+
+    assert_eq!(
+        plan_single
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        1,
+        "target_partitions=1 should coalesce all splits into exactly 1 partition"
+    );
+}

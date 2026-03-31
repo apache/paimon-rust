@@ -33,7 +33,7 @@
 //! let df = ctx.sql("SELECT * FROM my_table").await?;
 //! ```
 //!
-//! This version does not support write, column projection, or predicate pushdown.
+//! This version does not support write or predicate pushdown.
 
 mod error;
 mod physical_plan;
