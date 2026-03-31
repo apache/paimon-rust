@@ -20,8 +20,6 @@
 use std::collections::HashMap;
 
 /// Token for REST data access, containing credentials and expiration.
-///
-/// Corresponds to Python `RESTToken` in `pypaimon/catalog/rest/rest_token.py`.
 #[derive(Debug, Clone)]
 pub struct RESTToken {
     /// Token key-value pairs (e.g. access_key_id, access_key_secret, etc.)

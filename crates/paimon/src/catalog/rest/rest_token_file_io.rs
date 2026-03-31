@@ -20,9 +20,6 @@
 //! This module provides a FileIO wrapper that supports getting data access
 //! tokens from a REST Server. It handles token caching, expiration detection,
 //! and automatic refresh.
-//!
-//! Corresponds to Python `RESTTokenFileIO` in
-//! `pypaimon/catalog/rest/rest_token_file_io.py`.
 
 use std::collections::HashMap;
 

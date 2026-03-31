@@ -53,12 +53,12 @@ async fn main() {
 
     // Basic configuration — replace with your actual server URL and warehouse
     options.set(CatalogOptions::METASTORE, "rest");
-    options.set(CatalogOptions::WAREHOUSE, "pypaimon_catalog");
+    options.set(CatalogOptions::WAREHOUSE, "paimon_catalog");
     options.set(CatalogOptions::URI, "http://sample.net/");
 
     // --- Authentication (choose one) ---
 
-    // Option A: DLF authentication (Alibaba Cloud)
+    // DLF authentication (Alibaba Cloud)
     options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
     options.set("dlf.region", "cn-hangzhou");
     options.set(
@@ -69,11 +69,6 @@ async fn main() {
         "dlf.access-key-secret",
         std::env::var("DLF_ACCESS_KEY_SECRET").expect("DLF_ACCESS_KEY_SECRET env var not set"),
     );
-
-    // Option B: Bearer token authentication (uncomment to use)
-    // options.set(CatalogOptions::TOKEN_PROVIDER, "bearer");
-    // options.set("token", std::env::var("PAIMON_REST_TOKEN")
-    //     .expect("PAIMON_REST_TOKEN env var not set"));
 
     // ==================== Create RESTCatalog ====================
     println!("Creating RESTCatalog instance...");
