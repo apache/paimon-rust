@@ -39,11 +39,3 @@ impl RESTToken {
         }
     }
 }
-
-impl PartialEq for RESTToken {
-    fn eq(&self, other: &Self) -> bool {
-        self.expire_at_millis == other.expire_at_millis && self.token == other.token
-    }
-}
-
-impl Eq for RESTToken {}

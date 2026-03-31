@@ -94,7 +94,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn get<T: DeserializeOwned>(
-        &mut self,
+        &self,
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
@@ -136,7 +136,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn post<T: DeserializeOwned, B: serde::Serialize>(
-        &mut self,
+        &self,
         path: &str,
         body: &B,
     ) -> Result<T> {
@@ -163,7 +163,7 @@ impl HttpClient {
     /// # Returns
     /// The parsed JSON response.
     pub async fn delete<T: DeserializeOwned>(
-        &mut self,
+        &self,
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
@@ -203,13 +203,13 @@ impl HttpClient {
 
     /// Build auth headers for a request.
     async fn build_auth_headers(
-        &mut self,
+        &self,
         method: &str,
         path: &str,
         data: Option<&str>,
         params: HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        if let Some(ref mut auth_fn) = self.auth_function {
+        if let Some(ref auth_fn) = self.auth_function {
             let parameter =
                 RESTAuthParameter::new(method, path, data.map(|s| s.to_string()), params);
             auth_fn.apply(&parameter).await

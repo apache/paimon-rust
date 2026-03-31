@@ -73,7 +73,7 @@ async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
 // ==================== Database Tests ====================
 #[tokio::test]
 async fn test_list_databases() {
-    let mut ctx = setup_test_server(vec!["default", "test_db1", "prod_db"]).await;
+    let ctx = setup_test_server(vec!["default", "test_db1", "prod_db"]).await;
 
     let dbs = ctx.api.list_databases().await.unwrap();
 
@@ -84,7 +84,7 @@ async fn test_list_databases() {
 
 #[tokio::test]
 async fn test_create_database() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Create new database
     let result = ctx.api.create_database("new_db", None).await;
@@ -101,7 +101,7 @@ async fn test_create_database() {
 
 #[tokio::test]
 async fn test_get_database() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     let db_resp = ctx.api.get_database("default").await.unwrap();
     assert_eq!(db_resp.name, Some("default".to_string()));
@@ -160,7 +160,7 @@ async fn test_error_responses_status_mapping() {
 
 #[tokio::test]
 async fn test_alter_database() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Alter database with updates
     let mut updates = HashMap::new();
@@ -189,7 +189,7 @@ async fn test_alter_database() {
 
 #[tokio::test]
 async fn test_alter_database_not_found() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     let result = ctx
         .api
@@ -203,7 +203,7 @@ async fn test_alter_database_not_found() {
 
 #[tokio::test]
 async fn test_drop_database() {
-    let mut ctx = setup_test_server(vec!["default", "to_drop"]).await;
+    let ctx = setup_test_server(vec!["default", "to_drop"]).await;
 
     // Verify database exists
     let dbs = ctx.api.list_databases().await.unwrap();
@@ -227,7 +227,7 @@ async fn test_drop_database() {
 
 #[tokio::test]
 async fn test_drop_database_no_permission() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
     ctx.server.add_no_permission_database("secret");
 
     let result = ctx.api.drop_database("secret").await;
@@ -240,7 +240,7 @@ async fn test_drop_database_no_permission() {
 
 #[tokio::test]
 async fn test_list_tables_and_get_table() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Add tables
     ctx.server.add_table("default", "table1");
@@ -262,7 +262,7 @@ async fn test_list_tables_and_get_table() {
 
 #[tokio::test]
 async fn test_get_table_not_found() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     let result = ctx
         .api
@@ -273,7 +273,7 @@ async fn test_get_table_not_found() {
 
 #[tokio::test]
 async fn test_list_tables_empty_database() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     let tables = ctx.api.list_tables("default").await.unwrap();
     assert!(
@@ -284,7 +284,7 @@ async fn test_list_tables_empty_database() {
 
 #[tokio::test]
 async fn test_multiple_databases_with_tables() {
-    let mut ctx = setup_test_server(vec!["db1", "db2"]).await;
+    let ctx = setup_test_server(vec!["db1", "db2"]).await;
 
     // Add tables to different databases
     ctx.server.add_table("db1", "table1_db1");
@@ -305,7 +305,7 @@ async fn test_multiple_databases_with_tables() {
 
 #[tokio::test]
 async fn test_create_table() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Create a simple schema using builder
     use paimon::spec::{DataType, Schema};
@@ -339,7 +339,7 @@ async fn test_create_table() {
 
 #[tokio::test]
 async fn test_drop_table() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Add a table
     ctx.server.add_table("default", "table_to_drop");
@@ -369,7 +369,7 @@ async fn test_drop_table() {
 
 #[tokio::test]
 async fn test_drop_table_no_permission() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
     ctx.server
         .add_no_permission_table("default", "secret_table");
 
@@ -384,7 +384,7 @@ async fn test_drop_table_no_permission() {
 
 #[tokio::test]
 async fn test_rename_table() {
-    let mut ctx = setup_test_server(vec!["default"]).await;
+    let ctx = setup_test_server(vec!["default"]).await;
 
     // Add a table
     ctx.server.add_table("default", "old_table");

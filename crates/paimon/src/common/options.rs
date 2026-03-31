@@ -69,6 +69,9 @@ impl CatalogOptions {
 
     /// DLF ECS role name.
     pub const DLF_TOKEN_ECS_ROLE_NAME: &'static str = "dlf.token-ecs-role-name";
+
+    /// DLF OSS endpoint override.
+    pub const DLF_OSS_ENDPOINT: &'static str = "dlf.oss-endpoint";
 }
 
 /// Configuration options container.

@@ -31,14 +31,14 @@ use tokio::sync::{Mutex, RwLock};
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
-use crate::common::Options;
+use crate::common::{CatalogOptions, Options};
+use crate::io::storage_oss::OSS_ENDPOINT;
 use crate::io::FileIO;
 use crate::Result;
 
 use super::rest_token::RESTToken;
 
 /// Safe time margin (in milliseconds) before token expiration to trigger refresh.
-/// Matches `RESTApi.TOKEN_EXPIRATION_SAFE_TIME_MILLIS` in Python.
 const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 
 /// A FileIO wrapper that supports getting data access tokens from a REST Server.
@@ -47,9 +47,6 @@ const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 /// - Token caching with expiration detection
 /// - Automatic token refresh via `RESTApi::load_table_token`
 /// - Merging token credentials into catalog options to build the underlying `FileIO`
-///
-/// Corresponds to Python `RESTTokenFileIO` in
-/// `pypaimon/catalog/rest/rest_token_file_io.py`.
 pub struct RESTTokenFileIO {
     /// Table identifier for token requests.
     identifier: Identifier,
@@ -99,14 +96,8 @@ impl RESTTokenFileIO {
         match token_guard.as_ref() {
             Some(token) => {
                 // Merge catalog options (base) with token credentials (override)
-                // token.token["fs.oss.endpoint"] = oss-cn-hangzhou.aliyuncs.com
-                let mut token_with_endpoint = token.token.clone();
-                token_with_endpoint.insert(
-                    "fs.oss.endpoint".to_string(),
-                    "oss-cn-hangzhou.aliyuncs.com".to_string(),
-                );
-                let base = self.catalog_options.to_map().clone();
-                let merged_props = RESTUtil::merge(Some(&base), Some(&token_with_endpoint));
+                let merged_props =
+                    RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
                 // Build FileIO with merged properties
                 let mut builder = FileIO::from_path(&self.path)?;
                 builder = builder.with_props(merged_props);
@@ -120,13 +111,11 @@ impl RESTTokenFileIO {
     }
 
     /// Try to refresh the token if it is expired or not yet obtained.
-    ///
-    /// Corresponds to Python `RESTTokenFileIO.try_to_refresh_token`.
     async fn try_to_refresh_token(&self) -> Result<()> {
         // Fast path: check if token is still valid under read lock
         {
             let token_guard = self.token.read().await;
-            if let Some(ref token) = *token_guard {
+            if let Some(token) = token_guard.as_ref() {
                 if !Self::is_token_expired(token) {
                     return Ok(());
                 }
@@ -137,7 +126,7 @@ impl RESTTokenFileIO {
         let mut token_guard = self.token.write().await;
 
         // Double-check after acquiring write lock (another task may have refreshed)
-        if let Some(ref token) = *token_guard {
+        if let Some(token) = token_guard.as_ref() {
             if !Self::is_token_expired(token) {
                 return Ok(());
             }
@@ -153,11 +142,9 @@ impl RESTTokenFileIO {
     ///
     /// Lazily creates a `RESTApi` instance on first call and reuses it
     /// for subsequent refreshes.
-    ///
-    /// Corresponds to Python `RESTTokenFileIO.refresh_token`.
     async fn refresh_token(&self) -> Result<RESTToken> {
         let mut api_guard = self.api.lock().await;
-        let api = match api_guard.as_mut() {
+        let api = match api_guard.as_ref() {
             Some(existing) => existing,
             None => {
                 let new_api = RESTApi::new(self.catalog_options.clone(), false).await?;
@@ -183,17 +170,15 @@ impl RESTTokenFileIO {
     }
 
     /// Merge token credentials with catalog options for DLF OSS endpoint override.
-    ///
-    /// Corresponds to Python `RESTTokenFileIO._merge_token_with_catalog_options`.
     fn merge_token_with_catalog_options(
         &self,
         token: HashMap<String, String>,
     ) -> HashMap<String, String> {
         let mut merged = token;
         // If catalog options contain a DLF OSS endpoint, override the standard OSS endpoint
-        if let Some(dlf_oss_endpoint) = self.catalog_options.get("dlf.oss-endpoint") {
+        if let Some(dlf_oss_endpoint) = self.catalog_options.get(CatalogOptions::DLF_OSS_ENDPOINT) {
             if !dlf_oss_endpoint.trim().is_empty() {
-                merged.insert("fs.oss.endpoint".to_string(), dlf_oss_endpoint.clone());
+                merged.insert(OSS_ENDPOINT.to_string(), dlf_oss_endpoint.clone());
             }
         }
         merged

@@ -244,7 +244,7 @@ const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 /// (ROA v2 HMAC-SHA1).
 pub struct DLFAuthProvider {
     uri: String,
-    token: Option<DLFToken>,
+    token: tokio::sync::Mutex<Option<DLFToken>>,
     token_loader: Option<Arc<dyn DLFTokenLoader>>,
     signer: Box<dyn DLFRequestSigner>,
 }
@@ -279,7 +279,7 @@ impl DLFAuthProvider {
 
         Ok(Self {
             uri,
-            token,
+            token: tokio::sync::Mutex::new(token),
             token_loader,
             signer,
         })
@@ -290,9 +290,11 @@ impl DLFAuthProvider {
     /// If token_loader is configured, this method will:
     /// - Load a new token if current token is None
     /// - Refresh the token if it's about to expire (within TOKEN_EXPIRATION_SAFE_TIME_MILLIS)
-    async fn get_or_refresh_token(&mut self) -> Result<DLFToken> {
+    async fn get_or_refresh_token(&self) -> Result<DLFToken> {
+        let mut token_guard = self.token.lock().await;
+
         if let Some(loader) = &self.token_loader {
-            let need_reload = match &self.token {
+            let need_reload = match &*token_guard {
                 None => true,
                 Some(token) => match token.expiration_at_millis {
                     Some(expiration_at_millis) => {
@@ -305,11 +307,11 @@ impl DLFAuthProvider {
 
             if need_reload {
                 let new_token = loader.load_token().await?;
-                self.token = Some(new_token);
+                *token_guard = Some(new_token);
             }
         }
 
-        self.token.clone().ok_or_else(|| Error::DataInvalid {
+        token_guard.clone().ok_or_else(|| Error::DataInvalid {
             message: "Either token or token_loader must be provided".to_string(),
             source: None,
         })
@@ -330,7 +332,7 @@ impl DLFAuthProvider {
 #[async_trait]
 impl AuthProvider for DLFAuthProvider {
     async fn merge_auth_header(
-        &mut self,
+        &self,
         mut base_header: HashMap<String, String>,
         rest_auth_parameter: &RESTAuthParameter,
     ) -> crate::Result<HashMap<String, String>> {

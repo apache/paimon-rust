@@ -19,13 +19,10 @@
 //!
 //! This module provides a REST-based catalog that communicates with
 //! a Paimon REST catalog server for database and table CRUD operations.
-//!
-//! Reference: Python `RESTCatalog` in `pypaimon/catalog/rest/rest_catalog.py`.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
@@ -47,9 +44,8 @@ use super::rest_token_file_io::RESTTokenFileIO;
 ///
 /// Corresponds to Python `RESTCatalog` in `pypaimon/catalog/rest/rest_catalog.py`.
 pub struct RESTCatalog {
-    /// The REST API client, wrapped in a Mutex because `RESTApi` methods
-    /// require `&mut self` while `Catalog` trait methods take `&self`.
-    api: Mutex<RESTApi>,
+    /// The REST API client.
+    api: RESTApi,
     /// Catalog configuration options.
     options: Options,
     /// Warehouse path.
@@ -84,7 +80,7 @@ impl RESTCatalog {
         let api_options = api.options().clone();
 
         Ok(Self {
-            api: Mutex::new(api),
+            api,
             options: api_options,
             warehouse,
             data_token_enabled,
@@ -107,20 +103,209 @@ impl RESTCatalog {
     }
 
     /// List databases with pagination.
-    ///
-    /// Corresponds to Python `RESTCatalog.list_databases_paged`.
     pub async fn list_databases_paged(
         &self,
         max_results: Option<u32>,
         page_token: Option<&str>,
         database_name_pattern: Option<&str>,
     ) -> Result<PagedList<String>> {
-        let mut api = self.api.lock().await;
-        api.list_databases_paged(max_results, page_token, database_name_pattern)
+        self.api
+            .list_databases_paged(max_results, page_token, database_name_pattern)
             .await
     }
 }
 
+// ============================================================================
+// Catalog trait implementation
+// ============================================================================
+
+#[async_trait]
+impl Catalog for RESTCatalog {
+    // ======================= database methods ===============================
+
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        self.api.list_databases().await
+    }
+
+    async fn create_database(
+        &self,
+        name: &str,
+        ignore_if_exists: bool,
+        properties: HashMap<String, String>,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .create_database(name, Some(properties))
+            .await
+            .map_err(|e| map_rest_error_for_database(e, name));
+        ignore_error_if(result, |e| {
+            ignore_if_exists && matches!(e, Error::DatabaseAlreadyExist { .. })
+        })
+    }
+
+    async fn get_database(&self, name: &str) -> Result<Database> {
+        let response = self
+            .api
+            .get_database(name)
+            .await
+            .map_err(|e| map_rest_error_for_database(e, name))?;
+
+        let mut options = response.options;
+        if let Some(location) = response.location {
+            options.insert(DB_LOCATION_PROP.to_string(), location);
+        }
+
+        Ok(Database::new(name.to_string(), options, None))
+    }
+
+    async fn drop_database(
+        &self,
+        name: &str,
+        ignore_if_not_exists: bool,
+        cascade: bool,
+    ) -> Result<()> {
+        // If not cascade, check if database is empty first
+        if !cascade {
+            let tables = match self.api.list_tables(name).await {
+                Ok(tables) => tables,
+                Err(err) => {
+                    return ignore_error_if(Err(map_rest_error_for_database(err, name)), |e| {
+                        ignore_if_not_exists && matches!(e, Error::DatabaseNotExist { .. })
+                    });
+                }
+            };
+            if !tables.is_empty() {
+                return Err(Error::DatabaseNotEmpty {
+                    database: name.to_string(),
+                });
+            }
+        }
+
+        let result = self
+            .api
+            .drop_database(name)
+            .await
+            .map_err(|e| map_rest_error_for_database(e, name));
+        ignore_error_if(result, |e| {
+            ignore_if_not_exists && matches!(e, Error::DatabaseNotExist { .. })
+        })
+    }
+
+    // ======================= table methods ===============================
+
+    async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
+        let response = self
+            .api
+            .get_table(identifier)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, identifier))?;
+
+        // Extract schema from response
+        let schema = response.schema.ok_or_else(|| Error::DataInvalid {
+            message: format!("Table {} response missing schema", identifier.full_name()),
+            source: None,
+        })?;
+
+        let schema_id = response.schema_id.unwrap_or(0);
+        let table_schema = TableSchema::new(schema_id, &schema);
+
+        // Extract table path from response
+        let table_path = response.path.ok_or_else(|| Error::DataInvalid {
+            message: format!("Table {} response missing path", identifier.full_name()),
+            source: None,
+        })?;
+
+        // Check if the table is external
+        let is_external = response.is_external.unwrap_or(false);
+
+        // Build FileIO based on data_token_enabled and is_external
+        let file_io = if self.data_token_enabled && !is_external {
+            // Use RESTTokenFileIO to get token-based FileIO
+            let token_file_io =
+                RESTTokenFileIO::new(identifier.clone(), table_path.clone(), self.options.clone());
+            token_file_io.build_file_io().await?
+        } else {
+            // Use standard FileIO from path
+            FileIO::from_path(&table_path)?.build()?
+        };
+
+        Ok(Table::new(
+            file_io,
+            identifier.clone(),
+            table_path,
+            table_schema,
+        ))
+    }
+
+    async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
+        self.api
+            .list_tables(database_name)
+            .await
+            .map_err(|e| map_rest_error_for_database(e, database_name))
+    }
+
+    async fn create_table(
+        &self,
+        identifier: &Identifier,
+        creation: Schema,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .create_table(identifier, creation)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, identifier));
+        ignore_error_if(result, |e| {
+            ignore_if_exists && matches!(e, Error::TableAlreadyExist { .. })
+        })
+    }
+
+    async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
+        let result = self
+            .api
+            .drop_table(identifier)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, identifier));
+        ignore_error_if(result, |e| {
+            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
+        })
+    }
+
+    async fn rename_table(
+        &self,
+        from: &Identifier,
+        to: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .rename_table(from, to)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, from))
+            // Remap TableAlreadyExist to use destination identifier
+            .map_err(|e| match e {
+                Error::TableAlreadyExist { .. } => Error::TableAlreadyExist {
+                    full_name: to.full_name(),
+                },
+                other => other,
+            });
+        ignore_error_if(result, |e| {
+            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
+        })
+    }
+
+    async fn alter_table(
+        &self,
+        _identifier: &Identifier,
+        _changes: Vec<SchemaChange>,
+        _ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        // TODO: Implement alter_table when RESTApi supports it
+        Err(Error::Unsupported {
+            message: "Alter table is not yet implemented for REST catalog".to_string(),
+        })
+    }
+}
 // ============================================================================
 // Error mapping helpers
 // ============================================================================
@@ -183,208 +368,4 @@ where
             Err(err)
         }
     })
-}
-
-// ============================================================================
-// Catalog trait implementation
-// ============================================================================
-
-#[async_trait]
-impl Catalog for RESTCatalog {
-    // ======================= database methods ===============================
-
-    async fn list_databases(&self) -> Result<Vec<String>> {
-        let mut api = self.api.lock().await;
-        api.list_databases().await
-    }
-
-    async fn create_database(
-        &self,
-        name: &str,
-        ignore_if_exists: bool,
-        properties: HashMap<String, String>,
-    ) -> Result<()> {
-        let mut api = self.api.lock().await;
-        let options = if properties.is_empty() {
-            None
-        } else {
-            Some(properties)
-        };
-        let result = api
-            .create_database(name, options)
-            .await
-            .map_err(|e| map_rest_error_for_database(e, name));
-        ignore_error_if(result, |e| {
-            ignore_if_exists && matches!(e, Error::DatabaseAlreadyExist { .. })
-        })
-    }
-
-    async fn get_database(&self, name: &str) -> Result<Database> {
-        let mut api = self.api.lock().await;
-        let response = api
-            .get_database(name)
-            .await
-            .map_err(|e| map_rest_error_for_database(e, name))?;
-
-        let mut options = response.options;
-        if let Some(location) = response.location {
-            options.insert(DB_LOCATION_PROP.to_string(), location);
-        }
-
-        Ok(Database::new(name.to_string(), options, None))
-    }
-
-    async fn drop_database(
-        &self,
-        name: &str,
-        ignore_if_not_exists: bool,
-        cascade: bool,
-    ) -> Result<()> {
-        let mut api = self.api.lock().await;
-
-        // If not cascade, check if database is empty first
-        if !cascade {
-            let tables = match api.list_tables(name).await {
-                Ok(tables) => tables,
-                Err(err) => {
-                    let mapped = map_rest_error_for_database(err, name);
-                    if ignore_if_not_exists && matches!(mapped, Error::DatabaseNotExist { .. }) {
-                        return Ok(());
-                    }
-                    return Err(mapped);
-                }
-            };
-            if !tables.is_empty() {
-                return Err(Error::DatabaseNotEmpty {
-                    database: name.to_string(),
-                });
-            }
-        }
-
-        let result = api
-            .drop_database(name)
-            .await
-            .map_err(|e| map_rest_error_for_database(e, name));
-        ignore_error_if(result, |e| {
-            ignore_if_not_exists && matches!(e, Error::DatabaseNotExist { .. })
-        })
-    }
-
-    // ======================= table methods ===============================
-
-    async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
-        let mut api = self.api.lock().await;
-        let response = api
-            .get_table(identifier)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, identifier))?;
-
-        // Extract schema from response
-        let schema = response.schema.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing schema", identifier.full_name()),
-            source: None,
-        })?;
-
-        let schema_id = response.schema_id.unwrap_or(0);
-        let table_schema = TableSchema::new(schema_id, &schema);
-
-        // Extract table path from response
-        let table_path = response.path.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing path", identifier.full_name()),
-            source: None,
-        })?;
-
-        // Check if the table is external
-        let is_external = response.is_external.unwrap_or(false);
-
-        // Drop the API lock before async FileIO operations
-        drop(api);
-
-        // Build FileIO based on data_token_enabled and is_external
-        let file_io = if self.data_token_enabled && !is_external {
-            // Use RESTTokenFileIO to get token-based FileIO
-            let token_file_io =
-                RESTTokenFileIO::new(identifier.clone(), table_path.clone(), self.options.clone());
-            token_file_io.build_file_io().await?
-        } else {
-            // Use standard FileIO from path
-            FileIO::from_path(&table_path)?.build()?
-        };
-
-        Ok(Table::new(
-            file_io,
-            identifier.clone(),
-            table_path,
-            table_schema,
-        ))
-    }
-
-    async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
-        let mut api = self.api.lock().await;
-        api.list_tables(database_name)
-            .await
-            .map_err(|e| map_rest_error_for_database(e, database_name))
-    }
-
-    async fn create_table(
-        &self,
-        identifier: &Identifier,
-        creation: Schema,
-        ignore_if_exists: bool,
-    ) -> Result<()> {
-        let mut api = self.api.lock().await;
-        let result = api
-            .create_table(identifier, creation)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, identifier));
-        ignore_error_if(result, |e| {
-            ignore_if_exists && matches!(e, Error::TableAlreadyExist { .. })
-        })
-    }
-
-    async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
-        let mut api = self.api.lock().await;
-        let result = api
-            .drop_table(identifier)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, identifier));
-        ignore_error_if(result, |e| {
-            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
-        })
-    }
-
-    async fn rename_table(
-        &self,
-        from: &Identifier,
-        to: &Identifier,
-        ignore_if_not_exists: bool,
-    ) -> Result<()> {
-        let mut api = self.api.lock().await;
-        let result = api
-            .rename_table(from, to)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, from))
-            // Remap TableAlreadyExist to use destination identifier
-            .map_err(|e| match e {
-                Error::TableAlreadyExist { .. } => Error::TableAlreadyExist {
-                    full_name: to.full_name(),
-                },
-                other => other,
-            });
-        ignore_error_if(result, |e| {
-            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
-        })
-    }
-
-    async fn alter_table(
-        &self,
-        _identifier: &Identifier,
-        _changes: Vec<SchemaChange>,
-        _ignore_if_not_exists: bool,
-    ) -> Result<()> {
-        // TODO: Implement alter_table when RESTApi supports it
-        Err(Error::Unsupported {
-            message: "Alter table is not yet implemented for REST catalog".to_string(),
-        })
-    }
 }

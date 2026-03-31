@@ -32,7 +32,7 @@ mod storage_memory;
 use storage_memory::*;
 
 #[cfg(feature = "storage-oss")]
-mod storage_oss;
+pub(crate) mod storage_oss;
 #[cfg(feature = "storage-oss")]
 use storage_oss::*;
 

@@ -84,7 +84,7 @@ pub trait AuthProvider: Send + Sync {
     ///
     /// # Returns
     async fn merge_auth_header(
-        &mut self,
+        &self,
         base_header: HashMap<String, String>,
         parameter: &RESTAuthParameter,
     ) -> Result<HashMap<String, String>>;
@@ -120,10 +120,7 @@ impl RESTAuthFunction {
     ///
     /// # Returns
     /// A HashMap containing the authenticated headers.
-    pub async fn apply(
-        &mut self,
-        parameter: &RESTAuthParameter,
-    ) -> Result<HashMap<String, String>> {
+    pub async fn apply(&self, parameter: &RESTAuthParameter) -> Result<HashMap<String, String>> {
         self.auth_provider
             .merge_auth_header(self.init_header.clone(), parameter)
             .await

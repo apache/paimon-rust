@@ -162,7 +162,7 @@ mod tests {
         options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
         options.set(CatalogOptions::TOKEN, "test-token");
 
-        let mut provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
 
         let base_header = HashMap::new();
         let param = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
@@ -202,7 +202,7 @@ mod tests {
         options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "test_key_id");
         options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "test_key_secret");
 
-        let mut provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
 
         let base_header = HashMap::new();
         let param = RESTAuthParameter::new("GET", "/test", None, HashMap::new());

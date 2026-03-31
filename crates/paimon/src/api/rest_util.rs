@@ -47,8 +47,6 @@ impl RESTUtil {
     /// For keys present in both maps, the value from `override_properties` wins.
     /// `None` values are skipped (only relevant at the map level; individual
     /// entries are always `String`).
-    ///
-    /// Corresponds to Python `RESTUtil.merge`.
     pub fn merge(
         base_properties: Option<&HashMap<String, String>>,
         override_properties: Option<&HashMap<String, String>>,

@@ -473,7 +473,7 @@ fn simple_dv_pk_schema() -> Schema {
 async fn setup_rest_catalog_with_tables(
     table_configs: &[(&str, &str, Schema)],
 ) -> (mock_server::RESTServer, RESTCatalog) {
-    let data_path = get_test_warehouse();
+    let catalog_path = get_test_warehouse();
     // Use a simple warehouse name (no slashes) to avoid URL-encoding issues
     let warehouse_name = "test_warehouse";
     let prefix = "mock-test";
@@ -483,7 +483,7 @@ async fn setup_rest_catalog_with_tables(
 
     let server = start_mock_server(
         warehouse_name.to_string(),
-        data_path.clone(),
+        catalog_path.clone(),
         config,
         vec!["default".to_string()],
     )
@@ -491,7 +491,7 @@ async fn setup_rest_catalog_with_tables(
 
     // Register each table with its schema and the real on-disk path
     for (database, table_name, schema) in table_configs {
-        let table_path = format!("{}/{}.db/{}", data_path, database, table_name);
+        let table_path = format!("{}/{}.db/{}", catalog_path, database, table_name);
         server.add_table_with_schema(database, table_name, schema.clone(), &table_path);
     }
 

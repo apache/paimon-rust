@@ -27,23 +27,23 @@ use crate::Result;
 /// Configuration key for OSS endpoint.
 ///
 /// Compatible with paimon-java's `fs.oss.endpoint`.
-const OSS_ENDPOINT: &str = "fs.oss.endpoint";
+pub(crate) const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 
 /// Configuration key for OSS access key ID.
 ///
 /// Compatible with paimon-java's `fs.oss.accessKeyId`.
-const OSS_ACCESS_KEY_ID: &str = "fs.oss.accessKeyId";
+pub(crate) const OSS_ACCESS_KEY_ID: &str = "fs.oss.accessKeyId";
 
 /// Configuration key for OSS access key secret.
 ///
 /// Compatible with paimon-java's `fs.oss.accessKeySecret`.
-const OSS_ACCESS_KEY_SECRET: &str = "fs.oss.accessKeySecret";
+pub(crate) const OSS_ACCESS_KEY_SECRET: &str = "fs.oss.accessKeySecret";
 
 /// Configuration key for OSS STS security token (optional).
 ///
 /// Compatible with paimon-java's `fs.oss.securityToken`.
 /// Required when using STS temporary credentials (e.g. from REST data tokens).
-const OSS_SECURITY_TOKEN: &str = "fs.oss.securityToken";
+pub(crate) const OSS_SECURITY_TOKEN: &str = "fs.oss.securityToken";
 
 /// Parse paimon catalog options into an [`OssConfig`].
 ///

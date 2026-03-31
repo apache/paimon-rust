@@ -46,7 +46,7 @@ impl BearerTokenAuthProvider {
 #[async_trait]
 impl AuthProvider for BearerTokenAuthProvider {
     async fn merge_auth_header(
-        &mut self,
+        &self,
         mut base_header: HashMap<String, String>,
         _parameter: &RESTAuthParameter,
     ) -> crate::Result<HashMap<String, String>> {
@@ -64,7 +64,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bearer_token_auth() {
-        let mut provider = BearerTokenAuthProvider::new("test-token");
+        let provider = BearerTokenAuthProvider::new("test-token");
         let base_header = HashMap::new();
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());
 
@@ -81,7 +81,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bearer_token_with_base_headers() {
-        let mut provider = BearerTokenAuthProvider::new("my-token");
+        let provider = BearerTokenAuthProvider::new("my-token");
         let mut base_header = HashMap::new();
         base_header.insert("Content-Type".to_string(), "application/json".to_string());
         let parameter = RESTAuthParameter::for_get("/test", HashMap::new());

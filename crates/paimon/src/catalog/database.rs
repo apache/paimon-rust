@@ -20,8 +20,6 @@
 use std::collections::HashMap;
 
 /// Structure representing a database in a Paimon catalog.
-///
-/// Corresponds to Python `Database` in `pypaimon/catalog/rest/rest_catalog.py`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Database {
     /// Database name.
