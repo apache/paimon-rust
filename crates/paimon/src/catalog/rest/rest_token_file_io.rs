@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_util::RESTUtil;
@@ -53,7 +53,7 @@ pub struct RESTTokenFileIO {
     catalog_options: Options,
     /// Lazily-initialized REST API client for token refresh.
     /// Created on first token refresh and reused for subsequent refreshes.
-    api: Mutex<Option<RESTApi>>,
+    api: OnceCell<RESTApi>,
     /// Cached token with RwLock for concurrent access.
     token: RwLock<Option<RESTToken>>,
 }
@@ -70,7 +70,7 @@ impl RESTTokenFileIO {
             identifier,
             path,
             catalog_options,
-            api: Mutex::new(None),
+            api: OnceCell::new(),
             token: RwLock::new(None),
         }
     }
@@ -119,18 +119,22 @@ impl RESTTokenFileIO {
             }
         }
 
-        // Slow path: acquire write lock and refresh
-        let mut token_guard = self.token.write().await;
-
-        // Double-check after acquiring write lock (another task may have refreshed)
-        if let Some(token) = token_guard.as_ref() {
-            if !Self::is_token_expired(token) {
-                return Ok(());
+        // Slow path: acquire write lock and check again
+        {
+            let token_guard = self.token.write().await;
+            if let Some(token) = token_guard.as_ref() {
+                if !Self::is_token_expired(token) {
+                    return Ok(());
+                }
             }
         }
+        // Write lock released before .await to avoid potential deadlock
 
-        // Refresh the token
+        // Refresh the token WITHOUT holding the lock
         let new_token = self.refresh_token().await?;
+
+        // Acquire write lock again to update
+        let mut token_guard = self.token.write().await;
         *token_guard = Some(new_token);
         Ok(())
     }
@@ -140,14 +144,11 @@ impl RESTTokenFileIO {
     /// Lazily creates a `RESTApi` instance on first call and reuses it
     /// for subsequent refreshes.
     async fn refresh_token(&self) -> Result<RESTToken> {
-        let mut api_guard = self.api.lock().await;
-        let api = match api_guard.as_ref() {
-            Some(existing) => existing,
-            None => {
-                let new_api = RESTApi::new(self.catalog_options.clone(), false).await?;
-                api_guard.insert(new_api)
-            }
-        };
+        let api = self
+            .api
+            .get_or_try_init(|| async { RESTApi::new(self.catalog_options.clone(), false).await })
+            .await?;
+
         let response = api.load_table_token(&self.identifier).await?;
 
         let expires_at_millis = response.expires_at_millis.unwrap_or(0);

@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Example: REST Catalog Operations
+//! Example: REST Catalog Operations (Complete)
 //!
-//! This example demonstrates how to use `RESTCatalog` for database and table operations
-//! via the Paimon REST catalog API.
+//! This example demonstrates how to use `RESTCatalog` for:
+//! 1. Database operations (create, list, get, drop)
+//! 2. Table operations (create, list, get, rename, drop)
+//! 3. Data reading from append-only tables
 //!
 //! # Usage
 //! ```bash
@@ -33,6 +35,8 @@
 
 use std::collections::HashMap;
 
+use futures::TryStreamExt;
+
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{DataType, IntType, Schema, VarCharType};
@@ -44,6 +48,31 @@ fn create_test_schema() -> Schema {
         .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
         .build()
         .expect("Failed to build schema")
+}
+
+/// Format a single cell value from an Arrow array at the given row index.
+/// Supports INT (Int32), BIGINT (Int64), and VARCHAR (String/LargeString).
+fn array_value_to_string(array: &dyn arrow_array::Array, row: usize) -> String {
+    use arrow_array::*;
+
+    if array.is_null(row) {
+        return "null".to_string();
+    }
+
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        return arr.value(row).to_string();
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return arr.value(row).to_string();
+    }
+
+    format!("<unsupported type: {:?}>", array.data_type())
 }
 
 #[tokio::main]
@@ -80,8 +109,8 @@ async fn main() {
         }
     };
 
-    // ==================== Database Operations ====================
-    println!("\n=== Database Operations ===\n");
+    // ==================== Part 1: Database Operations ====================
+    println!("\n=== Part 1: Database Operations ===\n");
 
     // List databases
     println!("Listing databases...");
@@ -112,8 +141,8 @@ async fn main() {
         Err(err) => eprintln!("Failed to get database: {}", err),
     }
 
-    // ==================== Table Operations ====================
-    println!("\n=== Table Operations ===\n");
+    // ==================== Part 2: Table Operations ====================
+    println!("\n=== Part 2: Table Operations ===\n");
 
     // Create table
     let table_identifier = Identifier::new("example_db", "users");
@@ -138,7 +167,10 @@ async fn main() {
     // Get table info
     println!("\nGetting table info for '{}'...", table_identifier);
     match catalog.get_table(&table_identifier).await {
-        Ok(table) => println!("Table: {:?}", table),
+        Ok(table) => {
+            println!("Table location: {}", table.location());
+            println!("Table schema fields: {:?}", table.schema().fields());
+        }
         Err(err) => eprintln!("Failed to get table: {}", err),
     }
 
@@ -156,16 +188,109 @@ async fn main() {
         Err(err) => eprintln!("Failed to rename table: {}", err),
     }
 
+    // ==================== Part 3: Read Data from Existing Table ====================
+    println!("\n=== Part 3: Read Data from Existing Table ===\n");
+
+    // Try to read from an existing table (example_db.users_renamed)
+    // This table must already exist on the REST catalog server
+    let read_table_identifier = Identifier::new("example_db", "users_renamed");
+    println!(
+        "Attempting to read from table '{}'...",
+        read_table_identifier
+    );
+
+    match catalog.get_table(&read_table_identifier).await {
+        Ok(table) => {
+            println!("Table retrieved successfully");
+            println!("  Location: {}", table.location());
+            println!("  Schema fields: {:?}", table.schema().fields());
+
+            // Scan table
+            println!("\nScanning table...");
+            let read_builder = table.new_read_builder();
+            let scan = read_builder.new_scan();
+
+            match scan.plan().await {
+                Ok(plan) => {
+                    println!("  Number of splits: {}", plan.splits().len());
+
+                    if plan.splits().is_empty() {
+                        println!("No data splits found — the table may be empty.");
+                    } else {
+                        // Read table data
+                        println!("\nReading table data...");
+                        match read_builder.new_read() {
+                            Ok(read) => match read.to_arrow(plan.splits()) {
+                                Ok(stream) => {
+                                    let batches: Vec<_> =
+                                        stream.try_collect().await.unwrap_or_default();
+                                    println!("Collected {} record batch(es)", batches.len());
+
+                                    let mut total_rows = 0;
+                                    for (batch_index, batch) in batches.iter().enumerate() {
+                                        let num_rows = batch.num_rows();
+                                        total_rows += num_rows;
+                                        println!(
+                                            "\n--- Batch {} ({} rows, {} columns) ---",
+                                            batch_index,
+                                            num_rows,
+                                            batch.num_columns()
+                                        );
+                                        println!("Schema: {}", batch.schema());
+
+                                        // Print up to 10 rows per batch
+                                        let display_rows = num_rows.min(10);
+                                        for row in 0..display_rows {
+                                            let mut row_values = Vec::new();
+                                            for col in 0..batch.num_columns() {
+                                                let column = batch.column(col);
+                                                row_values.push(array_value_to_string(column, row));
+                                            }
+                                            println!("  Row {}: [{}]", row, row_values.join(", "));
+                                        }
+                                        if num_rows > display_rows {
+                                            println!(
+                                                "  ... ({} more rows omitted)",
+                                                num_rows - display_rows
+                                            );
+                                        }
+                                    }
+
+                                    println!("\n=== Read Summary ===");
+                                    println!("Total rows read: {}", total_rows);
+                                    println!("Total batches: {}", batches.len());
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to create arrow stream: {}", err);
+                                }
+                            },
+                            Err(err) => {
+                                eprintln!("Failed to create table read: {}", err);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Failed to plan scan: {}", err);
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "Failed to get table '{}' (this is expected if the table doesn't exist): {}",
+                read_table_identifier, err
+            );
+        }
+    }
+
+    // ==================== Cleanup ====================
+    println!("\n=== Cleanup ===\n");
     // Drop table
     println!("\nDropping table '{}'...", renamed_identifier);
     match catalog.drop_table(&renamed_identifier, false).await {
         Ok(()) => println!("Table dropped successfully"),
         Err(err) => eprintln!("Failed to drop table: {}", err),
     }
-
-    // ==================== Cleanup ====================
-    println!("\n=== Cleanup ===\n");
-
     // Drop database (cascade = true to force drop even if not empty)
     println!("Dropping database 'example_db'...");
     match catalog.drop_database("example_db", false, true).await {

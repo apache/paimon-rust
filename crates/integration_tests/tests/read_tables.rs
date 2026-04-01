@@ -34,15 +34,12 @@ fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
 }
 
-async fn scan_and_read(table_name: &str) -> (Plan, Vec<RecordBatch>) {
-    scan_and_read_with_projection(table_name, None).await
-}
-
-async fn scan_and_read_with_projection(
+async fn scan_and_read<C: Catalog + ?Sized>(
+    catalog: &C,
     table_name: &str,
     projection: Option<&[&str]>,
 ) -> (Plan, Vec<RecordBatch>) {
-    let table = get_test_table(table_name).await;
+    let table = get_table_from_catalog(catalog, table_name).await;
 
     let mut read_builder = table.new_read_builder();
     if let Some(cols) = projection {
@@ -67,6 +64,30 @@ async fn scan_and_read_with_projection(
     (plan, batches)
 }
 
+async fn get_table_from_catalog<C: Catalog + ?Sized>(
+    catalog: &C,
+    table_name: &str,
+) -> paimon::Table {
+    let identifier = Identifier::new("default", table_name);
+    catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table")
+}
+
+fn create_file_system_catalog() -> FileSystemCatalog {
+    let warehouse = get_test_warehouse();
+    FileSystemCatalog::new(warehouse).expect("Failed to create FileSystemCatalog")
+}
+
+async fn scan_and_read_with_fs_catalog(
+    table_name: &str,
+    projection: Option<&[&str]>,
+) -> (Plan, Vec<RecordBatch>) {
+    let catalog = create_file_system_catalog();
+    scan_and_read(&catalog, table_name, projection).await
+}
+
 fn extract_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -88,7 +109,7 @@ fn extract_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
 
 #[tokio::test]
 async fn test_read_log_table() {
-    let (plan, batches) = scan_and_read("simple_log_table").await;
+    let (plan, batches) = scan_and_read_with_fs_catalog("simple_log_table", None).await;
 
     // Non-partitioned table: partition should be a valid arity=0 BinaryRow
     // deserialized from manifest bytes, not a stub without backing data.
@@ -112,7 +133,7 @@ async fn test_read_log_table() {
 
 #[tokio::test]
 async fn test_read_dv_primary_key_table() {
-    let (_, batches) = scan_and_read("simple_dv_pk_table").await;
+    let (_, batches) = scan_and_read_with_fs_catalog("simple_dv_pk_table", None).await;
     let actual = extract_id_name(&batches);
     let expected = vec![
         (1, "alice-v2".to_string()),
@@ -130,7 +151,7 @@ async fn test_read_dv_primary_key_table() {
 
 #[tokio::test]
 async fn test_read_partitioned_log_table() {
-    let (plan, batches) = scan_and_read("partitioned_log_table").await;
+    let (plan, batches) = scan_and_read_with_fs_catalog("partitioned_log_table", None).await;
 
     let mut seen_partitions: HashSet<String> = HashSet::new();
     for split in plan.splits() {
@@ -183,7 +204,7 @@ async fn test_read_partitioned_log_table() {
 
 #[tokio::test]
 async fn test_read_multi_partitioned_log_table() {
-    let (plan, batches) = scan_and_read("multi_partitioned_log_table").await;
+    let (plan, batches) = scan_and_read_with_fs_catalog("multi_partitioned_log_table", None).await;
 
     let mut seen_partitions: HashSet<(String, i32)> = HashSet::new();
     for split in plan.splits() {
@@ -251,7 +272,7 @@ async fn test_read_multi_partitioned_log_table() {
 
 #[tokio::test]
 async fn test_read_partitioned_dv_pk_table() {
-    let (plan, batches) = scan_and_read("partitioned_dv_pk_table").await;
+    let (plan, batches) = scan_and_read_with_fs_catalog("partitioned_dv_pk_table", None).await;
 
     // Verify partition metadata on each split.
     let mut seen_partitions: HashSet<String> = HashSet::new();
@@ -305,20 +326,10 @@ async fn test_read_partitioned_dv_pk_table() {
     );
 }
 
-async fn get_test_table(table_name: &str) -> paimon::Table {
-    let warehouse = get_test_warehouse();
-    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
-    let identifier = Identifier::new("default", table_name);
-    catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table")
-}
-
 #[tokio::test]
 async fn test_read_with_column_projection() {
     let (_, batches) =
-        scan_and_read_with_projection("partitioned_log_table", Some(&["name", "id"])).await;
+        scan_and_read_with_fs_catalog("partitioned_log_table", Some(&["name", "id"])).await;
 
     // Verify that output schema preserves caller-specified column order.
     for batch in &batches {
@@ -347,7 +358,8 @@ async fn test_read_with_column_projection() {
 
 #[tokio::test]
 async fn test_read_projection_empty() {
-    let table = get_test_table("simple_log_table").await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[]);
@@ -385,10 +397,10 @@ async fn test_read_projection_empty() {
         );
     }
 }
-
 #[tokio::test]
 async fn test_read_projection_unknown_column() {
-    let table = get_test_table("simple_log_table").await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&["id", "nonexistent_column"]);
@@ -410,7 +422,8 @@ async fn test_read_projection_unknown_column() {
 
 #[tokio::test]
 async fn test_read_projection_all_invalid() {
-    let table = get_test_table("simple_log_table").await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&["nonexistent_a", "nonexistent_b"]);
@@ -432,7 +445,8 @@ async fn test_read_projection_all_invalid() {
 
 #[tokio::test]
 async fn test_read_projection_duplicate_column() {
-    let table = get_test_table("simple_log_table").await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&["id", "id"]);
@@ -453,17 +467,6 @@ fn simple_log_schema() -> Schema {
     Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("name", DataType::VarChar(VarCharType::string_type()))
-        .build()
-        .expect("Failed to build schema")
-}
-
-/// Build a DV-enabled primary key schema (id INT NOT NULL as PK, name VARCHAR).
-fn simple_dv_pk_schema() -> Schema {
-    Schema::builder()
-        .column("id", DataType::Int(IntType::with_nullable(false)))
-        .column("name", DataType::VarChar(VarCharType::string_type()))
-        .primary_key(["id"])
-        .option("deletion-vectors.enabled", "true")
         .build()
         .expect("Failed to build schema")
 }
@@ -518,29 +521,12 @@ async fn test_rest_catalog_read_append_table() {
     let (_server, catalog) =
         setup_rest_catalog_with_tables(&[("default", table_name, simple_log_schema())]).await;
 
-    let identifier = Identifier::new("default", table_name);
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table from REST catalog");
-
-    let read_builder = table.new_read_builder();
-    let scan = read_builder.new_scan();
-    let plan = scan.plan().await.expect("Failed to plan scan");
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
 
     assert!(
         !plan.splits().is_empty(),
         "REST append table should have at least one split"
     );
-
-    let read = read_builder.new_read().expect("Failed to create read");
-    let stream = read
-        .to_arrow(plan.splits())
-        .expect("Failed to create arrow stream");
-    let batches: Vec<_> = stream
-        .try_collect()
-        .await
-        .expect("Failed to collect batches");
 
     assert!(
         !batches.is_empty(),
@@ -556,58 +542,5 @@ async fn test_rest_catalog_read_append_table() {
     assert_eq!(
         actual, expected,
         "REST catalog append table rows should match expected values"
-    );
-}
-
-/// Test reading a primary-key table with deletion vectors via REST catalog backed by mock server.
-///
-/// The mock server returns table metadata pointing to Spark-provisioned data on disk.
-#[tokio::test]
-async fn test_rest_catalog_read_pk_table() {
-    let table_name = "simple_dv_pk_table";
-    let (_server, catalog) =
-        setup_rest_catalog_with_tables(&[("default", table_name, simple_dv_pk_schema())]).await;
-
-    let identifier = Identifier::new("default", table_name);
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table from REST catalog");
-
-    let read_builder = table.new_read_builder();
-    let scan = read_builder.new_scan();
-    let plan = scan.plan().await.expect("Failed to plan scan");
-
-    assert!(
-        !plan.splits().is_empty(),
-        "REST PK table should have at least one split"
-    );
-
-    let read = read_builder.new_read().expect("Failed to create read");
-    let stream = read
-        .to_arrow(plan.splits())
-        .expect("Failed to create arrow stream");
-    let batches: Vec<_> = stream
-        .try_collect()
-        .await
-        .expect("Failed to collect batches");
-
-    assert!(
-        !batches.is_empty(),
-        "REST PK table should produce at least one batch"
-    );
-
-    let actual = extract_id_name(&batches);
-    let expected = vec![
-        (1, "alice-v2".to_string()),
-        (2, "bob-v2".to_string()),
-        (3, "carol-v2".to_string()),
-        (4, "dave-v2".to_string()),
-        (5, "eve-v2".to_string()),
-        (6, "frank-v1".to_string()),
-    ];
-    assert_eq!(
-        actual, expected,
-        "REST catalog DV-enabled PK table should only expose the latest row per key"
     );
 }

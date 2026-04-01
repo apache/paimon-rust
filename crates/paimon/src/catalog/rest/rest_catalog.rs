@@ -67,7 +67,9 @@ impl RESTCatalog {
         let warehouse = options
             .get(CatalogOptions::WAREHOUSE)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| RestError::BadRequest {
+                message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
+            })?;
 
         let api = RESTApi::new(options.clone(), config_required).await?;
 
@@ -206,7 +208,13 @@ impl Catalog for RESTCatalog {
             source: None,
         })?;
 
-        let schema_id = response.schema_id.unwrap_or(0);
+        let schema_id = response.schema_id.ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Table {} response missing schema_id",
+                identifier.full_name()
+            ),
+            source: None,
+        })?;
         let table_schema = TableSchema::new(schema_id, &schema);
 
         // Extract table path from response
