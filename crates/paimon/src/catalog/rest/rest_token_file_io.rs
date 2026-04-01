@@ -151,7 +151,15 @@ impl RESTTokenFileIO {
 
         let response = api.load_table_token(&self.identifier).await?;
 
-        let expires_at_millis = response.expires_at_millis.unwrap_or(0);
+        let expires_at_millis = response.expires_at_millis.ok_or_else(|| {
+            crate::Error::DataInvalid {
+                message: format!(
+                    "Token response for table '{}' missing expires_at_millis",
+                    self.identifier.full_name()
+                ),
+                source: None,
+            }
+        })?;
 
         // Merge token with catalog options (e.g. DLF OSS endpoint override)
         let merged_token = self.merge_token_with_catalog_options(response.token);
