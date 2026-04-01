@@ -225,9 +225,12 @@ impl Catalog for RESTCatalog {
 
         // Check if the table is external
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing is_external", identifier.full_name()),
+            message: format!(
+                "Table {} response missing is_external",
+                identifier.full_name()
+            ),
             source: None,
-        })?;();
+        })?;
 
         // Build FileIO based on data_token_enabled and is_external
         // TODO Support token cache and direct oss access
