@@ -227,6 +227,7 @@ impl Catalog for RESTCatalog {
         let is_external = response.is_external.unwrap_or(false);
 
         // Build FileIO based on data_token_enabled and is_external
+        // TODO Support token cache and direct oss access
         let file_io = if self.data_token_enabled && !is_external {
             // Use RESTTokenFileIO to get token-based FileIO
             let token_file_io =
