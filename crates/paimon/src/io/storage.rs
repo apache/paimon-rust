@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+#[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+use std::sync::{Mutex, MutexGuard};
+
 #[cfg(feature = "storage-oss")]
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
+#[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+use url::Url;
 
 use crate::error;
 
@@ -29,37 +35,49 @@ use super::FileIOBuilder;
 #[derive(Debug)]
 pub enum Storage {
     #[cfg(feature = "storage-memory")]
-    Memory,
+    Memory { op: Operator },
     #[cfg(feature = "storage-fs")]
-    LocalFs,
+    LocalFs { op: Operator },
     #[cfg(feature = "storage-oss")]
-    Oss { config: Box<OssConfig> },
+    Oss {
+        config: Box<OssConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
     #[cfg(feature = "storage-s3")]
-    S3 { config: Box<S3Config> },
+    S3 {
+        config: Box<S3Config>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
 }
 
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
-        let (scheme_str, _props) = file_io_builder.into_parts();
+        let (scheme_str, props) = file_io_builder.into_parts();
         let scheme = Self::parse_scheme(&scheme_str)?;
 
         match scheme {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory),
+            Scheme::Memory => Ok(Self::Memory {
+                op: super::memory_config_build()?,
+            }),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs),
+            Scheme::Fs => Ok(Self::LocalFs {
+                op: super::fs_config_build()?,
+            }),
             #[cfg(feature = "storage-oss")]
             Scheme::Oss => {
-                let config = super::oss_config_parse(_props)?;
+                let config = super::oss_config_parse(props)?;
                 Ok(Self::Oss {
                     config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
                 })
             }
             #[cfg(feature = "storage-s3")]
             Scheme::S3 => {
-                let config = super::s3_config_parse(_props)?;
+                let config = super::s3_config_parse(props)?;
                 Ok(Self::S3 {
                     config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
                 })
             }
             _ => Err(error::Error::IoUnsupported {
@@ -68,70 +86,144 @@ impl Storage {
         }
     }
 
-    pub(crate) fn build_operator(&self) -> crate::Result<Operator> {
+    pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, &'a str)> {
         match self {
             #[cfg(feature = "storage-memory")]
-            Storage::Memory => super::memory_config_build(),
+            Storage::Memory { op } => Ok((op.clone(), Self::memory_relative_path(path)?)),
             #[cfg(feature = "storage-fs")]
-            Storage::LocalFs => super::fs_config_build(),
+            Storage::LocalFs { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
+            #[cfg(feature = "storage-oss")]
+            Storage::Oss { config, operators } => {
+                let (bucket, relative_path) = Self::oss_bucket_and_relative_path(path)?;
+                let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
+                Ok((op, relative_path))
+            }
+            #[cfg(feature = "storage-s3")]
+            Storage::S3 { config, operators } => {
+                let (bucket, relative_path) = Self::s3_bucket_and_relative_path(path)?;
+                let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
+                Ok((op, relative_path))
+            }
         }
     }
 
-    pub(crate) fn relative_path<'a>(&self, path: &'a str) -> crate::Result<&'a str> {
-        match self {
-            #[cfg(feature = "storage-memory")]
-            Storage::Memory => {
-                if let Some(stripped) = path.strip_prefix("memory:/") {
-                    Ok(stripped)
-                } else {
-                    path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
-                        message: format!("Invalid memory path: {path}"),
-                    })
-                }
-            }
-            #[cfg(feature = "storage-fs")]
-            Storage::LocalFs => {
-                if let Some(stripped) = path.strip_prefix("file:/") {
-                    Ok(stripped)
-                } else {
-                    path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
-                        message: format!("Invalid file path: {path}"),
-                    })
-                }
-            }
-            #[cfg(feature = "storage-oss")]
-            Storage::Oss { config } => {
-                let op = super::oss_config_build(config, path)?;
-                let prefix = format!("oss://{}/", op.info().name());
-                if let Some(stripped) = path.strip_prefix(&prefix) {
-                    Ok((op, stripped))
-                } else {
-                    Err(error::Error::ConfigInvalid {
-                        message: format!("Invalid OSS url: {path}, should start with {prefix}"),
-                    })
-                }
-            }
-            #[cfg(feature = "storage-s3")]
-            Storage::S3 { config } => {
-                let op = super::s3_config_build(config, path)?;
-                // Support both s3:// and s3a:// URL prefixes.
-                let info = op.info();
-                let bucket = info.name();
-                let s3_prefix = format!("s3://{}/", bucket);
-                let s3a_prefix = format!("s3a://{}/", bucket);
-                if let Some(stripped) = path.strip_prefix(&s3_prefix) {
-                    Ok((op, stripped))
-                } else if let Some(stripped) = path.strip_prefix(&s3a_prefix) {
-                    Ok((op, stripped))
-                } else {
-                    Err(error::Error::ConfigInvalid {
-                        message: format!(
-                            "Invalid S3 url: {path}, should start with {s3_prefix} or {s3a_prefix}"
-                        ),
-                    })
-                }
-            }
+    #[cfg(feature = "storage-memory")]
+    fn memory_relative_path(path: &str) -> crate::Result<&str> {
+        if let Some(stripped) = path.strip_prefix("memory:/") {
+            Ok(stripped)
+        } else {
+            path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
+                message: format!("Invalid memory path: {path}"),
+            })
         }
+    }
+
+    #[cfg(feature = "storage-fs")]
+    fn fs_relative_path(path: &str) -> crate::Result<&str> {
+        if let Some(stripped) = path.strip_prefix("file:/") {
+            Ok(stripped)
+        } else {
+            path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
+                message: format!("Invalid file path: {path}"),
+            })
+        }
+    }
+
+    #[cfg(feature = "storage-oss")]
+    fn oss_bucket_and_relative_path<'a>(path: &'a str) -> crate::Result<(String, &'a str)> {
+        let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
+            message: format!("Invalid OSS url: {path}"),
+        })?;
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| error::Error::ConfigInvalid {
+                message: format!("Invalid OSS url: {path}, missing bucket"),
+            })?
+            .to_string();
+        let prefix = format!("oss://{bucket}/");
+        let relative_path =
+            path.strip_prefix(&prefix)
+                .ok_or_else(|| error::Error::ConfigInvalid {
+                    message: format!("Invalid OSS url: {path}, should start with {prefix}"),
+                })?;
+        Ok((bucket, relative_path))
+    }
+
+    #[cfg(feature = "storage-s3")]
+    fn s3_bucket_and_relative_path<'a>(path: &'a str) -> crate::Result<(String, &'a str)> {
+        let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
+            message: format!("Invalid S3 url: {path}"),
+        })?;
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| error::Error::ConfigInvalid {
+                message: format!("Invalid S3 url: {path}, missing bucket"),
+            })?
+            .to_string();
+        let scheme = url.scheme();
+        let prefix = match scheme {
+            "s3" | "s3a" => format!("{scheme}://{bucket}/"),
+            _ => {
+                return Err(error::Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid S3 url: {path}, should start with s3://{bucket}/ or s3a://{bucket}/"
+                    ),
+                });
+            }
+        };
+        let relative_path =
+            path.strip_prefix(&prefix)
+                .ok_or_else(|| error::Error::ConfigInvalid {
+                    message: format!(
+                    "Invalid S3 url: {path}, should start with s3://{bucket}/ or s3a://{bucket}/"
+                ),
+                })?;
+        Ok((bucket, relative_path))
+    }
+
+    #[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+    fn lock_operator_cache<'a>(
+        operators: &'a Mutex<HashMap<String, Operator>>,
+        storage_name: &str,
+    ) -> crate::Result<MutexGuard<'a, HashMap<String, Operator>>> {
+        operators.lock().map_err(|_| error::Error::UnexpectedError {
+            message: format!("Failed to lock {storage_name} operator cache"),
+            source: None,
+        })
+    }
+
+    #[cfg(feature = "storage-oss")]
+    fn cached_oss_operator(
+        config: &OssConfig,
+        operators: &Mutex<HashMap<String, Operator>>,
+        path: &str,
+        bucket: &str,
+    ) -> crate::Result<Operator> {
+        let mut operators = Self::lock_operator_cache(operators, "OSS")?;
+        if let Some(op) = operators.get(bucket) {
+            return Ok(op.clone());
+        }
+
+        let op = super::oss_config_build(config, path)?;
+        operators.insert(bucket.to_string(), op.clone());
+        Ok(op)
+    }
+
+    #[cfg(feature = "storage-s3")]
+    fn cached_s3_operator(
+        config: &S3Config,
+        operators: &Mutex<HashMap<String, Operator>>,
+        path: &str,
+        bucket: &str,
+    ) -> crate::Result<Operator> {
+        let mut operators = Self::lock_operator_cache(operators, "S3")?;
+        if let Some(op) = operators.get(bucket) {
+            return Ok(op.clone());
+        }
+
+        let op = super::s3_config_build(config, path)?;
+        operators.insert(bucket.to_string(), op.clone());
+        Ok(op)
     }
 
     fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {

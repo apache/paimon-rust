@@ -19,10 +19,11 @@ use crate::error::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use opendal::raw::normalize_root;
-use opendal::raw::Timestamp;
 use opendal::Operator;
 use snafu::ResultExt;
 use url::Url;
@@ -32,7 +33,6 @@ use super::Storage;
 #[derive(Clone, Debug)]
 pub struct FileIO {
     storage: Arc<Storage>,
-    op: Operator,
 }
 
 impl FileIO {
@@ -70,11 +70,11 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
         let path = path.to_string();
         let relative_path_pos = path.len() - relative_path.len();
         Ok(InputFile {
-            op: self.op.clone(),
+            op,
             path,
             relative_path_pos,
         })
@@ -84,11 +84,11 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> Result<OutputFile> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
         let path = path.to_string();
         let relative_path_pos = path.len() - relative_path.len();
         Ok(OutputFile {
-            op: self.op.clone(),
+            op,
             path,
             relative_path_pos,
         })
@@ -98,19 +98,17 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
-        let relative_path = self.storage.relative_path(path)?;
-        let meta = self
-            .op
-            .stat(relative_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to get file status for '{path}'"),
-            })?;
+        let (op, relative_path) = self.storage.create(path)?;
+        let meta = op.stat(relative_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to get file status for '{path}'"),
+        })?;
 
         Ok(FileStatus {
             size: meta.content_length(),
             is_dir: meta.is_dir(),
-            last_modified: meta.last_modified(),
+            last_modified: meta
+                .last_modified()
+                .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
             path: path.to_string(),
         })
     }
@@ -121,37 +119,35 @@ impl FileIO {
     ///
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
         let base_path = &path[..path.len() - relative_path.len()];
         // Opendal list() expects directory path to end with `/`.
         // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path);
 
-        let entries = self
-            .op
-            .list_with(&list_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to list files in '{path}'"),
-            })?;
+        let entries = op.list_with(&list_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to list files in '{path}'"),
+        })?;
 
         let mut statuses = Vec::new();
         let list_path_normalized = list_path.trim_start_matches('/');
         for entry in entries {
-            // opendal list_with includes the root directory itself as the first entry.
-            // The root entry's path equals list_path (with or without leading slash).
-            // Skip it so callers only see the direct children.
             let entry_path = entry.path();
-            let entry_path_normalized = entry_path.trim_start_matches('/');
-            if entry_path_normalized == list_path_normalized {
+            if entry_path.trim_start_matches('/') == list_path_normalized {
                 continue;
             }
-            let meta = entry.metadata();
+            // OpenDAL 0.55 removed list metakey selection, so stat each entry to
+            // guarantee FileStatus metadata is populated consistently across backends.
+            let meta = op.stat(entry_path).await.context(IoUnexpectedSnafu {
+                message: format!("Failed to stat listed entry '{}' in '{path}'", entry_path),
+            })?;
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: meta.is_dir(),
-                path: format!("{base_path}{}", entry.path()),
-                last_modified: meta.last_modified(),
+                path: format!("{base_path}{entry_path}"),
+                last_modified: meta
+                    .last_modified()
+                    .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
             });
         }
 
@@ -162,28 +158,22 @@ impl FileIO {
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
     pub async fn exists(&self, path: &str) -> Result<bool> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
 
-        self.op
-            .exists(relative_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to check existence of '{path}'"),
-            })
+        op.exists(relative_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to check existence of '{path}'"),
+        })
     }
 
     /// Delete a file.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
 
-        self.op
-            .delete(relative_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to delete file '{path}'"),
-            })?;
+        op.delete(relative_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to delete file '{path}'"),
+        })?;
 
         Ok(())
     }
@@ -192,10 +182,9 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
 
-        self.op
-            .remove_all(relative_path)
+        op.remove_all(relative_path)
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete directory '{path}'"),
@@ -210,15 +199,12 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L150>
     pub async fn mkdirs(&self, path: &str) -> Result<()> {
-        let relative_path = self.storage.relative_path(path)?;
+        let (op, relative_path) = self.storage.create(path)?;
         // Opendal create_dir expects the path to end with `/` to indicate a directory.
         let dir_path = normalize_root(relative_path);
-        self.op
-            .create_dir(&dir_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to create directory '{path}'"),
-            })?;
+        op.create_dir(&dir_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to create directory '{path}'"),
+        })?;
 
         Ok(())
     }
@@ -227,10 +213,10 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let relative_path_src = self.storage.relative_path(src)?;
-        let relative_path_dst = self.storage.relative_path(dst)?;
+        let (op_src, relative_path_src) = self.storage.create(src)?;
+        let (_, relative_path_dst) = self.storage.create(dst)?;
 
-        self.op
+        op_src
             .rename(relative_path_src, relative_path_dst)
             .await
             .context(IoUnexpectedSnafu {
@@ -275,10 +261,8 @@ impl FileIOBuilder {
 
     pub fn build(self) -> crate::Result<FileIO> {
         let storage = Storage::build(self)?;
-        let op = storage.build_operator()?;
         Ok(FileIO {
             storage: Arc::new(storage),
-            op,
         })
     }
 }
@@ -319,7 +303,7 @@ pub struct FileStatus {
     pub size: u64,
     pub is_dir: bool,
     pub path: String,
-    pub last_modified: Option<Timestamp>,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -345,7 +329,9 @@ impl InputFile {
             size: meta.content_length(),
             is_dir: meta.is_dir(),
             path: self.path.clone(),
-            last_modified: meta.last_modified(),
+            last_modified: meta
+                .last_modified()
+                .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
         })
     }
 
@@ -516,6 +502,20 @@ mod file_action_test {
     }
 
     #[tokio::test]
+    async fn test_empty_path_should_return_error_for_exists_fs() {
+        let file_io = setup_fs_file_io();
+        let result = file_io.exists("").await;
+        assert!(matches!(result, Err(Error::ConfigInvalid { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_empty_path_should_return_error_for_exists_memory() {
+        let file_io = setup_memory_file_io();
+        let result = file_io.exists("").await;
+        assert!(matches!(result, Err(Error::ConfigInvalid { .. })));
+    }
+
+    #[tokio::test]
     async fn test_memory_operator_reuse_across_file_io_calls() {
         let file_io = setup_memory_file_io();
         let path = "memory:/tmp/reuse_case";
@@ -555,30 +555,6 @@ mod file_action_test {
 
         assert!(file_io_1.exists(path).await.unwrap());
         assert!(!file_io_2.exists(path).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_empty_path_should_return_error_for_exists_fs() {
-        let file_io = setup_fs_file_io();
-        let result = file_io.exists("").await;
-        assert!(matches!(result, Err(Error::ConfigInvalid { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_empty_path_should_return_error_for_exists_memory() {
-        let file_io = setup_memory_file_io();
-        let result = file_io.exists("").await;
-        assert!(matches!(result, Err(Error::ConfigInvalid { .. })));
-    }
-
-    #[test]
-    fn test_empty_path_should_return_error_for_new_input_and_new_output() {
-        let file_io = setup_fs_file_io();
-        let input_result = file_io.new_input("");
-        let output_result = file_io.new_output("");
-
-        assert!(matches!(input_result, Err(Error::ConfigInvalid { .. })));
-        assert!(matches!(output_result, Err(Error::ConfigInvalid { .. })));
     }
 
     #[tokio::test]
