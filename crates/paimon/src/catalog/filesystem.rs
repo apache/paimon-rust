@@ -121,16 +121,9 @@ impl FileSystemCatalog {
     /// List directories in the given path.
     async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
         let statuses = self.file_io.list_status(path).await?;
-        // Normalize the listed path for comparison: strip trailing slash
-        let normalized_path = path.trim_end_matches('/');
         let mut dirs = Vec::new();
         for status in statuses {
             if status.is_dir {
-                // Skip the directory itself (opendal list_with includes the root entry)
-                let entry_path = status.path.trim_end_matches('/');
-                if entry_path == normalized_path {
-                    continue;
-                }
                 if let Some(p) = get_basename(status.path.as_str())
                     // opendal get_basename will contain "/" for directory,
                     // we need to strip suffix to get the real base name
