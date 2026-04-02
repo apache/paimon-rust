@@ -73,5 +73,5 @@ urlencoding = "2.1"
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 rand = "0.8.5"
-serde_avro_fast = { version = "1.1.2", features = ["snappy"] }
+serde_avro_fast = { version = "2.0.2", features = ["snappy"] }
 tempfile = "3"
