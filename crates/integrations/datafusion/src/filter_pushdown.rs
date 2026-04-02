@@ -25,9 +25,14 @@ pub(crate) fn classify_filter_pushdown(
     fields: &[DataField],
     partition_keys: &[String],
 ) -> TableProviderFilterPushDown {
-    let translator = PartitionFilterTranslator::new(fields, partition_keys);
+    let translator = FilterTranslator::new(fields);
     if translator.translate(filter).is_some() {
-        TableProviderFilterPushDown::Exact
+        let partition_translator = FilterTranslator::for_allowed_columns(fields, partition_keys);
+        if partition_translator.translate(filter).is_some() {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Inexact
+        }
     } else if split_conjunction(filter)
         .into_iter()
         .any(|expr| translator.translate(expr).is_some())
@@ -38,12 +43,8 @@ pub(crate) fn classify_filter_pushdown(
     }
 }
 
-pub(crate) fn build_pushed_predicate(
-    filters: &[Expr],
-    fields: &[DataField],
-    partition_keys: &[String],
-) -> Option<Predicate> {
-    let translator = PartitionFilterTranslator::new(fields, partition_keys);
+pub(crate) fn build_pushed_predicate(filters: &[Expr], fields: &[DataField]) -> Option<Predicate> {
+    let translator = FilterTranslator::new(fields);
     let pushed: Vec<_> = filters
         .iter()
         .flat_map(split_conjunction)
@@ -72,17 +73,25 @@ fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-struct PartitionFilterTranslator<'a> {
+struct FilterTranslator<'a> {
     fields: &'a [DataField],
-    partition_keys: &'a [String],
+    allowed_columns: Option<&'a [String]>,
     predicate_builder: PredicateBuilder,
 }
 
-impl<'a> PartitionFilterTranslator<'a> {
-    fn new(fields: &'a [DataField], partition_keys: &'a [String]) -> Self {
+impl<'a> FilterTranslator<'a> {
+    fn new(fields: &'a [DataField]) -> Self {
         Self {
             fields,
-            partition_keys,
+            allowed_columns: None,
+            predicate_builder: PredicateBuilder::new(fields),
+        }
+    }
+
+    fn for_allowed_columns(fields: &'a [DataField], allowed_columns: &'a [String]) -> Self {
+        Self {
+            fields,
+            allowed_columns: Some(allowed_columns),
             predicate_builder: PredicateBuilder::new(fields),
         }
     }
@@ -96,11 +105,11 @@ impl<'a> PartitionFilterTranslator<'a> {
             // DataFusion would remove the residual filter, producing wrong results.
             Expr::Not(_) => None,
             Expr::IsNull(inner) => {
-                let field = self.resolve_partition_column(inner.as_ref())?;
+                let field = self.resolve_field(inner.as_ref())?;
                 self.predicate_builder.is_null(field.name()).ok()
             }
             Expr::IsNotNull(inner) => {
-                let field = self.resolve_partition_column(inner.as_ref())?;
+                let field = self.resolve_field(inner.as_ref())?;
                 self.predicate_builder.is_not_null(field.name()).ok()
             }
             Expr::InList(in_list) => self.translate_in_list(in_list),
@@ -152,7 +161,7 @@ impl<'a> PartitionFilterTranslator<'a> {
         op: Operator,
         literal_expr: &Expr,
     ) -> Option<Predicate> {
-        let field = self.resolve_partition_column(column_expr)?;
+        let field = self.resolve_field(column_expr)?;
         let scalar = extract_scalar_literal(literal_expr)?;
         let datum = scalar_to_datum(scalar, field.data_type())?;
 
@@ -177,7 +186,7 @@ impl<'a> PartitionFilterTranslator<'a> {
     }
 
     fn translate_in_list(&self, in_list: &InList) -> Option<Predicate> {
-        let field = self.resolve_partition_column(in_list.expr.as_ref())?;
+        let field = self.resolve_field(in_list.expr.as_ref())?;
         let literals: Option<Vec<_>> = in_list
             .list
             .iter()
@@ -198,7 +207,7 @@ impl<'a> PartitionFilterTranslator<'a> {
     }
 
     fn translate_between(&self, between: &Between) -> Option<Predicate> {
-        let field = self.resolve_partition_column(between.expr.as_ref())?;
+        let field = self.resolve_field(between.expr.as_ref())?;
         let low = scalar_to_datum(
             extract_scalar_literal(between.low.as_ref())?,
             field.data_type(),
@@ -226,13 +235,15 @@ impl<'a> PartitionFilterTranslator<'a> {
         }
     }
 
-    fn resolve_partition_column(&self, expr: &Expr) -> Option<&'a DataField> {
+    fn resolve_field(&self, expr: &Expr) -> Option<&'a DataField> {
         let Expr::Column(Column { name, .. }) = expr else {
             return None;
         };
 
-        if !self.partition_keys.iter().any(|key| key == name) {
-            return None;
+        if let Some(allowed_columns) = self.allowed_columns {
+            if !allowed_columns.iter().any(|column| column == name) {
+                return None;
+            }
         }
 
         self.fields.iter().find(|field| field.name() == name)
@@ -364,8 +375,8 @@ mod tests {
         let fields = test_fields();
         let filter = Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01"));
 
-        let predicate = build_pushed_predicate(&[filter], &fields, &partition_keys())
-            .expect("partition filter should translate");
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("partition filter should translate");
 
         assert_eq!(predicate.to_string(), "dt = '2024-01-01'");
     }
@@ -386,7 +397,7 @@ mod tests {
         let fields = test_fields();
         let filter = lit(10).lt(Expr::Column(Column::from_name("hr")));
 
-        let predicate = build_pushed_predicate(&[filter], &fields, &partition_keys())
+        let predicate = build_pushed_predicate(&[filter], &fields)
             .expect("reversed comparison should translate");
 
         assert_eq!(predicate.to_string(), "hr > 10");
@@ -401,58 +412,58 @@ mod tests {
             false,
         ));
 
-        let predicate = build_pushed_predicate(&[filter], &fields, &partition_keys())
-            .expect("in-list filter should translate");
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("in-list filter should translate");
 
         assert_eq!(predicate.to_string(), "dt IN ('2024-01-01', '2024-01-02')");
     }
 
     #[test]
-    fn test_translate_mixed_or_is_not_supported() {
+    fn test_translate_mixed_or_filter() {
         let fields = test_fields();
         let filter = Expr::Column(Column::from_name("dt"))
             .eq(lit("2024-01-01"))
             .or(Expr::Column(Column::from_name("id")).gt(lit(10)));
 
-        assert!(
-            build_pushed_predicate(&[filter], &fields, &partition_keys()).is_none(),
-            "mixed OR should remain residual"
-        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("mixed OR filter should translate");
+
+        assert_eq!(predicate.to_string(), "(dt = '2024-01-01' OR id > 10)");
     }
 
     #[test]
-    fn test_translate_non_partition_filter_is_not_supported() {
+    fn test_translate_non_partition_filter() {
         let fields = test_fields();
         let filter = Expr::Column(Column::from_name("id")).gt(lit(10));
 
-        assert!(
-            build_pushed_predicate(&[filter], &fields, &partition_keys()).is_none(),
-            "non-partition filter should not translate"
-        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("data filter should translate");
+
+        assert_eq!(predicate.to_string(), "id > 10");
     }
 
     #[test]
-    fn test_classify_non_partition_filter_as_unsupported() {
+    fn test_classify_non_partition_filter_as_inexact() {
         let fields = test_fields();
         let filter = Expr::Column(Column::from_name("id")).gt(lit(10));
 
         assert_eq!(
             classify_filter_pushdown(&filter, &fields, &partition_keys()),
-            TableProviderFilterPushDown::Unsupported
+            TableProviderFilterPushDown::Inexact
         );
     }
 
     #[test]
-    fn test_translate_mixed_and_pushes_partition_conjunct() {
+    fn test_translate_mixed_and_filter() {
         let fields = test_fields();
         let filter = Expr::Column(Column::from_name("dt"))
             .eq(lit("2024-01-01"))
             .and(Expr::Column(Column::from_name("id")).gt(lit(10)));
 
-        let predicate = build_pushed_predicate(&[filter], &fields, &partition_keys())
-            .expect("partition conjunct should still translate");
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("mixed filter should translate");
 
-        assert_eq!(predicate.to_string(), "dt = '2024-01-01'");
+        assert_eq!(predicate.to_string(), "(dt = '2024-01-01' AND id > 10)");
     }
 
     #[test]
@@ -476,7 +487,7 @@ mod tests {
         ));
 
         assert!(
-            build_pushed_predicate(&[filter], &fields, &partition_keys()).is_none(),
+            build_pushed_predicate(&[filter], &fields).is_none(),
             "NOT expressions should not translate due to NULL semantics"
         );
     }
@@ -505,7 +516,7 @@ mod tests {
         ));
 
         assert!(
-            build_pushed_predicate(&[filter], &fields, &partition_keys()).is_none(),
+            build_pushed_predicate(&[filter], &fields).is_none(),
             "Negated BETWEEN should not translate due to NULL semantics"
         );
     }
@@ -517,7 +528,7 @@ mod tests {
         for value in [true, false] {
             let filter = Expr::Literal(ScalarValue::Boolean(Some(value)), None);
             assert!(
-                build_pushed_predicate(&[filter], &fields, &partition_keys()).is_none(),
+                build_pushed_predicate(&[filter], &fields).is_none(),
                 "Boolean literal ({value}) is not a partition predicate and must not be translated"
             );
         }

@@ -116,11 +116,7 @@ impl TableProvider for PaimonTableProvider {
 
         // Plan splits eagerly so we know partition count upfront.
         let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = build_pushed_predicate(
-            filters,
-            self.table.schema().fields(),
-            self.table.schema().partition_keys(),
-        ) {
+        if let Some(filter) = build_pushed_predicate(filters, self.table.schema().fields()) {
             read_builder.with_filter(filter);
         }
         let scan = read_builder.new_scan();

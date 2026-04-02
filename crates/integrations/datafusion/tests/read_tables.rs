@@ -185,7 +185,7 @@ async fn test_supports_partition_filters_pushdown() {
         vec![
             TableProviderFilterPushDown::Exact,
             TableProviderFilterPushDown::Inexact,
-            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Inexact,
         ]
     );
 }
