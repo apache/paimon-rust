@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, StringArray};
-use datafusion::prelude::SessionContext;
+use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon::catalog::Identifier;
 use paimon::{Catalog, FileSystemCatalog};
 use paimon_datafusion::PaimonTableProvider;
@@ -28,6 +30,15 @@ fn get_test_warehouse() -> String {
 }
 
 async fn create_context(table_name: &str) -> SessionContext {
+    let provider = create_provider(table_name).await;
+    let ctx = SessionContext::new();
+    ctx.register_table(table_name, Arc::new(provider))
+        .expect("Failed to register table");
+
+    ctx
+}
+
+async fn create_provider(table_name: &str) -> PaimonTableProvider {
     let warehouse = get_test_warehouse();
     let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
     let identifier = Identifier::new("default", table_name);
@@ -36,12 +47,7 @@ async fn create_context(table_name: &str) -> SessionContext {
         .await
         .expect("Failed to get table");
 
-    let provider = PaimonTableProvider::try_new(table).expect("Failed to create table provider");
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::new(provider))
-        .expect("Failed to register table");
-
-    ctx
+    PaimonTableProvider::try_new(table).expect("Failed to create table provider")
 }
 
 async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
@@ -54,25 +60,7 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
         "Expected at least one batch from table {table_name}"
     );
 
-    let mut actual_rows = Vec::new();
-    for batch in &batches {
-        let id_array = batch
-            .column_by_name("id")
-            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
-            .expect("Expected Int32Array for id column");
-        let name_array = batch
-            .column_by_name("name")
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-            .expect("Expected StringArray for name column");
-
-        for row_index in 0..batch.num_rows() {
-            actual_rows.push((
-                id_array.value(row_index),
-                name_array.value(row_index).to_string(),
-            ));
-        }
-    }
-
+    let mut actual_rows = extract_id_name_rows(&batches);
     actual_rows.sort_by_key(|(id, _)| *id);
     actual_rows
 }
@@ -84,6 +72,30 @@ async fn collect_query(
     let ctx = create_context(table_name).await;
 
     ctx.sql(sql).await?.collect().await
+}
+
+fn extract_id_name_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+) -> Vec<(i32, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .expect("Expected Int32Array for id column");
+        let name_array = batch
+            .column_by_name("name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for name column");
+
+        for row_index in 0..batch.num_rows() {
+            rows.push((
+                id_array.value(row_index),
+                name_array.value(row_index).to_string(),
+            ));
+        }
+    }
+    rows
 }
 
 #[tokio::test]
@@ -157,23 +169,33 @@ async fn test_projection_via_datafusion() {
     );
 }
 
+#[tokio::test]
+async fn test_supports_partition_filters_pushdown() {
+    let provider = create_provider("multi_partitioned_log_table").await;
+    let partition_filter = col("dt").eq(lit("2024-01-01"));
+    let mixed_and_filter = col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)));
+    let data_filter = col("id").gt(lit(1));
+
+    let supports = provider
+        .supports_filters_pushdown(&[&partition_filter, &mixed_and_filter, &data_filter])
+        .expect("supports_filters_pushdown should succeed");
+
+    assert_eq!(
+        supports,
+        vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+        ]
+    );
+}
+
 /// Verifies that `PaimonTableProvider::scan()` produces more than one
 /// execution partition for a multi-partition table, and that the reported
 /// partition count is still capped by `target_partitions`.
 #[tokio::test]
 async fn test_scan_partition_count_respects_session_config() {
-    use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionConfig;
-
-    let warehouse = get_test_warehouse();
-    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
-    let identifier = Identifier::new("default", "partitioned_log_table");
-    let table = catalog
-        .get_table(&identifier)
-        .await
-        .expect("Failed to get table");
-
-    let provider = PaimonTableProvider::try_new(table).expect("Failed to create table provider");
+    let provider = create_provider("partitioned_log_table").await;
 
     // With generous target_partitions, the plan should expose more than one partition.
     let config = SessionConfig::new().with_target_partitions(8);
@@ -207,4 +229,52 @@ async fn test_scan_partition_count_respects_session_config() {
         1,
         "target_partitions=1 should coalesce all splits into exactly 1 partition"
     );
+}
+
+#[tokio::test]
+async fn test_partition_filter_query_via_datafusion() {
+    let batches = collect_query(
+        "partitioned_log_table",
+        "SELECT id, name FROM partitioned_log_table WHERE dt = '2024-01-01'",
+    )
+    .await
+    .expect("Partition filter query should succeed");
+
+    let mut actual_rows = extract_id_name_rows(&batches);
+    actual_rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        actual_rows,
+        vec![(1, "alice".to_string()), (2, "bob".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_multi_partition_filter_query_via_datafusion() {
+    let batches = collect_query(
+        "multi_partitioned_log_table",
+        "SELECT id, name FROM multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr = 10",
+    )
+    .await
+    .expect("Multi-partition filter query should succeed");
+
+    let mut actual_rows = extract_id_name_rows(&batches);
+    actual_rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        actual_rows,
+        vec![(1, "alice".to_string()), (2, "bob".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
+    let batches = collect_query(
+        "partitioned_log_table",
+        "SELECT id, name FROM partitioned_log_table WHERE dt = '2024-01-01' AND id > 1",
+    )
+    .await
+    .expect("Mixed filter query should succeed");
+
+    let actual_rows = extract_id_name_rows(&batches);
+
+    assert_eq!(actual_rows, vec![(2, "bob".to_string())]);
 }

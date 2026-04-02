@@ -72,6 +72,11 @@ impl PaimonTableScan {
     pub fn table(&self) -> &Table {
         &self.table
     }
+
+    #[cfg(test)]
+    pub(crate) fn planned_partitions(&self) -> &[Arc<[DataSplit]>] {
+        &self.planned_partitions
+    }
 }
 
 impl ExecutionPlan for PaimonTableScan {

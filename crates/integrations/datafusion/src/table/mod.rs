@@ -25,18 +25,19 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
+use crate::filter_pushdown::{build_pushed_predicate, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::schema::paimon_schema_to_arrow;
 
 /// Read-only table provider for a Paimon table.
 ///
-/// Supports full table scan and column projection. Predicate pushdown and writes
-/// are not yet supported.
+/// Supports full table scan, column projection, and partition predicate pushdown.
+/// Data-level filtering remains a residual DataFusion filter.
 #[derive(Debug, Clone)]
 pub struct PaimonTableProvider {
     table: Table,
@@ -81,11 +82,24 @@ impl TableProvider for PaimonTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        let fields = self.table.schema().fields();
+        let partition_keys = self.table.schema().partition_keys();
+
+        Ok(filters
+            .iter()
+            .map(|filter| classify_filter_pushdown(filter, fields, partition_keys))
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Convert projection indices to column names and compute projected schema
@@ -101,7 +115,14 @@ impl TableProvider for PaimonTableProvider {
         };
 
         // Plan splits eagerly so we know partition count upfront.
-        let read_builder = self.table.new_read_builder();
+        let mut read_builder = self.table.new_read_builder();
+        if let Some(filter) = build_pushed_predicate(
+            filters,
+            self.table.schema().fields(),
+            self.table.schema().partition_keys(),
+        ) {
+            read_builder.with_filter(filter);
+        }
         let scan = read_builder.new_scan();
         let plan = scan.plan().await.map_err(to_datafusion_error)?;
 
@@ -133,6 +154,16 @@ impl TableProvider for PaimonTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::{col, lit, Expr};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use paimon::catalog::Identifier;
+    use paimon::{Catalog, DataSplit, FileSystemCatalog};
+
+    use crate::physical_plan::PaimonTableScan;
 
     #[test]
     fn test_bucket_round_robin_distributes_evenly() {
@@ -150,5 +181,126 @@ mod tests {
     fn test_bucket_round_robin_single_bucket() {
         let result = bucket_round_robin(vec![1, 2, 3], 1);
         assert_eq!(result, vec![vec![1, 2, 3]]);
+    }
+
+    fn get_test_warehouse() -> String {
+        std::env::var("PAIMON_TEST_WAREHOUSE")
+            .unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
+    }
+
+    async fn create_provider(table_name: &str) -> PaimonTableProvider {
+        let warehouse = get_test_warehouse();
+        let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
+        let identifier = Identifier::new("default", table_name);
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to get table");
+
+        PaimonTableProvider::try_new(table).expect("Failed to create table provider")
+    }
+
+    async fn plan_partitions(
+        provider: &PaimonTableProvider,
+        filters: Vec<Expr>,
+    ) -> Vec<Arc<[DataSplit]>> {
+        let config = SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        let state = ctx.state();
+        let plan = provider
+            .scan(&state, None, &filters, None)
+            .await
+            .expect("scan() should succeed");
+        let scan = plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        scan.planned_partitions().to_vec()
+    }
+
+    fn extract_dt_partition_set(planned_partitions: &[Arc<[DataSplit]>]) -> BTreeSet<String> {
+        planned_partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .map(|split| {
+                split
+                    .partition()
+                    .get_string(0)
+                    .expect("Failed to decode dt")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn extract_dt_hr_partition_set(
+        planned_partitions: &[Arc<[DataSplit]>],
+    ) -> BTreeSet<(String, i32)> {
+        planned_partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .map(|split| {
+                let partition = split.partition();
+                (
+                    partition
+                        .get_string(0)
+                        .expect("Failed to decode dt")
+                        .to_string(),
+                    partition.get_int(1).expect("Failed to decode hr"),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_scan_partition_filter_plans_matching_partition_set() {
+        let provider = create_provider("partitioned_log_table").await;
+        let planned_partitions =
+            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))]).await;
+
+        assert_eq!(
+            extract_dt_partition_set(&planned_partitions),
+            BTreeSet::from(["2024-01-01".to_string()]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_mixed_and_filter_keeps_partition_pruning() {
+        let provider = create_provider("partitioned_log_table").await;
+        let planned_partitions = plan_partitions(
+            &provider,
+            vec![col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)))],
+        )
+        .await;
+
+        assert_eq!(
+            extract_dt_partition_set(&planned_partitions),
+            BTreeSet::from(["2024-01-01".to_string()]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_multi_partition_filter_plans_exact_partition_set() {
+        let provider = create_provider("multi_partitioned_log_table").await;
+
+        let dt_only_partitions =
+            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))]).await;
+        let dt_hr_partitions = plan_partitions(
+            &provider,
+            vec![col("dt").eq(lit("2024-01-01")).and(col("hr").eq(lit(10)))],
+        )
+        .await;
+
+        assert_eq!(
+            extract_dt_hr_partition_set(&dt_only_partitions),
+            BTreeSet::from([
+                ("2024-01-01".to_string(), 10),
+                ("2024-01-01".to_string(), 20),
+            ]),
+        );
+        assert_eq!(
+            extract_dt_hr_partition_set(&dt_hr_partitions),
+            BTreeSet::from([("2024-01-01".to_string(), 10)]),
+        );
     }
 }
