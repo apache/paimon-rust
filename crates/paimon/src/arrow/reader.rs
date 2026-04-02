@@ -192,7 +192,7 @@ impl ArrowReader {
 /// Read a single parquet file from a split, returning a lazy stream of batches.
 /// Optionally applies a deletion vector.
 fn read_single_file_stream(
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
     split: DataSplit,
     file_meta: DataFileMeta,
     projected_column_names: Vec<String>,
@@ -272,7 +272,7 @@ fn read_single_file_stream(
 /// assembles columns from the winning files, and yields the merged batch. When a file's
 /// current batch is exhausted, the next batch is read from its stream on demand.
 fn merge_files_by_columns(
-    file_io: &FileIO,
+    file_io: &Arc<dyn FileIOProvider>,
     split: &DataSplit,
     projected_column_names: &[String],
     table_field_names: &[String],
