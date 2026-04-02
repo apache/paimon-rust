@@ -226,10 +226,6 @@ fn read_single_file_stream(
             .map(String::as_str)
             .collect();
 
-        if available_columns.is_empty() {
-            return;
-        }
-
         let mask = ProjectionMask::columns(&parquet_schema, available_columns.iter().copied());
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
