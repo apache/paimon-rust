@@ -593,7 +593,7 @@ impl RESTServer {
             )
         });
 
-        let key = format!("{}.{}", database, table);
+        let key = format!("{database}.{table}");
         s.tables.insert(
             key,
             GetTableResponse::new(

@@ -22,13 +22,15 @@
 use std::collections::HashMap;
 
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
-use crate::error::{Error, Result};
+use crate::common::{CatalogOptions, Options};
+use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
 use crate::table::Table;
 use async_trait::async_trait;
 use bytes::Bytes;
 use opendal::raw::get_basename;
+use snafu::OptionExt;
 
 /// Name of the schema directory under each table path.
 const SCHEMA_DIR: &str = "schema";
@@ -67,16 +69,44 @@ pub struct FileSystemCatalog {
 
 #[allow(dead_code)]
 impl FileSystemCatalog {
-    /// Create a new filesystem catalog.
+    /// Create a new filesystem catalog from configuration options.
     ///
     /// # Arguments
-    /// * `warehouse` - The root warehouse path
-    pub fn new(warehouse: impl Into<String>) -> crate::Result<Self> {
-        let warehouse = warehouse.into();
-        Ok(Self {
-            file_io: FileIO::from_path(warehouse.as_str())?.build()?,
-            warehouse,
-        })
+    /// * `options` - Configuration options containing warehouse path and storage configs (S3, OSS, etc.)
+    ///
+    /// # Required Options
+    /// * `warehouse` - The root warehouse path (e.g., `/path/to/warehouse`, `s3://bucket/warehouse`)
+    ///
+    /// # Example
+    /// ```ignore
+    /// use paimon::{FileSystemCatalog, Options, CatalogOptions};
+    ///
+    /// // Local filesystem
+    /// let mut options = Options::new();
+    /// options.set(CatalogOptions::WAREHOUSE, "/tmp/warehouse");
+    /// let catalog = FileSystemCatalog::new(options)?;
+    ///
+    /// // S3 with credentials
+    /// let mut options = Options::new();
+    /// options.set(CatalogOptions::WAREHOUSE, "s3://bucket/warehouse");
+    /// options.set("s3.access-key-id", "...");
+    /// options.set("s3.secret-access-key", "...");
+    /// let catalog = FileSystemCatalog::new(options)?;
+    /// ```
+    pub fn new(options: Options) -> crate::Result<Self> {
+        let warehouse =
+            options
+                .get(CatalogOptions::WAREHOUSE)
+                .cloned()
+                .context(ConfigInvalidSnafu {
+                    message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
+                })?;
+
+        let file_io = FileIO::from_path(&warehouse)?
+            .with_props(options.to_map().iter())
+            .build()?;
+
+        Ok(Self { file_io, warehouse })
     }
 
     /// Get the warehouse path.
@@ -424,7 +454,9 @@ mod tests {
     fn create_test_catalog() -> (TempDir, FileSystemCatalog) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = temp_dir.path().to_str().unwrap().to_string();
-        let catalog = FileSystemCatalog::new(warehouse).unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = FileSystemCatalog::new(options).unwrap();
         (temp_dir, catalog)
     }
 

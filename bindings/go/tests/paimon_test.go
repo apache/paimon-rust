@@ -45,7 +45,10 @@ func TestReadLogTable(t *testing.T) {
 		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
 	}
 
-	catalog, err := paimon.NewFileSystemCatalog(warehouse)
+	// Use NewCatalog with options
+	catalog, err := paimon.NewCatalog(map[string]string{
+		"warehouse": warehouse,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create catalog: %v", err)
 	}
@@ -167,7 +170,10 @@ func TestReadWithProjection(t *testing.T) {
 		t.Skipf("Skipping: warehouse %s does not exist (run 'make docker-up' first)", warehouse)
 	}
 
-	catalog, err := paimon.NewFileSystemCatalog(warehouse)
+	// Use NewCatalog with options
+	catalog, err := paimon.NewCatalog(map[string]string{
+		"warehouse": warehouse,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create catalog: %v", err)
 	}

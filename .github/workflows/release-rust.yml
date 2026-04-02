@@ -47,7 +47,7 @@ jobs:
           - paimon
           - paimon-datafusion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable

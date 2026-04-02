@@ -20,6 +20,13 @@ use std::ffi::c_void;
 use paimon::spec::DataField;
 use paimon::table::Table;
 
+/// C-compatible key-value pair for options.
+#[repr(C)]
+pub struct paimon_option {
+    pub key: *const std::ffi::c_char,
+    pub value: *const std::ffi::c_char,
+}
+
 /// C-compatible byte buffer.
 #[repr(C)]
 #[derive(Clone, Copy)]

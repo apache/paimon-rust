@@ -47,7 +47,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ inputs.source_ref || github.sha }}
@@ -111,7 +111,7 @@ jobs:
             expected_file: libpaimon_c.darwin.arm64.dylib.zst
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
 
@@ -140,7 +140,7 @@ jobs:
           test -s '${{ matrix.expected_file }}'
 
       - name: Upload packaged library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.expected_file }}
           path: bindings/go/${{ matrix.expected_file }}
@@ -152,13 +152,13 @@ jobs:
       - build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.source_sha }}
 
       - name: Download packaged libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: bindings/go
           merge-multiple: true

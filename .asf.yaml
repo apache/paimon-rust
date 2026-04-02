@@ -37,10 +37,7 @@ github:
     discussions: true
     wiki: false
     projects: false
-  protected_branches:
-    main:
-      required_pull_request_reviews:
-        required_approving_review_count: 0
+  protected_branches: ~
   collaborators:
     - Xuanwo
 

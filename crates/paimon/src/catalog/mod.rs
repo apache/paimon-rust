@@ -21,6 +21,7 @@
 //! and follows API patterns from Apache Iceberg Rust.
 
 mod database;
+mod factory;
 mod filesystem;
 mod rest;
 
@@ -28,6 +29,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 pub use database::*;
+pub use factory::*;
 pub use filesystem::*;
 pub use rest::*;
 use serde::{Deserialize, Serialize};

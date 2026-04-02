@@ -28,13 +28,34 @@
 //
 // Basic usage:
 //
-//	catalog, err := paimon.NewFileSystemCatalog("/path/to/warehouse")
+//	// Create a catalog with options
+//	catalog, err := paimon.NewCatalog(map[string]string{
+//		"warehouse": "/path/to/warehouse",
+//	})
 //	if err != nil { log.Fatal(err) }
 //	defer catalog.Close()
 //
 //	table, err := catalog.GetTable(paimon.NewIdentifier("default", "my_table"))
 //	if err != nil { log.Fatal(err) }
 //	defer table.Close()
+//
+// For S3 or OSS warehouses, pass the appropriate credentials:
+//
+//	// S3
+//	catalog, _ := paimon.NewCatalog(map[string]string{
+//		"warehouse":            "s3://bucket/warehouse",
+//		"s3.access-key-id":     "...",
+//		"s3.secret-access-key": "...",
+//		"s3.region":            "us-east-1",
+//	})
+//
+//	// OSS
+//	catalog, _ := paimon.NewCatalog(map[string]string{
+//		"warehouse":            "oss://bucket/warehouse",
+//		"fs.oss.accessKeyId":     "...",
+//		"fs.oss.accessKeySecret": "...",
+//		"fs.oss.endpoint":        "oss-cn-hangzhou.aliyuncs.com",
+//	})
 package paimon
 
 import (
