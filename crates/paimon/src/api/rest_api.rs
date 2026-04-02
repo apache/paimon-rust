@@ -121,8 +121,7 @@ impl RESTApi {
 
         let mut client = HttpClient::new(uri, Some(rest_auth_function))?;
 
-        let options = if 
-        config_required {
+        let options = if config_required {
             let warehouse = options.get(CatalogOptions::WAREHOUSE).ok_or_else(|| {
                 crate::Error::ConfigInvalid {
                     message: "Warehouse name cannot be empty".to_string(),
