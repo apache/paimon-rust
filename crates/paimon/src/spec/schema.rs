@@ -94,6 +94,13 @@ impl TableSchema {
         &self.options
     }
 
+    /// Create a copy of this schema with extra options merged in.
+    pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        let mut new_schema = self.clone();
+        new_schema.options.extend(extra);
+        new_schema
+    }
+
     pub fn comment(&self) -> Option<&str> {
         self.comment.as_deref()
     }

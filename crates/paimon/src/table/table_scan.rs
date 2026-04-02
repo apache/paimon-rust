@@ -233,15 +233,37 @@ impl<'a> TableScan<'a> {
         Self { table, filter }
     }
 
-    /// Plan the full scan: read latest snapshot, manifest list, manifest entries, then build DataSplits using bin packing.
+    /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
+    ///
+    /// Time travel is resolved from table options:
+    /// - `scan.snapshot-id` → read that specific snapshot
+    /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
+    /// - otherwise → read the latest snapshot
+    ///
+    /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
     pub async fn plan(&self) -> crate::Result<Plan> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let core_options = CoreOptions::new(self.table.schema().options());
 
-        let snapshot = match snapshot_manager.get_latest_snapshot().await? {
-            Some(s) => s,
-            None => return Ok(Plan::new(Vec::new())),
+        let snapshot = if let Some(id) = core_options.scan_snapshot_id() {
+            snapshot_manager.get_snapshot(id).await?
+        } else if let Some(ts) = core_options.scan_timestamp_millis() {
+            match snapshot_manager.earlier_or_equal_time_mills(ts).await? {
+                Some(s) => s,
+                None => {
+                    return Err(Error::DataInvalid {
+                        message: format!("No snapshot found with timestamp <= {ts}"),
+                        source: None,
+                    })
+                }
+            }
+        } else {
+            match snapshot_manager.get_latest_snapshot().await? {
+                Some(s) => s,
+                None => return Ok(Plan::new(Vec::new())),
+            }
         };
         self.plan_snapshot(snapshot).await
     }

@@ -24,7 +24,7 @@ use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider};
+use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonTableProvider};
 
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
@@ -313,5 +313,64 @@ async fn test_missing_database_returns_no_schema() {
     assert!(
         provider.schema("definitely_missing_database").is_none(),
         "missing databases should not resolve to a schema provider"
+    );
+}
+
+// ======================= Time Travel Tests =======================
+
+/// Helper: create a SessionContext with catalog + relation planner for time travel.
+async fn create_time_travel_context() -> SessionContext {
+    let catalog = create_catalog();
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "paimon",
+        Arc::new(PaimonCatalogProvider::new(Arc::new(catalog))),
+    );
+    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
+        .expect("Failed to register relation planner");
+    ctx
+}
+
+#[tokio::test]
+async fn test_time_travel_by_snapshot_id() {
+    let ctx = create_time_travel_context().await;
+
+    // Snapshot 1: should contain only the first insert (alice, bob)
+    let batches = ctx
+        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 1")
+        .await
+        .expect("time travel query should parse")
+        .collect()
+        .await
+        .expect("time travel query should execute");
+
+    let mut rows = extract_id_name_rows(&batches);
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        rows,
+        vec![(1, "alice".to_string()), (2, "bob".to_string())],
+        "Snapshot 1 should contain only the first batch of rows"
+    );
+
+    // Snapshot 2 (latest): should contain all rows
+    let batches = ctx
+        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 2")
+        .await
+        .expect("time travel query should parse")
+        .collect()
+        .await
+        .expect("time travel query should execute");
+
+    let mut rows = extract_id_name_rows(&batches);
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".to_string()),
+            (2, "bob".to_string()),
+            (3, "carol".to_string()),
+            (4, "dave".to_string()),
+        ],
+        "Snapshot 2 should contain all rows"
     );
 }

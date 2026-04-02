@@ -26,6 +26,7 @@ keywords = ["paimon", "datafusion", "integrations"]
 
 [dependencies]
 async-trait = "0.1"
+chrono = "0.4"
 datafusion = { version = "52.3.0"}
 paimon = { path = "../../paimon" }
 futures = "0.3"

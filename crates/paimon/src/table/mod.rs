@@ -34,6 +34,7 @@ pub use table_scan::TableScan;
 use crate::catalog::Identifier;
 use crate::io::FileIO;
 use crate::spec::TableSchema;
+use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -86,6 +87,16 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_read_builder(&self) -> ReadBuilder<'_> {
         ReadBuilder::new(self)
+    }
+
+    /// Create a copy of this table with extra options merged into the schema.
+    pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        Self {
+            file_io: self.file_io.clone(),
+            identifier: self.identifier.clone(),
+            location: self.location.clone(),
+            schema: self.schema.copy_with_options(extra),
+        }
     }
 }
 

@@ -260,6 +260,32 @@ def main():
     )
     spark.sql("DROP TABLE data_evolution_updates")
 
+    # ===== Time travel table: multiple snapshots for time travel tests =====
+    # Snapshot 1: rows (1, 'alice'), (2, 'bob')
+    # Snapshot 2: rows (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS time_travel_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO time_travel_table VALUES
+            (1, 'alice'),
+            (2, 'bob')
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO time_travel_table VALUES
+            (3, 'carol'),
+            (4, 'dave')
+        """
+    )
+
 
 if __name__ == "__main__":
     main()
