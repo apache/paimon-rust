@@ -203,7 +203,7 @@ mod tests {
         let schema = Schema::builder().build().unwrap();
         let table_schema = TableSchema::new(0, &schema);
         Table::new(
-            file_io,
+            Arc::new(file_io),
             Identifier::new("test_db", "test_table"),
             "/tmp/test-table".to_string(),
             table_schema,

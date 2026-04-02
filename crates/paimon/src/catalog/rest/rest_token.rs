@@ -51,8 +51,10 @@ impl Hash for RESTToken {
         keys.sort();
 
         for key in keys {
-            key.hash(state);
-            self.token.get(key).expect("key exists").hash(state);
+            if let Some(value) = self.token.get(key) {
+                key.hash(state);
+                value.hash(state);
+            }
         }
     }
 }

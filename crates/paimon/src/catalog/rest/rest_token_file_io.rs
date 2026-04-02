@@ -39,7 +39,7 @@ use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::storage_oss::OSS_ENDPOINT;
 use crate::io::{FileIO, FileIOProvider, FileStatus, InputFile, OutputFile};
-use crate::Result;
+use crate::{Error, Result};
 
 use super::rest_token::RESTToken;
 
@@ -91,15 +91,6 @@ pub struct RESTTokenFileIO {
     token: RwLock<Option<RESTToken>>,
 }
 
-impl std::fmt::Debug for RESTTokenFileIO {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RESTTokenFileIO")
-            .field("identifier", &self.identifier)
-            .field("path", &self.path)
-            .finish()
-    }
-}
-
 impl RESTTokenFileIO {
     /// Create a new RESTTokenFileIO.
     ///
@@ -131,7 +122,7 @@ impl RESTTokenFileIO {
         let token_guard = self.token.read().await;
         let current_token = token_guard
             .as_ref()
-            .ok_or_else(|| crate::Error::DataInvalid {
+            .ok_or_else(|| Error::DataInvalid {
                 message: "Token should be available after refresh".to_string(),
                 source: None,
             })?
@@ -140,23 +131,27 @@ impl RESTTokenFileIO {
         // Drop the read lock before checking cache
         drop(token_guard);
 
-        // Check global cache first
+        // Get or create FileIO from global cache (thread-safe, prevents duplicate creation)
         let cache = get_file_io_cache();
-        if let Some(file_io) = cache.get(&current_token).await {
-            return Ok(file_io);
-        }
+        let current_token_clone = current_token.clone();
+        let path = self.path.clone();
+        let catalog_options = self.catalog_options.clone();
 
-        // Need to create new FileIO with current token
-        let merged_props = RESTUtil::merge(
-            Some(self.catalog_options.to_map()),
-            Some(&current_token.token),
-        );
-        let mut builder = FileIO::from_path(&self.path)?;
-        builder = builder.with_props(merged_props);
-        let file_io = builder.build()?;
-
-        // Store in global cache
-        cache.insert(current_token, file_io.clone()).await;
+        let file_io = cache
+            .try_get_with(current_token, async move {
+                let merged_props = RESTUtil::merge(
+                    Some(catalog_options.to_map()),
+                    Some(&current_token_clone.token),
+                );
+                let mut builder = FileIO::from_path(&path)?;
+                builder = builder.with_props(merged_props);
+                builder.build()
+            })
+            .await
+            .map_err(|e| Error::DataInvalid {
+                message: format!("Failed to create FileIO: {}", e),
+                source: Some(Box::new(std::io::Error::other(e.to_string()))),
+            })?;
 
         Ok(file_io)
     }
@@ -205,16 +200,15 @@ impl RESTTokenFileIO {
 
         let response = api.load_table_token(&self.identifier).await?;
 
-        let expires_at_millis =
-            response
-                .expires_at_millis
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "Token response for table '{}' missing expires_at_millis",
-                        self.identifier.full_name()
-                    ),
-                    source: None,
-                })?;
+        let expires_at_millis = response
+            .expires_at_millis
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "Token response for table '{}' missing expires_at_millis",
+                    self.identifier.full_name()
+                ),
+                source: None,
+            })?;
 
         // Merge token with catalog options (e.g. DLF OSS endpoint override)
         let merged_token = self.merge_token_with_catalog_options(response.token);
@@ -291,5 +285,14 @@ impl FileIOProvider for RESTTokenFileIO {
     async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let file_io = self.get_file_io().await?;
         file_io.rename(src, dst).await
+    }
+}
+
+impl std::fmt::Debug for RESTTokenFileIO {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RESTTokenFileIO")
+            .field("identifier", &self.identifier)
+            .field("path", &self.path)
+            .finish()
     }
 }

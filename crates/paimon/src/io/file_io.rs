@@ -349,7 +349,6 @@ mod file_action_test {
     use std::fs;
 
     use super::*;
-    use crate::io::FileIOProvider;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
@@ -564,7 +563,6 @@ mod file_action_test {
 #[cfg(test)]
 mod input_output_test {
     use super::*;
-    use crate::io::FileIOProvider;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
@@ -576,7 +574,7 @@ mod input_output_test {
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
-        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -590,7 +588,7 @@ mod input_output_test {
     }
 
     async fn common_test_output_file_exists(file_io: &FileIO, path: &str) {
-        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -602,7 +600,7 @@ mod input_output_test {
     }
 
     async fn common_test_input_file_metadata(file_io: &FileIO, path: &str) {
-        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -616,7 +614,7 @@ mod input_output_test {
     }
 
     async fn common_test_input_file_partial_read(file_io: &FileIO, path: &str) {
-        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();

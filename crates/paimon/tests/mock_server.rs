@@ -600,7 +600,7 @@ impl RESTServer {
                 Some(table.to_string()),
                 Some(table.to_string()),
                 Some(path.to_string()),
-                Some(true),
+                Some(false),
                 Some(0),
                 Some(schema),
                 AuditRESTResponse::new(None, None, None, None, None),

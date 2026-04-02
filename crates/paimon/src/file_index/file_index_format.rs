@@ -102,7 +102,7 @@ pub async fn write_column_indexes(
     path: &str,
     indexes: HashMap<String, HashMap<String, Bytes>>,
 ) -> crate::Result<OutputFile> {
-    let file_io = Arc::new(FileIO::from_path(path)?.build()?) as Arc<dyn crate::io::FileIOProvider>;
+    let file_io: Arc<dyn crate::io::FileIOProvider> = Arc::new(FileIO::from_path(path)?.build()?);
     let output = file_io.new_output(path).await?;
     let mut writer = output.writer().await?;
 
