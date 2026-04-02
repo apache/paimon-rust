@@ -130,7 +130,7 @@ impl Storage {
     }
 
     #[cfg(feature = "storage-oss")]
-    fn oss_bucket_and_relative_path<'a>(path: &'a str) -> crate::Result<(String, &'a str)> {
+    fn oss_bucket_and_relative_path(path: &str) -> crate::Result<(String, &str)> {
         let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
             message: format!("Invalid OSS url: {path}"),
         })?;
