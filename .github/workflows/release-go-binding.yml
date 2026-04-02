@@ -140,7 +140,7 @@ jobs:
           test -s '${{ matrix.expected_file }}'
 
       - name: Upload packaged library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.expected_file }}
           path: bindings/go/${{ matrix.expected_file }}
