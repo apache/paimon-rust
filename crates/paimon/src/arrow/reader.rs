@@ -276,9 +276,7 @@ fn read_single_file_stream(
 /// Like Java's `ForceSingleBatchReader`: consumes the entire inner stream and yields
 /// one combined batch. Used in data evolution merge to ensure all file readers produce
 /// the same number of rows per iteration, so columns can be safely assembled.
-fn force_single_batch_stream(
-    inner: ArrowRecordBatchStream,
-) -> ArrowRecordBatchStream {
+fn force_single_batch_stream(inner: ArrowRecordBatchStream) -> ArrowRecordBatchStream {
     try_stream! {
         let mut inner = inner;
         let mut batches: Vec<RecordBatch> = Vec::new();
