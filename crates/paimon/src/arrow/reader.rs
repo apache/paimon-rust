@@ -374,18 +374,25 @@ fn merge_files_by_columns(
                 }
             }
 
-            // Determine how many rows we can emit: min of remaining rows across all files.
-            let remaining: Option<usize> = active_file_indices
-                .iter()
-                .filter_map(|idx| {
-                    file_cursors.get(idx).map(|(batch, offset)| batch.num_rows() - offset)
-                })
-                .min();
+            // All active files must have a cursor to assemble a valid row.
+            // If any file has no cursor (stream exhausted), we're done.
+            if active_file_indices.iter().any(|idx| !file_cursors.contains_key(idx)) {
+                break;
+            }
 
-            let remaining = match remaining {
-                Some(0) | None => break,
-                Some(r) => r,
-            };
+            // Determine how many rows we can emit: min of remaining rows across all files.
+            let remaining: usize = active_file_indices
+                .iter()
+                .map(|idx| {
+                    let (batch, offset) = file_cursors.get(idx).unwrap();
+                    batch.num_rows() - offset
+                })
+                .min()
+                .unwrap_or(0);
+
+            if remaining == 0 {
+                break;
+            }
 
             let rows_to_emit = remaining.min(output_batch_size);
 
