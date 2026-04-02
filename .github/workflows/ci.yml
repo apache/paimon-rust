@@ -39,7 +39,7 @@ jobs:
         run: python3 scripts/validate_asf_yaml.py
 
       - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.6.0
+        uses: apache/skywalking-eyes/header@v0.8.0
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
