@@ -22,6 +22,7 @@ use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
 use arrow_array::{new_null_array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::concat::concat_batches;
 
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -177,6 +178,7 @@ impl ArrowReader {
                         &split,
                         &projected_column_names,
                         &table_field_names,
+                        &read_type,
                         batch_size,
                     )?;
                     while let Some(batch) = merge_stream.next().await {
@@ -269,6 +271,32 @@ fn read_single_file_stream(
     .boxed())
 }
 
+/// Wraps a record batch stream to concatenate all batches into a single batch.
+///
+/// Like Java's `ForceSingleBatchReader`: consumes the entire inner stream and yields
+/// one combined batch. Used in data evolution merge to ensure all file readers produce
+/// the same number of rows per iteration, so columns can be safely assembled.
+fn force_single_batch_stream(
+    inner: ArrowRecordBatchStream,
+) -> ArrowRecordBatchStream {
+    try_stream! {
+        let mut inner = inner;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = inner.next().await {
+            batches.push(batch?);
+        }
+        if !batches.is_empty() {
+            let schema = batches[0].schema();
+            let combined = concat_batches(&schema, &batches).map_err(|e| Error::UnexpectedError {
+                message: format!("ForceSingleBatch: failed to concat batches: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            yield combined;
+        }
+    }
+    .boxed()
+}
+
 /// Merge multiple files column-wise for data evolution, streaming one batch at a time.
 ///
 /// Like Java's `DataEvolutionFileReader`: opens all file readers simultaneously, reads one
@@ -279,6 +307,7 @@ fn merge_files_by_columns(
     split: &DataSplit,
     projected_column_names: &[String],
     table_field_names: &[String],
+    read_type: &[DataField],
     batch_size: Option<usize>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let data_files = split.data_files();
@@ -329,6 +358,16 @@ fn merge_files_by_columns(
         })
         .collect();
 
+    // Build a map from column name to Arrow type from read_type for null column creation.
+    let read_type_map: HashMap<String, ArrowDataType> = read_type
+        .iter()
+        .filter_map(|f| {
+            super::paimon_type_to_arrow(f.data_type())
+                .ok()
+                .map(|t| (f.name().to_string(), t))
+        })
+        .collect();
+
     // Collect which file indices we need to open streams for.
     let active_file_indices: Vec<usize> = file_read_columns.keys().copied().collect();
 
@@ -339,10 +378,12 @@ fn merge_files_by_columns(
     let projected_column_names = projected_column_names.to_vec();
 
     Ok(try_stream! {
-        // Open a stream for each file that contributes columns.
-        let mut file_streams: HashMap<usize, _> = HashMap::new();
+        // Open a stream for each file that contributes columns, wrapped to force
+        // a single batch per file (like Java's ForceSingleBatchReader). This ensures
+        // all files produce the same number of rows, so columns align.
+        let mut file_batches: HashMap<usize, RecordBatch> = HashMap::new();
         for &file_idx in &active_file_indices {
-            let stream = read_single_file_stream(
+            let inner = read_single_file_stream(
                 file_io.clone(),
                 split.clone(),
                 data_files[file_idx].clone(),
@@ -350,45 +391,20 @@ fn merge_files_by_columns(
                 batch_size,
                 None,
             )?;
-            file_streams.insert(file_idx, stream);
+            let mut stream = force_single_batch_stream(inner);
+            if let Some(batch) = stream.next().await {
+                file_batches.insert(file_idx, batch?);
+            }
         }
 
-        // Read one batch from each stream at a time and merge columns.
-        loop {
-            // Read next batch from each active stream.
-            let mut file_batches: HashMap<usize, RecordBatch> = HashMap::new();
-            let mut any_data = false;
-            let mut all_done = true;
+        // Determine row count from any batch.
+        let row_count = file_batches
+            .values()
+            .next()
+            .map(|b| b.num_rows())
+            .unwrap_or(0);
 
-            for (&file_idx, stream) in file_streams.iter_mut() {
-                match stream.next().await {
-                    Some(Ok(batch)) => {
-                        any_data = true;
-                        all_done = false;
-                        file_batches.insert(file_idx, batch);
-                    }
-                    Some(Err(e)) => Err(e)?,
-                    None => {
-                        // This stream is exhausted.
-                    }
-                }
-            }
-
-            if !any_data || all_done {
-                break;
-            }
-
-            // Determine row count from any batch in this iteration.
-            let row_count = file_batches
-                .values()
-                .next()
-                .map(|b| b.num_rows())
-                .unwrap_or(0);
-
-            if row_count == 0 {
-                continue;
-            }
-
+        if row_count > 0 {
             // Assemble merged batch: pick each column from the winning file or fill with nulls.
             let mut columns: Vec<Arc<dyn arrow_array::Array>> =
                 Vec::with_capacity(column_plan.len());
@@ -404,10 +420,10 @@ fn merge_files_by_columns(
                         }
                     }
                 }
-                // Column not found — fill with nulls.
-                let null_type = file_batches
-                    .values()
-                    .find_map(|b| b.schema().index_of(col_name).ok().map(|i| b.schema().field(i).data_type().clone()))
+                // Column not found in any file — fill with nulls using type from read_type.
+                let null_type = read_type_map
+                    .get(col_name)
+                    .cloned()
                     .unwrap_or(ArrowDataType::Utf8);
                 let null_array = new_null_array(&null_type, row_count);
                 schema_fields.push(ArrowField::new(col_name, null_type, true));

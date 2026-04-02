@@ -216,7 +216,7 @@ impl DataSplitBuilder {
             total_buckets: -1,
             data_files: None,
             data_deletion_files: None,
-            raw_convertible: true,
+            raw_convertible: false,
         }
     }
 

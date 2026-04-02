@@ -408,53 +408,38 @@ impl<'a> TableScan<'a> {
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
-            if data_evolution_enabled {
+            // Split files into groups: data evolution merges overlapping row_id ranges
+            // then bin-packs; normal mode just bin-packs by file size.
+            let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
-                let packed_splits =
-                    pack_data_evolution_splits(row_id_groups, target_split_size, open_file_cost);
-                for (file_group, raw_convertible) in packed_splits {
-                    let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
-                        file_group
-                            .iter()
-                            .map(|f| per_bucket.get(&f.file_name).cloned())
-                            .collect::<Vec<Option<DeletionFile>>>()
-                    });
-
-                    let mut builder = DataSplitBuilder::new()
-                        .with_snapshot(snapshot_id)
-                        .with_partition(partition_row.clone())
-                        .with_bucket(bucket)
-                        .with_bucket_path(bucket_path.clone())
-                        .with_total_buckets(total_buckets)
-                        .with_data_files(file_group)
-                        .with_raw_convertible(raw_convertible);
-                    if let Some(files) = data_deletion_files {
-                        builder = builder.with_data_deletion_files(files);
-                    }
-                    splits.push(builder.build()?);
-                }
+                pack_data_evolution_splits(row_id_groups, target_split_size, open_file_cost)
             } else {
-                let file_groups = split_for_batch(data_files, target_split_size, open_file_cost);
-                for file_group in file_groups {
-                    let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
-                        file_group
-                            .iter()
-                            .map(|f| per_bucket.get(&f.file_name).cloned())
-                            .collect::<Vec<Option<DeletionFile>>>()
-                    });
+                split_for_batch(data_files, target_split_size, open_file_cost)
+                    .into_iter()
+                    .map(|g| (g, true))
+                    .collect()
+            };
 
-                    let mut builder = DataSplitBuilder::new()
-                        .with_snapshot(snapshot_id)
-                        .with_partition(partition_row.clone())
-                        .with_bucket(bucket)
-                        .with_bucket_path(bucket_path.clone())
-                        .with_total_buckets(total_buckets)
-                        .with_data_files(file_group);
-                    if let Some(files) = data_deletion_files {
-                        builder = builder.with_data_deletion_files(files);
-                    }
-                    splits.push(builder.build()?);
+            for (file_group, raw_convertible) in file_groups_with_raw {
+                let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
+                    file_group
+                        .iter()
+                        .map(|f| per_bucket.get(&f.file_name).cloned())
+                        .collect::<Vec<Option<DeletionFile>>>()
+                });
+
+                let mut builder = DataSplitBuilder::new()
+                    .with_snapshot(snapshot_id)
+                    .with_partition(partition_row.clone())
+                    .with_bucket(bucket)
+                    .with_bucket_path(bucket_path.clone())
+                    .with_total_buckets(total_buckets)
+                    .with_data_files(file_group)
+                    .with_raw_convertible(raw_convertible);
+                if let Some(files) = data_deletion_files {
+                    builder = builder.with_data_deletion_files(files);
                 }
+                splits.push(builder.build()?);
             }
         }
         Ok(Plan::new(splits))
