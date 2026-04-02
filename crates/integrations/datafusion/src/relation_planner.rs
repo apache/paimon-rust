@@ -109,8 +109,15 @@ fn object_name_to_table_reference(
     let idents: Vec<String> = name
         .0
         .iter()
-        .map(|part| context.normalize_ident(part.as_ident().unwrap().clone()))
-        .collect();
+        .map(|part| {
+            let ident = part.as_ident().ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Expected simple identifier in table reference, got: {part}"
+                ))
+            })?;
+            Ok(context.normalize_ident(ident.clone()))
+        })
+        .collect::<DFResult<_>>()?;
     match idents.len() {
         1 => Ok(TableReference::bare(idents[0].clone())),
         2 => Ok(TableReference::partial(

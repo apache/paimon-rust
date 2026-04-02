@@ -17,17 +17,17 @@
 
 use std::collections::HashMap;
 
-pub const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
-pub const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
-pub const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
-pub const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
-pub const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
-pub const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
+const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
+const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
+const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
+const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
+const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
-pub const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
-pub const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
-pub const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
+const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
+const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
+const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 
 /// Typed accessors for common table options.
 ///
