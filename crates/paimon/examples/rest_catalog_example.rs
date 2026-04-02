@@ -105,7 +105,7 @@ async fn main() {
     let catalog = match CatalogFactory::create(options).await {
         Ok(catalog) => catalog,
         Err(err) => {
-            eprintln!("Failed to create catalog: {err}");
+            eprintln!("Failed to create RESTCatalog: {err}");
             return;
         }
     };

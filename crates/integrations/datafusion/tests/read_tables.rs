@@ -18,12 +18,13 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonTableProvider;
+use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider};
 
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
@@ -283,4 +284,34 @@ async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
     let actual_rows = extract_id_name_rows(&batches);
 
     assert_eq!(actual_rows, vec![(2, "bob".to_string())]);
+}
+
+// ======================= Catalog Provider Tests =======================
+#[tokio::test]
+async fn test_query_via_catalog_provider() {
+    let catalog = create_catalog();
+    let provider = PaimonCatalogProvider::new(Arc::new(catalog));
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("paimon", Arc::new(provider));
+
+    let df = ctx
+        .sql("SELECT id, name FROM paimon.default.simple_log_table")
+        .await
+        .expect("Failed to execute query");
+
+    let batches = df.collect().await.expect("Failed to collect results");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows from simple_log_table");
+}
+
+#[tokio::test]
+async fn test_missing_database_returns_no_schema() {
+    let catalog = create_catalog();
+    let provider = PaimonCatalogProvider::new(Arc::new(catalog));
+
+    assert!(
+        provider.schema("definitely_missing_database").is_none(),
+        "missing databases should not resolve to a schema provider"
+    );
 }

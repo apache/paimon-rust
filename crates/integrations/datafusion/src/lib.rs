@@ -36,12 +36,14 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod catalog;
 mod error;
 mod filter_pushdown;
 mod physical_plan;
 mod schema;
 mod table;
 
+pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
 pub use physical_plan::PaimonTableScan;
 pub use schema::paimon_schema_to_arrow;
