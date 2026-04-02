@@ -147,8 +147,10 @@ impl RESTTokenFileIO {
         }
 
         // Need to create new FileIO with current token
-        let merged_props =
-            RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&current_token.token));
+        let merged_props = RESTUtil::merge(
+            Some(self.catalog_options.to_map()),
+            Some(&current_token.token),
+        );
         let mut builder = FileIO::from_path(&self.path)?;
         builder = builder.with_props(merged_props);
         let file_io = builder.build()?;

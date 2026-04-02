@@ -66,7 +66,10 @@ pub struct IndexManifest;
 
 impl IndexManifest {
     /// Read index manifest entries from a file.
-    pub async fn read(file_io: &Arc<dyn FileIOProvider>, path: &str) -> Result<Vec<IndexManifestEntry>> {
+    pub async fn read(
+        file_io: &Arc<dyn FileIOProvider>,
+        path: &str,
+    ) -> Result<Vec<IndexManifestEntry>> {
         let input_file = file_io.new_input(path).await?;
         if !input_file.exists().await? {
             return Ok(Vec::new());

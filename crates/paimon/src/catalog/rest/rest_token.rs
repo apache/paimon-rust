@@ -45,11 +45,11 @@ impl Hash for RESTToken {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Hash expire_at_millis first
         self.expire_at_millis.hash(state);
-        
+
         // Sort keys and hash key-value pairs in order
         let mut keys: Vec<&String> = self.token.keys().collect();
         keys.sort();
-        
+
         for key in keys {
             key.hash(state);
             self.token.get(key).expect("key exists").hash(state);

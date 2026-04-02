@@ -82,7 +82,8 @@ mod tests {
         let path =
             workdir.join("tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0");
 
-        let file_io: Arc<dyn FileIOProvider> = Arc::new(FileIO::from_url("file://").unwrap().build().unwrap());
+        let file_io: Arc<dyn FileIOProvider> =
+            Arc::new(FileIO::from_url("file://").unwrap().build().unwrap());
         let entries = Manifest::read(&file_io, path.to_str().unwrap())
             .await
             .unwrap();

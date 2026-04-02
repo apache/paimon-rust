@@ -65,7 +65,6 @@ impl FileIO {
             })?;
         Ok(FileIOBuilder::new(url.scheme()))
     }
-
 }
 // Implement FileIOProvider for FileIO
 use crate::io::FileIOProvider;

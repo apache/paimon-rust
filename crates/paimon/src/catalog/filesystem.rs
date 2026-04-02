@@ -23,9 +23,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
-use crate::io::{FileIO, FileIOProvider};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
+use crate::io::{FileIO, FileIOProvider};
 use crate::spec::{Schema, TableSchema};
 use crate::table::Table;
 use async_trait::async_trait;
@@ -107,7 +107,10 @@ impl FileSystemCatalog {
             .with_props(options.to_map().iter())
             .build()?;
 
-        Ok(Self { file_io: Arc::new(file_io), warehouse })
+        Ok(Self {
+            file_io: Arc::new(file_io),
+            warehouse,
+        })
     }
 
     /// Get the warehouse path.

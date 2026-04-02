@@ -65,7 +65,10 @@ impl DeletionVectorFactory {
 
     /// Read a single DeletionVector from storage using DeletionFile (path/offset/length).
     /// Same as Java's DeletionVector.read(FileIO, DeletionFile).
-    async fn read(file_io: &Arc<dyn FileIOProvider>, df: &crate::DeletionFile) -> Result<DeletionVector> {
+    async fn read(
+        file_io: &Arc<dyn FileIOProvider>,
+        df: &crate::DeletionFile,
+    ) -> Result<DeletionVector> {
         let input = file_io.new_input(df.path()).await?;
         let reader = input.reader().await?;
         let offset = df.offset() as u64;

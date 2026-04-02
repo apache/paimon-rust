@@ -236,10 +236,7 @@ impl Catalog for RESTCatalog {
         // External tables are not supported
         if is_external {
             return Err(Error::Unsupported {
-                message: format!(
-                    "External table {} is not supported",
-                    identifier.full_name()
-                ),
+                message: format!("External table {} is not supported", identifier.full_name()),
             });
         }
 
