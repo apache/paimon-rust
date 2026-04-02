@@ -136,11 +136,7 @@ impl FileIO {
             if entry_path.trim_start_matches('/') == list_path_normalized {
                 continue;
             }
-            // OpenDAL 0.55 removed list metakey selection, so stat each entry to
-            // guarantee FileStatus metadata is populated consistently across backends.
-            let meta = op.stat(entry_path).await.context(IoUnexpectedSnafu {
-                message: format!("Failed to stat listed entry '{}' in '{path}'", entry_path),
-            })?;
+            let meta = entry.metadata();
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: meta.is_dir(),
