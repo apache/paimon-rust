@@ -350,6 +350,7 @@ mod file_action_test {
     use std::fs;
 
     use super::*;
+    use crate::io::FileIOProvider;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
@@ -361,7 +362,7 @@ mod file_action_test {
     }
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -373,7 +374,7 @@ mod file_action_test {
     }
 
     async fn common_test_exists(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -385,7 +386,7 @@ mod file_action_test {
     }
 
     async fn common_test_delete_file(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = file_io.new_output(path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -406,7 +407,7 @@ mod file_action_test {
     }
 
     async fn common_test_rename(file_io: &FileIO, src: &str, dst: &str) {
-        let output = file_io.new_output(src).unwrap();
+        let output = file_io.new_output(src).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -433,6 +434,7 @@ mod file_action_test {
         for file in [&file_a, &file_b] {
             file_io
                 .new_output(file)
+                .await
                 .unwrap()
                 .write(Bytes::from("test data"))
                 .await
@@ -482,6 +484,7 @@ mod file_action_test {
 
         file_io
             .new_output(path)
+            .await
             .unwrap()
             .write(Bytes::from("data"))
             .await
@@ -507,6 +510,7 @@ mod file_action_test {
 
         file_io_1
             .new_output(path)
+            .await
             .unwrap()
             .write(Bytes::from("data"))
             .await
@@ -561,6 +565,7 @@ mod file_action_test {
 #[cfg(test)]
 mod input_output_test {
     use super::*;
+    use crate::io::FileIOProvider;
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
@@ -572,7 +577,7 @@ mod input_output_test {
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -586,7 +591,7 @@ mod input_output_test {
     }
 
     async fn common_test_output_file_exists(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -598,7 +603,7 @@ mod input_output_test {
     }
 
     async fn common_test_input_file_metadata(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();
@@ -612,7 +617,7 @@ mod input_output_test {
     }
 
     async fn common_test_input_file_partial_read(file_io: &FileIO, path: &str) {
-        let output = file_io.new_output(path).unwrap();
+        let output = FileIOProvider::new_output(file_io, path).await.unwrap();
         let mut writer = output.writer().await.unwrap();
         writer.write(Bytes::from("hello world")).await.unwrap();
         writer.close().await.unwrap();

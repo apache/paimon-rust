@@ -248,12 +248,12 @@ impl RESTTokenFileIO {
 impl FileIOProvider for RESTTokenFileIO {
     async fn new_input(&self, path: &str) -> Result<InputFile> {
         let file_io = self.get_file_io().await?;
-        file_io.new_input(path)
+        file_io.new_input(path).await
     }
 
     async fn new_output(&self, path: &str) -> Result<OutputFile> {
         let file_io = self.get_file_io().await?;
-        file_io.new_output(path)
+        file_io.new_output(path).await
     }
 
     async fn get_status(&self, path: &str) -> Result<FileStatus> {
