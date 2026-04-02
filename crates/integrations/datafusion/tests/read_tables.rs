@@ -22,11 +22,18 @@ use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon::catalog::Identifier;
-use paimon::{Catalog, FileSystemCatalog};
+use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::PaimonTableProvider;
 
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
+}
+
+fn create_catalog() -> FileSystemCatalog {
+    let warehouse = get_test_warehouse();
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    FileSystemCatalog::new(options).expect("Failed to create catalog")
 }
 
 async fn create_context(table_name: &str) -> SessionContext {
@@ -39,8 +46,7 @@ async fn create_context(table_name: &str) -> SessionContext {
 }
 
 async fn create_provider(table_name: &str) -> PaimonTableProvider {
-    let warehouse = get_test_warehouse();
-    let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
+    let catalog = create_catalog();
     let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)

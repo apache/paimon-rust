@@ -48,15 +48,50 @@ Available storage features:
 
 ## Catalog Management
 
-`FileSystemCatalog` manages databases and tables stored on a local (or remote) filesystem.
+Paimon supports multiple catalog types. The `CatalogFactory` provides a unified way to create catalogs based on configuration options.
 
 ### Create a Catalog
 
-```rust
-use paimon::FileSystemCatalog;
+The `CatalogFactory` automatically determines the catalog type based on the `metastore` option:
 
-let catalog = FileSystemCatalog::new("/tmp/paimon-warehouse")?;
+```rust
+use paimon::{CatalogFactory, CatalogOptions, Options};
+
+// Local filesystem (no credentials needed)
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "/path/to/warehouse");
+let catalog = CatalogFactory::create(options).await?;
+
+// Amazon S3
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "s3://bucket/warehouse");
+options.set("s3.access-key-id", "your-access-key-id");
+options.set("s3.secret-access-key", "your-secret-access-key");
+options.set("s3.region", "us-east-1");
+let catalog = CatalogFactory::create(options).await?;
+
+// Alibaba Cloud OSS
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "oss://bucket/warehouse");
+options.set("fs.oss.accessKeyId", "your-access-key-id");
+options.set("fs.oss.accessKeySecret", "your-access-key-secret");
+options.set("fs.oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
+let catalog = CatalogFactory::create(options).await?;
+
+// REST catalog
+let mut options = Options::new();
+options.set(CatalogOptions::METASTORE, "rest");
+options.set(CatalogOptions::URI, "http://localhost:8080");
+options.set(CatalogOptions::WAREHOUSE, "my_warehouse");
+let catalog = CatalogFactory::create(options).await?;
 ```
+
+Supported metastore types:
+
+| Metastore Type | Description                      |
+|----------------|----------------------------------|
+| `filesystem`   | Local or remote filesystem (default) |
+| `rest`         | REST catalog server              |
 
 ### Manage Databases
 

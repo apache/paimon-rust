@@ -23,7 +23,7 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
-use paimon::{Catalog, Error, FileSystemCatalog, Plan};
+use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan};
 use std::collections::{HashMap, HashSet};
 
 #[path = "../../paimon/tests/mock_server.rs"]
@@ -77,7 +77,9 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
 
 fn create_file_system_catalog() -> FileSystemCatalog {
     let warehouse = get_test_warehouse();
-    FileSystemCatalog::new(warehouse).expect("Failed to create FileSystemCatalog")
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    FileSystemCatalog::new(options).expect("Failed to create FileSystemCatalog")
 }
 
 async fn scan_and_read_with_fs_catalog(
@@ -801,7 +803,7 @@ async fn setup_rest_catalog_with_tables(
 
     // Register each table with its schema and the real on-disk path
     for (database, table_name, schema) in table_configs {
-        let table_path = format!("{}/{}.db/{}", catalog_path, database, table_name);
+        let table_path = format!("{catalog_path}/{database}.db/{table_name}");
         server.add_table_with_schema(database, table_name, schema.clone(), &table_path);
     }
 

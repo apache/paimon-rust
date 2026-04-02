@@ -27,7 +27,7 @@ import (
 	"github.com/jupiterrider/ffi"
 )
 
-// Catalog wraps a paimon FileSystemCatalog.
+// Catalog wraps a paimon Catalog.
 type Catalog struct {
 	ctx       context.Context
 	lib       *libRef
@@ -35,14 +35,22 @@ type Catalog struct {
 	closeOnce sync.Once
 }
 
-// NewFileSystemCatalog creates a new FileSystemCatalog for the given warehouse path.
-func NewFileSystemCatalog(warehouse string) (*Catalog, error) {
+// NewCatalog creates a new Catalog using the CatalogFactory with the given options.
+// The catalog type is determined by the "metastore" option (default: "filesystem").
+//
+// Common options:
+//   - "warehouse": The warehouse path (required)
+//   - "metastore": Catalog type - "filesystem" (default) or "rest"
+//   - "uri": REST catalog server URI (required for REST catalog)
+//   - "s3.access-key-id", "s3.secret-access-key", "s3.region": S3 credentials
+//   - "fs.oss.accessKeyId", "fs.oss.accessKeySecret", "fs.oss.endpoint": OSS credentials
+func NewCatalog(options map[string]string) (*Catalog, error) {
 	ctx, lib, err := ensureLoaded()
 	if err != nil {
 		return nil, err
 	}
-	createFn := ffiCatalogNew.symbol(ctx)
-	inner, err := createFn(warehouse)
+	createFn := ffiCatalogCreate.symbol(ctx)
+	inner, err := createFn(options)
 	if err != nil {
 		return nil, err
 	}
@@ -80,20 +88,41 @@ func (c *Catalog) GetTable(id Identifier) (*Table, error) {
 	return &Table{ctx: c.ctx, lib: c.lib, inner: inner}, nil
 }
 
-var ffiCatalogNew = newFFI(ffiOpts{
-	sym:    "paimon_catalog_new",
+var ffiCatalogCreate = newFFI(ffiOpts{
+	sym:    "paimon_catalog_create",
 	rType:  &typeResultCatalogNew,
-	aTypes: []*ffi.Type{&ffi.TypePointer},
-}, func(ctx context.Context, ffiCall ffiCall) func(warehouse string) (*paimonCatalog, error) {
-	return func(warehouse string) (*paimonCatalog, error) {
-		byteWarehouse, err := bytePtrFromString(warehouse)
-		if err != nil {
-			return nil, err
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(options map[string]string) (*paimonCatalog, error) {
+	return func(options map[string]string) (*paimonCatalog, error) {
+		// Convert map to array of paimonOption
+		type paimonOption struct {
+			key   *byte
+			value *byte
 		}
+		opts := make([]paimonOption, 0, len(options))
+		for k, v := range options {
+			keyBytes, err := bytePtrFromString(k)
+			if err != nil {
+				return nil, err
+			}
+			valBytes, err := bytePtrFromString(v)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, paimonOption{key: keyBytes, value: valBytes})
+		}
+
+		var optsPtr unsafe.Pointer
+		if len(opts) > 0 {
+			optsPtr = unsafe.Pointer(&opts[0])
+		}
+		optsLen := uintptr(len(opts))
+
 		var result resultCatalogNew
 		ffiCall(
 			unsafe.Pointer(&result),
-			unsafe.Pointer(&byteWarehouse),
+			unsafe.Pointer(&optsPtr),
+			unsafe.Pointer(&optsLen),
 		)
 		if result.error != nil {
 			return nil, parseError(ctx, result.error)

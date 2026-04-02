@@ -15,32 +15,56 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_void;
+use std::sync::Arc;
 
 use paimon::catalog::Identifier;
-use paimon::{Catalog, FileSystemCatalog};
+use paimon::{Catalog, CatalogFactory, Options};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr};
 use crate::result::{paimon_result_catalog_new, paimon_result_get_table};
 use crate::runtime;
-use crate::types::{paimon_catalog, paimon_table};
+use crate::types::{paimon_catalog, paimon_option, paimon_table};
 
-/// Create a new FileSystemCatalog.
+/// Create a catalog using CatalogFactory with the given options.
 ///
 /// # Safety
-/// `warehouse` must be a valid null-terminated C string, or null (returns error).
+/// `options` must be a valid pointer to an array of `paimon_option` with `options_len` elements.
+/// Each key and value in the options must be valid null-terminated C strings.
 #[no_mangle]
-pub unsafe extern "C" fn paimon_catalog_new(warehouse: *const c_char) -> paimon_result_catalog_new {
-    let warehouse_str = match validate_cstr(warehouse, "warehouse") {
-        Ok(s) => s,
-        Err(e) => {
-            return paimon_result_catalog_new {
-                catalog: std::ptr::null_mut(),
-                error: e,
-            }
+pub unsafe extern "C" fn paimon_catalog_create(
+    options: *const paimon_option,
+    options_len: usize,
+) -> paimon_result_catalog_new {
+    // Build Options from the array
+    let mut opts = Options::new();
+    if !options.is_null() && options_len > 0 {
+        let options_slice = std::slice::from_raw_parts(options, options_len);
+        for opt in options_slice {
+            let key = match validate_cstr(opt.key, "option key") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_catalog_new {
+                        catalog: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            let value = match validate_cstr(opt.value, "option value") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_catalog_new {
+                        catalog: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            opts.set(key, value);
         }
-    };
-    match FileSystemCatalog::new(warehouse_str) {
+    }
+
+    // Create catalog using CatalogFactory
+    match runtime().block_on(CatalogFactory::create(opts)) {
         Ok(catalog) => {
             let wrapper = Box::new(paimon_catalog {
                 inner: Box::into_raw(Box::new(catalog)) as *mut c_void,
@@ -60,13 +84,13 @@ pub unsafe extern "C" fn paimon_catalog_new(warehouse: *const c_char) -> paimon_
 /// Free a paimon_catalog.
 ///
 /// # Safety
-/// Only call with a catalog returned from `paimon_catalog_new`.
+/// Only call with a catalog returned from `paimon_catalog_create`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_catalog_free(catalog: *mut paimon_catalog) {
     if !catalog.is_null() {
         let c = Box::from_raw(catalog);
         if !c.inner.is_null() {
-            drop(Box::from_raw(c.inner as *mut FileSystemCatalog));
+            drop(Box::from_raw(c.inner as *mut Arc<dyn Catalog>));
         }
     }
 }
@@ -93,7 +117,7 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
         };
     }
 
-    let catalog_ref = &*((*catalog).inner as *const FileSystemCatalog);
+    let catalog_ref = &*((*catalog).inner as *const Arc<dyn Catalog>);
     let identifier_ref = &*((*identifier).inner as *const Identifier);
 
     match runtime().block_on(catalog_ref.get_table(identifier_ref)) {

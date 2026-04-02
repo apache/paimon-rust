@@ -161,7 +161,7 @@ mod tests {
     use datafusion::logical_expr::{col, lit, Expr};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
-    use paimon::{Catalog, DataSplit, FileSystemCatalog};
+    use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
 
     use crate::physical_plan::PaimonTableScan;
 
@@ -188,9 +188,15 @@ mod tests {
             .unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
     }
 
-    async fn create_provider(table_name: &str) -> PaimonTableProvider {
+    fn create_catalog() -> FileSystemCatalog {
         let warehouse = get_test_warehouse();
-        let catalog = FileSystemCatalog::new(warehouse).expect("Failed to create catalog");
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        FileSystemCatalog::new(options).expect("Failed to create catalog")
+    }
+
+    async fn create_provider(table_name: &str) -> PaimonTableProvider {
+        let catalog = create_catalog();
         let identifier = Identifier::new("default", table_name);
         let table = catalog
             .get_table(&identifier)

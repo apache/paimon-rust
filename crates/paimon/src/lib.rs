@@ -34,6 +34,7 @@ pub mod spec;
 pub mod table;
 
 pub use catalog::Catalog;
+pub use catalog::CatalogFactory;
 pub use catalog::FileSystemCatalog;
 
 pub use table::{

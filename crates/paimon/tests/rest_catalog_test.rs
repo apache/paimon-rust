@@ -97,7 +97,7 @@ async fn test_catalog_create_database() {
         .catalog
         .create_database("new_db", false, HashMap::new())
         .await;
-    assert!(result.is_ok(), "failed to create database: {:?}", result);
+    assert!(result.is_ok(), "failed to create database: {result:?}");
 
     // Verify creation
     let dbs = ctx.catalog.list_databases().await.unwrap();
@@ -144,7 +144,7 @@ async fn test_catalog_drop_database() {
 
     // Drop database (cascade=true to skip empty check)
     let result = ctx.catalog.drop_database("to_drop", false, true).await;
-    assert!(result.is_ok(), "failed to drop database: {:?}", result);
+    assert!(result.is_ok(), "failed to drop database: {result:?}");
 
     // Verify database is gone
     let dbs = ctx.catalog.list_databases().await.unwrap();
@@ -232,8 +232,7 @@ async fn test_catalog_list_tables_empty() {
     let tables = ctx.catalog.list_tables("default").await.unwrap();
     assert!(
         tables.is_empty(),
-        "expected empty tables list, got: {:?}",
-        tables
+        "expected empty tables list, got: {tables:?}"
     );
 }
 
@@ -252,7 +251,7 @@ async fn test_catalog_get_table() {
 
     let identifier = Identifier::new("default", "my_table");
     let table = ctx.catalog.get_table(&identifier).await;
-    assert!(table.is_ok(), "failed to get table: {:?}", table);
+    assert!(table.is_ok(), "failed to get table: {table:?}");
 }
 
 #[tokio::test]
@@ -272,7 +271,7 @@ async fn test_catalog_create_table() {
     let identifier = Identifier::new("default", "new_table");
 
     let result = ctx.catalog.create_table(&identifier, schema, false).await;
-    assert!(result.is_ok(), "failed to create table: {:?}", result);
+    assert!(result.is_ok(), "failed to create table: {result:?}");
 
     // Verify table exists
     let tables = ctx.catalog.list_tables("default").await.unwrap();
@@ -326,7 +325,7 @@ async fn test_catalog_drop_table() {
 
     // Drop table
     let result = ctx.catalog.drop_table(&identifier, false).await;
-    assert!(result.is_ok(), "failed to drop table: {:?}", result);
+    assert!(result.is_ok(), "failed to drop table: {result:?}");
 
     // Verify table is gone
     let tables = ctx.catalog.list_tables("default").await.unwrap();
@@ -375,7 +374,7 @@ async fn test_catalog_rename_table() {
 
     // Rename table
     let result = ctx.catalog.rename_table(&from, &to, false).await;
-    assert!(result.is_ok(), "failed to rename table: {:?}", result);
+    assert!(result.is_ok(), "failed to rename table: {result:?}");
 
     // Verify old table is gone and new table exists
     let tables = ctx.catalog.list_tables("default").await.unwrap();
