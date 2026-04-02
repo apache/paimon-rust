@@ -26,7 +26,7 @@ use crate::spec::{
     eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataFileMeta, FileKind,
     IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
 };
-use crate::table::bin_pack::{pack_for_ordered, split_for_batch};
+use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
 use crate::Error;
@@ -219,53 +219,6 @@ fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFile
     result
 }
 
-/// Packs row-id groups into splits using bin packing, respecting `target_split_size` and
-/// `open_file_cost`. Each group is treated as an atomic unit (files sharing the same row IDs
-/// must stay together). A split is `raw_convertible` only if every group in it has exactly
-/// one file (no column-wise merge needed).
-///
-/// Multi-file groups (that need column-wise merge) are kept as separate splits to avoid
-/// mixing files from different row_id ranges in the merge logic.
-///
-/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
-fn pack_data_evolution_splits(
-    file_groups: Vec<Vec<DataFileMeta>>,
-    target_split_size: i64,
-    open_file_cost: i64,
-) -> Vec<(Vec<DataFileMeta>, bool)> {
-    use std::cmp;
-
-    // Separate single-file groups (can be bin-packed) from multi-file groups (need dedicated splits).
-    let (single_file_groups, multi_file_groups): (Vec<_>, Vec<_>) =
-        file_groups.into_iter().partition(|g| g.len() == 1);
-
-    let mut result: Vec<(Vec<DataFileMeta>, bool)> = Vec::new();
-
-    // Each multi-file group becomes its own split with raw_convertible=false.
-    // These files share the same row_id range and need column-wise merge.
-    for group in multi_file_groups {
-        result.push((group, false));
-    }
-
-    // Single-file groups can be bin-packed together with raw_convertible=true.
-    if !single_file_groups.is_empty() {
-        let group_weight = |group: &Vec<DataFileMeta>| -> i64 {
-            group
-                .iter()
-                .map(|f| cmp::max(f.file_size, open_file_cost))
-                .sum()
-        };
-
-        let packed = pack_for_ordered(single_file_groups, group_weight, target_split_size);
-        for groups in packed {
-            let files: Vec<DataFileMeta> = groups.into_iter().flatten().collect();
-            result.push((files, true));
-        }
-    }
-
-    result
-}
-
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -422,11 +375,27 @@ impl<'a> TableScan<'a> {
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
-            // Split files into groups: data evolution merges overlapping row_id ranges
-            // then bin-packs; normal mode just bin-packs by file size.
+            // Split files into groups: data evolution merges overlapping row_id ranges;
+            // multi-file groups need column-wise merge, single-file groups can be bin-packed.
             let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
-                pack_data_evolution_splits(row_id_groups, target_split_size, open_file_cost)
+                let (singles, multis): (Vec<_>, Vec<_>) =
+                    row_id_groups.into_iter().partition(|g| g.len() == 1);
+
+                let mut result: Vec<(Vec<DataFileMeta>, bool)> = Vec::new();
+
+                // Multi-file groups: each becomes its own split, raw_convertible=false
+                for group in multis {
+                    result.push((group, false));
+                }
+
+                // Single-file groups: flatten and bin-pack, raw_convertible=true
+                let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
+                for file_group in split_for_batch(single_files, target_split_size, open_file_cost) {
+                    result.push((file_group, true));
+                }
+
+                result
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
                     .into_iter()
@@ -462,9 +431,7 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_by_overlapping_row_id, pack_data_evolution_splits, partition_matches_predicate,
-    };
+    use super::{group_by_overlapping_row_id, partition_matches_predicate};
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum, IntType,
         Predicate, PredicateBuilder, PredicateOperator, VarCharType,
@@ -670,77 +637,5 @@ mod tests {
         assert_eq!(groups.len(), 1);
         // Sorted by descending max_sequence_number: b(3), c(2), a(1)
         assert_eq!(file_names(&groups), vec![vec!["b", "c", "a"]]);
-    }
-
-    // ==================== pack_data_evolution_splits tests ====================
-
-    #[test]
-    fn test_pack_data_evolution_splits_empty() {
-        let result = pack_data_evolution_splits(vec![], 128, 4);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_pack_data_evolution_splits_single_file_groups() {
-        // All groups have 1 file → all raw_convertible.
-        let groups = vec![
-            vec![make_evo_file("a", 10, 100, 1, Some(0))],
-            vec![make_evo_file("b", 10, 100, 2, Some(100))],
-        ];
-        let result = pack_data_evolution_splits(groups, 100, 4);
-        // Both fit in one split (10+10 < 100).
-        assert_eq!(result.len(), 1);
-        let (files, raw) = &result[0];
-        assert_eq!(files.len(), 2);
-        assert!(raw, "all single-file groups should be raw_convertible");
-    }
-
-    #[test]
-    fn test_pack_data_evolution_splits_multi_file_group_not_raw() {
-        // A group with 2 files → not raw_convertible.
-        let groups = vec![vec![
-            make_evo_file("a", 10, 100, 1, Some(0)),
-            make_evo_file("b", 10, 100, 2, Some(0)),
-        ]];
-        let result = pack_data_evolution_splits(groups, 100, 4);
-        assert_eq!(result.len(), 1);
-        let (files, raw) = &result[0];
-        assert_eq!(files.len(), 2);
-        assert!(!raw, "multi-file group should not be raw_convertible");
-    }
-
-    #[test]
-    fn test_pack_data_evolution_splits_mixed_raw() {
-        // Group1: 2 files (not raw), Group2: 1 file (raw).
-        // If packed together, the split is not raw_convertible.
-        let groups = vec![
-            vec![
-                make_evo_file("a", 10, 100, 1, Some(0)),
-                make_evo_file("b", 10, 100, 2, Some(0)),
-            ],
-            vec![make_evo_file("c", 10, 100, 3, Some(100))],
-        ];
-        let result = pack_data_evolution_splits(groups, 1000, 4);
-        // All fit in one split.
-        assert_eq!(result.len(), 1);
-        let (files, raw) = &result[0];
-        assert_eq!(files.len(), 3);
-        assert!(!raw, "mixed groups should not be raw_convertible");
-    }
-
-    #[test]
-    fn test_pack_data_evolution_splits_respects_target_size() {
-        // Each group is 50 bytes, target is 60 → one group per split.
-        let groups = vec![
-            vec![make_evo_file("a", 50, 100, 1, Some(0))],
-            vec![make_evo_file("b", 50, 100, 2, Some(100))],
-            vec![make_evo_file("c", 50, 100, 3, Some(200))],
-        ];
-        let result = pack_data_evolution_splits(groups, 60, 4);
-        assert_eq!(result.len(), 3);
-        for (files, raw) in &result {
-            assert_eq!(files.len(), 1);
-            assert!(raw);
-        }
     }
 }
