@@ -443,6 +443,7 @@ fn find_column_type_from_batches(
     None
 }
 
+/// Builds a Parquet [RowSelection] from deletion vector.
 /// Only rows not in the deletion vector are selected; deleted rows are skipped at read time.
 /// todo: Uses [DeletionVectorIterator] with [advance_to](DeletionVectorIterator::advance_to) when skipping row groups similar to iceberg-rust
 fn build_deletes_row_selection(

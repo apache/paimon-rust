@@ -407,7 +407,7 @@ pub struct DataFileMeta {
 
     /// Which table columns this file contains (used in data evolution mode).
     #[serde(
-        rename = "_WRITE_COLUMNS",
+        rename = "_WRITE_COLS",
         default,
         skip_serializing_if = "Option::is_none"
     )]

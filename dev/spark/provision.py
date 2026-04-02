@@ -236,10 +236,18 @@ def main():
     # MERGE INTO: partial column update on existing rows.
     # This writes new files containing only the updated column (name) with the
     # same first_row_id, so the reader must merge columns from multiple files.
+    # Paimon 1.3.1 requires the source table to be a Paimon table.
     spark.sql(
         """
-        CREATE TEMPORARY VIEW data_evolution_updates AS
-        SELECT * FROM VALUES (1, 'alice-v2'), (3, 'carol-v2') AS t(id, name)
+        CREATE TABLE IF NOT EXISTS data_evolution_updates (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO data_evolution_updates VALUES (1, 'alice-v2'), (3, 'carol-v2')
         """
     )
     spark.sql(
@@ -250,6 +258,7 @@ def main():
         WHEN MATCHED THEN UPDATE SET t.name = s.name
         """
     )
+    spark.sql("DROP TABLE data_evolution_updates")
 
 
 if __name__ == "__main__":
