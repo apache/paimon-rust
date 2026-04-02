@@ -22,7 +22,6 @@ use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::concat::concat_batches;
 
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -266,12 +265,12 @@ fn read_single_file_stream(
     .boxed())
 }
 
-/// Merge multiple files column-wise for data evolution.
+/// Merge multiple files column-wise for data evolution, streaming with bounded memory.
 ///
-/// Like Java's `ForceSingleBatchReader`: reads all batches from each file and concatenates
-/// them into a single batch per file, ensuring row alignment. Then assembles the output by
-/// picking each projected column from the winning file (highest `max_sequence_number`).
-/// Columns not found in any file are skipped.
+/// Opens all file readers simultaneously and maintains a cursor (current batch + offset)
+/// per file. Each poll slices up to `batch_size` rows from each file's current batch,
+/// assembles columns from the winning files, and yields the merged batch. When a file's
+/// current batch is exhausted, the next batch is read from its stream on demand.
 fn merge_files_by_columns(
     file_io: &FileIO,
     split: &DataSplit,
@@ -334,15 +333,13 @@ fn merge_files_by_columns(
     let split = split.clone();
     let data_files: Vec<DataFileMeta> = data_files.to_vec();
     let projected_column_names = projected_column_names.to_vec();
+    let output_batch_size = batch_size.unwrap_or(1024);
 
     Ok(try_stream! {
-        // Read each file that contributes columns, concat into a single batch per file.
-        // Like Java's ForceSingleBatchReader — ensures all files produce the same number
-        // of rows so columns can be safely assembled. Data is only read when this stream
-        // is polled (try_stream is lazy).
-        let mut file_batches: HashMap<usize, RecordBatch> = HashMap::new();
+        // Open a stream for each active file.
+        let mut file_streams: HashMap<usize, ArrowRecordBatchStream> = HashMap::new();
         for &file_idx in &active_file_indices {
-            let mut stream = read_single_file_stream(
+            let stream = read_single_file_stream(
                 file_io.clone(),
                 split.clone(),
                 data_files[file_idx].clone(),
@@ -350,50 +347,80 @@ fn merge_files_by_columns(
                 batch_size,
                 None,
             )?;
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            while let Some(batch) = stream.next().await {
-                batches.push(batch?);
-            }
-            if !batches.is_empty() {
-                let schema = batches[0].schema();
-                let combined = concat_batches(&schema, &batches).map_err(|e| Error::UnexpectedError {
-                    message: format!("Failed to concat batches for file index {file_idx}: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-                file_batches.insert(file_idx, combined);
-            }
+            file_streams.insert(file_idx, stream);
         }
 
-        // Determine row count from any batch.
-        let row_count = file_batches
-            .values()
-            .next()
-            .map(|b| b.num_rows())
-            .unwrap_or(0);
+        // Per-file cursor: current batch + offset within it.
+        let mut file_cursors: HashMap<usize, (RecordBatch, usize)> = HashMap::new();
 
-        if row_count > 0 {
-            // Assemble merged batch: pick each column from the winning file or fill with nulls.
+        loop {
+            // Ensure each active file has a current batch. If a file's cursor is exhausted
+            // or not yet initialized, read the next batch from its stream.
+            for &file_idx in &active_file_indices {
+                let needs_next = match file_cursors.get(&file_idx) {
+                    None => true,
+                    Some((batch, offset)) => *offset >= batch.num_rows(),
+                };
+                if needs_next {
+                    file_cursors.remove(&file_idx);
+                    if let Some(stream) = file_streams.get_mut(&file_idx) {
+                        if let Some(batch_result) = stream.next().await {
+                            let batch = batch_result?;
+                            if batch.num_rows() > 0 {
+                                file_cursors.insert(file_idx, (batch, 0));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Determine how many rows we can emit: min of remaining rows across all files.
+            let remaining: Option<usize> = active_file_indices
+                .iter()
+                .filter_map(|idx| {
+                    file_cursors.get(idx).map(|(batch, offset)| batch.num_rows() - offset)
+                })
+                .min();
+
+            let remaining = match remaining {
+                Some(0) | None => break,
+                Some(r) => r,
+            };
+
+            let rows_to_emit = remaining.min(output_batch_size);
+
+            // Slice each file's current batch and assemble columns.
             let mut columns: Vec<Arc<dyn arrow_array::Array>> =
                 Vec::with_capacity(column_plan.len());
             let mut schema_fields: Vec<ArrowField> = Vec::with_capacity(column_plan.len());
 
             for (file_idx_opt, col_name) in &column_plan {
                 if let Some(file_idx) = file_idx_opt {
-                    if let Some(batch) = file_batches.get(file_idx) {
+                    if let Some((batch, offset)) = file_cursors.get(file_idx) {
                         if let Ok(col_idx) = batch.schema().index_of(col_name) {
-                            columns.push(batch.column(col_idx).clone());
+                            let col = batch.column(col_idx).slice(*offset, rows_to_emit);
+                            columns.push(col);
                             schema_fields.push(batch.schema().field(col_idx).clone());
                         }
                     }
                 }
             }
 
-            let schema = Arc::new(ArrowSchema::new(schema_fields));
-            let merged = RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to build merged RecordBatch: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-            yield merged;
+            // Advance all cursors.
+            for &file_idx in &active_file_indices {
+                if let Some((_, ref mut offset)) = file_cursors.get_mut(&file_idx) {
+                    *offset += rows_to_emit;
+                }
+            }
+
+            if !columns.is_empty() {
+                let schema = Arc::new(ArrowSchema::new(schema_fields));
+                let merged = RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to build merged RecordBatch: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+                yield merged;
+            }
         }
     }
     .boxed())
