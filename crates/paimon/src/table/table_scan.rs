@@ -224,6 +224,9 @@ fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFile
 /// must stay together). A split is `raw_convertible` only if every group in it has exactly
 /// one file (no column-wise merge needed).
 ///
+/// Multi-file groups (that need column-wise merge) are kept as separate splits to avoid
+/// mixing files from different row_id ranges in the merge logic.
+///
 /// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
 fn pack_data_evolution_splits(
     file_groups: Vec<Vec<DataFileMeta>>,
@@ -232,24 +235,35 @@ fn pack_data_evolution_splits(
 ) -> Vec<(Vec<DataFileMeta>, bool)> {
     use std::cmp;
 
-    // Weight of a group = sum of max(file_size, open_file_cost) for each file.
-    let group_weight = |group: &Vec<DataFileMeta>| -> i64 {
-        group
-            .iter()
-            .map(|f| cmp::max(f.file_size, open_file_cost))
-            .sum()
-    };
+    // Separate single-file groups (can be bin-packed) from multi-file groups (need dedicated splits).
+    let (single_file_groups, multi_file_groups): (Vec<_>, Vec<_>) =
+        file_groups.into_iter().partition(|g| g.len() == 1);
 
-    let packed = pack_for_ordered(file_groups, group_weight, target_split_size);
+    let mut result: Vec<(Vec<DataFileMeta>, bool)> = Vec::new();
 
-    packed
-        .into_iter()
-        .map(|groups| {
-            let raw_convertible = groups.iter().all(|g| g.len() == 1);
+    // Each multi-file group becomes its own split with raw_convertible=false.
+    // These files share the same row_id range and need column-wise merge.
+    for group in multi_file_groups {
+        result.push((group, false));
+    }
+
+    // Single-file groups can be bin-packed together with raw_convertible=true.
+    if !single_file_groups.is_empty() {
+        let group_weight = |group: &Vec<DataFileMeta>| -> i64 {
+            group
+                .iter()
+                .map(|f| cmp::max(f.file_size, open_file_cost))
+                .sum()
+        };
+
+        let packed = pack_for_ordered(single_file_groups, group_weight, target_split_size);
+        for groups in packed {
             let files: Vec<DataFileMeta> = groups.into_iter().flatten().collect();
-            (files, raw_convertible)
-        })
-        .collect()
+            result.push((files, true));
+        }
+    }
+
+    result
 }
 
 /// TableScan for full table scan (no incremental, no predicate).
