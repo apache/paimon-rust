@@ -47,7 +47,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ inputs.source_ref || github.sha }}
@@ -111,7 +111,7 @@ jobs:
             expected_file: libpaimon_c.darwin.arm64.dylib.zst
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
 
@@ -152,7 +152,7 @@ jobs:
       - build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.source_sha }}

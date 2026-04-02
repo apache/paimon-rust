@@ -33,7 +33,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Validate .asf.yaml
         run: python3 scripts/validate_asf_yaml.py
@@ -64,7 +64,7 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build
         run: cargo build
 
@@ -77,7 +77,7 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Test
         run: cargo test -p paimon --all-targets
@@ -88,7 +88,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Start Docker containers
         run: make docker-up
