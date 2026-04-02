@@ -22,7 +22,7 @@ use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
 use arrow_array::{new_null_array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::concat::concat_batches;
+
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -86,7 +86,6 @@ impl ArrowReader {
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let file_io = self.file_io.clone();
         let batch_size = self.batch_size;
-        // Owned list of splits so the stream does not hold references.
         let splits: Vec<DataSplit> = data_splits.to_vec();
         let read_type = self.read_type;
         let projected_column_names: Vec<String> = read_type
@@ -96,7 +95,6 @@ impl ArrowReader {
         Ok(try_stream! {
             for split in splits {
                 // Create DV factory for this split only (like Java createReader(partition, bucket, files, deletionFiles)).
-                let core_data_files = split.data_files();
                 let dv_factory = if split
                     .data_deletion_files()
                     .is_some_and(|files| files.iter().any(Option::is_some))
@@ -104,7 +102,7 @@ impl ArrowReader {
                     Some(
                         DeletionVectorFactory::new(
                             &file_io,
-                            core_data_files,
+                            split.data_files(),
                             split.data_deletion_files(),
                         )
                         .await?,
@@ -113,80 +111,27 @@ impl ArrowReader {
                     None
                 };
 
-                for file_meta in core_data_files {
-                    let path_to_read = split.data_file_path(file_meta);
-                    if !path_to_read.to_ascii_lowercase().ends_with(".parquet") {
-                        Err(Error::Unsupported {
-                            message: format!(
-                                "unsupported file format: only .parquet is supported, got: {path_to_read}"
-                            ),
-                        })?
-                    }
+                for file_meta in split.data_files().to_vec() {
                     let dv = dv_factory
                         .as_ref()
-                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name));
+                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name))
+                        .cloned();
 
-                    let parquet_file = file_io.new_input(&path_to_read)?;
-                    let (parquet_metadata, parquet_reader) = try_join!(
-                        parquet_file.metadata(),
-                        parquet_file.reader()
+                    let mut stream = read_single_file_stream(
+                        file_io.clone(),
+                        split.clone(),
+                        file_meta,
+                        projected_column_names.clone(),
+                        batch_size,
+                        dv,
                     )?;
-                    let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);
-
-                    let mut batch_stream_builder =
-                        ParquetRecordBatchStreamBuilder::new(arrow_file_reader)
-                            .await?;
-                    // ProjectionMask preserves parquet-schema order; read_type order is restored below.
-                    let mask = {
-                        let parquet_schema = batch_stream_builder.parquet_schema();
-                        ProjectionMask::columns(
-                            parquet_schema,
-                            projected_column_names.iter().map(String::as_str),
-                        )
-                    };
-                    batch_stream_builder = batch_stream_builder.with_projection(mask);
-
-                    if let Some(dv) = dv {
-                        if !dv.is_empty() {
-                            let row_selection =
-                                build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?;
-                            batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
-                        }
-                    }
-                    if let Some(size) = batch_size {
-                        batch_stream_builder = batch_stream_builder.with_batch_size(size);
-                    }
-                    let mut batch_stream = batch_stream_builder.build()?;
-
-                    while let Some(batch) = batch_stream.next().await {
-                        let batch = batch?;
-                        // Reorder columns from parquet-schema order to read_type order.
-                        // Every projected column must exist in the batch; a missing
-                        // column indicates schema mismatch and must not be silenced.
-                        let reorder_indices: Vec<usize> = projected_column_names
-                            .iter()
-                            .map(|name| {
-                                batch.schema().index_of(name).map_err(|_| {
-                                    Error::UnexpectedError {
-                                        message: format!(
-                                            "Projected column '{name}' not found in Parquet batch schema of file {path_to_read}"
-                                        ),
-                                        source: None,
-                                    }
-                                })
-                            })
-                            .collect::<crate::Result<Vec<_>>>()?;
-                        yield batch.project(&reorder_indices).map_err(|e| {
-                            Error::UnexpectedError {
-                                message: "Failed to reorder projected columns".to_string(),
-                                source: Some(Box::new(e)),
-                            }
-                        })?;
+                    while let Some(batch) = stream.next().await {
+                        yield batch?;
                     }
                 }
             }
         }
-            .boxed())
+        .boxed())
     }
 
     /// Read data files in data evolution mode, merging columns from files that share the same row ID range.
@@ -214,28 +159,28 @@ impl ArrowReader {
             .collect();
 
         Ok(try_stream! {
-            for split in &splits {
+            for split in splits {
                 if split.raw_convertible() || split.data_files().len() == 1 {
-                    // Single file or raw convertible — read normally.
-                    for file_meta in split.data_files() {
-                        let batches = read_single_file(
-                            &file_io, split, file_meta, &projected_column_names, batch_size, None,
-                        ).await?;
-                        for batch in batches {
-                            yield batch;
+                    // Single file or raw convertible — stream lazily without loading all into memory.
+                    for file_meta in split.data_files().to_vec() {
+                        let mut stream = read_single_file_stream(
+                            file_io.clone(), split.clone(), file_meta, projected_column_names.clone(), batch_size, None,
+                        )?;
+                        while let Some(batch) = stream.next().await {
+                            yield batch?;
                         }
                     }
                 } else {
-                    // Multiple files need column-wise merge.
-                    let merged_batches = merge_files_by_columns(
+                    // Multiple files need column-wise merge — also streamed lazily.
+                    let mut merge_stream = merge_files_by_columns(
                         &file_io,
-                        split,
+                        &split,
                         &projected_column_names,
                         &table_field_names,
                         batch_size,
-                    ).await?;
-                    for batch in merged_batches {
-                        yield batch;
+                    )?;
+                    while let Some(batch) = merge_stream.next().await {
+                        yield batch?;
                     }
                 }
             }
@@ -244,82 +189,101 @@ impl ArrowReader {
     }
 }
 
-/// Read a single parquet file from a split, returning all batches.
+/// Read a single parquet file from a split, returning a lazy stream of batches.
 /// Optionally applies a deletion vector.
-async fn read_single_file(
-    file_io: &FileIO,
-    split: &DataSplit,
-    file_meta: &DataFileMeta,
-    projected_column_names: &[String],
+fn read_single_file_stream(
+    file_io: FileIO,
+    split: DataSplit,
+    file_meta: DataFileMeta,
+    projected_column_names: Vec<String>,
     batch_size: Option<usize>,
-    dv: Option<&DeletionVector>,
-) -> crate::Result<Vec<RecordBatch>> {
-    let path_to_read = split.data_file_path(file_meta);
-    if !path_to_read.to_ascii_lowercase().ends_with(".parquet") {
-        return Err(Error::Unsupported {
-            message: format!(
-                "unsupported file format: only .parquet is supported, got: {path_to_read}"
-            ),
-        });
-    }
+    dv: Option<Arc<DeletionVector>>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    Ok(try_stream! {
+        let path_to_read = split.data_file_path(&file_meta);
+        if !path_to_read.to_ascii_lowercase().ends_with(".parquet") {
+            Err(Error::Unsupported {
+                message: format!(
+                    "unsupported file format: only .parquet is supported, got: {path_to_read}"
+                ),
+            })?
+        }
 
-    let parquet_file = file_io.new_input(&path_to_read)?;
-    let (parquet_metadata, parquet_reader) =
-        try_join!(parquet_file.metadata(), parquet_file.reader())?;
-    let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);
+        let parquet_file = file_io.new_input(&path_to_read)?;
+        let (parquet_metadata, parquet_reader) =
+            try_join!(parquet_file.metadata(), parquet_file.reader())?;
+        let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);
 
-    let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
+        let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
 
-    // Only project columns that exist in this file.
-    let parquet_schema = batch_stream_builder.parquet_schema().clone();
-    let file_column_names: Vec<&str> = parquet_schema.columns().iter().map(|c| c.name()).collect();
-    let available_columns: Vec<&str> = projected_column_names
-        .iter()
-        .filter(|name| file_column_names.contains(&name.as_str()))
-        .map(String::as_str)
-        .collect();
+        // Only project columns that exist in this file.
+        let parquet_schema = batch_stream_builder.parquet_schema().clone();
+        let file_column_names: Vec<&str> = parquet_schema.columns().iter().map(|c| c.name()).collect();
+        let available_columns: Vec<&str> = projected_column_names
+            .iter()
+            .filter(|name| file_column_names.contains(&name.as_str()))
+            .map(String::as_str)
+            .collect();
 
-    if available_columns.is_empty() {
-        return Ok(Vec::new());
-    }
+        if available_columns.is_empty() {
+            return;
+        }
 
-    let mask = ProjectionMask::columns(&parquet_schema, available_columns.iter().copied());
-    batch_stream_builder = batch_stream_builder.with_projection(mask);
+        let mask = ProjectionMask::columns(&parquet_schema, available_columns.iter().copied());
+        batch_stream_builder = batch_stream_builder.with_projection(mask);
 
-    if let Some(dv) = dv {
-        if !dv.is_empty() {
-            let row_selection =
-                build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?;
-            batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
+        if let Some(ref dv) = dv {
+            if !dv.is_empty() {
+                let row_selection =
+                    build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?;
+                batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
+            }
+        }
+        if let Some(size) = batch_size {
+            batch_stream_builder = batch_stream_builder.with_batch_size(size);
+        }
+
+        let mut batch_stream = batch_stream_builder.build()?;
+        while let Some(batch) = batch_stream.next().await {
+            let batch = batch?;
+            // Reorder columns from parquet-schema order to projected_column_names order,
+            // consistent with the normal read() path.
+            let reorder_indices: Vec<usize> = projected_column_names
+                .iter()
+                .filter_map(|name| batch.schema().index_of(name).ok())
+                .collect();
+            if reorder_indices.len() == batch.num_columns() {
+                yield batch.project(&reorder_indices).map_err(|e| {
+                    Error::UnexpectedError {
+                        message: "Failed to reorder projected columns".to_string(),
+                        source: Some(Box::new(e)),
+                    }
+                })?;
+            } else {
+                // Not all projected columns exist in this file (data evolution case),
+                // return as-is; the caller (merge_files_by_columns) handles missing columns.
+                yield batch;
+            }
         }
     }
-    if let Some(size) = batch_size {
-        batch_stream_builder = batch_stream_builder.with_batch_size(size);
-    }
-
-    let mut batch_stream = batch_stream_builder.build()?;
-    let mut batches = Vec::new();
-    while let Some(batch) = batch_stream.next().await {
-        batches.push(batch?);
-    }
-    Ok(batches)
+    .boxed())
 }
 
-/// Merge multiple files column-wise for data evolution.
+/// Merge multiple files column-wise for data evolution, streaming one batch at a time.
 ///
-/// All files in the split share the same `first_row_id` and `row_count`.
-/// Each file contributes a subset of columns. When multiple files provide the same column,
-/// the file with the higher `max_sequence_number` wins.
-async fn merge_files_by_columns(
+/// Like Java's `DataEvolutionFileReader`: opens all file readers simultaneously, reads one
+/// batch from each per iteration, assembles the output by picking columns from the winning
+/// reader, and yields the merged batch lazily. No full materialization needed.
+fn merge_files_by_columns(
     file_io: &FileIO,
     split: &DataSplit,
     projected_column_names: &[String],
     table_field_names: &[String],
     batch_size: Option<usize>,
-) -> crate::Result<Vec<RecordBatch>> {
+) -> crate::Result<ArrowRecordBatchStream> {
     let data_files = split.data_files();
     if data_files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(futures::stream::empty().boxed());
     }
 
     // Determine which columns each file provides and resolve conflicts by max_sequence_number.
@@ -330,7 +294,6 @@ async fn merge_files_by_columns(
         let file_columns: Vec<String> = if let Some(ref wc) = file_meta.write_cols {
             wc.clone()
         } else {
-            // File written before data evolution — contains all table columns at that schema version.
             table_field_names.to_vec()
         };
 
@@ -356,91 +319,110 @@ async fn merge_files_by_columns(
         }
     }
 
-    // Read each file that contributes columns.
-    let mut file_batches: HashMap<usize, Vec<RecordBatch>> = HashMap::new();
-    for file_idx in file_read_columns.keys() {
-        let file_meta = &data_files[*file_idx];
-        let batches = read_single_file(
-            file_io,
-            split,
-            file_meta,
-            projected_column_names,
-            batch_size,
-            None,
-        )
-        .await?;
-        file_batches.insert(*file_idx, batches);
-    }
+    // For each projected column, record (file_index, column_name) for assembly.
+    // If no file provides it, we'll fill with nulls.
+    let column_plan: Vec<(Option<usize>, String)> = projected_column_names
+        .iter()
+        .map(|col_name| {
+            let file_idx = column_source.get(col_name).map(|&(idx, _)| idx);
+            (file_idx, col_name.clone())
+        })
+        .collect();
 
-    // Concatenate all batches per file into a single RecordBatch.
-    let mut file_concat: HashMap<usize, RecordBatch> = HashMap::new();
-    for (file_idx, batches) in &file_batches {
-        if batches.is_empty() {
-            continue;
+    // Collect which file indices we need to open streams for.
+    let active_file_indices: Vec<usize> = file_read_columns.keys().copied().collect();
+
+    // Build owned data for the stream closure.
+    let file_io = file_io.clone();
+    let split = split.clone();
+    let data_files: Vec<DataFileMeta> = data_files.to_vec();
+    let projected_column_names = projected_column_names.to_vec();
+
+    Ok(try_stream! {
+        // Open a stream for each file that contributes columns.
+        let mut file_streams: HashMap<usize, _> = HashMap::new();
+        for &file_idx in &active_file_indices {
+            let stream = read_single_file_stream(
+                file_io.clone(),
+                split.clone(),
+                data_files[file_idx].clone(),
+                projected_column_names.clone(),
+                batch_size,
+                None,
+            )?;
+            file_streams.insert(file_idx, stream);
         }
-        let schema = batches[0].schema();
-        let concat = concat_batches(&schema, batches).map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to concatenate batches for file index {file_idx}: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-        file_concat.insert(*file_idx, concat);
-    }
 
-    // Determine the total row count from any file.
-    let row_count = file_concat
-        .values()
-        .next()
-        .map(|b| b.num_rows())
-        .unwrap_or(0);
+        // Read one batch from each stream at a time and merge columns.
+        loop {
+            // Read next batch from each active stream.
+            let mut file_batches: HashMap<usize, RecordBatch> = HashMap::new();
+            let mut any_data = false;
+            let mut all_done = true;
 
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Build the merged RecordBatch: for each projected column, pick from the winning file
-    // or fill with nulls.
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> =
-        Vec::with_capacity(projected_column_names.len());
-    let mut schema_fields: Vec<ArrowField> = Vec::with_capacity(projected_column_names.len());
-
-    for col_name in projected_column_names {
-        if let Some(&(file_idx, _)) = column_source.get(col_name) {
-            if let Some(concat_batch) = file_concat.get(&file_idx) {
-                if let Ok(col_idx) = concat_batch.schema().index_of(col_name) {
-                    columns.push(concat_batch.column(col_idx).clone());
-                    schema_fields.push(concat_batch.schema().field(col_idx).clone());
-                    continue;
+            for (&file_idx, stream) in file_streams.iter_mut() {
+                match stream.next().await {
+                    Some(Ok(batch)) => {
+                        any_data = true;
+                        all_done = false;
+                        file_batches.insert(file_idx, batch);
+                    }
+                    Some(Err(e)) => Err(e)?,
+                    None => {
+                        // This stream is exhausted.
+                    }
                 }
             }
+
+            if !any_data || all_done {
+                break;
+            }
+
+            // Determine row count from any batch in this iteration.
+            let row_count = file_batches
+                .values()
+                .next()
+                .map(|b| b.num_rows())
+                .unwrap_or(0);
+
+            if row_count == 0 {
+                continue;
+            }
+
+            // Assemble merged batch: pick each column from the winning file or fill with nulls.
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> =
+                Vec::with_capacity(column_plan.len());
+            let mut schema_fields: Vec<ArrowField> = Vec::with_capacity(column_plan.len());
+
+            for (file_idx_opt, col_name) in &column_plan {
+                if let Some(file_idx) = file_idx_opt {
+                    if let Some(batch) = file_batches.get(file_idx) {
+                        if let Ok(col_idx) = batch.schema().index_of(col_name) {
+                            columns.push(batch.column(col_idx).clone());
+                            schema_fields.push(batch.schema().field(col_idx).clone());
+                            continue;
+                        }
+                    }
+                }
+                // Column not found — fill with nulls.
+                let null_type = file_batches
+                    .values()
+                    .find_map(|b| b.schema().index_of(col_name).ok().map(|i| b.schema().field(i).data_type().clone()))
+                    .unwrap_or(ArrowDataType::Utf8);
+                let null_array = new_null_array(&null_type, row_count);
+                schema_fields.push(ArrowField::new(col_name, null_type, true));
+                columns.push(null_array);
+            }
+
+            let schema = Arc::new(ArrowSchema::new(schema_fields));
+            let merged = RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to build merged RecordBatch: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            yield merged;
         }
-        // Column not found in any file — fill with nulls.
-        let null_type =
-            find_column_type_from_batches(&file_concat, col_name).unwrap_or(ArrowDataType::Utf8);
-        let null_array = new_null_array(&null_type, row_count);
-        schema_fields.push(ArrowField::new(col_name, null_type, true));
-        columns.push(null_array);
     }
-
-    let schema = Arc::new(ArrowSchema::new(schema_fields));
-    let merged = RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
-        message: format!("Failed to build merged RecordBatch: {e}"),
-        source: Some(Box::new(e)),
-    })?;
-
-    Ok(vec![merged])
-}
-
-/// Find the Arrow data type for a column name from any available concatenated batch.
-fn find_column_type_from_batches(
-    file_concat: &HashMap<usize, RecordBatch>,
-    col_name: &str,
-) -> Option<ArrowDataType> {
-    for batch in file_concat.values() {
-        if let Ok(idx) = batch.schema().index_of(col_name) {
-            return Some(batch.schema().field(idx).data_type().clone());
-        }
-    }
-    None
+    .boxed())
 }
 
 /// Builds a Parquet [RowSelection] from deletion vector.

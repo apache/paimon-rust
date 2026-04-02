@@ -26,7 +26,7 @@ use crate::spec::{
     eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataFileMeta, FileKind,
     IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
 };
-use crate::table::bin_pack::split_for_batch;
+use crate::table::bin_pack::{pack_for_ordered, split_for_batch};
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
 use crate::Error;
@@ -166,14 +166,14 @@ fn partition_matches_predicate(
     }
 }
 
-/// Splits data files into groups by overlapping `first_row_id` ranges for data evolution.
+/// Groups data files by overlapping `row_id_range` for data evolution.
 ///
-/// Files are sorted by `(first_row_id, -max_sequence_number)`. Files with the same
-/// `first_row_id` are grouped together (they contain different columns for the same rows).
+/// Files are sorted by `(first_row_id, -max_sequence_number)`. Files whose row ID ranges
+/// overlap are merged into the same group (they contain different columns for the same rows).
 /// Files without `first_row_id` become their own group.
 ///
-/// Reference: [DataEvolutionSplitRead._split_by_row_id](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/split_read.py)
-fn split_by_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
+fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
     files.sort_by(|a, b| {
         let a_row_id = a.first_row_id.unwrap_or(i64::MIN);
         let b_row_id = b.first_row_id.unwrap_or(i64::MIN);
@@ -184,27 +184,32 @@ fn split_by_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
 
     let mut result: Vec<Vec<DataFileMeta>> = Vec::new();
     let mut current_group: Vec<DataFileMeta> = Vec::new();
-    let mut last_row_id: Option<i64> = None;
+    // Track the end of the current merged row_id range.
+    let mut current_range_end: i64 = i64::MIN;
 
     for file in files {
-        match file.first_row_id {
+        match file.row_id_range() {
             None => {
                 // Files without first_row_id become their own group.
                 if !current_group.is_empty() {
                     result.push(std::mem::take(&mut current_group));
-                    last_row_id = None;
+                    current_range_end = i64::MIN;
                 }
                 result.push(vec![file]);
             }
-            Some(fid) => {
-                if last_row_id != Some(fid) {
-                    // New row ID range — start a new group.
-                    if !current_group.is_empty() {
-                        result.push(std::mem::take(&mut current_group));
+            Some((start, end)) => {
+                if current_group.is_empty() || start <= current_range_end {
+                    // Overlaps with current range — merge into current group.
+                    if end > current_range_end {
+                        current_range_end = end;
                     }
-                    last_row_id = Some(fid);
+                    current_group.push(file);
+                } else {
+                    // No overlap — start a new group.
+                    result.push(std::mem::take(&mut current_group));
+                    current_range_end = end;
+                    current_group.push(file);
                 }
-                current_group.push(file);
             }
         }
     }
@@ -212,6 +217,39 @@ fn split_by_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
         result.push(current_group);
     }
     result
+}
+
+/// Packs row-id groups into splits using bin packing, respecting `target_split_size` and
+/// `open_file_cost`. Each group is treated as an atomic unit (files sharing the same row IDs
+/// must stay together). A split is `raw_convertible` only if every group in it has exactly
+/// one file (no column-wise merge needed).
+///
+/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
+fn pack_data_evolution_splits(
+    file_groups: Vec<Vec<DataFileMeta>>,
+    target_split_size: i64,
+    open_file_cost: i64,
+) -> Vec<(Vec<DataFileMeta>, bool)> {
+    use std::cmp;
+
+    // Weight of a group = sum of max(file_size, open_file_cost) for each file.
+    let group_weight = |group: &Vec<DataFileMeta>| -> i64 {
+        group
+            .iter()
+            .map(|f| cmp::max(f.file_size, open_file_cost))
+            .sum()
+    };
+
+    let packed = pack_for_ordered(file_groups, group_weight, target_split_size);
+
+    packed
+        .into_iter()
+        .map(|groups| {
+            let raw_convertible = groups.iter().all(|g| g.len() == 1);
+            let files: Vec<DataFileMeta> = groups.into_iter().flatten().collect();
+            (files, raw_convertible)
+        })
+        .collect()
 }
 
 /// TableScan for full table scan (no incremental, no predicate).
@@ -371,9 +409,10 @@ impl<'a> TableScan<'a> {
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
             if data_evolution_enabled {
-                let file_groups = split_by_row_id(data_files);
-                for file_group in file_groups {
-                    let raw_convertible = file_group.len() == 1;
+                let row_id_groups = group_by_overlapping_row_id(data_files);
+                let packed_splits =
+                    pack_data_evolution_splits(row_id_groups, target_split_size, open_file_cost);
+                for (file_group, raw_convertible) in packed_splits {
                     let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                         file_group
                             .iter()
