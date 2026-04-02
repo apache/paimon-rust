@@ -17,6 +17,7 @@
 
 //! Authentication provider factory.
 
+use super::dlf_signer::{DLFDefaultSigner, DLFOpenApiSigner};
 use crate::api::auth::dlf_provider::DLFTokenLoaderFactory;
 use crate::api::auth::{BearerTokenAuthProvider, DLFAuthProvider, DLFToken};
 use crate::api::AuthProvider;
@@ -28,10 +29,6 @@ use regex::Regex;
 pub struct DLFAuthProviderFactory;
 
 impl DLFAuthProviderFactory {
-    /// OpenAPI identifier.
-    pub const OPENAPI_IDENTIFIER: &'static str = "openapi";
-    /// Default identifier.
-    pub const DEFAULT_IDENTIFIER: &'static str = "default";
     /// Region pattern for parsing from URI.
     const REGION_PATTERN: &'static str = r"(?:pre-)?([a-z]+-[a-z]+(?:-\d+)?)";
 
@@ -57,10 +54,10 @@ impl DLFAuthProviderFactory {
             let host = host.split(':').next().unwrap_or("");
 
             if host.starts_with("dlfnext") {
-                return Self::OPENAPI_IDENTIFIER;
+                return DLFOpenApiSigner::IDENTIFIER;
             }
         }
-        Self::DEFAULT_IDENTIFIER
+        DLFDefaultSigner::IDENTIFIER
     }
 
     /// Create a DLF authentication provider from options.
@@ -94,7 +91,7 @@ impl DLFAuthProviderFactory {
         let signing_algorithm = options
             .get(CatalogOptions::DLF_SIGNING_ALGORITHM)
             .map(|s| s.as_str())
-            .filter(|s| *s != "default")
+            .filter(|s| *s != DLFDefaultSigner::IDENTIFIER)
             .unwrap_or_else(|| Self::parse_signing_algo_from_uri(Some(&uri)))
             .to_string();
 
@@ -239,11 +236,17 @@ mod tests {
         let algo = DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(
             "http://dlfnext.cn-hangzhou.aliyuncs.com",
         ));
-        assert_eq!(algo, "openapi");
+        assert_eq!(algo, DLFOpenApiSigner::IDENTIFIER);
 
         let algo = DLFAuthProviderFactory::parse_signing_algo_from_uri(Some(
             "http://cn-hangzhou-vpc.dlf.aliyuncs.com",
         ));
-        assert_eq!(algo, "default");
+        assert_eq!(algo, DLFDefaultSigner::IDENTIFIER);
+    }
+
+    #[test]
+    fn test_parse_signing_algo_from_uri_defaults_when_missing() {
+        let algo = DLFAuthProviderFactory::parse_signing_algo_from_uri(None);
+        assert_eq!(algo, DLFDefaultSigner::IDENTIFIER);
     }
 }
