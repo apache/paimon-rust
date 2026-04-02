@@ -320,9 +320,11 @@ async fn test_missing_database_returns_no_schema() {
 // ======================= Time Travel Tests =======================
 
 /// Helper: create a SessionContext with catalog + relation planner for time travel.
+/// Uses BigQuery dialect to enable `FOR SYSTEM_TIME AS OF` syntax.
 async fn create_time_travel_context() -> SessionContext {
     let catalog = create_catalog();
-    let ctx = SessionContext::new();
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "BigQuery");
+    let ctx = SessionContext::new_with_config(config);
     ctx.register_catalog(
         "paimon",
         Arc::new(PaimonCatalogProvider::new(Arc::new(catalog))),
