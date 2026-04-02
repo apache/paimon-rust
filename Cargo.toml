@@ -22,7 +22,7 @@ members = ["crates/paimon", "crates/integration_tests", "bindings/c", "crates/in
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-homepage = "https://paimon.apache.org/"
+homepage = "https://paimon.apache.org/docs/rust/"
 repository = "https://github.com/apache/paimon-rust"
 license = "Apache-2.0"
 rust-version = "1.86.0"

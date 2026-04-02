@@ -45,7 +45,8 @@ This is a pure Rust project, so only `cargo` is needed. Here are some common com
 2. Open a pull request on the project's GitHub page. Provide a clear description of your changes and why they are necessary.
 3. Wait for reviews and address any feedback. Once the pull request is approved and merged, your changes will be part of the project.
 
-### Read the design docs 
-For a deeper understanding of the project, read the design documentation available on our [Paimon official website](https://paimon.apache.org/).
+### Read the design docs
+
+For a deeper understanding of the project, read the design documentation available on our [Paimon Rust](https://paimon.apache.org/docs/rust/).
 
 Thank you for contributing to this project! 😊

@@ -19,7 +19,7 @@
 
 github:
   description: "Apache Paimon Rust The rust implementation of Apache Paimon."
-  homepage: https://paimon.apache.org/
+  homepage: https://paimon.apache.org/docs/rust/
   labels:
     - rust
     - paimon
