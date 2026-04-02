@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use chrono::TimeZone;
 use datafusion::arrow::array::{Int32Array, StringArray};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
