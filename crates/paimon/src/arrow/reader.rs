@@ -20,8 +20,8 @@ use crate::io::{FileIO, FileRead, FileStatus};
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
-use arrow_array::{new_null_array, RecordBatch};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::RecordBatch;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 
 use async_stream::try_stream;
@@ -178,7 +178,6 @@ impl ArrowReader {
                         &split,
                         &projected_column_names,
                         &table_field_names,
-                        &read_type,
                         batch_size,
                     )?;
                     while let Some(batch) = merge_stream.next().await {
@@ -271,17 +270,17 @@ fn read_single_file_stream(
     .boxed())
 }
 
-/// Merge multiple files column-wise for data evolution, streaming one batch at a time.
+/// Merge multiple files column-wise for data evolution.
 ///
-/// Like Java's `DataEvolutionFileReader`: opens all file readers simultaneously, reads one
-/// batch from each per iteration, assembles the output by picking columns from the winning
-/// reader, and yields the merged batch lazily. No full materialization needed.
+/// Like Java's `ForceSingleBatchReader`: reads all batches from each file and concatenates
+/// them into a single batch per file, ensuring row alignment. Then assembles the output by
+/// picking each projected column from the winning file (highest `max_sequence_number`).
+/// Columns not found in any file are skipped.
 fn merge_files_by_columns(
     file_io: &FileIO,
     split: &DataSplit,
     projected_column_names: &[String],
     table_field_names: &[String],
-    read_type: &[DataField],
     batch_size: Option<usize>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let data_files = split.data_files();
@@ -323,22 +322,11 @@ fn merge_files_by_columns(
     }
 
     // For each projected column, record (file_index, column_name) for assembly.
-    // If no file provides it, we'll fill with nulls.
     let column_plan: Vec<(Option<usize>, String)> = projected_column_names
         .iter()
         .map(|col_name| {
             let file_idx = column_source.get(col_name).map(|&(idx, _)| idx);
             (file_idx, col_name.clone())
-        })
-        .collect();
-
-    // Build a map from column name to Arrow type from read_type for null column creation.
-    let read_type_map: HashMap<String, ArrowDataType> = read_type
-        .iter()
-        .filter_map(|f| {
-            super::paimon_type_to_arrow(f.data_type())
-                .ok()
-                .map(|t| (f.name().to_string(), t))
         })
         .collect();
 
@@ -399,18 +387,9 @@ fn merge_files_by_columns(
                         if let Ok(col_idx) = batch.schema().index_of(col_name) {
                             columns.push(batch.column(col_idx).clone());
                             schema_fields.push(batch.schema().field(col_idx).clone());
-                            continue;
                         }
                     }
                 }
-                // Column not found in any file — fill with nulls using type from read_type.
-                let null_type = read_type_map
-                    .get(col_name)
-                    .cloned()
-                    .unwrap_or(ArrowDataType::Utf8);
-                let null_array = new_null_array(&null_type, row_count);
-                schema_fields.push(ArrowField::new(col_name, null_type, true));
-                columns.push(null_array);
             }
 
             let schema = Arc::new(ArrowSchema::new(schema_fields));
