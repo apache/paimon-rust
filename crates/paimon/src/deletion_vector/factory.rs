@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use crate::deletion_vector::core::DeletionVector;
-use crate::io::{FileIO, FileRead};
+use crate::io::{FileIOProvider, FileRead};
 use crate::spec::DataFileMeta;
 use crate::Result;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ impl DeletionVectorFactory {
     /// Same as Java's `DeletionVector.factory(fileIO, files, deletionFiles)`: for each file that
     /// has a DeletionFile, reads path/offset/length and loads the DV.
     pub async fn new(
-        file_io: &FileIO,
+        file_io: &Arc<dyn FileIOProvider>,
         data_files: &[DataFileMeta],
         data_deletion_files: Option<&[Option<crate::DeletionFile>]>,
     ) -> Result<Self> {
@@ -65,8 +65,8 @@ impl DeletionVectorFactory {
 
     /// Read a single DeletionVector from storage using DeletionFile (path/offset/length).
     /// Same as Java's DeletionVector.read(FileIO, DeletionFile).
-    async fn read(file_io: &FileIO, df: &crate::DeletionFile) -> Result<DeletionVector> {
-        let input = file_io.new_input(df.path())?;
+    async fn read(file_io: &Arc<dyn FileIOProvider>, df: &crate::DeletionFile) -> Result<DeletionVector> {
+        let input = file_io.new_input(df.path()).await?;
         let reader = input.reader().await?;
         let offset = df.offset() as u64;
         let len = df.length() as u64;

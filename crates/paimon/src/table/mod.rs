@@ -23,6 +23,8 @@ mod snapshot_manager;
 mod source;
 mod table_scan;
 
+use std::sync::Arc;
+
 use crate::Result;
 use arrow_array::RecordBatch;
 use futures::stream::BoxStream;
@@ -32,13 +34,13 @@ pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Pla
 pub use table_scan::TableScan;
 
 use crate::catalog::Identifier;
-use crate::io::FileIO;
+use crate::io::FileIOProvider;
 use crate::spec::TableSchema;
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct Table {
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
     identifier: Identifier,
     location: String,
     schema: TableSchema,
@@ -48,7 +50,7 @@ pub struct Table {
 impl Table {
     /// Create a new table.
     pub fn new(
-        file_io: FileIO,
+        file_io: Arc<dyn FileIOProvider>,
         identifier: Identifier,
         location: String,
         schema: TableSchema,
@@ -76,8 +78,8 @@ impl Table {
         &self.schema
     }
 
-    /// Get the FileIO instance for this table.
-    pub fn file_io(&self) -> &FileIO {
+    /// Get the FileIOProvider instance for this table.
+    pub fn file_io(&self) -> &Arc<dyn FileIOProvider> {
         &self.file_io
     }
 

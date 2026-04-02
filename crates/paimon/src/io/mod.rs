@@ -18,6 +18,9 @@
 mod file_io;
 pub use file_io::*;
 
+mod file_io_provider;
+pub use file_io_provider::*;
+
 mod storage;
 pub use storage::*;
 

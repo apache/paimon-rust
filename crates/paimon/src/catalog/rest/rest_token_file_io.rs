@@ -20,9 +20,17 @@
 //! This module provides a FileIO wrapper that supports getting data access
 //! tokens from a REST Server. It handles token caching, expiration detection,
 //! and automatic refresh.
+//!
+//! Unlike the previous implementation that only refreshed tokens during
+//! `build_file_io()`, this implementation implements `FileIOProvider` and
+//! checks token validity before each file operation, matching the Java
+//! implementation behavior.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Duration;
 
+use moka::future::Cache;
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::api::rest_api::RESTApi;
@@ -30,7 +38,7 @@ use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::storage_oss::OSS_ENDPOINT;
-use crate::io::FileIO;
+use crate::io::{FileIO, FileIOProvider, FileStatus, InputFile, OutputFile};
 use crate::Result;
 
 use super::rest_token::RESTToken;
@@ -38,12 +46,37 @@ use super::rest_token::RESTToken;
 /// Safe time margin (in milliseconds) before token expiration to trigger refresh.
 const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 
+/// Maximum number of entries in the global FileIO cache.
+const FILE_IO_CACHE_MAX_CAPACITY: u64 = 1000;
+/// Time-to-live for cache entries in seconds (10 hours).
+const FILE_IO_CACHE_TTL_SECS: u64 = 10 * 60 * 60;
+
+/// Global static FileIO cache, similar to Java's Caffeine cache.
+///
+/// This cache stores FileIO instances keyed by their corresponding RESTToken.
+/// Features:
+/// - max_capacity: 1000 entries
+/// - time_to_live: 10 hours (entries expire after this duration)
+/// - thread-safe via moka's internal synchronization
+static FILE_IO_CACHE: OnceLock<Cache<RESTToken, FileIO>> = OnceLock::new();
+
+/// Get the global FileIO cache, initializing it if necessary.
+fn get_file_io_cache() -> &'static Cache<RESTToken, FileIO> {
+    FILE_IO_CACHE.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(FILE_IO_CACHE_MAX_CAPACITY)
+            .time_to_live(Duration::from_secs(FILE_IO_CACHE_TTL_SECS))
+            .build()
+    })
+}
+
 /// A FileIO wrapper that supports getting data access tokens from a REST Server.
 ///
 /// This struct handles:
 /// - Token caching with expiration detection
 /// - Automatic token refresh via `RESTApi::load_table_token`
 /// - Merging token credentials into catalog options to build the underlying `FileIO`
+/// - FileIO caching based on token to avoid rebuilding FileIO unnecessarily
 pub struct RESTTokenFileIO {
     /// Table identifier for token requests.
     identifier: Identifier,
@@ -56,6 +89,15 @@ pub struct RESTTokenFileIO {
     api: OnceCell<RESTApi>,
     /// Cached token with RwLock for concurrent access.
     token: RwLock<Option<RESTToken>>,
+}
+
+impl std::fmt::Debug for RESTTokenFileIO {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RESTTokenFileIO")
+            .field("identifier", &self.identifier)
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl RESTTokenFileIO {
@@ -75,36 +117,46 @@ impl RESTTokenFileIO {
         }
     }
 
-    /// Build a `FileIO` instance with the current token merged into options.
+    /// Get or create a valid FileIO instance.
     ///
     /// This method:
     /// 1. Refreshes the token if expired or not yet obtained.
-    /// 2. Merges token credentials into catalog options.
-    /// 3. Builds a `FileIO` from the merged options.
-    ///
-    /// This method builds a FileIO with the current token,
-    /// which can be passed to `Table::new`. If the token expires, a new
-    /// `get_table` call is needed.
-    pub async fn build_file_io(&self) -> Result<FileIO> {
-        // Ensure token is fresh
+    /// 2. Returns cached FileIO from global cache if token exists.
+    /// 3. Otherwise creates a new FileIO with the new token and caches it.
+    async fn get_file_io(&self) -> Result<FileIO> {
+        // Ensure token is fresh (this will update self.token if needed)
         self.try_to_refresh_token().await?;
 
+        // Get current token
         let token_guard = self.token.read().await;
-        match token_guard.as_ref() {
-            Some(token) => {
-                // Merge catalog options (base) with token credentials (override)
-                let merged_props =
-                    RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
-                // Build FileIO with merged properties
-                let mut builder = FileIO::from_path(&self.path)?;
-                builder = builder.with_props(merged_props);
-                builder.build()
-            }
-            None => {
-                // No token available, build FileIO from path only
-                FileIO::from_path(&self.path)?.build()
-            }
+        let current_token = token_guard
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "Token should be available after refresh".to_string(),
+                source: None,
+            })?
+            .clone();
+
+        // Drop the read lock before checking cache
+        drop(token_guard);
+
+        // Check global cache first
+        let cache = get_file_io_cache();
+        if let Some(file_io) = cache.get(&current_token).await {
+            return Ok(file_io);
         }
+
+        // Need to create new FileIO with current token
+        let merged_props =
+            RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&current_token.token));
+        let mut builder = FileIO::from_path(&self.path)?;
+        builder = builder.with_props(merged_props);
+        let file_io = builder.build()?;
+
+        // Store in global cache
+        cache.insert(current_token, file_io.clone()).await;
+
+        Ok(file_io)
     }
 
     /// Try to refresh the token if it is expired or not yet obtained.
@@ -189,5 +241,53 @@ impl RESTTokenFileIO {
             }
         }
         merged
+    }
+}
+
+#[async_trait::async_trait]
+impl FileIOProvider for RESTTokenFileIO {
+    async fn new_input(&self, path: &str) -> Result<InputFile> {
+        let file_io = self.get_file_io().await?;
+        file_io.new_input(path)
+    }
+
+    async fn new_output(&self, path: &str) -> Result<OutputFile> {
+        let file_io = self.get_file_io().await?;
+        file_io.new_output(path)
+    }
+
+    async fn get_status(&self, path: &str) -> Result<FileStatus> {
+        let file_io = self.get_file_io().await?;
+        file_io.get_status(path).await
+    }
+
+    async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
+        let file_io = self.get_file_io().await?;
+        file_io.list_status(path).await
+    }
+
+    async fn exists(&self, path: &str) -> Result<bool> {
+        let file_io = self.get_file_io().await?;
+        file_io.exists(path).await
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<()> {
+        let file_io = self.get_file_io().await?;
+        file_io.delete_file(path).await
+    }
+
+    async fn delete_dir(&self, path: &str) -> Result<()> {
+        let file_io = self.get_file_io().await?;
+        file_io.delete_dir(path).await
+    }
+
+    async fn mkdirs(&self, path: &str) -> Result<()> {
+        let file_io = self.get_file_io().await?;
+        file_io.mkdirs(path).await
+    }
+
+    async fn rename(&self, src: &str, dst: &str) -> Result<()> {
+        let file_io = self.get_file_io().await?;
+        file_io.rename(src, dst).await
     }
 }

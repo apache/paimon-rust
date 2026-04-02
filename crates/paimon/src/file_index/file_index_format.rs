@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -101,8 +102,8 @@ pub async fn write_column_indexes(
     path: &str,
     indexes: HashMap<String, HashMap<String, Bytes>>,
 ) -> crate::Result<OutputFile> {
-    let file_io = FileIO::from_path(path)?.build()?;
-    let output = file_io.new_output(path)?;
+    let file_io = Arc::new(FileIO::from_path(path)?.build()?) as Arc<dyn crate::io::FileIOProvider>;
+    let output = file_io.new_output(path).await?;
     let mut writer = output.writer().await?;
 
     let mut body_info: HashMap<String, HashMap<String, IndexInfo>> = HashMap::new();

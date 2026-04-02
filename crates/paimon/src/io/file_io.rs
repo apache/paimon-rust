@@ -66,10 +66,13 @@ impl FileIO {
         Ok(FileIOBuilder::new(url.scheme()))
     }
 
-    /// Create a new input file to read data.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
-    pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+}
+// Implement FileIOProvider for FileIO
+use crate::io::FileIOProvider;
+
+#[async_trait::async_trait]
+impl FileIOProvider for FileIO {
+    async fn new_input(&self, path: &str) -> Result<InputFile> {
         let (op, relative_path) = self.storage.create(path)?;
         let path = path.to_string();
         let relative_path_pos = path.len() - relative_path.len();
@@ -80,10 +83,7 @@ impl FileIO {
         })
     }
 
-    /// Create a new output file to write data.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
-    pub fn new_output(&self, path: &str) -> Result<OutputFile> {
+    async fn new_output(&self, path: &str) -> Result<OutputFile> {
         let (op, relative_path) = self.storage.create(path)?;
         let path = path.to_string();
         let relative_path_pos = path.len() - relative_path.len();
@@ -94,10 +94,7 @@ impl FileIO {
         })
     }
 
-    /// Return a file status object that represents the path.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
-    pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
+    async fn get_status(&self, path: &str) -> Result<FileStatus> {
         let (op, relative_path) = self.storage.create(path)?;
         let meta = op.stat(relative_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to get file status for '{path}'"),
@@ -113,16 +110,9 @@ impl FileIO {
         })
     }
 
-    /// List the statuses of the files/directories in the given path if the path is a directory.
-    ///
-    /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L105>
-    ///
-    /// FIXME: how to handle large dir? Better to return a stream instead?
-    pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
+    async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
         let (op, relative_path) = self.storage.create(path)?;
         let base_path = &path[..path.len() - relative_path.len()];
-        // Opendal list() expects directory path to end with `/`.
-        // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path);
 
         let entries = op.list_with(&list_path).await.context(IoUnexpectedSnafu {
@@ -150,79 +140,52 @@ impl FileIO {
         Ok(statuses)
     }
 
-    /// Check if exists.
-    ///
-    /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
-    pub async fn exists(&self, path: &str) -> Result<bool> {
+    async fn exists(&self, path: &str) -> Result<bool> {
         let (op, relative_path) = self.storage.create(path)?;
-
         op.exists(relative_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to check existence of '{path}'"),
         })
     }
 
-    /// Delete a file.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    async fn delete_file(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
-
         op.delete(relative_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to delete file '{path}'"),
         })?;
-
         Ok(())
     }
 
-    /// Delete a dir recursively.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
-    pub async fn delete_dir(&self, path: &str) -> Result<()> {
+    async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
-
         op.remove_all(relative_path)
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete directory '{path}'"),
             })?;
-
         Ok(())
     }
 
-    /// Make the given file and all non-existent parents into directories.
-    ///
-    /// Has the semantics of Unix 'mkdir -p'. Existence of the directory hierarchy is not an error.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L150>
-    pub async fn mkdirs(&self, path: &str) -> Result<()> {
+    async fn mkdirs(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
-        // Opendal create_dir expects the path to end with `/` to indicate a directory.
         let dir_path = normalize_root(relative_path);
         op.create_dir(&dir_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to create directory '{path}'"),
         })?;
-
         Ok(())
     }
 
-    /// Renames the file/directory src to dst.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
-    pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
+    async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let (op_src, relative_path_src) = self.storage.create(src)?;
         let (_, relative_path_dst) = self.storage.create(dst)?;
-
         op_src
             .rename(relative_path_src, relative_path_dst)
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to rename '{src}' to '{dst}'"),
             })?;
-
         Ok(())
     }
 }
-
 #[derive(Debug)]
 pub struct FileIOBuilder {
     scheme_str: Option<String>,

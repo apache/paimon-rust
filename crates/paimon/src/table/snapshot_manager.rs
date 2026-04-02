@@ -21,9 +21,10 @@
 // TODO: remove when SnapshotManager is used (e.g. from Table or source planning).
 #![allow(dead_code)]
 
-use crate::io::FileIO;
+use crate::io::FileIOProvider;
 use crate::spec::Snapshot;
 use std::str;
+use std::sync::Arc;
 
 const SNAPSHOT_DIR: &str = "snapshot";
 const LATEST_SNAPSHOT_FILE: &str = "LATEST";
@@ -33,13 +34,13 @@ const LATEST_SNAPSHOT_FILE: &str = "LATEST";
 /// Reference: [org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 #[derive(Debug, Clone)]
 pub struct SnapshotManager {
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
     table_path: String,
 }
 
 impl SnapshotManager {
     /// Create a snapshot manager for the given table path and FileIO.
-    pub fn new(file_io: FileIO, table_path: String) -> Self {
+    pub fn new(file_io: Arc<dyn FileIOProvider>, table_path: String) -> Self {
         Self {
             file_io,
             table_path,
@@ -66,7 +67,7 @@ impl SnapshotManager {
     pub async fn get_latest_snapshot(&self) -> crate::Result<Option<Snapshot>> {
         // todo: consider snapshot loader to load snapshot from catalog
         let latest_path = self.latest_file_path();
-        let input = self.file_io.new_input(&latest_path)?;
+        let input = self.file_io.new_input(&latest_path).await?;
         if !input.exists().await? {
             // todo: may need to list directory and find the latest snapshot
             return Ok(None);
@@ -84,7 +85,7 @@ impl SnapshotManager {
                 source: Some(Box::new(e)),
             })?;
         let snapshot_path = self.snapshot_path(snapshot_id);
-        let snap_input = self.file_io.new_input(&snapshot_path)?;
+        let snap_input = self.file_io.new_input(&snapshot_path).await?;
         if !snap_input.exists().await? {
             return Err(crate::Error::DataInvalid {
                 message: format!(

@@ -21,6 +21,7 @@
 //! a Paimon REST catalog server for database and table CRUD operations.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -30,7 +31,7 @@ use crate::api::PagedList;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::FileIO;
+use crate::io::{FileIO, FileIOProvider};
 use crate::spec::{Schema, SchemaChange, TableSchema};
 use crate::table::Table;
 use crate::Result;
@@ -232,16 +233,27 @@ impl Catalog for RESTCatalog {
             source: None,
         })?;
 
-        // Build FileIO based on data_token_enabled and is_external
-        // TODO Support token cache and direct oss access
-        let file_io = if self.data_token_enabled && !is_external {
-            // Use RESTTokenFileIO to get token-based FileIO
-            let token_file_io =
-                RESTTokenFileIO::new(identifier.clone(), table_path.clone(), self.options.clone());
-            token_file_io.build_file_io().await?
+        // External tables are not supported
+        if is_external {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "External table {} is not supported",
+                    identifier.full_name()
+                ),
+            });
+        }
+
+        // Build FileIOProvider based on data_token_enabled and is_external
+        let file_io: Arc<dyn FileIOProvider> = if self.data_token_enabled && !is_external {
+            // Use RESTTokenFileIO which will refresh token on each operation
+            Arc::new(RESTTokenFileIO::new(
+                identifier.clone(),
+                table_path.clone(),
+                self.options.clone(),
+            ))
         } else {
             // Use standard FileIO from path
-            FileIO::from_path(&table_path)?.build()?
+            Arc::new(FileIO::from_path(&table_path)?.build()?)
         };
 
         Ok(Table::new(

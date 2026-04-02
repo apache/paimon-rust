@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
-use crate::io::{FileIO, FileRead, FileStatus};
+use crate::io::{FileIOProvider, FileRead, FileStatus};
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
@@ -40,12 +40,12 @@ use tokio::try_join;
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
 }
 
 impl ArrowReaderBuilder {
     /// Create a new ArrowReaderBuilder
-    pub(crate) fn new(file_io: FileIO) -> Self {
+    pub(crate) fn new(file_io: Arc<dyn FileIOProvider>) -> Self {
         ArrowReaderBuilder {
             batch_size: None,
             file_io,
@@ -67,7 +67,7 @@ impl ArrowReaderBuilder {
 #[derive(Clone)]
 pub struct ArrowReader {
     batch_size: Option<usize>,
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
     read_type: Vec<DataField>,
 }
 
@@ -209,7 +209,7 @@ fn read_single_file_stream(
             })?
         }
 
-        let parquet_file = file_io.new_input(&path_to_read)?;
+        let parquet_file = file_io.new_input(&path_to_read).await?;
         let (parquet_metadata, parquet_reader) =
             try_join!(parquet_file.metadata(), parquet_file.reader())?;
         let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::io::FileIO;
+use std::sync::Arc;
+
+use crate::io::FileIOProvider;
 use crate::spec::manifest_entry::ManifestEntry;
 use apache_avro::types::Value;
 use apache_avro::{from_value, Reader};
@@ -31,31 +33,28 @@ use crate::Result;
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFile.java>
 pub struct Manifest;
 
-#[allow(dead_code)]
 impl Manifest {
-    /// Read manifest entries from a file.
+    /// Read a manifest file and return the entries.
     ///
     /// # Arguments
-    /// * `file_io` - FileIO instance for reading files
+    /// * `file_io` - FileIO provider for reading files
     /// * `path` - Path to the manifest file
     ///
     /// # Returns
     /// A vector of ManifestEntry records
-    pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<ManifestEntry>> {
-        let input_file = file_io.new_input(path)?;
-
+    pub async fn read(file_io: &Arc<dyn FileIOProvider>, path: &str) -> Result<Vec<ManifestEntry>> {
+        let input_file = file_io.new_input(path).await?;
         if !input_file.exists().await? {
             return Ok(Vec::new());
         }
-
-        let content = input_file.read().await?;
-        Self::read_from_bytes(&content)
+        let bytes = input_file.read().await?;
+        Self::read_from_bytes(&bytes)
     }
 
-    /// Read manifest entries from bytes.
+    /// Read manifest entries from Avro-encoded bytes.
     ///
     /// # Arguments
-    /// * `bytes` - Avro-encoded manifest file content
+    /// * `bytes` - Raw bytes of the manifest file
     ///
     /// # Returns
     /// A vector of ManifestEntry records
@@ -83,7 +82,7 @@ mod tests {
         let path =
             workdir.join("tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0");
 
-        let file_io = FileIO::from_url("file://").unwrap().build().unwrap();
+        let file_io: Arc<dyn FileIOProvider> = Arc::new(FileIO::from_url("file://").unwrap().build().unwrap());
         let entries = Manifest::read(&file_io, path.to_str().unwrap())
             .await
             .unwrap();

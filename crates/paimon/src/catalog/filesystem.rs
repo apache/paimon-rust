@@ -20,11 +20,12 @@
 //! Reference: [org.apache.paimon.catalog.FileSystemCatalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/FileSystemCatalog.java)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
+use crate::io::{FileIO, FileIOProvider};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
-use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
 use crate::table::Table;
 use async_trait::async_trait;
@@ -63,7 +64,7 @@ fn make_path(parent: &str, child: &str) -> String {
 /// Reference: [org.apache.paimon.catalog.FileSystemCatalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/FileSystemCatalog.java)
 #[derive(Clone, Debug)]
 pub struct FileSystemCatalog {
-    file_io: FileIO,
+    file_io: Arc<dyn FileIOProvider>,
     warehouse: String,
 }
 
@@ -106,7 +107,7 @@ impl FileSystemCatalog {
             .with_props(options.to_map().iter())
             .build()?;
 
-        Ok(Self { file_io, warehouse })
+        Ok(Self { file_io: Arc::new(file_io), warehouse })
     }
 
     /// Get the warehouse path.
@@ -115,7 +116,7 @@ impl FileSystemCatalog {
     }
 
     /// Get the FileIO instance.
-    pub fn file_io(&self) -> &FileIO {
+    pub fn file_io(&self) -> &Arc<dyn FileIOProvider> {
         &self.file_io
     }
 
@@ -187,7 +188,7 @@ impl FileSystemCatalog {
 
         if let Some(schema_id) = latest_schema_id {
             let schema_path = self.schema_file_path(table_path, schema_id);
-            let input_file = self.file_io.new_input(&schema_path)?;
+            let input_file = self.file_io.new_input(&schema_path).await?;
             let content = input_file.read().await?;
             let schema: TableSchema =
                 serde_json::from_slice(&content).map_err(|e| Error::DataInvalid {
@@ -205,7 +206,7 @@ impl FileSystemCatalog {
         let schema_dir = self.schema_dir_path(table_path);
         self.file_io.mkdirs(&schema_dir).await?;
         let schema_path = self.schema_file_path(table_path, schema.id());
-        let output_file = self.file_io.new_output(&schema_path)?;
+        let output_file = self.file_io.new_output(&schema_path).await?;
         let content =
             Bytes::from(
                 serde_json::to_string(schema).map_err(|e| Error::DataInvalid {

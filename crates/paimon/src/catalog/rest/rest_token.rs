@@ -18,9 +18,10 @@
 //! REST token for data access in Apache Paimon.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 /// Token for REST data access, containing credentials and expiration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RESTToken {
     /// Token key-value pairs (e.g. access_key_id, access_key_secret, etc.)
     pub token: HashMap<String, String>,
@@ -34,6 +35,24 @@ impl RESTToken {
         Self {
             token,
             expire_at_millis,
+        }
+    }
+}
+
+/// Manual implementation of Hash for RESTToken.
+/// HashMap doesn't implement Hash, so we hash the sorted key-value pairs.
+impl Hash for RESTToken {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash expire_at_millis first
+        self.expire_at_millis.hash(state);
+        
+        // Sort keys and hash key-value pairs in order
+        let mut keys: Vec<&String> = self.token.keys().collect();
+        keys.sort();
+        
+        for key in keys {
+            key.hash(state);
+            self.token.get(key).expect("key exists").hash(state);
         }
     }
 }
