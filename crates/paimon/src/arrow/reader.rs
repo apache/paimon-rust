@@ -271,30 +271,6 @@ fn read_single_file_stream(
     .boxed())
 }
 
-/// Wraps a record batch stream to concatenate all batches into a single batch.
-///
-/// Like Java's `ForceSingleBatchReader`: consumes the entire inner stream and yields
-/// one combined batch. Used in data evolution merge to ensure all file readers produce
-/// the same number of rows per iteration, so columns can be safely assembled.
-fn force_single_batch_stream(inner: ArrowRecordBatchStream) -> ArrowRecordBatchStream {
-    try_stream! {
-        let mut inner = inner;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        while let Some(batch) = inner.next().await {
-            batches.push(batch?);
-        }
-        if !batches.is_empty() {
-            let schema = batches[0].schema();
-            let combined = concat_batches(&schema, &batches).map_err(|e| Error::UnexpectedError {
-                message: format!("ForceSingleBatch: failed to concat batches: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-            yield combined;
-        }
-    }
-    .boxed()
-}
-
 /// Merge multiple files column-wise for data evolution, streaming one batch at a time.
 ///
 /// Like Java's `DataEvolutionFileReader`: opens all file readers simultaneously, reads one
@@ -376,12 +352,13 @@ fn merge_files_by_columns(
     let projected_column_names = projected_column_names.to_vec();
 
     Ok(try_stream! {
-        // Open a stream for each file that contributes columns, wrapped to force
-        // a single batch per file (like Java's ForceSingleBatchReader). This ensures
-        // all files produce the same number of rows, so columns align.
+        // Read each file that contributes columns, concat into a single batch per file.
+        // Like Java's ForceSingleBatchReader — ensures all files produce the same number
+        // of rows so columns can be safely assembled. Data is only read when this stream
+        // is polled (try_stream is lazy).
         let mut file_batches: HashMap<usize, RecordBatch> = HashMap::new();
         for &file_idx in &active_file_indices {
-            let inner = read_single_file_stream(
+            let mut stream = read_single_file_stream(
                 file_io.clone(),
                 split.clone(),
                 data_files[file_idx].clone(),
@@ -389,9 +366,17 @@ fn merge_files_by_columns(
                 batch_size,
                 None,
             )?;
-            let mut stream = force_single_batch_stream(inner);
-            if let Some(batch) = stream.next().await {
-                file_batches.insert(file_idx, batch?);
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
+            if !batches.is_empty() {
+                let schema = batches[0].schema();
+                let combined = concat_batches(&schema, &batches).map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to concat batches for file index {file_idx}: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+                file_batches.insert(file_idx, combined);
             }
         }
 

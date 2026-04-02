@@ -448,12 +448,51 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::partition_matches_predicate;
+    use super::{
+        group_by_overlapping_row_id, pack_data_evolution_splits, partition_matches_predicate,
+    };
     use crate::spec::{
-        ArrayType, DataField, DataType, Datum, IntType, Predicate, PredicateBuilder,
-        PredicateOperator, VarCharType,
+        stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum, IntType,
+        Predicate, PredicateBuilder, PredicateOperator, VarCharType,
     };
     use crate::Error;
+    use chrono::{DateTime, Utc};
+
+    /// Helper to build a DataFileMeta with data evolution fields.
+    fn make_evo_file(
+        name: &str,
+        file_size: i64,
+        row_count: i64,
+        max_seq: i64,
+        first_row_id: Option<i64>,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+        }
+    }
+
+    fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|f| f.file_name.as_str()).collect())
+            .collect()
+    }
 
     struct SerializedBinaryRowBuilder {
         arity: i32,
@@ -530,5 +569,164 @@ mod tests {
             matches!(&err, Error::Unsupported { message } if message.contains("extract_datum")),
             "Expected extract_datum unsupported error, got: {err:?}"
         );
+    }
+
+    // ==================== group_by_overlapping_row_id tests ====================
+
+    #[test]
+    fn test_group_by_overlapping_row_id_empty() {
+        let result = group_by_overlapping_row_id(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_no_row_ids() {
+        // Files without first_row_id each become their own group.
+        // Sorted by (i64::MIN, -max_seq), so b(seq=2) before a(seq=1).
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, None),
+            make_evo_file("b", 10, 100, 2, None),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(file_names(&groups), vec![vec!["b"], vec!["a"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_same_range() {
+        // Two files with the same first_row_id and row_count → same range → one group.
+        let files = vec![
+            make_evo_file("a", 10, 100, 2, Some(0)),
+            make_evo_file("b", 10, 100, 1, Some(0)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_overlapping_ranges() {
+        // File a: rows [0, 99], file b: rows [50, 149] → overlapping → one group.
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(50)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_non_overlapping() {
+        // File a: rows [0, 99], file b: rows [100, 199] → no overlap → two groups.
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(100)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(file_names(&groups), vec![vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_mixed() {
+        // a: [0,99], b: [0,99] (overlap), c: None (own group), d: [200,299]
+        // After sort: c(None→MIN) comes first, then b(seq=2), a(seq=1), d.
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(0)),
+            make_evo_file("c", 10, 100, 3, None),
+            make_evo_file("d", 10, 100, 4, Some(200)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(
+            file_names(&groups),
+            vec![vec!["c"], vec!["b", "a"], vec!["d"]]
+        );
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_sorted_by_seq() {
+        // Within a group, files are sorted by (first_row_id, -max_sequence_number).
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 3, Some(0)),
+            make_evo_file("c", 10, 100, 2, Some(0)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        // Sorted by descending max_sequence_number: b(3), c(2), a(1)
+        assert_eq!(file_names(&groups), vec![vec!["b", "c", "a"]]);
+    }
+
+    // ==================== pack_data_evolution_splits tests ====================
+
+    #[test]
+    fn test_pack_data_evolution_splits_empty() {
+        let result = pack_data_evolution_splits(vec![], 128, 4);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_pack_data_evolution_splits_single_file_groups() {
+        // All groups have 1 file → all raw_convertible.
+        let groups = vec![
+            vec![make_evo_file("a", 10, 100, 1, Some(0))],
+            vec![make_evo_file("b", 10, 100, 2, Some(100))],
+        ];
+        let result = pack_data_evolution_splits(groups, 100, 4);
+        // Both fit in one split (10+10 < 100).
+        assert_eq!(result.len(), 1);
+        let (files, raw) = &result[0];
+        assert_eq!(files.len(), 2);
+        assert!(raw, "all single-file groups should be raw_convertible");
+    }
+
+    #[test]
+    fn test_pack_data_evolution_splits_multi_file_group_not_raw() {
+        // A group with 2 files → not raw_convertible.
+        let groups = vec![vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(0)),
+        ]];
+        let result = pack_data_evolution_splits(groups, 100, 4);
+        assert_eq!(result.len(), 1);
+        let (files, raw) = &result[0];
+        assert_eq!(files.len(), 2);
+        assert!(!raw, "multi-file group should not be raw_convertible");
+    }
+
+    #[test]
+    fn test_pack_data_evolution_splits_mixed_raw() {
+        // Group1: 2 files (not raw), Group2: 1 file (raw).
+        // If packed together, the split is not raw_convertible.
+        let groups = vec![
+            vec![
+                make_evo_file("a", 10, 100, 1, Some(0)),
+                make_evo_file("b", 10, 100, 2, Some(0)),
+            ],
+            vec![make_evo_file("c", 10, 100, 3, Some(100))],
+        ];
+        let result = pack_data_evolution_splits(groups, 1000, 4);
+        // All fit in one split.
+        assert_eq!(result.len(), 1);
+        let (files, raw) = &result[0];
+        assert_eq!(files.len(), 3);
+        assert!(!raw, "mixed groups should not be raw_convertible");
+    }
+
+    #[test]
+    fn test_pack_data_evolution_splits_respects_target_size() {
+        // Each group is 50 bytes, target is 60 → one group per split.
+        let groups = vec![
+            vec![make_evo_file("a", 50, 100, 1, Some(0))],
+            vec![make_evo_file("b", 50, 100, 2, Some(100))],
+            vec![make_evo_file("c", 50, 100, 3, Some(200))],
+        ];
+        let result = pack_data_evolution_splits(groups, 60, 4);
+        assert_eq!(result.len(), 3);
+        for (files, raw) in &result {
+            assert_eq!(files.len(), 1);
+            assert!(raw);
+        }
     }
 }

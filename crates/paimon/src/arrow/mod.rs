@@ -37,7 +37,8 @@ pub(crate) fn paimon_type_to_arrow(dt: &crate::spec::DataType) -> crate::Result<
         PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) => ArrowDataType::Binary,
         PaimonDataType::Date(_) => ArrowDataType::Date32,
         PaimonDataType::Time(t) => match t.precision() {
-            0..=3 => ArrowDataType::Time32(TimeUnit::Millisecond),
+            0 => ArrowDataType::Time32(TimeUnit::Second),
+            1..=3 => ArrowDataType::Time32(TimeUnit::Millisecond),
             4..=6 => ArrowDataType::Time64(TimeUnit::Microsecond),
             7..=9 => ArrowDataType::Time64(TimeUnit::Nanosecond),
             p => {
@@ -71,7 +72,8 @@ pub(crate) fn paimon_type_to_arrow(dt: &crate::spec::DataType) -> crate::Result<
 
 fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
     match precision {
-        0..=3 => Ok(TimeUnit::Millisecond),
+        0 => Ok(TimeUnit::Second),
+        1..=3 => Ok(TimeUnit::Millisecond),
         4..=6 => Ok(TimeUnit::Microsecond),
         7..=9 => Ok(TimeUnit::Nanosecond),
         _ => Err(crate::Error::Unsupported {
