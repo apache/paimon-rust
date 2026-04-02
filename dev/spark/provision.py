@@ -196,6 +196,61 @@ def main():
         """
     )
 
+    # ===== Data Evolution table: append-only with row tracking =====
+    # data-evolution.enabled + row-tracking.enabled allows partial column updates
+    # via MERGE INTO. This produces files with different write_cols covering the
+    # same row ID ranges, exercising the column-wise merge read path.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_table (
+            id INT,
+            name STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )
+        """
+    )
+
+    # First batch: rows with row_id 0, 1, 2 — all columns written
+    spark.sql(
+        """
+        INSERT INTO data_evolution_table VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200),
+            (3, 'carol', 300)
+        """
+    )
+
+    # Second batch: rows with row_id 3, 4
+    spark.sql(
+        """
+        INSERT INTO data_evolution_table VALUES
+            (4, 'dave', 400),
+            (5, 'eve', 500)
+        """
+    )
+
+    # MERGE INTO: partial column update on existing rows.
+    # This writes new files containing only the updated column (name) with the
+    # same first_row_id, so the reader must merge columns from multiple files.
+    spark.sql(
+        """
+        CREATE TEMPORARY VIEW data_evolution_updates AS
+        SELECT * FROM VALUES (1, 'alice-v2'), (3, 'carol-v2') AS t(id, name)
+        """
+    )
+    spark.sql(
+        """
+        MERGE INTO data_evolution_table t
+        USING data_evolution_updates s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.name = s.name
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

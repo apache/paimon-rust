@@ -96,6 +96,8 @@ mod tests {
             creation_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
             delete_row_count: None,
             embedded_index: None,
+            first_row_id: None,
+            write_cols: None,
         }
     }
 

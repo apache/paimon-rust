@@ -108,6 +108,10 @@ pub struct DataSplit {
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
+    /// Whether this split can be read file-by-file without merging.
+    /// `false` when files need column-wise merge (e.g. data evolution) or
+    /// key-value merge (e.g. primary key tables without deletion vectors).
+    raw_convertible: bool,
 }
 
 impl DataSplit {
@@ -134,6 +138,11 @@ impl DataSplit {
     /// Deletion files for each data file (same order as `data_files`); `None` = no deletion file for that data file.
     pub fn data_deletion_files(&self) -> Option<&[Option<DeletionFile>]> {
         self.data_deletion_files.as_deref()
+    }
+
+    /// Whether this split can be read without column-wise merging.
+    pub fn raw_convertible(&self) -> bool {
+        self.raw_convertible
     }
 
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
@@ -194,6 +203,7 @@ pub struct DataSplitBuilder {
     data_files: Option<Vec<DataFileMeta>>,
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
+    raw_convertible: bool,
 }
 
 impl DataSplitBuilder {
@@ -206,6 +216,7 @@ impl DataSplitBuilder {
             total_buckets: -1,
             data_files: None,
             data_deletion_files: None,
+            raw_convertible: true,
         }
     }
 
@@ -240,6 +251,11 @@ impl DataSplitBuilder {
         data_deletion_files: Vec<Option<DeletionFile>>,
     ) -> Self {
         self.data_deletion_files = Some(data_deletion_files);
+        self
+    }
+
+    pub fn with_raw_convertible(mut self, raw_convertible: bool) -> Self {
+        self.raw_convertible = raw_convertible;
         self
     }
 
@@ -294,6 +310,7 @@ impl DataSplitBuilder {
             total_buckets: self.total_buckets,
             data_files,
             data_deletion_files: self.data_deletion_files,
+            raw_convertible: self.raw_convertible,
         })
     }
 }

@@ -853,3 +853,97 @@ async fn test_rest_catalog_read_append_table() {
         "REST catalog append table rows should match expected values"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Data Evolution integration tests
+// ---------------------------------------------------------------------------
+
+/// Test reading a data-evolution enabled append-only table.
+///
+/// The table is provisioned by Spark with `data-evolution.enabled=true` and
+/// `row-tracking.enabled=true`. Multiple inserts produce files with `first_row_id`
+/// set, exercising the data evolution scan and read path.
+#[tokio::test]
+async fn test_read_data_evolution_table() {
+    let (plan, batches) = scan_and_read_with_fs_catalog("data_evolution_table", None).await;
+
+    assert!(
+        !plan.splits().is_empty(),
+        "Data evolution table should have at least one split"
+    );
+
+    let mut rows: Vec<(i32, String, i32)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".into(), 100),
+            (2, "bob".into(), 200),
+            (3, "carol-v2".into(), 300),
+            (4, "dave".into(), 400),
+            (5, "eve".into(), 500),
+        ],
+        "Data evolution table should return merged rows after MERGE INTO"
+    );
+}
+
+/// Test reading a data-evolution table with column projection.
+#[tokio::test]
+async fn test_read_data_evolution_table_with_projection() {
+    let (_, batches) =
+        scan_and_read_with_fs_catalog("data_evolution_table", Some(&["value", "id"])).await;
+
+    for batch in &batches {
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["value", "id"],
+            "Projection order should be preserved"
+        );
+        assert!(
+            batch.column_by_name("name").is_none(),
+            "Non-projected column 'name' should be absent"
+        );
+    }
+
+    let mut rows: Vec<(i32, i32)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)],
+        "Projected data evolution read should return correct values"
+    );
+}

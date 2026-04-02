@@ -17,9 +17,12 @@
 
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::{FileIO, FileRead, FileStatus};
-use crate::spec::DataField;
+use crate::spec::{DataField, DataFileMeta};
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
+use arrow_array::{new_null_array, RecordBatch};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::concat::concat_batches;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -29,6 +32,7 @@ use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::try_join;
@@ -184,9 +188,261 @@ impl ArrowReader {
         }
             .boxed())
     }
+
+    /// Read data files in data evolution mode, merging columns from files that share the same row ID range.
+    ///
+    /// Each DataSplit contains files grouped by `first_row_id`. Files within a split may contain
+    /// different columns for the same logical rows. This method reads each file and merges them
+    /// column-wise, respecting `max_sequence_number` for conflict resolution.
+    ///
+    /// `table_fields` is the full table schema fields, used to determine which columns each file
+    /// provides when `write_cols` is not set.
+    pub fn read_data_evolution(
+        self,
+        data_splits: &[DataSplit],
+        table_fields: &[DataField],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let file_io = self.file_io.clone();
+        let batch_size = self.batch_size;
+        let splits: Vec<DataSplit> = data_splits.to_vec();
+        let read_type = self.read_type;
+        let table_field_names: Vec<String> =
+            table_fields.iter().map(|f| f.name().to_string()).collect();
+        let projected_column_names: Vec<String> = read_type
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
+
+        Ok(try_stream! {
+            for split in &splits {
+                if split.raw_convertible() || split.data_files().len() == 1 {
+                    // Single file or raw convertible — read normally.
+                    for file_meta in split.data_files() {
+                        let batches = read_single_file(
+                            &file_io, split, file_meta, &projected_column_names, batch_size, None,
+                        ).await?;
+                        for batch in batches {
+                            yield batch;
+                        }
+                    }
+                } else {
+                    // Multiple files need column-wise merge.
+                    let merged_batches = merge_files_by_columns(
+                        &file_io,
+                        split,
+                        &projected_column_names,
+                        &table_field_names,
+                        batch_size,
+                    ).await?;
+                    for batch in merged_batches {
+                        yield batch;
+                    }
+                }
+            }
+        }
+        .boxed())
+    }
 }
 
-/// Builds a Parquet [RowSelection] from deletion vector.
+/// Read a single parquet file from a split, returning all batches.
+/// Optionally applies a deletion vector.
+async fn read_single_file(
+    file_io: &FileIO,
+    split: &DataSplit,
+    file_meta: &DataFileMeta,
+    projected_column_names: &[String],
+    batch_size: Option<usize>,
+    dv: Option<&DeletionVector>,
+) -> crate::Result<Vec<RecordBatch>> {
+    let path_to_read = split.data_file_path(file_meta);
+    if !path_to_read.to_ascii_lowercase().ends_with(".parquet") {
+        return Err(Error::Unsupported {
+            message: format!(
+                "unsupported file format: only .parquet is supported, got: {path_to_read}"
+            ),
+        });
+    }
+
+    let parquet_file = file_io.new_input(&path_to_read)?;
+    let (parquet_metadata, parquet_reader) =
+        try_join!(parquet_file.metadata(), parquet_file.reader())?;
+    let arrow_file_reader = ArrowFileReader::new(parquet_metadata, parquet_reader);
+
+    let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
+
+    // Only project columns that exist in this file.
+    let parquet_schema = batch_stream_builder.parquet_schema().clone();
+    let file_column_names: Vec<&str> = parquet_schema.columns().iter().map(|c| c.name()).collect();
+    let available_columns: Vec<&str> = projected_column_names
+        .iter()
+        .filter(|name| file_column_names.contains(&name.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    if available_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mask = ProjectionMask::columns(&parquet_schema, available_columns.iter().copied());
+    batch_stream_builder = batch_stream_builder.with_projection(mask);
+
+    if let Some(dv) = dv {
+        if !dv.is_empty() {
+            let row_selection =
+                build_deletes_row_selection(batch_stream_builder.metadata().row_groups(), dv)?;
+            batch_stream_builder = batch_stream_builder.with_row_selection(row_selection);
+        }
+    }
+    if let Some(size) = batch_size {
+        batch_stream_builder = batch_stream_builder.with_batch_size(size);
+    }
+
+    let mut batch_stream = batch_stream_builder.build()?;
+    let mut batches = Vec::new();
+    while let Some(batch) = batch_stream.next().await {
+        batches.push(batch?);
+    }
+    Ok(batches)
+}
+
+/// Merge multiple files column-wise for data evolution.
+///
+/// All files in the split share the same `first_row_id` and `row_count`.
+/// Each file contributes a subset of columns. When multiple files provide the same column,
+/// the file with the higher `max_sequence_number` wins.
+async fn merge_files_by_columns(
+    file_io: &FileIO,
+    split: &DataSplit,
+    projected_column_names: &[String],
+    table_field_names: &[String],
+    batch_size: Option<usize>,
+) -> crate::Result<Vec<RecordBatch>> {
+    let data_files = split.data_files();
+    if data_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Determine which columns each file provides and resolve conflicts by max_sequence_number.
+    // column_name -> (file_index, max_sequence_number)
+    let mut column_source: HashMap<String, (usize, i64)> = HashMap::new();
+
+    for (file_idx, file_meta) in data_files.iter().enumerate() {
+        let file_columns: Vec<String> = if let Some(ref wc) = file_meta.write_cols {
+            wc.clone()
+        } else {
+            // File written before data evolution — contains all table columns at that schema version.
+            table_field_names.to_vec()
+        };
+
+        for col in &file_columns {
+            let entry = column_source
+                .entry(col.clone())
+                .or_insert((file_idx, i64::MIN));
+            if file_meta.max_sequence_number > entry.1 {
+                *entry = (file_idx, file_meta.max_sequence_number);
+            }
+        }
+    }
+
+    // For each file, determine which projected columns to read from it.
+    // file_index -> Vec<column_name>
+    let mut file_read_columns: HashMap<usize, Vec<String>> = HashMap::new();
+    for col_name in projected_column_names {
+        if let Some(&(file_idx, _)) = column_source.get(col_name) {
+            file_read_columns
+                .entry(file_idx)
+                .or_default()
+                .push(col_name.clone());
+        }
+    }
+
+    // Read each file that contributes columns.
+    let mut file_batches: HashMap<usize, Vec<RecordBatch>> = HashMap::new();
+    for file_idx in file_read_columns.keys() {
+        let file_meta = &data_files[*file_idx];
+        let batches = read_single_file(
+            file_io,
+            split,
+            file_meta,
+            projected_column_names,
+            batch_size,
+            None,
+        )
+        .await?;
+        file_batches.insert(*file_idx, batches);
+    }
+
+    // Concatenate all batches per file into a single RecordBatch.
+    let mut file_concat: HashMap<usize, RecordBatch> = HashMap::new();
+    for (file_idx, batches) in &file_batches {
+        if batches.is_empty() {
+            continue;
+        }
+        let schema = batches[0].schema();
+        let concat = concat_batches(&schema, batches).map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to concatenate batches for file index {file_idx}: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+        file_concat.insert(*file_idx, concat);
+    }
+
+    // Determine the total row count from any file.
+    let row_count = file_concat
+        .values()
+        .next()
+        .map(|b| b.num_rows())
+        .unwrap_or(0);
+
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Build the merged RecordBatch: for each projected column, pick from the winning file
+    // or fill with nulls.
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> =
+        Vec::with_capacity(projected_column_names.len());
+    let mut schema_fields: Vec<ArrowField> = Vec::with_capacity(projected_column_names.len());
+
+    for col_name in projected_column_names {
+        if let Some(&(file_idx, _)) = column_source.get(col_name) {
+            if let Some(concat_batch) = file_concat.get(&file_idx) {
+                if let Ok(col_idx) = concat_batch.schema().index_of(col_name) {
+                    columns.push(concat_batch.column(col_idx).clone());
+                    schema_fields.push(concat_batch.schema().field(col_idx).clone());
+                    continue;
+                }
+            }
+        }
+        // Column not found in any file — fill with nulls.
+        let null_type =
+            find_column_type_from_batches(&file_concat, col_name).unwrap_or(ArrowDataType::Utf8);
+        let null_array = new_null_array(&null_type, row_count);
+        schema_fields.push(ArrowField::new(col_name, null_type, true));
+        columns.push(null_array);
+    }
+
+    let schema = Arc::new(ArrowSchema::new(schema_fields));
+    let merged = RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build merged RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+
+    Ok(vec![merged])
+}
+
+/// Find the Arrow data type for a column name from any available concatenated batch.
+fn find_column_type_from_batches(
+    file_concat: &HashMap<usize, RecordBatch>,
+    col_name: &str,
+) -> Option<ArrowDataType> {
+    for batch in file_concat.values() {
+        if let Ok(idx) = batch.schema().index_of(col_name) {
+            return Some(batch.schema().field(idx).data_type().clone());
+        }
+    }
+    None
+}
+
 /// Only rows not in the deletion vector are selected; deleted rows are skipped at read time.
 /// todo: Uses [DeletionVectorIterator] with [advance_to](DeletionVectorIterator::advance_to) when skipping row groups similar to iceberg-rust
 fn build_deletes_row_selection(

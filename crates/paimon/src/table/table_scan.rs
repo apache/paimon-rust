@@ -23,8 +23,8 @@
 use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
-    eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, FileKind, IndexManifest,
-    ManifestEntry, PartitionComputer, Predicate, Snapshot,
+    eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataFileMeta, FileKind,
+    IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
@@ -166,6 +166,54 @@ fn partition_matches_predicate(
     }
 }
 
+/// Splits data files into groups by overlapping `first_row_id` ranges for data evolution.
+///
+/// Files are sorted by `(first_row_id, -max_sequence_number)`. Files with the same
+/// `first_row_id` are grouped together (they contain different columns for the same rows).
+/// Files without `first_row_id` become their own group.
+///
+/// Reference: [DataEvolutionSplitRead._split_by_row_id](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/split_read.py)
+fn split_by_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+    files.sort_by(|a, b| {
+        let a_row_id = a.first_row_id.unwrap_or(i64::MIN);
+        let b_row_id = b.first_row_id.unwrap_or(i64::MIN);
+        a_row_id
+            .cmp(&b_row_id)
+            .then_with(|| b.max_sequence_number.cmp(&a.max_sequence_number))
+    });
+
+    let mut result: Vec<Vec<DataFileMeta>> = Vec::new();
+    let mut current_group: Vec<DataFileMeta> = Vec::new();
+    let mut last_row_id: Option<i64> = None;
+
+    for file in files {
+        match file.first_row_id {
+            None => {
+                // Files without first_row_id become their own group.
+                if !current_group.is_empty() {
+                    result.push(std::mem::take(&mut current_group));
+                    last_row_id = None;
+                }
+                result.push(vec![file]);
+            }
+            Some(fid) => {
+                if last_row_id != Some(fid) {
+                    // New row ID range — start a new group.
+                    if !current_group.is_empty() {
+                        result.push(std::mem::take(&mut current_group));
+                    }
+                    last_row_id = Some(fid);
+                }
+                current_group.push(file);
+            }
+        }
+    }
+    if !current_group.is_empty() {
+        result.push(current_group);
+    }
+    result
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -198,6 +246,7 @@ impl<'a> TableScan<'a> {
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let data_evolution_enabled = core_options.data_evolution_enabled();
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let entries = read_all_manifest_entries(file_io, table_path, &snapshot).await?;
@@ -321,26 +370,52 @@ impl<'a> TableScan<'a> {
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
-            let file_groups = split_for_batch(data_files, target_split_size, open_file_cost);
-            for file_group in file_groups {
-                let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
-                    file_group
-                        .iter()
-                        .map(|f| per_bucket.get(&f.file_name).cloned())
-                        .collect::<Vec<Option<DeletionFile>>>()
-                });
+            if data_evolution_enabled {
+                let file_groups = split_by_row_id(data_files);
+                for file_group in file_groups {
+                    let raw_convertible = file_group.len() == 1;
+                    let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
+                        file_group
+                            .iter()
+                            .map(|f| per_bucket.get(&f.file_name).cloned())
+                            .collect::<Vec<Option<DeletionFile>>>()
+                    });
 
-                let mut builder = DataSplitBuilder::new()
-                    .with_snapshot(snapshot_id)
-                    .with_partition(partition_row.clone())
-                    .with_bucket(bucket)
-                    .with_bucket_path(bucket_path.clone())
-                    .with_total_buckets(total_buckets)
-                    .with_data_files(file_group);
-                if let Some(files) = data_deletion_files {
-                    builder = builder.with_data_deletion_files(files);
+                    let mut builder = DataSplitBuilder::new()
+                        .with_snapshot(snapshot_id)
+                        .with_partition(partition_row.clone())
+                        .with_bucket(bucket)
+                        .with_bucket_path(bucket_path.clone())
+                        .with_total_buckets(total_buckets)
+                        .with_data_files(file_group)
+                        .with_raw_convertible(raw_convertible);
+                    if let Some(files) = data_deletion_files {
+                        builder = builder.with_data_deletion_files(files);
+                    }
+                    splits.push(builder.build()?);
                 }
-                splits.push(builder.build()?);
+            } else {
+                let file_groups = split_for_batch(data_files, target_split_size, open_file_cost);
+                for file_group in file_groups {
+                    let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
+                        file_group
+                            .iter()
+                            .map(|f| per_bucket.get(&f.file_name).cloned())
+                            .collect::<Vec<Option<DeletionFile>>>()
+                    });
+
+                    let mut builder = DataSplitBuilder::new()
+                        .with_snapshot(snapshot_id)
+                        .with_partition(partition_row.clone())
+                        .with_bucket(bucket)
+                        .with_bucket_path(bucket_path.clone())
+                        .with_total_buckets(total_buckets)
+                        .with_data_files(file_group);
+                    if let Some(files) = data_deletion_files {
+                        builder = builder.with_data_deletion_files(files);
+                    }
+                    splits.push(builder.build()?);
+                }
             }
         }
         Ok(Plan::new(splits))

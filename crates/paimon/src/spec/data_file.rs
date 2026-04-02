@@ -396,6 +396,22 @@ pub struct DataFileMeta {
     // file index filter bytes, if it is small, store in data file meta
     #[serde(rename = "_EMBEDDED_FILE_INDEX", with = "serde_bytes")]
     pub embedded_index: Option<Vec<u8>>,
+
+    /// The starting row ID for this file's data (used in data evolution mode).
+    #[serde(
+        rename = "_FIRST_ROW_ID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub first_row_id: Option<i64>,
+
+    /// Which table columns this file contains (used in data evolution mode).
+    #[serde(
+        rename = "_WRITE_COLUMNS",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub write_cols: Option<Vec<String>>,
 }
 
 impl Display for DataFileMeta {
@@ -405,7 +421,12 @@ impl Display for DataFileMeta {
 }
 
 #[allow(dead_code)]
-impl DataFileMeta {}
+impl DataFileMeta {
+    /// Returns the row ID range `[first_row_id, first_row_id + row_count - 1]` if `first_row_id` is set.
+    pub fn row_id_range(&self) -> Option<(i64, i64)> {
+        self.first_row_id.map(|fid| (fid, fid + self.row_count - 1))
+    }
+}
 
 #[cfg(test)]
 mod tests {

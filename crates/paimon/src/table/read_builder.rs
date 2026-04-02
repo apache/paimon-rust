@@ -84,7 +84,10 @@ impl<'a> ReadBuilder<'a> {
             Some(projected) => self.resolve_projected_fields(projected)?,
         };
 
-        Ok(TableRead::new(self.table, read_type))
+        let core_options = CoreOptions::new(self.table.schema.options());
+        let data_evolution = core_options.data_evolution_enabled();
+
+        Ok(TableRead::new(self.table, read_type, data_evolution))
     }
 
     fn resolve_projected_fields(&self, projected_fields: &[String]) -> Result<Vec<DataField>> {
@@ -131,12 +134,17 @@ impl<'a> ReadBuilder<'a> {
 pub struct TableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
+    data_evolution: bool,
 }
 
 impl<'a> TableRead<'a> {
     /// Create a new TableRead with a specific read type (projected fields).
-    pub fn new(table: &'a Table, read_type: Vec<DataField>) -> Self {
-        Self { table, read_type }
+    pub fn new(table: &'a Table, read_type: Vec<DataField>, data_evolution: bool) -> Self {
+        Self {
+            table,
+            read_type,
+            data_evolution,
+        }
     }
 
     /// Schema (fields) that this read will produce.
@@ -167,6 +175,11 @@ impl<'a> TableRead<'a> {
 
         let reader =
             ArrowReaderBuilder::new(self.table.file_io.clone()).build(self.read_type().to_vec());
-        reader.read(data_splits)
+
+        if self.data_evolution {
+            reader.read_data_evolution(data_splits, self.table.schema.fields())
+        } else {
+            reader.read(data_splits)
+        }
     }
 }

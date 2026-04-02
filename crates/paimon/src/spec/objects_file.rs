@@ -120,6 +120,8 @@ mod tests {
                             .unwrap(),
                         delete_row_count: Some(0),
                         embedded_index: None,
+                        first_row_id: None,
+                        write_cols: None,
                     },
                     2
                 ),
@@ -154,6 +156,8 @@ mod tests {
                             .unwrap(),
                         delete_row_count: Some(1),
                         embedded_index: None,
+                        first_row_id: None,
+                        write_cols: None,
                     },
                     2
                 ),
