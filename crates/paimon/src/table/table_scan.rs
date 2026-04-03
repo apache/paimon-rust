@@ -33,6 +33,7 @@ use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionB
 use crate::table::SnapshotManager;
 use crate::table::TagManager;
 use crate::Error;
+use futures::{StreamExt, TryStreamExt};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -74,13 +75,17 @@ async fn read_all_manifest_entries(
     manifest_files.extend(delta);
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
-    let mut all_entries = Vec::new();
-    // todo: consider use multiple-threads read manifest
-    for meta in manifest_files {
-        let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
-        let entries = crate::spec::Manifest::read(file_io, &path).await?;
-        all_entries.extend(entries);
-    }
+    let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
+        .map(|meta| {
+            let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+            async move { crate::spec::Manifest::read(file_io, &path).await }
+        })
+        .buffered(64)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
     Ok(all_entries)
 }
 
@@ -953,7 +958,44 @@ mod tests {
     };
     use crate::table::source::DeletionFile;
     use crate::Error;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
+
+    /// Helper to build a DataFileMeta with data evolution fields.
+    fn make_evo_file(
+        name: &str,
+        file_size: i64,
+        row_count: i64,
+        max_seq: i64,
+        first_row_id: Option<i64>,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+            external_path: None,
+        }
+    }
+
+    fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|f| f.file_name.as_str()).collect())
+            .collect()
+    }
 
     struct SerializedBinaryRowBuilder {
         arity: i32,
@@ -1106,42 +1148,8 @@ mod tests {
             embedded_index: None,
             first_row_id: None,
             write_cols: None,
+            external_path: None,
         }
-    }
-
-    fn make_evo_file(
-        name: &str,
-        file_size: i64,
-        row_count: i64,
-        max_seq: i64,
-        first_row_id: Option<i64>,
-    ) -> DataFileMeta {
-        DataFileMeta {
-            file_name: name.to_string(),
-            file_size,
-            row_count,
-            min_key: Vec::new(),
-            max_key: Vec::new(),
-            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
-            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
-            min_sequence_number: max_seq,
-            max_sequence_number: max_seq,
-            schema_id: 0,
-            level: 0,
-            extra_files: Vec::new(),
-            creation_time: Utc::now(),
-            delete_row_count: None,
-            embedded_index: None,
-            first_row_id,
-            write_cols: None,
-        }
-    }
-
-    fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {
-        groups
-            .iter()
-            .map(|group| group.iter().map(|file| file.file_name.as_str()).collect())
-            .collect()
     }
 
     #[test]

@@ -70,14 +70,6 @@ pub enum Error {
     ConfigInvalid { message: String },
     #[snafu(
         visibility(pub(crate)),
-        display("Paimon hitting unexpected avro error {}: {:?}", message, source)
-    )]
-    DataUnexpected {
-        message: String,
-        source: Box<apache_avro::Error>,
-    },
-    #[snafu(
-        visibility(pub(crate)),
         display("Paimon hitting invalid file index format: {}", message)
     )]
     FileIndexFormatInvalid { message: String },
@@ -122,15 +114,6 @@ impl From<opendal::Error> for Error {
         // TODO: Simple use IoUnexpected for now
         Error::IoUnexpected {
             message: "IO operation failed on underlying storage".to_string(),
-            source: Box::new(source),
-        }
-    }
-}
-
-impl From<apache_avro::Error> for Error {
-    fn from(source: apache_avro::Error) -> Self {
-        Error::DataUnexpected {
-            message: "".to_string(),
             source: Box::new(source),
         }
     }

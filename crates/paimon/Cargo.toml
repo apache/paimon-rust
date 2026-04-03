@@ -51,13 +51,12 @@ snafu = "0.9.0"
 typed-builder = "^0.19"
 opendal = { version = "0.55", features = ["services-fs"] }
 pretty_assertions = "1"
-apache-avro = { version = "0.17", features = ["snappy", "zstandard"] }
+serde_avro_fast = { version = "2.0.2", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
 roaring = "0.11"
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-select = { workspace = true }
 futures = "0.3"
 parquet = { workspace = true, features = ["async", "zstd"] }
 async-stream = "0.3.6"
@@ -76,5 +75,5 @@ urlencoding = "2.1"
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 rand = "0.8.5"
-serde_avro_fast = { version = "2.0.2", features = ["snappy"] }
+
 tempfile = "3"

@@ -15,19 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::Error;
-use apache_avro::types::Value;
-use apache_avro::{from_value, Reader};
 use serde::de::DeserializeOwned;
+use serde_avro_fast::object_container_file_encoding::Reader;
+use snafu::ResultExt;
 
 #[allow(dead_code)]
 pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T>> {
-    let reader = Reader::new(bytes).map_err(Error::from)?;
-    let records = reader
-        .collect::<Result<Vec<Value>, _>>()
-        .map_err(Error::from)?;
-    let values = Value::Array(records);
-    from_value::<Vec<T>>(&values).map_err(Error::from)
+    let mut reader = Reader::from_slice(bytes)
+        .whatever_context::<_, crate::Error>("read avro object container")?;
+    reader
+        .deserialize::<T>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .whatever_context::<_, crate::Error>("deserialize avro records")
 }
 
 #[cfg(test)]
@@ -122,6 +121,7 @@ mod tests {
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
+                        external_path: None,
                     },
                     2
                 ),
@@ -158,6 +158,7 @@ mod tests {
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
+                        external_path: None,
                     },
                     2
                 ),

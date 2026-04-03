@@ -28,6 +28,9 @@ pub struct Identifier {
     pub bucket: i32,
     pub level: i32,
     pub file_name: String,
+    pub extra_files: Vec<String>,
+    pub embedded_index: Option<Vec<u8>>,
+    pub external_path: Option<String>,
 }
 
 /// Entry of a manifest file, representing an addition / deletion of a data file.
@@ -90,6 +93,9 @@ impl ManifestEntry {
             bucket: self.bucket,
             level: self.file.level,
             file_name: self.file.file_name.clone(),
+            extra_files: self.file.extra_files.clone(),
+            embedded_index: self.file.embedded_index.clone(),
+            external_path: self.file.external_path.clone(),
         }
     }
 

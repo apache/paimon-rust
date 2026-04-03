@@ -412,6 +412,14 @@ pub struct DataFileMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub write_cols: Option<Vec<String>>,
+
+    /// External path for the data file (e.g. when data is stored outside the table directory).
+    #[serde(
+        rename = "_EXTERNAL_PATH",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_path: Option<String>,
 }
 
 impl Display for DataFileMeta {

@@ -31,6 +31,5 @@ rust-version = "1.86.0"
 arrow-array = { version = "57.0", features = ["ffi"] }
 arrow-schema = "57.0"
 arrow-cast = "57.0"
-arrow-select = "57.0"
 parquet = "57.0"
 tokio = "1.39.2"

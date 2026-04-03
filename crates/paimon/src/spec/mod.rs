@@ -47,6 +47,7 @@ pub use manifest::Manifest;
 mod manifest_common;
 pub use manifest_common::FileKind;
 mod manifest_entry;
+pub use manifest_entry::Identifier;
 pub use manifest_entry::ManifestEntry;
 mod objects_file;
 pub use objects_file::from_avro_bytes;

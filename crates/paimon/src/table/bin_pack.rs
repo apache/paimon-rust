@@ -98,6 +98,7 @@ mod tests {
             embedded_index: None,
             first_row_id: None,
             write_cols: None,
+            external_path: None,
         }
     }
 
