@@ -17,7 +17,7 @@
 
 //! Integration tests for reading Paimon tables provisioned by Spark.
 
-use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrowPrimitiveType, Int32Array, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
@@ -998,4 +998,223 @@ async fn test_limit_pushdown() {
             split.row_count()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schema Evolution integration tests
+// ---------------------------------------------------------------------------
+
+/// Test reading a table after ALTER TABLE ADD COLUMNS.
+/// Old data files lack the new column; reader should fill nulls.
+#[tokio::test]
+async fn test_read_schema_evolution_add_column() {
+    let (_, batches) = scan_and_read_with_fs_catalog("schema_evolution_add_column", None).await;
+
+    let mut rows: Vec<(i32, String, Option<i32>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let age = batch
+            .column_by_name("age")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("age");
+        for i in 0..batch.num_rows() {
+            let age_val = if age.is_null(i) {
+                None
+            } else {
+                Some(age.value(i))
+            };
+            rows.push((id.value(i), name.value(i).to_string(), age_val));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".into(), None),
+            (2, "bob".into(), None),
+            (3, "carol".into(), Some(30)),
+            (4, "dave".into(), Some(40)),
+        ],
+        "Old rows should have null for added column 'age'"
+    );
+}
+
+/// Test reading a table after ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
+/// Old data files have INT; reader should cast to BIGINT.
+#[tokio::test]
+async fn test_read_schema_evolution_type_promotion() {
+    let (_, batches) = scan_and_read_with_fs_catalog("schema_evolution_type_promotion", None).await;
+
+    // Verify the value column is Int64 (BIGINT) in all batches
+    for batch in &batches {
+        let value_col = batch.column_by_name("value").expect("value column");
+        assert_eq!(
+            value_col.data_type(),
+            &arrow_array::types::Int64Type::DATA_TYPE,
+            "value column should be Int64 (BIGINT) after type promotion"
+        );
+    }
+
+    let mut rows: Vec<(i32, i64)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("value as Int64Array");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![(1, 100i64), (2, 200i64), (3, 3_000_000_000i64)],
+        "INT values should be promoted to BIGINT, including values > INT_MAX"
+    );
+}
+
+/// Test reading a data-evolution table after ALTER TABLE ADD COLUMNS.
+/// Old files lack the new column; reader should fill nulls even in data evolution mode.
+#[tokio::test]
+async fn test_read_data_evolution_add_column() {
+    let (_, batches) = scan_and_read_with_fs_catalog("data_evolution_add_column", None).await;
+
+    let mut rows: Vec<(i32, String, i32, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        let extra = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("extra");
+        for i in 0..batch.num_rows() {
+            let extra_val = if extra.is_null(i) {
+                None
+            } else {
+                Some(extra.value(i).to_string())
+            };
+            rows.push((
+                id.value(i),
+                name.value(i).to_string(),
+                value.value(i),
+                extra_val,
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".into(), 100, None),
+            (2, "bob".into(), 200, None),
+            (3, "carol".into(), 300, Some("new".into())),
+            (4, "dave".into(), 400, Some("new".into())),
+        ],
+        "Data evolution + add column: old rows should have null for 'extra', MERGE INTO updates name"
+    );
+}
+
+/// Test reading a data-evolution table after ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
+/// Old files have INT; reader should cast to BIGINT in data evolution mode.
+#[tokio::test]
+async fn test_read_data_evolution_type_promotion() {
+    let (_, batches) = scan_and_read_with_fs_catalog("data_evolution_type_promotion", None).await;
+
+    // Verify the value column is Int64 (BIGINT) in all batches
+    for batch in &batches {
+        let value_col = batch.column_by_name("value").expect("value column");
+        assert_eq!(
+            value_col.data_type(),
+            &arrow_array::types::Int64Type::DATA_TYPE,
+            "value column should be Int64 (BIGINT) after type promotion in data evolution mode"
+        );
+    }
+
+    let mut rows: Vec<(i32, i64)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("value as Int64Array");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![(1, 999i64), (2, 200i64), (3, 3_000_000_000i64)],
+        "Data evolution + type promotion: INT should be cast to BIGINT, MERGE INTO updates value"
+    );
+}
+
+/// Test reading a table after ALTER TABLE DROP COLUMN.
+/// Old data files have the dropped column; reader should ignore it.
+#[tokio::test]
+async fn test_read_schema_evolution_drop_column() {
+    let (_, batches) = scan_and_read_with_fs_catalog("schema_evolution_drop_column", None).await;
+
+    // Verify the dropped column 'score' is not present in the output.
+    for batch in &batches {
+        assert!(
+            batch.column_by_name("score").is_none(),
+            "Dropped column 'score' should not appear in output"
+        );
+    }
+
+    let mut rows: Vec<(i32, String)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string()));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".into()),
+            (2, "bob".into()),
+            (3, "carol".into()),
+            (4, "dave".into()),
+        ],
+        "Old rows should be readable after DROP COLUMN, with only remaining columns"
+    );
 }

@@ -181,8 +181,12 @@ impl<'a> TableRead<'a> {
             });
         }
 
-        let reader =
-            ArrowReaderBuilder::new(self.table.file_io.clone()).build(self.read_type().to_vec());
+        let reader = ArrowReaderBuilder::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+        )
+        .build(self.read_type().to_vec());
 
         if data_evolution {
             reader.read_data_evolution(data_splits, self.table.schema.fields())

@@ -292,6 +292,175 @@ def main():
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot1', 1)")
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot2', 2)")
 
+    # ===== Schema Evolution: Add Column =====
+    # Old files have (id, name); after ALTER TABLE ADD COLUMNS, new files have (id, name, age).
+    # Reader must fill nulls for 'age' when reading old files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS schema_evolution_add_column (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        "INSERT INTO schema_evolution_add_column VALUES (1, 'alice'), (2, 'bob')"
+    )
+    spark.sql("ALTER TABLE schema_evolution_add_column ADD COLUMNS (age INT)")
+    spark.sql(
+        "INSERT INTO schema_evolution_add_column VALUES (3, 'carol', 30), (4, 'dave', 40)"
+    )
+
+    # ===== Schema Evolution: Type Promotion (INT -> BIGINT) =====
+    # Old files have value as INT; after ALTER TABLE, new files have value as BIGINT.
+    # Reader must cast INT to BIGINT when reading old files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS schema_evolution_type_promotion (
+            id INT,
+            value INT
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        "INSERT INTO schema_evolution_type_promotion VALUES (1, 100), (2, 200)"
+    )
+    spark.sql(
+        "ALTER TABLE schema_evolution_type_promotion ALTER COLUMN value TYPE BIGINT"
+    )
+    spark.sql(
+        "INSERT INTO schema_evolution_type_promotion VALUES (3, 3000000000)"
+    )
+
+    # ===== Data Evolution + Schema Evolution: Add Column =====
+    # Combines data-evolution (row-tracking + MERGE INTO) with ALTER TABLE ADD COLUMNS.
+    # Old files lack the new column; MERGE INTO produces partial-column files.
+    # Reader must fill nulls for missing columns AND merge columns across files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_add_column (
+            id INT,
+            name STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO data_evolution_add_column VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200)
+        """
+    )
+    spark.sql("ALTER TABLE data_evolution_add_column ADD COLUMNS (extra STRING)")
+    spark.sql(
+        """
+        INSERT INTO data_evolution_add_column VALUES
+            (3, 'carol', 300, 'new'),
+            (4, 'dave', 400, 'new')
+        """
+    )
+    # MERGE INTO to trigger merge_files_by_columns with schema evolution.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_add_column_updates (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_add_column_updates VALUES (1, 'alice-v2')"
+    )
+    spark.sql(
+        """
+        MERGE INTO data_evolution_add_column t
+        USING data_evolution_add_column_updates s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.name = s.name
+        """
+    )
+    spark.sql("DROP TABLE data_evolution_add_column_updates")
+
+    # ===== Data Evolution + Schema Evolution: Type Promotion =====
+    # Combines data-evolution with ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
+    # Old files have INT; new files have BIGINT. MERGE INTO updates some rows.
+    # Reader must cast old INT columns to BIGINT AND merge columns across files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_type_promotion (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_type_promotion VALUES (1, 100), (2, 200)"
+    )
+    spark.sql(
+        "ALTER TABLE data_evolution_type_promotion ALTER COLUMN value TYPE BIGINT"
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_type_promotion VALUES (3, 3000000000)"
+    )
+    # MERGE INTO to trigger merge_files_by_columns with type promotion.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_type_promotion_updates (
+            id INT,
+            value BIGINT
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_type_promotion_updates VALUES (1, 999)"
+    )
+    spark.sql(
+        """
+        MERGE INTO data_evolution_type_promotion t
+        USING data_evolution_type_promotion_updates s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.value = s.value
+        """
+    )
+    spark.sql("DROP TABLE data_evolution_type_promotion_updates")
+
+    # ===== Schema Evolution: Drop Column =====
+    # Old files have (id, name, score); after ALTER TABLE DROP COLUMN, table has (id, name).
+    # Reader should ignore the dropped column when reading old files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS schema_evolution_drop_column (
+            id INT,
+            name STRING,
+            score INT
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO schema_evolution_drop_column VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200)
+        """
+    )
+    spark.sql("ALTER TABLE schema_evolution_drop_column DROP COLUMN score")
+    spark.sql(
+        """
+        INSERT INTO schema_evolution_drop_column VALUES
+            (3, 'carol'),
+            (4, 'dave')
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

@@ -19,6 +19,7 @@
 
 pub(crate) mod bin_pack;
 mod read_builder;
+pub(crate) mod schema_manager;
 mod snapshot_manager;
 mod source;
 mod table_scan;
@@ -28,6 +29,7 @@ use crate::Result;
 use arrow_array::RecordBatch;
 use futures::stream::BoxStream;
 pub use read_builder::{ReadBuilder, TableRead};
+pub use schema_manager::SchemaManager;
 pub use snapshot_manager::SnapshotManager;
 pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 pub use table_scan::TableScan;
@@ -45,6 +47,7 @@ pub struct Table {
     identifier: Identifier,
     location: String,
     schema: TableSchema,
+    schema_manager: SchemaManager,
 }
 
 #[allow(dead_code)]
@@ -56,11 +59,13 @@ impl Table {
         location: String,
         schema: TableSchema,
     ) -> Self {
+        let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         Self {
             file_io,
             identifier,
             location,
             schema,
+            schema_manager,
         }
     }
 
@@ -84,6 +89,11 @@ impl Table {
         &self.file_io
     }
 
+    /// Get the SchemaManager for this table.
+    pub fn schema_manager(&self) -> &SchemaManager {
+        &self.schema_manager
+    }
+
     /// Create a read builder for scan/read.
     ///
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
@@ -98,6 +108,7 @@ impl Table {
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema: self.schema.copy_with_options(extra),
+            schema_manager: self.schema_manager.clone(),
         }
     }
 }

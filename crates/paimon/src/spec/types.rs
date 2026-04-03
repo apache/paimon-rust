@@ -227,6 +227,10 @@ impl ArrayType {
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
     }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
+    }
 }
 
 /// BigIntType for paimon.
@@ -1348,6 +1352,14 @@ impl MapType {
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
     }
+
+    pub fn key_type(&self) -> &DataType {
+        &self.key_type
+    }
+
+    pub fn value_type(&self) -> &DataType {
+        &self.value_type
+    }
 }
 
 /// MultisetType for paimon.
@@ -1380,6 +1392,10 @@ impl MultisetType {
 
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
     }
 }
 
