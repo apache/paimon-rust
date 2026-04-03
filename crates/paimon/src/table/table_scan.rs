@@ -230,13 +230,27 @@ struct FileStatsRows {
 }
 
 impl FileStatsRows {
-    fn from_data_file(file: &DataFileMeta) -> Self {
-        Self {
+    /// Build file stats only when they are compatible with the current table schema.
+    ///
+    /// Schema-evolved files are conservatively skipped here so callers don't
+    /// accidentally interpret old stats rows using current field indexes.
+    fn try_from_data_file(
+        file: &DataFileMeta,
+        current_schema_id: i64,
+        expected_fields: usize,
+    ) -> Option<Self> {
+        if file.schema_id != current_schema_id {
+            return None;
+        }
+
+        let stats = Self {
             row_count: file.row_count,
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
-        }
+        };
+
+        stats.arity_matches(expected_fields).then_some(stats)
     }
 
     fn null_count(&self, index: usize) -> Option<i64> {
@@ -318,15 +332,10 @@ fn data_file_matches_predicates(
         return true;
     }
 
-    // Fail open if the file stats layout cannot be interpreted safely.
-    if file.schema_id != current_schema_id {
+    // Fail open if schema evolution or stats layout make index-based access unsafe.
+    let Some(stats) = FileStatsRows::try_from_data_file(file, current_schema_id, num_fields) else {
         return true;
-    }
-
-    let stats = FileStatsRows::from_data_file(file);
-    if !stats.arity_matches(num_fields) {
-        return true;
-    }
+    };
 
     predicates
         .iter()
