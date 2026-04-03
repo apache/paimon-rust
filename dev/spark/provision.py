@@ -433,6 +433,60 @@ def main():
     )
     spark.sql("DROP TABLE data_evolution_type_promotion_updates")
 
+    # ===== Data Evolution + Drop Column: tests NULL-fill when no file provides a column =====
+    # After MERGE INTO on old rows, the merge group files all predate ADD COLUMN.
+    # SELECT on the new column should return NULLs for old rows (not silently drop them).
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_drop_column (
+            id INT,
+            name STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO data_evolution_drop_column VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200)
+        """
+    )
+    # MERGE INTO to create a partial-column file in the same row_id range.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_drop_column_updates (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_drop_column_updates VALUES (1, 'alice-v2')"
+    )
+    spark.sql(
+        """
+        MERGE INTO data_evolution_drop_column t
+        USING data_evolution_drop_column_updates s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.name = s.name
+        """
+    )
+    spark.sql("DROP TABLE data_evolution_drop_column_updates")
+    # Add a new column that no existing file contains.
+    spark.sql("ALTER TABLE data_evolution_drop_column ADD COLUMNS (extra STRING)")
+    # Insert new rows that DO have the extra column.
+    spark.sql(
+        """
+        INSERT INTO data_evolution_drop_column VALUES
+            (3, 'carol', 300, 'new')
+        """
+    )
+
     # ===== Schema Evolution: Drop Column =====
     # Old files have (id, name, score); after ALTER TABLE DROP COLUMN, table has (id, name).
     # Reader should ignore the dropped column when reading old files.

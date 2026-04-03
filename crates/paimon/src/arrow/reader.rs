@@ -515,6 +515,38 @@ fn merge_files_by_columns(
         // Collect which file indices we need to open streams for.
         let active_file_indices: Vec<usize> = file_read_columns.keys().copied().collect();
 
+        // Edge case: if no file provides any projected column (e.g. SELECT on a newly added
+        // column that no file contains yet), we still need to emit NULL-filled rows to
+        // preserve the correct row count.
+        if active_file_indices.is_empty() {
+            // All files in a merge group cover the same rows; use the first file's row_count.
+            let total_rows = data_files[0].row_count as usize;
+            let mut emitted = 0;
+            while emitted < total_rows {
+                let rows_to_emit = (total_rows - emitted).min(output_batch_size);
+                let columns: Vec<Arc<dyn arrow_array::Array>> = target_schema
+                    .fields()
+                    .iter()
+                    .map(|f| arrow_array::new_null_array(f.data_type(), rows_to_emit))
+                    .collect();
+                let batch = if columns.is_empty() {
+                    RecordBatch::try_new_with_options(
+                        target_schema.clone(),
+                        columns,
+                        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows_to_emit)),
+                    )
+                } else {
+                    RecordBatch::try_new(target_schema.clone(), columns)
+                }
+                .map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to build NULL-filled RecordBatch: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+                emitted += rows_to_emit;
+                yield batch;
+            }
+        } else {
+
         // Open a stream for each active file.
         // Build per-file read_type: only the DataFields this file is responsible for.
         let mut file_streams: HashMap<usize, ArrowRecordBatchStream> = HashMap::new();
@@ -620,6 +652,7 @@ fn merge_files_by_columns(
             })?;
             yield merged;
         }
+        } // end else (active_file_indices non-empty)
     }
     .boxed())
 }

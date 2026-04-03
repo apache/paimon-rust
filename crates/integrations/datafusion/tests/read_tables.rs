@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
@@ -466,5 +466,60 @@ async fn test_time_travel_by_tag_name() {
             (4, "dave".to_string()),
         ],
         "Tag 'snapshot2' should contain all rows"
+    );
+}
+
+/// Verifies that data evolution merge correctly NULL-fills columns that no file in a
+/// merge group provides (e.g. a newly added column after MERGE INTO on old rows).
+/// Without the fix, `active_file_indices` would be empty and rows would be silently lost.
+#[tokio::test]
+async fn test_data_evolution_drop_column_null_fill() {
+    let batches = collect_query(
+        "data_evolution_drop_column",
+        "SELECT id, name, extra FROM data_evolution_drop_column",
+    )
+    .await
+    .expect("data_evolution_drop_column query should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "Should return 3 rows (not silently drop rows from merge groups missing the new column)"
+    );
+
+    let mut rows: Vec<(i32, String, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("Expected Int32Array for id");
+        let name_array = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for name");
+        let extra_array = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for extra");
+
+        for i in 0..batch.num_rows() {
+            let extra = if extra_array.is_null(i) {
+                None
+            } else {
+                Some(extra_array.value(i).to_string())
+            };
+            rows.push((id_array.value(i), name_array.value(i).to_string(), extra));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".to_string(), None),
+            (2, "bob".to_string(), None),
+            (3, "carol".to_string(), Some("new".to_string())),
+        ],
+        "Old rows should have extra=NULL, new row should have extra='new'"
     );
 }

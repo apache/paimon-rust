@@ -117,8 +117,7 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
 
 fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
     match precision {
-        0 => Ok(TimeUnit::Second),
-        1..=3 => Ok(TimeUnit::Millisecond),
+        0..=3 => Ok(TimeUnit::Millisecond),
         4..=6 => Ok(TimeUnit::Microsecond),
         7..=9 => Ok(TimeUnit::Nanosecond),
         _ => Err(crate::Error::Unsupported {
