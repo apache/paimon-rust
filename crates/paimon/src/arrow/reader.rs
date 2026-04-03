@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::paimon_type_to_arrow;
+use crate::arrow::build_target_arrow_schema;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::{FileIO, FileRead, FileStatus};
@@ -25,7 +25,6 @@ use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
 use arrow_array::RecordBatch;
 use arrow_cast::cast;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -213,22 +212,6 @@ impl ArrowReader {
         }
         .boxed())
     }
-}
-
-/// Build the target Arrow schema from the read type (Paimon DataFields).
-fn build_target_arrow_schema(read_type: &[DataField]) -> crate::Result<Arc<ArrowSchema>> {
-    let fields: Vec<ArrowField> = read_type
-        .iter()
-        .map(|f| {
-            let arrow_type = paimon_type_to_arrow(f.data_type())?;
-            Ok(ArrowField::new(
-                f.name(),
-                arrow_type,
-                f.data_type().is_nullable(),
-            ))
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
 /// Read a single parquet file from a split, returning a lazy stream of batches.

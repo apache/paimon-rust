@@ -20,9 +20,9 @@ pub(crate) mod schema_evolution;
 
 pub use crate::arrow::reader::ArrowReaderBuilder;
 
-use crate::spec::DataType as PaimonDataType;
+use crate::spec::{DataField, DataType as PaimonDataType};
 use arrow_schema::DataType as ArrowDataType;
-use arrow_schema::{Field as ArrowField, TimeUnit};
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use std::sync::Arc;
 
 /// Converts a Paimon [`DataType`](PaimonDataType) to an Arrow [`DataType`](ArrowDataType).
@@ -124,4 +124,20 @@ fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
             message: format!("Unsupported TIMESTAMP precision {precision}"),
         }),
     }
+}
+
+/// Build an Arrow [`Schema`](ArrowSchema) from Paimon [`DataField`]s.
+pub fn build_target_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<ArrowSchema>> {
+    let arrow_fields: Vec<ArrowField> = fields
+        .iter()
+        .map(|f| {
+            let arrow_type = paimon_type_to_arrow(f.data_type())?;
+            Ok(ArrowField::new(
+                f.name(),
+                arrow_type,
+                f.data_type().is_nullable(),
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(Arc::new(ArrowSchema::new(arrow_fields)))
 }

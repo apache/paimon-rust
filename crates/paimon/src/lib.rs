@@ -25,7 +25,7 @@ pub use common::{CatalogOptions, Options};
 pub mod api;
 pub use api::rest_api::RESTApi;
 
-mod arrow;
+pub mod arrow;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;

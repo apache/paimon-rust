@@ -32,7 +32,6 @@ use paimon::table::Table;
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{build_pushed_predicate, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
-use crate::schema::paimon_schema_to_arrow;
 
 /// Read-only table provider for a Paimon table.
 ///
@@ -50,7 +49,8 @@ impl PaimonTableProvider {
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
         let fields = table.schema().fields();
-        let schema = paimon_schema_to_arrow(fields)?;
+        let schema =
+            paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
         Ok(Self { table, schema })
     }
 
