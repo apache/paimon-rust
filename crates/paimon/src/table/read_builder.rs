@@ -60,15 +60,15 @@ impl<'a> ReadBuilder<'a> {
     /// Set a filter predicate for scan planning.
     ///
     /// The predicate should use table schema field indices (as produced by
-    /// [`PredicateBuilder`]).  During [`TableScan::plan`] the filter is
-    /// decomposed at AND boundaries: partition-only conjuncts are extracted
-    /// and used to prune partitions; all other conjuncts are currently
-    /// **ignored** (neither `TableScan` nor `TableRead` applies data-level
-    /// predicates yet).
+    /// [`PredicateBuilder`]). During [`TableScan::plan`], partition-only
+    /// conjuncts are used for partition pruning and supported data conjuncts
+    /// may be used for conservative file-stats pruning.
     ///
-    /// This means rows returned by `TableRead` may **not** satisfy the full
-    /// filter — callers must apply remaining predicates themselves until
-    /// data-level pushdown is implemented.
+    /// Stats pruning is per file. Files with a different `schema_id`,
+    /// incompatible stats layout, or inconclusive stats are kept.
+    ///
+    /// [`TableRead`] does not evaluate row-level filters; callers must apply
+    /// any remaining predicates themselves.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
         self

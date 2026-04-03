@@ -543,7 +543,6 @@ async fn test_read_partitioned_table_with_filter() {
 
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
-    // Build a filter: dt = '2024-01-01'
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
     let filter = pb
@@ -577,7 +576,6 @@ async fn test_read_multi_partitioned_table_with_filter() {
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
 
-    // Filter: dt = '2024-01-01' AND hr = 10
     let filter = Predicate::and(vec![
         pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
         pb.equal("hr", Datum::Int(10)).unwrap(),
@@ -600,7 +598,7 @@ async fn test_read_multi_partitioned_table_with_filter() {
 }
 
 #[tokio::test]
-async fn test_read_partitioned_table_data_only_filter_preserves_all_partitions() {
+async fn test_read_partitioned_table_data_only_filter_prunes_all_files() {
     use paimon::spec::{Datum, PredicateBuilder};
 
     let catalog = create_file_system_catalog();
@@ -608,8 +606,6 @@ async fn test_read_partitioned_table_data_only_filter_preserves_all_partitions()
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
 
-    // Data-only filter: id > 10 — should NOT prune any partitions,
-    // and is still ignored at read level in Phase 2.
     let filter = pb
         .greater_than("id", Datum::Int(10))
         .expect("Failed to build predicate");
@@ -618,24 +614,18 @@ async fn test_read_partitioned_table_data_only_filter_preserves_all_partitions()
     let seen_partitions = extract_plan_partitions(&plan);
     assert_eq!(
         seen_partitions,
-        HashSet::from(["2024-01-01".into(), "2024-01-02".into()]),
-        "Data-only filter should not prune any partitions"
+        HashSet::<String>::new(),
+        "Data-only filter should prune all files when stats prove no match"
     );
 
     let actual = extract_id_name(&batches);
     assert_eq!(
         actual,
-        vec![
-            (1, "alice".to_string()),
-            (2, "bob".to_string()),
-            (3, "carol".to_string()),
-        ],
-        "Data predicate is not applied at read level; all rows are still returned"
+        Vec::<(i32, String)>::new(),
+        "No rows should be planned when stats prove the predicate is unsatisfiable"
     );
 }
 
-/// Mixed AND: partition predicate prunes partitions, but data predicate is
-/// silently ignored — all rows from the matching partition are returned.
 #[tokio::test]
 async fn test_read_partitioned_table_mixed_and_filter() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
@@ -645,8 +635,6 @@ async fn test_read_partitioned_table_mixed_and_filter() {
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
 
-    // dt = '2024-01-01' AND id > 10
-    // Partition conjunct (dt) is applied; data conjunct (id) is NOT.
     let filter = Predicate::and(vec![
         pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
         pb.greater_than("id", Datum::Int(10)).unwrap(),
@@ -656,20 +644,48 @@ async fn test_read_partitioned_table_mixed_and_filter() {
     let seen_partitions = extract_plan_partitions(&plan);
     assert_eq!(
         seen_partitions,
-        HashSet::from(["2024-01-01".into()]),
-        "Only dt=2024-01-01 should survive"
+        HashSet::<String>::new(),
+        "The matching partition should also be pruned when file stats prove no match"
     );
 
     let actual = extract_id_name(&batches);
     assert_eq!(
         actual,
-        vec![(1, "alice".to_string()), (2, "bob".to_string())],
-        "Data predicate (id > 10) is NOT applied — all rows from matching partition returned"
+        Vec::<(i32, String)>::new(),
+        "No rows should remain after partition pruning and data stats pruning"
     );
 }
 
-/// Mixed OR: `dt = '...' OR id > 10` cannot be split into a pure partition
-/// predicate, so no partitions should be pruned.
+#[tokio::test]
+async fn test_read_partitioned_table_data_only_filter_keeps_matching_partition() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "partitioned_log_table").await;
+    let schema = table.schema();
+    let pb = PredicateBuilder::new(schema.fields());
+
+    let filter = pb
+        .greater_than("id", Datum::Int(2))
+        .expect("Failed to build predicate");
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    let seen_partitions = extract_plan_partitions(&plan);
+    assert_eq!(
+        seen_partitions,
+        HashSet::from(["2024-01-02".into()]),
+        "Only files whose stats may satisfy the predicate should remain in the plan"
+    );
+
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(3, "carol".to_string())],
+        "Only rows from files that survive stats pruning should be returned"
+    );
+}
+
+/// Mixed OR cannot be split safely, so no partitions should be pruned.
 #[tokio::test]
 async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
@@ -679,7 +695,6 @@ async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
 
-    // dt = '2024-01-01' OR id > 10 — mixed OR is not safely splittable.
     let filter = Predicate::or(vec![
         pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
         pb.greater_than("id", Datum::Int(10)).unwrap(),
@@ -705,7 +720,7 @@ async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     );
 }
 
-/// Filter that matches no existing partition — all entries pruned, 0 splits.
+/// A filter that matches no partition should produce no splits.
 #[tokio::test]
 async fn test_read_partitioned_table_filter_matches_no_partition() {
     use paimon::spec::{Datum, PredicateBuilder};
@@ -715,7 +730,6 @@ async fn test_read_partitioned_table_filter_matches_no_partition() {
     let schema = table.schema();
     let pb = PredicateBuilder::new(schema.fields());
 
-    // dt = '9999-12-31' matches no partition.
     let filter = pb
         .equal("dt", Datum::String("9999-12-31".into()))
         .expect("Failed to build predicate");
@@ -744,8 +758,7 @@ async fn test_read_partitioned_table_eval_row_error_fails_plan() {
         .position(|f| f.name() == "dt")
         .expect("dt partition column should exist");
 
-    // Use an unsupported DataType in a partition leaf so remapping succeeds
-    // but `eval_row` fails during partition pruning.
+    // Use an unsupported partition type so remapping succeeds but `eval_row` fails.
     let filter = Predicate::Leaf {
         column: "dt".into(),
         index: dt_index,
