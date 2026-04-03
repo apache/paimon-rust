@@ -29,6 +29,7 @@ use crate::spec::{
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 use crate::table::SnapshotManager;
+use crate::table::TagManager;
 use crate::Error;
 use std::collections::{HashMap, HashSet};
 
@@ -254,7 +255,18 @@ impl<'a> TableScan<'a> {
         let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let core_options = CoreOptions::new(self.table.schema().options());
 
-        let snapshot = if let Some(id) = core_options.scan_snapshot_id() {
+        let snapshot = if let Some(tag_name) = core_options.scan_tag_name() {
+            let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
+            match tag_manager.get(tag_name).await? {
+                Some(s) => s,
+                None => {
+                    return Err(Error::DataInvalid {
+                        message: format!("Tag '{tag_name}' doesn't exist."),
+                        source: None,
+                    })
+                }
+            }
+        } else if let Some(id) = core_options.scan_snapshot_id() {
             snapshot_manager.get_snapshot(id).await?
         } else if let Some(ts) = core_options.scan_timestamp_millis() {
             match snapshot_manager.earlier_or_equal_time_mills(ts).await? {

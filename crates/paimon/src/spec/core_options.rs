@@ -25,6 +25,7 @@ const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
+pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
@@ -103,6 +104,11 @@ impl<'a> CoreOptions<'a> {
         self.options
             .get(SCAN_TIMESTAMP_MILLIS_OPTION)
             .and_then(|v| v.parse().ok())
+    }
+
+    /// Tag name for time travel via `scan.tag-name`.
+    pub fn scan_tag_name(&self) -> Option<&str> {
+        self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str)
     }
 }
 

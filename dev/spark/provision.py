@@ -286,6 +286,12 @@ def main():
         """
     )
 
+    # Create tags for tag-based time travel tests
+    # Tag 'snapshot1' points to snapshot 1 (alice, bob)
+    # Tag 'snapshot2' points to snapshot 2 (alice, bob, carol, dave)
+    spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot1', 1)")
+    spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot2', 2)")
+
 
 if __name__ == "__main__":
     main()

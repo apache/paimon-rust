@@ -22,6 +22,7 @@ mod read_builder;
 mod snapshot_manager;
 mod source;
 mod table_scan;
+mod tag_manager;
 
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -30,6 +31,7 @@ pub use read_builder::{ReadBuilder, TableRead};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
 pub use table_scan::TableScan;
+pub use tag_manager::TagManager;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;

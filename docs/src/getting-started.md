@@ -161,39 +161,6 @@ while let Some(batch) = stream.next().await {
 }
 ```
 
-## DataFusion Integration
-
-Query Paimon tables using SQL with [Apache DataFusion](https://datafusion.apache.org/). Add the integration crate:
-
-```toml
-[dependencies]
-paimon = "0.0.0"
-paimon-datafusion = "0.0.0"
-datafusion = "52"
-```
-
-Register a Paimon table and run SQL queries:
-
-```rust
-use std::sync::Arc;
-use datafusion::prelude::SessionContext;
-use paimon_datafusion::PaimonTableProvider;
-
-// Get a Paimon table from your catalog
-let table = catalog.get_table(&identifier).await?;
-
-// Register as a DataFusion table
-let provider = PaimonTableProvider::try_new(table)?;
-let ctx = SessionContext::new();
-ctx.register_table("my_table", Arc::new(provider))?;
-
-// Query with SQL
-let df = ctx.sql("SELECT * FROM my_table").await?;
-df.show().await?;
-```
-
-> **Note:** The DataFusion integration supports full table scans and column projection. Predicate pushdown is not yet implemented.
-
 ## Building from Source
 
 ```bash

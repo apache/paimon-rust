@@ -29,7 +29,7 @@ use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
 use datafusion::sql::sqlparser::ast::{self, TableFactor, TableVersion};
-use paimon::spec::{SCAN_SNAPSHOT_ID_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION};
+use paimon::spec::{SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION};
 
 use crate::table::PaimonTableProvider;
 
@@ -37,7 +37,8 @@ use crate::table::PaimonTableProvider;
 /// on Paimon tables and resolves them to time travel options.
 ///
 /// - Integer literal → sets `scan.snapshot-id` option on the table.
-/// - String literal → parsed as a timestamp, sets `scan.timestamp-millis` option.
+/// - String literal (timestamp) → parsed as a timestamp, sets `scan.timestamp-millis` option.
+/// - String literal (other) → sets `scan.tag-name` option on the table.
 #[derive(Debug)]
 pub struct PaimonRelationPlanner;
 
@@ -138,7 +139,8 @@ fn object_name_to_table_reference(
 /// Resolve `FOR SYSTEM_TIME AS OF <expr>` into table options.
 ///
 /// - Integer literal → `{"scan.snapshot-id": "N"}`
-/// - String literal (timestamp) → parse to millis → `{"scan.timestamp-millis": "M"}`
+/// - String literal (timestamp `YYYY-MM-DD HH:MM:SS`) → `{"scan.timestamp-millis": "M"}`
+/// - String literal (other) → `{"scan.tag-name": "S"}`
 fn resolve_time_travel_options(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
@@ -155,18 +157,24 @@ fn resolve_time_travel_options(expr: &ast::Expr) -> DFResult<HashMap<String, Str
                 )]))
             }
             ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
-                let timestamp_millis = parse_timestamp_to_millis(s)?;
-                Ok(HashMap::from([(
-                    SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
-                    timestamp_millis.to_string(),
-                )]))
+                // Try parsing as timestamp first; fall back to tag name.
+                match parse_timestamp_to_millis(s) {
+                    Ok(timestamp_millis) => Ok(HashMap::from([(
+                        SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
+                        timestamp_millis.to_string(),
+                    )])),
+                    Err(_) => Ok(HashMap::from([(
+                        SCAN_TAG_NAME_OPTION.to_string(),
+                        s.clone(),
+                    )])),
+                }
             }
             _ => Err(datafusion::error::DataFusionError::Plan(format!(
                 "Unsupported time travel expression: {expr}"
             ))),
         },
         _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "Unsupported time travel expression: {expr}. Expected an integer snapshot id or a timestamp string."
+            "Unsupported time travel expression: {expr}. Expected an integer snapshot id, a timestamp string, or a tag name."
         ))),
     }
 }

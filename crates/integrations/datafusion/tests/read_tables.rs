@@ -424,3 +424,47 @@ async fn test_time_travel_by_snapshot_id() {
         "Snapshot 2 should contain all rows"
     );
 }
+
+#[tokio::test]
+async fn test_time_travel_by_tag_name() {
+    let ctx = create_time_travel_context().await;
+
+    // Tag 'snapshot1' points to snapshot 1: should contain only (alice, bob)
+    let batches = ctx
+        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 'snapshot1'")
+        .await
+        .expect("tag time travel query should parse")
+        .collect()
+        .await
+        .expect("tag time travel query should execute");
+
+    let mut rows = extract_id_name_rows(&batches);
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        rows,
+        vec![(1, "alice".to_string()), (2, "bob".to_string())],
+        "Tag 'snapshot1' should contain only the first batch of rows"
+    );
+
+    // Tag 'snapshot2' points to snapshot 2: should contain all rows
+    let batches = ctx
+        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 'snapshot2'")
+        .await
+        .expect("tag time travel query should parse")
+        .collect()
+        .await
+        .expect("tag time travel query should execute");
+
+    let mut rows = extract_id_name_rows(&batches);
+    rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".to_string()),
+            (2, "bob".to_string()),
+            (3, "carol".to_string()),
+            (4, "dave".to_string()),
+        ],
+        "Tag 'snapshot2' should contain all rows"
+    );
+}

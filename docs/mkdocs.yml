@@ -48,6 +48,7 @@ theme:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - DataFusion Integration: datafusion.md
   - Architecture: architecture.md
   - Releases: releases.md
   - Contributing: contributing.md
