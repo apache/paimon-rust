@@ -283,16 +283,23 @@ fn read_single_file_stream(
 
         let mut batch_stream_builder = ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
 
-        // Only project columns that exist in this file.
+        // Project columns by root-level index to correctly handle complex types
+        // (ARRAY, MAP, STRUCT). `ProjectionMask::columns` matches leaf column names
+        // which doesn't work for nested types; `ProjectionMask::roots` uses top-level
+        // field indices instead.
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
-        let file_column_names: Vec<&str> = parquet_schema.columns().iter().map(|c| c.name()).collect();
-        let available_columns: Vec<&str> = parquet_column_names
+        let root_schema = parquet_schema.root_schema();
+        let root_indices: Vec<usize> = parquet_column_names
             .iter()
-            .filter(|name| file_column_names.contains(&name.as_str()))
-            .map(String::as_str)
+            .filter_map(|name| {
+                root_schema
+                    .get_fields()
+                    .iter()
+                    .position(|f| f.name() == name)
+            })
             .collect();
 
-        let mask = ProjectionMask::columns(&parquet_schema, available_columns.iter().copied());
+        let mask = ProjectionMask::roots(&parquet_schema, root_indices);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
         if let Some(ref dv) = dv {
