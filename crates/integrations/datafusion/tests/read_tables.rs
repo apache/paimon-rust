@@ -523,3 +523,76 @@ async fn test_data_evolution_drop_column_null_fill() {
         "Old rows should have extra=NULL, new row should have extra='new'"
     );
 }
+
+// ======================= Complex Type Tests =======================
+
+#[tokio::test]
+async fn test_read_complex_type_table_via_datafusion() {
+    let batches = collect_query(
+        "complex_type_table",
+        "SELECT id, int_array, string_map, row_field FROM complex_type_table ORDER BY id",
+    )
+    .await
+    .expect("Complex type query should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows from complex_type_table");
+
+    // Verify column types exist and are correct
+    for batch in &batches {
+        let schema = batch.schema();
+        assert!(
+            schema.field_with_name("int_array").is_ok(),
+            "int_array column should exist"
+        );
+        assert!(
+            schema.field_with_name("string_map").is_ok(),
+            "string_map column should exist"
+        );
+        assert!(
+            schema.field_with_name("row_field").is_ok(),
+            "row_field column should exist"
+        );
+    }
+
+    // Extract and verify data using Arrow arrays
+    let mut rows: Vec<(i32, String, String, String)> = Vec::new();
+    for batch in &batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("Expected Int32Array for id");
+        let int_array_col = batch.column_by_name("int_array").expect("int_array");
+        let string_map_col = batch.column_by_name("string_map").expect("string_map");
+        let row_field_col = batch.column_by_name("row_field").expect("row_field");
+
+        for i in 0..batch.num_rows() {
+            use datafusion::arrow::util::display::ArrayFormatter;
+            let fmt_opts = datafusion::arrow::util::display::FormatOptions::default();
+
+            let arr_fmt = ArrayFormatter::try_new(int_array_col.as_ref(), &fmt_opts).unwrap();
+            let map_fmt = ArrayFormatter::try_new(string_map_col.as_ref(), &fmt_opts).unwrap();
+            let row_fmt = ArrayFormatter::try_new(row_field_col.as_ref(), &fmt_opts).unwrap();
+
+            rows.push((
+                id_array.value(i),
+                arr_fmt.value(i).to_string(),
+                map_fmt.value(i).to_string(),
+                row_fmt.value(i).to_string(),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, "[1, 2, 3]");
+    assert_eq!(rows[0].3, "{name: alice, value: 100}");
+
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, "[4, 5]");
+    assert_eq!(rows[1].3, "{name: bob, value: 200}");
+
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[2].1, "[]");
+    assert_eq!(rows[2].3, "{name: carol, value: 300}");
+}

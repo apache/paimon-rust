@@ -17,7 +17,10 @@
 
 //! Integration tests for reading Paimon tables provisioned by Spark.
 
-use arrow_array::{Array, ArrowPrimitiveType, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
+    StringArray, StructArray,
+};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
@@ -1216,5 +1219,100 @@ async fn test_read_schema_evolution_drop_column() {
             (4, "dave".into()),
         ],
         "Old rows should be readable after DROP COLUMN, with only remaining columns"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Complex type integration tests
+// ---------------------------------------------------------------------------
+
+/// Test reading a table with complex types: ARRAY<INT>, MAP<STRING, INT>, STRUCT<name: STRING, value: INT>.
+#[tokio::test]
+async fn test_read_complex_type_table() {
+    let (_, batches) = scan_and_read_with_fs_catalog("complex_type_table", None).await;
+
+    #[allow(clippy::type_complexity)]
+    let mut rows: Vec<(i32, Vec<i32>, Vec<(String, i32)>, (String, i32))> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let int_array = batch
+            .column_by_name("int_array")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+            .expect("int_array as ListArray");
+        let string_map = batch
+            .column_by_name("string_map")
+            .and_then(|c| c.as_any().downcast_ref::<MapArray>())
+            .expect("string_map as MapArray");
+        let row_field = batch
+            .column_by_name("row_field")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+            .expect("row_field as StructArray");
+
+        for i in 0..batch.num_rows() {
+            // Extract ARRAY<INT>
+            let list_values = int_array.value(i);
+            let int_arr = list_values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("list element as Int32Array");
+            let arr_vals: Vec<i32> = (0..int_arr.len()).map(|j| int_arr.value(j)).collect();
+
+            // Extract MAP<STRING, INT>
+            let map_val = string_map.value(i);
+            let map_struct = map_val
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("map entries as StructArray");
+            let keys = map_struct
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("map keys");
+            let values = map_struct
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("map values");
+            let mut map_entries: Vec<(String, i32)> = (0..keys.len())
+                .map(|j| (keys.value(j).to_string(), values.value(j)))
+                .collect();
+            map_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Extract STRUCT<name: STRING, value: INT>
+            let struct_name = row_field
+                .column_by_name("name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("struct name");
+            let struct_value = row_field
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("struct value");
+
+            rows.push((
+                id.value(i),
+                arr_vals,
+                map_entries,
+                (struct_name.value(i).to_string(), struct_value.value(i)),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                1,
+                vec![1, 2, 3],
+                vec![("a".into(), 10), ("b".into(), 20)],
+                ("alice".into(), 100),
+            ),
+            (2, vec![4, 5], vec![("c".into(), 30)], ("bob".into(), 200),),
+            (3, vec![], vec![], ("carol".into(), 300),),
+        ],
+        "Complex type table should return correct ARRAY, MAP, and STRUCT values"
     );
 }

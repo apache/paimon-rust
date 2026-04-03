@@ -515,6 +515,26 @@ def main():
         """
     )
 
+    # ===== Complex Types table: ARRAY, MAP, STRUCT =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS complex_type_table (
+            id INT,
+            int_array ARRAY<INT>,
+            string_map MAP<STRING, INT>,
+            row_field STRUCT<name: STRING, value: INT>
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO complex_type_table VALUES
+            (1, array(1, 2, 3), map('a', 10, 'b', 20), named_struct('name', 'alice', 'value', 100)),
+            (2, array(4, 5), map('c', 30), named_struct('name', 'bob', 'value', 200)),
+            (3, array(), map(), named_struct('name', 'carol', 'value', 300))
+        """
+    )
+
 
 if __name__ == "__main__":
     main()
