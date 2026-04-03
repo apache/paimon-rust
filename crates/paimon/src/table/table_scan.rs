@@ -567,6 +567,7 @@ impl<'a> TableScan<'a> {
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let data_evolution_enabled = core_options.data_evolution_enabled();
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let entries = read_all_manifest_entries(file_io, table_path, &snapshot).await?;
@@ -618,7 +619,10 @@ impl<'a> TableScan<'a> {
 
         let current_schema_id = self.table.schema().id();
         let num_fields = self.table.schema().fields().len();
-        let entries = if data_predicates.is_empty() {
+        // Data-evolution tables can spread one logical row across multiple files with
+        // different column sets. Pruning files independently would split merge groups,
+        // so keep the current fail-open behavior until we support group-aware pruning.
+        let entries = if data_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
             entries
@@ -699,8 +703,33 @@ impl<'a> TableScan<'a> {
                 .as_ref()
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
-            let file_groups = split_for_batch(data_files, target_split_size, open_file_cost);
-            for file_group in file_groups {
+            // Data-evolution tables merge overlapping row-id groups column-wise during read.
+            // Keep that split boundary intact and only bin-pack single-file groups.
+            let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
+                let row_id_groups = group_by_overlapping_row_id(data_files);
+                let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
+                    .into_iter()
+                    .partition(|group| group.len() == 1);
+
+                let mut result = Vec::new();
+                for group in multis {
+                    result.push((group, false));
+                }
+
+                let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
+                for file_group in split_for_batch(single_files, target_split_size, open_file_cost) {
+                    result.push((file_group, true));
+                }
+
+                result
+            } else {
+                split_for_batch(data_files, target_split_size, open_file_cost)
+                    .into_iter()
+                    .map(|group| (group, true))
+                    .collect()
+            };
+
+            for (file_group, raw_convertible) in file_groups_with_raw {
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
@@ -714,7 +743,8 @@ impl<'a> TableScan<'a> {
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
-                    .with_data_files(file_group);
+                    .with_data_files(file_group)
+                    .with_raw_convertible(raw_convertible);
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
                 }
@@ -731,7 +761,13 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
+<<<<<<< HEAD
     use super::{data_file_matches_predicates, partition_matches_predicate};
+=======
+    use super::{
+        data_file_matches_predicates, group_by_overlapping_row_id, partition_matches_predicate,
+    };
+>>>>>>> 3418e77 (fix(scan): preserve data-evolution split semantics for stats pruning)
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum,
         DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,
@@ -895,6 +931,41 @@ mod tests {
         }
     }
 
+    fn make_evo_file(
+        name: &str,
+        file_size: i64,
+        row_count: i64,
+        max_seq: i64,
+        first_row_id: Option<i64>,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: max_seq,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: Utc::now(),
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+        }
+    }
+
+    fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {
+        groups
+            .iter()
+            .map(|group| group.iter().map(|file| file.file_name.as_str()).collect())
+            .collect()
+    }
+
     #[test]
     fn test_partition_matches_predicate_decode_failure_fails_open() {
         let predicate = PredicateBuilder::new(&partition_string_field())
@@ -929,6 +1000,82 @@ mod tests {
 
     const TEST_SCHEMA_ID: i64 = 0;
     const TEST_NUM_FIELDS: usize = 1;
+
+    #[test]
+    fn test_group_by_overlapping_row_id_empty() {
+        let result = group_by_overlapping_row_id(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_no_row_ids() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, None),
+            make_evo_file("b", 10, 100, 2, None),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(file_names(&groups), vec![vec!["b"], vec!["a"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_same_range() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 2, Some(0)),
+            make_evo_file("b", 10, 100, 1, Some(0)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_overlapping_ranges() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(50)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_non_overlapping() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(100)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(file_names(&groups), vec![vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_mixed() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 2, Some(0)),
+            make_evo_file("c", 10, 100, 3, None),
+            make_evo_file("d", 10, 100, 4, Some(200)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(
+            file_names(&groups),
+            vec![vec!["c"], vec!["b", "a"], vec!["d"]]
+        );
+    }
+
+    #[test]
+    fn test_group_by_overlapping_row_id_sorted_by_seq() {
+        let files = vec![
+            make_evo_file("a", 10, 100, 1, Some(0)),
+            make_evo_file("b", 10, 100, 3, Some(0)),
+            make_evo_file("c", 10, 100, 2, Some(0)),
+        ];
+        let groups = group_by_overlapping_row_id(files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(file_names(&groups), vec![vec!["b", "c", "a"]]);
+    }
 
     #[test]
     fn test_data_file_matches_eq_prunes_out_of_range() {
