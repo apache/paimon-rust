@@ -154,6 +154,15 @@ impl SnapshotManager {
                 message: format!("snapshot JSON invalid: {e}"),
                 source: Some(Box::new(e)),
             })?;
+        if snapshot.id() != snapshot_id {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "snapshot file id mismatch: in file name is {snapshot_id}, but file contains snapshot id {}",
+                    snapshot.id()
+                ),
+                source: None
+            });
+        }
         Ok(snapshot)
     }
 
