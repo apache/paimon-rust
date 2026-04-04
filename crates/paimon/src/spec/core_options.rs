@@ -23,6 +23,8 @@ const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
+const BUCKET_KEY_OPTION: &str = "bucket-key";
+const BUCKET_OPTION: &str = "bucket";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
@@ -109,6 +111,18 @@ impl<'a> CoreOptions<'a> {
     /// Tag name for time travel via `scan.tag-name`.
     pub fn scan_tag_name(&self) -> Option<&str> {
         self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str)
+    }
+
+    /// Explicit bucket key columns. If not set, defaults to primary keys for PK tables.
+    pub fn bucket_key(&self) -> Option<Vec<String>> {
+        self.options
+            .get(BUCKET_KEY_OPTION)
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+    }
+
+    /// Number of buckets configured via `bucket` option.
+    pub fn bucket(&self) -> Option<i32> {
+        self.options.get(BUCKET_OPTION).and_then(|v| v.parse().ok())
     }
 }
 

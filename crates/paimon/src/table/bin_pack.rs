@@ -93,12 +93,14 @@ mod tests {
             schema_id: 0,
             level: 0,
             extra_files: Vec::new(),
-            creation_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            creation_time: DateTime::<Utc>::from_timestamp(0, 0),
             delete_row_count: None,
             embedded_index: None,
             first_row_id: None,
             write_cols: None,
             external_path: None,
+            file_source: None,
+            value_stats_cols: None,
         }
     }
 

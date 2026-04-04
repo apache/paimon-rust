@@ -15,8 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
+
+/// Deserialize `_NULL_COUNTS` which in Avro is `["null", {"type":"array","items":["null","long"]}]`.
+/// Flattens nullable array with nullable items into `Vec<i64>`, treating null items as 0.
+fn deserialize_null_counts<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<Vec<Option<i64>>> = Option::deserialize(deserializer)?;
+    Ok(opt
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.unwrap_or(0))
+        .collect())
+}
+
+fn serialize_null_counts<S>(value: &[i64], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // Serialize as Option<Vec<Option<i64>>> to match the Avro union schema.
+    let wrapped: Option<Vec<Option<i64>>> = Some(value.iter().copied().map(Some).collect());
+    wrapped.serialize(serializer)
+}
 
 /// The statistics for columns, supports the following stats.
 ///
@@ -34,7 +57,11 @@ pub struct BinaryTableStats {
     max_values: Vec<u8>,
 
     /// the number of nulls of the columns
-    #[serde(rename = "_NULL_COUNTS")]
+    #[serde(
+        rename = "_NULL_COUNTS",
+        deserialize_with = "deserialize_null_counts",
+        serialize_with = "serialize_null_counts"
+    )]
     null_counts: Vec<i64>,
 }
 

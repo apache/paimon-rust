@@ -113,14 +113,18 @@ mod tests {
                         schema_id: 0,
                         level: 1,
                         extra_files: vec![],
-                        creation_time: "2024-09-06T07:45:55.039+00:00"
-                            .parse::<DateTime<Utc>>()
-                            .unwrap(),
+                        creation_time: Some(
+                            "2024-09-06T07:45:55.039+00:00"
+                                .parse::<DateTime<Utc>>()
+                                .unwrap()
+                        ),
                         delete_row_count: Some(0),
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
                         external_path: None,
+                        file_source: None,
+                        value_stats_cols: None,
                     },
                     2
                 ),
@@ -150,14 +154,18 @@ mod tests {
                         schema_id: 0,
                         level: 1,
                         extra_files: vec![],
-                        creation_time: "2024-09-06T07:45:55.039+00:00"
-                            .parse::<DateTime<Utc>>()
-                            .unwrap(),
+                        creation_time: Some(
+                            "2024-09-06T07:45:55.039+00:00"
+                                .parse::<DateTime<Utc>>()
+                                .unwrap()
+                        ),
                         delete_row_count: Some(1),
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
                         external_path: None,
+                        file_source: None,
+                        value_stats_cols: None,
                     },
                     2
                 ),

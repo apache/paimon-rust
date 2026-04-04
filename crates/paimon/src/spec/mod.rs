@@ -62,3 +62,4 @@ pub(crate) use predicate::extract_datum;
 pub use predicate::{
     field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
 };
+pub(crate) mod murmur_hash;

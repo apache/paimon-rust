@@ -573,6 +573,86 @@ def main():
         """
     )
 
+    # ===== Non-PK table with deletion vectors enabled =====
+    # Append-only table with DV: level-0 files should NOT be filtered out
+    # because there is no primary key merge.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS simple_dv_log_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO simple_dv_log_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+
+    # ===== Postpone bucket PK table (bucket = -2) =====
+    # New data lands in bucket-postpone and is NOT visible to readers until compacted.
+    # Without running compaction, the table should appear empty to batch readers.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS postpone_bucket_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '-2',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO postpone_bucket_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+
+
+    # ===== Multi-bucket PK table for bucket predicate filtering tests =====
+    # PK table with bucket=4 so data distributes across multiple buckets.
+    # Bucket key defaults to primary key (id). Used to test that bucket predicate
+    # filtering correctly computes target buckets from equality predicates.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS multi_bucket_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO multi_bucket_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol'),
+            (4, 'dave'),
+            (5, 'eve'),
+            (6, 'frank'),
+            (7, 'grace'),
+            (8, 'heidi')
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

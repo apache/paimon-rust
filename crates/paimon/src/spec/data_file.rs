@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::spec::stats::BinaryTableStats;
-use chrono::serde::ts_milliseconds::deserialize as from_millis;
-use chrono::serde::ts_milliseconds::serialize as to_millis;
+use chrono::serde::ts_milliseconds_option::deserialize as from_millis_opt;
+use chrono::serde::ts_milliseconds_option::serialize as to_millis_opt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -386,16 +386,41 @@ pub struct DataFileMeta {
     pub extra_files: Vec<String>,
     #[serde(
         rename = "_CREATION_TIME",
-        serialize_with = "to_millis",
-        deserialize_with = "from_millis"
+        serialize_with = "to_millis_opt",
+        deserialize_with = "from_millis_opt",
+        default
     )]
-    pub creation_time: DateTime<Utc>,
+    pub creation_time: Option<DateTime<Utc>>,
     #[serde(rename = "_DELETE_ROW_COUNT")]
     // rowCount = add_row_count + delete_row_count.
     pub delete_row_count: Option<i64>,
     // file index filter bytes, if it is small, store in data file meta
     #[serde(rename = "_EMBEDDED_FILE_INDEX", with = "serde_bytes")]
     pub embedded_index: Option<Vec<u8>>,
+
+    /// File source identifier (e.g. APPEND, COMPACT).
+    #[serde(
+        rename = "_FILE_SOURCE",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_source: Option<i32>,
+
+    /// Column names covered by `_VALUE_STATS` when stats are written in dense mode.
+    #[serde(
+        rename = "_VALUE_STATS_COLS",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value_stats_cols: Option<Vec<String>>,
+
+    /// External path for the data file (e.g. when data is stored outside the table directory).
+    #[serde(
+        rename = "_EXTERNAL_PATH",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_path: Option<String>,
 
     /// The starting row ID for this file's data (used in data evolution mode).
     #[serde(
@@ -412,14 +437,6 @@ pub struct DataFileMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub write_cols: Option<Vec<String>>,
-
-    /// External path for the data file (e.g. when data is stored outside the table directory).
-    #[serde(
-        rename = "_EXTERNAL_PATH",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub external_path: Option<String>,
 }
 
 impl Display for DataFileMeta {

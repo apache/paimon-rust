@@ -23,10 +23,11 @@
 use super::Table;
 use crate::arrow::schema_evolution::create_index_mapping;
 use crate::io::FileIO;
+use crate::spec::murmur_hash::compute_bucket_from_datums;
 use crate::spec::{
     eval_row, extract_datum, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataField,
-    DataFileMeta, DataType, Datum, FileKind, IndexManifest, ManifestEntry, PartitionComputer,
-    Predicate, PredicateOperator, Snapshot,
+    DataFileMeta, DataType, Datum, FileKind, IndexManifest, ManifestEntry, ManifestFileMeta,
+    PartitionComputer, Predicate, PredicateOperator, Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan};
@@ -63,16 +64,99 @@ async fn read_manifest_list(
     crate::spec::from_avro_bytes::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
+/// Check whether a manifest file *may* contain entries matching the partition predicate,
+/// using the manifest-level partition stats (min/max over all entries in the manifest).
+///
+/// The `predicate` must already be projected to partition-field indices.
+fn manifest_file_matches_partition_predicate(
+    meta: &ManifestFileMeta,
+    predicate: &Predicate,
+    partition_fields: &[DataField],
+) -> bool {
+    let stats = meta.partition_stats();
+    let num_fields = partition_fields.len();
+
+    let Some(file_stats) = ({
+        let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
+        let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
+        let null_counts = stats.null_counts().clone();
+
+        let stats = FileStatsRows {
+            row_count: meta.num_added_files() + meta.num_deleted_files(),
+            min_values,
+            max_values,
+            null_counts,
+        };
+        stats.arity_matches(num_fields).then_some(stats)
+    }) else {
+        return true;
+    };
+
+    manifest_partition_predicate_may_match(predicate, &file_stats, partition_fields)
+}
+
+fn manifest_partition_predicate_may_match(
+    predicate: &Predicate,
+    stats: &FileStatsRows,
+    partition_fields: &[DataField],
+) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue => true,
+        Predicate::AlwaysFalse => false,
+        Predicate::And(children) => children
+            .iter()
+            .all(|child| manifest_partition_predicate_may_match(child, stats, partition_fields)),
+        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => {
+            let stats_data_type = match partition_fields.get(*index) {
+                Some(f) => f.data_type(),
+                None => return true,
+            };
+            data_leaf_may_match(*index, stats_data_type, data_type, *op, literals, stats)
+        }
+    }
+}
+
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
+/// Applies filters during concurrent manifest reading to reduce entries early:
+/// - Manifest-file-level partition stats pruning (skip entire manifest files)
+/// - DV level-0 filtering per entry
+/// - Partition predicate filtering per entry
+/// - Data-level stats pruning per entry (current schema only, cross-schema fail-open)
+#[allow(clippy::too_many_arguments)]
 async fn read_all_manifest_entries(
     file_io: &FileIO,
     table_path: &str,
     snapshot: &Snapshot,
+    deletion_vectors_enabled: bool,
+    has_primary_keys: bool,
+    partition_predicate: Option<&Predicate>,
+    partition_fields: &[DataField],
+    data_predicates: &[Predicate],
+    current_schema_id: i64,
+    num_fields: usize,
+    target_buckets: Option<&HashSet<i32>>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let mut manifest_files =
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()).await?;
     let delta = read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()).await?;
     manifest_files.extend(delta);
+
+    // Manifest-file-level partition stats pruning: skip entire manifest files
+    // whose partition range doesn't overlap the partition predicate.
+    if let Some(pred) = partition_predicate {
+        if !partition_fields.is_empty() {
+            manifest_files.retain(|meta| {
+                manifest_file_matches_partition_predicate(meta, pred, partition_fields)
+            });
+        }
+    }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
     let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
@@ -85,18 +169,46 @@ async fn read_all_manifest_entries(
         .await?
         .into_iter()
         .flatten()
+        .filter(|entry| {
+            // DV level-0 filtering: only for primary-key tables with DV enabled.
+            // Non-PK (append-only) tables with DV should keep level-0 files.
+            if deletion_vectors_enabled && has_primary_keys && entry.file().level == 0 {
+                return false;
+            }
+            // Postpone bucket filtering: entries in bucket < 0 (e.g. -2 for postpone mode)
+            // are not yet compacted into real buckets and should not be visible to readers.
+            if has_primary_keys && entry.bucket() < 0 {
+                return false;
+            }
+            // Bucket predicate filtering: skip entries whose bucket is not in the target set.
+            if let Some(targets) = target_buckets {
+                if !targets.contains(&entry.bucket()) {
+                    return false;
+                }
+            }
+            // Partition predicate filtering per entry
+            if let Some(pred) = partition_predicate {
+                match partition_matches_predicate(entry.partition(), pred) {
+                    Ok(false) => return false,
+                    Ok(true) => {}
+                    Err(_) => {} // fail-open on error
+                }
+            }
+            // Data-level stats pruning (current schema only, cross-schema fail-open)
+            if !data_predicates.is_empty()
+                && !data_file_matches_predicates(
+                    entry.file(),
+                    data_predicates,
+                    current_schema_id,
+                    num_fields,
+                )
+            {
+                return false;
+            }
+            true
+        })
         .collect();
     Ok(all_entries)
-}
-
-fn filter_manifest_entries(
-    entries: Vec<ManifestEntry>,
-    deletion_vectors_enabled: bool,
-) -> Vec<ManifestEntry> {
-    entries
-        .into_iter()
-        .filter(|entry| !(deletion_vectors_enabled && entry.file().level == 0))
-        .collect()
 }
 
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
@@ -323,6 +435,144 @@ fn split_partition_and_data_predicates(
     };
 
     (partition_predicate, data_predicates)
+}
+
+/// Extract a predicate projected onto the given key columns.
+///
+/// This is a generic utility that works for both partition keys and bucket keys.
+/// Returns `None` if no conjuncts reference the given keys.
+fn extract_predicate_for_keys(
+    filter: &Predicate,
+    fields: &[DataField],
+    keys: &[String],
+) -> Option<Predicate> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mapping = field_idx_to_partition_idx(fields, keys);
+    let projected: Vec<Predicate> = filter
+        .clone()
+        .split_and()
+        .into_iter()
+        .filter_map(|conjunct| conjunct.project_field_index_inclusive(&mapping))
+        .collect();
+    if projected.is_empty() {
+        None
+    } else {
+        Some(Predicate::and(projected))
+    }
+}
+
+/// Compute the set of target buckets from a bucket predicate.
+///
+/// Extracts equal-value literals for each bucket key field from the predicate,
+/// builds a BinaryRow, hashes it, and returns the target bucket(s).
+///
+/// Supports:
+/// - `key = value` (single bucket)
+/// - `key IN (v1, v2, ...)` (multiple buckets)
+/// - AND of the above for composite bucket keys
+///
+/// Returns `None` if the predicate cannot determine target buckets (fail-open).
+fn compute_target_buckets(
+    bucket_predicate: &Predicate,
+    bucket_key_fields: &[DataField],
+    total_buckets: i32,
+) -> Option<HashSet<i32>> {
+    if total_buckets <= 0 || bucket_key_fields.is_empty() {
+        return None;
+    }
+
+    // Collect equal-value candidates per bucket key field (by projected index).
+    // Each field can have one value (Eq) or multiple values (In).
+    let num_keys = bucket_key_fields.len();
+    let mut field_candidates: Vec<Option<Vec<&Datum>>> = vec![None; num_keys];
+
+    collect_eq_candidates(bucket_predicate, &mut field_candidates);
+
+    // All bucket key fields must have candidates.
+    let candidates: Vec<&Vec<&Datum>> =
+        field_candidates.iter().filter_map(|c| c.as_ref()).collect();
+    if candidates.len() != num_keys {
+        return None;
+    }
+
+    // Compute cartesian product of candidates and hash each combination.
+    let mut buckets = HashSet::new();
+    let mut combo: Vec<usize> = vec![0; num_keys];
+    loop {
+        let datums: Vec<(&Datum, &DataType)> = (0..num_keys)
+            .map(|i| {
+                let vals = field_candidates[i].as_ref().unwrap();
+                (vals[combo[i]], bucket_key_fields[i].data_type())
+            })
+            .collect();
+
+        if let Some(bucket) = compute_bucket_from_datums(&datums, total_buckets) {
+            buckets.insert(bucket);
+        } else {
+            return None;
+        }
+
+        // Advance the combination counter (rightmost first).
+        let mut carry = true;
+        for i in (0..num_keys).rev() {
+            if carry {
+                combo[i] += 1;
+                if combo[i] < field_candidates[i].as_ref().unwrap().len() {
+                    carry = false;
+                } else {
+                    combo[i] = 0;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+
+    if buckets.is_empty() {
+        None
+    } else {
+        Some(buckets)
+    }
+}
+
+/// Recursively collect Eq/In literal candidates from a predicate for each bucket key field.
+fn collect_eq_candidates<'a>(
+    predicate: &'a Predicate,
+    field_candidates: &mut Vec<Option<Vec<&'a Datum>>>,
+) {
+    match predicate {
+        Predicate::And(children) => {
+            for child in children {
+                collect_eq_candidates(child, field_candidates);
+            }
+        }
+        Predicate::Leaf {
+            index,
+            op,
+            literals,
+            ..
+        } => {
+            if *index < field_candidates.len() {
+                match op {
+                    PredicateOperator::Eq => {
+                        if let Some(lit) = literals.first() {
+                            field_candidates[*index] = Some(vec![lit]);
+                        }
+                    }
+                    PredicateOperator::In => {
+                        if !literals.is_empty() {
+                            field_candidates[*index] = Some(literals.iter().collect());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Check whether a data file *may* contain rows matching all `predicates`.
@@ -633,6 +883,133 @@ fn extract_stats_datum(row: &BinaryRow, index: usize, data_type: &DataType) -> O
     }
 }
 
+/// Check whether a data-evolution file group *may* contain rows matching all `predicates`.
+///
+/// In data evolution mode, a logical row can be spread across multiple files with
+/// different column sets. After `group_by_overlapping_row_id`, each group contains
+/// files covering the same row ID range. Stats for each field come from the file
+/// with the highest `max_sequence_number` that actually contains that field.
+///
+/// Reference: [DataEvolutionFileStoreScan.evolutionStats](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/DataEvolutionFileStoreScan.java)
+fn data_evolution_group_matches_predicates(
+    group: &[DataFileMeta],
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+) -> bool {
+    if predicates.is_empty() || group.is_empty() {
+        return true;
+    }
+
+    if predicates
+        .iter()
+        .any(|p| matches!(p, Predicate::AlwaysFalse))
+    {
+        return false;
+    }
+    if predicates
+        .iter()
+        .all(|p| matches!(p, Predicate::AlwaysTrue))
+    {
+        return true;
+    }
+
+    // Sort files by max_sequence_number descending so the highest-seq file wins per field.
+    let mut sorted_files: Vec<&DataFileMeta> = group.iter().collect();
+    sorted_files.sort_by(|a, b| b.max_sequence_number.cmp(&a.max_sequence_number));
+
+    // For each table field, find which file (index in sorted_files) provides it,
+    // and the field's offset within that file's stats.
+    let field_sources: Vec<Option<(usize, usize)>> = table_fields
+        .iter()
+        .map(|field| {
+            for (file_idx, file) in sorted_files.iter().enumerate() {
+                let file_columns = file_write_columns(file, table_fields);
+                for (stats_idx, col_name) in file_columns.iter().enumerate() {
+                    if *col_name == field.name() {
+                        return Some((file_idx, stats_idx));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Build per-file stats (lazily, only parse once per file).
+    let file_stats: Vec<Option<FileStatsRows>> = sorted_files
+        .iter()
+        .map(|file| {
+            let num_stats_fields = file_write_columns(file, table_fields).len();
+            FileStatsRows::try_from_data_file(file, num_stats_fields)
+        })
+        .collect();
+
+    // row_count is the max across the group (overlapping row ranges).
+    let row_count = group.iter().map(|f| f.row_count).max().unwrap_or(0);
+
+    predicates.iter().all(|predicate| {
+        data_evolution_predicate_may_match(
+            predicate,
+            table_fields,
+            &field_sources,
+            &file_stats,
+            row_count,
+        )
+    })
+}
+
+/// Resolve which columns a file's stats cover.
+/// If `write_cols` is set, those are the columns. Otherwise, the file covers all table fields.
+fn file_write_columns<'a>(file: &'a DataFileMeta, table_fields: &'a [DataField]) -> Vec<&'a str> {
+    match &file.write_cols {
+        Some(cols) => cols.iter().map(|s| s.as_str()).collect(),
+        None => table_fields.iter().map(|f| f.name()).collect(),
+    }
+}
+
+fn data_evolution_predicate_may_match(
+    predicate: &Predicate,
+    table_fields: &[DataField],
+    field_sources: &[Option<(usize, usize)>],
+    file_stats: &[Option<FileStatsRows>],
+    row_count: i64,
+) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue => true,
+        Predicate::AlwaysFalse => false,
+        Predicate::And(children) => children.iter().all(|child| {
+            data_evolution_predicate_may_match(
+                child,
+                table_fields,
+                field_sources,
+                file_stats,
+                row_count,
+            )
+        }),
+        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => {
+            let Some(source) = field_sources.get(*index).copied().flatten() else {
+                // Field not found in any file — treat as all-null column.
+                return missing_field_may_match(*op, row_count);
+            };
+            let (file_idx, stats_idx) = source;
+            let Some(stats) = &file_stats[file_idx] else {
+                return true; // fail-open if stats unavailable
+            };
+            let stats_data_type = table_fields
+                .get(*index)
+                .map(|f| f.data_type())
+                .unwrap_or(data_type);
+            data_leaf_may_match(stats_idx, stats_data_type, data_type, *op, literals, stats)
+        }
+    }
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -755,13 +1132,8 @@ impl<'a> TableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
-        let entries = read_all_manifest_entries(file_io, table_path, &snapshot).await?;
-        let entries = filter_manifest_entries(entries, deletion_vectors_enabled);
-        let entries = merge_manifest_entries(entries);
-        if entries.is_empty() {
-            return Ok(Plan::new(Vec::new()));
-        }
 
+        // Compute predicates before reading manifests so they can be pushed down.
         let partition_keys = self.table.schema().partition_keys();
         let (partition_predicate, data_predicates) = if let Some(filter) = self.filter.clone() {
             if partition_keys.is_empty() {
@@ -777,52 +1149,127 @@ impl<'a> TableScan<'a> {
             (None, Vec::new())
         };
 
-        let entries = if let Some(ref pred) = partition_predicate {
-            let mut kept = Vec::with_capacity(entries.len());
-            let mut cache: HashMap<Vec<u8>, bool> = HashMap::new();
-            for e in entries {
-                let accept = match cache.get(e.partition()) {
-                    Some(&cached) => cached,
-                    None => {
-                        let partition_bytes = e.partition();
-                        let accept = partition_matches_predicate(partition_bytes, pred)?;
-                        cache.insert(partition_bytes.to_vec(), accept);
-                        accept
-                    }
-                };
-                if accept {
-                    kept.push(e);
-                }
-            }
-            kept
+        // Resolve partition fields for manifest-file-level stats pruning.
+        let partition_fields: Vec<DataField> = partition_keys
+            .iter()
+            .filter_map(|key| {
+                self.table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .find(|f| f.name() == key)
+                    .cloned()
+            })
+            .collect();
+
+        // Data-evolution tables must not prune data files independently.
+        let pushdown_data_predicates = if data_evolution_enabled {
+            &[][..]
         } else {
-            entries
+            &data_predicates
         };
+
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+
+        // Compute target buckets from bucket key predicate for bucket pruning.
+        let target_buckets: Option<HashSet<i32>> = if let Some(filter) = &self.filter {
+            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
+                if has_primary_keys {
+                    self.table
+                        .schema()
+                        .primary_keys()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            });
+            if let Some(total_buckets) = core_options.bucket() {
+                if total_buckets > 0 && !bucket_keys.is_empty() {
+                    let bucket_key_fields: Vec<DataField> = bucket_keys
+                        .iter()
+                        .filter_map(|key| {
+                            self.table
+                                .schema()
+                                .fields()
+                                .iter()
+                                .find(|f| f.name() == key)
+                                .cloned()
+                        })
+                        .collect();
+                    if bucket_key_fields.len() == bucket_keys.len() {
+                        if let Some(bucket_pred) = extract_predicate_for_keys(
+                            filter,
+                            self.table.schema().fields(),
+                            &bucket_keys,
+                        ) {
+                            compute_target_buckets(&bucket_pred, &bucket_key_fields, total_buckets)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let entries = read_all_manifest_entries(
+            file_io,
+            table_path,
+            &snapshot,
+            deletion_vectors_enabled,
+            has_primary_keys,
+            partition_predicate.as_ref(),
+            &partition_fields,
+            pushdown_data_predicates,
+            self.table.schema().id(),
+            self.table.schema().fields().len(),
+            target_buckets.as_ref(),
+        )
+        .await?;
+        let entries = merge_manifest_entries(entries);
         if entries.is_empty() {
             return Ok(Plan::new(Vec::new()));
         }
 
-        // Data-evolution tables can spread one logical row across multiple files with
-        // different column sets. Pruning files independently would split merge groups,
-        // so keep the current fail-open behavior until we support group-aware pruning.
+        // For non-data-evolution tables, cross-schema files were kept (fail-open)
+        // by the pushdown. Apply the full schema-aware filter for those files.
         let entries = if data_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
-            let mut kept = Vec::with_capacity(entries.len());
-            let mut schema_cache: HashMap<i64, Option<Arc<ResolvedStatsSchema>>> = HashMap::new();
-            for entry in entries {
-                if data_file_matches_predicates_for_table(
-                    self.table,
-                    entry.file(),
-                    &data_predicates,
-                    &mut schema_cache,
-                )
-                .await
-                {
-                    kept.push(entry);
+            let current_schema_id = self.table.schema().id();
+            let has_cross_schema = entries
+                .iter()
+                .any(|e| e.file().schema_id != current_schema_id);
+            if !has_cross_schema {
+                entries
+            } else {
+                let mut kept = Vec::with_capacity(entries.len());
+                let mut schema_cache: HashMap<i64, Option<Arc<ResolvedStatsSchema>>> =
+                    HashMap::new();
+                for entry in entries {
+                    if entry.file().schema_id == current_schema_id
+                        || data_file_matches_predicates_for_table(
+                            self.table,
+                            entry.file(),
+                            &data_predicates,
+                            &mut schema_cache,
+                        )
+                        .await
+                    {
+                        kept.push(entry);
+                    }
                 }
+                kept
             }
-            kept
         };
         if entries.is_empty() {
             return Ok(Plan::new(Vec::new()));
@@ -892,8 +1339,26 @@ impl<'a> TableScan<'a> {
 
             // Data-evolution tables merge overlapping row-id groups column-wise during read.
             // Keep that split boundary intact and only bin-pack single-file groups.
+            // Apply group-level predicate filtering after grouping by row_id range.
             let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
+
+                // Filter groups by merged stats before splitting.
+                let row_id_groups: Vec<Vec<DataFileMeta>> = if data_predicates.is_empty() {
+                    row_id_groups
+                } else {
+                    row_id_groups
+                        .into_iter()
+                        .filter(|group| {
+                            data_evolution_group_matches_predicates(
+                                group,
+                                &data_predicates,
+                                self.table.schema().fields(),
+                            )
+                        })
+                        .collect()
+                };
+
                 let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
                     .into_iter()
                     .partition(|group| group.len() == 1);
@@ -949,7 +1414,8 @@ impl<'a> TableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        data_file_matches_predicates, group_by_overlapping_row_id, partition_matches_predicate,
+        compute_target_buckets, data_file_matches_predicates, extract_predicate_for_keys,
+        group_by_overlapping_row_id, partition_matches_predicate,
     };
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum,
@@ -981,12 +1447,14 @@ mod tests {
             schema_id: 0,
             level: 0,
             extra_files: Vec::new(),
-            creation_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            creation_time: DateTime::<Utc>::from_timestamp(0, 0),
             delete_row_count: None,
             embedded_index: None,
             first_row_id,
             write_cols: None,
             external_path: None,
+            file_source: None,
+            value_stats_cols: None,
         }
     }
 
@@ -1143,12 +1611,14 @@ mod tests {
             schema_id,
             level: 1,
             extra_files: Vec::new(),
-            creation_time: Utc::now(),
+            creation_time: Some(Utc::now()),
             delete_row_count: None,
             embedded_index: None,
             first_row_id: None,
             write_cols: None,
             external_path: None,
+            file_source: None,
+            value_stats_cols: None,
         }
     }
 
@@ -1472,5 +1942,201 @@ mod tests {
             deletion_file,
             &DeletionFile::new("file:/tmp/table/index/index-file".into(), 11, 22, Some(33))
         );
+    }
+
+    // ======================== Bucket predicate filtering ========================
+
+    fn bucket_key_fields() -> Vec<DataField> {
+        vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )]
+    }
+
+    #[test]
+    fn test_extract_predicate_for_keys_eq() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+        ];
+        let pb = PredicateBuilder::new(&fields);
+        let filter = Predicate::and(vec![
+            pb.equal("id", Datum::Int(42)).unwrap(),
+            pb.equal("name", Datum::String("alice".into())).unwrap(),
+        ]);
+
+        let keys = vec!["id".to_string()];
+        let extracted = extract_predicate_for_keys(&filter, &fields, &keys);
+        assert!(extracted.is_some());
+        match extracted.unwrap() {
+            Predicate::Leaf {
+                column, index, op, ..
+            } => {
+                assert_eq!(column, "id");
+                assert_eq!(index, 0); // remapped to key index
+                assert_eq!(op, PredicateOperator::Eq);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_predicate_for_keys_no_match() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+        ];
+        let pb = PredicateBuilder::new(&fields);
+        let filter = pb.equal("name", Datum::String("alice".into())).unwrap();
+
+        let keys = vec!["id".to_string()];
+        let extracted = extract_predicate_for_keys(&filter, &fields, &keys);
+        assert!(extracted.is_none());
+    }
+
+    #[test]
+    fn test_compute_target_buckets_single_eq() {
+        let fields = bucket_key_fields();
+        // Build a bucket predicate (already projected to bucket key space, index=0)
+        let pred = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(42)],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 4);
+        assert!(buckets.is_some());
+        let buckets = buckets.unwrap();
+        assert_eq!(buckets.len(), 1);
+        // The bucket should be deterministic
+        let bucket = *buckets.iter().next().unwrap();
+        assert!((0..4).contains(&bucket));
+    }
+
+    #[test]
+    fn test_compute_target_buckets_in_predicate() {
+        let fields = bucket_key_fields();
+        let pred = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::In,
+            literals: vec![Datum::Int(1), Datum::Int(2), Datum::Int(3)],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 4);
+        assert!(buckets.is_some());
+        let buckets = buckets.unwrap();
+        // Should have at most 3 buckets (could be fewer if some hash to the same bucket)
+        assert!(!buckets.is_empty());
+        assert!(buckets.len() <= 3);
+        for &b in &buckets {
+            assert!((0..4).contains(&b));
+        }
+    }
+
+    #[test]
+    fn test_compute_target_buckets_range_returns_none() {
+        let fields = bucket_key_fields();
+        let pred = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Gt,
+            literals: vec![Datum::Int(10)],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 4);
+        assert!(
+            buckets.is_none(),
+            "Range predicates cannot determine target buckets"
+        );
+    }
+
+    #[test]
+    fn test_compute_target_buckets_composite_key() {
+        let fields = vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let pred = Predicate::And(vec![
+            Predicate::Leaf {
+                column: "a".into(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Int(1)],
+            },
+            Predicate::Leaf {
+                column: "b".into(),
+                index: 1,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Int(2)],
+            },
+        ]);
+
+        let buckets = compute_target_buckets(&pred, &fields, 8);
+        assert!(buckets.is_some());
+        let buckets = buckets.unwrap();
+        assert_eq!(buckets.len(), 1);
+        let bucket = *buckets.iter().next().unwrap();
+        assert!((0..8).contains(&bucket));
+    }
+
+    #[test]
+    fn test_compute_target_buckets_partial_key_returns_none() {
+        // Only one of two bucket key fields has an eq predicate
+        let fields = vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let pred = Predicate::Leaf {
+            column: "a".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(1)],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 8);
+        assert!(
+            buckets.is_none(),
+            "Partial bucket key should not determine target buckets"
+        );
+    }
+
+    #[test]
+    fn test_compute_target_buckets_string_key() {
+        let fields = vec![DataField::new(
+            0,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::default()),
+        )];
+        let pred = Predicate::Leaf {
+            column: "name".into(),
+            index: 0,
+            data_type: DataType::VarChar(VarCharType::default()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::String("alice".into())],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 4);
+        assert!(buckets.is_some());
+        let buckets = buckets.unwrap();
+        assert_eq!(buckets.len(), 1);
+        let bucket = *buckets.iter().next().unwrap();
+        assert!((0..4).contains(&bucket));
     }
 }
