@@ -21,6 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::Table;
+use crate::arrow::schema_evolution::create_index_mapping;
 use crate::io::FileIO;
 use crate::spec::{
     eval_row, extract_datum, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataField,
@@ -34,6 +35,7 @@ use crate::table::TagManager;
 use crate::Error;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
@@ -230,19 +232,8 @@ struct FileStatsRows {
 }
 
 impl FileStatsRows {
-    /// Build file stats only when they are compatible with the current table schema.
-    ///
-    /// Schema-evolved files are conservatively skipped here so callers don't
-    /// accidentally interpret old stats rows using current field indexes.
-    fn try_from_data_file(
-        file: &DataFileMeta,
-        current_schema_id: i64,
-        expected_fields: usize,
-    ) -> Option<Self> {
-        if file.schema_id != current_schema_id {
-            return None;
-        }
-
+    /// Build file stats only when they are compatible with the expected file schema.
+    fn try_from_data_file(file: &DataFileMeta, expected_fields: usize) -> Option<Self> {
         let stats = Self {
             row_count: file.row_count,
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
@@ -276,6 +267,27 @@ impl FileStatsRows {
     }
 }
 
+#[derive(Debug)]
+struct ResolvedStatsSchema {
+    file_fields: Vec<DataField>,
+    field_mapping: Vec<Option<usize>>,
+}
+
+fn identity_field_mapping(num_fields: usize) -> Vec<Option<usize>> {
+    (0..num_fields).map(Some).collect()
+}
+
+fn normalize_field_mapping(mapping: Option<Vec<i32>>, num_fields: usize) -> Vec<Option<usize>> {
+    mapping
+        .map(|field_mapping| {
+            field_mapping
+                .into_iter()
+                .map(|index| usize::try_from(index).ok())
+                .collect()
+        })
+        .unwrap_or_else(|| identity_field_mapping(num_fields))
+}
+
 fn split_partition_and_data_predicates(
     filter: Predicate,
     fields: &[DataField],
@@ -286,9 +298,16 @@ fn split_partition_and_data_predicates(
     let mut data_predicates = Vec::new();
 
     for conjunct in filter.split_and() {
-        match conjunct.clone().remap_field_index(&mapping) {
-            Some(remapped) => partition_predicates.push(remapped),
-            None => data_predicates.push(conjunct),
+        let strict_partition_only = conjunct.references_only_mapped_fields(&mapping);
+
+        if let Some(projected) = conjunct.project_field_index_inclusive(&mapping) {
+            partition_predicates.push(projected);
+        }
+
+        // Keep any conjunct that is not fully partition-only for data-level
+        // stats pruning, even if part of it contributed to partition pruning.
+        if !strict_partition_only {
+            data_predicates.push(conjunct);
         }
     }
 
@@ -332,14 +351,87 @@ fn data_file_matches_predicates(
         return true;
     }
 
+    if file.schema_id != current_schema_id {
+        return true;
+    }
+
     // Fail open if schema evolution or stats layout make index-based access unsafe.
-    let Some(stats) = FileStatsRows::try_from_data_file(file, current_schema_id, num_fields) else {
+    let Some(stats) = FileStatsRows::try_from_data_file(file, num_fields) else {
         return true;
     };
 
     predicates
         .iter()
         .all(|predicate| data_predicate_may_match(predicate, &stats))
+}
+
+async fn resolve_stats_schema(
+    table: &Table,
+    file_schema_id: i64,
+    schema_cache: &mut HashMap<i64, Option<Arc<ResolvedStatsSchema>>>,
+) -> Option<Arc<ResolvedStatsSchema>> {
+    if let Some(cached) = schema_cache.get(&file_schema_id) {
+        return cached.clone();
+    }
+
+    let table_schema = table.schema();
+    let current_fields = table_schema.fields();
+    let resolved = if file_schema_id == table_schema.id() {
+        Some(Arc::new(ResolvedStatsSchema {
+            file_fields: current_fields.to_vec(),
+            field_mapping: identity_field_mapping(current_fields.len()),
+        }))
+    } else {
+        let file_schema = table.schema_manager().schema(file_schema_id).await.ok()?;
+        let file_fields = file_schema.fields().to_vec();
+        Some(Arc::new(ResolvedStatsSchema {
+            field_mapping: normalize_field_mapping(
+                create_index_mapping(current_fields, &file_fields),
+                current_fields.len(),
+            ),
+            file_fields,
+        }))
+    };
+
+    schema_cache.insert(file_schema_id, resolved.clone());
+    resolved
+}
+
+async fn data_file_matches_predicates_for_table(
+    table: &Table,
+    file: &DataFileMeta,
+    predicates: &[Predicate],
+    schema_cache: &mut HashMap<i64, Option<Arc<ResolvedStatsSchema>>>,
+) -> bool {
+    if predicates.is_empty() {
+        return true;
+    }
+
+    if file.schema_id == table.schema().id() {
+        return data_file_matches_predicates(
+            file,
+            predicates,
+            table.schema().id(),
+            table.schema().fields().len(),
+        );
+    }
+
+    let Some(resolved) = resolve_stats_schema(table, file.schema_id, schema_cache).await else {
+        return true;
+    };
+
+    let Some(stats) = FileStatsRows::try_from_data_file(file, resolved.file_fields.len()) else {
+        return true;
+    };
+
+    predicates.iter().all(|predicate| {
+        data_predicate_may_match_with_schema(
+            predicate,
+            &stats,
+            &resolved.field_mapping,
+            &resolved.file_fields,
+        )
+    })
 }
 
 fn data_predicate_may_match(predicate: &Predicate, stats: &FileStatsRows) -> bool {
@@ -357,13 +449,53 @@ fn data_predicate_may_match(predicate: &Predicate, stats: &FileStatsRows) -> boo
             op,
             literals,
             ..
-        } => data_leaf_may_match(*index, data_type, *op, literals, stats),
+        } => data_leaf_may_match(*index, data_type, data_type, *op, literals, stats),
+    }
+}
+
+fn data_predicate_may_match_with_schema(
+    predicate: &Predicate,
+    stats: &FileStatsRows,
+    field_mapping: &[Option<usize>],
+    file_fields: &[DataField],
+) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue => true,
+        Predicate::AlwaysFalse => false,
+        Predicate::And(children) => children.iter().all(|child| {
+            data_predicate_may_match_with_schema(child, stats, field_mapping, file_fields)
+        }),
+        // Keep the first version conservative: only prune simple leaves and conjunctions.
+        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => match field_mapping.get(*index).copied().flatten() {
+            Some(file_index) => {
+                let Some(file_field) = file_fields.get(file_index) else {
+                    return true;
+                };
+                data_leaf_may_match(
+                    file_index,
+                    file_field.data_type(),
+                    data_type,
+                    *op,
+                    literals,
+                    stats,
+                )
+            }
+            None => missing_field_may_match(*op, stats.row_count),
+        },
     }
 }
 
 fn data_leaf_may_match(
     index: usize,
-    data_type: &DataType,
+    stats_data_type: &DataType,
+    predicate_data_type: &DataType,
     op: PredicateOperator,
     literals: &[Datum],
     stats: &FileStatsRows,
@@ -406,7 +538,8 @@ fn data_leaf_may_match(
     let min_value = match stats
         .min_values
         .as_ref()
-        .and_then(|row| extract_stats_datum(row, index, data_type))
+        .and_then(|row| extract_stats_datum(row, index, stats_data_type))
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
     {
         Some(value) => value,
         None => return true,
@@ -414,7 +547,8 @@ fn data_leaf_may_match(
     let max_value = match stats
         .max_values
         .as_ref()
-        .and_then(|row| extract_stats_datum(row, index, data_type))
+        .and_then(|row| extract_stats_datum(row, index, stats_data_type))
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
     {
         Some(value) => value,
         None => return true,
@@ -442,6 +576,43 @@ fn data_leaf_may_match(
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
         | PredicateOperator::NotIn => true,
+    }
+}
+
+fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> bool {
+    if row_count <= 0 {
+        return false;
+    }
+
+    matches!(op, PredicateOperator::IsNull)
+}
+
+fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType) -> Option<Datum> {
+    match (datum, predicate_data_type) {
+        (datum @ Datum::Bool(_), DataType::Boolean(_))
+        | (datum @ Datum::TinyInt(_), DataType::TinyInt(_))
+        | (datum @ Datum::SmallInt(_), DataType::SmallInt(_))
+        | (datum @ Datum::Int(_), DataType::Int(_))
+        | (datum @ Datum::Long(_), DataType::BigInt(_))
+        | (datum @ Datum::Float(_), DataType::Float(_))
+        | (datum @ Datum::Double(_), DataType::Double(_))
+        | (datum @ Datum::String(_), DataType::VarChar(_))
+        | (datum @ Datum::String(_), DataType::Char(_))
+        | (datum @ Datum::Bytes(_), DataType::Binary(_))
+        | (datum @ Datum::Bytes(_), DataType::VarBinary(_))
+        | (datum @ Datum::Date(_), DataType::Date(_))
+        | (datum @ Datum::Time(_), DataType::Time(_))
+        | (datum @ Datum::Timestamp { .. }, DataType::Timestamp(_))
+        | (datum @ Datum::LocalZonedTimestamp { .. }, DataType::LocalZonedTimestamp(_))
+        | (datum @ Datum::Decimal { .. }, DataType::Decimal(_)) => Some(datum),
+        (Datum::TinyInt(value), DataType::SmallInt(_)) => Some(Datum::SmallInt(value as i16)),
+        (Datum::TinyInt(value), DataType::Int(_)) => Some(Datum::Int(value as i32)),
+        (Datum::TinyInt(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
+        (Datum::SmallInt(value), DataType::Int(_)) => Some(Datum::Int(value as i32)),
+        (Datum::SmallInt(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
+        (Datum::Int(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
+        (Datum::Float(value), DataType::Double(_)) => Some(Datum::Double(value as f64)),
+        _ => None,
     }
 }
 
@@ -626,25 +797,27 @@ impl<'a> TableScan<'a> {
             return Ok(Plan::new(Vec::new()));
         }
 
-        let current_schema_id = self.table.schema().id();
-        let num_fields = self.table.schema().fields().len();
         // Data-evolution tables can spread one logical row across multiple files with
         // different column sets. Pruning files independently would split merge groups,
         // so keep the current fail-open behavior until we support group-aware pruning.
         let entries = if data_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
-            entries
-                .into_iter()
-                .filter(|entry| {
-                    data_file_matches_predicates(
-                        entry.file(),
-                        &data_predicates,
-                        current_schema_id,
-                        num_fields,
-                    )
-                })
-                .collect()
+            let mut kept = Vec::with_capacity(entries.len());
+            let mut schema_cache: HashMap<i64, Option<Arc<ResolvedStatsSchema>>> = HashMap::new();
+            for entry in entries {
+                if data_file_matches_predicates_for_table(
+                    self.table,
+                    entry.file(),
+                    &data_predicates,
+                    &mut schema_cache,
+                )
+                .await
+                {
+                    kept.push(entry);
+                }
+            }
+            kept
         };
         if entries.is_empty() {
             return Ok(Plan::new(Vec::new()));
@@ -770,13 +943,9 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-<<<<<<< HEAD
-    use super::{data_file_matches_predicates, partition_matches_predicate};
-=======
     use super::{
         data_file_matches_predicates, group_by_overlapping_row_id, partition_matches_predicate,
     };
->>>>>>> 3418e77 (fix(scan): preserve data-evolution split semantics for stats pruning)
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum,
         DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,

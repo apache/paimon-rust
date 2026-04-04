@@ -391,7 +391,7 @@ impl Predicate {
     /// a mixed predicate is never partially remapped.
     ///
     /// `mapping` is the output of `field_idx_to_partition_idx`.
-    pub(crate) fn remap_field_index(self, mapping: &[Option<usize>]) -> Option<Predicate> {
+    pub(crate) fn remap_field_index(&self, mapping: &[Option<usize>]) -> Option<Predicate> {
         match self {
             Predicate::Leaf {
                 column,
@@ -400,25 +400,25 @@ impl Predicate {
                 op,
                 literals,
             } => {
-                let new_index = (*mapping.get(index)?)?;
+                let new_index = (*mapping.get(*index)?)?;
                 Some(Predicate::Leaf {
-                    column,
+                    column: column.clone(),
                     index: new_index,
-                    data_type,
-                    op,
-                    literals,
+                    data_type: data_type.clone(),
+                    op: *op,
+                    literals: literals.clone(),
                 })
             }
             Predicate::And(children) => {
                 let remapped: Option<Vec<_>> = children
-                    .into_iter()
+                    .iter()
                     .map(|c| c.remap_field_index(mapping))
                     .collect();
                 Some(Predicate::and(remapped?))
             }
             Predicate::Or(children) => {
                 let remapped: Option<Vec<_>> = children
-                    .into_iter()
+                    .iter()
                     .map(|c| c.remap_field_index(mapping))
                     .collect();
                 Some(Predicate::or(remapped?))
@@ -426,6 +426,77 @@ impl Predicate {
             Predicate::Not(inner) => {
                 let remapped = inner.remap_field_index(mapping)?;
                 Some(Predicate::negate(remapped))
+            }
+            Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
+            Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
+        }
+    }
+
+    /// Check whether every leaf field in this subtree is present in `mapping`.
+    ///
+    /// This is used to decide whether the original conjunct still needs to be
+    /// retained as a residual data predicate after partition projection.
+    pub(crate) fn references_only_mapped_fields(&self, mapping: &[Option<usize>]) -> bool {
+        match self {
+            Predicate::Leaf { index, .. } => mapping.get(*index).is_some_and(Option::is_some),
+            Predicate::And(children) | Predicate::Or(children) => children
+                .iter()
+                .all(|child| child.references_only_mapped_fields(mapping)),
+            Predicate::Not(inner) => inner.references_only_mapped_fields(mapping),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => true,
+        }
+    }
+
+    /// Project leaf field indices from table schema space into a smaller field space.
+    ///
+    /// Unlike [`Self::remap_field_index`], mixed `AND` subtrees keep the children
+    /// that can be projected and drop the rest. `OR` and `NOT` still require all
+    /// children to be projectable to preserve correctness.
+    ///
+    /// This matches the partition predicate extraction semantics used by Java
+    /// `splitPartitionPredicatesAndDataPredicates`.
+    pub(crate) fn project_field_index_inclusive(
+        &self,
+        mapping: &[Option<usize>],
+    ) -> Option<Predicate> {
+        match self {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                literals,
+            } => {
+                let new_index = (*mapping.get(*index)?)?;
+                Some(Predicate::Leaf {
+                    column: column.clone(),
+                    index: new_index,
+                    data_type: data_type.clone(),
+                    op: *op,
+                    literals: literals.clone(),
+                })
+            }
+            Predicate::And(children) => {
+                let projected: Vec<_> = children
+                    .iter()
+                    .filter_map(|c| c.project_field_index_inclusive(mapping))
+                    .collect();
+                if projected.is_empty() {
+                    None
+                } else {
+                    Some(Predicate::and(projected))
+                }
+            }
+            Predicate::Or(children) => {
+                let projected: Option<Vec<_>> = children
+                    .iter()
+                    .map(|c| c.project_field_index_inclusive(mapping))
+                    .collect();
+                Some(Predicate::or(projected?))
+            }
+            Predicate::Not(inner) => {
+                let projected = inner.remap_field_index(mapping)?;
+                Some(Predicate::negate(projected))
             }
             Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
             Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
@@ -1712,5 +1783,102 @@ mod tests {
 
         // NOT(partition AND data) → mixed under NOT → None
         assert!(negated.remap_field_index(&mapping).is_none());
+    }
+
+    // ================== project_field_index_inclusive ==================
+
+    #[test]
+    fn test_project_inclusive_and_keeps_partition_children() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let mixed = Predicate::and(vec![
+            pb.equal("dt", Datum::Date(19723)).unwrap(),
+            pb.greater_than("id", Datum::Int(10)).unwrap(),
+        ]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        let projected = mixed.project_field_index_inclusive(&mapping).unwrap();
+        match projected {
+            Predicate::Leaf { column, index, .. } => {
+                assert_eq!(column, "dt");
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected projected partition leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_project_inclusive_and_all_data_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let data_only = Predicate::and(vec![
+            pb.equal("id", Datum::Int(1)).unwrap(),
+            pb.equal("name", Datum::String("alice".into())).unwrap(),
+        ]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        assert!(data_only.project_field_index_inclusive(&mapping).is_none());
+    }
+
+    #[test]
+    fn test_project_inclusive_or_with_mixed_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let p_partition = pb.equal("dt", Datum::Date(19723)).unwrap();
+        let p_data = pb.equal("id", Datum::Int(1)).unwrap();
+        let combined = Predicate::or(vec![p_partition, p_data]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        assert!(combined.project_field_index_inclusive(&mapping).is_none());
+    }
+
+    #[test]
+    fn test_project_inclusive_or_of_mixed_ands_projects_each_branch() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let left = Predicate::and(vec![
+            pb.equal("dt", Datum::Date(19723)).unwrap(),
+            pb.greater_than("id", Datum::Int(10)).unwrap(),
+        ]);
+        let right = Predicate::and(vec![
+            pb.equal("hr", Datum::Int(10)).unwrap(),
+            pb.equal("name", Datum::String("alice".into())).unwrap(),
+        ]);
+        let combined = Predicate::or(vec![left, right]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        let projected = combined.project_field_index_inclusive(&mapping).unwrap();
+        match projected {
+            Predicate::Or(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(
+                    &children[0],
+                    Predicate::Leaf {
+                        column,
+                        index: 0,
+                        ..
+                    } if column == "dt"
+                ));
+                assert!(matches!(
+                    &children[1],
+                    Predicate::Leaf {
+                        column,
+                        index: 1,
+                        ..
+                    } if column == "hr"
+                ));
+            }
+            other => panic!("expected projected OR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_project_inclusive_not_with_mixed_returns_none() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let inner = Predicate::and(vec![
+            pb.equal("dt", Datum::Date(19723)).unwrap(),
+            pb.greater_than("id", Datum::Int(10)).unwrap(),
+        ]);
+        let mapping = vec![None, None, Some(0), Some(1)];
+
+        assert!(Predicate::negate(inner)
+            .project_field_index_inclusive(&mapping)
+            .is_none());
     }
 }

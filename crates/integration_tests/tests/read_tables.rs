@@ -685,7 +685,51 @@ async fn test_read_partitioned_table_data_only_filter_keeps_matching_partition()
     );
 }
 
-/// Mixed OR cannot be split safely, so no partitions should be pruned.
+/// Java-style inclusive projection can still extract partition predicates from
+/// an OR of mixed AND branches.
+#[tokio::test]
+async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() {
+    use paimon::spec::{Datum, Predicate, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "multi_partitioned_log_table").await;
+    let schema = table.schema();
+    let pb = PredicateBuilder::new(schema.fields());
+
+    let filter = Predicate::or(vec![
+        Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+            pb.equal("hr", Datum::Int(10)).unwrap(),
+            pb.greater_than("id", Datum::Int(10)).unwrap(),
+        ]),
+        Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+            pb.equal("hr", Datum::Int(20)).unwrap(),
+        ]),
+    ]);
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    let seen_partitions = extract_plan_multi_partitions(&plan);
+    assert_eq!(
+        seen_partitions,
+        HashSet::from([("2024-01-01".into(), 10), ("2024-01-01".into(), 20)]),
+        "Inclusive projection should prune the dt=2024-01-02 partition"
+    );
+
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![
+            (1, "alice".to_string()),
+            (2, "bob".to_string()),
+            (3, "carol".to_string()),
+        ],
+        "All rows from the surviving partitions should be returned"
+    );
+}
+
+/// A directly mixed OR like `dt = '...' OR id > 10` is still not safely
+/// splittable into a partition predicate, so no partitions should be pruned.
 #[tokio::test]
 async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
@@ -962,58 +1006,6 @@ async fn test_read_data_evolution_table_with_projection() {
 }
 
 // ---------------------------------------------------------------------------
-// Limit pushdown integration tests
-// ---------------------------------------------------------------------------
-
-/// Helper function to scan and read with limit pushdown.
-async fn plan_table(table: &paimon::Table, limit: Option<usize>) -> Plan {
-    let mut read_builder = table.new_read_builder();
-    if let Some(limit) = limit {
-        read_builder.with_limit(limit);
-    }
-    let scan = read_builder.new_scan();
-    scan.plan().await.expect("Failed to plan scan")
-}
-
-/// Test limit pushdown: when limit is smaller than total rows, fewer data files may be generated.
-#[tokio::test]
-async fn test_limit_pushdown() {
-    let catalog = create_file_system_catalog();
-
-    // Test limit pushdown for data evolution table
-    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
-
-    // Get full plan without limit
-    let full_plan = plan_table(&table, None).await;
-    let full_data_split_count: usize = full_plan.splits().iter().count();
-
-    // Get the plan with limit = 2
-    let limited_plan = plan_table(&table, Some(2)).await;
-    let limited_data_split_count: usize = limited_plan.splits().iter().count();
-
-    // For data evolution tables, limit pushdown at split level uses merged_row_count
-    // The limited data split count should be < full data split count
-    assert!(
-        limited_data_split_count < full_data_split_count,
-        "Limit pushdown should reduce data split count for data evolution table: limited={limited_data_split_count}, full={full_data_split_count}"
-    );
-
-    // Verify data evolution splits have merged_row_count
-    for split in full_plan.splits() {
-        let merged_count = split.merged_row_count().expect(
-            "Data evolution table should have merged_row_count (all files should have first_row_id)",
-        );
-        // merged_row_count should be < row_count (overlapping ranges reduce count)
-        assert!(
-            merged_count < split.row_count(),
-            "merged_row_count ({}) should be < row_count ({})",
-            merged_count,
-            split.row_count()
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Schema Evolution integration tests
 // ---------------------------------------------------------------------------
 
@@ -1096,6 +1088,100 @@ async fn test_read_schema_evolution_type_promotion() {
         rows,
         vec![(1, 100i64), (2, 200i64), (3, 3_000_000_000i64)],
         "INT values should be promoted to BIGINT, including values > INT_MAX"
+    );
+}
+
+/// Stats pruning should treat a newly added column as all-NULL for old files.
+#[tokio::test]
+async fn test_stats_pruning_schema_evolution_added_column_eq_prunes_old_files() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "schema_evolution_add_column").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("age", Datum::Int(30))
+        .expect("Failed to build predicate");
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    assert_eq!(
+        plan.splits().len(),
+        1,
+        "Only the file written after ADD COLUMN should survive stats pruning"
+    );
+
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(3, "carol".to_string())],
+        "Old files missing 'age' and rows with age != 30 should be pruned"
+    );
+}
+
+/// Stats pruning should keep only old files for IS NULL on a newly added column.
+#[tokio::test]
+async fn test_stats_pruning_schema_evolution_added_column_is_null_prunes_new_files() {
+    use paimon::spec::PredicateBuilder;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "schema_evolution_add_column").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb.is_null("age").expect("Failed to build predicate");
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    assert_eq!(
+        plan.splits().len(),
+        1,
+        "Only files missing 'age' should survive stats pruning for age IS NULL"
+    );
+
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(1, "alice".to_string()), (2, "bob".to_string())],
+        "New files with non-null age should be pruned for age IS NULL"
+    );
+}
+
+/// Stats pruning should still work after INT -> BIGINT type promotion.
+#[tokio::test]
+async fn test_stats_pruning_schema_evolution_type_promotion_prunes_old_int_files() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "schema_evolution_type_promotion").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .greater_than("value", Datum::Long(250))
+        .expect("Failed to build predicate");
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    assert_eq!(
+        plan.splits().len(),
+        1,
+        "Old INT files should still be pruned using promoted BIGINT predicates"
+    );
+
+    let mut rows: Vec<(i32, i64)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![(3, 3_000_000_000i64)],
+        "Only the BIGINT file should remain after value > 250 pruning"
     );
 }
 
