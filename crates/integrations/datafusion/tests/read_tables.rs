@@ -586,13 +586,16 @@ async fn test_read_complex_type_table_via_datafusion() {
 
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "[1, 2, 3]");
+    assert_eq!(rows[0].2, "{a: 10, b: 20}");
     assert_eq!(rows[0].3, "{name: alice, value: 100}");
 
     assert_eq!(rows[1].0, 2);
     assert_eq!(rows[1].1, "[4, 5]");
+    assert_eq!(rows[1].2, "{c: 30}");
     assert_eq!(rows[1].3, "{name: bob, value: 200}");
 
     assert_eq!(rows[2].0, 3);
     assert_eq!(rows[2].1, "[]");
+    assert_eq!(rows[2].2, "{}");
     assert_eq!(rows[2].3, "{name: carol, value: 300}");
 }
