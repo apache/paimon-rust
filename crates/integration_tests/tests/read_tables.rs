@@ -1006,6 +1006,58 @@ async fn test_read_data_evolution_table_with_projection() {
 }
 
 // ---------------------------------------------------------------------------
+// Limit pushdown integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper function to scan and read with limit pushdown.
+async fn plan_table(table: &paimon::Table, limit: Option<usize>) -> Plan {
+    let mut read_builder = table.new_read_builder();
+    if let Some(limit) = limit {
+        read_builder.with_limit(limit);
+    }
+    let scan = read_builder.new_scan();
+    scan.plan().await.expect("Failed to plan scan")
+}
+
+/// Test limit pushdown: when limit is smaller than total rows, fewer data files may be generated.
+#[tokio::test]
+async fn test_limit_pushdown() {
+    let catalog = create_file_system_catalog();
+
+    // Test limit pushdown for data evolution table
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    // Get full plan without limit
+    let full_plan = plan_table(&table, None).await;
+    let full_data_split_count: usize = full_plan.splits().iter().count();
+
+    // Get the plan with limit = 2
+    let limited_plan = plan_table(&table, Some(2)).await;
+    let limited_data_split_count: usize = limited_plan.splits().iter().count();
+
+    // For data evolution tables, limit pushdown at split level uses merged_row_count
+    // The limited data split count should be < full data split count
+    assert!(
+        limited_data_split_count < full_data_split_count,
+        "Limit pushdown should reduce data split count for data evolution table: limited={limited_data_split_count}, full={full_data_split_count}"
+    );
+
+    // Verify data evolution splits have merged_row_count
+    for split in full_plan.splits() {
+        let merged_count = split.merged_row_count().expect(
+            "Data evolution table should have merged_row_count (all files should have first_row_id)",
+        );
+        // merged_row_count should be < row_count (overlapping ranges reduce count)
+        assert!(
+            merged_count < split.row_count(),
+            "merged_row_count ({}) should be < row_count ({})",
+            merged_count,
+            split.row_count()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Schema Evolution integration tests
 // ---------------------------------------------------------------------------
 
