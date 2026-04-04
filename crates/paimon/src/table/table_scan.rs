@@ -86,6 +86,7 @@ fn manifest_file_matches_partition_predicate(
             min_values,
             max_values,
             null_counts,
+            stats_col_mapping: None,
         };
         stats.arity_matches(num_fields).then_some(stats)
     }) else {
@@ -140,8 +141,9 @@ async fn read_all_manifest_entries(
     partition_fields: &[DataField],
     data_predicates: &[Predicate],
     current_schema_id: i64,
-    num_fields: usize,
-    target_buckets: Option<&HashSet<i32>>,
+    schema_fields: &[DataField],
+    bucket_predicate: Option<&Predicate>,
+    bucket_key_fields: &[DataField],
 ) -> crate::Result<Vec<ManifestEntry>> {
     let mut manifest_files =
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()).await?;
@@ -159,6 +161,8 @@ async fn read_all_manifest_entries(
     }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
+    // Cache target buckets by total_buckets value (few distinct values in practice).
+    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
     let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
         .map(|meta| {
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
@@ -180,10 +184,16 @@ async fn read_all_manifest_entries(
             if has_primary_keys && entry.bucket() < 0 {
                 return false;
             }
-            // Bucket predicate filtering: skip entries whose bucket is not in the target set.
-            if let Some(targets) = target_buckets {
-                if !targets.contains(&entry.bucket()) {
-                    return false;
+            // Bucket predicate filtering: compute target buckets using entry's total_buckets.
+            if let Some(pred) = bucket_predicate {
+                let total = entry.total_buckets();
+                let targets = bucket_cache
+                    .entry(total)
+                    .or_insert_with(|| compute_target_buckets(pred, bucket_key_fields, total));
+                if let Some(targets) = targets {
+                    if !targets.contains(&entry.bucket()) {
+                        return false;
+                    }
                 }
             }
             // Partition predicate filtering per entry
@@ -200,7 +210,7 @@ async fn read_all_manifest_entries(
                     entry.file(),
                     data_predicates,
                     current_schema_id,
-                    num_fields,
+                    schema_fields,
                 )
             {
                 return false;
@@ -346,30 +356,68 @@ struct FileStatsRows {
     min_values: Option<BinaryRow>,
     max_values: Option<BinaryRow>,
     null_counts: Vec<i64>,
+    /// Maps schema field index → stats index. `None` means identity mapping
+    /// (stats cover all schema fields in order). `Some` is used when
+    /// `value_stats_cols` is present (dense mode).
+    stats_col_mapping: Option<Vec<Option<usize>>>,
 }
 
 impl FileStatsRows {
-    /// Build file stats only when they are compatible with the expected file schema.
-    fn try_from_data_file(file: &DataFileMeta, expected_fields: usize) -> Option<Self> {
+    /// Build file stats from a data file, respecting `value_stats_cols`.
+    ///
+    /// When `value_stats_cols` is `None`, stats cover all fields in `schema_fields` order.
+    /// When `value_stats_cols` is `Some`, stats are in dense mode — only covering those
+    /// columns, and the mapping from schema field index to stats index is built by name.
+    fn try_from_data_file(file: &DataFileMeta, schema_fields: &[DataField]) -> Option<Self> {
+        let (expected_fields, stats_col_mapping) = match &file.value_stats_cols {
+            None => (schema_fields.len(), None),
+            Some(cols) => {
+                let mapping: Vec<Option<usize>> = schema_fields
+                    .iter()
+                    .map(|field| cols.iter().position(|c| c == field.name()))
+                    .collect();
+                (cols.len(), Some(mapping))
+            }
+        };
+
         let stats = Self {
             row_count: file.row_count,
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
+            stats_col_mapping,
         };
 
         stats.arity_matches(expected_fields).then_some(stats)
     }
 
-    fn null_count(&self, index: usize) -> Option<i64> {
-        self.null_counts.get(index).copied()
+    /// Build file stats for the data evolution path where indices are resolved externally by name.
+    /// No `stats_col_mapping` is needed since the caller already maps field → stats index.
+    fn try_from_data_file_with_arity(file: &DataFileMeta, expected_fields: usize) -> Option<Self> {
+        let stats = Self {
+            row_count: file.row_count,
+            min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
+            max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
+            null_counts: file.value_stats.null_counts().clone(),
+            stats_col_mapping: None,
+        };
+
+        stats.arity_matches(expected_fields).then_some(stats)
+    }
+
+    /// Resolve a schema field index to the corresponding stats index.
+    fn stats_index(&self, schema_index: usize) -> Option<usize> {
+        match &self.stats_col_mapping {
+            None => Some(schema_index),
+            Some(mapping) => mapping.get(schema_index).copied().flatten(),
+        }
+    }
+
+    fn null_count(&self, stats_index: usize) -> Option<i64> {
+        self.null_counts.get(stats_index).copied()
     }
 
     /// Check whether the stats rows have the expected number of fields.
-    ///
-    /// If either min or max BinaryRow has an arity different from
-    /// `expected_fields`, the stats were likely written in dense mode or
-    /// under a different schema — making index-based access unsafe.
     fn arity_matches(&self, expected_fields: usize) -> bool {
         let min_ok = self
             .min_values
@@ -586,7 +634,7 @@ fn data_file_matches_predicates(
     file: &DataFileMeta,
     predicates: &[Predicate],
     current_schema_id: i64,
-    num_fields: usize,
+    schema_fields: &[DataField],
 ) -> bool {
     if predicates.is_empty() {
         return true;
@@ -611,7 +659,7 @@ fn data_file_matches_predicates(
     }
 
     // Fail open if schema evolution or stats layout make index-based access unsafe.
-    let Some(stats) = FileStatsRows::try_from_data_file(file, num_fields) else {
+    let Some(stats) = FileStatsRows::try_from_data_file(file, schema_fields) else {
         return true;
     };
 
@@ -667,7 +715,7 @@ async fn data_file_matches_predicates_for_table(
             file,
             predicates,
             table.schema().id(),
-            table.schema().fields().len(),
+            table.schema().fields(),
         );
     }
 
@@ -675,7 +723,7 @@ async fn data_file_matches_predicates_for_table(
         return true;
     };
 
-    let Some(stats) = FileStatsRows::try_from_data_file(file, resolved.file_fields.len()) else {
+    let Some(stats) = FileStatsRows::try_from_data_file(file, &resolved.file_fields) else {
         return true;
     };
 
@@ -704,7 +752,14 @@ fn data_predicate_may_match(predicate: &Predicate, stats: &FileStatsRows) -> boo
             op,
             literals,
             ..
-        } => data_leaf_may_match(*index, data_type, data_type, *op, literals, stats),
+        } => {
+            // Resolve schema field index → stats index via value_stats_cols mapping.
+            // If the field is not covered by stats, fail open.
+            let Some(stats_idx) = stats.stats_index(*index) else {
+                return true;
+            };
+            data_leaf_may_match(stats_idx, data_type, data_type, *op, literals, stats)
+        }
     }
 }
 
@@ -733,8 +788,12 @@ fn data_predicate_may_match_with_schema(
                 let Some(file_field) = file_fields.get(file_index) else {
                     return true;
                 };
+                // Resolve file schema index → stats index via value_stats_cols mapping.
+                let Some(stats_idx) = stats.stats_index(file_index) else {
+                    return true;
+                };
                 data_leaf_may_match(
-                    file_index,
+                    stats_idx,
                     file_field.data_type(),
                     data_type,
                     *op,
@@ -923,7 +982,7 @@ fn data_evolution_group_matches_predicates(
         .iter()
         .map(|field| {
             for (file_idx, file) in sorted_files.iter().enumerate() {
-                let file_columns = file_write_columns(file, table_fields);
+                let file_columns = file_stats_columns(file, table_fields);
                 for (stats_idx, col_name) in file_columns.iter().enumerate() {
                     if *col_name == field.name() {
                         return Some((file_idx, stats_idx));
@@ -938,8 +997,8 @@ fn data_evolution_group_matches_predicates(
     let file_stats: Vec<Option<FileStatsRows>> = sorted_files
         .iter()
         .map(|file| {
-            let num_stats_fields = file_write_columns(file, table_fields).len();
-            FileStatsRows::try_from_data_file(file, num_stats_fields)
+            let num_stats_fields = file_stats_columns(file, table_fields).len();
+            FileStatsRows::try_from_data_file_with_arity(file, num_stats_fields)
         })
         .collect();
 
@@ -957,9 +1016,13 @@ fn data_evolution_group_matches_predicates(
     })
 }
 
-/// Resolve which columns a file's stats cover.
-/// If `write_cols` is set, those are the columns. Otherwise, the file covers all table fields.
-fn file_write_columns<'a>(file: &'a DataFileMeta, table_fields: &'a [DataField]) -> Vec<&'a str> {
+/// Resolve which columns a file's value stats cover.
+/// If `value_stats_cols` is set, those are the stats columns. Otherwise, the file's stats
+/// cover all table fields (or `write_cols` if present).
+fn file_stats_columns<'a>(file: &'a DataFileMeta, table_fields: &'a [DataField]) -> Vec<&'a str> {
+    if let Some(cols) = &file.value_stats_cols {
+        return cols.iter().map(|s| s.as_str()).collect();
+    }
     match &file.write_cols {
         Some(cols) => cols.iter().map(|s| s.as_str()).collect(),
         None => table_fields.iter().map(|f| f.name()).collect(),
@@ -1171,23 +1234,28 @@ impl<'a> TableScan<'a> {
 
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
 
-        // Compute target buckets from bucket key predicate for bucket pruning.
-        let target_buckets: Option<HashSet<i32>> = if let Some(filter) = &self.filter {
-            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-                if has_primary_keys {
-                    self.table
-                        .schema()
-                        .primary_keys()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect()
+        // Compute bucket predicate and key fields for per-entry bucket pruning.
+        // Only supported for the default bucket function (MurmurHash3-based).
+        let (bucket_predicate, bucket_key_fields): (Option<Predicate>, Vec<DataField>) =
+            if !core_options.is_default_bucket_function() {
+                (None, Vec::new())
+            } else if let Some(filter) = &self.filter {
+                let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
+                    if has_primary_keys {
+                        self.table
+                            .schema()
+                            .primary_keys()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                });
+                if bucket_keys.is_empty() {
+                    (None, Vec::new())
                 } else {
-                    Vec::new()
-                }
-            });
-            if let Some(total_buckets) = core_options.bucket() {
-                if total_buckets > 0 && !bucket_keys.is_empty() {
-                    let bucket_key_fields: Vec<DataField> = bucket_keys
+                    let fields: Vec<DataField> = bucket_keys
                         .iter()
                         .filter_map(|key| {
                             self.table
@@ -1198,28 +1266,20 @@ impl<'a> TableScan<'a> {
                                 .cloned()
                         })
                         .collect();
-                    if bucket_key_fields.len() == bucket_keys.len() {
-                        if let Some(bucket_pred) = extract_predicate_for_keys(
+                    if fields.len() == bucket_keys.len() {
+                        let pred = extract_predicate_for_keys(
                             filter,
                             self.table.schema().fields(),
                             &bucket_keys,
-                        ) {
-                            compute_target_buckets(&bucket_pred, &bucket_key_fields, total_buckets)
-                        } else {
-                            None
-                        }
+                        );
+                        (pred, fields)
                     } else {
-                        None
+                        (None, Vec::new())
                     }
-                } else {
-                    None
                 }
             } else {
-                None
-            }
-        } else {
-            None
-        };
+                (None, Vec::new())
+            };
 
         let entries = read_all_manifest_entries(
             file_io,
@@ -1231,8 +1291,9 @@ impl<'a> TableScan<'a> {
             &partition_fields,
             pushdown_data_predicates,
             self.table.schema().id(),
-            self.table.schema().fields().len(),
-            target_buckets.as_ref(),
+            self.table.schema().fields(),
+            bucket_predicate.as_ref(),
+            &bucket_key_fields,
         )
         .await?;
         let entries = merge_manifest_entries(entries);
@@ -1655,7 +1716,9 @@ mod tests {
     }
 
     const TEST_SCHEMA_ID: i64 = 0;
-    const TEST_NUM_FIELDS: usize = 1;
+    fn test_schema_fields() -> Vec<DataField> {
+        int_field()
+    }
 
     #[test]
     fn test_group_by_overlapping_row_id_empty() {
@@ -1746,7 +1809,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1761,7 +1824,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1775,7 +1838,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1794,7 +1857,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1810,7 +1873,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1832,7 +1895,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1866,7 +1929,7 @@ mod tests {
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1884,7 +1947,7 @@ mod tests {
             &file,
             &[Predicate::AlwaysFalse],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
@@ -1902,7 +1965,7 @@ mod tests {
             &file,
             &[Predicate::AlwaysTrue],
             TEST_SCHEMA_ID,
-            TEST_NUM_FIELDS,
+            &test_schema_fields(),
         ));
     }
 
