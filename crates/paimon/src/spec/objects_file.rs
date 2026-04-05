@@ -56,7 +56,11 @@ mod tests {
                     10,
                     10,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                    BinaryTableStats::new(
+                        value_bytes.clone(),
+                        value_bytes.clone(),
+                        vec![Some(1), Some(2)]
+                    ),
                     1
                 ),
                 ManifestFileMeta::new(
@@ -64,7 +68,11 @@ mod tests {
                     11,
                     0,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                    BinaryTableStats::new(
+                        value_bytes.clone(),
+                        value_bytes.clone(),
+                        vec![Some(1), Some(2)]
+                    ),
                     2
                 )
             ],
@@ -101,26 +109,30 @@ mod tests {
                         key_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         value_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         min_sequence_number: 1,
                         max_sequence_number: 100,
                         schema_id: 0,
                         level: 1,
                         extra_files: vec![],
-                        creation_time: "2024-09-06T07:45:55.039+00:00"
-                            .parse::<DateTime<Utc>>()
-                            .unwrap(),
+                        creation_time: Some(
+                            "2024-09-06T07:45:55.039+00:00"
+                                .parse::<DateTime<Utc>>()
+                                .unwrap()
+                        ),
                         delete_row_count: Some(0),
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
                         external_path: None,
+                        file_source: None,
+                        value_stats_cols: None,
                     },
                     2
                 ),
@@ -138,26 +150,30 @@ mod tests {
                         key_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         value_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         min_sequence_number: 1,
                         max_sequence_number: 100,
                         schema_id: 0,
                         level: 1,
                         extra_files: vec![],
-                        creation_time: "2024-09-06T07:45:55.039+00:00"
-                            .parse::<DateTime<Utc>>()
-                            .unwrap(),
+                        creation_time: Some(
+                            "2024-09-06T07:45:55.039+00:00"
+                                .parse::<DateTime<Utc>>()
+                                .unwrap()
+                        ),
                         delete_row_count: Some(1),
                         embedded_index: None,
                         first_row_id: None,
                         write_cols: None,
                         external_path: None,
+                        file_source: None,
+                        value_stats_cols: None,
                     },
                     2
                 ),

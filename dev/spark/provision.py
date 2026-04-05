@@ -573,6 +573,143 @@ def main():
         """
     )
 
+    # ===== Non-PK table with deletion vectors enabled =====
+    # Append-only table with DV: level-0 files should NOT be filtered out
+    # because there is no primary key merge.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS simple_dv_log_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO simple_dv_log_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+
+    # ===== Postpone bucket PK table (bucket = -2) =====
+    # New data lands in bucket-postpone and is NOT visible to readers until compacted.
+    # Without running compaction, the table should appear empty to batch readers.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS postpone_bucket_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '-2',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO postpone_bucket_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+
+
+    # ===== Multi-bucket PK table for bucket predicate filtering tests =====
+    # PK table with bucket=4 so data distributes across multiple buckets.
+    # Bucket key defaults to primary key (id). Used to test that bucket predicate
+    # filtering correctly computes target buckets from equality predicates.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS multi_bucket_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO multi_bucket_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol'),
+            (4, 'dave'),
+            (5, 'eve'),
+            (6, 'frank'),
+            (7, 'grace'),
+            (8, 'heidi')
+        """
+    )
+
+    # ===== String bucket key tables for variable-length hash tests =====
+    # Short string keys (<=7 bytes) use inline encoding in BinaryRow.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS string_bucket_short_key (
+            code STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'code',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO string_bucket_short_key VALUES
+            ('aaa', 1),
+            ('bbb', 2),
+            ('ccc', 3),
+            ('ddd', 4),
+            ('eee', 5),
+            ('fff', 6),
+            ('ggg', 7),
+            ('hhh', 8)
+        """
+    )
+
+    # Long string keys (>7 bytes) use variable-length encoding in BinaryRow.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS string_bucket_long_key (
+            code STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'code',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO string_bucket_long_key VALUES
+            ('alpha-long-key', 1),
+            ('bravo-long-key', 2),
+            ('charlie-long-key', 3),
+            ('delta-long-key', 4),
+            ('echo-long-key', 5),
+            ('foxtrot-long-key', 6),
+            ('golf-long-key', 7),
+            ('hotel-long-key', 8)
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

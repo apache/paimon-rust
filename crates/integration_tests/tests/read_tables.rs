@@ -792,8 +792,10 @@ async fn test_read_partitioned_table_filter_matches_no_partition() {
     );
 }
 
+/// Using an unsupported DataType in a partition predicate should fail-open:
+/// the plan succeeds and returns all partitions (no pruning).
 #[tokio::test]
-async fn test_read_partitioned_table_eval_row_error_fails_plan() {
+async fn test_read_partitioned_table_eval_row_error_fails_open() {
     use paimon::spec::{ArrayType, DataType, Datum, IntType, PredicateOperator};
 
     let catalog = create_file_system_catalog();
@@ -806,6 +808,7 @@ async fn test_read_partitioned_table_eval_row_error_fails_plan() {
         .expect("dt partition column should exist");
 
     // Use an unsupported partition type so remapping succeeds but `eval_row` fails.
+    // The entry-level filter catches the error and fails open (keeps the entry).
     let filter = Predicate::Leaf {
         column: "dt".into(),
         index: dt_index,
@@ -817,15 +820,18 @@ async fn test_read_partitioned_table_eval_row_error_fails_plan() {
     let mut read_builder = table.new_read_builder();
     read_builder.with_filter(filter);
 
-    let err = read_builder
+    let plan = read_builder
         .new_scan()
         .plan()
         .await
-        .expect_err("eval_row error should fail-fast during planning");
+        .expect("Plan should succeed (fail-open on unsupported type)");
 
-    assert!(
-        matches!(&err, Error::Unsupported { message } if message.contains("extract_datum")),
-        "Expected extract_datum unsupported error, got: {err:?}"
+    // All partitions should survive since the predicate evaluation fails open.
+    let seen_partitions = extract_plan_partitions(&plan);
+    assert_eq!(
+        seen_partitions,
+        HashSet::from(["2024-01-01".into(), "2024-01-02".into()]),
+        "Unsupported predicate type should fail-open and keep all partitions"
     );
 }
 
@@ -1465,5 +1471,532 @@ async fn test_read_complex_type_table() {
             (3, vec![], vec![], ("carol".into(), 300),),
         ],
         "Complex type table should return correct ARRAY, MAP, and STRUCT values"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PK-without-DV and non-PK-with-DV tests
+// ---------------------------------------------------------------------------
+
+/// Reading a primary-key table without deletion vectors should return an Unsupported error.
+#[tokio::test]
+async fn test_read_pk_table_without_dv_returns_error() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "simple_pk_table").await;
+
+    let read_builder = table.new_read_builder();
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+    assert!(
+        !plan.splits().is_empty(),
+        "PK table should have splits to read"
+    );
+
+    let read = table.new_read_builder().new_read();
+    let result = read
+        .expect("new_read should succeed")
+        .to_arrow(plan.splits());
+    let err = result
+        .err()
+        .expect("Reading PK table without DV should fail");
+
+    assert!(
+        matches!(&err, Error::Unsupported { message } if message.contains("primary-key")),
+        "Expected Unsupported error about primary-key tables, got: {err:?}"
+    );
+}
+
+/// Reading a non-PK (append-only) table with deletion vectors enabled should work correctly.
+/// Level-0 files must NOT be filtered out since there is no PK merge.
+#[tokio::test]
+async fn test_read_non_pk_table_with_dv() {
+    let (_, batches) = scan_and_read_with_fs_catalog("simple_dv_log_table", None).await;
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "Non-PK table with DV enabled should return all rows (level-0 files kept)"
+    );
+}
+
+/// Postpone bucket PK table (bucket = -2): uncompacted data sits in bucket-postpone
+/// and should NOT be visible to batch readers. The plan should produce no splits.
+#[tokio::test]
+async fn test_read_postpone_bucket_pk_table_returns_empty() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "postpone_bucket_pk_table").await;
+
+    let read_builder = table.new_read_builder();
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    assert!(
+        plan.splits().is_empty(),
+        "Postpone bucket PK table should have no visible splits before compaction"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Data evolution predicate filtering tests
+// ---------------------------------------------------------------------------
+
+/// Data evolution group-level predicate filtering: after group_by_overlapping_row_id,
+/// merged stats across files in each group should allow pruning entire groups.
+#[tokio::test]
+async fn test_data_evolution_table_with_filter() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    // Filter: value > 300 should keep only groups containing rows with value > 300.
+    // Expected rows after merge: (4, 'dave', 400), (5, 'eve', 500)
+    let filter = pb
+        .greater_than("value", Datum::Int(300))
+        .expect("Failed to build predicate");
+
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    // The first batch (rows 1-3) was MERGE INTO'd, creating overlapping row_id groups.
+    // Their max value is 300, so the group should be pruned by value > 300.
+    // The second batch (rows 4-5) has values 400, 500 and should survive.
+    assert!(
+        !plan.splits().is_empty(),
+        "Some splits should survive the filter"
+    );
+
+    let mut rows: Vec<(i32, String, i32)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![(4, "dave".into(), 400), (5, "eve".into(), 500),],
+        "Data evolution group-level pruning should filter out groups where value <= 300"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bucket predicate filtering tests
+// ---------------------------------------------------------------------------
+
+/// Bucket predicate filtering: when filtering by bucket key (primary key) with an
+/// equality predicate, only splits whose bucket matches the computed target bucket
+/// should survive. This tests the full pipeline: extract bucket predicate → compute
+/// target bucket via MurmurHash3 → filter manifest entries by bucket.
+#[tokio::test]
+async fn test_bucket_predicate_filtering() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "multi_bucket_pk_table").await;
+    let schema = table.schema();
+    let pb = PredicateBuilder::new(schema.fields());
+
+    // Get full plan without filter to see all buckets
+    let full_plan = plan_table(&table, None).await;
+    let all_buckets: HashSet<i32> = full_plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        all_buckets.len() > 1,
+        "multi_bucket_pk_table should have data in multiple buckets, got: {all_buckets:?}"
+    );
+
+    // Filter by id = 1 (bucket key). This should compute the target bucket and
+    // only return splits from that bucket.
+    let filter = pb
+        .equal("id", Datum::Int(1))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert_eq!(
+        filtered_buckets.len(),
+        1,
+        "Bucket predicate filtering should narrow to exactly one bucket, got: {filtered_buckets:?}"
+    );
+    assert!(
+        filtered_buckets.is_subset(&all_buckets),
+        "Filtered bucket should be one of the original buckets"
+    );
+
+    let actual = extract_id_name(&batches);
+    // Bucket filtering is at the bucket level, not row level. Other rows that
+    // hash to the same bucket will also be returned.
+    let ids: HashSet<i32> = actual.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids.contains(&1),
+        "Row with id=1 should be in the filtered result, got: {actual:?}"
+    );
+    // Verify we got fewer rows than the full table (8 rows)
+    assert!(
+        actual.len() < 8,
+        "Bucket filtering should return fewer rows than the full table, got: {}",
+        actual.len()
+    );
+}
+
+/// Bucket predicate filtering with IN predicate: multiple target buckets.
+#[tokio::test]
+async fn test_bucket_predicate_filtering_in() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "multi_bucket_pk_table").await;
+    let schema = table.schema();
+    let pb = PredicateBuilder::new(schema.fields());
+
+    // Filter by id IN (1, 5) — may hash to different buckets
+    let filter = pb
+        .is_in("id", vec![Datum::Int(1), Datum::Int(5)])
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        filtered_buckets.len() <= 2,
+        "IN predicate with 2 values should produce at most 2 target buckets, got: {filtered_buckets:?}"
+    );
+
+    let actual = extract_id_name(&batches);
+    // Should contain exactly id=1 and id=5
+    let ids: HashSet<i32> = actual.iter().map(|(id, _)| *id).collect();
+    assert!(
+        ids.contains(&1) && ids.contains(&5),
+        "Should return rows for id=1 and id=5, got: {actual:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Time travel integration tests
+// ---------------------------------------------------------------------------
+
+/// Time travel by snapshot id: snapshot 1 should return only the first batch.
+#[tokio::test]
+async fn test_time_travel_by_snapshot_id() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    // Snapshot 1: (1, 'alice'), (2, 'bob')
+    let table_snap1 = table.copy_with_options(HashMap::from([(
+        "scan.snapshot-id".to_string(),
+        "1".to_string(),
+    )]));
+    let rb = table_snap1.new_read_builder();
+    let plan = rb.new_scan().plan().await.expect("plan snap1");
+    let read = rb.new_read().expect("read snap1");
+    let batches: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(1, "alice".into()), (2, "bob".into())],
+        "Snapshot 1 should contain only the first batch"
+    );
+
+    // Snapshot 2: (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
+    let table_snap2 = table.copy_with_options(HashMap::from([(
+        "scan.snapshot-id".to_string(),
+        "2".to_string(),
+    )]));
+    let rb2 = table_snap2.new_read_builder();
+    let plan2 = rb2.new_scan().plan().await.expect("plan snap2");
+    let read2 = rb2.new_read().expect("read snap2");
+    let batches2: Vec<RecordBatch> = read2
+        .to_arrow(plan2.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual2 = extract_id_name(&batches2);
+    assert_eq!(
+        actual2,
+        vec![
+            (1, "alice".into()),
+            (2, "bob".into()),
+            (3, "carol".into()),
+            (4, "dave".into()),
+        ],
+        "Snapshot 2 should contain all rows"
+    );
+}
+
+/// Time travel by tag name.
+#[tokio::test]
+async fn test_time_travel_by_tag_name() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    // Tag 'snapshot1' -> snapshot 1: (1, 'alice'), (2, 'bob')
+    let table_tag1 = table.copy_with_options(HashMap::from([(
+        "scan.tag-name".to_string(),
+        "snapshot1".to_string(),
+    )]));
+    let rb = table_tag1.new_read_builder();
+    let plan = rb.new_scan().plan().await.expect("plan tag1");
+    let read = rb.new_read().expect("read tag1");
+    let batches: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(1, "alice".into()), (2, "bob".into())],
+        "Tag 'snapshot1' should return snapshot 1 data"
+    );
+
+    // Tag 'snapshot2' -> snapshot 2: all 4 rows
+    let table_tag2 = table.copy_with_options(HashMap::from([(
+        "scan.tag-name".to_string(),
+        "snapshot2".to_string(),
+    )]));
+    let rb2 = table_tag2.new_read_builder();
+    let plan2 = rb2.new_scan().plan().await.expect("plan tag2");
+    let read2 = rb2.new_read().expect("read tag2");
+    let batches2: Vec<RecordBatch> = read2
+        .to_arrow(plan2.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual2 = extract_id_name(&batches2);
+    assert_eq!(
+        actual2,
+        vec![
+            (1, "alice".into()),
+            (2, "bob".into()),
+            (3, "carol".into()),
+            (4, "dave".into()),
+        ],
+        "Tag 'snapshot2' should return all rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Data evolution + drop column tests
+// ---------------------------------------------------------------------------
+
+/// Data evolution + drop column: old rows that were MERGE INTO'd should have NULL
+/// for the newly added column (no file in the merge group provides it).
+#[tokio::test]
+async fn test_read_data_evolution_drop_column() {
+    let (_, batches) = scan_and_read_with_fs_catalog("data_evolution_drop_column", None).await;
+
+    let mut rows: Vec<(i32, String, i32, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        let extra = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("extra");
+        for i in 0..batch.num_rows() {
+            let extra_val = if extra.is_null(i) {
+                None
+            } else {
+                Some(extra.value(i).to_string())
+            };
+            rows.push((
+                id.value(i),
+                name.value(i).to_string(),
+                value.value(i),
+                extra_val,
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".into(), 100, None),
+            (2, "bob".into(), 200, None),
+            (3, "carol".into(), 300, Some("new".into())),
+        ],
+        "Old rows should have NULL for 'extra' (added after MERGE INTO), new rows should have it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Limit pushdown with data predicates test
+// ---------------------------------------------------------------------------
+
+/// Limit pushdown must be disabled when data predicates exist.
+/// Otherwise merged_row_count (pre-filter) could cause early stop, returning
+/// fewer rows than the limit after filtering.
+#[tokio::test]
+async fn test_limit_pushdown_disabled_with_data_predicates() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    // Filter: value >= 100 (matches all rows). With limit=2, if limit pushdown
+    // were applied, it might stop after the first split (merged_row_count >= 2)
+    // but that split's rows might all be filtered out by a stricter predicate.
+    // Here we use a lenient predicate to verify the plan still includes enough splits.
+    let filter = pb
+        .greater_than("value", Datum::Int(0))
+        .expect("Failed to build predicate");
+
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(filter);
+    read_builder.with_limit(2);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    // With data predicates, limit pushdown should be disabled, so we should get
+    // the same number of splits as without limit.
+    let full_plan = plan_table(&table, None).await;
+    assert_eq!(
+        plan.splits().len(),
+        full_plan.splits().len(),
+        "With data predicates, limit pushdown should be disabled — split count should match full plan"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// String bucket key tests (variable-length hash compatibility with Java)
+// ---------------------------------------------------------------------------
+
+/// Helper to extract (code, value) rows from batches.
+fn extract_code_value(batches: &[RecordBatch]) -> Vec<(String, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let code = batch
+            .column_by_name("code")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("code");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((code.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// Bucket predicate filtering with short string keys (<=7 bytes, inline encoding).
+#[tokio::test]
+async fn test_bucket_predicate_filtering_short_string_key() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "string_bucket_short_key").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let full_plan = plan_table(&table, None).await;
+    let all_buckets: HashSet<i32> = full_plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        all_buckets.len() > 1,
+        "string_bucket_short_key should have data in multiple buckets, got: {all_buckets:?}"
+    );
+
+    // Filter by code = 'aaa' (short string, inline BinaryRow encoding)
+    let filter = pb
+        .equal("code", Datum::String("aaa".into()))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert_eq!(
+        filtered_buckets.len(),
+        1,
+        "Short string bucket filtering should narrow to one bucket, got: {filtered_buckets:?}"
+    );
+
+    let actual = extract_code_value(&batches);
+    let codes: HashSet<&str> = actual.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(
+        codes.contains("aaa"),
+        "Row with code='aaa' should be in the result, got: {actual:?}"
+    );
+    assert!(
+        actual.len() < 8,
+        "Bucket filtering should return fewer rows than the full table, got: {}",
+        actual.len()
+    );
+}
+
+/// Bucket predicate filtering with long string keys (>7 bytes, variable-length encoding).
+#[tokio::test]
+async fn test_bucket_predicate_filtering_long_string_key() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "string_bucket_long_key").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let full_plan = plan_table(&table, None).await;
+    let all_buckets: HashSet<i32> = full_plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        all_buckets.len() > 1,
+        "string_bucket_long_key should have data in multiple buckets, got: {all_buckets:?}"
+    );
+
+    // Filter by code = 'alpha-long-key' (>7 bytes, var-length BinaryRow encoding with 8-byte padding)
+    let filter = pb
+        .equal("code", Datum::String("alpha-long-key".into()))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert_eq!(
+        filtered_buckets.len(),
+        1,
+        "Long string bucket filtering should narrow to one bucket, got: {filtered_buckets:?}"
+    );
+
+    let actual = extract_code_value(&batches);
+    let codes: HashSet<&str> = actual.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(
+        codes.contains("alpha-long-key"),
+        "Row with code='alpha-long-key' should be in the result, got: {actual:?}"
+    );
+    assert!(
+        actual.len() < 8,
+        "Bucket filtering should return fewer rows than the full table, got: {}",
+        actual.len()
     );
 }

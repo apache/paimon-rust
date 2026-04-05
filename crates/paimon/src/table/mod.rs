@@ -18,10 +18,12 @@
 //! Table API for Apache Paimon
 
 pub(crate) mod bin_pack;
+mod bucket_filter;
 mod read_builder;
 pub(crate) mod schema_manager;
 mod snapshot_manager;
 mod source;
+mod stats_filter;
 mod table_scan;
 mod tag_manager;
 

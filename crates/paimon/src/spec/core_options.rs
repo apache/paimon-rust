@@ -23,6 +23,8 @@ const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
+const BUCKET_KEY_OPTION: &str = "bucket-key";
+const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
@@ -109,6 +111,24 @@ impl<'a> CoreOptions<'a> {
     /// Tag name for time travel via `scan.tag-name`.
     pub fn scan_tag_name(&self) -> Option<&str> {
         self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str)
+    }
+
+    /// Explicit bucket key columns. If not set, defaults to primary keys for PK tables.
+    pub fn bucket_key(&self) -> Option<Vec<String>> {
+        self.options
+            .get(BUCKET_KEY_OPTION)
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+    }
+
+    /// Whether the bucket function type is the default hash-based function.
+    ///
+    /// Only the default function (`Math.abs(hash % numBuckets)`) is supported
+    /// for bucket predicate pruning. `mod` and `hive` use different algorithms.
+    pub fn is_default_bucket_function(&self) -> bool {
+        self.options
+            .get(BUCKET_FUNCTION_TYPE_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("default"))
+            .unwrap_or(true)
     }
 }
 
