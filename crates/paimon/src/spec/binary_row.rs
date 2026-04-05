@@ -279,7 +279,7 @@ impl BinaryRow {
         let arity = datums.len() as i32;
         let mut builder = BinaryRowBuilder::new(arity);
 
-        for (pos, (datum, _data_type)) in datums.iter().enumerate() {
+        for (pos, (datum, data_type)) in datums.iter().enumerate() {
             match datum {
                 crate::spec::Datum::Bool(v) => builder.write_boolean(pos, *v),
                 crate::spec::Datum::TinyInt(v) => builder.write_byte(pos, *v),
@@ -290,9 +290,27 @@ impl BinaryRow {
                 crate::spec::Datum::Long(v) => builder.write_long(pos, *v),
                 crate::spec::Datum::Float(v) => builder.write_float(pos, *v),
                 crate::spec::Datum::Double(v) => builder.write_double(pos, *v),
-                crate::spec::Datum::Timestamp { millis, .. }
-                | crate::spec::Datum::LocalZonedTimestamp { millis, .. } => {
-                    builder.write_long(pos, *millis)
+                crate::spec::Datum::Timestamp { millis, nanos } => {
+                    let precision = match data_type {
+                        crate::spec::DataType::Timestamp(ts) => ts.precision(),
+                        _ => 3,
+                    };
+                    if precision <= 3 {
+                        builder.write_timestamp_compact(pos, *millis);
+                    } else {
+                        builder.write_timestamp_non_compact(pos, *millis, *nanos);
+                    }
+                }
+                crate::spec::Datum::LocalZonedTimestamp { millis, nanos } => {
+                    let precision = match data_type {
+                        crate::spec::DataType::LocalZonedTimestamp(ts) => ts.precision(),
+                        _ => 3,
+                    };
+                    if precision <= 3 {
+                        builder.write_timestamp_compact(pos, *millis);
+                    } else {
+                        builder.write_timestamp_non_compact(pos, *millis, *nanos);
+                    }
                 }
                 crate::spec::Datum::Decimal {
                     unscaled,
@@ -302,7 +320,7 @@ impl BinaryRow {
                     if *precision <= 18 {
                         builder.write_decimal_compact(pos, *unscaled as i64);
                     } else {
-                        return None;
+                        builder.write_decimal_var_len(pos, *unscaled);
                     }
                 }
                 crate::spec::Datum::String(s) => {
@@ -322,11 +340,7 @@ impl BinaryRow {
             }
         }
 
-        let mut row = builder.build();
-        // Pad data to word-aligned (multiple of 4) for hash_by_words.
-        while !row.data.len().is_multiple_of(4) {
-            row.data.push(0);
-        }
+        let row = builder.build();
         Some(row)
     }
 
@@ -424,10 +438,13 @@ impl BinaryRowBuilder {
         self.write_binary_inline(pos, value.as_bytes());
     }
 
-    /// Write binary data to the variable-length part.
+    /// Write binary data to the variable-length part (8-byte aligned, matching Java BinaryRowWriter).
     pub fn write_binary(&mut self, pos: usize, value: &[u8]) {
         let var_offset = self.data.len();
         self.data.extend_from_slice(value);
+        // Pad to 8-byte word boundary (Java: roundNumberOfBytesToNearestWord)
+        let padding = (8 - (value.len() % 8)) % 8;
+        self.data.extend(std::iter::repeat(0u8).take(padding));
         let encoded = ((var_offset as u64) << 32) | (value.len() as u64);
         let offset = self.field_offset(pos);
         self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
@@ -451,7 +468,7 @@ impl BinaryRowBuilder {
         self.write_long(pos, unscaled);
     }
 
-    /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes.
+    /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes (8-byte aligned).
     pub fn write_decimal_var_len(&mut self, pos: usize, unscaled: i128) {
         let be_bytes = unscaled.to_be_bytes();
         let mut start = 0;
@@ -468,6 +485,8 @@ impl BinaryRowBuilder {
 
         let var_offset = self.data.len();
         self.data.extend_from_slice(minimal);
+        let padding = (8 - (minimal.len() % 8)) % 8;
+        self.data.extend(std::iter::repeat(0u8).take(padding));
         let len = minimal.len();
         let encoded = ((var_offset as u64) << 32) | (len as u64);
         let offset = self.field_offset(pos);
