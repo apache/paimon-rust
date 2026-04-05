@@ -219,7 +219,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use futures::TryStreamExt;
     use paimon::catalog::Identifier;
-    use paimon::io::{FileIO, FileIOBuilder};
+    use paimon::io::FileIOBuilder;
     use paimon::spec::{
         BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
         Schema as PaimonSchema, TableSchema,
@@ -310,6 +310,15 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn local_file_path(path: &std::path::Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with('/') {
+            format!("file:{normalized}")
+        } else {
+            format!("file:/{normalized}")
+        }
+    }
+
     fn test_data_file(file_name: &str, row_count: i64) -> DataFileMeta {
         serde_json::from_value(serde_json::json!({
             "_FILE_NAME": file_name,
@@ -345,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_applies_pushed_filter_during_read() {
         let tempdir = tempdir().unwrap();
-        let table_path = format!("file:{}", tempdir.path().display());
+        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
@@ -355,10 +364,7 @@ mod tests {
             Some(2),
         );
 
-        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
             &paimon::spec::Schema::builder()
@@ -378,7 +384,7 @@ mod tests {
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
-            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4)])
             .with_raw_convertible(true)

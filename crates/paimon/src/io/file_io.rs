@@ -54,15 +54,22 @@ impl FileIO {
     ///
     /// Otherwise will return parsing error.
     pub fn from_path(path: impl AsRef<str>) -> crate::Result<FileIOBuilder> {
-        let url = Url::parse(path.as_ref())
-            .map_err(|_| Error::ConfigInvalid {
-                message: format!("Invalid URL: {}", path.as_ref()),
-            })
-            .or_else(|_| {
-                Url::from_file_path(path.as_ref()).map_err(|_| Error::ConfigInvalid {
-                    message: format!("Input {} is neither a valid url nor path", path.as_ref()),
+        let path = path.as_ref();
+        let url = if looks_like_windows_drive_path(path) {
+            Url::from_file_path(path).map_err(|_| Error::ConfigInvalid {
+                message: format!("Input {path} is neither a valid url nor path"),
+            })?
+        } else {
+            Url::parse(path)
+                .map_err(|_| Error::ConfigInvalid {
+                    message: format!("Invalid URL: {path}"),
                 })
-            })?;
+                .or_else(|_| {
+                    Url::from_file_path(path).map_err(|_| Error::ConfigInvalid {
+                        message: format!("Input {path} is neither a valid url nor path"),
+                    })
+                })?
+        };
         Ok(FileIOBuilder::new(url.scheme()))
     }
 
@@ -221,6 +228,14 @@ impl FileIO {
 
         Ok(())
     }
+}
+
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 #[derive(Debug)]
@@ -385,6 +400,7 @@ impl OutputFile {
 mod file_action_test {
     use std::collections::BTreeSet;
     use std::fs;
+    use tempfile::tempdir;
 
     use super::*;
     use bytes::Bytes;
@@ -395,6 +411,15 @@ mod file_action_test {
 
     fn setup_fs_file_io() -> FileIO {
         FileIOBuilder::new("file").build().unwrap()
+    }
+
+    fn local_file_path(path: &std::path::Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with('/') {
+            format!("file:{normalized}")
+        } else {
+            format!("file:/{normalized}")
+        }
     }
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
@@ -592,6 +617,27 @@ mod file_action_test {
     async fn test_list_status_fs_should_return_entry_paths() {
         let file_io = setup_fs_file_io();
         common_test_list_status_paths(&file_io, "file:/tmp/test_list_status_paths_fs/").await;
+    }
+
+    #[test]
+    fn test_from_path_detects_local_fs_path() {
+        let dir = tempdir().unwrap();
+        let file_io = FileIO::from_path(dir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let path = local_file_path(&dir.path().join("from_path_detects_local_fs_path.txt"));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            file_io
+                .new_output(&path)
+                .unwrap()
+                .write(Bytes::from("data"))
+                .await
+                .unwrap();
+            assert!(file_io.exists(&path).await.unwrap());
+        });
     }
 }
 

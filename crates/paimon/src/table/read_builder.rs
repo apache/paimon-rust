@@ -242,7 +242,7 @@ impl<'a> TableRead<'a> {
 mod tests {
     use super::TableRead;
     use crate::catalog::Identifier;
-    use crate::io::FileIO;
+    use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
         BinaryRow, DataFileMeta, DataType, IntType, Predicate, PredicateBuilder, Schema,
@@ -312,6 +312,15 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn local_file_path(path: &std::path::Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with('/') {
+            format!("file:{normalized}")
+        } else {
+            format!("file:/{normalized}")
+        }
+    }
+
     fn collect_int_column(batches: &[RecordBatch], column_name: &str) -> Vec<i32> {
         batches
             .iter()
@@ -329,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_read_pushes_filter_to_reader_when_filter_column_not_projected() {
         let tempdir = tempdir().unwrap();
-        let table_path = format!("file:{}", tempdir.path().display());
+        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
@@ -340,10 +349,7 @@ mod tests {
             Some(2),
         );
 
-        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -363,7 +369,7 @@ mod tests {
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
-            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4)])
             .with_raw_convertible(true)
@@ -390,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_direct_table_read_with_filter_pushes_filter_to_reader() {
         let tempdir = tempdir().unwrap();
-        let table_path = format!("file:{}", tempdir.path().display());
+        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
@@ -401,10 +407,7 @@ mod tests {
             Some(2),
         );
 
-        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -424,7 +427,7 @@ mod tests {
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
-            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4)])
             .with_raw_convertible(true)
@@ -449,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_read_row_filter_filters_rows_within_matching_row_group() {
         let tempdir = tempdir().unwrap();
-        let table_path = format!("file:{}", tempdir.path().display());
+        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
@@ -460,10 +463,7 @@ mod tests {
             Some(2),
         );
 
-        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -483,7 +483,7 @@ mod tests {
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
-            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4)])
             .with_raw_convertible(true)
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn test_reader_pruning_ignores_partition_conjuncts() {
         let tempdir = tempdir().unwrap();
-        let table_path = format!("file:{}", tempdir.path().display());
+        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("dt=2024-01-01").join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
@@ -520,10 +520,7 @@ mod tests {
             Some(2),
         );
 
-        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
@@ -545,7 +542,7 @@ mod tests {
             .with_snapshot(1)
             .with_partition(BinaryRow::new(1))
             .with_bucket(0)
-            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4)])
             .with_raw_convertible(true)
