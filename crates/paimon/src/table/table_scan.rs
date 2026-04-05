@@ -78,23 +78,17 @@ fn manifest_file_matches_partition_predicate(
     partition_fields: &[DataField],
 ) -> bool {
     let stats = meta.partition_stats();
-    let num_fields = partition_fields.len();
 
-    let Some(file_stats) = ({
-        let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
-        let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
-        let null_counts = stats.null_counts().clone();
+    let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
+    let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
+    let null_counts = stats.null_counts().clone();
 
-        let stats = FileStatsRows::for_manifest_partition(
-            meta.num_added_files() + meta.num_deleted_files(),
-            min_values,
-            max_values,
-            null_counts,
-        );
-        stats.arity_matches(num_fields).then_some(stats)
-    }) else {
-        return true;
-    };
+    let file_stats = FileStatsRows::for_manifest_partition(
+        meta.num_added_files() + meta.num_deleted_files(),
+        min_values,
+        max_values,
+        null_counts,
+    );
 
     manifest_partition_predicate_may_match(predicate, &file_stats, partition_fields)
 }
@@ -1042,39 +1036,6 @@ mod tests {
             int_stats_row(Some(20)),
             vec![Some(0)],
             5,
-            5,
-        );
-        let predicate = PredicateBuilder::new(&fields)
-            .equal("id", Datum::Int(30))
-            .unwrap();
-
-        assert!(data_file_matches_predicates(
-            &file,
-            &[predicate],
-            TEST_SCHEMA_ID,
-            &test_schema_fields(),
-        ));
-    }
-
-    #[test]
-    fn test_data_file_matches_dense_stats_arity_mismatch_fails_open() {
-        let mut builder = BinaryRowBuilder::new(3);
-        builder.write_int(0, 10);
-        builder.write_int(1, 100);
-        builder.write_int(2, 200);
-        let min_serialized = builder.build_serialized();
-
-        let mut builder = BinaryRowBuilder::new(3);
-        builder.write_int(0, 20);
-        builder.write_int(1, 200);
-        builder.write_int(2, 300);
-        let max_serialized = builder.build_serialized();
-
-        let fields = int_field();
-        let file = test_data_file_meta(
-            min_serialized,
-            max_serialized,
-            vec![Some(0), Some(0), Some(0)],
             5,
         );
         let predicate = PredicateBuilder::new(&fields)

@@ -61,54 +61,35 @@ impl FileStatsRows {
     /// When `value_stats_cols` is `None`, stats cover all fields in `schema_fields` order.
     /// When `value_stats_cols` is `Some`, stats are in dense mode — only covering those
     /// columns, and the mapping from schema field index to stats index is built by name.
-    pub(super) fn try_from_data_file(
-        file: &DataFileMeta,
-        schema_fields: &[DataField],
-    ) -> Option<Self> {
+    pub(super) fn from_data_file(file: &DataFileMeta, schema_fields: &[DataField]) -> Self {
         // Determine which columns the stats cover and build the mapping.
         // Priority: value_stats_cols > write_cols > all schema fields.
-        let (expected_fields, stats_col_mapping) = if let Some(cols) = &file.value_stats_cols {
+        let stats_col_mapping = if let Some(cols) = &file.value_stats_cols {
             let mapping: Vec<Option<usize>> = schema_fields
                 .iter()
                 .map(|field| cols.iter().position(|c| c == field.name()))
                 .collect();
-            (cols.len(), Some(mapping))
+            Some(mapping)
         } else if let Some(cols) = &file.write_cols {
             let mapping: Vec<Option<usize>> = schema_fields
                 .iter()
                 .map(|field| cols.iter().position(|c| c == field.name()))
                 .collect();
-            (cols.len(), Some(mapping))
+            Some(mapping)
         } else {
-            (schema_fields.len(), None)
+            None
         };
 
-        let stats = Self {
-            row_count: file.row_count,
-            min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
-            max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
-            null_counts: file.value_stats.null_counts().clone(),
-            stats_col_mapping,
-        };
-
-        stats.arity_matches(expected_fields).then_some(stats)
-    }
-
-    /// Build file stats directly from a data file without arity validation.
-    ///
-    /// Used in data evolution mode where the caller handles field mapping
-    /// via `field_sources` instead of `stats_col_mapping`. No `table_fields`
-    /// arity check is needed because files from older schemas may have
-    /// fewer columns than the current table schema.
-    fn from_data_file_unchecked(file: &DataFileMeta) -> Self {
         Self {
             row_count: file.row_count,
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
-            stats_col_mapping: None,
+            stats_col_mapping,
         }
     }
+
+    /// Resolve a schema field index to the corresponding stats index.
     fn stats_index(&self, schema_index: usize) -> Option<usize> {
         match &self.stats_col_mapping {
             None => Some(schema_index),
@@ -118,20 +99,6 @@ impl FileStatsRows {
 
     fn null_count(&self, stats_index: usize) -> Option<i64> {
         self.null_counts.get(stats_index).copied().flatten()
-    }
-
-    /// Check whether the stats rows have the expected number of fields.
-    pub(super) fn arity_matches(&self, expected_fields: usize) -> bool {
-        let min_ok = self
-            .min_values
-            .as_ref()
-            .is_none_or(|r| r.arity() as usize == expected_fields);
-        let max_ok = self
-            .max_values
-            .as_ref()
-            .is_none_or(|r| r.arity() as usize == expected_fields);
-        let null_ok = self.null_counts.is_empty() || self.null_counts.len() == expected_fields;
-        min_ok && max_ok && null_ok
     }
 }
 
@@ -188,9 +155,7 @@ pub(super) fn data_file_matches_predicates(
         return true;
     }
 
-    let Some(stats) = FileStatsRows::try_from_data_file(file, schema_fields) else {
-        return true;
-    };
+    let stats = FileStatsRows::from_data_file(file, schema_fields);
 
     predicates
         .iter()
@@ -252,9 +217,7 @@ pub(super) async fn data_file_matches_predicates_for_table(
         return true;
     };
 
-    let Some(stats) = FileStatsRows::try_from_data_file(file, &resolved.file_fields) else {
-        return true;
-    };
+    let stats = FileStatsRows::from_data_file(file, &resolved.file_fields);
 
     predicates.iter().all(|predicate| {
         data_predicate_may_match_with_schema(
@@ -519,9 +482,9 @@ pub(super) fn data_evolution_group_matches_predicates(
 
     // Build per-file stats without arity validation — data evolution files
     // may have fewer columns than the current table schema.
-    let file_stats: Vec<Option<FileStatsRows>> = sorted_files
+    let file_stats: Vec<FileStatsRows> = sorted_files
         .iter()
-        .map(|file| Some(FileStatsRows::from_data_file_unchecked(file)))
+        .map(|file| FileStatsRows::from_data_file(file, table_fields))
         .collect();
 
     // row_count is the max across the group (overlapping row ranges).
@@ -555,7 +518,7 @@ fn data_evolution_predicate_may_match(
     predicate: &Predicate,
     table_fields: &[DataField],
     field_sources: &[Option<(usize, usize)>],
-    file_stats: &[Option<FileStatsRows>],
+    file_stats: &[FileStatsRows],
     row_count: i64,
 ) -> bool {
     match predicate {
@@ -582,9 +545,7 @@ fn data_evolution_predicate_may_match(
                 return missing_field_may_match(*op, row_count);
             };
             let (file_idx, stats_idx) = source;
-            let Some(stats) = &file_stats[file_idx] else {
-                return true;
-            };
+            let stats = &file_stats[file_idx];
             let stats_data_type = table_fields
                 .get(*index)
                 .map(|f| f.data_type())
