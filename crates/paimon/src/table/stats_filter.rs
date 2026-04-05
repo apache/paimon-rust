@@ -32,7 +32,7 @@ pub(super) struct FileStatsRows {
     pub(super) row_count: i64,
     min_values: Option<BinaryRow>,
     max_values: Option<BinaryRow>,
-    null_counts: Vec<i64>,
+    null_counts: Vec<Option<i64>>,
     /// Maps schema field index → stats index. `None` means identity mapping
     /// (stats cover all schema fields in order). `Some` is used when
     /// `value_stats_cols` or `write_cols` is present (dense mode).
@@ -45,7 +45,7 @@ impl FileStatsRows {
         row_count: i64,
         min_values: Option<BinaryRow>,
         max_values: Option<BinaryRow>,
-        null_counts: Vec<i64>,
+        null_counts: Vec<Option<i64>>,
     ) -> Self {
         Self {
             row_count,
@@ -103,7 +103,7 @@ impl FileStatsRows {
     }
 
     fn null_count(&self, stats_index: usize) -> Option<i64> {
-        self.null_counts.get(stats_index).copied()
+        self.null_counts.get(stats_index).copied().flatten()
     }
 
     /// Check whether the stats rows have the expected number of fields.

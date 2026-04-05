@@ -56,7 +56,7 @@ mod tests {
                     10,
                     10,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1), Some(2)]),
                     1
                 ),
                 ManifestFileMeta::new(
@@ -64,7 +64,7 @@ mod tests {
                     11,
                     0,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![1, 2]),
+                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1), Some(2)]),
                     2
                 )
             ],
@@ -101,12 +101,12 @@ mod tests {
                         key_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         value_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         min_sequence_number: 1,
                         max_sequence_number: 100,
@@ -142,12 +142,12 @@ mod tests {
                         key_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         value_stats: BinaryTableStats::new(
                             value_bytes.clone(),
                             value_bytes.clone(),
-                            vec![1, 2]
+                            vec![Some(1), Some(2)]
                         ),
                         min_sequence_number: 1,
                         max_sequence_number: 100,

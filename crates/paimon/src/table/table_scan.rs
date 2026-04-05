@@ -785,7 +785,7 @@ mod tests {
     fn test_data_file_meta(
         min_values: Vec<u8>,
         max_values: Vec<u8>,
-        null_counts: Vec<i64>,
+        null_counts: Vec<Option<i64>>,
         row_count: i64,
     ) -> DataFileMeta {
         test_data_file_meta_with_schema(
@@ -800,7 +800,7 @@ mod tests {
     fn test_data_file_meta_with_schema(
         min_values: Vec<u8>,
         max_values: Vec<u8>,
-        null_counts: Vec<i64>,
+        null_counts: Vec<Option<i64>>,
         row_count: i64,
         schema_id: i64,
     ) -> DataFileMeta {
@@ -945,7 +945,7 @@ mod tests {
     fn test_data_file_matches_eq_prunes_out_of_range() {
         let fields = int_field();
         let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![0], 5);
+            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(30))
             .unwrap();
@@ -962,7 +962,7 @@ mod tests {
     fn test_data_file_matches_is_null_prunes_when_null_count_is_zero() {
         let fields = int_field();
         let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![0], 5);
+            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
         let predicate = PredicateBuilder::new(&fields).is_null("id").unwrap();
 
         assert!(!data_file_matches_predicates(
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn test_data_file_matches_is_not_null_prunes_all_null_file() {
         let fields = int_field();
-        let file = test_data_file_meta(int_stats_row(None), int_stats_row(None), vec![5], 5);
+        let file = test_data_file_meta(int_stats_row(None), int_stats_row(None), vec![Some(5)], 5);
         let predicate = PredicateBuilder::new(&fields).is_not_null("id").unwrap();
 
         assert!(!data_file_matches_predicates(
@@ -991,7 +991,7 @@ mod tests {
     fn test_data_file_matches_unsupported_predicate_fails_open() {
         let fields = int_field();
         let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![0], 5);
+            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
         let pb = PredicateBuilder::new(&fields);
         let predicate = Predicate::or(vec![
             pb.less_than("id", Datum::Int(5)).unwrap(),
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn test_data_file_matches_corrupt_stats_fails_open() {
         let fields = int_field();
-        let file = test_data_file_meta(Vec::new(), Vec::new(), vec![0], 5);
+        let file = test_data_file_meta(Vec::new(), Vec::new(), vec![Some(0)], 5);
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(30))
             .unwrap();
@@ -1028,7 +1028,7 @@ mod tests {
         let file = test_data_file_meta_with_schema(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
-            vec![0],
+            vec![Some(0)],
             5,
             5,
         );
@@ -1059,7 +1059,7 @@ mod tests {
         let max_serialized = builder.build_serialized();
 
         let fields = int_field();
-        let file = test_data_file_meta(min_serialized, max_serialized, vec![0, 0, 0], 5);
+        let file = test_data_file_meta(min_serialized, max_serialized, vec![Some(0), Some(0), Some(0)], 5);
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(30))
             .unwrap();
@@ -1077,7 +1077,7 @@ mod tests {
         let file = test_data_file_meta_with_schema(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
-            vec![0],
+            vec![Some(0)],
             5,
             99,
         );
@@ -1095,7 +1095,7 @@ mod tests {
         let file = test_data_file_meta_with_schema(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
-            vec![0],
+            vec![Some(0)],
             5,
             99,
         );
