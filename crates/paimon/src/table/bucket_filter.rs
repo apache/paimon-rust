@@ -18,8 +18,7 @@
 //! Bucket and partition predicate extraction and bucket hash pruning.
 
 use crate::spec::{
-    field_idx_to_partition_idx, BinaryRow, DataField, DataType, Datum, Predicate,
-    PredicateOperator,
+    field_idx_to_partition_idx, BinaryRow, DataField, DataType, Datum, Predicate, PredicateOperator,
 };
 use std::collections::HashSet;
 

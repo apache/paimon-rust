@@ -20,7 +20,9 @@
 //! Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/table_scan.py)
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
-use super::bucket_filter::{compute_target_buckets, extract_predicate_for_keys, split_partition_and_data_predicates};
+use super::bucket_filter::{
+    compute_target_buckets, extract_predicate_for_keys, split_partition_and_data_predicates,
+};
 use super::stats_filter::{
     data_evolution_group_matches_predicates, data_file_matches_predicates,
     data_file_matches_predicates_for_table, data_leaf_may_match, group_by_overlapping_row_id,
@@ -172,10 +174,7 @@ async fn read_all_manifest_entries(
                 let filtered: Vec<ManifestEntry> = entries
                     .into_iter()
                     .filter(|entry| {
-                        if deletion_vectors_enabled
-                            && has_primary_keys
-                            && entry.file().level == 0
-                        {
+                        if deletion_vectors_enabled && has_primary_keys && entry.file().level == 0 {
                             return false;
                         }
                         if has_primary_keys && entry.bucket() < 0 {
@@ -702,14 +701,14 @@ impl<'a> TableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::partition_matches_predicate;
-    use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
-    use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum,
         DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,
         PredicateBuilder, PredicateOperator, VarCharType,
     };
+    use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::source::DeletionFile;
+    use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
     use crate::Error;
     use chrono::{DateTime, Utc};
 
