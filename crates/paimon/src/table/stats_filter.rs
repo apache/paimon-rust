@@ -94,7 +94,21 @@ impl FileStatsRows {
         stats.arity_matches(expected_fields).then_some(stats)
     }
 
-    /// Resolve a schema field index to the corresponding stats index.
+    /// Build file stats directly from a data file without arity validation.
+    ///
+    /// Used in data evolution mode where the caller handles field mapping
+    /// via `field_sources` instead of `stats_col_mapping`. No `table_fields`
+    /// arity check is needed because files from older schemas may have
+    /// fewer columns than the current table schema.
+    fn from_data_file_unchecked(file: &DataFileMeta) -> Self {
+        Self {
+            row_count: file.row_count,
+            min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
+            max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
+            null_counts: file.value_stats.null_counts().clone(),
+            stats_col_mapping: None,
+        }
+    }
     fn stats_index(&self, schema_index: usize) -> Option<usize> {
         match &self.stats_col_mapping {
             None => Some(schema_index),
@@ -503,10 +517,11 @@ pub(super) fn data_evolution_group_matches_predicates(
         })
         .collect();
 
-    // Build per-file stats (lazily, only parse once per file).
+    // Build per-file stats without arity validation — data evolution files
+    // may have fewer columns than the current table schema.
     let file_stats: Vec<Option<FileStatsRows>> = sorted_files
         .iter()
-        .map(|file| FileStatsRows::try_from_data_file(file, table_fields))
+        .map(|file| Some(FileStatsRows::from_data_file_unchecked(file)))
         .collect();
 
     // row_count is the max across the group (overlapping row ranges).
