@@ -241,87 +241,21 @@ impl<'a> TableRead<'a> {
 #[cfg(test)]
 mod tests {
     use super::TableRead;
+    mod test_utils {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
+    }
+
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryRow, DataFileMeta, DataType, IntType, Predicate, PredicateBuilder, Schema,
-        TableSchema, VarCharType,
+        BinaryRow, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema, VarCharType,
     };
     use crate::table::{DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
-    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-    use chrono::Utc;
     use futures::TryStreamExt;
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-    use std::fs::{self, File};
-    use std::sync::Arc;
+    use std::fs;
     use tempfile::tempdir;
-
-    fn test_data_file(file_name: &str, row_count: i64) -> DataFileMeta {
-        DataFileMeta {
-            file_name: file_name.to_string(),
-            file_size: 0,
-            row_count,
-            min_key: Vec::new(),
-            max_key: Vec::new(),
-            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
-            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
-            min_sequence_number: 0,
-            max_sequence_number: 0,
-            schema_id: 0,
-            level: 1,
-            extra_files: Vec::new(),
-            creation_time: Some(Utc::now()),
-            delete_row_count: None,
-            embedded_index: None,
-            file_source: None,
-            value_stats_cols: None,
-            first_row_id: None,
-            write_cols: None,
-            external_path: None,
-        }
-    }
-
-    fn write_int_parquet_file(
-        path: &std::path::Path,
-        columns: Vec<(&str, Vec<i32>)>,
-        max_row_group_size: Option<usize>,
-    ) {
-        let schema = Arc::new(ArrowSchema::new(
-            columns
-                .iter()
-                .map(|(name, _)| ArrowField::new(*name, ArrowDataType::Int32, false))
-                .collect::<Vec<_>>(),
-        ));
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = columns
-            .iter()
-            .map(|(_, values)| {
-                Arc::new(Int32Array::from(values.clone())) as Arc<dyn arrow_array::Array>
-            })
-            .collect();
-        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
-
-        let props = max_row_group_size.map(|size| {
-            WriterProperties::builder()
-                .set_max_row_group_size(size)
-                .build()
-        });
-        let file = File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, props).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
-
-    fn local_file_path(path: &std::path::Path) -> String {
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        if normalized.starts_with('/') {
-            format!("file:{normalized}")
-        } else {
-            format!("file:/{normalized}")
-        }
-    }
+    use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
 
     fn collect_int_column(batches: &[RecordBatch], column_name: &str) -> Vec<i32> {
         batches

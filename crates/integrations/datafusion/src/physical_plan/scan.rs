@@ -16,10 +16,8 @@
 // under the License.
 
 use std::any::Any;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -27,7 +25,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use paimon::spec::Predicate;
 use paimon::table::Table;
 use paimon::DataSplit;
@@ -140,7 +138,6 @@ impl ExecutionPlan for PaimonTableScan {
         let schema = self.schema();
         let projected_columns = self.projected_columns.clone();
         let pushed_predicate = self.pushed_predicate.clone();
-        let limit = self.limit;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -163,31 +160,9 @@ impl ExecutionPlan for PaimonTableScan {
             ))
         };
 
-        let stream = futures::stream::once(fut).try_flatten();
-
-        // Enforce the final LIMIT at the DataFusion execution layer.
-        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-            if let Some(limit) = limit {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            limited_stream,
+            futures::stream::once(fut).try_flatten(),
         )))
     }
 }
@@ -213,6 +188,10 @@ impl DisplayAs for PaimonTableScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod test_utils {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_utils.rs"));
+    }
+
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::ExecutionPlan;
@@ -221,13 +200,11 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
-        Schema as PaimonSchema, TableSchema,
+        BinaryRow, DataType, Datum, IntType, PredicateBuilder, Schema as PaimonSchema, TableSchema,
     };
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-    use std::fs::{self, File};
+    use std::fs;
     use tempfile::tempdir;
+    use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
 
     fn test_schema() -> ArrowSchemaRef {
         Arc::new(ArrowSchema::new(vec![Field::new(
@@ -276,79 +253,6 @@ mod tests {
             "/tmp/test-table".to_string(),
             table_schema,
         )
-    }
-
-    fn write_int_parquet_file(
-        path: &std::path::Path,
-        columns: Vec<(&str, Vec<i32>)>,
-        max_row_group_size: Option<usize>,
-    ) {
-        let schema = Arc::new(ArrowSchema::new(
-            columns
-                .iter()
-                .map(|(name, _)| Field::new(*name, ArrowDataType::Int32, false))
-                .collect::<Vec<_>>(),
-        ));
-        let arrays: Vec<Arc<dyn datafusion::arrow::array::Array>> = columns
-            .iter()
-            .map(|(_, values)| {
-                Arc::new(Int32Array::from(values.clone()))
-                    as Arc<dyn datafusion::arrow::array::Array>
-            })
-            .collect();
-        let batch =
-            datafusion::arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays).unwrap();
-
-        let props = max_row_group_size.map(|size| {
-            WriterProperties::builder()
-                .set_max_row_group_size(size)
-                .build()
-        });
-        let file = File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, props).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
-
-    fn local_file_path(path: &std::path::Path) -> String {
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        if normalized.starts_with('/') {
-            format!("file:{normalized}")
-        } else {
-            format!("file:/{normalized}")
-        }
-    }
-
-    fn test_data_file(file_name: &str, row_count: i64) -> DataFileMeta {
-        serde_json::from_value(serde_json::json!({
-            "_FILE_NAME": file_name,
-            "_FILE_SIZE": 0,
-            "_ROW_COUNT": row_count,
-            "_MIN_KEY": [],
-            "_MAX_KEY": [],
-            "_KEY_STATS": {
-                "_MIN_VALUES": [],
-                "_MAX_VALUES": [],
-                "_NULL_COUNTS": []
-            },
-            "_VALUE_STATS": {
-                "_MIN_VALUES": [],
-                "_MAX_VALUES": [],
-                "_NULL_COUNTS": []
-            },
-            "_MIN_SEQUENCE_NUMBER": 0,
-            "_MAX_SEQUENCE_NUMBER": 0,
-            "_SCHEMA_ID": 0,
-            "_LEVEL": 1,
-            "_EXTRA_FILES": [],
-            "_CREATION_TIME": chrono::Utc::now().timestamp_millis(),
-            "_DELETE_ROW_COUNT": null,
-            "_EMBEDDED_FILE_INDEX": null,
-            "_FIRST_ROW_ID": null,
-            "_WRITE_COLS": null,
-            "_EXTERNAL_PATH": null
-        }))
-        .unwrap()
     }
 
     #[tokio::test]

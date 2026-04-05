@@ -32,7 +32,10 @@ paimon = { path = "../../paimon" }
 futures = "0.3"
 
 [dev-dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 parquet = { workspace = true }
+serde = "1"
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
