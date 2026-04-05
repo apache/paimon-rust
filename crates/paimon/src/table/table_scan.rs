@@ -691,8 +691,14 @@ impl<'a> TableScan<'a> {
             }
         }
 
-        // Apply limit pushdown to reduce the number of splits if possible
-        let splits = self.apply_limit_pushdown(splits);
+        // Apply limit pushdown only when there are no data predicates.
+        // With data predicates, merged_row_count() reflects pre-filter row counts,
+        // so stopping early could return fewer rows than the limit after filtering.
+        let splits = if data_predicates.is_empty() {
+            self.apply_limit_pushdown(splits)
+        } else {
+            splits
+        };
 
         Ok(Plan::new(splits))
     }
