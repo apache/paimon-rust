@@ -1892,3 +1892,111 @@ async fn test_limit_pushdown_disabled_with_data_predicates() {
         "With data predicates, limit pushdown should be disabled — split count should match full plan"
     );
 }
+
+// ---------------------------------------------------------------------------
+// String bucket key tests (variable-length hash compatibility with Java)
+// ---------------------------------------------------------------------------
+
+/// Helper to extract (code, value) rows from batches.
+fn extract_code_value(batches: &[RecordBatch]) -> Vec<(String, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let code = batch
+            .column_by_name("code")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("code");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        for i in 0..batch.num_rows() {
+            rows.push((code.value(i).to_string(), value.value(i)));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// Bucket predicate filtering with short string keys (<=7 bytes, inline encoding).
+#[tokio::test]
+async fn test_bucket_predicate_filtering_short_string_key() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "string_bucket_short_key").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let full_plan = plan_table(&table, None).await;
+    let all_buckets: HashSet<i32> = full_plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        all_buckets.len() > 1,
+        "string_bucket_short_key should have data in multiple buckets, got: {all_buckets:?}"
+    );
+
+    // Filter by code = 'aaa' (short string, inline BinaryRow encoding)
+    let filter = pb
+        .equal("code", Datum::String("aaa".into()))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert_eq!(
+        filtered_buckets.len(),
+        1,
+        "Short string bucket filtering should narrow to one bucket, got: {filtered_buckets:?}"
+    );
+
+    let actual = extract_code_value(&batches);
+    let codes: HashSet<&str> = actual.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(
+        codes.contains("aaa"),
+        "Row with code='aaa' should be in the result, got: {actual:?}"
+    );
+    assert!(
+        actual.len() < 8,
+        "Bucket filtering should return fewer rows than the full table, got: {}",
+        actual.len()
+    );
+}
+
+/// Bucket predicate filtering with long string keys (>7 bytes, variable-length encoding).
+#[tokio::test]
+async fn test_bucket_predicate_filtering_long_string_key() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "string_bucket_long_key").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let full_plan = plan_table(&table, None).await;
+    let all_buckets: HashSet<i32> = full_plan.splits().iter().map(|s| s.bucket()).collect();
+    assert!(
+        all_buckets.len() > 1,
+        "string_bucket_long_key should have data in multiple buckets, got: {all_buckets:?}"
+    );
+
+    // Filter by code = 'alpha-long-key' (>7 bytes, var-length BinaryRow encoding with 8-byte padding)
+    let filter = pb
+        .equal("code", Datum::String("alpha-long-key".into()))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+
+    let filtered_buckets: HashSet<i32> = plan.splits().iter().map(|s| s.bucket()).collect();
+    assert_eq!(
+        filtered_buckets.len(),
+        1,
+        "Long string bucket filtering should narrow to one bucket, got: {filtered_buckets:?}"
+    );
+
+    let actual = extract_code_value(&batches);
+    let codes: HashSet<&str> = actual.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(
+        codes.contains("alpha-long-key"),
+        "Row with code='alpha-long-key' should be in the result, got: {actual:?}"
+    );
+    assert!(
+        actual.len() < 8,
+        "Bucket filtering should return fewer rows than the full table, got: {}",
+        actual.len()
+    );
+}

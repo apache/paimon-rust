@@ -653,6 +653,63 @@ def main():
         """
     )
 
+    # ===== String bucket key tables for variable-length hash tests =====
+    # Short string keys (<=7 bytes) use inline encoding in BinaryRow.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS string_bucket_short_key (
+            code STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'code',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO string_bucket_short_key VALUES
+            ('aaa', 1),
+            ('bbb', 2),
+            ('ccc', 3),
+            ('ddd', 4),
+            ('eee', 5),
+            ('fff', 6),
+            ('ggg', 7),
+            ('hhh', 8)
+        """
+    )
+
+    # Long string keys (>7 bytes) use variable-length encoding in BinaryRow.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS string_bucket_long_key (
+            code STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'code',
+            'bucket' = '4',
+            'deletion-vectors.enabled' = 'true'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO string_bucket_long_key VALUES
+            ('alpha-long-key', 1),
+            ('bravo-long-key', 2),
+            ('charlie-long-key', 3),
+            ('delta-long-key', 4),
+            ('echo-long-key', 5),
+            ('foxtrot-long-key', 6),
+            ('golf-long-key', 7),
+            ('hotel-long-key', 8)
+        """
+    )
+
 
 if __name__ == "__main__":
     main()
