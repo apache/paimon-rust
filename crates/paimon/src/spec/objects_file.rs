@@ -56,7 +56,11 @@ mod tests {
                     10,
                     10,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1), Some(2)]),
+                    BinaryTableStats::new(
+                        value_bytes.clone(),
+                        value_bytes.clone(),
+                        vec![Some(1), Some(2)]
+                    ),
                     1
                 ),
                 ManifestFileMeta::new(
@@ -64,7 +68,11 @@ mod tests {
                     11,
                     0,
                     10,
-                    BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1), Some(2)]),
+                    BinaryTableStats::new(
+                        value_bytes.clone(),
+                        value_bytes.clone(),
+                        vec![Some(1), Some(2)]
+                    ),
                     2
                 )
             ],

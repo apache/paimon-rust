@@ -944,8 +944,12 @@ mod tests {
     #[test]
     fn test_data_file_matches_eq_prunes_out_of_range() {
         let fields = int_field();
-        let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(30))
             .unwrap();
@@ -961,8 +965,12 @@ mod tests {
     #[test]
     fn test_data_file_matches_is_null_prunes_when_null_count_is_zero() {
         let fields = int_field();
-        let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
         let predicate = PredicateBuilder::new(&fields).is_null("id").unwrap();
 
         assert!(!data_file_matches_predicates(
@@ -990,8 +998,12 @@ mod tests {
     #[test]
     fn test_data_file_matches_unsupported_predicate_fails_open() {
         let fields = int_field();
-        let file =
-            test_data_file_meta(int_stats_row(Some(10)), int_stats_row(Some(20)), vec![Some(0)], 5);
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
         let pb = PredicateBuilder::new(&fields);
         let predicate = Predicate::or(vec![
             pb.less_than("id", Datum::Int(5)).unwrap(),
@@ -1059,7 +1071,12 @@ mod tests {
         let max_serialized = builder.build_serialized();
 
         let fields = int_field();
-        let file = test_data_file_meta(min_serialized, max_serialized, vec![Some(0), Some(0), Some(0)], 5);
+        let file = test_data_file_meta(
+            min_serialized,
+            max_serialized,
+            vec![Some(0), Some(0), Some(0)],
+            5,
+        );
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(30))
             .unwrap();
