@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod filtering;
 mod reader;
 pub(crate) mod schema_evolution;
 

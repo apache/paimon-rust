@@ -35,8 +35,13 @@ use crate::physical_plan::PaimonTableScan;
 
 /// Read-only table provider for a Paimon table.
 ///
-/// Supports full table scan, column projection, and partition predicate pushdown.
-/// Data-level filtering remains a residual DataFusion filter.
+/// Supports full table scan, column projection, and predicate pushdown for
+/// planning. Partition predicates prune splits eagerly, while supported
+/// non-partition data predicates may also be reused by the Parquet read path
+/// for row-group pruning and partial decode-time filtering.
+///
+/// DataFusion still treats pushed filters as inexact because unsupported
+/// predicates and non-Parquet reads remain residual filters.
 #[derive(Debug, Clone)]
 pub struct PaimonTableProvider {
     table: Table,
@@ -115,8 +120,9 @@ impl TableProvider for PaimonTableProvider {
         };
 
         // Plan splits eagerly so we know partition count upfront.
+        let pushed_predicate = build_pushed_predicate(filters, self.table.schema().fields());
         let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = build_pushed_predicate(filters, self.table.schema().fields()) {
+        if let Some(filter) = pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
         // Push the limit hint to paimon-core planning to reduce splits when possible.
@@ -147,6 +153,7 @@ impl TableProvider for PaimonTableProvider {
             projected_schema,
             self.table.clone(),
             projected_columns,
+            pushed_predicate,
             planned_partitions,
             limit,
         )))
@@ -310,5 +317,28 @@ mod tests {
             extract_dt_hr_partition_set(&dt_hr_partitions),
             BTreeSet::from([("2024-01-01".to_string(), 10)]),
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_keeps_pushed_predicate_for_execute() {
+        let provider = create_provider("partitioned_log_table").await;
+        let filter = col("id").gt(lit(1));
+
+        let config = SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        let state = ctx.state();
+        let plan = provider
+            .scan(&state, None, std::slice::from_ref(&filter), None)
+            .await
+            .expect("scan() should succeed");
+        let scan = plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        let expected = build_pushed_predicate(&[filter], provider.table().schema().fields())
+            .expect("data filter should translate");
+
+        assert_eq!(scan.pushed_predicate(), Some(&expected));
     }
 }

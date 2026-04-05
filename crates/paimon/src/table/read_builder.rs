@@ -21,6 +21,7 @@
 //! and [TypeUtils.project](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/utils/TypeUtils.java).
 
 use super::{ArrowRecordBatchStream, Table, TableScan};
+use crate::arrow::filtering::reader_pruning_predicates;
 use crate::arrow::ArrowReaderBuilder;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::Result;
@@ -57,7 +58,7 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
-    /// Set a filter predicate for scan planning.
+    /// Set a filter predicate for scan planning and conservative read pruning.
     ///
     /// The predicate should use table schema field indices (as produced by
     /// [`PredicateBuilder`]). During [`TableScan::plan`], partition-only
@@ -67,8 +68,11 @@ impl<'a> ReadBuilder<'a> {
     /// Stats pruning is per file. Files with a different `schema_id`,
     /// incompatible stats layout, or inconclusive stats are kept.
     ///
-    /// [`TableRead`] does not evaluate row-level filters; callers must apply
-    /// any remaining predicates themselves.
+    /// [`TableRead`] may use supported non-partition data predicates only on
+    /// the regular Parquet read path for conservative row-group pruning and
+    /// native Parquet row filtering. Unsupported predicates, non-Parquet
+    /// reads, and data-evolution reads remain residual and should still be
+    /// applied by the caller if exact filtering semantics are required.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
         self
@@ -99,7 +103,7 @@ impl<'a> ReadBuilder<'a> {
             Some(projected) => self.resolve_projected_fields(projected)?,
         };
 
-        Ok(TableRead::new(self.table, read_type))
+        Ok(TableRead::new(self.table, read_type).with_optional_filter(self.filter.clone()))
     }
 
     fn resolve_projected_fields(&self, projected_fields: &[String]) -> Result<Vec<DataField>> {
@@ -146,12 +150,17 @@ impl<'a> ReadBuilder<'a> {
 pub struct TableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
+    filter: Option<Predicate>,
 }
 
 impl<'a> TableRead<'a> {
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(table: &'a Table, read_type: Vec<DataField>) -> Self {
-        Self { table, read_type }
+        Self {
+            table,
+            read_type,
+            filter: None,
+        }
     }
 
     /// Schema (fields) that this read will produce.
@@ -162,6 +171,24 @@ impl<'a> TableRead<'a> {
     /// Table for this read.
     pub fn table(&self) -> &Table {
         self.table
+    }
+
+    /// Set a filter predicate for conservative read-side pruning.
+    ///
+    /// This is the direct-`TableRead` equivalent of [`ReadBuilder::with_filter`].
+    /// Supported non-partition data predicates may be used only on the regular
+    /// Parquet read path for row-group pruning and native Parquet row
+    /// filtering. Callers should still keep residual filtering at the query
+    /// layer for unsupported predicates, non-Parquet files, and data-evolution
+    /// reads.
+    pub fn with_filter(mut self, filter: Predicate) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    fn with_optional_filter(mut self, filter: Option<Predicate>) -> Self {
+        self.filter = filter;
+        self
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -186,6 +213,8 @@ impl<'a> TableRead<'a> {
             self.table.schema_manager().clone(),
             self.table.schema().id(),
         )
+        .with_predicates(self.reader_pruning_predicates())
+        .with_table_fields(self.table.schema.fields().to_vec())
         .build(self.read_type().to_vec());
 
         if data_evolution {
@@ -193,5 +222,355 @@ impl<'a> TableRead<'a> {
         } else {
             reader.read(data_splits)
         }
+    }
+
+    fn reader_pruning_predicates(&self) -> Vec<Predicate> {
+        self.filter
+            .clone()
+            .map(|filter| {
+                reader_pruning_predicates(
+                    filter,
+                    self.table.schema.fields(),
+                    self.table.schema.partition_keys(),
+                )
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TableRead;
+    use crate::catalog::Identifier;
+    use crate::io::FileIO;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{
+        BinaryRow, DataFileMeta, DataType, IntType, Predicate, PredicateBuilder, Schema,
+        TableSchema, VarCharType,
+    };
+    use crate::table::{DataSplitBuilder, Table};
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use chrono::Utc;
+    use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::{self, File};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn test_data_file(file_name: &str, row_count: i64) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size: 0,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 1,
+            extra_files: Vec::new(),
+            creation_time: Utc::now(),
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id: None,
+            write_cols: None,
+            external_path: None,
+        }
+    }
+
+    fn write_int_parquet_file(
+        path: &std::path::Path,
+        columns: Vec<(&str, Vec<i32>)>,
+        max_row_group_size: Option<usize>,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(
+            columns
+                .iter()
+                .map(|(name, _)| ArrowField::new(*name, ArrowDataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<Arc<dyn arrow_array::Array>> = columns
+            .iter()
+            .map(|(_, values)| {
+                Arc::new(Int32Array::from(values.clone())) as Arc<dyn arrow_array::Array>
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+
+        let props = max_row_group_size.map(|size| {
+            WriterProperties::builder()
+                .set_max_row_group_size(size)
+                .build()
+        });
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, props).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn collect_int_column(batches: &[RecordBatch], column_name: &str) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column_index = batch.schema().index_of(column_name).unwrap();
+                let array = batch.column(column_index);
+                let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..values.len())
+                    .map(|index| values.value(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_new_read_pushes_filter_to_reader_when_filter_column_not_projected() {
+        let tempdir = tempdir().unwrap();
+        let table_path = format!("file:{}", tempdir.path().display());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 20, 30])],
+            Some(2),
+        );
+
+        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4)])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_direct_table_read_with_filter_pushes_filter_to_reader() {
+        let tempdir = tempdir().unwrap();
+        let table_path = format!("file:{}", tempdir.path().display());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 20, 30])],
+            Some(2),
+        );
+
+        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4)])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+        let read =
+            TableRead::new(&table, vec![table.schema().fields()[0].clone()]).with_filter(predicate);
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_new_read_row_filter_filters_rows_within_matching_row_group() {
+        let tempdir = tempdir().unwrap();
+        let table_path = format!("file:{}", tempdir.path().display());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 20, 30, 40])],
+            Some(2),
+        );
+
+        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4)])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_reader_pruning_ignores_partition_conjuncts() {
+        let tempdir = tempdir().unwrap();
+        let table_path = format!("file:{}", tempdir.path().display());
+        let bucket_dir = tempdir.path().join("dt=2024-01-01").join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        write_int_parquet_file(
+            &bucket_dir.join("data.parquet"),
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 20, 30])],
+            Some(2),
+        );
+
+        let file_io = FileIO::from_path(tempdir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .partition_keys(["dt"])
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(1))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:{}", bucket_dir.display()))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4)])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+
+        let predicate = Predicate::and(vec![
+            PredicateBuilder::new(table.schema().fields())
+                .equal("dt", crate::spec::Datum::String("2024-01-01".to_string()))
+                .unwrap(),
+            PredicateBuilder::new(table.schema().fields())
+                .greater_or_equal("value", crate::spec::Datum::Int(10))
+                .unwrap(),
+        ]);
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
     }
 }

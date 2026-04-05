@@ -56,6 +56,7 @@ indexmap = "2.5.0"
 roaring = "0.11"
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 futures = "0.3"
 parquet = { workspace = true, features = ["async", "zstd"] }
