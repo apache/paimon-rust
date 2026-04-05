@@ -444,7 +444,7 @@ impl BinaryRowBuilder {
         self.data.extend_from_slice(value);
         // Pad to 8-byte word boundary (Java: roundNumberOfBytesToNearestWord)
         let padding = (8 - (value.len() % 8)) % 8;
-        self.data.extend(std::iter::repeat(0u8).take(padding));
+        self.data.extend(std::iter::repeat_n(0u8, padding));
         let encoded = ((var_offset as u64) << 32) | (value.len() as u64);
         let offset = self.field_offset(pos);
         self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
@@ -486,7 +486,7 @@ impl BinaryRowBuilder {
         let var_offset = self.data.len();
         self.data.extend_from_slice(minimal);
         let padding = (8 - (minimal.len() % 8)) % 8;
-        self.data.extend(std::iter::repeat(0u8).take(padding));
+        self.data.extend(std::iter::repeat_n(0u8, padding));
         let len = minimal.len();
         let encoded = ((var_offset as u64) << 32) | (len as u64);
         let offset = self.field_offset(pos);
