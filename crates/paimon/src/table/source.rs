@@ -20,7 +20,7 @@
 //! Reference: [org.apache.paimon.table.source](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/).
 
 use crate::spec::{BinaryRow, DataFileMeta};
-use crate::table::table_scan::group_by_overlapping_row_id;
+use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
 // ======================= DeletionFile ===============================
 
