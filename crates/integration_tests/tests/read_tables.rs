@@ -1686,3 +1686,209 @@ async fn test_bucket_predicate_filtering_in() {
         "Should return rows for id=1 and id=5, got: {actual:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Time travel integration tests
+// ---------------------------------------------------------------------------
+
+/// Time travel by snapshot id: snapshot 1 should return only the first batch.
+#[tokio::test]
+async fn test_time_travel_by_snapshot_id() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    // Snapshot 1: (1, 'alice'), (2, 'bob')
+    let table_snap1 = table.copy_with_options(HashMap::from([(
+        "scan.snapshot-id".to_string(),
+        "1".to_string(),
+    )]));
+    let rb = table_snap1.new_read_builder();
+    let plan = rb.new_scan().plan().await.expect("plan snap1");
+    let read = rb.new_read().expect("read snap1");
+    let batches: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(1, "alice".into()), (2, "bob".into())],
+        "Snapshot 1 should contain only the first batch"
+    );
+
+    // Snapshot 2: (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
+    let table_snap2 = table.copy_with_options(HashMap::from([(
+        "scan.snapshot-id".to_string(),
+        "2".to_string(),
+    )]));
+    let rb2 = table_snap2.new_read_builder();
+    let plan2 = rb2.new_scan().plan().await.expect("plan snap2");
+    let read2 = rb2.new_read().expect("read snap2");
+    let batches2: Vec<RecordBatch> = read2
+        .to_arrow(plan2.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual2 = extract_id_name(&batches2);
+    assert_eq!(
+        actual2,
+        vec![
+            (1, "alice".into()),
+            (2, "bob".into()),
+            (3, "carol".into()),
+            (4, "dave".into()),
+        ],
+        "Snapshot 2 should contain all rows"
+    );
+}
+
+/// Time travel by tag name.
+#[tokio::test]
+async fn test_time_travel_by_tag_name() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    // Tag 'snapshot1' -> snapshot 1: (1, 'alice'), (2, 'bob')
+    let table_tag1 = table.copy_with_options(HashMap::from([(
+        "scan.tag-name".to_string(),
+        "snapshot1".to_string(),
+    )]));
+    let rb = table_tag1.new_read_builder();
+    let plan = rb.new_scan().plan().await.expect("plan tag1");
+    let read = rb.new_read().expect("read tag1");
+    let batches: Vec<RecordBatch> = read
+        .to_arrow(plan.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual = extract_id_name(&batches);
+    assert_eq!(
+        actual,
+        vec![(1, "alice".into()), (2, "bob".into())],
+        "Tag 'snapshot1' should return snapshot 1 data"
+    );
+
+    // Tag 'snapshot2' -> snapshot 2: all 4 rows
+    let table_tag2 = table.copy_with_options(HashMap::from([(
+        "scan.tag-name".to_string(),
+        "snapshot2".to_string(),
+    )]));
+    let rb2 = table_tag2.new_read_builder();
+    let plan2 = rb2.new_scan().plan().await.expect("plan tag2");
+    let read2 = rb2.new_read().expect("read tag2");
+    let batches2: Vec<RecordBatch> = read2
+        .to_arrow(plan2.splits())
+        .expect("stream")
+        .try_collect()
+        .await
+        .expect("collect");
+    let actual2 = extract_id_name(&batches2);
+    assert_eq!(
+        actual2,
+        vec![
+            (1, "alice".into()),
+            (2, "bob".into()),
+            (3, "carol".into()),
+            (4, "dave".into()),
+        ],
+        "Tag 'snapshot2' should return all rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Data evolution + drop column tests
+// ---------------------------------------------------------------------------
+
+/// Data evolution + drop column: old rows that were MERGE INTO'd should have NULL
+/// for the newly added column (no file in the merge group provides it).
+#[tokio::test]
+async fn test_read_data_evolution_drop_column() {
+    let (_, batches) = scan_and_read_with_fs_catalog("data_evolution_drop_column", None).await;
+
+    let mut rows: Vec<(i32, String, i32, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        let extra = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("extra");
+        for i in 0..batch.num_rows() {
+            let extra_val = if extra.is_null(i) {
+                None
+            } else {
+                Some(extra.value(i).to_string())
+            };
+            rows.push((
+                id.value(i),
+                name.value(i).to_string(),
+                value.value(i),
+                extra_val,
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".into(), 100, None),
+            (2, "bob".into(), 200, None),
+            (3, "carol".into(), 300, Some("new".into())),
+        ],
+        "Old rows should have NULL for 'extra' (added after MERGE INTO), new rows should have it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Limit pushdown with data predicates test
+// ---------------------------------------------------------------------------
+
+/// Limit pushdown must be disabled when data predicates exist.
+/// Otherwise merged_row_count (pre-filter) could cause early stop, returning
+/// fewer rows than the limit after filtering.
+#[tokio::test]
+async fn test_limit_pushdown_disabled_with_data_predicates() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    // Filter: value >= 100 (matches all rows). With limit=2, if limit pushdown
+    // were applied, it might stop after the first split (merged_row_count >= 2)
+    // but that split's rows might all be filtered out by a stricter predicate.
+    // Here we use a lenient predicate to verify the plan still includes enough splits.
+    let filter = pb
+        .greater_than("value", Datum::Int(0))
+        .expect("Failed to build predicate");
+
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(filter);
+    read_builder.with_limit(2);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    // With data predicates, limit pushdown should be disabled, so we should get
+    // the same number of splits as without limit.
+    let full_plan = plan_table(&table, None).await;
+    assert_eq!(
+        plan.splits().len(),
+        full_plan.splits().len(),
+        "With data predicates, limit pushdown should be disabled — split count should match full plan"
+    );
+}
