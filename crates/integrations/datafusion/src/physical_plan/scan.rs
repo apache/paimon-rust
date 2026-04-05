@@ -16,10 +16,8 @@
 // under the License.
 
 use std::any::Any;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -27,7 +25,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use paimon::table::Table;
 use paimon::DataSplit;
 
@@ -128,7 +126,6 @@ impl ExecutionPlan for PaimonTableScan {
         let table = self.table.clone();
         let schema = self.schema();
         let projected_columns = self.projected_columns.clone();
-        let limit = self.limit;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
