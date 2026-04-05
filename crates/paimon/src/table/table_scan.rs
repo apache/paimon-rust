@@ -23,7 +23,6 @@
 use super::Table;
 use crate::arrow::schema_evolution::create_index_mapping;
 use crate::io::FileIO;
-use crate::spec::murmur_hash::compute_bucket_from_datums;
 use crate::spec::{
     eval_row, extract_datum, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataField,
     DataFileMeta, DataType, Datum, FileKind, IndexManifest, ManifestEntry, ManifestFileMeta,
@@ -556,7 +555,7 @@ fn compute_target_buckets(
             })
             .collect();
 
-        if let Some(bucket) = compute_bucket_from_datums(&datums, total_buckets) {
+        if let Some(bucket) = BinaryRow::compute_bucket_from_datums(&datums, total_buckets) {
             buckets.insert(bucket);
         } else {
             return None;

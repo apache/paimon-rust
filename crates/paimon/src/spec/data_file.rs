@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::spec::murmur_hash::hash_by_words;
 use crate::spec::stats::BinaryTableStats;
 use chrono::serde::ts_milliseconds_option::deserialize as from_millis_opt;
 use chrono::serde::ts_milliseconds_option::serialize as to_millis_opt;
@@ -350,6 +351,117 @@ impl BinaryRow {
             let millis = i64::from_le_bytes(self.read_slice::<8>(offset)?);
             Ok((millis, nano_of_milli))
         }
+    }
+
+    /// Compute the hash code of this BinaryRow, matching Java's `BinaryRow.hashCode()`.
+    ///
+    /// Uses MurmurHash3 (seed=42) over the raw data bytes (word-aligned).
+    pub fn hash_code(&self) -> i32 {
+        hash_by_words(&self.data)
+    }
+
+    /// Build a BinaryRow from typed Datum values.
+    ///
+    /// This matches the memory layout produced by Java's `BinaryRowWriter`.
+    /// Only supports types commonly used as bucket/partition keys.
+    /// Returns `None` for unsupported types.
+    pub fn from_datums(datums: &[(&crate::spec::Datum, &crate::spec::DataType)]) -> Option<Self> {
+        let arity = datums.len() as i32;
+        let null_bits_size = Self::cal_bit_set_width_in_bytes(arity) as usize;
+        let fixed_part_size = null_bits_size + (datums.len()) * 8;
+        let mut data = vec![0u8; fixed_part_size];
+
+        for (pos, (datum, _data_type)) in datums.iter().enumerate() {
+            let field_offset = null_bits_size + pos * 8;
+            match datum {
+                crate::spec::Datum::Bool(v) => {
+                    data[field_offset] = u8::from(*v);
+                }
+                crate::spec::Datum::TinyInt(v) => {
+                    data[field_offset] = *v as u8;
+                }
+                crate::spec::Datum::SmallInt(v) => {
+                    data[field_offset..field_offset + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                crate::spec::Datum::Int(v)
+                | crate::spec::Datum::Date(v)
+                | crate::spec::Datum::Time(v) => {
+                    data[field_offset..field_offset + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                crate::spec::Datum::Long(v) => {
+                    data[field_offset..field_offset + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                crate::spec::Datum::Float(v) => {
+                    data[field_offset..field_offset + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                crate::spec::Datum::Double(v) => {
+                    data[field_offset..field_offset + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                crate::spec::Datum::Timestamp { millis, .. }
+                | crate::spec::Datum::LocalZonedTimestamp { millis, .. } => {
+                    data[field_offset..field_offset + 8].copy_from_slice(&millis.to_le_bytes());
+                }
+                crate::spec::Datum::Decimal {
+                    unscaled,
+                    precision,
+                    ..
+                } => {
+                    if *precision <= 18 {
+                        let v = *unscaled as i64;
+                        data[field_offset..field_offset + 8].copy_from_slice(&v.to_le_bytes());
+                    } else {
+                        return None;
+                    }
+                }
+                crate::spec::Datum::String(s) => {
+                    let bytes = s.as_bytes();
+                    if bytes.len() <= 7 {
+                        data[field_offset..field_offset + bytes.len()].copy_from_slice(bytes);
+                        data[field_offset + 7] = 0x80 | (bytes.len() as u8);
+                    } else {
+                        let var_offset = data.len();
+                        data.extend_from_slice(bytes);
+                        let encoded = ((var_offset as u64) << 32) | (bytes.len() as u64);
+                        data[field_offset..field_offset + 8]
+                            .copy_from_slice(&encoded.to_le_bytes());
+                    }
+                }
+                crate::spec::Datum::Bytes(b) => {
+                    if b.len() <= 7 {
+                        data[field_offset..field_offset + b.len()].copy_from_slice(b);
+                        data[field_offset + 7] = 0x80 | (b.len() as u8);
+                    } else {
+                        let var_offset = data.len();
+                        data.extend_from_slice(b);
+                        let encoded = ((var_offset as u64) << 32) | (b.len() as u64);
+                        data[field_offset..field_offset + 8]
+                            .copy_from_slice(&encoded.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        // Pad data to word-aligned (multiple of 4) for hash_by_words.
+        while !data.len().is_multiple_of(4) {
+            data.push(0);
+        }
+
+        Some(Self::from_bytes(arity, data))
+    }
+
+    /// Build a BinaryRow from typed Datum values and compute its bucket.
+    ///
+    /// This matches Java's `DefaultBucketFunction`: project the bucket key fields
+    /// into a new `BinaryRow`, then `Math.abs(row.hashCode() % numBuckets)`.
+    ///
+    /// Returns `None` for unsupported types (fail-open: no bucket pruning).
+    pub fn compute_bucket_from_datums(
+        datums: &[(&crate::spec::Datum, &crate::spec::DataType)],
+        total_buckets: i32,
+    ) -> Option<i32> {
+        let row = Self::from_datums(datums)?;
+        let hash = row.hash_code();
+        Some((hash % total_buckets).abs())
     }
 }
 
