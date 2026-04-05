@@ -702,8 +702,8 @@ impl<'a> TableScan<'a> {
 mod tests {
     use super::partition_matches_predicate;
     use crate::spec::{
-        stats::BinaryTableStats, ArrayType, DataField, DataFileMeta, DataType, Datum,
-        DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,
+        stats::BinaryTableStats, ArrayType, BinaryRowBuilder, DataField, DataFileMeta, DataType,
+        Datum, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,
         PredicateBuilder, PredicateOperator, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
@@ -751,86 +751,13 @@ mod tests {
             .collect()
     }
 
-    struct SerializedBinaryRowBuilder {
-        arity: i32,
-        null_bits_size: usize,
-        data: Vec<u8>,
-    }
-
-    impl SerializedBinaryRowBuilder {
-        fn new(arity: i32) -> Self {
-            let null_bits_size = crate::spec::BinaryRow::cal_bit_set_width_in_bytes(arity) as usize;
-            let fixed_part_size = null_bits_size + (arity as usize) * 8;
-            Self {
-                arity,
-                null_bits_size,
-                data: vec![0u8; fixed_part_size],
-            }
+    fn int_stats_row(value: Option<i32>) -> Vec<u8> {
+        let mut builder = BinaryRowBuilder::new(1);
+        match value {
+            Some(value) => builder.write_int(0, value),
+            None => builder.set_null_at(0),
         }
-
-        fn field_offset(&self, pos: usize) -> usize {
-            self.null_bits_size + pos * 8
-        }
-
-        fn write_string(&mut self, pos: usize, value: &str) {
-            let var_offset = self.data.len();
-            self.data.extend_from_slice(value.as_bytes());
-            let encoded = ((var_offset as u64) << 32) | (value.len() as u64);
-            let offset = self.field_offset(pos);
-            self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
-        }
-
-        fn build_serialized(self) -> Vec<u8> {
-            let mut serialized = Vec::with_capacity(4 + self.data.len());
-            serialized.extend_from_slice(&self.arity.to_be_bytes());
-            serialized.extend_from_slice(&self.data);
-            serialized
-        }
-    }
-
-    struct RawBinaryRowBuilder {
-        arity: i32,
-        null_bits_size: usize,
-        data: Vec<u8>,
-    }
-
-    impl RawBinaryRowBuilder {
-        fn new(arity: i32) -> Self {
-            let null_bits_size = crate::spec::BinaryRow::cal_bit_set_width_in_bytes(arity) as usize;
-            let fixed_part_size = null_bits_size + (arity as usize) * 8;
-            Self {
-                arity,
-                null_bits_size,
-                data: vec![0u8; fixed_part_size],
-            }
-        }
-
-        fn field_offset(&self, pos: usize) -> usize {
-            self.null_bits_size + pos * 8
-        }
-
-        fn set_null_at(&mut self, pos: usize) {
-            let bit_index = pos + crate::spec::BinaryRow::HEADER_SIZE_IN_BYTES as usize;
-            let byte_index = bit_index / 8;
-            let bit_offset = bit_index % 8;
-            self.data[byte_index] |= 1 << bit_offset;
-
-            let offset = self.field_offset(pos);
-            self.data[offset..offset + 8].fill(0);
-        }
-
-        fn write_int(&mut self, pos: usize, value: i32) {
-            let offset = self.field_offset(pos);
-            self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-
-        fn build(self) -> Vec<u8> {
-            debug_assert_eq!(
-                self.data.len(),
-                self.null_bits_size + (self.arity as usize) * 8
-            );
-            self.data
-        }
+        builder.build_serialized()
     }
 
     fn partition_string_field() -> Vec<DataField> {
@@ -847,19 +774,6 @@ mod tests {
             "id".to_string(),
             DataType::Int(IntType::new()),
         )]
-    }
-
-    fn int_stats_row(value: Option<i32>) -> Vec<u8> {
-        let mut builder = RawBinaryRowBuilder::new(1);
-        match value {
-            Some(value) => builder.write_int(0, value),
-            None => builder.set_null_at(0),
-        }
-        let raw = builder.build();
-        let mut serialized = Vec::with_capacity(4 + raw.len());
-        serialized.extend_from_slice(&(1_i32).to_be_bytes());
-        serialized.extend_from_slice(&raw);
-        serialized
     }
 
     fn test_data_file_meta(
@@ -919,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_partition_matches_predicate_eval_error_fails_fast() {
-        let mut builder = SerializedBinaryRowBuilder::new(1);
+        let mut builder = BinaryRowBuilder::new(1);
         builder.write_string(0, "2024-01-01");
         let serialized = builder.build_serialized();
 
@@ -1126,23 +1040,17 @@ mod tests {
 
     #[test]
     fn test_data_file_matches_dense_stats_arity_mismatch_fails_open() {
-        let mut builder = RawBinaryRowBuilder::new(3);
+        let mut builder = BinaryRowBuilder::new(3);
         builder.write_int(0, 10);
         builder.write_int(1, 100);
         builder.write_int(2, 200);
-        let raw = builder.build();
-        let mut min_serialized = Vec::with_capacity(4 + raw.len());
-        min_serialized.extend_from_slice(&(3_i32).to_be_bytes());
-        min_serialized.extend_from_slice(&raw);
+        let min_serialized = builder.build_serialized();
 
-        let mut builder = RawBinaryRowBuilder::new(3);
+        let mut builder = BinaryRowBuilder::new(3);
         builder.write_int(0, 20);
         builder.write_int(1, 200);
         builder.write_int(2, 300);
-        let raw = builder.build();
-        let mut max_serialized = Vec::with_capacity(4 + raw.len());
-        max_serialized.extend_from_slice(&(3_i32).to_be_bytes());
-        max_serialized.extend_from_slice(&raw);
+        let max_serialized = builder.build_serialized();
 
         let fields = int_field();
         let file = test_data_file_meta(min_serialized, max_serialized, vec![0, 0, 0], 5);

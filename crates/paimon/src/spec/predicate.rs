@@ -24,7 +24,7 @@
 //! - Java `PredicateBuilder` / `LeafPredicate` / `CompoundPredicate`
 
 use crate::error::*;
-use crate::spec::data_file::BinaryRow;
+use crate::spec::binary_row::BinaryRow;
 use crate::spec::types::DataType;
 use crate::spec::DataField;
 use std::cmp::Ordering;

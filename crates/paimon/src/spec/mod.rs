@@ -19,6 +19,9 @@
 //!
 //! All paimon specs types are defined here.
 
+mod binary_row;
+pub use binary_row::*;
+
 mod data_file;
 pub use data_file::*;
 
