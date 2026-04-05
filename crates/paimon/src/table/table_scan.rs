@@ -160,62 +160,64 @@ async fn read_all_manifest_entries(
     }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
-    // Cache target buckets by total_buckets value (few distinct values in practice).
-    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
     let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
         .map(|meta| {
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
-            async move { crate::spec::Manifest::read(file_io, &path).await }
+            async move {
+                let entries = crate::spec::Manifest::read(file_io, &path).await?;
+                // Per-task bucket cache (few distinct total_buckets values per manifest).
+                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                let filtered: Vec<ManifestEntry> = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        if deletion_vectors_enabled
+                            && has_primary_keys
+                            && entry.file().level == 0
+                        {
+                            return false;
+                        }
+                        if has_primary_keys && entry.bucket() < 0 {
+                            return false;
+                        }
+                        if let Some(pred) = bucket_predicate {
+                            let total = entry.total_buckets();
+                            let targets = bucket_cache.entry(total).or_insert_with(|| {
+                                compute_target_buckets(pred, bucket_key_fields, total)
+                            });
+                            if let Some(targets) = targets {
+                                if !targets.contains(&entry.bucket()) {
+                                    return false;
+                                }
+                            }
+                        }
+                        if let Some(pred) = partition_predicate {
+                            match partition_matches_predicate(entry.partition(), pred) {
+                                Ok(false) => return false,
+                                Ok(true) => {}
+                                Err(_) => {}
+                            }
+                        }
+                        if !data_predicates.is_empty()
+                            && !data_file_matches_predicates(
+                                entry.file(),
+                                data_predicates,
+                                current_schema_id,
+                                schema_fields,
+                            )
+                        {
+                            return false;
+                        }
+                        true
+                    })
+                    .collect();
+                Ok::<_, crate::Error>(filtered)
+            }
         })
         .buffered(64)
         .try_collect::<Vec<_>>()
         .await?
         .into_iter()
         .flatten()
-        .filter(|entry| {
-            // DV level-0 filtering: only for primary-key tables with DV enabled.
-            // Non-PK (append-only) tables with DV should keep level-0 files.
-            if deletion_vectors_enabled && has_primary_keys && entry.file().level == 0 {
-                return false;
-            }
-            // Postpone bucket filtering: entries in bucket < 0 (e.g. -2 for postpone mode)
-            // are not yet compacted into real buckets and should not be visible to readers.
-            if has_primary_keys && entry.bucket() < 0 {
-                return false;
-            }
-            // Bucket predicate filtering: compute target buckets using entry's total_buckets.
-            if let Some(pred) = bucket_predicate {
-                let total = entry.total_buckets();
-                let targets = bucket_cache
-                    .entry(total)
-                    .or_insert_with(|| compute_target_buckets(pred, bucket_key_fields, total));
-                if let Some(targets) = targets {
-                    if !targets.contains(&entry.bucket()) {
-                        return false;
-                    }
-                }
-            }
-            // Partition predicate filtering per entry
-            if let Some(pred) = partition_predicate {
-                match partition_matches_predicate(entry.partition(), pred) {
-                    Ok(false) => return false,
-                    Ok(true) => {}
-                    Err(_) => {} // fail-open on error
-                }
-            }
-            // Data-level stats pruning (current schema only, cross-schema fail-open)
-            if !data_predicates.is_empty()
-                && !data_file_matches_predicates(
-                    entry.file(),
-                    data_predicates,
-                    current_schema_id,
-                    schema_fields,
-                )
-            {
-                return false;
-            }
-            true
-        })
         .collect();
     Ok(all_entries)
 }
@@ -368,15 +370,22 @@ impl FileStatsRows {
     /// When `value_stats_cols` is `Some`, stats are in dense mode — only covering those
     /// columns, and the mapping from schema field index to stats index is built by name.
     fn try_from_data_file(file: &DataFileMeta, schema_fields: &[DataField]) -> Option<Self> {
-        let (expected_fields, stats_col_mapping) = match &file.value_stats_cols {
-            None => (schema_fields.len(), None),
-            Some(cols) => {
-                let mapping: Vec<Option<usize>> = schema_fields
-                    .iter()
-                    .map(|field| cols.iter().position(|c| c == field.name()))
-                    .collect();
-                (cols.len(), Some(mapping))
-            }
+        // Determine which columns the stats cover and build the mapping.
+        // Priority: value_stats_cols > write_cols > all schema fields.
+        let (expected_fields, stats_col_mapping) = if let Some(cols) = &file.value_stats_cols {
+            let mapping: Vec<Option<usize>> = schema_fields
+                .iter()
+                .map(|field| cols.iter().position(|c| c == field.name()))
+                .collect();
+            (cols.len(), Some(mapping))
+        } else if let Some(cols) = &file.write_cols {
+            let mapping: Vec<Option<usize>> = schema_fields
+                .iter()
+                .map(|field| cols.iter().position(|c| c == field.name()))
+                .collect();
+            (cols.len(), Some(mapping))
+        } else {
+            (schema_fields.len(), None)
         };
 
         let stats = Self {
@@ -385,20 +394,6 @@ impl FileStatsRows {
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
             stats_col_mapping,
-        };
-
-        stats.arity_matches(expected_fields).then_some(stats)
-    }
-
-    /// Build file stats for the data evolution path where indices are resolved externally by name.
-    /// No `stats_col_mapping` is needed since the caller already maps field → stats index.
-    fn try_from_data_file_with_arity(file: &DataFileMeta, expected_fields: usize) -> Option<Self> {
-        let stats = Self {
-            row_count: file.row_count,
-            min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
-            max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
-            null_counts: file.value_stats.null_counts().clone(),
-            stats_col_mapping: None,
         };
 
         stats.arity_matches(expected_fields).then_some(stats)
@@ -995,10 +990,7 @@ fn data_evolution_group_matches_predicates(
     // Build per-file stats (lazily, only parse once per file).
     let file_stats: Vec<Option<FileStatsRows>> = sorted_files
         .iter()
-        .map(|file| {
-            let num_stats_fields = file_stats_columns(file, table_fields).len();
-            FileStatsRows::try_from_data_file_with_arity(file, num_stats_fields)
-        })
+        .map(|file| FileStatsRows::try_from_data_file(file, table_fields))
         .collect();
 
     // row_count is the max across the group (overlapping row ranges).
