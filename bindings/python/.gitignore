@@ -15,30 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "paimon-datafusion"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
-homepage = "https://paimon.apache.org/docs/rust/datafusion/"
-documentation = "https://docs.rs/paimon-datafusion"
-description = "Apache Paimon DataFusion Integration"
-categories = ["database"]
-keywords = ["paimon", "datafusion", "integrations"]
+.venv/
+.idea/
+__pycache__/
+.pytest_cache/
 
-[dependencies]
-async-trait = "0.1"
-chrono = "0.4"
-datafusion = { workspace = true }
-paimon = { path = "../../paimon" }
-futures = "0.3"
-tokio = { workspace = true, features = ["rt", "time", "fs"] }
-
-[dev-dependencies]
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
-parquet = { workspace = true }
-serde = "1"
-serde_json = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+*.dSYM/
+*.so
+uv.lock

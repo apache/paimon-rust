@@ -150,7 +150,7 @@ impl Storage {
     }
 
     #[cfg(feature = "storage-s3")]
-    fn s3_bucket_and_relative_path<'a>(path: &'a str) -> crate::Result<(String, &'a str)> {
+    fn s3_bucket_and_relative_path(path: &str) -> crate::Result<(String, &str)> {
         let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
             message: format!("Invalid S3 url: {path}"),
         })?;

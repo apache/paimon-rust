@@ -21,6 +21,7 @@ description = "The rust implementation of Apache Paimon"
 documentation = "https://docs.rs/paimon"
 name = "paimon"
 
+homepage.workspace = true
 repository.workspace = true
 edition.workspace = true
 license.workspace = true

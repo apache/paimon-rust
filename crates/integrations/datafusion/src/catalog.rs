@@ -28,6 +28,7 @@ use datafusion::error::Result as DFResult;
 use paimon::catalog::{Catalog, Identifier};
 
 use crate::error::to_datafusion_error;
+use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::table::PaimonTableProvider;
 
 /// Provides an interface to manage and access multiple schemas (databases)
@@ -61,22 +62,29 @@ impl CatalogProvider for PaimonCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        futures::executor::block_on(async {
-            self.catalog.list_databases().await.unwrap_or_default()
-        })
+        let catalog = Arc::clone(&self.catalog);
+        block_on_with_runtime(
+            async move { catalog.list_databases().await.unwrap_or_default() },
+            "paimon catalog access thread panicked",
+        )
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        futures::executor::block_on(async {
-            match self.catalog.get_database(name).await {
-                Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
-                    self.catalog.clone(),
-                    name.to_string(),
-                )) as Arc<dyn SchemaProvider>),
-                Err(paimon::Error::DatabaseNotExist { .. }) => None,
-                Err(_) => None,
-            }
-        })
+        let catalog = Arc::clone(&self.catalog);
+        let name = name.to_string();
+        block_on_with_runtime(
+            async move {
+                match catalog.get_database(&name).await {
+                    Ok(_) => Some(
+                        Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
+                            as Arc<dyn SchemaProvider>,
+                    ),
+                    Err(paimon::Error::DatabaseNotExist { .. }) => None,
+                    Err(_) => None,
+                }
+            },
+            "paimon catalog access thread panicked",
+        )
     }
 }
 
@@ -113,36 +121,42 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        // Use blocking call to fetch table names synchronously.
-        // This is acceptable as table name listing is lightweight.
-        futures::executor::block_on(async {
-            self.catalog
-                .list_tables(&self.database)
-                .await
-                .unwrap_or_default()
-        })
+        let catalog = Arc::clone(&self.catalog);
+        let database = self.database.clone();
+        block_on_with_runtime(
+            async move { catalog.list_tables(&database).await.unwrap_or_default() },
+            "paimon catalog access thread panicked",
+        )
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let catalog = Arc::clone(&self.catalog);
         let identifier = Identifier::new(self.database.clone(), name);
-        match self.catalog.get_table(&identifier).await {
-            Ok(table) => {
-                let provider = PaimonTableProvider::try_new(table)?;
-                Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
+        await_with_runtime(async move {
+            match catalog.get_table(&identifier).await {
+                Ok(table) => {
+                    let provider = PaimonTableProvider::try_new(table)?;
+                    Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
+                }
+                Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+                Err(e) => Err(to_datafusion_error(e)),
             }
-            Err(paimon::Error::TableNotExist { .. }) => Ok(None),
-            Err(e) => Err(to_datafusion_error(e)),
-        }
+        })
+        .await
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        let catalog = Arc::clone(&self.catalog);
         let identifier = Identifier::new(self.database.clone(), name);
-        futures::executor::block_on(async {
-            match self.catalog.get_table(&identifier).await {
-                Ok(_) => true,
-                Err(paimon::Error::TableNotExist { .. }) => false,
-                Err(_) => false,
-            }
-        })
+        block_on_with_runtime(
+            async move {
+                match catalog.get_table(&identifier).await {
+                    Ok(_) => true,
+                    Err(paimon::Error::TableNotExist { .. }) => false,
+                    Err(_) => false,
+                }
+            },
+            "paimon catalog access thread panicked",
+        )
     }
 }

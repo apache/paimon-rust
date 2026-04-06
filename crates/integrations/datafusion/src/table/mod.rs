@@ -32,6 +32,7 @@ use paimon::table::Table;
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{build_pushed_predicate, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
+use crate::runtime::await_with_runtime;
 
 /// Read-only table provider for a Paimon table.
 ///
@@ -87,19 +88,6 @@ impl TableProvider for PaimonTableProvider {
         TableType::Base
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        let fields = self.table.schema().fields();
-        let partition_keys = self.table.schema().partition_keys();
-
-        Ok(filters
-            .iter()
-            .map(|filter| classify_filter_pushdown(filter, fields, partition_keys))
-            .collect())
-    }
-
     async fn scan(
         &self,
         state: &dyn Session,
@@ -131,7 +119,13 @@ impl TableProvider for PaimonTableProvider {
             read_builder.with_limit(limit);
         }
         let scan = read_builder.new_scan();
-        let plan = scan.plan().await.map_err(to_datafusion_error)?;
+        // DataFusion's Python FFI may poll `TableProvider::scan()` without an active
+        // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
+        // reading Paimon metadata, so we must provide a runtime here instead of
+        // assuming the caller already entered one.
+        let plan = await_with_runtime(scan.plan())
+            .await
+            .map_err(to_datafusion_error)?;
 
         // Distribute splits across DataFusion partitions, capped by the
         // session's target_partitions to avoid over-sharding with many small splits.
@@ -157,6 +151,19 @@ impl TableProvider for PaimonTableProvider {
             planned_partitions,
             limit,
         )))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        let fields = self.table.schema().fields();
+        let partition_keys = self.table.schema().partition_keys();
+
+        Ok(filters
+            .iter()
+            .map(|filter| classify_filter_pushdown(filter, fields, partition_keys))
+            .collect())
     }
 }
 

@@ -15,25 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-resolver = "2"
-members = ["crates/paimon", "crates/integration_tests", "bindings/c", "bindings/python", "crates/integrations/datafusion"]
+import os
 
-[workspace.package]
-version = "0.0.0"
-edition = "2021"
-homepage = "https://paimon.apache.org/docs/rust/"
-repository = "https://github.com/apache/paimon-rust"
-license = "Apache-2.0"
-rust-version = "1.86.0"
+import pyarrow as pa
+from datafusion import SessionContext
 
-[workspace.dependencies]
-arrow = "57.0"
-arrow-array = { version = "57.0", features = ["ffi"] }
-arrow-schema = "57.0"
-arrow-cast = "57.0"
-arrow-ord = "57.0"
-datafusion = "52.3.0"
-datafusion-ffi = "52.3.0"
-parquet = "57.0"
-tokio = "1.39.2"
+from pypaimon_rust.datafusion import PaimonCatalog
+
+WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
+
+
+def extract_rows(batches):
+    table = pa.Table.from_batches(batches)
+    return sorted(zip(table["id"].to_pylist(), table["name"].to_pylist()))
+
+
+def test_query_simple_table_via_catalog_provider():
+    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+    ctx = SessionContext()
+    ctx.register_catalog_provider("paimon", catalog)
+
+    df = ctx.sql("SELECT id, name FROM paimon.default.simple_log_table")
+
+    assert extract_rows(df.collect()) == [
+        (1, "alice"),
+        (2, "bob"),
+        (3, "carol"),
+    ]

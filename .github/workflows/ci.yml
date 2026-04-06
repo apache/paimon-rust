@@ -90,6 +90,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Rust Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-${{ runner.os }}-
+
       - name: Start Docker containers
         run: make docker-up
 
@@ -104,6 +115,16 @@ jobs:
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.3"
+          enable-cache: true
+
+      - name: Python Binding Integration Test
+        working-directory: bindings/python
+        run: make install && make test
 
       - name: Go Integration Test
         working-directory: bindings/go
