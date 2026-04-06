@@ -20,16 +20,15 @@
 //! Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/table_scan.py)
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
-use super::bucket_filter::{
-    compute_target_buckets, extract_predicate_for_keys, split_partition_and_data_predicates,
-};
+use super::bucket_filter::compute_target_buckets;
 use super::stats_filter::{
     data_evolution_group_matches_predicates, data_file_matches_predicates,
-    data_file_matches_predicates_for_table, data_leaf_may_match, group_by_overlapping_row_id,
-    FileStatsRows, ResolvedStatsSchema,
+    data_file_matches_predicates_for_table, group_by_overlapping_row_id, FileStatsRows,
+    ResolvedStatsSchema,
 };
 use super::Table;
 use crate::io::FileIO;
+use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
     eval_row, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind, IndexManifest,
     ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot,
@@ -299,17 +298,27 @@ fn partition_matches_predicate(
 #[derive(Debug, Clone)]
 pub struct TableScan<'a> {
     table: &'a Table,
-    filter: Option<Predicate>,
+    partition_predicate: Option<Predicate>,
+    data_predicates: Vec<Predicate>,
+    bucket_predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return.
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
 }
 
 impl<'a> TableScan<'a> {
-    pub fn new(table: &'a Table, filter: Option<Predicate>, limit: Option<usize>) -> Self {
+    pub fn new(
+        table: &'a Table,
+        partition_predicate: Option<Predicate>,
+        data_predicates: Vec<Predicate>,
+        bucket_predicate: Option<Predicate>,
+        limit: Option<usize>,
+    ) -> Self {
         Self {
             table,
-            filter,
+            partition_predicate,
+            data_predicates,
+            bucket_predicate,
             limit,
         }
     }
@@ -416,24 +425,12 @@ impl<'a> TableScan<'a> {
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
 
-        // Compute predicates before reading manifests so they can be pushed down.
-        let partition_keys = self.table.schema().partition_keys();
-        let (partition_predicate, data_predicates) = if let Some(filter) = self.filter.clone() {
-            if partition_keys.is_empty() {
-                (None, filter.split_and())
-            } else {
-                split_partition_and_data_predicates(
-                    filter,
-                    self.table.schema().fields(),
-                    partition_keys,
-                )
-            }
-        } else {
-            (None, Vec::new())
-        };
-
         // Resolve partition fields for manifest-file-level stats pruning.
-        let partition_fields: Vec<DataField> = partition_keys
+        let partition_keys = self.table.schema().partition_keys();
+        let partition_fields: Vec<DataField> = self
+            .table
+            .schema()
+            .partition_keys()
             .iter()
             .filter_map(|key| {
                 self.table
@@ -449,17 +446,17 @@ impl<'a> TableScan<'a> {
         let pushdown_data_predicates = if data_evolution_enabled {
             &[][..]
         } else {
-            &data_predicates
+            self.data_predicates.as_slice()
         };
 
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
 
         // Compute bucket predicate and key fields for per-entry bucket pruning.
         // Only supported for the default bucket function (MurmurHash3-based).
-        let (bucket_predicate, bucket_key_fields): (Option<Predicate>, Vec<DataField>) =
-            if !core_options.is_default_bucket_function() {
-                (None, Vec::new())
-            } else if let Some(filter) = &self.filter {
+        let bucket_key_fields: Vec<DataField> =
+            if self.bucket_predicate.is_none() || !core_options.is_default_bucket_function() {
+                Vec::new()
+            } else {
                 let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
                     if has_primary_keys {
                         self.table
@@ -472,33 +469,17 @@ impl<'a> TableScan<'a> {
                         Vec::new()
                     }
                 });
-                if bucket_keys.is_empty() {
-                    (None, Vec::new())
-                } else {
-                    let fields: Vec<DataField> = bucket_keys
-                        .iter()
-                        .filter_map(|key| {
-                            self.table
-                                .schema()
-                                .fields()
-                                .iter()
-                                .find(|f| f.name() == key)
-                                .cloned()
-                        })
-                        .collect();
-                    if fields.len() == bucket_keys.len() {
-                        let pred = extract_predicate_for_keys(
-                            filter,
-                            self.table.schema().fields(),
-                            &bucket_keys,
-                        );
-                        (pred, fields)
-                    } else {
-                        (None, Vec::new())
-                    }
-                }
-            } else {
-                (None, Vec::new())
+                bucket_keys
+                    .iter()
+                    .filter_map(|key| {
+                        self.table
+                            .schema()
+                            .fields()
+                            .iter()
+                            .find(|f| f.name() == key)
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>()
             };
 
         let entries = read_all_manifest_entries(
@@ -507,12 +488,12 @@ impl<'a> TableScan<'a> {
             &snapshot,
             deletion_vectors_enabled,
             has_primary_keys,
-            partition_predicate.as_ref(),
+            self.partition_predicate.as_ref(),
             &partition_fields,
             pushdown_data_predicates,
             self.table.schema().id(),
             self.table.schema().fields(),
-            bucket_predicate.as_ref(),
+            self.bucket_predicate.as_ref(),
             &bucket_key_fields,
         )
         .await?;
@@ -523,7 +504,7 @@ impl<'a> TableScan<'a> {
 
         // For non-data-evolution tables, cross-schema files were kept (fail-open)
         // by the pushdown. Apply the full schema-aware filter for those files.
-        let entries = if data_predicates.is_empty() || data_evolution_enabled {
+        let entries = if self.data_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
             let current_schema_id = self.table.schema().id();
@@ -541,7 +522,7 @@ impl<'a> TableScan<'a> {
                         || data_file_matches_predicates_for_table(
                             self.table,
                             entry.file(),
-                            &data_predicates,
+                            &self.data_predicates,
                             &mut schema_cache,
                         )
                         .await
@@ -625,7 +606,7 @@ impl<'a> TableScan<'a> {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
 
                 // Filter groups by merged stats before splitting.
-                let row_id_groups: Vec<Vec<DataFileMeta>> = if data_predicates.is_empty() {
+                let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
                     row_id_groups
@@ -633,7 +614,7 @@ impl<'a> TableScan<'a> {
                         .filter(|group| {
                             data_evolution_group_matches_predicates(
                                 group,
-                                &data_predicates,
+                                &self.data_predicates,
                                 self.table.schema().fields(),
                             )
                         })
@@ -688,7 +669,7 @@ impl<'a> TableScan<'a> {
         // Apply limit pushdown only when there are no data predicates.
         // With data predicates, merged_row_count() reflects pre-filter row counts,
         // so stopping early could return fewer rows than the limit after filtering.
-        let splits = if data_predicates.is_empty() {
+        let splits = if self.data_predicates.is_empty() {
             self.apply_limit_pushdown(splits)
         } else {
             splits

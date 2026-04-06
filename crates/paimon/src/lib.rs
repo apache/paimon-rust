@@ -30,6 +30,7 @@ pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
 pub mod io;
+mod predicate_stats;
 pub mod spec;
 pub mod table;
 

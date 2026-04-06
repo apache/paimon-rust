@@ -19,11 +19,10 @@
 
 use super::Table;
 use crate::arrow::schema_evolution::create_index_mapping;
-use crate::spec::{
-    extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate,
-    PredicateOperator,
+use crate::predicate_stats::{
+    data_leaf_may_match, missing_field_may_match, predicates_may_match_with_schema, StatsAccessor,
 };
-use std::cmp::Ordering;
+use crate::spec::{extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -97,8 +96,33 @@ impl FileStatsRows {
         }
     }
 
-    fn null_count(&self, stats_index: usize) -> Option<i64> {
+    fn stats_null_count(&self, stats_index: usize) -> Option<i64> {
         self.null_counts.get(stats_index).copied().flatten()
+    }
+}
+
+impl StatsAccessor for FileStatsRows {
+    fn row_count(&self) -> i64 {
+        self.row_count
+    }
+
+    fn null_count(&self, index: usize) -> Option<i64> {
+        let stats_index = self.stats_index(index)?;
+        self.stats_null_count(stats_index)
+    }
+
+    fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let stats_index = self.stats_index(index)?;
+        self.min_values
+            .as_ref()
+            .and_then(|row| extract_stats_datum(row, stats_index, data_type))
+    }
+
+    fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let stats_index = self.stats_index(index)?;
+        self.max_values
+            .as_ref()
+            .and_then(|row| extract_stats_datum(row, stats_index, data_type))
     }
 }
 
@@ -156,10 +180,8 @@ pub(super) fn data_file_matches_predicates(
     }
 
     let stats = FileStatsRows::from_data_file(file, schema_fields);
-
-    predicates
-        .iter()
-        .all(|predicate| data_predicate_may_match(predicate, &stats))
+    let field_mapping = identity_field_mapping(schema_fields.len());
+    predicates_may_match_with_schema(predicates, &stats, &field_mapping, schema_fields)
 }
 
 async fn resolve_stats_schema(
@@ -218,203 +240,12 @@ pub(super) async fn data_file_matches_predicates_for_table(
     };
 
     let stats = FileStatsRows::from_data_file(file, &resolved.file_fields);
-
-    predicates.iter().all(|predicate| {
-        data_predicate_may_match_with_schema(
-            predicate,
-            &stats,
-            &resolved.field_mapping,
-            &resolved.file_fields,
-        )
-    })
-}
-
-fn data_predicate_may_match(predicate: &Predicate, stats: &FileStatsRows) -> bool {
-    match predicate {
-        Predicate::AlwaysTrue => true,
-        Predicate::AlwaysFalse => false,
-        Predicate::And(children) => children
-            .iter()
-            .all(|child| data_predicate_may_match(child, stats)),
-        Predicate::Or(_) | Predicate::Not(_) => true,
-        Predicate::Leaf {
-            index,
-            data_type,
-            op,
-            literals,
-            ..
-        } => {
-            let Some(stats_idx) = stats.stats_index(*index) else {
-                return true;
-            };
-            data_leaf_may_match(stats_idx, data_type, data_type, *op, literals, stats)
-        }
-    }
-}
-
-fn data_predicate_may_match_with_schema(
-    predicate: &Predicate,
-    stats: &FileStatsRows,
-    field_mapping: &[Option<usize>],
-    file_fields: &[DataField],
-) -> bool {
-    match predicate {
-        Predicate::AlwaysTrue => true,
-        Predicate::AlwaysFalse => false,
-        Predicate::And(children) => children.iter().all(|child| {
-            data_predicate_may_match_with_schema(child, stats, field_mapping, file_fields)
-        }),
-        Predicate::Or(_) | Predicate::Not(_) => true,
-        Predicate::Leaf {
-            index,
-            data_type,
-            op,
-            literals,
-            ..
-        } => match field_mapping.get(*index).copied().flatten() {
-            Some(file_index) => {
-                let Some(file_field) = file_fields.get(file_index) else {
-                    return true;
-                };
-                let Some(stats_idx) = stats.stats_index(file_index) else {
-                    return true;
-                };
-                data_leaf_may_match(
-                    stats_idx,
-                    file_field.data_type(),
-                    data_type,
-                    *op,
-                    literals,
-                    stats,
-                )
-            }
-            None => missing_field_may_match(*op, stats.row_count),
-        },
-    }
-}
-
-pub(super) fn data_leaf_may_match(
-    index: usize,
-    stats_data_type: &DataType,
-    predicate_data_type: &DataType,
-    op: PredicateOperator,
-    literals: &[Datum],
-    stats: &FileStatsRows,
-) -> bool {
-    let row_count = stats.row_count;
-    if row_count <= 0 {
-        return false;
-    }
-
-    let null_count = stats.null_count(index);
-    let all_null = null_count.map(|count| count == row_count);
-
-    match op {
-        PredicateOperator::IsNull => {
-            return null_count.is_none_or(|count| count > 0);
-        }
-        PredicateOperator::IsNotNull => {
-            return all_null != Some(true);
-        }
-        PredicateOperator::In | PredicateOperator::NotIn => {
-            return true;
-        }
-        PredicateOperator::Eq
-        | PredicateOperator::NotEq
-        | PredicateOperator::Lt
-        | PredicateOperator::LtEq
-        | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {}
-    }
-
-    if all_null == Some(true) {
-        return false;
-    }
-
-    let literal = match literals.first() {
-        Some(literal) => literal,
-        None => return true,
-    };
-
-    let min_value = match stats
-        .min_values
-        .as_ref()
-        .and_then(|row| extract_stats_datum(row, index, stats_data_type))
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
-    };
-    let max_value = match stats
-        .max_values
-        .as_ref()
-        .and_then(|row| extract_stats_datum(row, index, stats_data_type))
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
-    };
-
-    match op {
-        PredicateOperator::Eq => {
-            !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
-                && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
-        }
-        PredicateOperator::NotEq => !(min_value == *literal && max_value == *literal),
-        PredicateOperator::Lt => !matches!(
-            min_value.partial_cmp(literal),
-            Some(Ordering::Greater | Ordering::Equal)
-        ),
-        PredicateOperator::LtEq => {
-            !matches!(min_value.partial_cmp(literal), Some(Ordering::Greater))
-        }
-        PredicateOperator::Gt => !matches!(
-            max_value.partial_cmp(literal),
-            Some(Ordering::Less | Ordering::Equal)
-        ),
-        PredicateOperator::GtEq => !matches!(max_value.partial_cmp(literal), Some(Ordering::Less)),
-        PredicateOperator::IsNull
-        | PredicateOperator::IsNotNull
-        | PredicateOperator::In
-        | PredicateOperator::NotIn => true,
-    }
-}
-
-fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> bool {
-    if row_count <= 0 {
-        return false;
-    }
-
-    matches!(op, PredicateOperator::IsNull)
-}
-
-fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType) -> Option<Datum> {
-    match (datum, predicate_data_type) {
-        (datum @ Datum::Bool(_), DataType::Boolean(_))
-        | (datum @ Datum::TinyInt(_), DataType::TinyInt(_))
-        | (datum @ Datum::SmallInt(_), DataType::SmallInt(_))
-        | (datum @ Datum::Int(_), DataType::Int(_))
-        | (datum @ Datum::Long(_), DataType::BigInt(_))
-        | (datum @ Datum::Float(_), DataType::Float(_))
-        | (datum @ Datum::Double(_), DataType::Double(_))
-        | (datum @ Datum::String(_), DataType::VarChar(_))
-        | (datum @ Datum::String(_), DataType::Char(_))
-        | (datum @ Datum::Bytes(_), DataType::Binary(_))
-        | (datum @ Datum::Bytes(_), DataType::VarBinary(_))
-        | (datum @ Datum::Date(_), DataType::Date(_))
-        | (datum @ Datum::Time(_), DataType::Time(_))
-        | (datum @ Datum::Timestamp { .. }, DataType::Timestamp(_))
-        | (datum @ Datum::LocalZonedTimestamp { .. }, DataType::LocalZonedTimestamp(_))
-        | (datum @ Datum::Decimal { .. }, DataType::Decimal(_)) => Some(datum),
-        (Datum::TinyInt(value), DataType::SmallInt(_)) => Some(Datum::SmallInt(value as i16)),
-        (Datum::TinyInt(value), DataType::Int(_)) => Some(Datum::Int(value as i32)),
-        (Datum::TinyInt(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
-        (Datum::SmallInt(value), DataType::Int(_)) => Some(Datum::Int(value as i32)),
-        (Datum::SmallInt(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
-        (Datum::Int(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
-        (Datum::Float(value), DataType::Double(_)) => Some(Datum::Double(value as f64)),
-        _ => None,
-    }
+    predicates_may_match_with_schema(
+        predicates,
+        &stats,
+        &resolved.field_mapping,
+        &resolved.file_fields,
+    )
 }
 
 fn extract_stats_datum(row: &BinaryRow, index: usize, data_type: &DataType) -> Option<Datum> {
@@ -463,16 +294,18 @@ pub(super) fn data_evolution_group_matches_predicates(
     let mut sorted_files: Vec<&DataFileMeta> = group.iter().collect();
     sorted_files.sort_by(|a, b| b.max_sequence_number.cmp(&a.max_sequence_number));
 
-    // For each table field, find which file (index in sorted_files) provides it,
-    // and the field's offset within that file's stats.
+    // For each table field, find which file (index in sorted_files) provides it.
+    // The field index remains a table-field index so FileStatsRows can resolve
+    // it through its own schema-to-stats mapping.
     let field_sources: Vec<Option<(usize, usize)>> = table_fields
         .iter()
-        .map(|field| {
+        .enumerate()
+        .map(|(field_idx, field)| {
             for (file_idx, file) in sorted_files.iter().enumerate() {
                 let file_columns = file_stats_columns(file, table_fields);
-                for (stats_idx, col_name) in file_columns.iter().enumerate() {
+                for col_name in &file_columns {
                     if *col_name == field.name() {
-                        return Some((file_idx, stats_idx));
+                        return Some((file_idx, field_idx));
                     }
                 }
             }
@@ -544,13 +377,20 @@ fn data_evolution_predicate_may_match(
             let Some(source) = field_sources.get(*index).copied().flatten() else {
                 return missing_field_may_match(*op, row_count);
             };
-            let (file_idx, stats_idx) = source;
+            let (file_idx, field_index) = source;
             let stats = &file_stats[file_idx];
             let stats_data_type = table_fields
                 .get(*index)
                 .map(|f| f.data_type())
                 .unwrap_or(data_type);
-            data_leaf_may_match(stats_idx, stats_data_type, data_type, *op, literals, stats)
+            data_leaf_may_match(
+                field_index,
+                stats_data_type,
+                data_type,
+                *op,
+                literals,
+                stats,
+            )
         }
     }
 }
