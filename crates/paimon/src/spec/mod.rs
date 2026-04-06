@@ -26,6 +26,7 @@ mod data_file;
 pub use data_file::*;
 
 mod core_options;
+pub(crate) use core_options::TimeTravelSelector;
 pub use core_options::*;
 
 mod schema;

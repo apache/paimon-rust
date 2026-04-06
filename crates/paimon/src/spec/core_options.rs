@@ -40,6 +40,13 @@ pub struct CoreOptions<'a> {
     options: &'a HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeTravelSelector<'a> {
+    TagName(&'a str),
+    SnapshotId(i64),
+    TimestampMillis(i64),
+}
+
 impl<'a> CoreOptions<'a> {
     pub fn new(options: &'a HashMap<String, String>) -> Self {
         Self { options }
@@ -94,23 +101,88 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(true)
     }
 
-    /// Snapshot id for time travel via `scan.snapshot-id`.
+    fn parse_i64_option(&self, option_name: &'static str) -> crate::Result<Option<i64>> {
+        match self.options.get(option_name) {
+            Some(value) => value
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Invalid value for {option_name}: '{value}'"),
+                    source: Some(Box::new(e)),
+                }),
+            None => Ok(None),
+        }
+    }
+
+    /// Raw snapshot id accessor for `scan.snapshot-id`.
+    ///
+    /// This compatibility accessor is lossy: it returns `None` for absent or
+    /// invalid values and does not validate selector conflicts. Internal
+    /// time-travel planning should use `try_time_travel_selector`.
     pub fn scan_snapshot_id(&self) -> Option<i64> {
         self.options
             .get(SCAN_SNAPSHOT_ID_OPTION)
             .and_then(|v| v.parse().ok())
     }
 
-    /// Timestamp in millis for time travel via `scan.timestamp-millis`.
+    /// Raw timestamp accessor for `scan.timestamp-millis`.
+    ///
+    /// This compatibility accessor is lossy: it returns `None` for absent or
+    /// invalid values and does not validate selector conflicts. Internal
+    /// time-travel planning should use `try_time_travel_selector`.
     pub fn scan_timestamp_millis(&self) -> Option<i64> {
         self.options
             .get(SCAN_TIMESTAMP_MILLIS_OPTION)
             .and_then(|v| v.parse().ok())
     }
 
-    /// Tag name for time travel via `scan.tag-name`.
-    pub fn scan_tag_name(&self) -> Option<&str> {
+    /// Raw tag name accessor for `scan.tag-name`.
+    ///
+    /// This compatibility accessor does not validate selector conflicts.
+    /// Internal time-travel planning should use `try_time_travel_selector`.
+    pub fn scan_tag_name(&self) -> Option<&'a str> {
         self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str)
+    }
+
+    fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
+        let mut selectors = Vec::with_capacity(3);
+        if self.options.contains_key(SCAN_TAG_NAME_OPTION) {
+            selectors.push(SCAN_TAG_NAME_OPTION);
+        }
+        if self.options.contains_key(SCAN_SNAPSHOT_ID_OPTION) {
+            selectors.push(SCAN_SNAPSHOT_ID_OPTION);
+        }
+        if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
+            selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        selectors
+    }
+
+    /// Validates and normalizes the internal time-travel selector.
+    ///
+    /// This is the semantic owner for selector mutual exclusion and strict
+    /// numeric parsing.
+    pub(crate) fn try_time_travel_selector(&self) -> crate::Result<Option<TimeTravelSelector<'a>>> {
+        let selectors = self.configured_time_travel_selectors();
+        if selectors.len() > 1 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Only one time-travel selector may be set, found: {}",
+                    selectors.join(", ")
+                ),
+                source: None,
+            });
+        }
+
+        if let Some(tag_name) = self.scan_tag_name() {
+            Ok(Some(TimeTravelSelector::TagName(tag_name)))
+        } else if let Some(id) = self.parse_i64_option(SCAN_SNAPSHOT_ID_OPTION)? {
+            Ok(Some(TimeTravelSelector::SnapshotId(id)))
+        } else if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
+            Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Explicit bucket key columns. If not set, defaults to primary keys for PK tables.
@@ -229,5 +301,87 @@ mod tests {
         let core = CoreOptions::new(&options);
         assert_eq!(core.partition_default_name(), "NULL_PART");
         assert!(!core.legacy_partition_name());
+    }
+
+    #[test]
+    fn test_try_time_travel_selector_rejects_conflicting_selectors() {
+        let options = HashMap::from([
+            (SCAN_TAG_NAME_OPTION.to_string(), "tag1".to_string()),
+            (SCAN_SNAPSHOT_ID_OPTION.to_string(), "7".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+
+        let err = core
+            .try_time_travel_selector()
+            .expect_err("conflicting selectors should fail");
+        match err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains("Only one time-travel selector may be set"));
+                assert!(message.contains(SCAN_TAG_NAME_OPTION));
+                assert!(message.contains(SCAN_SNAPSHOT_ID_OPTION));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_time_travel_selector_rejects_invalid_numeric_values() {
+        let snapshot_options =
+            HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "abc".to_string())]);
+        let snapshot_core = CoreOptions::new(&snapshot_options);
+
+        let snapshot_err = snapshot_core
+            .try_time_travel_selector()
+            .expect_err("invalid snapshot id should fail");
+        match snapshot_err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains(SCAN_SNAPSHOT_ID_OPTION));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let timestamp_options =
+            HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "xyz".to_string())]);
+        let timestamp_core = CoreOptions::new(&timestamp_options);
+
+        let timestamp_err = timestamp_core
+            .try_time_travel_selector()
+            .expect_err("invalid timestamp millis should fail");
+        match timestamp_err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains(SCAN_TIMESTAMP_MILLIS_OPTION));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_time_travel_selector_normalizes_valid_selector() {
+        let tag_options = HashMap::from([(SCAN_TAG_NAME_OPTION.to_string(), "tag1".to_string())]);
+        let tag_core = CoreOptions::new(&tag_options);
+        assert_eq!(
+            tag_core.try_time_travel_selector().expect("tag selector"),
+            Some(TimeTravelSelector::TagName("tag1"))
+        );
+
+        let snapshot_options =
+            HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "7".to_string())]);
+        let snapshot_core = CoreOptions::new(&snapshot_options);
+        assert_eq!(
+            snapshot_core
+                .try_time_travel_selector()
+                .expect("snapshot selector"),
+            Some(TimeTravelSelector::SnapshotId(7))
+        );
+
+        let timestamp_options =
+            HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "1234".to_string())]);
+        let timestamp_core = CoreOptions::new(&timestamp_options);
+        assert_eq!(
+            timestamp_core
+                .try_time_travel_selector()
+                .expect("timestamp selector"),
+            Some(TimeTravelSelector::TimestampMillis(1234))
+        );
     }
 }

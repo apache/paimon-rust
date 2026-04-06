@@ -1799,6 +1799,70 @@ async fn test_time_travel_by_tag_name() {
     );
 }
 
+#[tokio::test]
+async fn test_time_travel_conflicting_selectors_fail() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    let conflicted = table.copy_with_options(HashMap::from([
+        ("scan.tag-name".to_string(), "snapshot1".to_string()),
+        ("scan.snapshot-id".to_string(), "2".to_string()),
+    ]));
+
+    let plan_err = conflicted
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect_err("conflicting time-travel selectors should fail");
+
+    match plan_err {
+        Error::DataInvalid { message, .. } => {
+            assert!(
+                message.contains("Only one time-travel selector may be set"),
+                "unexpected conflict error: {message}"
+            );
+            assert!(
+                message.contains("scan.snapshot-id"),
+                "conflict error should mention scan.snapshot-id: {message}"
+            );
+            assert!(
+                message.contains("scan.tag-name"),
+                "conflict error should mention scan.tag-name: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_time_travel_invalid_numeric_selector_fails() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_table").await;
+
+    let invalid = table.copy_with_options(HashMap::from([(
+        "scan.snapshot-id".to_string(),
+        "not-a-number".to_string(),
+    )]));
+
+    let plan_err = invalid
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect_err("invalid numeric time-travel selector should fail");
+
+    match plan_err {
+        Error::DataInvalid { message, .. } => {
+            assert!(
+                message.contains("Invalid value for scan.snapshot-id"),
+                "unexpected invalid selector error: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data evolution + drop column tests
 // ---------------------------------------------------------------------------

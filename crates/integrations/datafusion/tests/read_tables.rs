@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
@@ -53,6 +54,21 @@ async fn create_provider(table_name: &str) -> PaimonTableProvider {
         .get_table(&identifier)
         .await
         .expect("Failed to get table");
+
+    PaimonTableProvider::try_new(table).expect("Failed to create table provider")
+}
+
+async fn create_provider_with_options(
+    table_name: &str,
+    extra_options: HashMap<String, String>,
+) -> PaimonTableProvider {
+    let catalog = create_catalog();
+    let identifier = Identifier::new("default", table_name);
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("Failed to get table")
+        .copy_with_options(extra_options);
 
     PaimonTableProvider::try_new(table).expect("Failed to create table provider")
 }
@@ -466,6 +482,71 @@ async fn test_time_travel_by_tag_name() {
             (4, "dave".to_string()),
         ],
         "Tag 'snapshot2' should contain all rows"
+    );
+}
+
+#[tokio::test]
+async fn test_time_travel_conflicting_selectors_fail() {
+    let provider = create_provider_with_options(
+        "time_travel_table",
+        HashMap::from([("scan.tag-name".to_string(), "snapshot1".to_string())]),
+    )
+    .await;
+
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "BigQuery");
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_table("time_travel_table", Arc::new(provider))
+        .expect("Failed to register table");
+    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
+        .expect("Failed to register relation planner");
+
+    let err = ctx
+        .sql("SELECT id, name FROM time_travel_table FOR SYSTEM_TIME AS OF 2")
+        .await
+        .expect("time travel query should parse")
+        .collect()
+        .await
+        .expect_err("conflicting time-travel selectors should fail");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("Only one time-travel selector may be set"),
+        "unexpected conflict error: {message}"
+    );
+    assert!(
+        message.contains("scan.snapshot-id"),
+        "conflict error should mention scan.snapshot-id: {message}"
+    );
+    assert!(
+        message.contains("scan.tag-name"),
+        "conflict error should mention scan.tag-name: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_time_travel_invalid_numeric_selector_fails() {
+    let provider = create_provider_with_options(
+        "time_travel_table",
+        HashMap::from([("scan.snapshot-id".to_string(), "not-a-number".to_string())]),
+    )
+    .await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("time_travel_table", Arc::new(provider))
+        .expect("Failed to register table");
+
+    let err = ctx
+        .sql("SELECT id, name FROM time_travel_table")
+        .await
+        .expect("query should parse")
+        .collect()
+        .await
+        .expect_err("invalid numeric time-travel selector should fail");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("Invalid value for scan.snapshot-id"),
+        "unexpected invalid selector error: {message}"
     );
 }
 
