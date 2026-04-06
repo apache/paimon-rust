@@ -349,8 +349,10 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
     let end = (offset.saturating_add(length)).min(all_splits.len());
     let selected = &all_splits[start..end];
 
-    // Create TableRead with the stored read_type (projection)
-    let table_read = paimon::table::TableRead::new(&state.table, state.read_type.clone());
+    // C bindings currently persist only the projection, so reconstructing the
+    // read uses an empty predicate set.
+    let table_read =
+        paimon::table::TableRead::new(&state.table, state.read_type.clone(), Vec::new());
 
     match table_read.to_arrow(selected) {
         Ok(stream) => {
