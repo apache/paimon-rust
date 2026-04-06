@@ -203,11 +203,27 @@ impl DisplayAs for PaimonTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
+
+        let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
+        let total_files: usize = self
+            .planned_partitions
+            .iter()
+            .flat_map(|p| p.iter())
+            .map(|s| s.data_files().len())
+            .sum();
         write!(
             f,
-            "PaimonTableScan: partitions={}",
+            ", partitions={}, splits={total_splits}, files={total_files}",
             self.planned_partitions.len()
         )?;
+
+        if let Some(ref columns) = self.projected_columns {
+            write!(f, ", projection=[{}]", columns.join(", "))?;
+        }
+        if let Some(ref predicate) = self.pushed_predicate {
+            write!(f, ", predicate={predicate}")?;
+        }
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
         }
