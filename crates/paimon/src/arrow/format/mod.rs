@@ -68,7 +68,9 @@ pub(crate) fn create_format_reader(path: &str) -> crate::Result<Box<dyn FormatFi
         Ok(Box::new(avro::AvroFormatReader))
     } else {
         Err(Error::Unsupported {
-            message: format!("unsupported file format: only .parquet is supported, got: {path}"),
+            message: format!(
+                "unsupported file format: expected .parquet, .orc, or .avro, got: {path}"
+            ),
         })
     }
 }

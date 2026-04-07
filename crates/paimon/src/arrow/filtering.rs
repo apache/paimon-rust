@@ -63,10 +63,10 @@ fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Option<P
                 .iter()
                 .filter_map(|c| remap_predicate(c, mapping))
                 .collect();
-            if remapped.is_empty() {
-                None
-            } else {
-                Some(Predicate::and(remapped))
+            match remapped.len() {
+                0 => None,
+                1 => Some(remapped.into_iter().next().unwrap()),
+                _ => Some(Predicate::and(remapped)),
             }
         }
         Predicate::Or(children) => {

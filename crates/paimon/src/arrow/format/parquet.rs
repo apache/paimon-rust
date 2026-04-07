@@ -420,6 +420,8 @@ fn build_predicate_row_selection(
         return Ok(None);
     }
 
+    // Predicates have already been remapped to file-level indices by the caller
+    // (remap_predicates_to_file in reader.rs), so we use an identity mapping here.
     let identity_mapping: Vec<Option<usize>> = (0..file_fields.len()).map(Some).collect();
     let column_indices = build_row_group_column_indices(row_groups[0].columns(), file_fields);
     let mut selectors = Vec::with_capacity(row_groups.len());

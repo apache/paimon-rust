@@ -813,6 +813,8 @@ fn to_local_row_ranges(
 
 /// Merge DV and row_ranges into a unified list of 0-based inclusive RowRanges.
 /// Returns `None` if no filtering is needed (no DV and no ranges).
+///
+/// Complexity: O(D + R) where D = number of deleted rows, R = number of ranges.
 fn merge_row_selection(
     row_count: i64,
     dv: Option<&DeletionVector>,
@@ -829,50 +831,54 @@ fn merge_row_selection(
         return row_ranges.map(|r| r.to_vec());
     }
 
-    let total = row_count as usize;
-    let mut mask = vec![true; total];
+    // Build non-deleted ranges from DV (sorted iterator).
+    let dv_ranges = dv_to_non_deleted_ranges(dv.unwrap(), row_count);
 
-    if let Some(dv) = dv {
-        for deleted in dv.iter() {
-            let idx = deleted as usize;
-            if idx < total {
-                mask[idx] = false;
-            }
+    match row_ranges {
+        Some(ranges) => Some(intersect_sorted_ranges(&dv_ranges, ranges)),
+        None => Some(dv_ranges),
+    }
+}
+
+/// Convert a DeletionVector into sorted non-deleted inclusive RowRanges.
+/// The DV iterator yields sorted deleted positions.
+fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange> {
+    let mut result = Vec::new();
+    let mut cursor: i64 = 0;
+    for deleted in dv.iter() {
+        let del = deleted as i64;
+        if del >= row_count {
+            break;
+        }
+        if del > cursor {
+            result.push(RowRange::new(cursor, del - 1));
+        }
+        cursor = del + 1;
+    }
+    if cursor < row_count {
+        result.push(RowRange::new(cursor, row_count - 1));
+    }
+    result
+}
+
+/// Intersect two sorted lists of inclusive RowRanges using a merge-style scan.
+fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+    let mut result = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let from = a[i].from().max(b[j].from());
+        let to = a[i].to().min(b[j].to());
+        if from <= to {
+            result.push(RowRange::new(from, to));
+        }
+        // Advance the range that ends first.
+        if a[i].to() < b[j].to() {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
-
-    if let Some(ranges) = row_ranges {
-        let mut range_mask = vec![false; total];
-        for r in ranges {
-            let from = r.from().max(0) as usize;
-            let to = (r.to().min(row_count - 1)) as usize;
-            for i in from..=to {
-                range_mask[i] = true;
-            }
-        }
-        for i in 0..total {
-            mask[i] = mask[i] && range_mask[i];
-        }
-    }
-
-    // Convert boolean mask to consecutive RowRanges.
-    let mut ranges = Vec::new();
-    let mut start: Option<usize> = None;
-    for (i, &selected) in mask.iter().enumerate() {
-        if selected {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            ranges.push(RowRange::new(s as i64, (i - 1) as i64));
-            start = None;
-        }
-    }
-    if let Some(s) = start {
-        ranges.push(RowRange::new(s as i64, (total - 1) as i64));
-    }
-
-    Some(ranges)
+    result
 }
 
 /// Expand row_ranges into a flat sequence of selected row IDs for a file.

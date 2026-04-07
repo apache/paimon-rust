@@ -2369,11 +2369,14 @@ async fn test_read_timestamp_type_table() {
     assert_eq!(rows.len(), 3);
     // id=1 (parquet): 2024-01-01 10:00:00.123456
     assert_eq!(rows[0].0, 1);
-    assert_eq!(rows[0].1, 1_704_103_200_123_456); // micros since epoch
+    assert_eq!(rows[0].1, 1_704_103_200_123_456); // ts micros since epoch
+    assert_eq!(rows[0].2, 1_704_103_200_123_456); // ts_ltz micros since epoch
                                                   // id=2 (orc): 2024-06-15 12:30:00.456789
     assert_eq!(rows[1].0, 2);
     assert_eq!(rows[1].1, 1_718_454_600_456_789);
+    assert_eq!(rows[1].2, 1_718_454_600_456_789);
     // id=3 (avro): 2025-12-31 23:59:59.999999
     assert_eq!(rows[2].0, 3);
     assert_eq!(rows[2].1, 1_767_225_599_999_999);
+    assert_eq!(rows[2].2, 1_767_225_599_999_999);
 }

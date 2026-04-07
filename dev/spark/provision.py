@@ -742,6 +742,8 @@ def main():
     # Tests TIMESTAMP (without timezone, precision 6) and TIMESTAMP_LTZ (with timezone, precision 6)
     # across all three file formats via ALTER TABLE.
     # Spark TIMESTAMP_NTZ → Paimon TIMESTAMP(6), Spark TIMESTAMP → Paimon TIMESTAMP_LTZ(6).
+    # Note: Spark 3.x does not support parameterized timestamp precision (e.g. TIMESTAMP(3)),
+    # so all timestamps here use the default precision 6 (microseconds).
     spark.sql(
         """
         CREATE TABLE IF NOT EXISTS timestamp_type_table (

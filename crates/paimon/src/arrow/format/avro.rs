@@ -49,6 +49,8 @@ impl FormatFileReader for AvroFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // NOTE: Avro OCF requires sequential reading, so we load the entire file into memory.
+        // This is fine for typical Paimon data files but may be problematic for very large files.
         let file_bytes = reader.read(0..file_size).await?;
 
         let read_fields = read_fields.to_vec();
@@ -270,9 +272,10 @@ fn build_column(
             t.precision(),
             Some(Arc::from("UTC")),
         ),
-        _ => {
-            // Unsupported types: fill with nulls.
-            arrow_array::new_null_array(&crate::arrow::paimon_type_to_arrow(data_type)?, num_rows)
+        other => {
+            return Err(Error::Unsupported {
+                message: format!("Avro reader does not support data type: {other:?}"),
+            });
         }
     })
 }
