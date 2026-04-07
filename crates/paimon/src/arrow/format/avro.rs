@@ -109,8 +109,8 @@ fn ranges_to_mask(total_rows: usize, ranges: &[RowRange]) -> Vec<bool> {
     for r in ranges {
         let from = r.from().max(0) as usize;
         let to = (r.to().min(file_end) as usize).min(total_rows - 1);
-        for i in from..=to {
-            mask[i] = true;
+        for item in mask.iter_mut().take(to + 1).skip(from) {
+            *item = true;
         }
     }
     mask

@@ -118,6 +118,36 @@ fn build_range_row_selection(
 // OrcFileReader — adapts paimon FileRead to orc-rust AsyncChunkReader
 // ---------------------------------------------------------------------------
 
+struct OrcFileReader {
+    file_size: u64,
+    r: Box<dyn FileRead>,
+}
+
+impl OrcFileReader {
+    fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
+        Self { file_size, r }
+    }
+}
+
+impl AsyncChunkReader for OrcFileReader {
+    fn len(&mut self) -> BoxFuture<'_, std::io::Result<u64>> {
+        Box::pin(std::future::ready(Ok(self.file_size)))
+    }
+
+    fn get_bytes(
+        &mut self,
+        offset_from_start: u64,
+        length: u64,
+    ) -> BoxFuture<'_, std::io::Result<Bytes>> {
+        Box::pin(async move {
+            self.r
+                .read(offset_from_start..offset_from_start + length)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -160,35 +190,5 @@ mod tests {
         let sel = build_range_row_selection(5, &ranges);
         let expected: orc_rust::row_selection::RowSelection = vec![RowSelector::skip(5)].into();
         assert_eq!(sel, expected);
-    }
-}
-
-struct OrcFileReader {
-    file_size: u64,
-    r: Box<dyn FileRead>,
-}
-
-impl OrcFileReader {
-    fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
-        Self { file_size, r }
-    }
-}
-
-impl AsyncChunkReader for OrcFileReader {
-    fn len(&mut self) -> BoxFuture<'_, std::io::Result<u64>> {
-        Box::pin(std::future::ready(Ok(self.file_size)))
-    }
-
-    fn get_bytes(
-        &mut self,
-        offset_from_start: u64,
-        length: u64,
-    ) -> BoxFuture<'_, std::io::Result<Bytes>> {
-        Box::pin(async move {
-            self.r
-                .read(offset_from_start..offset_from_start + length)
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })
     }
 }
