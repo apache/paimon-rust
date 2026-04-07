@@ -313,6 +313,7 @@ mod tests {
             vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 20, 30, 40])],
             Some(2),
         );
+        let file_size = fs::metadata(bucket_dir.join("data.parquet")).unwrap().len() as i64;
 
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
@@ -336,7 +337,7 @@ mod tests {
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
-            .with_data_files(vec![test_data_file("data.parquet", 4)])
+            .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
             .with_raw_convertible(true)
             .build()
             .unwrap();

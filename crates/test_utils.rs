@@ -63,13 +63,13 @@ pub(crate) fn local_file_path(path: &Path) -> String {
     }
 }
 
-pub(crate) fn test_data_file<T>(file_name: &str, row_count: i64) -> T
+pub(crate) fn test_data_file<T>(file_name: &str, row_count: i64, file_size: i64) -> T
 where
     T: DeserializeOwned,
 {
     serde_json::from_value(serde_json::json!({
         "_FILE_NAME": file_name,
-        "_FILE_SIZE": 0,
+        "_FILE_SIZE": file_size,
         "_ROW_COUNT": row_count,
         "_MIN_KEY": [],
         "_MAX_KEY": [],

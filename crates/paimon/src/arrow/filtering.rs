@@ -26,6 +26,69 @@ pub(crate) fn reader_pruning_predicates(data_predicates: Vec<Predicate>) -> Vec<
         .collect()
 }
 
+/// Remap predicates from table-level indices to file-level indices.
+/// Predicates referencing fields not present in the file are dropped.
+pub(crate) fn remap_predicates_to_file(
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+    file_fields: &[DataField],
+) -> Vec<Predicate> {
+    let mapping = build_field_mapping(table_fields, file_fields);
+    predicates
+        .iter()
+        .filter_map(|p| remap_predicate(p, &mapping))
+        .collect()
+}
+
+fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Option<Predicate> {
+    match predicate {
+        Predicate::Leaf {
+            column,
+            index,
+            data_type,
+            op,
+            literals,
+        } => {
+            let file_index = mapping.get(*index).copied().flatten()?;
+            Some(Predicate::Leaf {
+                column: column.clone(),
+                index: file_index,
+                data_type: data_type.clone(),
+                op: *op,
+                literals: literals.clone(),
+            })
+        }
+        Predicate::And(children) => {
+            let remapped: Vec<_> = children
+                .iter()
+                .filter_map(|c| remap_predicate(c, mapping))
+                .collect();
+            if remapped.is_empty() {
+                None
+            } else {
+                Some(Predicate::and(remapped))
+            }
+        }
+        Predicate::Or(children) => {
+            // If any child is dropped, the OR is no longer safe to evaluate
+            let remapped: Vec<_> = children
+                .iter()
+                .filter_map(|c| remap_predicate(c, mapping))
+                .collect();
+            if remapped.len() != children.len() {
+                None
+            } else {
+                Some(Predicate::or(remapped))
+            }
+        }
+        Predicate::Not(inner) => {
+            remap_predicate(inner, mapping).map(|r| Predicate::Not(Box::new(r)))
+        }
+        Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
+        Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
+    }
+}
+
 pub(crate) fn build_field_mapping(
     table_fields: &[DataField],
     file_fields: &[DataField],

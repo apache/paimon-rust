@@ -2292,3 +2292,88 @@ async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
         "Row range filtered count ({total_rows}) should be <= full count ({full_count})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ORC format integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_read_orc_log_table() {
+    let (_, batches) = scan_and_read_with_fs_catalog("orc_log_table", None).await;
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(actual, expected, "ORC log table should return correct rows");
+}
+
+// ---------------------------------------------------------------------------
+// Avro format integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_read_avro_log_table() {
+    let (_, batches) = scan_and_read_with_fs_catalog("avro_log_table", None).await;
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "Avro log table should return correct rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp types integration tests (parquet + orc + avro)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_read_timestamp_type_table() {
+    let (_, batches) = scan_and_read_with_fs_catalog("timestamp_type_table", None).await;
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "timestamp_type_table should have 3 rows");
+
+    // Collect all rows: (id, ts_micros, ts_ltz_micros)
+    let mut rows: Vec<(i32, i64, i64)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ts = batch
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        let ts_ltz = batch
+            .column_by_name("ts_ltz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), ts.value(i), ts_ltz.value(i)));
+        }
+    }
+    rows.sort_by_key(|r| r.0);
+
+    assert_eq!(rows.len(), 3);
+    // id=1 (parquet): 2024-01-01 10:00:00.123456
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, 1_704_103_200_123_456); // micros since epoch
+                                                  // id=2 (orc): 2024-06-15 12:30:00.456789
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, 1_718_454_600_456_789);
+    // id=3 (avro): 2025-12-31 23:59:59.999999
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[2].1, 1_767_225_599_999_999);
+}

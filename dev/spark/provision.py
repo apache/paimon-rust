@@ -710,6 +710,80 @@ def main():
         """
     )
 
+    # ===== ORC format table =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS orc_log_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'orc'
+        )
+        """
+    )
+    spark.sql("INSERT INTO orc_log_table VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+
+    # ===== Avro format table =====
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS avro_log_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'avro'
+        )
+        """
+    )
+    spark.sql("INSERT INTO avro_log_table VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+
+    # ===== Timestamp types table: parquet, orc, avro =====
+    # Tests TIMESTAMP (without timezone, precision 6) and TIMESTAMP_LTZ (with timezone, precision 6)
+    # across all three file formats via ALTER TABLE.
+    # Spark TIMESTAMP_NTZ → Paimon TIMESTAMP(6), Spark TIMESTAMP → Paimon TIMESTAMP_LTZ(6).
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS timestamp_type_table (
+            id INT,
+            ts TIMESTAMP_NTZ,
+            ts_ltz TIMESTAMP
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    # Parquet row
+    spark.sql(
+        """
+        INSERT INTO timestamp_type_table VALUES
+            (1,
+             TIMESTAMP_NTZ '2024-01-01 10:00:00.123456',
+             TIMESTAMP '2024-01-01 10:00:00.123456')
+        """
+    )
+    # Switch to ORC
+    spark.sql("ALTER TABLE timestamp_type_table SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        """
+        INSERT INTO timestamp_type_table VALUES
+            (2,
+             TIMESTAMP_NTZ '2024-06-15 12:30:00.456789',
+             TIMESTAMP '2024-06-15 12:30:00.456789')
+        """
+    )
+    # Switch to Avro
+    spark.sql("ALTER TABLE timestamp_type_table SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        """
+        INSERT INTO timestamp_type_table VALUES
+            (3,
+             TIMESTAMP_NTZ '2025-12-31 23:59:59.999999',
+             TIMESTAMP '2025-12-31 23:59:59.999999')
+        """
+    )
+
 
 if __name__ == "__main__":
     main()

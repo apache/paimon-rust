@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod filtering;
+pub(crate) mod format;
 mod reader;
 pub(crate) mod schema_evolution;
 
