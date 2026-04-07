@@ -293,6 +293,21 @@ impl std::fmt::Debug for RESTTokenFileIO {
         f.debug_struct("RESTTokenFileIO")
             .field("identifier", &self.identifier)
             .field("path", &self.path)
+            .field("catalog_options", &self.catalog_options)
+            .field("token", &self.token)
             .finish()
+    }
+}
+
+impl Clone for RESTTokenFileIO {
+    fn clone(&self) -> Self {
+        Self {
+            identifier: self.identifier.clone(),
+            path: self.path.clone(),
+            catalog_options: self.catalog_options.clone(),
+            // Re-initialize api and token fields instead of cloning
+            api: OnceCell::new(),
+            token: RwLock::new(None),
+        }
     }
 }

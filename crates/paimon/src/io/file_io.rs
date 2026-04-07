@@ -20,6 +20,8 @@
 //! This trait allows different FileIO implementations (e.g., DefaultFileIO,
 //! RESTTokenFileIO) to be used interchangeably.
 
+use std::sync::Arc;
+
 use crate::Result;
 
 use super::{FileStatus, InputFile, OutputFile};
@@ -58,3 +60,6 @@ pub trait FileIO: Send + Sync + std::fmt::Debug {
     /// Renames the file/directory src to dst.
     async fn rename(&self, src: &str, dst: &str) -> Result<()>;
 }
+
+/// Type alias for a reference-counted FileIO trait object.
+pub type FileIORef = Arc<dyn FileIO>;

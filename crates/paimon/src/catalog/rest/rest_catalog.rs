@@ -20,10 +20,8 @@
 //! This module provides a REST-based catalog that communicates with
 //! a Paimon REST catalog server for database and table CRUD operations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
@@ -31,7 +29,7 @@ use crate::api::PagedList;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::{FileIO, DefaultFileIO};
+use crate::io::{DefaultFileIO, FileIORef};
 use crate::spec::{Schema, SchemaChange, TableSchema};
 use crate::table::Table;
 use crate::Result;
@@ -241,16 +239,16 @@ impl Catalog for RESTCatalog {
         }
 
         // Build FileIO based on data_token_enabled and is_external
-        let file_io: Arc<dyn FileIO> = if self.data_token_enabled && !is_external {
+        let file_io: FileIORef = if self.data_token_enabled && !is_external {
             // Use RESTTokenFileIO which will refresh token on each operation
-            Arc::new(RESTTokenFileIO::new(
+            std::sync::Arc::new(RESTTokenFileIO::new(
                 identifier.clone(),
                 table_path.clone(),
                 self.options.clone(),
             ))
         } else {
             // Use standard DefaultFileIO from path
-            Arc::new(DefaultFileIO::from_path(&table_path)?.build()?)
+            std::sync::Arc::new(DefaultFileIO::from_path(&table_path)?.build()?)
         };
 
         Ok(Table::new(

@@ -21,7 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::Table;
-use crate::io::FileIO;
+use crate::io::FileIORef;
 use crate::spec::{
     eval_row, field_idx_to_partition_idx, BinaryRow, CoreOptions, DataFileMeta, FileKind,
     IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
@@ -31,7 +31,6 @@ use crate::table::source::{DataSplitBuilder, DeletionFile, PartitionBucket, Plan
 use crate::table::SnapshotManager;
 use crate::Error;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
@@ -40,7 +39,7 @@ const INDEX_DIR: &str = "index";
 
 /// Reads a manifest list file (Avro) and returns manifest file metas.
 async fn read_manifest_list(
-    file_io: &Arc<dyn FileIO>,
+    file_io: &FileIORef,
     table_path: &str,
     list_name: &str,
 ) -> crate::Result<Vec<crate::spec::ManifestFileMeta>> {
@@ -60,7 +59,7 @@ async fn read_manifest_list(
 
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
 async fn read_all_manifest_entries(
-    file_io: &Arc<dyn FileIO>,
+    file_io: &FileIORef,
     table_path: &str,
     snapshot: &Snapshot,
 ) -> crate::Result<Vec<ManifestEntry>> {

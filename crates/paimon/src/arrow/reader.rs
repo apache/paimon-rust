@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
-use crate::io::{FileIO, FileRead, FileStatus};
+use crate::io::{FileIORef, FileRead, FileStatus};
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
@@ -40,12 +40,12 @@ use tokio::try_join;
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
-    file_io: Arc<dyn FileIO>,
+    file_io: FileIORef,
 }
 
 impl ArrowReaderBuilder {
     /// Create a new ArrowReaderBuilder
-    pub(crate) fn new(file_io: Arc<dyn FileIO>) -> Self {
+    pub(crate) fn new(file_io: FileIORef) -> Self {
         ArrowReaderBuilder {
             batch_size: None,
             file_io,
@@ -67,7 +67,7 @@ impl ArrowReaderBuilder {
 #[derive(Clone)]
 pub struct ArrowReader {
     batch_size: Option<usize>,
-    file_io: Arc<dyn FileIO>,
+    file_io: FileIORef,
     read_type: Vec<DataField>,
 }
 
@@ -192,7 +192,7 @@ impl ArrowReader {
 /// Read a single parquet file from a split, returning a lazy stream of batches.
 /// Optionally applies a deletion vector.
 fn read_single_file_stream(
-    file_io: Arc<dyn FileIO>,
+    file_io: FileIORef,
     split: DataSplit,
     file_meta: DataFileMeta,
     projected_column_names: Vec<String>,
@@ -272,7 +272,7 @@ fn read_single_file_stream(
 /// assembles columns from the winning files, and yields the merged batch. When a file's
 /// current batch is exhausted, the next batch is read from its stream on demand.
 fn merge_files_by_columns(
-    file_io: &Arc<dyn FileIO>,
+    file_io: &FileIORef,
     split: &DataSplit,
     projected_column_names: &[String],
     table_field_names: &[String],

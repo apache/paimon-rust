@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
-use crate::io::{FileIO, DefaultFileIO};
+use crate::io::{DefaultFileIO, FileIORef};
 use crate::spec::{Schema, TableSchema};
 use crate::table::Table;
 use async_trait::async_trait;
@@ -64,7 +64,7 @@ fn make_path(parent: &str, child: &str) -> String {
 /// Reference: [org.apache.paimon.catalog.FileSystemCatalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/FileSystemCatalog.java)
 #[derive(Clone, Debug)]
 pub struct FileSystemCatalog {
-    file_io: Arc<dyn FileIO>,
+    file_io: FileIORef,
     warehouse: String,
 }
 
@@ -119,7 +119,7 @@ impl FileSystemCatalog {
     }
 
     /// Get the FileIO instance.
-    pub fn file_io(&self) -> &Arc<dyn FileIO> {
+    pub fn file_io(&self) -> &FileIORef {
         &self.file_io
     }
 
