@@ -1160,6 +1160,15 @@ impl FromStr for VarBinaryType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // "BYTES" is an alias for VARBINARY(MAX_LENGTH) in Paimon Java.
+        if s == "BYTES" || s == "BYTES NOT NULL" {
+            let nullable = !s.contains("NOT NULL");
+            return Ok(VarBinaryType {
+                nullable,
+                length: Self::MAX_LENGTH,
+            });
+        }
+
         if !s.starts_with(serde_utils::VARBINARY::NAME) {
             return DataTypeInvalidSnafu {
                 message: "Invalid VARBINARY type. Expected string to start with 'VARBINARY'.",

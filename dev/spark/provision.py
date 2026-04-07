@@ -710,46 +710,31 @@ def main():
         """
     )
 
-    # ===== ORC format table =====
-    spark.sql(
-        """
-        CREATE TABLE IF NOT EXISTS orc_log_table (
-            id INT,
-            name STRING
-        ) USING paimon
-        TBLPROPERTIES (
-            'file.format' = 'orc'
-        )
-        """
-    )
-    spark.sql("INSERT INTO orc_log_table VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
-
-    # ===== Avro format table =====
-    spark.sql(
-        """
-        CREATE TABLE IF NOT EXISTS avro_log_table (
-            id INT,
-            name STRING
-        ) USING paimon
-        TBLPROPERTIES (
-            'file.format' = 'avro'
-        )
-        """
-    )
-    spark.sql("INSERT INTO avro_log_table VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
-
-    # ===== Timestamp types table: parquet, orc, avro =====
-    # Tests TIMESTAMP (without timezone, precision 6) and TIMESTAMP_LTZ (with timezone, precision 6)
-    # across all three file formats via ALTER TABLE.
-    # Spark TIMESTAMP_NTZ → Paimon TIMESTAMP(6), Spark TIMESTAMP → Paimon TIMESTAMP_LTZ(6).
+    # ===== Full types table: parquet, orc, avro =====
     # Note: Spark 3.x does not support parameterized timestamp precision (e.g. TIMESTAMP(3)),
     # so all timestamps here use the default precision 6 (microseconds).
     spark.sql(
         """
-        CREATE TABLE IF NOT EXISTS timestamp_type_table (
+        CREATE TABLE IF NOT EXISTS full_types_table (
             id INT,
-            ts TIMESTAMP_NTZ,
-            ts_ltz TIMESTAMP
+            col_boolean BOOLEAN,
+            col_tinyint TINYINT,
+            col_smallint SMALLINT,
+            col_int INT,
+            col_bigint BIGINT,
+            col_float FLOAT,
+            col_double DOUBLE,
+            col_decimal DECIMAL(10, 2),
+            col_decimal5 DECIMAL(5),
+            col_decimal38 DECIMAL(38, 18),
+            col_string STRING,
+            col_binary BINARY,
+            col_date DATE,
+            col_timestamp TIMESTAMP_NTZ,
+            col_timestamp_ltz TIMESTAMP,
+            col_array ARRAY<INT>,
+            col_map MAP<STRING, INT>,
+            col_struct STRUCT<name: STRING, value: INT>
         ) USING paimon
         TBLPROPERTIES (
             'file.format' = 'parquet'
@@ -759,30 +744,48 @@ def main():
     # Parquet row
     spark.sql(
         """
-        INSERT INTO timestamp_type_table VALUES
-            (1,
+        INSERT INTO full_types_table VALUES
+            (1, true, CAST(1 AS TINYINT), CAST(100 AS SMALLINT), 1000, 100000,
+             CAST(1.5 AS FLOAT), 2.5, CAST(123.45 AS DECIMAL(10,2)),
+             CAST(12345 AS DECIMAL(5)), CAST(12345.678901234567890 AS DECIMAL(38,18)),
+             'parquet-hello', X'DEADBEEF',
+             DATE '2024-01-01',
              TIMESTAMP_NTZ '2024-01-01 10:00:00.123456',
-             TIMESTAMP '2024-01-01 10:00:00.123456')
+             TIMESTAMP '2024-01-01 10:00:00.123456',
+             array(1, 2, 3), map('a', 10, 'b', 20),
+             named_struct('name', 'alice', 'value', 100))
         """
     )
     # Switch to ORC
-    spark.sql("ALTER TABLE timestamp_type_table SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql("ALTER TABLE full_types_table SET TBLPROPERTIES ('file.format' = 'orc')")
     spark.sql(
         """
-        INSERT INTO timestamp_type_table VALUES
-            (2,
+        INSERT INTO full_types_table VALUES
+            (2, false, CAST(2 AS TINYINT), CAST(200 AS SMALLINT), 2000, 200000,
+             CAST(3.5 AS FLOAT), 4.5, CAST(678.90 AS DECIMAL(10,2)),
+             CAST(99999 AS DECIMAL(5)), CAST(99999.999999999999999 AS DECIMAL(38,18)),
+             'orc-world', X'CAFEBABE',
+             DATE '2024-06-15',
              TIMESTAMP_NTZ '2024-06-15 12:30:00.456789',
-             TIMESTAMP '2024-06-15 12:30:00.456789')
+             TIMESTAMP '2024-06-15 12:30:00.456789',
+             array(4, 5), map('c', 30),
+             named_struct('name', 'bob', 'value', 200))
         """
     )
     # Switch to Avro
-    spark.sql("ALTER TABLE timestamp_type_table SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql("ALTER TABLE full_types_table SET TBLPROPERTIES ('file.format' = 'avro')")
     spark.sql(
         """
-        INSERT INTO timestamp_type_table VALUES
-            (3,
+        INSERT INTO full_types_table VALUES
+            (3, true, CAST(3 AS TINYINT), CAST(300 AS SMALLINT), 3000, 300000,
+             CAST(5.5 AS FLOAT), 6.5, CAST(999.99 AS DECIMAL(10,2)),
+             CAST(0 AS DECIMAL(5)), CAST(0.000000000000000001 AS DECIMAL(38,18)),
+             'avro-test', X'01020304',
+             DATE '2025-12-31',
              TIMESTAMP_NTZ '2025-12-31 23:59:59.999999',
-             TIMESTAMP '2025-12-31 23:59:59.999999')
+             TIMESTAMP '2025-12-31 23:59:59.999999',
+             array(6), map('d', 40, 'e', 50),
+             named_struct('name', 'carol', 'value', 300))
         """
     )
 

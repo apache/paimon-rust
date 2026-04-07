@@ -56,6 +56,7 @@ serde_avro_fast = { version = "2.0.2", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
 roaring = "0.11"
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }

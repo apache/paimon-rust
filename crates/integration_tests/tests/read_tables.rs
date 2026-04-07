@@ -2294,89 +2294,290 @@ async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
 }
 
 // ---------------------------------------------------------------------------
-// ORC format integration tests
+// Full types integration tests (parquet + orc + avro)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_read_orc_log_table() {
-    let (_, batches) = scan_and_read_with_fs_catalog("orc_log_table", None).await;
-    let actual = extract_id_name(&batches);
-    let expected = vec![
-        (1, "alice".to_string()),
-        (2, "bob".to_string()),
-        (3, "carol".to_string()),
-    ];
-    assert_eq!(actual, expected, "ORC log table should return correct rows");
-}
+async fn test_read_full_types_table() {
+    use arrow_array::{
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int64Array, Int8Array, ListArray, MapArray, StructArray,
+        TimestampMicrosecondArray,
+    };
 
-// ---------------------------------------------------------------------------
-// Avro format integration tests
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_read_avro_log_table() {
-    let (_, batches) = scan_and_read_with_fs_catalog("avro_log_table", None).await;
-    let actual = extract_id_name(&batches);
-    let expected = vec![
-        (1, "alice".to_string()),
-        (2, "bob".to_string()),
-        (3, "carol".to_string()),
-    ];
-    assert_eq!(
-        actual, expected,
-        "Avro log table should return correct rows"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Timestamp types integration tests (parquet + orc + avro)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_read_timestamp_type_table() {
-    let (_, batches) = scan_and_read_with_fs_catalog("timestamp_type_table", None).await;
+    let (_, batches) = scan_and_read_with_fs_catalog("full_types_table", None).await;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "timestamp_type_table should have 3 rows");
+    assert_eq!(total_rows, 3, "full_types_table should have 3 rows");
 
-    // Collect all rows: (id, ts_micros, ts_ltz_micros)
-    let mut rows: Vec<(i32, i64, i64)> = Vec::new();
+    // Collect all rows sorted by id.
+    // We verify primitive types via a tuple, then complex/extra decimal types separately.
+    #[allow(clippy::type_complexity)]
+    let mut rows: Vec<(
+        i32,
+        bool,
+        i8,
+        i16,
+        i32,
+        i64,
+        f32,
+        f64,
+        i128,
+        i128,
+        i128,
+        String,
+        Vec<u8>,
+        i32,
+        i64,
+        i64,
+        Vec<i32>,
+        Vec<(String, i32)>,
+        (String, i32),
+    )> = Vec::new();
     for batch in &batches {
-        let ids = batch
+        let id = batch
             .column_by_name("id")
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let ts = batch
-            .column_by_name("ts")
+        let col_boolean = batch
+            .column_by_name("col_boolean")
             .unwrap()
             .as_any()
-            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .downcast_ref::<BooleanArray>()
             .unwrap();
-        let ts_ltz = batch
-            .column_by_name("ts_ltz")
+        let col_tinyint = batch
+            .column_by_name("col_tinyint")
             .unwrap()
             .as_any()
-            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
+        let col_smallint = batch
+            .column_by_name("col_smallint")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let col_int = batch
+            .column_by_name("col_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col_bigint = batch
+            .column_by_name("col_bigint")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let col_float = batch
+            .column_by_name("col_float")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let col_double = batch
+            .column_by_name("col_double")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let col_decimal = batch
+            .column_by_name("col_decimal")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_decimal5 = batch
+            .column_by_name("col_decimal5")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_decimal38 = batch
+            .column_by_name("col_decimal38")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_string = batch
+            .column_by_name("col_string")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let col_binary = batch
+            .column_by_name("col_binary")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let col_date = batch
+            .column_by_name("col_date")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let col_ts = batch
+            .column_by_name("col_timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let col_ts_ltz = batch
+            .column_by_name("col_timestamp_ltz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let col_array = batch
+            .column_by_name("col_array")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let col_map = batch
+            .column_by_name("col_map")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let col_struct = batch
+            .column_by_name("col_struct")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
         for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), ts.value(i), ts_ltz.value(i)));
+            // Extract ARRAY<INT>
+            let list_values = col_array.value(i);
+            let int_arr = list_values.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr_vals: Vec<i32> = (0..int_arr.len()).map(|j| int_arr.value(j)).collect();
+
+            // Extract MAP<STRING, INT>
+            let map_val = col_map.value(i);
+            let map_struct = map_val.as_any().downcast_ref::<StructArray>().unwrap();
+            let keys = map_struct
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = map_struct
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let mut map_entries: Vec<(String, i32)> = (0..keys.len())
+                .map(|j| (keys.value(j).to_string(), values.value(j)))
+                .collect();
+            map_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Extract STRUCT<name: STRING, value: INT>
+            let struct_name = col_struct
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let struct_value = col_struct
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+
+            rows.push((
+                id.value(i),
+                col_boolean.value(i),
+                col_tinyint.value(i),
+                col_smallint.value(i),
+                col_int.value(i),
+                col_bigint.value(i),
+                col_float.value(i),
+                col_double.value(i),
+                col_decimal.value(i),
+                col_decimal5.value(i),
+                col_decimal38.value(i),
+                col_string.value(i).to_string(),
+                col_binary.value(i).to_vec(),
+                col_date.value(i),
+                col_ts.value(i),
+                col_ts_ltz.value(i),
+                arr_vals,
+                map_entries,
+                (struct_name.value(i).to_string(), struct_value.value(i)),
+            ));
         }
     }
     rows.sort_by_key(|r| r.0);
 
     assert_eq!(rows.len(), 3);
-    // id=1 (parquet): 2024-01-01 10:00:00.123456
-    assert_eq!(rows[0].0, 1);
-    assert_eq!(rows[0].1, 1_704_103_200_123_456); // ts micros since epoch
-    assert_eq!(rows[0].2, 1_704_103_200_123_456); // ts_ltz micros since epoch
-                                                  // id=2 (orc): 2024-06-15 12:30:00.456789
-    assert_eq!(rows[1].0, 2);
-    assert_eq!(rows[1].1, 1_718_454_600_456_789);
-    assert_eq!(rows[1].2, 1_718_454_600_456_789);
-    // id=3 (avro): 2025-12-31 23:59:59.999999
-    assert_eq!(rows[2].0, 3);
-    assert_eq!(rows[2].1, 1_767_225_599_999_999);
-    assert_eq!(rows[2].2, 1_767_225_599_999_999);
+
+    // id=1 (parquet)
+    let r = &rows[0];
+    assert_eq!(r.0, 1);
+    assert!(r.1); // boolean = true
+    assert_eq!(r.2, 1i8); // tinyint
+    assert_eq!(r.3, 100i16); // smallint
+    assert_eq!(r.4, 1000); // int
+    assert_eq!(r.5, 100000i64); // bigint
+    assert!((r.6 - 1.5f32).abs() < f32::EPSILON); // float
+    assert!((r.7 - 2.5f64).abs() < f64::EPSILON); // double
+    assert_eq!(r.8, 12345); // decimal(10,2) = 123.45 * 100
+    assert_eq!(r.9, 12345); // decimal(5,0) = 12345
+    assert_eq!(r.10, 12_345_678_901_234_567_890_000i128); // decimal(38,18) 12345.678901234567890 * 10^18
+    assert_eq!(r.11, "parquet-hello"); // string
+    assert_eq!(r.12, vec![0xDE, 0xAD, 0xBE, 0xEF]); // binary
+    assert_eq!(r.13, 19723); // date: 2024-01-01 days since epoch
+    assert_eq!(r.14, 1_704_103_200_123_456); // ts micros
+    assert_eq!(r.15, 1_704_103_200_123_456); // ts_ltz micros
+    assert_eq!(r.16, vec![1, 2, 3]); // array
+    assert_eq!(r.17, vec![("a".into(), 10), ("b".into(), 20)]); // map
+    assert_eq!(r.18, ("alice".into(), 100)); // struct
+
+    // id=2 (orc)
+    let r = &rows[1];
+    assert_eq!(r.0, 2);
+    assert!(!r.1); // boolean = false
+    assert_eq!(r.2, 2i8);
+    assert_eq!(r.3, 200i16);
+    assert_eq!(r.4, 2000);
+    assert_eq!(r.5, 200000i64);
+    assert!((r.6 - 3.5f32).abs() < f32::EPSILON);
+    assert!((r.7 - 4.5f64).abs() < f64::EPSILON);
+    assert_eq!(r.8, 67890); // 678.90 * 100
+    assert_eq!(r.9, 99999); // decimal(5,0)
+    assert_eq!(r.10, 99_999_999_999_999_999_999_000i128); // decimal(38,18) 99999.999999999999999 * 10^18
+    assert_eq!(r.11, "orc-world");
+    assert_eq!(r.12, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+    assert_eq!(r.13, 19889); // date: 2024-06-15 days since epoch
+    assert_eq!(r.14, 1_718_454_600_456_789);
+    assert_eq!(r.15, 1_718_454_600_456_789);
+    assert_eq!(r.16, vec![4, 5]); // array
+    assert_eq!(r.17, vec![("c".into(), 30)]); // map
+    assert_eq!(r.18, ("bob".into(), 200)); // struct
+
+    // id=3 (avro)
+    let r = &rows[2];
+    assert_eq!(r.0, 3);
+    assert!(r.1); // boolean = true
+    assert_eq!(r.2, 3i8);
+    assert_eq!(r.3, 300i16);
+    assert_eq!(r.4, 3000);
+    assert_eq!(r.5, 300000i64);
+    assert!((r.6 - 5.5f32).abs() < f32::EPSILON);
+    assert!((r.7 - 6.5f64).abs() < f64::EPSILON);
+    assert_eq!(r.8, 99999); // 999.99 * 100
+    assert_eq!(r.9, 0); // decimal(5,0)
+    assert_eq!(r.10, 1); // decimal(38,18) = 0.000000000000000001 * 10^18
+    assert_eq!(r.11, "avro-test");
+    assert_eq!(r.12, vec![0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(r.13, 20453); // date: 2025-12-31 days since epoch
+    assert_eq!(r.14, 1_767_225_599_999_999);
+    assert_eq!(r.15, 1_767_225_599_999_999);
+    assert_eq!(r.16, vec![6]); // array
+    assert_eq!(r.17, vec![("d".into(), 40), ("e".into(), 50)]); // map
+    assert_eq!(r.18, ("carol".into(), 300)); // struct
 }
