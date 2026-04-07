@@ -27,7 +27,9 @@ pub(crate) fn reader_pruning_predicates(data_predicates: Vec<Predicate>) -> Vec<
 }
 
 /// Remap predicates from table-level indices to file-level indices.
-/// Predicates referencing fields not present in the file are dropped.
+/// Predicates referencing fields not present in the file are resolved based on
+/// NULL semantics: the missing column is treated as all-NULL, so `IS NULL`
+/// becomes `AlwaysTrue` and all other operators become `AlwaysFalse`.
 pub(crate) fn remap_predicates_to_file(
     predicates: &[Predicate],
     table_fields: &[DataField],
@@ -36,11 +38,11 @@ pub(crate) fn remap_predicates_to_file(
     let mapping = build_field_mapping(table_fields, file_fields);
     predicates
         .iter()
-        .filter_map(|p| remap_predicate(p, &mapping))
+        .map(|p| remap_predicate(p, &mapping))
         .collect()
 }
 
-fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Option<Predicate> {
+fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicate {
     match predicate {
         Predicate::Leaf {
             column,
@@ -49,43 +51,69 @@ fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Option<P
             op,
             literals,
         } => {
-            let file_index = mapping.get(*index).copied().flatten()?;
-            Some(Predicate::Leaf {
-                column: column.clone(),
-                index: file_index,
-                data_type: data_type.clone(),
-                op: *op,
-                literals: literals.clone(),
-            })
+            match mapping.get(*index).copied().flatten() {
+                Some(file_index) => Predicate::Leaf {
+                    column: column.clone(),
+                    index: file_index,
+                    data_type: data_type.clone(),
+                    op: *op,
+                    literals: literals.clone(),
+                },
+                // Column missing from file → all values are NULL.
+                None => match op {
+                    PredicateOperator::IsNull => Predicate::AlwaysTrue,
+                    _ => Predicate::AlwaysFalse,
+                },
+            }
         }
         Predicate::And(children) => {
             let remapped: Vec<_> = children
                 .iter()
-                .filter_map(|c| remap_predicate(c, mapping))
+                .map(|c| remap_predicate(c, mapping))
                 .collect();
-            match remapped.len() {
-                0 => None,
-                1 => Some(remapped.into_iter().next().unwrap()),
-                _ => Some(Predicate::and(remapped)),
+            if remapped.iter().any(|p| matches!(p, Predicate::AlwaysFalse)) {
+                Predicate::AlwaysFalse
+            } else {
+                let filtered: Vec<_> = remapped
+                    .into_iter()
+                    .filter(|p| !matches!(p, Predicate::AlwaysTrue))
+                    .collect();
+                match filtered.len() {
+                    0 => Predicate::AlwaysTrue,
+                    1 => filtered.into_iter().next().unwrap(),
+                    _ => Predicate::and(filtered),
+                }
             }
         }
         Predicate::Or(children) => {
-            // If any child is dropped, the OR is no longer safe to evaluate
             let remapped: Vec<_> = children
                 .iter()
-                .filter_map(|c| remap_predicate(c, mapping))
+                .map(|c| remap_predicate(c, mapping))
                 .collect();
-            if remapped.len() != children.len() {
-                None
+            if remapped.iter().any(|p| matches!(p, Predicate::AlwaysTrue)) {
+                Predicate::AlwaysTrue
             } else {
-                Some(Predicate::or(remapped))
+                let filtered: Vec<_> = remapped
+                    .into_iter()
+                    .filter(|p| !matches!(p, Predicate::AlwaysFalse))
+                    .collect();
+                match filtered.len() {
+                    0 => Predicate::AlwaysFalse,
+                    1 => filtered.into_iter().next().unwrap(),
+                    _ => Predicate::or(filtered),
+                }
             }
         }
         Predicate::Not(inner) => {
-            remap_predicate(inner, mapping).map(|r| Predicate::Not(Box::new(r)))
+            let remapped = remap_predicate(inner, mapping);
+            match remapped {
+                Predicate::AlwaysTrue => Predicate::AlwaysFalse,
+                Predicate::AlwaysFalse => Predicate::AlwaysTrue,
+                other => Predicate::Not(Box::new(other)),
+            }
         }
-        Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
-        Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
+        Predicate::AlwaysTrue => Predicate::AlwaysTrue,
+        Predicate::AlwaysFalse => Predicate::AlwaysFalse,
     }
 }
 
