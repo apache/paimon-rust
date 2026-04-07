@@ -27,6 +27,7 @@ categories = ["database"]
 keywords = ["paimon", "datafusion", "integrations"]
 
 [dependencies]
+async-stream = "0.3"
 async-trait = "0.1"
 chrono = "0.4"
 datafusion = { workspace = true }

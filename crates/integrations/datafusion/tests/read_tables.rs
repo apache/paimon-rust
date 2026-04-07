@@ -680,3 +680,36 @@ async fn test_read_complex_type_table_via_datafusion() {
     assert_eq!(rows[2].2, "{}");
     assert_eq!(rows[2].3, "{name: carol, value: 300}");
 }
+
+/// Test that PaimonTableScan supports the DataFusion fetch contract, allowing
+/// DataFusion to push LIMIT directly into the scan node (eliminating LimitExec).
+#[tokio::test]
+async fn test_fetch_contract_eliminates_limit_exec() {
+    let ctx = create_context("simple_log_table").await;
+
+    let df = ctx
+        .sql("SELECT id, name FROM simple_log_table LIMIT 2")
+        .await
+        .expect("SQL should parse");
+
+    let plan = df.clone().create_physical_plan().await.expect("plan should work");
+
+    let plan_display = datafusion::physical_plan::get_plan_string(&plan);
+    let plan_str = plan_display.join("\n");
+
+    // The fetch contract should push LIMIT into PaimonTableScan (shown as
+    // "fetch=2") and there should be no separate GlobalLimitExec in the plan.
+    assert!(
+        plan_str.contains("limit=2") || plan_str.contains("fetch=2"),
+        "PaimonTableScan should show limit in plan display, got:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("GlobalLimitExec"),
+        "GlobalLimitExec should be eliminated by fetch contract, got:\n{plan_str}"
+    );
+
+    // Verify correct row count
+    let batches = df.collect().await.expect("collect should succeed");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "LIMIT 2 should return exactly 2 rows");
+}

@@ -100,6 +100,42 @@ impl PaimonTableScan {
     }
 }
 
+/// Wraps a record batch stream with a row-count limit. If `limit` is `None`,
+/// the stream is returned unchanged.
+fn apply_limit(
+    stream: impl futures::Stream<Item = Result<datafusion::arrow::record_batch::RecordBatch, datafusion::error::DataFusionError>>
+        + Send
+        + 'static,
+    limit: Option<usize>,
+) -> impl futures::Stream<Item = Result<datafusion::arrow::record_batch::RecordBatch, datafusion::error::DataFusionError>>
+       + Send {
+    async_stream::stream! {
+        futures::pin_mut!(stream);
+        let mut remaining = match limit {
+            Some(n) => n,
+            None => usize::MAX,
+        };
+        while remaining > 0 {
+            match stream.next().await {
+                None => break,
+                Some(Err(e)) => {
+                    yield Err(e);
+                    break;
+                }
+                Some(Ok(batch)) => {
+                    if batch.num_rows() <= remaining {
+                        remaining -= batch.num_rows();
+                        yield Ok(batch);
+                    } else {
+                        yield Ok(batch.slice(0, remaining));
+                        remaining = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl ExecutionPlan for PaimonTableScan {
     fn name(&self) -> &str {
         "PaimonTableScan"
@@ -140,6 +176,7 @@ impl ExecutionPlan for PaimonTableScan {
         let schema = self.schema();
         let projected_columns = self.projected_columns.clone();
         let pushed_predicate = self.pushed_predicate.clone();
+        let limit = self.limit;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -158,7 +195,7 @@ impl ExecutionPlan for PaimonTableScan {
 
             Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
                 schema,
-                Box::pin(stream),
+                Box::pin(apply_limit(stream, limit)),
             ))
         };
 
@@ -166,6 +203,25 @@ impl ExecutionPlan for PaimonTableScan {
             self.schema(),
             futures::stream::once(fut).try_flatten(),
         )))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(PaimonTableScan {
+            table: self.table.clone(),
+            projected_columns: self.projected_columns.clone(),
+            pushed_predicate: self.pushed_predicate.clone(),
+            planned_partitions: self.planned_partitions.clone(),
+            plan_properties: self.plan_properties.clone(),
+            limit,
+        }))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
     }
 
     fn statistics(&self) -> DFResult<Statistics> {
