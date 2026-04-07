@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::io::FileIOProvider;
+use crate::io::FileIO;
 use crate::spec::manifest_entry::ManifestEntry;
 use apache_avro::types::Value;
 use apache_avro::{from_value, Reader};
@@ -42,7 +42,7 @@ impl Manifest {
     ///
     /// # Returns
     /// A vector of ManifestEntry records
-    pub async fn read(file_io: &Arc<dyn FileIOProvider>, path: &str) -> Result<Vec<ManifestEntry>> {
+    pub async fn read(file_io: &Arc<dyn FileIO>, path: &str) -> Result<Vec<ManifestEntry>> {
         let input_file = file_io.new_input(path).await?;
         if !input_file.exists().await? {
             return Ok(Vec::new());
@@ -72,7 +72,7 @@ impl Manifest {
 #[cfg(not(windows))] // Skip on Windows due to path compatibility issues
 mod tests {
     use super::*;
-    use crate::io::FileIO;
+    use crate::io::{FileIO, DefaultFileIO};
     use crate::spec::manifest_common::FileKind;
     use std::env::current_dir;
 
@@ -82,8 +82,8 @@ mod tests {
         let path =
             workdir.join("tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0");
 
-        let file_io: Arc<dyn FileIOProvider> =
-            Arc::new(FileIO::from_url("file://").unwrap().build().unwrap());
+        let file_io: Arc<dyn FileIO> =
+            Arc::new(DefaultFileIO::from_url("file://").unwrap().build().unwrap());
         let entries = Manifest::read(&file_io, path.to_str().unwrap())
             .await
             .unwrap();

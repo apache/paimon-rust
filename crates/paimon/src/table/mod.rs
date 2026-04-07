@@ -34,13 +34,13 @@ pub use source::{DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Pla
 pub use table_scan::TableScan;
 
 use crate::catalog::Identifier;
-use crate::io::FileIOProvider;
+use crate::io::FileIO;
 use crate::spec::TableSchema;
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct Table {
-    file_io: Arc<dyn FileIOProvider>,
+    file_io: Arc<dyn FileIO>,
     identifier: Identifier,
     location: String,
     schema: TableSchema,
@@ -50,7 +50,7 @@ pub struct Table {
 impl Table {
     /// Create a new table.
     pub fn new(
-        file_io: Arc<dyn FileIOProvider>,
+        file_io: Arc<dyn FileIO>,
         identifier: Identifier,
         location: String,
         schema: TableSchema,
@@ -78,8 +78,8 @@ impl Table {
         &self.schema
     }
 
-    /// Get the FileIOProvider instance for this table.
-    pub fn file_io(&self) -> &Arc<dyn FileIOProvider> {
+    /// Get the FileIO instance for this table.
+    pub fn file_io(&self) -> &Arc<dyn FileIO> {
         &self.file_io
     }
 

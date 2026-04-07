@@ -31,7 +31,7 @@ use crate::api::PagedList;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::{FileIO, FileIOProvider};
+use crate::io::{FileIO, DefaultFileIO};
 use crate::spec::{Schema, SchemaChange, TableSchema};
 use crate::table::Table;
 use crate::Result;
@@ -240,8 +240,8 @@ impl Catalog for RESTCatalog {
             });
         }
 
-        // Build FileIOProvider based on data_token_enabled and is_external
-        let file_io: Arc<dyn FileIOProvider> = if self.data_token_enabled && !is_external {
+        // Build FileIO based on data_token_enabled and is_external
+        let file_io: Arc<dyn FileIO> = if self.data_token_enabled && !is_external {
             // Use RESTTokenFileIO which will refresh token on each operation
             Arc::new(RESTTokenFileIO::new(
                 identifier.clone(),
@@ -249,8 +249,8 @@ impl Catalog for RESTCatalog {
                 self.options.clone(),
             ))
         } else {
-            // Use standard FileIO from path
-            Arc::new(FileIO::from_path(&table_path)?.build()?)
+            // Use standard DefaultFileIO from path
+            Arc::new(DefaultFileIO::from_path(&table_path)?.build()?)
         };
 
         Ok(Table::new(

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
-use crate::io::{FileIO, FileIOProvider};
+use crate::io::{FileIO, DefaultFileIO};
 use crate::spec::{Schema, TableSchema};
 use crate::table::Table;
 use async_trait::async_trait;
@@ -64,7 +64,7 @@ fn make_path(parent: &str, child: &str) -> String {
 /// Reference: [org.apache.paimon.catalog.FileSystemCatalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/FileSystemCatalog.java)
 #[derive(Clone, Debug)]
 pub struct FileSystemCatalog {
-    file_io: Arc<dyn FileIOProvider>,
+    file_io: Arc<dyn FileIO>,
     warehouse: String,
 }
 
@@ -103,7 +103,7 @@ impl FileSystemCatalog {
                     message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
                 })?;
 
-        let file_io = FileIO::from_path(&warehouse)?
+        let file_io = DefaultFileIO::from_path(&warehouse)?
             .with_props(options.to_map().iter())
             .build()?;
 
@@ -119,7 +119,7 @@ impl FileSystemCatalog {
     }
 
     /// Get the FileIO instance.
-    pub fn file_io(&self) -> &Arc<dyn FileIOProvider> {
+    pub fn file_io(&self) -> &Arc<dyn FileIO> {
         &self.file_io
     }
 

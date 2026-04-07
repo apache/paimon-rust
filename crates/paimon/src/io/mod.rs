@@ -18,8 +18,8 @@
 mod file_io;
 pub use file_io::*;
 
-mod file_io_provider;
-pub use file_io_provider::*;
+mod default_file_io;
+pub use default_file_io::*;
 
 mod storage;
 pub use storage::*;

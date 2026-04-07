@@ -21,7 +21,7 @@
 // TODO: remove when SnapshotManager is used (e.g. from Table or source planning).
 #![allow(dead_code)]
 
-use crate::io::FileIOProvider;
+use crate::io::FileIO;
 use crate::spec::Snapshot;
 use std::str;
 use std::sync::Arc;
@@ -34,13 +34,13 @@ const LATEST_SNAPSHOT_FILE: &str = "LATEST";
 /// Reference: [org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 #[derive(Debug, Clone)]
 pub struct SnapshotManager {
-    file_io: Arc<dyn FileIOProvider>,
+    file_io: Arc<dyn FileIO>,
     table_path: String,
 }
 
 impl SnapshotManager {
     /// Create a snapshot manager for the given table path and FileIO.
-    pub fn new(file_io: Arc<dyn FileIOProvider>, table_path: String) -> Self {
+    pub fn new(file_io: Arc<dyn FileIO>, table_path: String) -> Self {
         Self {
             file_io,
             table_path,

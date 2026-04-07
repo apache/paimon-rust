@@ -22,7 +22,7 @@
 //! and automatic refresh.
 //!
 //! Unlike the previous implementation that only refreshed tokens during
-//! `build_file_io()`, this implementation implements `FileIOProvider` and
+//! `build_file_io()`, this implementation implements `FileIO` and
 //! checks token validity before each file operation, matching the Java
 //! implementation behavior.
 
@@ -38,7 +38,7 @@ use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::storage_oss::OSS_ENDPOINT;
-use crate::io::{FileIO, FileIOProvider, FileStatus, InputFile, OutputFile};
+use crate::io::{DefaultFileIO, FileIO, FileStatus, InputFile, OutputFile};
 use crate::{Error, Result};
 
 use super::rest_token::RESTToken;
@@ -46,22 +46,22 @@ use super::rest_token::RESTToken;
 /// Safe time margin (in milliseconds) before token expiration to trigger refresh.
 const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 
-/// Maximum number of entries in the global FileIO cache.
+/// Maximum number of entries in the global DefaultFileIO cache.
 const FILE_IO_CACHE_MAX_CAPACITY: u64 = 1000;
 /// Time-to-live for cache entries in seconds (10 hours).
 const FILE_IO_CACHE_TTL_SECS: u64 = 10 * 60 * 60;
 
-/// Global static FileIO cache, similar to Java's Caffeine cache.
+/// Global static DefaultFileIO cache, similar to Java's Caffeine cache.
 ///
-/// This cache stores FileIO instances keyed by their corresponding RESTToken.
+/// This cache stores DefaultFileIO instances keyed by their corresponding RESTToken.
 /// Features:
 /// - max_capacity: 1000 entries
 /// - time_to_live: 10 hours (entries expire after this duration)
 /// - thread-safe via moka's internal synchronization
-static FILE_IO_CACHE: OnceLock<Cache<RESTToken, FileIO>> = OnceLock::new();
+static FILE_IO_CACHE: OnceLock<Cache<RESTToken, DefaultFileIO>> = OnceLock::new();
 
-/// Get the global FileIO cache, initializing it if necessary.
-fn get_file_io_cache() -> &'static Cache<RESTToken, FileIO> {
+/// Get the global DefaultFileIO cache, initializing it if necessary.
+fn get_file_io_cache() -> &'static Cache<RESTToken, DefaultFileIO> {
     FILE_IO_CACHE.get_or_init(|| {
         Cache::builder()
             .max_capacity(FILE_IO_CACHE_MAX_CAPACITY)
@@ -75,8 +75,8 @@ fn get_file_io_cache() -> &'static Cache<RESTToken, FileIO> {
 /// This struct handles:
 /// - Token caching with expiration detection
 /// - Automatic token refresh via `RESTApi::load_table_token`
-/// - Merging token credentials into catalog options to build the underlying `FileIO`
-/// - FileIO caching based on token to avoid rebuilding FileIO unnecessarily
+/// - Merging token credentials into catalog options to build the underlying `DefaultFileIO`
+/// - DefaultFileIO caching based on token to avoid rebuilding DefaultFileIO unnecessarily
 pub struct RESTTokenFileIO {
     /// Table identifier for token requests.
     identifier: Identifier,
@@ -108,13 +108,13 @@ impl RESTTokenFileIO {
         }
     }
 
-    /// Get or create a valid FileIO instance.
+    /// Get or create a valid DefaultFileIO instance.
     ///
     /// This method:
     /// 1. Refreshes the token if expired or not yet obtained.
-    /// 2. Returns cached FileIO from global cache if token exists.
-    /// 3. Otherwise creates a new FileIO with the new token and caches it.
-    async fn get_file_io(&self) -> Result<FileIO> {
+    /// 2. Returns cached DefaultFileIO from global cache if token exists.
+    /// 3. Otherwise creates a new DefaultFileIO with the new token and caches it.
+    async fn get_file_io(&self) -> Result<DefaultFileIO> {
         // Ensure token is fresh (this will update self.token if needed)
         self.try_to_refresh_token().await?;
 
@@ -143,7 +143,7 @@ impl RESTTokenFileIO {
                     Some(catalog_options.to_map()),
                     Some(&current_token_clone.token),
                 );
-                let mut builder = FileIO::from_path(&path)?;
+                let mut builder = DefaultFileIO::from_path(&path)?;
                 builder = builder.with_props(merged_props);
                 builder.build()
             })
@@ -241,7 +241,7 @@ impl RESTTokenFileIO {
 }
 
 #[async_trait::async_trait]
-impl FileIOProvider for RESTTokenFileIO {
+impl FileIO for RESTTokenFileIO {
     async fn new_input(&self, path: &str) -> Result<InputFile> {
         let file_io = self.get_file_io().await?;
         file_io.new_input(path).await

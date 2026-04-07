@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    io::{FileIO, FileRead, FileStatus, InputFile, OutputFile},
+    io::{DefaultFileIO, FileRead, FileStatus, InputFile, OutputFile},
     Error,
 };
 
@@ -102,7 +102,7 @@ pub async fn write_column_indexes(
     path: &str,
     indexes: HashMap<String, HashMap<String, Bytes>>,
 ) -> crate::Result<OutputFile> {
-    let file_io: Arc<dyn crate::io::FileIOProvider> = Arc::new(FileIO::from_path(path)?.build()?);
+    let file_io: Arc<dyn crate::io::FileIO> = Arc::new(DefaultFileIO::from_path(path)?.build()?);
     let output = file_io.new_output(path).await?;
     let mut writer = output.writer().await?;
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::io::FileIOProvider;
+use crate::io::FileIO;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::IndexFileMeta;
 use apache_avro::types::Value;
@@ -67,7 +67,7 @@ pub struct IndexManifest;
 impl IndexManifest {
     /// Read index manifest entries from a file.
     pub async fn read(
-        file_io: &Arc<dyn FileIOProvider>,
+        file_io: &Arc<dyn FileIO>,
         path: &str,
     ) -> Result<Vec<IndexManifestEntry>> {
         let input_file = file_io.new_input(path).await?;
