@@ -782,10 +782,16 @@ struct ArrowFileReader {
     /// Maximum gap (in bytes) between two ranges that will be merged into a
     /// single fetch request. Defaults to 1 MiB.
     range_coalesce_bytes: u64,
+    /// Hint for the number of bytes to speculatively read from the end of the
+    /// file when loading Parquet metadata. A sufficiently large hint reduces
+    /// footer loading from 2 round-trips to 1. Defaults to 512 KiB.
+    metadata_size_hint: Option<usize>,
 }
 
 /// Default coalesce threshold: 1 MiB.
 const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+/// Default metadata prefetch hint: 512 KiB (same as DataFusion's default).
+const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
@@ -793,6 +799,7 @@ impl ArrowFileReader {
             file_size,
             r,
             range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
+            metadata_size_hint: Some(DEFAULT_METADATA_SIZE_HINT),
         }
     }
 
@@ -862,9 +869,11 @@ impl AsyncFileReader for ArrowFileReader {
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let metadata_opts = options.map(|o| o.metadata_options().clone());
+        let prefetch_hint = self.metadata_size_hint;
         Box::pin(async move {
             let file_size = self.file_size;
             let metadata = ParquetMetaDataReader::new()
+                .with_prefetch_hint(prefetch_hint)
                 .with_metadata_options(metadata_opts)
                 .load_and_finish(self, file_size)
                 .await?;
