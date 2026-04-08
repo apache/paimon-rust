@@ -772,10 +772,14 @@ fn build_row_ranges_selection(
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
-/// Supports range coalescing to reduce the number of object-store round-trips
-/// when reading column chunks from remote storage.
+/// # TODO
 ///
-/// Inspired by iceberg-rust's `ArrowFileReader` (PR #2181).
+/// [ParquetObjectReader](https://docs.rs/parquet/latest/src/parquet/arrow/async_reader/store.rs.html#64)
+/// contains the following hints to speed up metadata loading, similar to iceberg, we can consider adding them to this struct:
+///
+/// - `metadata_size_hint`: Provide a hint as to the size of the parquet file's footer.
+/// - `preload_column_index`: Load the Column Index  as part of [`Self::get_metadata`].
+/// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
 struct ArrowFileReader {
     file_size: u64,
     r: Box<dyn FileRead>,
@@ -794,7 +798,7 @@ struct ArrowFileReader {
 const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
 /// Default concurrent range fetches.
 const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 8;
-/// Default metadata prefetch hint: 512 KiB (same as DataFusion's default).
+/// Default metadata prefetch hint: 512 KiB.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
 impl ArrowFileReader {
@@ -828,8 +832,8 @@ impl AsyncFileReader for ArrowFileReader {
     }
 
     fn get_byte_ranges(
-      &mut self,
-      ranges: Vec<Range<u64>>,
+        &mut self,
+        ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let coalesce_bytes = self.range_coalesce_bytes;
         let concurrency = self.range_fetch_concurrency.max(1);
@@ -839,26 +843,19 @@ impl AsyncFileReader for ArrowFileReader {
                 return Ok(vec![]);
             }
 
-            // Calculate max merged range size to ensure enough ranges for concurrency.
-            // For column-pruned reads, ranges are naturally spread out so this has no effect.
-            // For full-table reads, this prevents everything from merging into 1 huge range.
-            let total_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-            let max_merge_bytes = if concurrency > 1 {
-                (total_bytes / concurrency as u64).max(1)
-            } else {
-                u64::MAX
-            };
-
-            let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes, max_merge_bytes);
+            // Two-phase range optimization:
+            // Phase 1: Merge nearby ranges based on coalesce threshold.
+            let coalesced = merge_byte_ranges(&ranges, coalesce_bytes);
+            // Phase 2: Split large merged ranges to utilize concurrency.
+            let fetch_ranges = split_ranges_for_concurrency(coalesced, concurrency);
 
             // Fetch merged ranges concurrently.
             let r = &self.r;
             let fetched: Vec<Bytes> = if fetch_ranges.len() <= concurrency {
                 // All ranges fit within the concurrency limit — fire them all at once.
                 futures::future::try_join_all(fetch_ranges.iter().map(|range| {
-                    r.read(range.clone()).map_err(|e| {
-                        parquet::errors::ParquetError::External(format!("{e}").into())
-                    })
+                    r.read(range.clone())
+                        .map_err(|e| parquet::errors::ParquetError::External(format!("{e}").into()))
                 }))
                 .await?
             } else {
@@ -912,44 +909,74 @@ impl AsyncFileReader for ArrowFileReader {
 // Range coalescing
 // ---------------------------------------------------------------------------
 
-/// Merge nearby byte ranges to reduce the number of object-store requests.
+/// Merge nearby byte ranges to reduce the number of requests.
 ///
 /// Ranges whose gap is ≤ `coalesce` bytes are merged into a single range.
 /// The input does not need to be sorted.
-fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64, max_merge_bytes: u64) -> Vec<Range<u64>> {
-      if ranges.is_empty() {
-          return vec![];
-      }
+fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return vec![];
+    }
 
-      let mut sorted = ranges.to_vec();
-      sorted.sort_unstable_by_key(|r| r.start);
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|r| r.start);
 
-      let mut merged = Vec::with_capacity(sorted.len());
-      let mut start_idx = 0;
-      let mut end_idx = 1;
+    let mut merged = Vec::with_capacity(sorted.len());
+    let mut start_idx = 0;
+    let mut end_idx = 1;
 
-      while start_idx != sorted.len() {
-          let mut range_end = sorted[start_idx].end;
+    while start_idx != sorted.len() {
+        let mut range_end = sorted[start_idx].end;
 
-          while end_idx != sorted.len()
-              && sorted[end_idx]
-                  .start
-                  .checked_sub(range_end)
-                  .map(|delta| delta <= coalesce)
-                  .unwrap_or(true)
-              && (sorted[end_idx].end - sorted[start_idx].start) <= max_merge_bytes
-          {
-              range_end = range_end.max(sorted[end_idx].end);
-              end_idx += 1;
-          }
+        while end_idx != sorted.len()
+            && sorted[end_idx]
+                .start
+                .checked_sub(range_end)
+                .map(|delta| delta <= coalesce)
+                .unwrap_or(true)
+        {
+            range_end = range_end.max(sorted[end_idx].end);
+            end_idx += 1;
+        }
 
-          merged.push(sorted[start_idx].start..range_end);
-          start_idx = end_idx;
-          end_idx += 1;
-      }
+        merged.push(sorted[start_idx].start..range_end);
+        start_idx = end_idx;
+        end_idx += 1;
+    }
 
-      merged
-  }
+    merged
+}
+
+fn split_ranges_for_concurrency(ranges: Vec<Range<u64>>, target_count: usize) -> Vec<Range<u64>> {
+    if ranges.is_empty() || target_count <= 1 || ranges.len() >= target_count {
+        return ranges;
+    }
+
+    let mut result = ranges;
+
+    while result.len() < target_count {
+        // Find the largest range by byte size.
+        let (largest_idx, largest_range) = result
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, r)| r.end - r.start)
+            .expect("result is non-empty");
+
+        let range_size = largest_range.end - largest_range.start;
+        if range_size <= 1 {
+            break;
+        }
+
+        let mid = largest_range.start + range_size / 2;
+        let left = largest_range.start..mid;
+        let right = mid..largest_range.end;
+
+        result[largest_idx] = left;
+        result.insert(largest_idx + 1, right);
+    }
+
+    result
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1048,13 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_byte_ranges_single() {
-        let ranges = vec![100..200];
-        let merged = super::merge_byte_ranges(&ranges, 1024);
-        assert_eq!(merged, vec![100..200]);
-    }
-
-    #[test]
     fn test_merge_byte_ranges_zero_coalesce_adjacent() {
         // With coalesce=0, adjacent ranges (gap=0) should still merge
         let ranges = vec![0..100, 100..200];
@@ -1068,5 +1088,53 @@ mod tests {
         let ranges = vec![0..100, 101..200];
         let merged = super::merge_byte_ranges(&ranges, 0);
         assert_eq!(merged, vec![0..100, 101..200]);
+    }
+
+    // -----------------------------------------------------------------------
+    // split_ranges_for_concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_single_range() {
+        // One large range split into 4
+        let ranges = vec![0..1000];
+        let result = super::split_ranges_for_concurrency(ranges, 4);
+        assert_eq!(result.len(), 4);
+        // All ranges should be contiguous and cover 0..1000
+        assert_eq!(result[0].start, 0);
+        assert_eq!(result.last().unwrap().end, 1000);
+        for window in result.windows(2) {
+            assert_eq!(window[0].end, window[1].start);
+        }
+    }
+
+    #[test]
+    fn test_split_mixed_sizes() {
+        // One large range + one small range, target=4
+        // Should split the large range, leave the small one alone
+        let ranges = vec![0..1000, 2000..2010];
+        let result = super::split_ranges_for_concurrency(ranges, 4);
+        assert_eq!(result.len(), 4);
+        // The small range (2000..2010) should remain intact
+        assert!(result.contains(&(2000..2010)));
+    }
+
+    #[test]
+    fn test_split_empty() {
+        let ranges: Vec<std::ops::Range<u64>> = vec![];
+        let result = super::split_ranges_for_concurrency(ranges, 4);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_split_clustered_and_sparse() {
+        // Simulates clustered + sparse columns:
+        // Clustered group merged into 0..400, sparse columns at 1000 and 2000
+        let ranges = vec![0..400, 1000..1010, 2000..2010];
+        let result = super::split_ranges_for_concurrency(ranges, 4);
+        assert_eq!(result.len(), 4);
+        // The large range should be split, small ones preserved
+        assert!(result.contains(&(1000..1010)));
+        assert!(result.contains(&(2000..2010)));
     }
 }
