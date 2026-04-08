@@ -261,6 +261,9 @@ impl FormatFileReader for AvroFormatReader {
 
 fn ranges_to_mask(total_rows: usize, ranges: &[RowRange]) -> Vec<bool> {
     let mut mask = vec![false; total_rows];
+    if total_rows == 0 {
+        return mask;
+    }
     let file_end = total_rows as i64 - 1;
     for r in ranges {
         let from = r.from().max(0) as usize;

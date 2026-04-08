@@ -36,6 +36,7 @@ impl FormatFileReader for OrcFormatReader {
         reader: Box<dyn FileRead>,
         file_size: u64,
         read_fields: &[DataField],
+        // TODO: support predicate pushdown for ORC (stripe pruning + row-level filtering)
         _predicates: Option<&FilePredicates>,
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
@@ -49,9 +50,9 @@ impl FormatFileReader for OrcFormatReader {
                 source: Some(Box::new(e)),
             })?;
 
-        let root_data_type = builder.file_metadata().root_data_type().clone();
         let projected_names: Vec<&str> = read_fields.iter().map(|f| f.name()).collect();
-        let projection = ProjectionMask::named_roots(&root_data_type, &projected_names);
+        let projection =
+            ProjectionMask::named_roots(builder.file_metadata().root_data_type(), &projected_names);
 
         let mut builder = builder.with_projection(projection);
 
