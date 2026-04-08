@@ -55,6 +55,8 @@ pretty_assertions = "1"
 serde_avro_fast = { version = "2.0.2", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
 roaring = "0.11"
+crc32fast = "1"
+zstd = "0.13"
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }

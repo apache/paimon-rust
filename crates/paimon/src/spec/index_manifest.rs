@@ -118,6 +118,7 @@ mod tests {
                             cardinality: Some(3),
                         }
                     )])),
+                    global_index_meta: None,
                 }
             }]
         );
@@ -143,6 +144,7 @@ mod tests {
                         cardinality: Some(7),
                     },
                 )])),
+                global_index_meta: None,
             },
         };
 

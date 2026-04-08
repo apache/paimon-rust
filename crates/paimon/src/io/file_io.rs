@@ -279,7 +279,7 @@ impl FileIOBuilder {
 }
 
 #[async_trait::async_trait]
-pub trait FileRead: Send + Unpin + 'static {
+pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 }
 

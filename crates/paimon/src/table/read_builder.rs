@@ -145,6 +145,7 @@ impl<'a> ReadBuilder<'a> {
     /// applied by the caller if exact filtering semantics are required.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);
+        self.try_extract_row_id_ranges();
         self
     }
 
@@ -156,6 +157,24 @@ impl<'a> ReadBuilder<'a> {
             Some(ranges)
         };
         self
+    }
+
+    /// Extract `_ROW_ID` predicates from data_predicates into row_ranges.
+    /// Only runs when no explicit row_ranges have been set.
+    fn try_extract_row_id_ranges(&mut self) {
+        if self.row_ranges.is_some() || self.filter.data_predicates.is_empty() {
+            return;
+        }
+        let combined = Predicate::and(self.filter.data_predicates.clone());
+        if let Some(ranges) = super::row_id_predicate::extract_row_id_ranges(&combined) {
+            self.row_ranges = Some(ranges);
+            self.filter.data_predicates = self
+                .filter
+                .data_predicates
+                .iter()
+                .filter_map(super::row_id_predicate::remove_row_id_filter)
+                .collect();
+        }
     }
 
     /// Push a row-limit hint down to scan planning.
@@ -591,5 +610,97 @@ mod tests {
             .unwrap();
 
         assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+    }
+
+    #[test]
+    fn test_with_filter_extracts_row_id_ranges() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test".to_string(),
+            table_schema,
+        );
+
+        let mut builder = table.new_read_builder();
+        let filter = Predicate::and(vec![
+            Predicate::Leaf {
+                column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+                index: 0,
+                data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+                op: crate::spec::PredicateOperator::GtEq,
+                literals: vec![crate::spec::Datum::Long(10)],
+            },
+            Predicate::Leaf {
+                column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+                index: 0,
+                data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+                op: crate::spec::PredicateOperator::LtEq,
+                literals: vec![crate::spec::Datum::Long(20)],
+            },
+            PredicateBuilder::new(table.schema().fields())
+                .equal("value", crate::spec::Datum::Int(42))
+                .unwrap(),
+        ]);
+        builder.with_filter(filter);
+
+        // _ROW_ID predicates should be extracted into row_ranges
+        assert!(builder.row_ranges.is_some());
+        let ranges = builder.row_ranges.as_ref().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].from(), 10);
+        assert_eq!(ranges[0].to(), 20);
+
+        // _ROW_ID predicates should be removed from data_predicates
+        assert!(!builder.filter.data_predicates.is_empty());
+        for p in &builder.filter.data_predicates {
+            if let Predicate::Leaf { column, .. } = p {
+                assert_ne!(column, crate::spec::ROW_ID_FIELD_NAME);
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_filter_skips_extraction_when_row_ranges_set() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test".to_string(),
+            table_schema,
+        );
+
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(vec![crate::table::source::RowRange::new(0, 5)]);
+
+        let filter = Predicate::Leaf {
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            index: 0,
+            data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+            op: crate::spec::PredicateOperator::GtEq,
+            literals: vec![crate::spec::Datum::Long(10)],
+        };
+        builder.with_filter(filter);
+
+        // Explicit row_ranges should be preserved, not overwritten
+        let ranges = builder.row_ranges.as_ref().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].from(), 0);
+        assert_eq!(ranges[0].to(), 5);
     }
 }

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
@@ -62,6 +63,13 @@ impl<'a> CoreOptions<'a> {
     pub fn data_evolution_enabled(&self) -> bool {
         self.options
             .get(DATA_EVOLUTION_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    pub fn global_index_enabled(&self) -> bool {
+        self.options
+            .get(GLOBAL_INDEX_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }

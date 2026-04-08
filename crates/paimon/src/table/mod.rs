@@ -19,7 +19,9 @@
 
 pub(crate) mod bin_pack;
 mod bucket_filter;
+pub(crate) mod global_index_scanner;
 mod read_builder;
+pub(crate) mod row_id_predicate;
 pub(crate) mod schema_manager;
 mod snapshot_manager;
 mod source;

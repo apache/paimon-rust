@@ -26,6 +26,7 @@ pub mod api;
 pub use api::rest_api::RESTApi;
 
 pub mod arrow;
+pub mod btree;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;

@@ -571,14 +571,36 @@ impl<'a> TableScan<'a> {
         };
 
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
-        let deletion_files_map = if let Some(index_manifest_name) = snapshot.index_manifest() {
-            let index_manifest_path = format!("{base_path}/{MANIFEST_DIR}");
-            let path = format!("{index_manifest_path}/{index_manifest_name}");
-            let index_entries = IndexManifest::read(file_io, &path).await?;
-            Some(build_deletion_files_map(&index_entries, base_path))
-        } else {
-            None
-        };
+        let (deletion_files_map, effective_row_ranges) =
+            if let Some(index_manifest_name) = snapshot.index_manifest() {
+                let index_manifest_path = format!("{base_path}/{MANIFEST_DIR}");
+                let path = format!("{index_manifest_path}/{index_manifest_name}");
+                let index_entries = IndexManifest::read(file_io, &path).await?;
+                let dv_map = build_deletion_files_map(&index_entries, base_path);
+
+                // Use pushed-down row_ranges first; otherwise try global index.
+                let row_ranges = if self.row_ranges.is_some() {
+                    self.row_ranges.clone()
+                } else if data_evolution_enabled
+                    && core_options.global_index_enabled()
+                    && !self.data_predicates.is_empty()
+                {
+                    super::global_index_scanner::evaluate_global_index(
+                        file_io,
+                        base_path,
+                        &index_entries,
+                        &self.data_predicates,
+                        self.table.schema().fields(),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+
+                (Some(dv_map), row_ranges)
+            } else {
+                (None, self.row_ranges.clone())
+            };
 
         for ((partition, bucket), group_entries) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
@@ -633,7 +655,7 @@ impl<'a> TableScan<'a> {
                 };
 
                 // Filter groups by row ID ranges.
-                let row_id_groups = if let Some(ref ranges) = self.row_ranges {
+                let row_id_groups = if let Some(ref ranges) = effective_row_ranges {
                     row_id_groups
                         .into_iter()
                         .filter(|group| group.iter().any(|f| any_range_overlaps_file(ranges, f)))
@@ -673,7 +695,7 @@ impl<'a> TableScan<'a> {
                 });
 
                 // Compute row_ranges before moving file_group to avoid clone
-                let split_row_ranges = if let Some(ref ranges) = self.row_ranges {
+                let split_row_ranges = if let Some(ref ranges) = effective_row_ranges {
                     let mut split_ranges = Vec::new();
                     for file in &file_group {
                         split_ranges.extend(intersect_ranges_with_file(ranges, file));
@@ -708,7 +730,7 @@ impl<'a> TableScan<'a> {
 
         // With data predicates or row_ranges, merged_row_count() reflects pre-filter
         // row counts, so stopping early could return fewer rows than the limit.
-        let splits = if self.data_predicates.is_empty() && self.row_ranges.is_none() {
+        let splits = if self.data_predicates.is_empty() && effective_row_ranges.is_none() {
             self.apply_limit_pushdown(splits)
         } else {
             splits
@@ -1126,6 +1148,7 @@ mod tests {
                         cardinality: Some(33),
                     },
                 )])),
+                global_index_meta: None,
             },
         }];
 

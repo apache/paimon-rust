@@ -27,6 +27,27 @@ pub struct DeletionVectorMeta {
     pub cardinality: Option<i64>,
 }
 
+/// Metadata for a global index entry within an index file.
+///
+/// Reference: [org.apache.paimon.index.GlobalIndexMeta](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexMeta.java)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalIndexMeta {
+    #[serde(rename = "_ROW_RANGE_START")]
+    pub row_range_start: i64,
+
+    #[serde(rename = "_ROW_RANGE_END")]
+    pub row_range_end: i64,
+
+    #[serde(rename = "_INDEX_FIELD_ID")]
+    pub index_field_id: i32,
+
+    #[serde(default, rename = "_EXTRA_FIELD_IDS")]
+    pub extra_field_ids: Option<Vec<i32>>,
+
+    #[serde(default, rename = "_INDEX_META", with = "serde_bytes")]
+    pub index_meta: Option<Vec<u8>>,
+}
+
 /// Metadata of index file.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/index/IndexFileMeta.java>
@@ -52,18 +73,26 @@ pub struct IndexFileMeta {
         alias = "_DELETION_VECTORS_RANGES"
     )]
     pub deletion_vectors_ranges: Option<IndexMap<String, DeletionVectorMeta>>,
+
+    #[serde(
+        default,
+        rename = "_GLOBAL_INDEX",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub global_index_meta: Option<GlobalIndexMeta>,
 }
 
 impl Display for IndexFileMeta {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IndexFileMeta{{index_type={}, fileName={}, fileSize={}, rowCount={}, deletion_vectors_ranges={:?}}}",
+            "IndexFileMeta{{index_type={}, fileName={}, fileSize={}, rowCount={}, deletion_vectors_ranges={:?}, global_index_meta={:?}}}",
             self.index_type,
             self.file_name,
             self.file_size,
             self.row_count,
             self.deletion_vectors_ranges,
+            self.global_index_meta,
         )
     }
 }
