@@ -828,8 +828,8 @@ impl AsyncFileReader for ArrowFileReader {
     }
 
     fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
+      &mut self,
+      ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let coalesce_bytes = self.range_coalesce_bytes;
         let concurrency = self.range_fetch_concurrency.max(1);
@@ -839,22 +839,27 @@ impl AsyncFileReader for ArrowFileReader {
                 return Ok(vec![]);
             }
 
-            // Merge nearby ranges to reduce the number of object-store requests.
-            let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes);
-            let r = &self.r;
+            // Calculate max merged range size to ensure enough ranges for concurrency.
+            // For column-pruned reads, ranges are naturally spread out so this has no effect.
+            // For full-table reads, this prevents everything from merging into 1 huge range.
+            let total_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+            let max_merge_bytes = if concurrency > 1 {
+                (total_bytes / concurrency as u64).max(1)
+            } else {
+                u64::MAX
+            };
 
-            eprintln!(
-                "[get_byte_ranges] original={}, merged={}",
-                ranges.len(),
-                fetch_ranges.len()
-            );
+            let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes, max_merge_bytes);
 
             // Fetch merged ranges concurrently.
+            // NOTE: requires FileRead to be Sync. If FileRead is !Sync, either
+            // add Sync bound or fall back to the sequential loop below.
+            let r = &self.r;
             let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
                 .map(|range| async move {
                     r.read(range)
                         .await
-                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                        .map_err(|e| parquet::errors::ParquetError::External(format!("{e}").into()))
                 })
                 .buffered(concurrency)
                 .try_collect()
@@ -902,39 +907,40 @@ impl AsyncFileReader for ArrowFileReader {
 ///
 /// Ranges whose gap is ≤ `coalesce` bytes are merged into a single range.
 /// The input does not need to be sorted.
-fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
-    if ranges.is_empty() {
-        return vec![];
-    }
+fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64, max_merge_bytes: u64) -> Vec<Range<u64>> {
+      if ranges.is_empty() {
+          return vec![];
+      }
 
-    let mut sorted = ranges.to_vec();
-    sorted.sort_unstable_by_key(|r| r.start);
+      let mut sorted = ranges.to_vec();
+      sorted.sort_unstable_by_key(|r| r.start);
 
-    let mut merged = Vec::with_capacity(sorted.len());
-    let mut start_idx = 0;
-    let mut end_idx = 1;
+      let mut merged = Vec::with_capacity(sorted.len());
+      let mut start_idx = 0;
+      let mut end_idx = 1;
 
-    while start_idx != sorted.len() {
-        let mut range_end = sorted[start_idx].end;
+      while start_idx != sorted.len() {
+          let mut range_end = sorted[start_idx].end;
 
-        while end_idx != sorted.len()
-            && sorted[end_idx]
-                .start
-                .checked_sub(range_end)
-                .map(|delta| delta <= coalesce)
-                .unwrap_or(true)
-        {
-            range_end = range_end.max(sorted[end_idx].end);
-            end_idx += 1;
-        }
+          while end_idx != sorted.len()
+              && sorted[end_idx]
+                  .start
+                  .checked_sub(range_end)
+                  .map(|delta| delta <= coalesce)
+                  .unwrap_or(true)
+              && (sorted[end_idx].end - sorted[start_idx].start) <= max_merge_bytes
+          {
+              range_end = range_end.max(sorted[end_idx].end);
+              end_idx += 1;
+          }
 
-        merged.push(sorted[start_idx].start..range_end);
-        start_idx = end_idx;
-        end_idx += 1;
-    }
+          merged.push(sorted[start_idx].start..range_end);
+          start_idx = end_idx;
+          end_idx += 1;
+      }
 
-    merged
-}
+      merged
+  }
 
 // ---------------------------------------------------------------------------
 // Tests
