@@ -528,7 +528,7 @@ fn build_map_column(
     let mut value_records: Vec<HashMap<String, AvroValue>> = Vec::new();
 
     for record in records.iter().take(num_rows) {
-        match get_field(record, name) {
+        match get_field_raw(record, name) {
             Some(AvroValue::Object(map)) => {
                 for (k, v) in map {
                     let mut km = HashMap::new();
@@ -581,7 +581,7 @@ fn build_map_column(
     let offsets_buf = OffsetBuffer::new(ScalarBuffer::from(offsets));
     let nulls = NullBuffer::new(BooleanBuffer::from(
         (0..num_rows)
-            .map(|i| get_field(&records[i], name).is_some())
+            .map(|i| get_field_raw(&records[i], name).is_some())
             .collect::<Vec<_>>(),
     ));
 
@@ -606,7 +606,7 @@ fn build_row_column(
     num_rows: usize,
 ) -> crate::Result<Arc<dyn arrow_array::Array>> {
     let sub_records: Vec<HashMap<String, AvroValue>> = (0..num_rows)
-        .map(|i| match get_field(&records[i], name) {
+        .map(|i| match get_field_raw(&records[i], name) {
             Some(AvroValue::Object(obj)) => obj.clone(),
             _ => HashMap::new(),
         })
@@ -628,7 +628,7 @@ fn build_row_column(
 
     let nulls = NullBuffer::new(BooleanBuffer::from(
         (0..num_rows)
-            .map(|i| get_field(&records[i], name).is_some())
+            .map(|i| get_field_raw(&records[i], name).is_some())
             .collect::<Vec<_>>(),
     ));
 
@@ -679,6 +679,15 @@ fn bytes_to_i128_be(bytes: &[u8]) -> i128 {
 /// Look up a field in an Avro record, unwrapping union encoding.
 fn get_field<'a>(record: &'a HashMap<String, AvroValue>, name: &str) -> Option<&'a AvroValue> {
     record.get(name).and_then(unwrap_avro_union)
+}
+
+/// Look up a field without union unwrapping — for Map/Row types whose Object
+/// shape overlaps with union wrappers.
+fn get_field_raw<'a>(record: &'a HashMap<String, AvroValue>, name: &str) -> Option<&'a AvroValue> {
+    record.get(name).and_then(|v| match v {
+        AvroValue::Null => None,
+        other => Some(other),
+    })
 }
 
 /// Unwrap Avro union encoding: `{"type": value}` → `value`, or `"null"` → `None`.
