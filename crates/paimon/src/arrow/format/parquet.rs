@@ -852,18 +852,27 @@ impl AsyncFileReader for ArrowFileReader {
             let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes, max_merge_bytes);
 
             // Fetch merged ranges concurrently.
-            // NOTE: requires FileRead to be Sync. If FileRead is !Sync, either
-            // add Sync bound or fall back to the sequential loop below.
             let r = &self.r;
-            let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
-                .map(|range| async move {
-                    r.read(range)
-                        .await
-                        .map_err(|e| parquet::errors::ParquetError::External(format!("{e}").into()))
-                })
-                .buffered(concurrency)
-                .try_collect()
-                .await?;
+            let fetched: Vec<Bytes> = if fetch_ranges.len() <= concurrency {
+                // All ranges fit within the concurrency limit — fire them all at once.
+                futures::future::try_join_all(fetch_ranges.iter().map(|range| {
+                    r.read(range.clone()).map_err(|e| {
+                        parquet::errors::ParquetError::External(format!("{e}").into())
+                    })
+                }))
+                .await?
+            } else {
+                // More ranges than concurrency slots — use buffered stream.
+                futures::stream::iter(fetch_ranges.iter().cloned())
+                    .map(|range| async move {
+                        r.read(range).await.map_err(|e| {
+                            parquet::errors::ParquetError::External(format!("{e}").into())
+                        })
+                    })
+                    .buffered(concurrency)
+                    .try_collect()
+                    .await?
+            };
 
             // Slice the fetched data back into the originally requested ranges.
             Ok(ranges
