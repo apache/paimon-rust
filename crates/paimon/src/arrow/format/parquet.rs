@@ -33,7 +33,7 @@ use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::{StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -772,22 +772,28 @@ fn build_row_ranges_selection(
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
-/// # TODO
+/// Supports range coalescing to reduce the number of object-store round-trips
+/// when reading column chunks from remote storage.
 ///
-/// [ParquetObjectReader](https://docs.rs/parquet/latest/src/parquet/arrow/async_reader/store.rs.html#64)
-/// contains the following hints to speed up metadata loading, similar to iceberg, we can consider adding them to this struct:
-///
-/// - `metadata_size_hint`: Provide a hint as to the size of the parquet file's footer.
-/// - `preload_column_index`: Load the Column Index  as part of [`Self::get_metadata`].
-/// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
+/// Inspired by iceberg-rust's `ArrowFileReader` (PR #2181).
 struct ArrowFileReader {
     file_size: u64,
     r: Box<dyn FileRead>,
+    /// Maximum gap (in bytes) between two ranges that will be merged into a
+    /// single fetch request. Defaults to 1 MiB.
+    range_coalesce_bytes: u64,
 }
+
+/// Default coalesce threshold: 1 MiB.
+const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
-        Self { file_size, r }
+        Self {
+            file_size,
+            r,
+            range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
+        }
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
@@ -809,6 +815,48 @@ impl AsyncFileReader for ArrowFileReader {
         self.read_bytes(range)
     }
 
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        let coalesce_bytes = self.range_coalesce_bytes;
+
+        async move {
+            if ranges.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Merge nearby ranges to reduce the number of object-store requests.
+            let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes);
+
+            // Fetch merged ranges sequentially (FileRead is !Sync so we cannot
+            // use buffered concurrency on &mut self). The coalescing itself is
+            // the main win — it turns N small requests into M merged requests
+            // where M << N for typical column-chunk access patterns.
+            let mut fetched: Vec<Bytes> = Vec::with_capacity(fetch_ranges.len());
+            for range in &fetch_ranges {
+                let bytes = self.r.read(range.clone()).await.map_err(|e| {
+                    parquet::errors::ParquetError::External(format!("{e}").into())
+                })?;
+                fetched.push(bytes);
+            }
+
+            // Slice the fetched data back into the originally requested ranges.
+            Ok(ranges
+                .iter()
+                .map(|range| {
+                    let idx = fetch_ranges.partition_point(|v| v.start <= range.start) - 1;
+                    let fetch_range = &fetch_ranges[idx];
+                    let fetch_bytes = &fetched[idx];
+                    let start = (range.start - fetch_range.start) as usize;
+                    let end = (range.end - fetch_range.start) as usize;
+                    fetch_bytes.slice(start..end.min(fetch_bytes.len()))
+                })
+                .collect())
+        }
+        .boxed()
+    }
+
     fn get_metadata(
         &mut self,
         options: Option<&ArrowReaderOptions>,
@@ -823,6 +871,48 @@ impl AsyncFileReader for ArrowFileReader {
             Ok(Arc::new(metadata))
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Range coalescing
+// ---------------------------------------------------------------------------
+
+/// Merge nearby byte ranges to reduce the number of object-store requests.
+///
+/// Ranges whose gap is ≤ `coalesce` bytes are merged into a single range.
+/// The input does not need to be sorted.
+fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return vec![];
+    }
+
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|r| r.start);
+
+    let mut merged = Vec::with_capacity(sorted.len());
+    let mut start_idx = 0;
+    let mut end_idx = 1;
+
+    while start_idx != sorted.len() {
+        let mut range_end = sorted[start_idx].end;
+
+        while end_idx != sorted.len()
+            && sorted[end_idx]
+                .start
+                .checked_sub(range_end)
+                .map(|delta| delta <= coalesce)
+                .unwrap_or(true)
+        {
+            range_end = range_end.max(sorted[end_idx].end);
+            end_idx += 1;
+        }
+
+        merged.push(sorted[start_idx].start..range_end);
+        start_idx = end_idx;
+        end_idx += 1;
+    }
+
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -877,5 +967,70 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_byte_ranges tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_byte_ranges_empty() {
+        assert_eq!(
+            super::merge_byte_ranges(&[], 1024),
+            Vec::<std::ops::Range<u64>>::new()
+        );
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_no_coalesce() {
+        // Ranges far apart should not be merged
+        let ranges = vec![0..100, 1_000_000..1_000_100];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![0..100, 1_000_000..1_000_100]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_coalesce() {
+        // Ranges within the gap threshold should be merged
+        let ranges = vec![0..100, 200..300, 500..600];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![0..600]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_overlapping() {
+        let ranges = vec![0..200, 100..300];
+        let merged = super::merge_byte_ranges(&ranges, 0);
+        assert_eq!(merged, vec![0..300]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_unsorted() {
+        let ranges = vec![500..600, 0..100, 200..300];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![0..600]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_single() {
+        let ranges = vec![100..200];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![100..200]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_zero_coalesce_adjacent() {
+        // With coalesce=0, adjacent ranges (gap=0) should still merge
+        let ranges = vec![0..100, 100..200];
+        let merged = super::merge_byte_ranges(&ranges, 0);
+        assert_eq!(merged, vec![0..200]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_zero_coalesce_gap() {
+        // With coalesce=0, ranges with a 1-byte gap should NOT merge
+        let ranges = vec![0..100, 101..200];
+        let merged = super::merge_byte_ranges(&ranges, 0);
+        assert_eq!(merged, vec![0..100, 101..200]);
     }
 }

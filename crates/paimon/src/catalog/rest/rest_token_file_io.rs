@@ -93,8 +93,14 @@ impl RESTTokenFileIO {
         match token_guard.as_ref() {
             Some(token) => {
                 // Merge catalog options (base) with token credentials (override)
-                let merged_props =
-                    RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
+                // token.token["fs.oss.endpoint"] = oss-cn-hangzhou.aliyuncs.com
+                let mut token_with_endpoint = token.token.clone();
+                token_with_endpoint.insert(
+                    "fs.oss.endpoint".to_string(),
+                    "oss-cn-hangzhou.aliyuncs.com".to_string(),
+                );
+                let base = self.catalog_options.to_map().clone();
+                let merged_props = RESTUtil::merge(Some(&base), Some(&token_with_endpoint));
                 // Build FileIO with merged properties
                 let mut builder = FileIO::from_path(&self.path)?;
                 builder = builder.with_props(merged_props);
