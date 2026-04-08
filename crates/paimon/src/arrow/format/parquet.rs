@@ -33,7 +33,7 @@ use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
@@ -782,6 +782,8 @@ struct ArrowFileReader {
     /// Maximum gap (in bytes) between two ranges that will be merged into a
     /// single fetch request. Defaults to 1 MiB.
     range_coalesce_bytes: u64,
+    /// Maximum number of merged ranges to fetch concurrently. Defaults to 8.
+    range_fetch_concurrency: usize,
     /// Hint for the number of bytes to speculatively read from the end of the
     /// file when loading Parquet metadata. A sufficiently large hint reduces
     /// footer loading from 2 round-trips to 1. Defaults to 512 KiB.
@@ -790,6 +792,8 @@ struct ArrowFileReader {
 
 /// Default coalesce threshold: 1 MiB.
 const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+/// Default concurrent range fetches.
+const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 8;
 /// Default metadata prefetch hint: 512 KiB (same as DataFusion's default).
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
@@ -799,6 +803,7 @@ impl ArrowFileReader {
             file_size,
             r,
             range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
+            range_fetch_concurrency: DEFAULT_RANGE_FETCH_CONCURRENCY,
             metadata_size_hint: Some(DEFAULT_METADATA_SIZE_HINT),
         }
     }
@@ -827,6 +832,7 @@ impl AsyncFileReader for ArrowFileReader {
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let coalesce_bytes = self.range_coalesce_bytes;
+        let concurrency = self.range_fetch_concurrency.max(1);
 
         async move {
             if ranges.is_empty() {
@@ -835,18 +841,24 @@ impl AsyncFileReader for ArrowFileReader {
 
             // Merge nearby ranges to reduce the number of object-store requests.
             let fetch_ranges = merge_byte_ranges(&ranges, coalesce_bytes);
+            let r = &self.r;
 
-            // Fetch merged ranges sequentially (FileRead is !Sync so we cannot
-            // use buffered concurrency on &mut self). The coalescing itself is
-            // the main win — it turns N small requests into M merged requests
-            // where M << N for typical column-chunk access patterns.
-            let mut fetched: Vec<Bytes> = Vec::with_capacity(fetch_ranges.len());
-            for range in &fetch_ranges {
-                let bytes = self.r.read(range.clone()).await.map_err(|e| {
-                    parquet::errors::ParquetError::External(format!("{e}").into())
-                })?;
-                fetched.push(bytes);
-            }
+            eprintln!(
+                "[get_byte_ranges] original={}, merged={}",
+                ranges.len(),
+                fetch_ranges.len()
+            );
+
+            // Fetch merged ranges concurrently.
+            let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
+                .map(|range| async move {
+                    r.read(range)
+                        .await
+                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                })
+                .buffered(concurrency)
+                .try_collect()
+                .await?;
 
             // Slice the fetched data back into the originally requested ranges.
             Ok(ranges
