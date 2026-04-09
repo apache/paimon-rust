@@ -792,7 +792,6 @@ const RANGE_FETCH_CONCURRENCY: usize = 8;
 /// Default metadata prefetch hint: 512 KiB.
 const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// Minimum range size for splitting: 4 MiB.
-/// Matches Java Paimon's `batchSizeForVectorReads` default.
 /// Ranges smaller than this will not be split further to avoid
 /// excessive small IO requests whose per-request overhead dominates.
 const MIN_SPLIT_SIZE: u64 = 4 * 1024 * 1024;
