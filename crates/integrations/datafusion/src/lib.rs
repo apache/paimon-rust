@@ -39,6 +39,8 @@
 mod catalog;
 mod error;
 mod filter_pushdown;
+#[cfg(feature = "fulltext")]
+mod full_text_search;
 mod physical_plan;
 mod relation_planner;
 pub mod runtime;
@@ -46,6 +48,8 @@ mod table;
 
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
+#[cfg(feature = "fulltext")]
+pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
 pub use table::PaimonTableProvider;

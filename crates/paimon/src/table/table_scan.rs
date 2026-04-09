@@ -329,6 +329,19 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Set row ranges for scan-time filtering.
+    ///
+    /// This replaces any existing row_ranges. Typically used to inject
+    /// results from global index lookups (e.g. full-text search).
+    pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        self.row_ranges = if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        };
+        self
+    }
+
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:

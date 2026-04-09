@@ -754,3 +754,126 @@ async fn test_filter_row_id_from_data_evolution_table() {
         }
     }
 }
+
+// ======================= Full-Text Search Tests =======================
+
+#[cfg(feature = "fulltext")]
+mod fulltext_tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::prelude::SessionContext;
+    use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+    use paimon_datafusion::{register_full_text_search, PaimonCatalogProvider};
+
+    /// Extract the bundled tar.gz into a temp dir and return (tempdir, warehouse_path).
+    fn extract_test_warehouse() -> (tempfile::TempDir, String) {
+        let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test_tantivy_fulltext.tar.gz");
+        let file = std::fs::File::open(&archive_path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_dir = tmp.path().join("default.db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        archive.unpack(&db_dir).unwrap();
+
+        let warehouse = format!("file://{}", tmp.path().display());
+        (tmp, warehouse)
+    }
+
+    async fn create_fulltext_context() -> (SessionContext, tempfile::TempDir) {
+        let (tmp, warehouse) = extract_test_warehouse();
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "paimon",
+            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
+        );
+        register_full_text_search(&ctx, catalog, "default");
+        (ctx, tmp)
+    }
+
+    fn extract_id_content_rows(
+        batches: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> Vec<(i32, String)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            let content_array = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("Expected StringArray for content");
+            for i in 0..batch.num_rows() {
+                rows.push((id_array.value(i), content_array.value(i).to_string()));
+            }
+        }
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    }
+
+    /// Search for 'paimon' — rows 0, 2, 4 mention "paimon".
+    #[tokio::test]
+    async fn test_full_text_search_paimon() {
+        let (ctx, _tmp) = create_fulltext_context().await;
+        let batches = ctx
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'paimon', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let rows = extract_id_content_rows(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![0, 2, 4],
+            "Searching 'paimon' should match rows 0, 2, 4"
+        );
+    }
+
+    /// Search for 'tantivy' — only row 1.
+    #[tokio::test]
+    async fn test_full_text_search_tantivy() {
+        let (ctx, _tmp) = create_fulltext_context().await;
+        let batches = ctx
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'tantivy', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let rows = extract_id_content_rows(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1], "Searching 'tantivy' should match row 1");
+    }
+
+    /// Search for 'search' — rows 1, 3 mention "full-text search".
+    #[tokio::test]
+    async fn test_full_text_search_search() {
+        let (ctx, _tmp) = create_fulltext_context().await;
+        let batches = ctx
+            .sql("SELECT id, content FROM full_text_search('paimon.default.test_tantivy_fulltext', 'content', 'search', 10)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let rows = extract_id_content_rows(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1), "Searching 'search' should match row 1");
+        assert!(ids.contains(&3), "Searching 'search' should match row 3");
+    }
+}

@@ -19,12 +19,16 @@
 name = "paimon-datafusion"
 edition.workspace = true
 version.workspace = true
+exclude = ["testdata/"]
 license.workspace = true
 homepage = "https://paimon.apache.org/docs/rust/datafusion/"
 documentation = "https://docs.rs/paimon-datafusion"
 description = "Apache Paimon DataFusion Integration"
 categories = ["database"]
 keywords = ["paimon", "datafusion", "integrations"]
+
+[features]
+fulltext = ["paimon/fulltext"]
 
 [dependencies]
 async-trait = "0.1"
@@ -37,8 +41,10 @@ tokio = { workspace = true, features = ["rt", "time", "fs"] }
 [dev-dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+flate2 = "1"
 parquet = { workspace = true }
 serde = "1"
 serde_json = "1"
+tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

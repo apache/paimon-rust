@@ -74,12 +74,55 @@ impl PaimonTableProvider {
 }
 
 /// Distribute `items` into `num_buckets` groups using round-robin assignment.
-fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Vec<T>> {
+pub(crate) fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Vec<T>> {
     let mut buckets: Vec<Vec<T>> = (0..num_buckets).map(|_| Vec::new()).collect();
     for (i, item) in items.into_iter().enumerate() {
         buckets[i % num_buckets].push(item);
     }
     buckets
+}
+
+/// Build a [`PaimonTableScan`] from a planned [`paimon::table::Plan`].
+///
+/// Shared by [`PaimonTableProvider`] and the full-text search UDTF to avoid
+/// duplicating projection, partition distribution, and scan construction.
+pub(crate) fn build_paimon_scan(
+    table: &Table,
+    schema: &ArrowSchemaRef,
+    plan: &paimon::table::Plan,
+    projection: Option<&Vec<usize>>,
+    pushed_predicate: Option<paimon::spec::Predicate>,
+    limit: Option<usize>,
+    target_partitions: usize,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let (projected_schema, projected_columns) = if let Some(indices) = projection {
+        let fields: Vec<Field> = indices.iter().map(|&i| schema.field(i).clone()).collect();
+        let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+        (Arc::new(Schema::new(fields)), Some(column_names))
+    } else {
+        let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        (schema.clone(), Some(column_names))
+    };
+
+    let splits = plan.splits().to_vec();
+    let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
+        vec![Arc::from(Vec::new())]
+    } else {
+        let num_partitions = splits.len().min(target_partitions.max(1));
+        bucket_round_robin(splits, num_partitions)
+            .into_iter()
+            .map(Arc::from)
+            .collect()
+    };
+
+    Ok(Arc::new(PaimonTableScan::new(
+        projected_schema,
+        table.clone(),
+        projected_columns,
+        pushed_predicate,
+        planned_partitions,
+        limit,
+    )))
 }
 
 #[async_trait]
@@ -103,23 +146,6 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (projected_schema, projected_columns) = if let Some(indices) = projection {
-            let fields: Vec<Field> = indices
-                .iter()
-                .map(|&i| self.schema.field(i).clone())
-                .collect();
-            let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
-            (Arc::new(Schema::new(fields)), Some(column_names))
-        } else {
-            let column_names: Vec<String> = self
-                .schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
-            (self.schema.clone(), Some(column_names))
-        };
-
         // Plan splits eagerly so we know partition count upfront.
         let pushed_predicate = build_pushed_predicate(filters, self.table.schema().fields());
         let mut read_builder = self.table.new_read_builder();
@@ -140,30 +166,16 @@ impl TableProvider for PaimonTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        // Distribute splits across DataFusion partitions, capped by the
-        // session's target_partitions to avoid over-sharding with many small splits.
-        // Each partition's splits are wrapped in Arc to avoid deep-cloning in execute().
-        let splits = plan.splits().to_vec();
-        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
-            // Empty plans get a single empty partition to avoid 0-partition edge cases.
-            vec![Arc::from(Vec::new())]
-        } else {
-            let target = state.config_options().execution.target_partitions;
-            let num_partitions = splits.len().min(target.max(1));
-            bucket_round_robin(splits, num_partitions)
-                .into_iter()
-                .map(Arc::from)
-                .collect()
-        };
-
-        Ok(Arc::new(PaimonTableScan::new(
-            projected_schema,
-            self.table.clone(),
-            projected_columns,
+        let target = state.config_options().execution.target_partitions;
+        build_paimon_scan(
+            &self.table,
+            &self.schema,
+            &plan,
+            projection,
             pushed_predicate,
-            planned_partitions,
             limit,
-        )))
+            target,
+        )
     }
 
     fn supports_filters_pushdown(

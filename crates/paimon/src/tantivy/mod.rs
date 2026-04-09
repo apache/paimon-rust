@@ -15,33 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+//! Tantivy-based full-text search for global index.
 
-pub mod common;
-pub use common::{CatalogOptions, Options};
-
-pub mod api;
-pub use api::rest_api::RESTApi;
-
-pub mod arrow;
-pub mod btree;
-pub mod catalog;
-mod deletion_vector;
-pub mod file_index;
-pub mod io;
-mod predicate_stats;
-pub mod spec;
-pub mod table;
-#[cfg(feature = "fulltext")]
-pub mod tantivy;
-
-pub use catalog::Catalog;
-pub use catalog::CatalogFactory;
-pub use catalog::FileSystemCatalog;
-
-pub use table::{
-    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, ReadBuilder, RowRange,
-    SnapshotManager, Table, TableRead, TableScan, TagManager,
-};
+pub(crate) mod directory;
+pub mod full_text_search;
+pub mod reader;
+pub mod writer;

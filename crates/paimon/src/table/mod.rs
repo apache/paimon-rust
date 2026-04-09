@@ -19,6 +19,8 @@
 
 pub(crate) mod bin_pack;
 mod bucket_filter;
+#[cfg(feature = "fulltext")]
+mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
 mod read_builder;
 pub(crate) mod row_id_predicate;
@@ -31,6 +33,8 @@ mod tag_manager;
 
 use crate::Result;
 use arrow_array::RecordBatch;
+#[cfg(feature = "fulltext")]
+pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use read_builder::{ReadBuilder, TableRead};
 pub use schema_manager::SchemaManager;
@@ -104,6 +108,14 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_read_builder(&self) -> ReadBuilder<'_> {
         ReadBuilder::new(self)
+    }
+
+    /// Create a full-text search builder.
+    ///
+    /// Reference: [FullTextSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
+    #[cfg(feature = "fulltext")]
+    pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
+        FullTextSearchBuilder::new(self)
     }
 
     /// Create a copy of this table with extra options merged into the schema.

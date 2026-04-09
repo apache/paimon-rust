@@ -20,6 +20,7 @@ categories = ["database"]
 description = "The rust implementation of Apache Paimon"
 documentation = "https://docs.rs/paimon"
 name = "paimon"
+exclude = ["testdata/"]
 
 homepage.workspace = true
 repository.workspace = true
@@ -30,6 +31,7 @@ version.workspace = true
 [features]
 default = ["storage-memory", "storage-fs", "storage-oss"]
 storage-all = ["storage-memory", "storage-fs", "storage-oss", "storage-s3"]
+fulltext = ["tantivy", "tempfile"]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
@@ -77,9 +79,10 @@ md-5 = "0.10"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
+tantivy = { version = "0.22", optional = true }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 rand = "0.8.5"
-
 tempfile = "3"
