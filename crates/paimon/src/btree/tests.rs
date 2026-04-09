@@ -549,7 +549,7 @@ async fn test_java_compat_int_with_nulls() {
     assert!(!null_bm.is_empty());
 
     let all = reader.all_non_null_rows().await.unwrap();
-    assert!(all.len() > 0);
+    assert!(!all.is_empty());
 
     let total = null_bm.len() + all.len();
     assert!(total > 0);
