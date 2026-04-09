@@ -846,8 +846,9 @@ impl AsyncFileReader for ArrowFileReader {
             // Two-phase range optimization:
             // Phase 1: Merge nearby ranges based on coalesce threshold.
             let coalesced = merge_byte_ranges(&ranges, coalesce_bytes);
-            // Phase 2: Split large merged ranges to utilize concurrency.
-            let fetch_ranges = split_ranges_for_concurrency(coalesced, concurrency);
+            // Phase 2: Split large merged ranges to utilize concurrency,
+            // but only at original range boundaries.
+            let fetch_ranges = split_ranges_for_concurrency(coalesced, &ranges, concurrency);
 
             // Fetch merged ranges concurrently.
             let r = &self.r;
@@ -947,32 +948,51 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     merged
 }
 
-fn split_ranges_for_concurrency(ranges: Vec<Range<u64>>, target_count: usize) -> Vec<Range<u64>> {
-    if ranges.is_empty() || target_count <= 1 || ranges.len() >= target_count {
-        return ranges;
+/// Split merged ranges to utilize concurrency by repeatedly bisecting the
+/// largest range at the nearest original-range boundary. This guarantees
+/// every original range stays fully inside one fetch range.
+fn split_ranges_for_concurrency(
+    merged: Vec<Range<u64>>,
+    original: &[Range<u64>],
+    target_count: usize,
+) -> Vec<Range<u64>> {
+    if merged.is_empty() || target_count <= 1 || merged.len() >= target_count {
+        return merged;
     }
 
-    let mut result = ranges;
+    // Collect all original-range start points as candidate split boundaries.
+    let mut boundaries: Vec<u64> = original.iter().map(|r| r.start).collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut result = merged;
 
     while result.len() < target_count {
-        // Find the largest range by byte size.
-        let (largest_idx, largest_range) = result
+        // Pick the largest range.
+        let (idx, _) = result
             .iter()
             .enumerate()
             .max_by_key(|(_, r)| r.end - r.start)
-            .expect("result is non-empty");
+            .unwrap();
 
-        let range_size = largest_range.end - largest_range.start;
-        if range_size <= 1 {
-            break;
-        }
+        let range = &result[idx];
+        let mid = range.start + (range.end - range.start) / 2;
 
-        let mid = largest_range.start + range_size / 2;
-        let left = largest_range.start..mid;
-        let right = mid..largest_range.end;
+        // Find the boundary closest to the midpoint that actually splits.
+        let best = boundaries
+            .iter()
+            .copied()
+            .filter(|&b| b > range.start && b < range.end)
+            .min_by_key(|&b| (b as i64 - mid as i64).unsigned_abs());
 
-        result[largest_idx] = left;
-        result.insert(largest_idx + 1, right);
+        let Some(split_at) = best else {
+            break; // No valid split point in the largest range; stop.
+        };
+
+        let left = range.start..split_at;
+        let right = split_at..range.end;
+        result[idx] = left;
+        result.insert(idx + 1, right);
     }
 
     result
@@ -1074,46 +1094,75 @@ mod tests {
 
     #[test]
     fn test_split_single_range() {
-        // One large range split into 4
+        // One merged range from a single original — no boundary to split at.
         #[allow(clippy::single_range_in_vec_init)]
-        let ranges = vec![0..1000];
-        let result = super::split_ranges_for_concurrency(ranges, 4);
+        let merged = vec![0..1000];
+        let original = vec![0..1000];
+        let result = super::split_ranges_for_concurrency(merged, &original, 4);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 0..1000);
+    }
+
+    #[test]
+    fn test_split_single_range_multiple_originals() {
+        // One merged range containing 4 originals — bisect at boundaries.
+        let original = vec![0..200, 250..500, 550..750, 800..1000];
+        let merged = vec![0..1000];
+        let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert_eq!(result.len(), 4);
-        // All ranges should be contiguous and cover 0..1000
         assert_eq!(result[0].start, 0);
         assert_eq!(result.last().unwrap().end, 1000);
         for window in result.windows(2) {
             assert_eq!(window[0].end, window[1].start);
         }
+        for orig in &original {
+            assert!(
+                result
+                    .iter()
+                    .any(|r| r.start <= orig.start && r.end >= orig.end),
+                "original {orig:?} not fully contained"
+            );
+        }
     }
 
     #[test]
     fn test_split_mixed_sizes() {
-        // One large range + one small range, target=4
-        // Should split the large range, leave the small one alone
-        let ranges = vec![0..1000, 2000..2010];
-        let result = super::split_ranges_for_concurrency(ranges, 4);
-        assert_eq!(result.len(), 4);
-        // The small range (2000..2010) should remain intact
+        let original = vec![0..300, 400..700, 800..1000, 2000..2010];
+        let merged = vec![0..1000, 2000..2010];
+        let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert!(result.contains(&(2000..2010)));
+        for orig in &original {
+            assert!(
+                result
+                    .iter()
+                    .any(|r| r.start <= orig.start && r.end >= orig.end),
+                "original {orig:?} not fully contained"
+            );
+        }
     }
 
     #[test]
     fn test_split_empty() {
-        let ranges: Vec<std::ops::Range<u64>> = vec![];
-        let result = super::split_ranges_for_concurrency(ranges, 4);
+        let merged: Vec<std::ops::Range<u64>> = vec![];
+        let original: Vec<std::ops::Range<u64>> = vec![];
+        let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_split_clustered_and_sparse() {
-        // Simulates clustered + sparse columns:
-        // Clustered group merged into 0..400, sparse columns at 1000 and 2000
-        let ranges = vec![0..400, 1000..1010, 2000..2010];
-        let result = super::split_ranges_for_concurrency(ranges, 4);
-        assert_eq!(result.len(), 4);
-        // The large range should be split, small ones preserved
+        let original = vec![0..100, 150..250, 300..400, 1000..1010, 2000..2010];
+        let merged = vec![0..400, 1000..1010, 2000..2010];
+        let result = super::split_ranges_for_concurrency(merged, &original, 5);
         assert!(result.contains(&(1000..1010)));
         assert!(result.contains(&(2000..2010)));
+        for orig in &original {
+            assert!(
+                result
+                    .iter()
+                    .any(|r| r.start <= orig.start && r.end >= orig.end),
+                "original {orig:?} not fully contained"
+            );
+        }
     }
 }
