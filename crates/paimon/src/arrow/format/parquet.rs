@@ -783,33 +783,18 @@ fn build_row_ranges_selection(
 struct ArrowFileReader {
     file_size: u64,
     r: Box<dyn FileRead>,
-    /// Maximum gap (in bytes) between two ranges that will be merged into a
-    /// single fetch request. Defaults to 1 MiB.
-    range_coalesce_bytes: u64,
-    /// Maximum number of merged ranges to fetch concurrently. Defaults to 8.
-    range_fetch_concurrency: usize,
-    /// Hint for the number of bytes to speculatively read from the end of the
-    /// file when loading Parquet metadata. A sufficiently large hint reduces
-    /// footer loading from 2 round-trips to 1. Defaults to 512 KiB.
-    metadata_size_hint: Option<usize>,
 }
 
 /// Default coalesce threshold: 1 MiB.
-const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+const RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
 /// Default concurrent range fetches.
-const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 8;
+const RANGE_FETCH_CONCURRENCY: usize = 8;
 /// Default metadata prefetch hint: 512 KiB.
-const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
+const METADATA_SIZE_HINT: usize = 512 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
-        Self {
-            file_size,
-            r,
-            range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
-            range_fetch_concurrency: DEFAULT_RANGE_FETCH_CONCURRENCY,
-            metadata_size_hint: Some(DEFAULT_METADATA_SIZE_HINT),
-        }
+        Self { file_size, r }
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
@@ -835,8 +820,8 @@ impl AsyncFileReader for ArrowFileReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
-        let coalesce_bytes = self.range_coalesce_bytes;
-        let concurrency = self.range_fetch_concurrency.max(1);
+        let coalesce_bytes = RANGE_COALESCE_BYTES;
+        let concurrency = RANGE_FETCH_CONCURRENCY;
 
         async move {
             if ranges.is_empty() {
@@ -893,7 +878,7 @@ impl AsyncFileReader for ArrowFileReader {
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let metadata_opts = options.map(|o| o.metadata_options().clone());
-        let prefetch_hint = self.metadata_size_hint;
+        let prefetch_hint = Some(METADATA_SIZE_HINT);
         Box::pin(async move {
             let file_size = self.file_size;
             let metadata = ParquetMetaDataReader::new()
