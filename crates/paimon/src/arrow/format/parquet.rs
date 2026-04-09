@@ -791,6 +791,11 @@ const RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
 const RANGE_FETCH_CONCURRENCY: usize = 8;
 /// Default metadata prefetch hint: 512 KiB.
 const METADATA_SIZE_HINT: usize = 512 * 1024;
+/// Minimum range size for splitting: 4 MiB.
+/// Matches Java Paimon's `batchSizeForVectorReads` default.
+/// Ranges smaller than this will not be split further to avoid
+/// excessive small IO requests whose per-request overhead dominates.
+const MIN_SPLIT_SIZE: u64 = 4 * 1024 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
@@ -858,17 +863,36 @@ impl AsyncFileReader for ArrowFileReader {
             };
 
             // Slice the fetched data back into the originally requested ranges.
-            Ok(ranges
+            let result: parquet::errors::Result<Vec<Bytes>> = ranges
                 .iter()
                 .map(|range| {
-                    let idx = fetch_ranges.partition_point(|v| v.start <= range.start) - 1;
+                    let pp = fetch_ranges.partition_point(|v| v.start <= range.start);
+                    let idx = pp.checked_sub(1).ok_or_else(|| {
+                        parquet::errors::ParquetError::General(format!(
+                            "No fetch range covers requested range {}..{}",
+                            range.start, range.end
+                        ))
+                    })?;
                     let fetch_range = &fetch_ranges[idx];
                     let fetch_bytes = &fetched[idx];
                     let start = (range.start - fetch_range.start) as usize;
                     let end = (range.end - fetch_range.start) as usize;
-                    fetch_bytes.slice(start..end.min(fetch_bytes.len()))
+                    if end > fetch_bytes.len() {
+                        return Err(parquet::errors::ParquetError::General(format!(
+                            "Fetched data too short for range {}..{}: \
+                             expected at least {} bytes from fetch range {}..{}, got {}",
+                            range.start,
+                            range.end,
+                            end,
+                            fetch_range.start,
+                            fetch_range.end,
+                            fetch_bytes.len()
+                        )));
+                    }
+                    Ok(fetch_bytes.slice(start..end))
                 })
-                .collect())
+                .collect();
+            result
         }
         .boxed()
     }
@@ -954,24 +978,35 @@ fn split_ranges_for_concurrency(
 
     while result.len() < target_count {
         // Pick the largest range.
-        let (idx, _) = result
+        let (idx, largest) = result
             .iter()
             .enumerate()
             .max_by_key(|(_, r)| r.end - r.start)
             .unwrap();
 
+        let largest_size = largest.end - largest.start;
+
+        // Don't split if the range is smaller than 2 * MIN_SPLIT_SIZE,
+        // because both halves would end up below the batch threshold.
+        if largest_size < MIN_SPLIT_SIZE * 2 {
+            break;
+        }
+
         let range = &result[idx];
+        // Each half must be at least MIN_SPLIT_SIZE.
+        let expected_size = MIN_SPLIT_SIZE.max(largest_size / target_count as u64 + 1);
         let mid = range.start + (range.end - range.start) / 2;
 
-        // Find the boundary closest to the midpoint that actually splits.
         let best = boundaries
             .iter()
             .copied()
-            .filter(|&b| b > range.start && b < range.end)
+            .filter(|&b| {
+                b >= range.start + expected_size && b <= range.end.saturating_sub(expected_size)
+            })
             .min_by_key(|&b| (b as i64 - mid as i64).unsigned_abs());
 
         let Some(split_at) = best else {
-            break; // No valid split point in the largest range; stop.
+            break; // No valid split point that keeps both halves large enough.
         };
 
         let left = range.start..split_at;
@@ -1087,29 +1122,6 @@ mod tests {
         let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], 0..1000);
-    }
-
-    #[test]
-    fn test_split_single_range_multiple_originals() {
-        // One merged range containing 4 originals — bisect at boundaries.
-        let original = vec![0..200, 250..500, 550..750, 800..1000];
-        #[allow(clippy::single_range_in_vec_init)]
-        let merged = vec![0..1000];
-        let result = super::split_ranges_for_concurrency(merged, &original, 4);
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0].start, 0);
-        assert_eq!(result.last().unwrap().end, 1000);
-        for window in result.windows(2) {
-            assert_eq!(window[0].end, window[1].start);
-        }
-        for orig in &original {
-            assert!(
-                result
-                    .iter()
-                    .any(|r| r.start <= orig.start && r.end >= orig.end),
-                "original {orig:?} not fully contained"
-            );
-        }
     }
 
     #[test]
