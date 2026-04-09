@@ -21,7 +21,7 @@
 //! - Point lookup (equal)
 //! - Range queries (less than, greater than, between, etc.)
 //! - Null bitmap reading
-//! - Sequential iteration over all entries
+//! - IN / NOT IN queries
 
 use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::footer::{BTreeFileFooter, BTREE_FOOTER_ENCODED_LENGTH};
@@ -29,7 +29,6 @@ use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
 use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::io::FileRead;
-use bytes::Bytes;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io::{self, Cursor};
@@ -42,13 +41,6 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
     key_comparator: F,
-}
-
-/// A key and its associated row ids.
-#[derive(Debug, Clone)]
-pub struct KeyRowIds {
-    pub key: Vec<u8>,
-    pub row_ids: Vec<i64>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
@@ -102,53 +94,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         })
     }
 
-    /// Open from in-memory file data (for tests and backward compatibility).
-    /// Supports `entry_iterator()` since full file data is available.
-    pub fn new(file_data: Vec<u8>, meta: &BTreeIndexMeta, key_comparator: F) -> io::Result<Self> {
-        let file_size = file_data.len();
-
-        if file_size < BTREE_FOOTER_ENCODED_LENGTH {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "File too small for BTree footer",
-            ));
-        }
-        let footer_start = file_size - BTREE_FOOTER_ENCODED_LENGTH;
-        let footer = BTreeFileFooter::read_footer(&file_data[footer_start..])?;
-
-        let null_bitmap = match footer.null_bitmap_handle {
-            Some(handle) => read_null_bitmap_from_bytes(&file_data, &handle)?,
-            None => RoaringTreemap::new(),
-        };
-
-        // Use SstFileReader::new to keep full data for entry_iterator and sync queries
-        let sst_reader = SstFileReader::new(file_data.clone(), footer.index_block_handle)?;
-
-        let reader: Box<dyn FileRead> = Box::new(BytesFileRead(Bytes::from(file_data)));
-
-        Ok(Self {
-            reader,
-            sst_reader,
-            null_bitmap,
-            min_key: meta.first_key.clone(),
-            max_key: meta.last_key.clone(),
-            key_comparator,
-        })
-    }
-
     /// Get the null bitmap (row ids of null keys).
     pub fn null_bitmap(&self) -> &RoaringTreemap {
         &self.null_bitmap
-    }
-
-    /// Iterate over all non-null key entries lazily.
-    /// Only works when created via `new()` (full file data available).
-    pub fn entry_iterator(&self) -> EntryIterator<'_> {
-        EntryIterator {
-            sst_iter: self.sst_reader.create_iterator(),
-            current_batch: None,
-            error: false,
-        }
     }
 
     /// Collect all non-null row ids into a bitmap.
@@ -439,22 +387,6 @@ async fn read_null_bitmap(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Read null bitmap from in-memory file data.
-fn read_null_bitmap_from_bytes(
-    file_data: &[u8],
-    handle: &BlockHandle,
-) -> io::Result<RoaringTreemap> {
-    let offset = handle.offset as usize;
-    let size = handle.size as usize;
-    let bitmap_bytes = &file_data[offset..offset + size];
-    let crc_bytes = &file_data[offset + size..offset + size + 4];
-
-    verify_null_bitmap_crc(bitmap_bytes, crc_bytes)?;
-
-    RoaringTreemap::deserialize_from(bitmap_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
 fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<()> {
     let expected_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     let mut hasher = crc32fast::Hasher::new();
@@ -472,16 +404,6 @@ fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<(
     Ok(())
 }
 
-/// Adapter to wrap `Bytes` as `FileRead` for in-memory usage and tests.
-struct BytesFileRead(Bytes);
-
-#[async_trait::async_trait]
-impl FileRead for BytesFileRead {
-    async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
-        Ok(self.0.slice(range.start as usize..range.end as usize))
-    }
-}
-
 /// Deserialize row ids from value bytes and insert directly into bitmap.
 fn insert_row_ids_into(data: &[u8], bitmap: &mut RoaringTreemap) -> io::Result<()> {
     let mut cursor = Cursor::new(data);
@@ -496,65 +418,4 @@ fn insert_row_ids_into(data: &[u8], bitmap: &mut RoaringTreemap) -> io::Result<(
         bitmap.insert(decode_var_long(&mut cursor)? as u64);
     }
     Ok(())
-}
-
-/// Deserialize row ids from value bytes.
-/// Format: var_len_int(count) + var_len_long(id) * count
-fn deserialize_row_ids(data: &[u8]) -> io::Result<Vec<i64>> {
-    let mut cursor = Cursor::new(data);
-    let count = decode_var_int(&mut cursor)?;
-    if count < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid row id count: {count}"),
-        ));
-    }
-    let mut ids = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        ids.push(decode_var_long(&mut cursor)?);
-    }
-    Ok(ids)
-}
-
-/// Lazy iterator over BTree index entries (requires full file data via `new`).
-pub struct EntryIterator<'a> {
-    sst_iter: crate::btree::sst_file::SstFileIterator<'a>,
-    current_batch: Option<crate::btree::sst_file::DataBlockBatch>,
-    error: bool,
-}
-
-impl<'a> Iterator for EntryIterator<'a> {
-    type Item = io::Result<KeyRowIds>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.error {
-            return None;
-        }
-        loop {
-            if let Some(ref mut batch) = self.current_batch {
-                if let Some((key, value)) = batch.next() {
-                    return match deserialize_row_ids(value) {
-                        Ok(row_ids) => Some(Ok(KeyRowIds {
-                            key: key.to_vec(),
-                            row_ids,
-                        })),
-                        Err(e) => {
-                            self.error = true;
-                            Some(Err(e))
-                        }
-                    };
-                }
-            }
-            match self.sst_iter.read_batch() {
-                Ok(Some(batch)) => {
-                    self.current_batch = Some(batch);
-                }
-                Ok(None) => return None,
-                Err(e) => {
-                    self.error = true;
-                    return Some(Err(e));
-                }
-            }
-        }
-    }
 }

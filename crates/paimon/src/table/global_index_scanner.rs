@@ -435,7 +435,7 @@ impl RowRangeIndex {
     /// Create a new `RowRangeIndex` from a list of ranges.
     /// Ranges are sorted and merged to eliminate overlaps.
     pub fn create(ranges: Vec<RowRange>) -> Self {
-        let ranges = sort_and_merge(ranges);
+        let ranges = super::merge_row_ranges(ranges);
         let starts: Vec<i64> = ranges.iter().map(|r| r.from()).collect();
         let ends: Vec<i64> = ranges.iter().map(|r| r.to()).collect();
         Self {
@@ -509,27 +509,6 @@ fn lower_bound(sorted: &[i64], target: i64) -> usize {
         }
     }
     left
-}
-
-/// Sort ranges by start and merge overlapping/adjacent ones.
-fn sort_and_merge(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
-    if ranges.len() <= 1 {
-        return ranges;
-    }
-    ranges.sort_by_key(|r| r.from());
-    let mut merged: Vec<RowRange> = Vec::with_capacity(ranges.len());
-    let mut iter = ranges.into_iter();
-    let mut current = iter.next().unwrap();
-    for r in iter {
-        if r.from() <= current.to().saturating_add(1) {
-            current = RowRange::new(current.from(), current.to().max(r.to()));
-        } else {
-            merged.push(current);
-            current = r;
-        }
-    }
-    merged.push(current);
-    merged
 }
 
 /// Create a GlobalIndexScanner and evaluate predicates, returning row ranges.

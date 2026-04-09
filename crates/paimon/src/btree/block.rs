@@ -409,6 +409,7 @@ impl BlockReader {
     }
 
     /// Create a sequential iterator over all entries.
+    #[cfg(test)]
     pub fn iter(&self) -> BlockIter<'_> {
         BlockIter {
             reader: self,

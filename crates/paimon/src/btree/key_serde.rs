@@ -95,7 +95,21 @@ pub fn make_key_comparator(data_type: &DataType) -> KeyComparator {
                 }
             })
         }
-        // String, VarChar, Char, Bytes, compact Timestamp, compact Decimal — lexicographic or i64
+        // Compact Timestamp/LocalZonedTimestamp (precision <= 3): millis as i64 LE
+        DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_) => {
+            Box::new(|a: &[u8], b: &[u8]| {
+                let av = i64::from_le_bytes(a[..8].try_into().unwrap());
+                let bv = i64::from_le_bytes(b[..8].try_into().unwrap());
+                av.cmp(&bv)
+            })
+        }
+        // Compact Decimal (precision <= 18): unscaled as i64 LE
+        DataType::Decimal(_) => Box::new(|a: &[u8], b: &[u8]| {
+            let av = i64::from_le_bytes(a[..8].try_into().unwrap());
+            let bv = i64::from_le_bytes(b[..8].try_into().unwrap());
+            av.cmp(&bv)
+        }),
+        // String, VarChar, Char, Bytes — lexicographic
         _ => Box::new(|a: &[u8], b: &[u8]| a.cmp(b)),
     }
 }

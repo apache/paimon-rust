@@ -26,6 +26,7 @@ use crate::btree::footer::BTreeFileFooter;
 use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::sst_file::SstFileWriter;
 use crate::btree::var_len::{encode_var_int, encode_var_long};
+use crate::io::FileWrite;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io;
@@ -34,7 +35,7 @@ use std::io;
 ///
 /// Usage:
 /// 1. Call `write(key, row_id)` for each entry (keys must be sorted).
-/// 2. Call `finish()` to get the file bytes and index meta.
+/// 2. Call `finish()` to close the file and get the index meta.
 pub struct BTreeIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
     sst_writer: SstFileWriter,
     current_row_ids: Vec<i64>,
@@ -47,8 +48,6 @@ pub struct BTreeIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
 
 /// Result of finishing a BTree index write.
 pub struct BTreeWriteResult {
-    /// The complete file bytes.
-    pub file_data: Vec<u8>,
     /// The serialized index meta (first_key, last_key, has_nulls).
     pub meta: BTreeIndexMeta,
     /// Total row count written.
@@ -56,9 +55,13 @@ pub struct BTreeWriteResult {
 }
 
 impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
-    pub fn new(block_size: usize, compression_type: BlockCompressionType) -> Self {
+    pub fn new(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+    ) -> Self {
         Self {
-            sst_writer: SstFileWriter::new(block_size, compression_type),
+            sst_writer: SstFileWriter::new(writer, block_size, compression_type),
             current_row_ids: Vec::new(),
             last_key: None,
             first_key: None,
@@ -72,12 +75,13 @@ impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
 impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
     /// Create a writer with a custom key comparator.
     pub fn with_comparator(
+        writer: Box<dyn FileWrite>,
         block_size: usize,
         compression_type: BlockCompressionType,
         cmp: F,
     ) -> Self {
         Self {
-            sst_writer: SstFileWriter::new(block_size, compression_type),
+            sst_writer: SstFileWriter::new(writer, block_size, compression_type),
             current_row_ids: Vec::new(),
             last_key: None,
             first_key: None,
@@ -90,7 +94,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
     /// Write a key and its associated row id.
     /// If key is None, the row id is added to the null bitmap.
     /// Keys must be written in sorted order; entries with the same key are combined.
-    pub fn write(&mut self, key: Option<&[u8]>, row_id: i64) -> io::Result<()> {
+    pub async fn write(&mut self, key: Option<&[u8]>, row_id: i64) -> io::Result<()> {
         self.row_count += 1;
 
         match key {
@@ -102,7 +106,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
             Some(k) => {
                 if let Some(ref last) = self.last_key {
                     if (self.key_comparator)(k, last) != Ordering::Equal {
-                        self.flush_row_ids()?;
+                        self.flush_row_ids().await?;
                     }
                 }
                 self.last_key = Some(k.to_vec());
@@ -117,7 +121,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
     }
 
     /// Flush accumulated row ids for the current key.
-    fn flush_row_ids(&mut self) -> io::Result<()> {
+    async fn flush_row_ids(&mut self) -> io::Result<()> {
         if self.current_row_ids.is_empty() {
             return Ok(());
         }
@@ -131,13 +135,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         self.current_row_ids.clear();
 
         if let Some(ref key) = self.last_key {
-            self.sst_writer.put(key, &value_buf)?;
+            self.sst_writer.put(key, &value_buf).await?;
         }
         Ok(())
     }
 
     /// Write the null bitmap block. Returns the block handle if there are nulls.
-    fn write_null_bitmap(&mut self) -> io::Result<Option<BlockHandle>> {
+    async fn write_null_bitmap(&mut self) -> io::Result<Option<BlockHandle>> {
         let bitmap = match &self.null_bitmap {
             Some(bm) => bm,
             None => return Ok(None),
@@ -158,33 +162,37 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         let mut block_data = Vec::with_capacity(length + 4);
         block_data.extend_from_slice(&serialized);
         block_data.extend_from_slice(&(crc_value as i32).to_le_bytes());
-        self.sst_writer.write_raw(&block_data);
+        self.sst_writer.write_raw(&block_data).await?;
 
         Ok(Some(null_bitmap_handle))
     }
 
-    /// Finish writing and return the complete file data and meta.
-    pub fn finish(mut self) -> io::Result<BTreeWriteResult> {
+    /// Finish writing: flush remaining data, write footer, close the file.
+    /// Returns the index meta and row count.
+    pub async fn finish(mut self) -> io::Result<BTreeWriteResult> {
         // Flush remaining row ids
-        self.flush_row_ids()?;
+        self.flush_row_ids().await?;
 
         // Flush remaining data blocks in SST writer
-        self.sst_writer.flush()?;
+        self.sst_writer.flush().await?;
 
         // Write null bitmap
-        let null_bitmap_handle = self.write_null_bitmap()?;
+        let null_bitmap_handle = self.write_null_bitmap().await?;
 
         // No bloom filter for now (same as Java: todo)
         let bloom_filter_handle = None;
 
         // Write index block
-        let index_block_handle = self.sst_writer.write_index_block()?;
+        let index_block_handle = self.sst_writer.write_index_block().await?;
 
         // Write footer
         let footer =
             BTreeFileFooter::new(bloom_filter_handle, index_block_handle, null_bitmap_handle);
         let footer_bytes = footer.write_footer();
-        self.sst_writer.write_raw(&footer_bytes);
+        self.sst_writer.write_raw(&footer_bytes).await?;
+
+        // Close the underlying writer
+        self.sst_writer.close().await?;
 
         // Build meta
         let meta = BTreeIndexMeta::new(
@@ -194,7 +202,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         );
 
         Ok(BTreeWriteResult {
-            file_data: self.sst_writer.finish(),
             meta,
             row_count: self.row_count,
         })

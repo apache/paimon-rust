@@ -54,4 +54,6 @@ pub use reader::BTreeIndexReader;
 pub use writer::BTreeIndexWriter;
 
 #[cfg(test)]
+pub(crate) mod test_util;
+#[cfg(test)]
 mod tests;
