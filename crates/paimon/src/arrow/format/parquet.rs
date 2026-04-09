@@ -861,34 +861,71 @@ impl AsyncFileReader for ArrowFileReader {
                     .await?
             };
 
-            // Slice the fetched data back into the originally requested ranges.
+            // Slice the fetched data back into the originally requested
+            // ranges.  A single original range may span multiple fetch
+            // chunks (the Java `copyMultiBytesToBytes` approach), so we
+            // copy from as many chunks as needed.
             let result: parquet::errors::Result<Vec<Bytes>> = ranges
                 .iter()
                 .map(|range| {
-                    let pp = fetch_ranges.partition_point(|v| v.start <= range.start);
-                    let idx = pp.checked_sub(1).ok_or_else(|| {
-                        parquet::errors::ParquetError::General(format!(
+                    // Find the first fetch chunk whose end is past range.start.
+                    let first = fetch_ranges.partition_point(|v| v.end <= range.start);
+                    if first >= fetch_ranges.len() {
+                        return Err(parquet::errors::ParquetError::General(format!(
                             "No fetch range covers requested range {}..{}",
                             range.start, range.end
-                        ))
-                    })?;
-                    let fetch_range = &fetch_ranges[idx];
-                    let fetch_bytes = &fetched[idx];
-                    let start = (range.start - fetch_range.start) as usize;
-                    let end = (range.end - fetch_range.start) as usize;
-                    if end > fetch_bytes.len() {
-                        return Err(parquet::errors::ParquetError::General(format!(
-                            "Fetched data too short for range {}..{}: \
-                             expected at least {} bytes from fetch range {}..{}, got {}",
-                            range.start,
-                            range.end,
-                            end,
-                            fetch_range.start,
-                            fetch_range.end,
-                            fetch_bytes.len()
                         )));
                     }
-                    Ok(fetch_bytes.slice(start..end))
+
+                    let need = (range.end - range.start) as usize;
+
+                    // Fast path: the original range fits entirely within one
+                    // fetch chunk — zero-copy slice.
+                    let fr = &fetch_ranges[first];
+                    if range.end <= fr.end {
+                        let start = (range.start - fr.start) as usize;
+                        let end = (range.end - fr.start) as usize;
+                        return Ok(fetched[first].slice(start..end));
+                    }
+
+                    // Slow path: the original range spans multiple fetch
+                    // chunks — copy pieces into a new buffer (mirrors Java's
+                    // copyMultiBytesToBytes).
+                    let mut buf = Vec::with_capacity(need);
+                    let mut pos = range.start;
+                    for i in first..fetch_ranges.len() {
+                        if pos >= range.end {
+                            break;
+                        }
+                        let fr = &fetch_ranges[i];
+                        let chunk = &fetched[i];
+                        let src_start = (pos - fr.start) as usize;
+                        let src_end = ((range.end.min(fr.end)) - fr.start) as usize;
+                        if src_end > chunk.len() {
+                            return Err(parquet::errors::ParquetError::General(format!(
+                                "Fetched data too short for range {}..{}: \
+                                 chunk {}..{} has {} bytes, need up to offset {}",
+                                range.start,
+                                range.end,
+                                fr.start,
+                                fr.end,
+                                chunk.len(),
+                                src_end,
+                            )));
+                        }
+                        buf.extend_from_slice(&chunk[src_start..src_end]);
+                        pos = fr.end;
+                    }
+                    if buf.len() != need {
+                        return Err(parquet::errors::ParquetError::General(format!(
+                            "Assembled {} bytes for range {}..{}, expected {}",
+                            buf.len(),
+                            range.start,
+                            range.end,
+                            need,
+                        )));
+                    }
+                    Ok(Bytes::from(buf))
                 })
                 .collect();
             result
@@ -956,62 +993,47 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     merged
 }
 
-/// Split merged ranges to utilize concurrency by repeatedly bisecting the
-/// largest range at the nearest original-range boundary. This guarantees
-/// every original range stays fully inside one fetch range.
+/// Split merged ranges into fixed-size batches to utilize concurrency,
+/// Each merged range is divided into chunks of `expected_size`, 
+/// with the last chunk taking whatever remains. 
+/// Ranges smaller than `2 * MIN_SPLIT_SIZE` are kept as-is to
+/// avoid excessive small IO requests.
 fn split_ranges_for_concurrency(
     merged: Vec<Range<u64>>,
-    original: &[Range<u64>],
+    _original: &[Range<u64>],
     target_count: usize,
 ) -> Vec<Range<u64>> {
-    if merged.is_empty() || target_count <= 1 || merged.len() >= target_count {
+    if merged.is_empty() || target_count <= 1 {
         return merged;
     }
 
-    // Collect all original-range start points as candidate split boundaries.
-    let mut boundaries: Vec<u64> = original.iter().map(|r| r.start).collect();
-    boundaries.sort_unstable();
-    boundaries.dedup();
+    let mut result = Vec::with_capacity(merged.len());
 
-    let mut result = merged;
+    for range in &merged {
+        let length = range.end - range.start;
 
-    while result.len() < target_count {
-        // Pick the largest range.
-        let (idx, largest) = result
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, r)| r.end - r.start)
-            .unwrap();
-
-        let largest_size = largest.end - largest.start;
-
-        // Don't split if the range is smaller than 2 * MIN_SPLIT_SIZE,
-        // because both halves would end up below the batch threshold.
-        if largest_size < MIN_SPLIT_SIZE * 2 {
-            break;
+        if length < MIN_SPLIT_SIZE * 2 {
+            result.push(range.clone());
+            continue;
         }
 
-        let range = &result[idx];
-        // Each half must be at least MIN_SPLIT_SIZE.
-        let expected_size = MIN_SPLIT_SIZE.max(largest_size / target_count as u64 + 1);
-        let mid = range.start + (range.end - range.start) / 2;
+        let expected_size = MIN_SPLIT_SIZE.max(length / target_count as u64 + 1);
+        let min_remain = expected_size.max(MIN_SPLIT_SIZE * 2);
 
-        let best = boundaries
-            .iter()
-            .copied()
-            .filter(|&b| {
-                b >= range.start + expected_size && b <= range.end.saturating_sub(expected_size)
-            })
-            .min_by_key(|&b| (b as i64 - mid as i64).unsigned_abs());
+        let mut offset = range.start;
+        let end = range.end;
 
-        let Some(split_at) = best else {
-            break; // No valid split point that keeps both halves large enough.
-        };
-
-        let left = range.start..split_at;
-        let right = split_at..range.end;
-        result[idx] = left;
-        result.insert(idx + 1, right);
+        loop {
+            if offset + min_remain > end {
+                if offset < end {
+                    result.push(offset..end);
+                }
+                break;
+            } else {
+                result.push(offset..offset + expected_size);
+                offset += expected_size;
+            }
+        }
     }
 
     result
@@ -1112,8 +1134,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_split_single_range() {
-        // One merged range from a single original — no boundary to split at.
+    fn test_split_single_small_range() {
+        // A single range smaller than 2 * MIN_SPLIT_SIZE should not be split.
         #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![0..1000];
         #[allow(clippy::single_range_in_vec_init)]
@@ -1123,21 +1145,6 @@ mod tests {
         assert_eq!(result[0], 0..1000);
     }
 
-    #[test]
-    fn test_split_mixed_sizes() {
-        let original = vec![0..300, 400..700, 800..1000, 2000..2010];
-        let merged = vec![0..1000, 2000..2010];
-        let result = super::split_ranges_for_concurrency(merged, &original, 4);
-        assert!(result.contains(&(2000..2010)));
-        for orig in &original {
-            assert!(
-                result
-                    .iter()
-                    .any(|r| r.start <= orig.start && r.end >= orig.end),
-                "original {orig:?} not fully contained"
-            );
-        }
-    }
 
     #[test]
     fn test_split_empty() {
@@ -1145,22 +1152,5 @@ mod tests {
         let original: Vec<std::ops::Range<u64>> = vec![];
         let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_clustered_and_sparse() {
-        let original = vec![0..100, 150..250, 300..400, 1000..1010, 2000..2010];
-        let merged = vec![0..400, 1000..1010, 2000..2010];
-        let result = super::split_ranges_for_concurrency(merged, &original, 5);
-        assert!(result.contains(&(1000..1010)));
-        assert!(result.contains(&(2000..2010)));
-        for orig in &original {
-            assert!(
-                result
-                    .iter()
-                    .any(|r| r.start <= orig.start && r.end >= orig.end),
-                "original {orig:?} not fully contained"
-            );
-        }
     }
 }
