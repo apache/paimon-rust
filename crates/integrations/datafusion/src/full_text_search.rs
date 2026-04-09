@@ -227,7 +227,11 @@ fn extract_int_literal(expr: &Expr, name: &str) -> DFResult<i64> {
             ScalarValue::UInt8(Some(v)) => Ok(*v as i64),
             ScalarValue::UInt16(Some(v)) => Ok(*v as i64),
             ScalarValue::UInt32(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt64(Some(v)) => Ok(*v as i64),
+            ScalarValue::UInt64(Some(v)) => i64::try_from(*v).map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "full_text_search: {name} value {v} exceeds i64 range"
+                ))
+            }),
             _ => Err(datafusion::error::DataFusionError::Plan(format!(
                 "full_text_search: {name} must be an integer literal, got: {expr}"
             ))),

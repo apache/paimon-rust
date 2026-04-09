@@ -89,7 +89,14 @@ impl ArchiveDirectory {
             .read(0..4)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let file_count = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let file_count = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if file_count < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Negative file count in archive: {file_count}"),
+            ));
+        }
+        let file_count = file_count as usize;
 
         let mut pos: u64 = 4;
         let mut files = HashMap::with_capacity(file_count);
@@ -100,7 +107,14 @@ impl ArchiveDirectory {
                 .read(pos..pos + 4)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            let name_len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+            let name_len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if name_len < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Negative name length in archive: {name_len}"),
+                ));
+            }
+            let name_len = name_len as u64;
             pos += 4;
 
             // Read name + data_len together in a single IO call.
@@ -126,7 +140,14 @@ impl ArchiveDirectory {
                 meta_buf[dl + 5],
                 meta_buf[dl + 6],
                 meta_buf[dl + 7],
-            ]) as u64;
+            ]);
+            if data_len < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Negative data length in archive: {data_len}"),
+                ));
+            }
+            let data_len = data_len as u64;
             pos += name_len + 8;
 
             let data_offset = pos;
