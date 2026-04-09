@@ -1097,6 +1097,7 @@ mod tests {
         // One merged range from a single original — no boundary to split at.
         #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![0..1000];
+        #[allow(clippy::single_range_in_vec_init)]
         let original = vec![0..1000];
         let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert_eq!(result.len(), 1);
@@ -1107,6 +1108,7 @@ mod tests {
     fn test_split_single_range_multiple_originals() {
         // One merged range containing 4 originals — bisect at boundaries.
         let original = vec![0..200, 250..500, 550..750, 800..1000];
+        #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![0..1000];
         let result = super::split_ranges_for_concurrency(merged, &original, 4);
         assert_eq!(result.len(), 4);
