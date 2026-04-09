@@ -993,14 +993,11 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 }
 
 /// Split merged ranges into fixed-size batches to utilize concurrency,
-/// Each merged range is divided into chunks of `expected_size`, 
-/// with the last chunk taking whatever remains. 
+/// Each merged range is divided into chunks of `expected_size`,
+/// with the last chunk taking whatever remains.
 /// Ranges smaller than `2 * MIN_SPLIT_SIZE` are kept as-is to
 /// avoid excessive small IO requests.
-fn split_ranges_for_concurrency(
-    merged: Vec<Range<u64>>,
-    target_count: usize,
-) -> Vec<Range<u64>> {
+fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, target_count: usize) -> Vec<Range<u64>> {
     if merged.is_empty() || target_count <= 1 {
         return merged;
     }
@@ -1009,12 +1006,6 @@ fn split_ranges_for_concurrency(
 
     for range in &merged {
         let length = range.end - range.start;
-
-        if length < MIN_SPLIT_SIZE * 2 {
-            result.push(range.clone());
-            continue;
-        }
-
         let expected_size = MIN_SPLIT_SIZE.max(length / target_count as u64 + 1);
         let min_remain = expected_size.max(MIN_SPLIT_SIZE * 2);
 
