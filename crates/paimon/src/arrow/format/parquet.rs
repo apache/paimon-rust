@@ -785,11 +785,11 @@ struct ArrowFileReader {
     r: Box<dyn FileRead>,
 }
 
-/// Default coalesce threshold: 1 MiB.
+/// coalesce threshold: 1 MiB.
 const RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
-/// Default concurrent range fetches.
+/// concurrent range fetches.
 const RANGE_FETCH_CONCURRENCY: usize = 10;
-/// Default metadata prefetch hint: 512 KiB.
+/// metadata prefetch hint: 512 KiB.
 const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// Minimum range size for splitting: 4 MiB.
 /// Ranges smaller than this will not be split further to avoid
