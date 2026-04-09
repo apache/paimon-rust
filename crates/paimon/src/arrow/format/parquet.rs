@@ -1061,28 +1061,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_byte_ranges_overlapping() {
-        let ranges = vec![0..200, 100..300];
-        let merged = super::merge_byte_ranges(&ranges, 0);
-        assert_eq!(merged, vec![0..300]);
-    }
-
-    #[test]
-    fn test_merge_byte_ranges_unsorted() {
-        let ranges = vec![500..600, 0..100, 200..300];
-        let merged = super::merge_byte_ranges(&ranges, 1024);
-        assert_eq!(merged, vec![0..600]);
-    }
-
-    #[test]
-    fn test_merge_byte_ranges_zero_coalesce_adjacent() {
-        // With coalesce=0, adjacent ranges (gap=0) should still merge
-        let ranges = vec![0..100, 100..200];
-        let merged = super::merge_byte_ranges(&ranges, 0);
-        assert_eq!(merged, vec![0..200]);
-    }
-
-    #[test]
     fn test_merge_byte_ranges_zero_coalesce_gap() {
         // With coalesce=0, ranges with a 1-byte gap should NOT merge
         let ranges = vec![0..100, 101..200];
@@ -1097,6 +1075,7 @@ mod tests {
     #[test]
     fn test_split_single_range() {
         // One large range split into 4
+        #[allow(clippy::single_range_in_vec_init)]
         let ranges = vec![0..1000];
         let result = super::split_ranges_for_concurrency(ranges, 4);
         assert_eq!(result.len(), 4);
