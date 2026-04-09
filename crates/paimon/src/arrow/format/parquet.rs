@@ -837,7 +837,7 @@ impl AsyncFileReader for ArrowFileReader {
             let coalesced = merge_byte_ranges(&ranges, coalesce_bytes);
             // Phase 2: Split large merged ranges to utilize concurrency,
             // but only at original range boundaries.
-            let fetch_ranges = split_ranges_for_concurrency(coalesced, &ranges, concurrency);
+            let fetch_ranges = split_ranges_for_concurrency(coalesced, concurrency);
 
             // Fetch merged ranges concurrently.
             let r = &self.r;
@@ -863,8 +863,7 @@ impl AsyncFileReader for ArrowFileReader {
 
             // Slice the fetched data back into the originally requested
             // ranges.  A single original range may span multiple fetch
-            // chunks (the Java `copyMultiBytesToBytes` approach), so we
-            // copy from as many chunks as needed.
+            // chunks, so we copy from as many chunks as needed.
             let result: parquet::errors::Result<Vec<Bytes>> = ranges
                 .iter()
                 .map(|range| {
@@ -1000,7 +999,6 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 /// avoid excessive small IO requests.
 fn split_ranges_for_concurrency(
     merged: Vec<Range<u64>>,
-    _original: &[Range<u64>],
     target_count: usize,
 ) -> Vec<Range<u64>> {
     if merged.is_empty() || target_count <= 1 {
@@ -1138,19 +1136,30 @@ mod tests {
         // A single range smaller than 2 * MIN_SPLIT_SIZE should not be split.
         #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![0..1000];
-        #[allow(clippy::single_range_in_vec_init)]
-        let original = vec![0..1000];
-        let result = super::split_ranges_for_concurrency(merged, &original, 4);
+        let result = super::split_ranges_for_concurrency(merged, 4);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], 0..1000);
     }
 
+    #[test]
+    fn test_split_large_range_into_batches() {
+        let mb = 1024 * 1024u64;
+        let size = 40 * mb;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![0..size];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert!(result.len() > 1);
+        assert_eq!(result.first().unwrap().start, 0);
+        assert_eq!(result.last().unwrap().end, size);
+        for i in 1..result.len() {
+            assert_eq!(result[i].start, result[i - 1].end);
+        }
+    }
 
     #[test]
     fn test_split_empty() {
         let merged: Vec<std::ops::Range<u64>> = vec![];
-        let original: Vec<std::ops::Range<u64>> = vec![];
-        let result = super::split_ranges_for_concurrency(merged, &original, 4);
+        let result = super::split_ranges_for_concurrency(merged, 4);
         assert!(result.is_empty());
     }
 }
