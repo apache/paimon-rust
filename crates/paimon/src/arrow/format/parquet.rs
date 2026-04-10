@@ -792,9 +792,10 @@ const RANGE_FETCH_CONCURRENCY: usize = 10;
 /// metadata prefetch hint: 512 KiB.
 const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// Minimum range size for splitting: 4 MiB.
-/// Ranges smaller than this will not be split further to avoid
-/// excessive small IO requests whose per-request overhead dominates.
-const MIN_SPLIT_SIZE: u64 = 4 * 1024 * 1024;
+/// The block size used for split alignment and as the minimum split
+/// granularity.  Ranges smaller than this will not be split further to
+/// avoid excessive small IO requests whose per-request overhead dominates.
+const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
@@ -995,7 +996,7 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 /// Split merged ranges into fixed-size batches to utilize concurrency,
 /// Each merged range is divided into chunks of `expected_size`,
 /// with the last chunk taking whatever remains.
-/// Ranges smaller than `2 * MIN_SPLIT_SIZE` are kept as-is to
+/// Ranges smaller than `2 * IO_BLOCK_SIZE` are kept as-is to
 /// avoid excessive small IO requests.
 fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> Vec<Range<u64>> {
     if merged.is_empty() || concurrency <= 1 {
@@ -1006,11 +1007,11 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 
     for range in &merged {
         let length = range.end - range.start;
-        let raw_size = MIN_SPLIT_SIZE.max(length / concurrency as u64 + 1);
-        // Round up to the nearest multiple of MIN_SPLIT_SIZE (4 MB) so that
+        let raw_size = IO_BLOCK_SIZE.max(length.div_ceil(concurrency as u64));
+        // Round up to the nearest multiple of IO_BLOCK_SIZE (4 MB) so that
         // every split boundary is 4 MB-aligned relative to the range start.
-        let expected_size = raw_size.div_ceil(MIN_SPLIT_SIZE) * MIN_SPLIT_SIZE;
-        let min_tail_size = expected_size.max(MIN_SPLIT_SIZE * 2);
+        let expected_size = raw_size.div_ceil(IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+        let min_tail_size = expected_size.max(IO_BLOCK_SIZE * 2);
 
         let mut offset = range.start;
         let end = range.end;
@@ -1018,9 +1019,9 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
         // Align the first split boundary: if `offset` is not 4 MB-aligned,
         // emit a short head chunk so that all subsequent chunks start on a
         // 4 MB boundary.
-        let misalign = offset % MIN_SPLIT_SIZE;
+        let misalign = offset % IO_BLOCK_SIZE;
         if misalign != 0 {
-            let first_end = (offset - misalign + MIN_SPLIT_SIZE).min(end);
+            let first_end = (offset - misalign + IO_BLOCK_SIZE).min(end);
             result.push(offset..first_end);
             offset = first_end;
         }
