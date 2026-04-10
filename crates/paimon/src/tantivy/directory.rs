@@ -368,9 +368,14 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_from_archive() {
         let dir = make_test_dir().await;
-        // Read any file from the archive and verify it's non-empty.
-        let first_path = dir.files.keys().next().unwrap().clone();
-        let handle = dir.get_file_handle(&first_path).unwrap();
+        // Find a non-empty file (some tantivy index files can be 0 bytes).
+        let non_empty_path = dir
+            .files
+            .iter()
+            .find(|(_, meta)| meta.length > 0)
+            .map(|(p, _)| p.clone())
+            .expect("archive should contain at least one non-empty file");
+        let handle = dir.get_file_handle(&non_empty_path).unwrap();
         assert!(handle.len() > 0);
         let data = handle.read_bytes(0..handle.len()).unwrap();
         assert_eq!(data.len(), handle.len());
