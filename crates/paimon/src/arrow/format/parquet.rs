@@ -1168,33 +1168,48 @@ mod tests {
     #[test]
     fn test_split_unaligned_start_6_to_22mb() {
         // 6MB..22MB, concurrency=4:
-        //   raw_size = max(4MB, 4MB+1) = 4MB+1
-        //   expected_size = ceil((4MB+1)/4MB)*4MB = 8MB
-        //   min_tail_size = 8MB
-        //   Head: 6..8MB. Loop: 8+8=16 ≤ 22 → 8..16; 16+8=24 > 22 → tail 16..22.
-        //   Result: [6..8, 8..16, 16..22]
+        //   raw_size = max(4MB, ceil(16MB/4)) = 4MB
+        //   expected_size = ceil(4MB/4MB)*4MB = 4MB
+        //   min_tail_size = max(4MB, 8MB) = 8MB
+        //   Head: 6..8MB (misalign=2MB).
+        //   Loop: 22-8=14≥8 → 8..12; 22-12=10≥8 → 12..16; 22-16=6<8 → tail 16..22.
+        //   Result: [6..8, 8..12, 12..16, 16..22]
         let mb = 1024 * 1024u64;
         #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![6 * mb..22 * mb];
         let result = super::split_ranges_for_concurrency(merged, 4);
         assert_eq!(
             result,
-            vec![6 * mb..8 * mb, 8 * mb..16 * mb, 16 * mb..22 * mb]
+            vec![
+                6 * mb..8 * mb,
+                8 * mb..12 * mb,
+                12 * mb..16 * mb,
+                16 * mb..22 * mb,
+            ]
         );
     }
 
     #[test]
     fn test_split_already_aligned_8_to_24mb() {
         // 8MB..24MB, concurrency=4:
-        //   raw_size = max(4MB, 4MB+1) = 4MB+1
-        //   expected_size = 8MB, min_tail_size = 8MB
-        //   No misalign. Loop: 8+8=16 ≤ 24 → 8..16; 16+8=24 ≤ 24 → 16..24; offset=24 >= end → break.
-        //   Result: [8..16, 16..24]
+        //   raw_size = max(4MB, ceil(16MB/4)) = 4MB
+        //   expected_size = 4MB, min_tail_size = 8MB
+        //   No misalign.
+        //   Loop: 24-8=16≥8 → 8..12; 24-12=12≥8 → 12..16; 24-16=8≥8 → 16..20; 24-20=4<8 → tail 20..24.
+        //   Result: [8..12, 12..16, 16..20, 20..24]
         let mb = 1024 * 1024u64;
         #[allow(clippy::single_range_in_vec_init)]
         let merged = vec![8 * mb..24 * mb];
         let result = super::split_ranges_for_concurrency(merged, 4);
-        assert_eq!(result, vec![8 * mb..16 * mb, 16 * mb..24 * mb]);
+        assert_eq!(
+            result,
+            vec![
+                8 * mb..12 * mb,
+                12 * mb..16 * mb,
+                16 * mb..20 * mb,
+                20 * mb..24 * mb,
+            ]
+        );
     }
 
     #[test]
