@@ -35,7 +35,7 @@ pub struct Identifier {
 
 /// Entry of a manifest file, representing an addition / deletion of a data file.
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestEntry.java>
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     #[serde(rename = "_KIND")]
     kind: FileKind,
@@ -124,4 +124,79 @@ impl ManifestEntry {
             version,
         }
     }
+
+    /// Return a copy with a different kind.
+    pub fn with_kind(mut self, kind: FileKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Return a copy with sequence numbers set on the file.
+    pub fn with_sequence_number(mut self, min_seq: i64, max_seq: i64) -> Self {
+        self.file.min_sequence_number = min_seq;
+        self.file.max_sequence_number = max_seq;
+        self
+    }
+
+    /// Return a copy with first_row_id set on the file.
+    pub fn with_first_row_id(mut self, first_row_id: i64) -> Self {
+        self.file.first_row_id = Some(first_row_id);
+        self
+    }
 }
+
+/// Avro schema for ManifestEntry (used in manifest files).
+pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
+    "type": "record",
+    "name": "record",
+    "namespace": "org.apache.paimon.avro.generated",
+    "fields": [
+        {"name": "_KIND", "type": "int"},
+        {"name": "_PARTITION", "type": "bytes"},
+        {"name": "_BUCKET", "type": "int"},
+        {"name": "_TOTAL_BUCKETS", "type": "int"},
+        {"name": "_FILE", "type": ["null", {
+            "type": "record",
+            "name": "record__FILE",
+            "fields": [
+                {"name": "_FILE_NAME", "type": "string"},
+                {"name": "_FILE_SIZE", "type": "long"},
+                {"name": "_ROW_COUNT", "type": "long"},
+                {"name": "_MIN_KEY", "type": "bytes"},
+                {"name": "_MAX_KEY", "type": "bytes"},
+                {"name": "_KEY_STATS", "type": ["null", {
+                    "type": "record",
+                    "name": "record__FILE__KEY_STATS",
+                    "fields": [
+                        {"name": "_MIN_VALUES", "type": "bytes"},
+                        {"name": "_MAX_VALUES", "type": "bytes"},
+                        {"name": "_NULL_COUNTS", "type": ["null", {"type": "array", "items": ["null", "long"]}], "default": null}
+                    ]
+                }], "default": null},
+                {"name": "_VALUE_STATS", "type": ["null", {
+                    "type": "record",
+                    "name": "record__FILE__VALUE_STATS",
+                    "fields": [
+                        {"name": "_MIN_VALUES", "type": "bytes"},
+                        {"name": "_MAX_VALUES", "type": "bytes"},
+                        {"name": "_NULL_COUNTS", "type": ["null", {"type": "array", "items": ["null", "long"]}], "default": null}
+                    ]
+                }], "default": null},
+                {"name": "_MIN_SEQUENCE_NUMBER", "type": "long"},
+                {"name": "_MAX_SEQUENCE_NUMBER", "type": "long"},
+                {"name": "_SCHEMA_ID", "type": "long"},
+                {"name": "_LEVEL", "type": "int"},
+                {"name": "_EXTRA_FILES", "type": {"type": "array", "items": "string"}},
+                {"name": "_CREATION_TIME", "type": ["null", {"type": "long", "logicalType": "timestamp-millis"}], "default": null},
+                {"name": "_DELETE_ROW_COUNT", "type": ["null", "long"], "default": null},
+                {"name": "_EMBEDDED_FILE_INDEX", "type": ["null", "bytes"], "default": null},
+                {"name": "_FILE_SOURCE", "type": ["null", "int"], "default": null},
+                {"name": "_VALUE_STATS_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+                {"name": "_EXTERNAL_PATH", "type": ["null", "string"], "default": null},
+                {"name": "_FIRST_ROW_ID", "type": ["null", "long"], "default": null},
+                {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+            ]
+        }], "default": null},
+        {"name": "_VERSION", "type": "int"}
+    ]
+}]"#;

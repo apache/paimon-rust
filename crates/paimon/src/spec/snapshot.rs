@@ -92,6 +92,10 @@ pub struct Snapshot {
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
     statistics: Option<String>,
+    /// next row id for row tracking
+    #[builder(default = None)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_row_id: Option<i64>,
 }
 
 impl Snapshot {
@@ -189,6 +193,18 @@ impl Snapshot {
     #[inline]
     pub fn statistics(&self) -> Option<&str> {
         self.statistics.as_deref()
+    }
+
+    /// Get the next row id of this snapshot.
+    #[inline]
+    pub fn next_row_id(&self) -> Option<i64> {
+        self.next_row_id
+    }
+
+    /// Get the commit kind of this snapshot.
+    #[inline]
+    pub fn commit_kind(&self) -> &CommitKind {
+        &self.commit_kind
     }
 }
 

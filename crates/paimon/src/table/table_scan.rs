@@ -440,33 +440,23 @@ impl<'a> TableScan<'a> {
         limited_splits
     }
 
-    async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
+    /// Read all manifest entries from a snapshot, applying filters and merging.
+    ///
+    /// This is the shared entry point used by both `plan_snapshot` (scan) and
+    /// `TableCommit` (overwrite). Filters include partition predicate, data
+    /// predicates, and bucket predicate.
+    pub(crate) async fn plan_manifest_entries(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
-        let target_split_size = core_options.source_split_target_size();
-        let open_file_cost = core_options.source_split_open_file_cost();
 
-        // Resolve partition fields for manifest-file-level stats pruning.
-        let partition_keys = self.table.schema().partition_keys();
-        let partition_fields: Vec<DataField> = self
-            .table
-            .schema()
-            .partition_keys()
-            .iter()
-            .filter_map(|key| {
-                self.table
-                    .schema()
-                    .fields()
-                    .iter()
-                    .find(|f| f.name() == key)
-                    .cloned()
-            })
-            .collect();
+        let partition_fields = self.table.schema().partition_fields();
 
-        // Data-evolution tables must not prune data files independently.
         let pushdown_data_predicates = if data_evolution_enabled {
             &[][..]
         } else {
@@ -475,8 +465,6 @@ impl<'a> TableScan<'a> {
 
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
 
-        // Compute bucket predicate and key fields for per-entry bucket pruning.
-        // Only supported for the default bucket function (MurmurHash3-based).
         let bucket_key_fields: Vec<DataField> =
             if self.bucket_predicate.is_none() || !core_options.is_default_bucket_function() {
                 Vec::new()
@@ -509,7 +497,7 @@ impl<'a> TableScan<'a> {
         let entries = read_all_manifest_entries(
             file_io,
             table_path,
-            &snapshot,
+            snapshot,
             deletion_vectors_enabled,
             has_primary_keys,
             self.partition_predicate.as_ref(),
@@ -521,7 +509,19 @@ impl<'a> TableScan<'a> {
             &bucket_key_fields,
         )
         .await?;
-        let entries = merge_manifest_entries(entries);
+        Ok(merge_manifest_entries(entries))
+    }
+
+    async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
+        let file_io = self.table.file_io();
+        let table_path = self.table.location();
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let data_evolution_enabled = core_options.data_evolution_enabled();
+        let target_split_size = core_options.source_split_target_size();
+        let open_file_cost = core_options.source_split_open_file_cost();
+        let partition_keys = self.table.schema().partition_keys();
+
+        let entries = self.plan_manifest_entries(&snapshot).await?;
         if entries.is_empty() {
             return Ok(Plan::new(Vec::new()));
         }

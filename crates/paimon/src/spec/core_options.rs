@@ -26,6 +26,17 @@ const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
+const BUCKET_OPTION: &str = "bucket";
+const DEFAULT_BUCKET: i32 = 1;
+const COMMIT_MAX_RETRIES_OPTION: &str = "commit.max-retries";
+const COMMIT_TIMEOUT_OPTION: &str = "commit.timeout";
+const COMMIT_MIN_RETRY_WAIT_OPTION: &str = "commit.min-retry-wait";
+const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
+const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
+const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
+const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
@@ -200,6 +211,49 @@ impl<'a> CoreOptions<'a> {
             .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
     }
 
+    pub fn commit_max_retries(&self) -> u32 {
+        self.options
+            .get(COMMIT_MAX_RETRIES_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_COMMIT_MAX_RETRIES)
+    }
+
+    pub fn commit_timeout_ms(&self) -> u64 {
+        self.options
+            .get(COMMIT_TIMEOUT_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_COMMIT_TIMEOUT_MS)
+    }
+
+    pub fn commit_min_retry_wait_ms(&self) -> u64 {
+        self.options
+            .get(COMMIT_MIN_RETRY_WAIT_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_COMMIT_MIN_RETRY_WAIT_MS)
+    }
+
+    pub fn commit_max_retry_wait_ms(&self) -> u64 {
+        self.options
+            .get(COMMIT_MAX_RETRY_WAIT_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_COMMIT_MAX_RETRY_WAIT_MS)
+    }
+
+    pub fn row_tracking_enabled(&self) -> bool {
+        self.options
+            .get(ROW_TRACKING_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Number of buckets for the table. Default is 1.
+    pub fn bucket(&self) -> i32 {
+        self.options
+            .get(BUCKET_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_BUCKET)
+    }
+
     /// Whether the bucket function type is the default hash-based function.
     ///
     /// Only the default function (`Math.abs(hash % numBuckets)`) is supported
@@ -361,6 +415,37 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_commit_options_defaults() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.bucket(), 1);
+        assert_eq!(core.commit_max_retries(), 10);
+        assert_eq!(core.commit_timeout_ms(), 120_000);
+        assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
+        assert_eq!(core.commit_max_retry_wait_ms(), 10_000);
+        assert!(!core.row_tracking_enabled());
+    }
+
+    #[test]
+    fn test_commit_options_custom() {
+        let options = HashMap::from([
+            (BUCKET_OPTION.to_string(), "4".to_string()),
+            (COMMIT_MAX_RETRIES_OPTION.to_string(), "20".to_string()),
+            (COMMIT_TIMEOUT_OPTION.to_string(), "60000".to_string()),
+            (COMMIT_MIN_RETRY_WAIT_OPTION.to_string(), "500".to_string()),
+            (COMMIT_MAX_RETRY_WAIT_OPTION.to_string(), "5000".to_string()),
+            (ROW_TRACKING_ENABLED_OPTION.to_string(), "true".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.bucket(), 4);
+        assert_eq!(core.commit_max_retries(), 20);
+        assert_eq!(core.commit_timeout_ms(), 60_000);
+        assert_eq!(core.commit_min_retry_wait_ms(), 500);
+        assert_eq!(core.commit_max_retry_wait_ms(), 5_000);
+        assert!(core.row_tracking_enabled());
     }
 
     #[test]

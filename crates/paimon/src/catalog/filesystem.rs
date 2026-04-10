@@ -327,6 +327,7 @@ impl Catalog for FileSystemCatalog {
             identifier.clone(),
             table_path,
             schema,
+            None,
         ))
     }
 

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use crate::api::rest_client::HttpClient;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
-use crate::spec::Schema;
+use crate::spec::{PartitionStatistics, Schema, Snapshot};
 use crate::Result;
 
 use super::api_request::{
@@ -390,5 +390,33 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.table_token(database, table);
         self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    // ==================== Commit Operations ====================
+
+    /// Commit a snapshot for a table.
+    ///
+    /// Corresponds to Python `RESTApi.commit_snapshot`.
+    pub async fn commit_snapshot(
+        &self,
+        identifier: &Identifier,
+        table_uuid: &str,
+        snapshot: &Snapshot,
+        statistics: &[PartitionStatistics],
+    ) -> Result<bool> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.commit_table(database, table);
+        let request = serde_json::json!({
+            "tableUuid": table_uuid,
+            "snapshot": snapshot,
+            "statistics": statistics,
+        });
+        let resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(resp
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 }

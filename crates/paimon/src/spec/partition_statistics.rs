@@ -15,34 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-pub mod common;
-pub use common::{CatalogOptions, Options};
-
-pub mod api;
-pub use api::rest_api::RESTApi;
-
-pub mod arrow;
-pub mod btree;
-pub mod catalog;
-mod deletion_vector;
-pub mod file_index;
-pub mod io;
-mod predicate_stats;
-pub mod spec;
-pub mod table;
-#[cfg(feature = "fulltext")]
-pub mod tantivy;
-
-pub use catalog::Catalog;
-pub use catalog::CatalogFactory;
-pub use catalog::FileSystemCatalog;
-
-pub use table::{
-    CommitMessage, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RESTEnv,
-    RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit, RowRange, SnapshotCommit,
-    SnapshotManager, Table, TableCommit, TableRead, TableScan, TagManager, WriteBuilder,
-};
+/// Partition-level statistics for snapshot commits.
+///
+/// Reference: [org.apache.paimon.partition.PartitionStatistics](https://github.com/apache/paimon)
+/// and [pypaimon snapshot_commit.py PartitionStatistics](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/snapshot/snapshot_commit.py)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionStatistics {
+    pub spec: HashMap<String, String>,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+    pub file_count: i64,
+    pub last_file_creation_time: u64,
+    pub total_buckets: i32,
+}

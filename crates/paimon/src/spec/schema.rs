@@ -86,6 +86,13 @@ impl TableSchema {
         &self.partition_keys
     }
 
+    pub fn partition_fields(&self) -> Vec<DataField> {
+        self.partition_keys
+            .iter()
+            .filter_map(|key| self.fields.iter().find(|f| f.name() == key).cloned())
+            .collect()
+    }
+
     pub fn primary_keys(&self) -> &[String] {
         &self.primary_keys
     }

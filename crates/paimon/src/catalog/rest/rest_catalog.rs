@@ -21,6 +21,7 @@
 //! a Paimon REST catalog server for database and table CRUD operations.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -32,7 +33,7 @@ use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::FileIO;
 use crate::spec::{Schema, SchemaChange, TableSchema};
-use crate::table::Table;
+use crate::table::{RESTEnv, Table};
 use crate::Result;
 
 use super::rest_token_file_io::RESTTokenFileIO;
@@ -44,8 +45,8 @@ use super::rest_token_file_io::RESTTokenFileIO;
 ///
 /// Corresponds to Python `RESTCatalog` in `pypaimon/catalog/rest/rest_catalog.py`.
 pub struct RESTCatalog {
-    /// The REST API client.
-    api: RESTApi,
+    /// The REST API client (shared with RESTEnv).
+    api: Arc<RESTApi>,
     /// Catalog configuration options.
     options: Options,
     /// Warehouse path.
@@ -71,7 +72,7 @@ impl RESTCatalog {
                 message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
             })?;
 
-        let api = RESTApi::new(options.clone(), config_required).await?;
+        let api = Arc::new(RESTApi::new(options.clone(), config_required).await?);
 
         let data_token_enabled = api
             .options()
@@ -232,6 +233,15 @@ impl Catalog for RESTCatalog {
             source: None,
         })?;
 
+        // Extract table uuid for RESTEnv
+        let uuid = response.id.ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Table {} response missing id (uuid)",
+                identifier.full_name()
+            ),
+            source: None,
+        })?;
+
         // Build FileIO based on data_token_enabled and is_external
         // TODO Support token cache and direct oss access
         let file_io = if self.data_token_enabled && !is_external {
@@ -244,11 +254,14 @@ impl Catalog for RESTCatalog {
             FileIO::from_path(&table_path)?.build()?
         };
 
+        let rest_env = RESTEnv::new(identifier.clone(), uuid, self.api.clone());
+
         Ok(Table::new(
             file_io,
             identifier.clone(),
             table_path,
             table_schema,
+            Some(rest_env),
         ))
     }
 

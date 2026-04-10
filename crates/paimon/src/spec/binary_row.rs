@@ -19,6 +19,7 @@
 //! and BinaryRowBuilder for constructing BinaryRow instances.
 
 use crate::spec::murmur_hash::hash_by_words;
+use crate::spec::{DataType, Datum};
 use serde::{Deserialize, Serialize};
 
 pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
@@ -523,6 +524,87 @@ impl BinaryRowBuilder {
         serialized.extend_from_slice(&self.data);
         serialized
     }
+
+    /// Write a Datum value at the given position, dispatching by type.
+    pub fn write_datum(&mut self, pos: usize, datum: &Datum, data_type: &DataType) {
+        match datum {
+            Datum::Bool(v) => self.write_boolean(pos, *v),
+            Datum::TinyInt(v) => self.write_byte(pos, *v),
+            Datum::SmallInt(v) => self.write_short(pos, *v),
+            Datum::Int(v) | Datum::Date(v) | Datum::Time(v) => self.write_int(pos, *v),
+            Datum::Long(v) => self.write_long(pos, *v),
+            Datum::Float(v) => self.write_float(pos, *v),
+            Datum::Double(v) => self.write_double(pos, *v),
+            Datum::Timestamp { millis, nanos } => {
+                let precision = match data_type {
+                    DataType::Timestamp(ts) => ts.precision(),
+                    _ => 3,
+                };
+                if precision <= 3 {
+                    self.write_timestamp_compact(pos, *millis);
+                } else {
+                    self.write_timestamp_non_compact(pos, *millis, *nanos);
+                }
+            }
+            Datum::LocalZonedTimestamp { millis, nanos } => {
+                let precision = match data_type {
+                    DataType::LocalZonedTimestamp(ts) => ts.precision(),
+                    _ => 3,
+                };
+                if precision <= 3 {
+                    self.write_timestamp_compact(pos, *millis);
+                } else {
+                    self.write_timestamp_non_compact(pos, *millis, *nanos);
+                }
+            }
+            Datum::Decimal {
+                unscaled,
+                precision,
+                ..
+            } => {
+                if *precision <= 18 {
+                    self.write_decimal_compact(pos, *unscaled as i64);
+                } else {
+                    self.write_decimal_var_len(pos, *unscaled);
+                }
+            }
+            Datum::String(s) => {
+                if s.len() <= 7 {
+                    self.write_string_inline(pos, s);
+                } else {
+                    self.write_string(pos, s);
+                }
+            }
+            Datum::Bytes(b) => {
+                if b.len() <= 7 {
+                    self.write_binary_inline(pos, b);
+                } else {
+                    self.write_binary(pos, b);
+                }
+            }
+        }
+    }
+}
+
+/// Build a serialized BinaryRow from optional Datum values.
+/// Returns empty vec if all values are None.
+pub fn datums_to_binary_row(datums: &[(&Option<Datum>, &DataType)]) -> Vec<u8> {
+    if datums.iter().all(|(d, _)| d.is_none()) {
+        return vec![];
+    }
+    let arity = datums.len() as i32;
+    let mut builder = BinaryRowBuilder::new(arity);
+    for (pos, (datum_opt, data_type)) in datums.iter().enumerate() {
+        match datum_opt {
+            Some(datum) => {
+                builder.write_datum(pos, datum, data_type);
+            }
+            None => {
+                builder.set_null_at(pos);
+            }
+        }
+    }
+    builder.build_serialized()
 }
 
 #[cfg(test)]
@@ -754,6 +836,73 @@ mod tests {
         let (millis, nano) = row.get_timestamp_raw(0, 3).unwrap();
         assert_eq!(millis, epoch_millis);
         assert_eq!(nano, 0);
+    }
+
+    #[test]
+    fn test_write_datum_int_and_string() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_datum(
+            0,
+            &Datum::Int(42),
+            &DataType::Int(crate::spec::IntType::new()),
+        );
+        builder.write_datum(
+            1,
+            &Datum::String("hello".to_string()),
+            &DataType::VarChar(crate::spec::VarCharType::string_type()),
+        );
+        let row = builder.build();
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_string(1).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_write_datum_long_string() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_datum(
+            0,
+            &Datum::String("long_string_value".to_string()),
+            &DataType::VarChar(crate::spec::VarCharType::string_type()),
+        );
+        let row = builder.build();
+        assert_eq!(row.get_string(0).unwrap(), "long_string_value");
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_roundtrip() {
+        let d1 = Some(Datum::Int(100));
+        let d2 = Some(Datum::String("abc".to_string()));
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let dt2 = DataType::VarChar(crate::spec::VarCharType::string_type());
+        let datums = vec![(&d1, &dt1), (&d2, &dt2)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(!bytes.is_empty());
+        let row = BinaryRow::from_serialized_bytes(&bytes).unwrap();
+        assert_eq!(row.get_int(0).unwrap(), 100);
+        assert_eq!(row.get_string(1).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_all_none() {
+        let d1: Option<Datum> = None;
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let datums = vec![(&d1, &dt1)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_mixed_null() {
+        let d1 = Some(Datum::Int(7));
+        let d2: Option<Datum> = None;
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let dt2 = DataType::Int(crate::spec::IntType::new());
+        let datums = vec![(&d1, &dt1), (&d2, &dt2)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(!bytes.is_empty());
+        let row = BinaryRow::from_serialized_bytes(&bytes).unwrap();
+        assert_eq!(row.get_int(0).unwrap(), 7);
+        assert!(row.is_null_at(1));
     }
 
     #[test]

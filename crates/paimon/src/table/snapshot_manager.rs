@@ -45,6 +45,10 @@ impl SnapshotManager {
         }
     }
 
+    pub fn file_io(&self) -> &FileIO {
+        &self.file_io
+    }
+
     /// Path to the snapshot directory (e.g. `table_path/snapshot`).
     pub fn snapshot_dir(&self) -> String {
         format!("{}/{}", self.table_path, SNAPSHOT_DIR)
@@ -65,14 +69,22 @@ impl SnapshotManager {
         format!("{}/snapshot-{}", self.snapshot_dir(), snapshot_id)
     }
 
+    /// Path to the manifest directory.
+    pub fn manifest_dir(&self) -> String {
+        format!("{}/manifest", self.table_path)
+    }
+
+    /// Path to a manifest file.
+    pub fn manifest_path(&self, manifest_name: &str) -> String {
+        format!("{}/{}", self.manifest_dir(), manifest_name)
+    }
+
     /// Read a hint file and return the id, or None if the file does not exist,
     /// is being deleted, or contains invalid content.
     ///
     /// Reference: [HintFileUtils.readHint](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/HintFileUtils.java)
     async fn read_hint(&self, path: &str) -> Option<i64> {
         let input = self.file_io.new_input(path).ok()?;
-        // Try to read directly without exists() check to avoid TOCTOU race.
-        // The file may be deleted or overwritten concurrently.
         let content = input.read().await.ok()?;
         let id_str = str::from_utf8(&content).ok()?;
         id_str.trim().parse().ok()
@@ -138,7 +150,7 @@ impl SnapshotManager {
         self.find_by_list_files(i64::min).await
     }
 
-    /// Get a snapshot by id. Returns an error if the snapshot file does not exist.
+    /// Get a snapshot by id.
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
@@ -176,6 +188,56 @@ impl SnapshotManager {
         Ok(Some(snapshot))
     }
 
+    /// Atomically commit a snapshot.
+    ///
+    /// Writes the snapshot JSON to the target path. Returns `false` if the
+    /// target already exists (another writer won the race).
+    ///
+    /// On file systems that support atomic rename, we write to a temp file
+    /// first then rename. On backends where rename is not supported (e.g.
+    /// memory, object stores), we fall back to a direct write after an
+    /// existence check.
+    pub async fn commit_snapshot(&self, snapshot: &Snapshot) -> crate::Result<bool> {
+        let target_path = self.snapshot_path(snapshot.id());
+
+        let json = serde_json::to_string(snapshot).map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to serialize snapshot: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        // Try rename-based atomic commit first, fall back to check-and-write
+        let tmp_path = format!("{}.tmp-{}", target_path, uuid::Uuid::new_v4());
+        let output = self.file_io.new_output(&tmp_path)?;
+        output.write(bytes::Bytes::from(json.clone())).await?;
+
+        match self.file_io.rename(&tmp_path, &target_path).await {
+            Ok(()) => {}
+            Err(_) => {
+                // Rename not supported (e.g. memory/object store).
+                // Clean up temp file, then check-and-write.
+                let _ = self.file_io.delete_file(&tmp_path).await;
+                if self.file_io.exists(&target_path).await? {
+                    return Ok(false);
+                }
+                let output = self.file_io.new_output(&target_path)?;
+                output.write(bytes::Bytes::from(json)).await?;
+            }
+        }
+
+        // Update LATEST hint (best-effort)
+        let _ = self.write_latest_hint(snapshot.id()).await;
+        Ok(true)
+    }
+
+    /// Update the LATEST hint file.
+    pub async fn write_latest_hint(&self, snapshot_id: i64) -> crate::Result<()> {
+        let hint_path = self.latest_hint_path();
+        let output = self.file_io.new_output(&hint_path)?;
+        output
+            .write(bytes::Bytes::from(snapshot_id.to_string()))
+            .await
+    }
+
     /// Returns the snapshot whose commit time is earlier than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///
@@ -196,7 +258,6 @@ impl SnapshotManager {
             None => return Ok(None),
         };
 
-        // If the earliest snapshot is already after the timestamp, no match.
         if (earliest_snapshot.time_millis() as i64) > timestamp_millis {
             return Ok(None);
         }
@@ -218,5 +279,79 @@ impl SnapshotManager {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::CommitKind;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    async fn setup(table_path: &str) -> (FileIO, SnapshotManager) {
+        let file_io = test_file_io();
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        (file_io, sm)
+    }
+
+    fn test_snapshot(id: i64) -> Snapshot {
+        Snapshot::builder()
+            .version(3)
+            .id(id)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000 * id as u64)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_first() {
+        let (_, sm) = setup("memory:/test_commit_first").await;
+        let snap = test_snapshot(1);
+        let result = sm.commit_snapshot(&snap).await.unwrap();
+        assert!(result);
+
+        let loaded = sm.get_snapshot(1).await.unwrap();
+        assert_eq!(loaded.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_snapshot_already_exists() {
+        let (_, sm) = setup("memory:/test_commit_exists").await;
+        let snap = test_snapshot(1);
+        assert!(sm.commit_snapshot(&snap).await.unwrap());
+        // Second commit to same id should return false
+        let result = sm.commit_snapshot(&snap).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_commit_updates_latest_hint() {
+        let (_, sm) = setup("memory:/test_commit_hint").await;
+        let snap = test_snapshot(1);
+        sm.commit_snapshot(&snap).await.unwrap();
+
+        let latest_id = sm.get_latest_snapshot_id().await.unwrap();
+        assert_eq!(latest_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_write_latest_hint() {
+        let (_, sm) = setup("memory:/test_write_hint").await;
+        sm.write_latest_hint(42).await.unwrap();
+        let hint = sm.read_hint(&sm.latest_hint_path()).await;
+        assert_eq!(hint, Some(42));
     }
 }

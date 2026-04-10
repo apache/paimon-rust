@@ -17,6 +17,7 @@
 
 use crate::io::FileIO;
 use crate::spec::manifest_entry::ManifestEntry;
+use crate::spec::manifest_entry::MANIFEST_ENTRY_SCHEMA;
 use serde_avro_fast::object_container_file_encoding::Reader;
 use snafu::ResultExt;
 
@@ -32,13 +33,6 @@ pub struct Manifest;
 
 impl Manifest {
     /// Read manifest entries from a file.
-    ///
-    /// # Arguments
-    /// * `file_io` - FileIO instance for reading files
-    /// * `path` - Path to the manifest file
-    ///
-    /// # Returns
-    /// A vector of ManifestEntry records
     pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<ManifestEntry>> {
         let input_file = file_io.new_input(path)?;
 
@@ -51,12 +45,6 @@ impl Manifest {
     }
 
     /// Read manifest entries from bytes.
-    ///
-    /// # Arguments
-    /// * `bytes` - Avro-encoded manifest file content
-    ///
-    /// # Returns
-    /// A vector of ManifestEntry records
     fn read_from_bytes(bytes: &[u8]) -> Result<Vec<ManifestEntry>> {
         let mut reader =
             Reader::from_slice(bytes).whatever_context::<_, crate::Error>("read manifest avro")?;
@@ -64,6 +52,13 @@ impl Manifest {
             .deserialize::<ManifestEntry>()
             .collect::<std::result::Result<Vec<_>, _>>()
             .whatever_context::<_, crate::Error>("deserialize manifest entry")
+    }
+
+    /// Write manifest entries to a file.
+    pub async fn write(file_io: &FileIO, path: &str, entries: &[ManifestEntry]) -> Result<()> {
+        let bytes = crate::spec::to_avro_bytes(MANIFEST_ENTRY_SCHEMA, entries)?;
+        let output = file_io.new_output(path)?;
+        output.write(bytes::Bytes::from(bytes)).await
     }
 }
 

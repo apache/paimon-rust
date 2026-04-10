@@ -115,6 +115,30 @@ impl ManifestFileMeta {
     }
 }
 
+/// Avro schema for ManifestFileMeta (used in manifest-list files).
+pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
+    "type": "record",
+    "name": "record",
+    "namespace": "org.apache.paimon.avro.generated",
+    "fields": [
+        {"name": "_VERSION", "type": "int"},
+        {"name": "_FILE_NAME", "type": "string"},
+        {"name": "_FILE_SIZE", "type": "long"},
+        {"name": "_NUM_ADDED_FILES", "type": "long"},
+        {"name": "_NUM_DELETED_FILES", "type": "long"},
+        {"name": "_PARTITION_STATS", "type": ["null", {
+            "type": "record",
+            "name": "record__PARTITION_STATS",
+            "fields": [
+                {"name": "_MIN_VALUES", "type": "bytes"},
+                {"name": "_MAX_VALUES", "type": "bytes"},
+                {"name": "_NULL_COUNTS", "type": ["null", {"type": "array", "items": ["null", "long"]}], "default": null}
+            ]
+        }], "default": null},
+        {"name": "_SCHEMA_ID", "type": "long"}
+    ]
+}]"#;
+
 impl Display for ManifestFileMeta {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(

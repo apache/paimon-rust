@@ -410,6 +410,7 @@ mod tests {
             Identifier::new("default", "t"),
             table_path,
             table_schema,
+            None,
         );
 
         let split = DataSplitBuilder::new()
@@ -469,6 +470,7 @@ mod tests {
             Identifier::new("default", "t"),
             table_path,
             table_schema,
+            None,
         );
 
         let split = DataSplitBuilder::new()
@@ -526,6 +528,7 @@ mod tests {
             Identifier::new("default", "t"),
             table_path,
             table_schema,
+            None,
         );
 
         let split = DataSplitBuilder::new()
@@ -586,6 +589,7 @@ mod tests {
             Identifier::new("default", "t"),
             table_path,
             table_schema,
+            None,
         );
 
         let split = DataSplitBuilder::new()
@@ -637,6 +641,7 @@ mod tests {
             Identifier::new("default", "t"),
             "/tmp/test".to_string(),
             table_schema,
+            None,
         );
 
         let mut builder = table.new_read_builder();
@@ -692,6 +697,7 @@ mod tests {
             Identifier::new("default", "t"),
             "/tmp/test".to_string(),
             table_schema,
+            None,
         );
 
         let mut builder = table.new_read_builder();

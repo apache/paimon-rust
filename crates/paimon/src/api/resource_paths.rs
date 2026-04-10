@@ -131,6 +131,18 @@ impl ResourcePaths {
     pub fn rename_table(&self) -> String {
         format!("{}/{}/rename", self.base_path, Self::TABLES)
     }
+
+    /// Get the commit table endpoint path.
+    pub fn commit_table(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/{}/{}/{}/{}/commit",
+            self.base_path,
+            Self::DATABASES,
+            RESTUtil::encode_string(database_name),
+            Self::TABLES,
+            RESTUtil::encode_string(table_name)
+        )
+    }
 }
 
 #[cfg(test)]

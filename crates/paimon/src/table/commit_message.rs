@@ -15,34 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod error;
-pub use error::Error;
-pub use error::Result;
+use crate::spec::DataFileMeta;
 
-pub mod common;
-pub use common::{CatalogOptions, Options};
+/// A commit message representing new files to be committed for a specific partition and bucket.
+///
+/// Reference: [org.apache.paimon.table.sink.CommitMessage](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/CommitMessageImpl.java)
+#[derive(Debug, Clone)]
+pub struct CommitMessage {
+    /// Binary row bytes for the partition.
+    pub partition: Vec<u8>,
+    /// Bucket id.
+    pub bucket: i32,
+    /// New data files to be added.
+    pub new_files: Vec<DataFileMeta>,
+}
 
-pub mod api;
-pub use api::rest_api::RESTApi;
-
-pub mod arrow;
-pub mod btree;
-pub mod catalog;
-mod deletion_vector;
-pub mod file_index;
-pub mod io;
-mod predicate_stats;
-pub mod spec;
-pub mod table;
-#[cfg(feature = "fulltext")]
-pub mod tantivy;
-
-pub use catalog::Catalog;
-pub use catalog::CatalogFactory;
-pub use catalog::FileSystemCatalog;
-
-pub use table::{
-    CommitMessage, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RESTEnv,
-    RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit, RowRange, SnapshotCommit,
-    SnapshotManager, Table, TableCommit, TableRead, TableScan, TagManager, WriteBuilder,
-};
+impl CommitMessage {
+    pub fn new(partition: Vec<u8>, bucket: i32, new_files: Vec<DataFileMeta>) -> Self {
+        Self {
+            partition,
+            bucket,
+            new_files,
+        }
+    }
+}

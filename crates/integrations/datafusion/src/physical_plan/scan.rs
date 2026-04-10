@@ -248,6 +248,7 @@ mod tests {
     use paimon::spec::{
         BinaryRow, DataType, Datum, IntType, PredicateBuilder, Schema as PaimonSchema, TableSchema,
     };
+    use paimon::table::Table;
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
@@ -298,6 +299,7 @@ mod tests {
             Identifier::new("test_db", "test_table"),
             "/tmp/test-table".to_string(),
             table_schema,
+            None,
         )
     }
 
@@ -329,6 +331,7 @@ mod tests {
             Identifier::new("default", "t"),
             table_path,
             table_schema,
+            None,
         );
 
         let split = paimon::DataSplitBuilder::new()

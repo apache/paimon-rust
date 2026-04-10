@@ -19,31 +19,41 @@
 
 pub(crate) mod bin_pack;
 mod bucket_filter;
+mod commit_message;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
 mod read_builder;
+pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
 pub(crate) mod schema_manager;
+pub(crate) mod snapshot_commit;
 mod snapshot_manager;
 mod source;
 mod stats_filter;
+pub(crate) mod table_commit;
 mod table_scan;
 mod tag_manager;
+mod write_builder;
 
 use crate::Result;
 use arrow_array::RecordBatch;
+pub use commit_message::CommitMessage;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use read_builder::{ReadBuilder, TableRead};
+pub use rest_env::RESTEnv;
 pub use schema_manager::SchemaManager;
+pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+pub use table_commit::TableCommit;
 pub use table_scan::TableScan;
 pub use tag_manager::TagManager;
+pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
@@ -58,6 +68,7 @@ pub struct Table {
     location: String,
     schema: TableSchema,
     schema_manager: SchemaManager,
+    rest_env: Option<RESTEnv>,
 }
 
 impl Table {
@@ -67,6 +78,7 @@ impl Table {
         identifier: Identifier,
         location: String,
         schema: TableSchema,
+        rest_env: Option<RESTEnv>,
     ) -> Self {
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
         Self {
@@ -75,6 +87,7 @@ impl Table {
             location,
             schema,
             schema_manager,
+            rest_env,
         }
     }
 
@@ -118,6 +131,13 @@ impl Table {
         FullTextSearchBuilder::new(self)
     }
 
+    /// Create a write builder for write/commit.
+    ///
+    /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
+    pub fn new_write_builder(&self) -> WriteBuilder<'_> {
+        WriteBuilder::new(self)
+    }
+
     /// Create a copy of this table with extra options merged into the schema.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
         Self {
@@ -126,6 +146,7 @@ impl Table {
             location: self.location.clone(),
             schema: self.schema.copy_with_options(extra),
             schema_manager: self.schema_manager.clone(),
+            rest_env: self.rest_env.clone(),
         }
     }
 }

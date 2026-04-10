@@ -53,8 +53,11 @@ pub use manifest_common::FileKind;
 mod manifest_entry;
 pub use manifest_entry::Identifier;
 pub use manifest_entry::ManifestEntry;
+mod manifest_list;
+pub use manifest_list::ManifestList;
 mod objects_file;
 pub use objects_file::from_avro_bytes;
+pub use objects_file::to_avro_bytes;
 pub(crate) mod stats;
 mod types;
 pub use types::*;
@@ -67,3 +70,5 @@ pub use predicate::{
     field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
 };
 pub(crate) mod murmur_hash;
+mod partition_statistics;
+pub use partition_statistics::PartitionStatistics;
