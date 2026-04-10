@@ -205,10 +205,22 @@ impl SnapshotManager {
             source: Some(Box::new(e)),
         })?;
 
-        // Try rename-based atomic commit first, fall back to check-and-write
+        // Try rename-based atomic commit first, fall back to check-and-write.
+        //
+        // TODO: opendal's rename uses POSIX semantics which silently overwrites the target.
+        //  The exists() check below narrows the race window but does not eliminate it.
+        //  Java Paimon uses `lock.runWithLock(() -> !fileIO.exists(newPath) && callable.call())`
+        //  for full mutual exclusion. We need an external lock mechanism (like Java's Lock
+        //  interface) for backends without atomic rename-no-replace support.
         let tmp_path = format!("{}.tmp-{}", target_path, uuid::Uuid::new_v4());
         let output = self.file_io.new_output(&tmp_path)?;
         output.write(bytes::Bytes::from(json.clone())).await?;
+
+        // Check before rename to avoid silent overwrite (opendal uses POSIX rename semantics)
+        if self.file_io.exists(&target_path).await? {
+            let _ = self.file_io.delete_file(&tmp_path).await;
+            return Ok(false);
+        }
 
         match self.file_io.rename(&tmp_path, &target_path).await {
             Ok(()) => {}
