@@ -997,8 +997,8 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
 /// with the last chunk taking whatever remains.
 /// Ranges smaller than `2 * MIN_SPLIT_SIZE` are kept as-is to
 /// avoid excessive small IO requests.
-fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, target_count: usize) -> Vec<Range<u64>> {
-    if merged.is_empty() || target_count <= 1 {
+fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> Vec<Range<u64>> {
+    if merged.is_empty() || concurrency <= 1 {
         return merged;
     }
 
@@ -1006,17 +1006,31 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, target_count: usize) ->
 
     for range in &merged {
         let length = range.end - range.start;
-        let expected_size = MIN_SPLIT_SIZE.max(length / target_count as u64 + 1);
-        let min_remain = expected_size.max(MIN_SPLIT_SIZE * 2);
+        let raw_size = MIN_SPLIT_SIZE.max(length / concurrency as u64 + 1);
+        // Round up to the nearest multiple of MIN_SPLIT_SIZE (4 MB) so that
+        // every split boundary is 4 MB-aligned relative to the range start.
+        let expected_size = raw_size.div_ceil(MIN_SPLIT_SIZE) * MIN_SPLIT_SIZE;
+        let min_tail_size = expected_size.max(MIN_SPLIT_SIZE * 2);
 
         let mut offset = range.start;
         let end = range.end;
 
+        // Align the first split boundary: if `offset` is not 4 MB-aligned,
+        // emit a short head chunk so that all subsequent chunks start on a
+        // 4 MB boundary.
+        let misalign = offset % MIN_SPLIT_SIZE;
+        if misalign != 0 {
+            let first_end = (offset - misalign + MIN_SPLIT_SIZE).min(end);
+            result.push(offset..first_end);
+            offset = first_end;
+        }
+
         loop {
-            if offset + min_remain > end {
-                if offset < end {
-                    result.push(offset..end);
-                }
+            if offset >= end {
+                break;
+            }
+            if end - offset < min_tail_size {
+                result.push(offset..end);
                 break;
             } else {
                 result.push(offset..offset + expected_size);
@@ -1123,28 +1137,86 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_split_single_small_range() {
-        // A single range smaller than 2 * MIN_SPLIT_SIZE should not be split.
+    fn test_split_aligned_range_0_to_20mb() {
+        // 0..20MB, concurrency=4:
+        //   raw_size = max(4MB, 5MB+1) = 5MB+1
+        //   expected_size = ceil((5MB+1)/4MB)*4MB = 8MB
+        //   min_tail_size = max(8MB, 8MB) = 8MB
+        //   No misalign. Chunks: [0..8, 8..16, 16..20]
+        let mb = 1024 * 1024u64;
         #[allow(clippy::single_range_in_vec_init)]
-        let merged = vec![0..1000];
+        let merged = vec![0..20 * mb];
         let result = super::split_ranges_for_concurrency(merged, 4);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], 0..1000);
+        assert_eq!(result, vec![0..8 * mb, 8 * mb..16 * mb, 16 * mb..20 * mb]);
     }
 
     #[test]
-    fn test_split_large_range_into_batches() {
+    fn test_split_unaligned_start_6_to_14mb() {
+        // 6MB..14MB, concurrency=4:
+        //   raw_size = max(4MB, 2MB+1) = 4MB
+        //   expected_size = 4MB, min_tail_size = 8MB
+        //   Head: 6..8MB. Loop: 8+8=16 > 14 → tail 8..14.
+        //   Result: [6..8, 8..14]
         let mb = 1024 * 1024u64;
-        let size = 40 * mb;
         #[allow(clippy::single_range_in_vec_init)]
-        let merged = vec![0..size];
+        let merged = vec![6 * mb..14 * mb];
         let result = super::split_ranges_for_concurrency(merged, 4);
-        assert!(result.len() > 1);
-        assert_eq!(result.first().unwrap().start, 0);
-        assert_eq!(result.last().unwrap().end, size);
-        for i in 1..result.len() {
-            assert_eq!(result[i].start, result[i - 1].end);
-        }
+        assert_eq!(result, vec![6 * mb..8 * mb, 8 * mb..14 * mb]);
+    }
+
+    #[test]
+    fn test_split_unaligned_start_6_to_22mb() {
+        // 6MB..22MB, concurrency=4:
+        //   raw_size = max(4MB, 4MB+1) = 4MB+1
+        //   expected_size = ceil((4MB+1)/4MB)*4MB = 8MB
+        //   min_tail_size = 8MB
+        //   Head: 6..8MB. Loop: 8+8=16 ≤ 22 → 8..16; 16+8=24 > 22 → tail 16..22.
+        //   Result: [6..8, 8..16, 16..22]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![6 * mb..22 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(
+            result,
+            vec![6 * mb..8 * mb, 8 * mb..16 * mb, 16 * mb..22 * mb]
+        );
+    }
+
+    #[test]
+    fn test_split_already_aligned_8_to_24mb() {
+        // 8MB..24MB, concurrency=4:
+        //   raw_size = max(4MB, 4MB+1) = 4MB+1
+        //   expected_size = 8MB, min_tail_size = 8MB
+        //   No misalign. Loop: 8+8=16 ≤ 24 → 8..16; 16+8=24 ≤ 24 → 16..24; offset=24 >= end → break.
+        //   Result: [8..16, 16..24]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![8 * mb..24 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(result, vec![8 * mb..16 * mb, 16 * mb..24 * mb]);
+    }
+
+    #[test]
+    fn test_split_multiple_ranges() {
+        // [0..20MB, 24..44MB], concurrency=4:
+        //   Range 0..20MB → [0..8, 8..16, 16..20] (same as test above)
+        //   Range 24..44MB (20MB): expected_size=8MB, min_tail_size=8MB, no misalign.
+        //     24+8=32 ≤ 44 → 24..32; 32+8=40 ≤ 44 → 32..40; 40+8=48 > 44 → tail 40..44.
+        //   Result: [0..8, 8..16, 16..20, 24..32, 32..40, 40..44]
+        let mb = 1024 * 1024u64;
+        let merged = vec![0..20 * mb, 24 * mb..44 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(
+            result,
+            vec![
+                0..8 * mb,
+                8 * mb..16 * mb,
+                16 * mb..20 * mb,
+                24 * mb..32 * mb,
+                32 * mb..40 * mb,
+                40 * mb..44 * mb,
+            ]
+        );
     }
 
     #[test]
