@@ -27,7 +27,7 @@ under the License.
 [dependencies]
 paimon = "0.1.0"
 paimon-datafusion = "0.1.0"
-datafusion = "52"
+datafusion = "53"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -49,41 +49,43 @@ df.show().await?;
 
 ## Time Travel
 
-Paimon supports time travel queries to read historical data. In DataFusion, this is done via the `FOR SYSTEM_TIME AS OF` clause.
+Paimon supports time travel queries to read historical data. In DataFusion, this is done via the `VERSION AS OF` and `TIMESTAMP AS OF` clauses.
 
 ### By Snapshot ID
 
-Read data from a specific snapshot by passing an integer literal:
+Read data from a specific snapshot by passing an integer:
 
 ```sql
-SELECT * FROM paimon.default.my_table FOR SYSTEM_TIME AS OF 1
+SELECT * FROM paimon.default.my_table VERSION AS OF 1
 ```
 
-This sets the `scan.snapshot-id` option and reads exactly that snapshot.
+This sets the `scan.version` option. At scan time, the value is resolved as a snapshot ID.
+
+### By Tag Name
+
+Read data from a named tag. Since `VERSION AS OF` in SQL only accepts numeric values, tag-based time travel is done via the `scan.version` table option:
+
+```rust
+let table = table.copy_with_options(HashMap::from([
+    ("scan.version".to_string(), "my_tag".to_string()),
+]));
+```
+
+At scan time, the version value is resolved by first checking if a tag with that name exists, then trying to parse it as a snapshot ID. If neither matches, an error is returned.
 
 ### By Timestamp
 
 Read data as of a specific point in time by passing a timestamp string in `YYYY-MM-DD HH:MM:SS` format:
 
 ```sql
-SELECT * FROM paimon.default.my_table FOR SYSTEM_TIME AS OF '2024-01-01 00:00:00'
+SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00'
 ```
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
 
-### By Tag Name
-
-Read data from a named tag by passing a string that is not a timestamp:
-
-```sql
-SELECT * FROM paimon.default.my_table FOR SYSTEM_TIME AS OF 'my_tag'
-```
-
-Tags are named snapshots created via Paimon's tag management (e.g., `CALL sys.create_tag(...)` in Spark). This is useful for pinning a stable version of the data for reproducible queries.
-
 ### Enabling Time Travel Syntax
 
-DataFusion requires the BigQuery SQL dialect to parse `FOR SYSTEM_TIME AS OF`. You also need to register the `PaimonRelationPlanner`:
+DataFusion requires the Databricks SQL dialect to parse `VERSION AS OF` and `TIMESTAMP AS OF`. You also need to register the `PaimonRelationPlanner`:
 
 ```rust
 use std::sync::Arc;
@@ -91,12 +93,12 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner};
 
 let config = SessionConfig::new()
-    .set_str("datafusion.sql_parser.dialect", "BigQuery");
+    .set_str("datafusion.sql_parser.dialect", "Databricks");
 let ctx = SessionContext::new_with_config(config);
 
 ctx.register_catalog("paimon", Arc::new(PaimonCatalogProvider::new(Arc::new(catalog))));
 ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))?;
 
 // Now time travel queries work
-let df = ctx.sql("SELECT * FROM paimon.default.my_table FOR SYSTEM_TIME AS OF 1").await?;
+let df = ctx.sql("SELECT * FROM paimon.default.my_table VERSION AS OF 1").await?;
 ```

@@ -345,9 +345,8 @@ impl<'a> TableScan<'a> {
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
-    /// - only one of `scan.tag-name`, `scan.snapshot-id`, `scan.timestamp-millis` may be set
-    /// - `scan.tag-name` → read the snapshot pinned by that tag
-    /// - `scan.snapshot-id` → read that specific snapshot
+    /// - only one of `scan.version`, `scan.timestamp-millis` may be set
+    /// - `scan.version` → tag name (if exists) → snapshot id (if parseable) → error
     /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
     /// - otherwise → read the latest snapshot
     ///
@@ -367,19 +366,6 @@ impl<'a> TableScan<'a> {
         let core_options = CoreOptions::new(self.table.schema().options());
 
         match core_options.try_time_travel_selector()? {
-            Some(TimeTravelSelector::TagName(tag_name)) => {
-                let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
-                match tag_manager.get(tag_name).await? {
-                    Some(s) => Ok(Some(s)),
-                    None => Err(Error::DataInvalid {
-                        message: format!("Tag '{tag_name}' doesn't exist."),
-                        source: None,
-                    }),
-                }
-            }
-            Some(TimeTravelSelector::SnapshotId(id)) => {
-                snapshot_manager.get_snapshot(id).await.map(Some)
-            }
             Some(TimeTravelSelector::TimestampMillis(ts)) => {
                 match snapshot_manager.earlier_or_equal_time_mills(ts).await? {
                     Some(s) => Ok(Some(s)),
@@ -387,6 +373,26 @@ impl<'a> TableScan<'a> {
                         message: format!("No snapshot found with timestamp <= {ts}"),
                         source: None,
                     }),
+                }
+            }
+            Some(TimeTravelSelector::Version(v)) => {
+                // Tag first, then snapshot id, else error.
+                let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
+                if tag_manager.tag_exists(v).await? {
+                    match tag_manager.get(v).await? {
+                        Some(s) => Ok(Some(s)),
+                        None => Err(Error::DataInvalid {
+                            message: format!("Tag '{v}' doesn't exist."),
+                            source: None,
+                        }),
+                    }
+                } else if let Ok(id) = v.parse::<i64>() {
+                    snapshot_manager.get_snapshot(id).await.map(Some)
+                } else {
+                    Err(Error::DataInvalid {
+                        message: format!("Version '{v}' is not a valid tag name or snapshot id."),
+                        source: None,
+                    })
                 }
             }
             None => snapshot_manager.get_latest_snapshot().await,

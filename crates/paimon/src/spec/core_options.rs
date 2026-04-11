@@ -40,9 +40,8 @@ const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
-pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
-pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
+pub const SCAN_VERSION_OPTION: &str = "scan.version";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
@@ -57,11 +56,12 @@ pub struct CoreOptions<'a> {
     options: &'a HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimeTravelSelector<'a> {
-    TagName(&'a str),
-    SnapshotId(i64),
     TimestampMillis(i64),
+    /// Raw version string from `VERSION AS OF`. Resolved at scan time:
+    /// tag name (if tag exists) → snapshot id (if parseable as i64) → error.
+    Version(&'a str),
 }
 
 impl<'a> CoreOptions<'a> {
@@ -138,17 +138,6 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
-    /// Raw snapshot id accessor for `scan.snapshot-id`.
-    ///
-    /// This compatibility accessor is lossy: it returns `None` for absent or
-    /// invalid values and does not validate selector conflicts. Internal
-    /// time-travel planning should use `try_time_travel_selector`.
-    pub fn scan_snapshot_id(&self) -> Option<i64> {
-        self.options
-            .get(SCAN_SNAPSHOT_ID_OPTION)
-            .and_then(|v| v.parse().ok())
-    }
-
     /// Raw timestamp accessor for `scan.timestamp-millis`.
     ///
     /// This compatibility accessor is lossy: it returns `None` for absent or
@@ -160,24 +149,13 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
     }
 
-    /// Raw tag name accessor for `scan.tag-name`.
-    ///
-    /// This compatibility accessor does not validate selector conflicts.
-    /// Internal time-travel planning should use `try_time_travel_selector`.
-    pub fn scan_tag_name(&self) -> Option<&'a str> {
-        self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str)
-    }
-
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(3);
-        if self.options.contains_key(SCAN_TAG_NAME_OPTION) {
-            selectors.push(SCAN_TAG_NAME_OPTION);
-        }
-        if self.options.contains_key(SCAN_SNAPSHOT_ID_OPTION) {
-            selectors.push(SCAN_SNAPSHOT_ID_OPTION);
-        }
+        let mut selectors = Vec::with_capacity(2);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        if self.options.contains_key(SCAN_VERSION_OPTION) {
+            selectors.push(SCAN_VERSION_OPTION);
         }
         selectors
     }
@@ -198,12 +176,10 @@ impl<'a> CoreOptions<'a> {
             });
         }
 
-        if let Some(tag_name) = self.scan_tag_name() {
-            Ok(Some(TimeTravelSelector::TagName(tag_name)))
-        } else if let Some(id) = self.parse_i64_option(SCAN_SNAPSHOT_ID_OPTION)? {
-            Ok(Some(TimeTravelSelector::SnapshotId(id)))
-        } else if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
+        if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else if let Some(version) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
+            Ok(Some(TimeTravelSelector::Version(version)))
         } else {
             Ok(None)
         }
@@ -408,8 +384,8 @@ mod tests {
     #[test]
     fn test_try_time_travel_selector_rejects_conflicting_selectors() {
         let options = HashMap::from([
-            (SCAN_TAG_NAME_OPTION.to_string(), "tag1".to_string()),
-            (SCAN_SNAPSHOT_ID_OPTION.to_string(), "7".to_string()),
+            (SCAN_VERSION_OPTION.to_string(), "tag1".to_string()),
+            (SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "1234".to_string()),
         ]);
         let core = CoreOptions::new(&options);
 
@@ -419,8 +395,8 @@ mod tests {
         match err {
             crate::Error::DataInvalid { message, .. } => {
                 assert!(message.contains("Only one time-travel selector may be set"));
-                assert!(message.contains(SCAN_TAG_NAME_OPTION));
-                assert!(message.contains(SCAN_SNAPSHOT_ID_OPTION));
+                assert!(message.contains(SCAN_VERSION_OPTION));
+                assert!(message.contains(SCAN_TIMESTAMP_MILLIS_OPTION));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -428,20 +404,6 @@ mod tests {
 
     #[test]
     fn test_try_time_travel_selector_rejects_invalid_numeric_values() {
-        let snapshot_options =
-            HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "abc".to_string())]);
-        let snapshot_core = CoreOptions::new(&snapshot_options);
-
-        let snapshot_err = snapshot_core
-            .try_time_travel_selector()
-            .expect_err("invalid snapshot id should fail");
-        match snapshot_err {
-            crate::Error::DataInvalid { message, .. } => {
-                assert!(message.contains(SCAN_SNAPSHOT_ID_OPTION));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
         let timestamp_options =
             HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "xyz".to_string())]);
         let timestamp_core = CoreOptions::new(&timestamp_options);
@@ -490,23 +452,6 @@ mod tests {
 
     #[test]
     fn test_try_time_travel_selector_normalizes_valid_selector() {
-        let tag_options = HashMap::from([(SCAN_TAG_NAME_OPTION.to_string(), "tag1".to_string())]);
-        let tag_core = CoreOptions::new(&tag_options);
-        assert_eq!(
-            tag_core.try_time_travel_selector().expect("tag selector"),
-            Some(TimeTravelSelector::TagName("tag1"))
-        );
-
-        let snapshot_options =
-            HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "7".to_string())]);
-        let snapshot_core = CoreOptions::new(&snapshot_options);
-        assert_eq!(
-            snapshot_core
-                .try_time_travel_selector()
-                .expect("snapshot selector"),
-            Some(TimeTravelSelector::SnapshotId(7))
-        );
-
         let timestamp_options =
             HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "1234".to_string())]);
         let timestamp_core = CoreOptions::new(&timestamp_options);
@@ -515,6 +460,26 @@ mod tests {
                 .try_time_travel_selector()
                 .expect("timestamp selector"),
             Some(TimeTravelSelector::TimestampMillis(1234))
+        );
+
+        let version_options =
+            HashMap::from([(SCAN_VERSION_OPTION.to_string(), "my-tag".to_string())]);
+        let version_core = CoreOptions::new(&version_options);
+        assert_eq!(
+            version_core
+                .try_time_travel_selector()
+                .expect("version selector"),
+            Some(TimeTravelSelector::Version("my-tag"))
+        );
+
+        let version_num_options =
+            HashMap::from([(SCAN_VERSION_OPTION.to_string(), "3".to_string())]);
+        let version_num_core = CoreOptions::new(&version_num_options);
+        assert_eq!(
+            version_num_core
+                .try_time_travel_selector()
+                .expect("version numeric selector"),
+            Some(TimeTravelSelector::Version("3"))
         );
     }
 

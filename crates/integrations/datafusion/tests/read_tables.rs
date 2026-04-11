@@ -383,10 +383,10 @@ async fn test_missing_database_returns_no_schema() {
 // ======================= Time Travel Tests =======================
 
 /// Helper: create a SessionContext with catalog + relation planner for time travel.
-/// Uses BigQuery dialect to enable `FOR SYSTEM_TIME AS OF` syntax.
+/// Uses Databricks dialect to enable `VERSION AS OF` and `TIMESTAMP AS OF` syntax.
 async fn create_time_travel_context() -> SessionContext {
     let catalog = create_catalog();
-    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "BigQuery");
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Databricks");
     let ctx = SessionContext::new_with_config(config);
     ctx.register_catalog(
         "paimon",
@@ -403,7 +403,7 @@ async fn test_time_travel_by_snapshot_id() {
 
     // Snapshot 1: should contain only the first insert (alice, bob)
     let batches = ctx
-        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 1")
+        .sql("SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 1")
         .await
         .expect("time travel query should parse")
         .collect()
@@ -420,7 +420,7 @@ async fn test_time_travel_by_snapshot_id() {
 
     // Snapshot 2 (latest): should contain all rows
     let batches = ctx
-        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 2")
+        .sql("SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 2")
         .await
         .expect("time travel query should parse")
         .collect()
@@ -443,11 +443,21 @@ async fn test_time_travel_by_snapshot_id() {
 
 #[tokio::test]
 async fn test_time_travel_by_tag_name() {
-    let ctx = create_time_travel_context().await;
+    // Tag-based time travel uses `scan.version` option directly since
+    // `VERSION AS OF` in SQL only accepts numeric values.
+    let provider = create_provider_with_options(
+        "time_travel_table",
+        HashMap::from([("scan.version".to_string(), "snapshot1".to_string())]),
+    )
+    .await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("time_travel_table", Arc::new(provider))
+        .expect("Failed to register table");
 
     // Tag 'snapshot1' points to snapshot 1: should contain only (alice, bob)
     let batches = ctx
-        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 'snapshot1'")
+        .sql("SELECT id, name FROM time_travel_table")
         .await
         .expect("tag time travel query should parse")
         .collect()
@@ -463,8 +473,18 @@ async fn test_time_travel_by_tag_name() {
     );
 
     // Tag 'snapshot2' points to snapshot 2: should contain all rows
-    let batches = ctx
-        .sql("SELECT id, name FROM paimon.default.time_travel_table FOR SYSTEM_TIME AS OF 'snapshot2'")
+    let provider2 = create_provider_with_options(
+        "time_travel_table",
+        HashMap::from([("scan.version".to_string(), "snapshot2".to_string())]),
+    )
+    .await;
+
+    let ctx2 = SessionContext::new();
+    ctx2.register_table("time_travel_table", Arc::new(provider2))
+        .expect("Failed to register table");
+
+    let batches = ctx2
+        .sql("SELECT id, name FROM time_travel_table")
         .await
         .expect("tag time travel query should parse")
         .collect()
@@ -489,11 +509,11 @@ async fn test_time_travel_by_tag_name() {
 async fn test_time_travel_conflicting_selectors_fail() {
     let provider = create_provider_with_options(
         "time_travel_table",
-        HashMap::from([("scan.tag-name".to_string(), "snapshot1".to_string())]),
+        HashMap::from([("scan.timestamp-millis".to_string(), "1234".to_string())]),
     )
     .await;
 
-    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "BigQuery");
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Databricks");
     let ctx = SessionContext::new_with_config(config);
     ctx.register_table("time_travel_table", Arc::new(provider))
         .expect("Failed to register table");
@@ -501,7 +521,7 @@ async fn test_time_travel_conflicting_selectors_fail() {
         .expect("Failed to register relation planner");
 
     let err = ctx
-        .sql("SELECT id, name FROM time_travel_table FOR SYSTEM_TIME AS OF 2")
+        .sql("SELECT id, name FROM time_travel_table VERSION AS OF 2")
         .await
         .expect("time travel query should parse")
         .collect()
@@ -514,20 +534,16 @@ async fn test_time_travel_conflicting_selectors_fail() {
         "unexpected conflict error: {message}"
     );
     assert!(
-        message.contains("scan.snapshot-id"),
-        "conflict error should mention scan.snapshot-id: {message}"
-    );
-    assert!(
-        message.contains("scan.tag-name"),
-        "conflict error should mention scan.tag-name: {message}"
+        message.contains("scan.version"),
+        "conflict error should mention scan.version: {message}"
     );
 }
 
 #[tokio::test]
-async fn test_time_travel_invalid_numeric_selector_fails() {
+async fn test_time_travel_invalid_version_fails() {
     let provider = create_provider_with_options(
         "time_travel_table",
-        HashMap::from([("scan.snapshot-id".to_string(), "not-a-number".to_string())]),
+        HashMap::from([("scan.version".to_string(), "nonexistent-tag".to_string())]),
     )
     .await;
 
@@ -541,12 +557,12 @@ async fn test_time_travel_invalid_numeric_selector_fails() {
         .expect("query should parse")
         .collect()
         .await
-        .expect_err("invalid numeric time-travel selector should fail");
+        .expect_err("invalid version should fail");
 
     let message = err.to_string();
     assert!(
-        message.contains("Invalid value for scan.snapshot-id"),
-        "unexpected invalid selector error: {message}"
+        message.contains("is not a valid tag name or snapshot id"),
+        "unexpected invalid version error: {message}"
     );
 }
 

@@ -45,7 +45,7 @@ pub(crate) fn write_int_parquet_file(
 
     let props = max_row_group_size.map(|size| {
         WriterProperties::builder()
-            .set_max_row_group_size(size)
+            .set_max_row_group_row_count(Some(size))
             .build()
     });
     let file = File::create(path).unwrap();

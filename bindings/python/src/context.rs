@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use datafusion::catalog::CatalogProvider;
@@ -24,7 +23,6 @@ use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use paimon::{CatalogFactory, Options};
 use paimon_datafusion::PaimonCatalogProvider;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
@@ -52,23 +50,8 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<'_, PyAny>) -> PyResult<FFI_Logic
 
     let capsule = capsule.cast::<PyCapsule>()?;
     let expected_name = c"datafusion_logical_extension_codec";
-    match capsule.name()? {
-        Some(name) if name == expected_name => {}
-        Some(name) => {
-            return Err(PyValueError::new_err(format!(
-                "Expected capsule named {expected_name:?}, got {name:?}"
-            )));
-        }
-        None => {
-            return Err(PyValueError::new_err(format!(
-                "Expected capsule named {expected_name:?}, got unnamed capsule"
-            )));
-        }
-    }
-
-    let data = NonNull::new(capsule.pointer().cast::<FFI_LogicalExtensionCodec>())
-        .ok_or_else(|| PyValueError::new_err("Null logical extension codec capsule pointer"))?;
-    let codec = unsafe { data.as_ref() };
+    let ptr = capsule.pointer_checked(Some(expected_name))?;
+    let codec = unsafe { ptr.cast::<FFI_LogicalExtensionCodec>().as_ref() };
 
     Ok(codec.clone())
 }

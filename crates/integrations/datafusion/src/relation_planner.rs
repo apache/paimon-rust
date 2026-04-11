@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Custom [`RelationPlanner`] for Paimon time travel via `FOR SYSTEM_TIME AS OF`.
+//! Custom [`RelationPlanner`] for Paimon time travel via `VERSION AS OF` and `TIMESTAMP AS OF`.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -29,16 +29,16 @@ use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
 use datafusion::sql::sqlparser::ast::{self, TableFactor, TableVersion};
-use paimon::spec::{SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION};
+use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
 use crate::table::PaimonTableProvider;
 
-/// A [`RelationPlanner`] that intercepts `FOR SYSTEM_TIME AS OF` clauses
-/// on Paimon tables and resolves them to time travel options.
+/// A [`RelationPlanner`] that intercepts `VERSION AS OF` and `TIMESTAMP AS OF`
+/// clauses on Paimon tables and resolves them to time travel options.
 ///
-/// - Integer literal → sets `scan.snapshot-id` option on the table.
-/// - String literal (timestamp) → parsed as a timestamp, sets `scan.timestamp-millis` option.
-/// - String literal (other) → sets `scan.tag-name` option on the table.
+/// - `VERSION AS OF <integer or string>` → sets `scan.version` option on the table.
+///   At scan time, the version is resolved: tag name (if exists) → snapshot id → error.
+/// - `TIMESTAMP AS OF <timestamp string>` → parsed as a timestamp, sets `scan.timestamp-millis`.
 #[derive(Debug)]
 pub struct PaimonRelationPlanner;
 
@@ -67,12 +67,13 @@ impl RelationPlanner for PaimonRelationPlanner {
             ..
         } = relation
         else {
-            return Ok(RelationPlanning::Original(relation));
+            return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        let version_expr = match version {
-            Some(TableVersion::ForSystemTimeAsOf(expr)) => expr.clone(),
-            _ => return Ok(RelationPlanning::Original(relation)),
+        let extra_options = match version {
+            Some(TableVersion::VersionAsOf(expr)) => resolve_version_as_of(expr)?,
+            Some(TableVersion::TimestampAsOf(expr)) => resolve_timestamp_as_of(expr)?,
+            _ => return Ok(RelationPlanning::Original(Box::new(relation))),
         };
 
         // Resolve the table reference.
@@ -84,10 +85,9 @@ impl RelationPlanner for PaimonRelationPlanner {
 
         // Check if this is a Paimon table.
         let Some(paimon_provider) = provider.as_any().downcast_ref::<PaimonTableProvider>() else {
-            return Ok(RelationPlanning::Original(relation));
+            return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        let extra_options = resolve_time_travel_options(&version_expr)?;
         let new_table = paimon_provider.table().copy_with_options(extra_options);
         let new_provider = PaimonTableProvider::try_new(new_table)?;
         let new_source = provider_as_source(Arc::new(new_provider));
@@ -98,7 +98,9 @@ impl RelationPlanner for PaimonRelationPlanner {
         };
 
         let plan = LogicalPlanBuilder::scan(table_ref, new_source, None)?.build()?;
-        Ok(RelationPlanning::Planned(PlannedRelation::new(plan, alias)))
+        Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
+            plan, alias,
+        ))))
     }
 }
 
@@ -136,45 +138,47 @@ fn object_name_to_table_reference(
     }
 }
 
-/// Resolve `FOR SYSTEM_TIME AS OF <expr>` into table options.
+/// Resolve `VERSION AS OF <expr>` into `scan.version` option.
 ///
-/// - Integer literal → `{"scan.snapshot-id": "N"}`
-/// - String literal (timestamp `YYYY-MM-DD HH:MM:SS`) → `{"scan.timestamp-millis": "M"}`
-/// - String literal (other) → `{"scan.tag-name": "S"}`
-fn resolve_time_travel_options(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
+/// The raw value (integer or string) is passed through as-is.
+/// Resolution (tag vs snapshot id) happens at scan time in `TableScan`.
+fn resolve_version_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
+    let version = match expr {
+        ast::Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.clone(),
+            ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => s.clone(),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Plan(format!(
+                    "Unsupported VERSION AS OF expression: {expr}"
+                )))
+            }
+        },
+        _ => {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "Unsupported VERSION AS OF expression: {expr}. Expected an integer snapshot id or a tag name."
+            )))
+        }
+    };
+    Ok(HashMap::from([(SCAN_VERSION_OPTION.to_string(), version)]))
+}
+
+/// Resolve `TIMESTAMP AS OF <expr>` into `scan.timestamp-millis` option.
+fn resolve_timestamp_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
-            ast::Value::Number(n, _) => {
-                // Validate it's a valid integer
-                n.parse::<i64>().map_err(|e| {
-                    datafusion::error::DataFusionError::Plan(format!(
-                        "Invalid snapshot id '{n}': {e}"
-                    ))
-                })?;
+            ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                let millis = parse_timestamp_to_millis(s)?;
                 Ok(HashMap::from([(
-                    SCAN_SNAPSHOT_ID_OPTION.to_string(),
-                    n.clone(),
+                    SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
+                    millis.to_string(),
                 )]))
             }
-            ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
-                // Try parsing as timestamp first; fall back to tag name.
-                match parse_timestamp_to_millis(s) {
-                    Ok(timestamp_millis) => Ok(HashMap::from([(
-                        SCAN_TIMESTAMP_MILLIS_OPTION.to_string(),
-                        timestamp_millis.to_string(),
-                    )])),
-                    Err(_) => Ok(HashMap::from([(
-                        SCAN_TAG_NAME_OPTION.to_string(),
-                        s.clone(),
-                    )])),
-                }
-            }
             _ => Err(datafusion::error::DataFusionError::Plan(format!(
-                "Unsupported time travel expression: {expr}"
+                "Unsupported TIMESTAMP AS OF expression: {expr}. Expected a timestamp string."
             ))),
         },
         _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "Unsupported time travel expression: {expr}. Expected an integer snapshot id, a timestamp string, or a tag name."
+            "Unsupported TIMESTAMP AS OF expression: {expr}. Expected a timestamp string."
         ))),
     }
 }

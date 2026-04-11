@@ -51,7 +51,7 @@ pub struct PaimonTableScan {
     /// Paimon splits that DataFusion partition `i` will read.
     /// Wrapped in `Arc` to avoid deep-cloning `DataSplit` metadata in `execute()`.
     planned_partitions: Vec<Arc<[DataSplit]>>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     /// Optional limit on the number of rows to return.
     limit: Option<usize>,
 }
@@ -65,12 +65,12 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
     ) -> Self {
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(planned_partitions.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             table,
             projected_columns,
@@ -109,7 +109,7 @@ impl ExecutionPlan for PaimonTableScan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -166,10 +166,6 @@ impl ExecutionPlan for PaimonTableScan {
             self.schema(),
             futures::stream::once(fut).try_flatten(),
         )))
-    }
-
-    fn statistics(&self) -> DFResult<Statistics> {
-        self.partition_statistics(None)
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {

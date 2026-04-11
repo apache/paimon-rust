@@ -1699,7 +1699,7 @@ async fn test_time_travel_by_snapshot_id() {
 
     // Snapshot 1: (1, 'alice'), (2, 'bob')
     let table_snap1 = table.copy_with_options(HashMap::from([(
-        "scan.snapshot-id".to_string(),
+        "scan.version".to_string(),
         "1".to_string(),
     )]));
     let rb = table_snap1.new_read_builder();
@@ -1720,7 +1720,7 @@ async fn test_time_travel_by_snapshot_id() {
 
     // Snapshot 2: (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, 'dave')
     let table_snap2 = table.copy_with_options(HashMap::from([(
-        "scan.snapshot-id".to_string(),
+        "scan.version".to_string(),
         "2".to_string(),
     )]));
     let rb2 = table_snap2.new_read_builder();
@@ -1753,7 +1753,7 @@ async fn test_time_travel_by_tag_name() {
 
     // Tag 'snapshot1' -> snapshot 1: (1, 'alice'), (2, 'bob')
     let table_tag1 = table.copy_with_options(HashMap::from([(
-        "scan.tag-name".to_string(),
+        "scan.version".to_string(),
         "snapshot1".to_string(),
     )]));
     let rb = table_tag1.new_read_builder();
@@ -1774,7 +1774,7 @@ async fn test_time_travel_by_tag_name() {
 
     // Tag 'snapshot2' -> snapshot 2: all 4 rows
     let table_tag2 = table.copy_with_options(HashMap::from([(
-        "scan.tag-name".to_string(),
+        "scan.version".to_string(),
         "snapshot2".to_string(),
     )]));
     let rb2 = table_tag2.new_read_builder();
@@ -1805,8 +1805,8 @@ async fn test_time_travel_conflicting_selectors_fail() {
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     let conflicted = table.copy_with_options(HashMap::from([
-        ("scan.tag-name".to_string(), "snapshot1".to_string()),
-        ("scan.snapshot-id".to_string(), "2".to_string()),
+        ("scan.version".to_string(), "snapshot1".to_string()),
+        ("scan.timestamp-millis".to_string(), "1234".to_string()),
     ]));
 
     let plan_err = conflicted
@@ -1823,12 +1823,12 @@ async fn test_time_travel_conflicting_selectors_fail() {
                 "unexpected conflict error: {message}"
             );
             assert!(
-                message.contains("scan.snapshot-id"),
-                "conflict error should mention scan.snapshot-id: {message}"
+                message.contains("scan.version"),
+                "conflict error should mention scan.version: {message}"
             );
             assert!(
-                message.contains("scan.tag-name"),
-                "conflict error should mention scan.tag-name: {message}"
+                message.contains("scan.timestamp-millis"),
+                "conflict error should mention scan.timestamp-millis: {message}"
             );
         }
         other => panic!("unexpected error: {other:?}"),
@@ -1836,13 +1836,13 @@ async fn test_time_travel_conflicting_selectors_fail() {
 }
 
 #[tokio::test]
-async fn test_time_travel_invalid_numeric_selector_fails() {
+async fn test_time_travel_invalid_version_fails() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
     let invalid = table.copy_with_options(HashMap::from([(
-        "scan.snapshot-id".to_string(),
-        "not-a-number".to_string(),
+        "scan.version".to_string(),
+        "nonexistent-tag".to_string(),
     )]));
 
     let plan_err = invalid
@@ -1850,13 +1850,13 @@ async fn test_time_travel_invalid_numeric_selector_fails() {
         .new_scan()
         .plan()
         .await
-        .expect_err("invalid numeric time-travel selector should fail");
+        .expect_err("invalid version should fail");
 
     match plan_err {
         Error::DataInvalid { message, .. } => {
             assert!(
-                message.contains("Invalid value for scan.snapshot-id"),
-                "unexpected invalid selector error: {message}"
+                message.contains("is not a valid tag name or snapshot id"),
+                "unexpected invalid version error: {message}"
             );
         }
         other => panic!("unexpected error: {other:?}"),

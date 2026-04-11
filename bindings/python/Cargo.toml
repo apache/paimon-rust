@@ -32,5 +32,5 @@ datafusion = { workspace = true }
 datafusion-ffi = { workspace = true }
 paimon = { path = "../../crates/paimon", features = ["storage-all"] }
 paimon-datafusion = { path = "../../crates/integrations/datafusion" }
-pyo3 = { version = "0.26", features = ["abi3-py310"] }
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
 tokio = { workspace = true }
