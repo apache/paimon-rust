@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use opendal::raw::normalize_root;
 use opendal::Operator;
 use snafu::ResultExt;
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
 use super::Storage;
@@ -309,6 +310,11 @@ impl FileWrite for opendal::Writer {
     }
 }
 
+/// Async streaming writer trait for format-level writers (e.g. parquet).
+pub trait AsyncFileWrite: tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T: tokio::io::AsyncWrite + Unpin + Send> AsyncFileWrite for T {}
+
 #[derive(Clone, Debug)]
 pub struct FileStatus {
     pub size: u64,
@@ -390,9 +396,21 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
+        Ok(Box::new(self.opendal_writer().await?))
+    }
+
+    /// Get an async streaming writer for format-level writes (e.g. parquet).
+    pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
         Ok(Box::new(
-            self.op.writer(&self.path[self.relative_path_pos..]).await?,
+            self.opendal_writer()
+                .await?
+                .into_futures_async_write()
+                .compat_write(),
         ))
+    }
+
+    async fn opendal_writer(&self) -> crate::Result<opendal::Writer> {
+        Ok(self.op.writer(&self.path[self.relative_path_pos..]).await?)
     }
 }
 

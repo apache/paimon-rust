@@ -27,12 +27,15 @@ const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
-const DEFAULT_BUCKET: i32 = 1;
+const DEFAULT_BUCKET: i32 = -1;
 const COMMIT_MAX_RETRIES_OPTION: &str = "commit.max-retries";
 const COMMIT_TIMEOUT_OPTION: &str = "commit.timeout";
 const COMMIT_MIN_RETRY_WAIT_OPTION: &str = "commit.min-retry-wait";
 const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
+const FILE_COMPRESSION_OPTION: &str = "file.compression";
+const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
@@ -43,6 +46,8 @@ pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
+const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 
 /// Typed accessors for common table options.
 ///
@@ -264,6 +269,41 @@ impl<'a> CoreOptions<'a> {
             .map(|v| v.eq_ignore_ascii_case("default"))
             .unwrap_or(true)
     }
+
+    /// Target file size for data files. Default is 128MB.
+    pub fn target_file_size(&self) -> i64 {
+        self.options
+            .get("target-file-size")
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
+    }
+
+    /// File compression codec (e.g. "lz4", "zstd", "snappy", "none").
+    /// Default is "zstd".
+    pub fn file_compression(&self) -> &str {
+        self.options
+            .get(FILE_COMPRESSION_OPTION)
+            .map(String::as_str)
+            .unwrap_or("zstd")
+    }
+
+    /// Zstd compression level. Only meaningful when `file.compression` is `"zstd"`.
+    /// Default is 1 (matching Paimon Java).
+    pub fn file_compression_zstd_level(&self) -> i32 {
+        self.options
+            .get(FILE_COMPRESSION_ZSTD_LEVEL_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// Parquet writer in-progress buffer size limit. Default is 256MB.
+    /// When the buffered data exceeds this, the writer flushes the current row group.
+    pub fn write_parquet_buffer_size(&self) -> i64 {
+        self.options
+            .get(WRITE_PARQUET_BUFFER_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or(DEFAULT_WRITE_PARQUET_BUFFER_SIZE)
+    }
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics.
@@ -421,7 +461,7 @@ mod tests {
     fn test_commit_options_defaults() {
         let options = HashMap::new();
         let core = CoreOptions::new(&options);
-        assert_eq!(core.bucket(), 1);
+        assert_eq!(core.bucket(), -1);
         assert_eq!(core.commit_max_retries(), 10);
         assert_eq!(core.commit_timeout_ms(), 120_000);
         assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
@@ -476,5 +516,22 @@ mod tests {
                 .expect("timestamp selector"),
             Some(TimeTravelSelector::TimestampMillis(1234))
         );
+    }
+
+    #[test]
+    fn test_write_options_defaults() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.write_parquet_buffer_size(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_write_options_custom() {
+        let options = HashMap::from([(
+            WRITE_PARQUET_BUFFER_SIZE_OPTION.to_string(),
+            "32mb".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.write_parquet_buffer_size(), 32 * 1024 * 1024);
     }
 }

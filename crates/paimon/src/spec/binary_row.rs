@@ -20,9 +20,14 @@
 
 use crate::spec::murmur_hash::hash_by_words;
 use crate::spec::{DataType, Datum};
+use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
+
+pub static EMPTY_SERIALIZED_ROW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| BinaryRowBuilder::new(0).build_serialized());
 
 /// Highest bit mask for detecting inline vs variable-length encoding.
 const HIGHEST_FIRST_BIT: u64 = 0x80 << 56;
@@ -605,6 +610,169 @@ pub fn datums_to_binary_row(datums: &[(&Option<Datum>, &DataType)]) -> Vec<u8> {
         }
     }
     builder.build_serialized()
+}
+
+/// Extract a Datum from an Arrow RecordBatch column at the given row index.
+pub fn extract_datum_from_arrow(
+    batch: &RecordBatch,
+    row_idx: usize,
+    col_idx: usize,
+    data_type: &DataType,
+) -> crate::Result<Option<Datum>> {
+    use arrow_array::Array;
+
+    let col = batch.column(col_idx);
+    if col.is_null(row_idx) {
+        return Ok(None);
+    }
+
+    let datum = match data_type {
+        DataType::Boolean(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?;
+            Datum::Bool(arr.value(row_idx))
+        }
+        DataType::TinyInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int8Array>()
+                .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?;
+            Datum::TinyInt(arr.value(row_idx))
+        }
+        DataType::SmallInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int16Array>()
+                .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?;
+            Datum::SmallInt(arr.value(row_idx))
+        }
+        DataType::Int(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .ok_or_else(|| type_mismatch_err("Int", col_idx))?;
+            Datum::Int(arr.value(row_idx))
+        }
+        DataType::BigInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?;
+            Datum::Long(arr.value(row_idx))
+        }
+        DataType::Float(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| type_mismatch_err("Float", col_idx))?;
+            Datum::Float(arr.value(row_idx))
+        }
+        DataType::Double(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .ok_or_else(|| type_mismatch_err("Double", col_idx))?;
+            Datum::Double(arr.value(row_idx))
+        }
+        DataType::Char(_) | DataType::VarChar(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| type_mismatch_err("String", col_idx))?;
+            Datum::String(arr.value(row_idx).to_string())
+        }
+        DataType::Date(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| type_mismatch_err("Date", col_idx))?;
+            Datum::Date(arr.value(row_idx))
+        }
+        DataType::Decimal(d) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?;
+            Datum::Decimal {
+                unscaled: arr.value(row_idx),
+                precision: d.precision(),
+                scale: d.scale(),
+            }
+        }
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .ok_or_else(|| type_mismatch_err("Binary", col_idx))?;
+            Datum::Bytes(arr.value(row_idx).to_vec())
+        }
+        DataType::Timestamp(ts) => {
+            if ts.precision() <= 3 {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                    .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?;
+                Datum::Timestamp {
+                    millis: arr.value(row_idx),
+                    nanos: 0,
+                }
+            } else {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                    .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?;
+                let micros = arr.value(row_idx);
+                Datum::Timestamp {
+                    millis: micros / 1000,
+                    nanos: ((micros % 1000) * 1000) as i32,
+                }
+            }
+        }
+        DataType::LocalZonedTimestamp(ts) => {
+            if ts.precision() <= 3 {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                    .ok_or_else(|| type_mismatch_err("LocalZonedTimestamp(ms)", col_idx))?;
+                Datum::LocalZonedTimestamp {
+                    millis: arr.value(row_idx),
+                    nanos: 0,
+                }
+            } else {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                    .ok_or_else(|| type_mismatch_err("LocalZonedTimestamp(us)", col_idx))?;
+                let micros = arr.value(row_idx);
+                Datum::LocalZonedTimestamp {
+                    millis: micros / 1000,
+                    nanos: ((micros % 1000) * 1000) as i32,
+                }
+            }
+        }
+        _ => {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Unsupported data type {:?} for Arrow extraction at column {}",
+                    data_type, col_idx
+                ),
+            });
+        }
+    };
+
+    Ok(Some(datum))
+}
+
+fn type_mismatch_err(expected: &str, col_idx: usize) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!(
+            "Arrow column {} type mismatch: expected {} compatible array",
+            col_idx, expected
+        ),
+        source: None,
+    }
 }
 
 #[cfg(test)]

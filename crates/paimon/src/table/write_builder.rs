@@ -19,9 +19,7 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
-use crate::spec::Datum;
-use crate::table::{Table, TableCommit};
-use std::collections::HashMap;
+use crate::table::{Table, TableCommit, TableWrite};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -31,7 +29,6 @@ use uuid::Uuid;
 pub struct WriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
-    overwrite_partition: Option<HashMap<String, Datum>>,
 }
 
 impl<'a> WriteBuilder<'a> {
@@ -39,25 +36,16 @@ impl<'a> WriteBuilder<'a> {
         Self {
             table,
             commit_user: Uuid::new_v4().to_string(),
-            overwrite_partition: None,
         }
-    }
-
-    /// Set overwrite mode. If `partition` is None, overwrites the entire table.
-    /// If `partition` is Some, overwrites only the specified partition.
-    pub fn overwrite(&mut self, partition: Option<HashMap<String, Datum>>) -> &mut Self {
-        self.overwrite_partition = Some(partition.unwrap_or_default());
-        self
     }
 
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
-        TableCommit::new(
-            self.table.clone(),
-            self.commit_user.clone(),
-            self.overwrite_partition.clone(),
-        )
+        TableCommit::new(self.table.clone(), self.commit_user.clone())
     }
 
-    // TODO: pub fn new_write(&self) -> TableWrite { ... }
+    /// Create a new TableWrite for writing Arrow data.
+    pub fn new_write(&self) -> crate::Result<TableWrite> {
+        TableWrite::new(self.table)
+    }
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Paimon table provider for DataFusion (read-only).
+//! Paimon table provider for DataFusion.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -23,11 +23,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::catalog::Session;
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::table::Table;
+
+use crate::physical_plan::PaimonDataSink;
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{build_pushed_predicate, classify_filter_pushdown};
@@ -176,6 +180,25 @@ impl TableProvider for PaimonTableProvider {
             limit,
             target,
         )
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let overwrite = match insert_op {
+            InsertOp::Append => false,
+            InsertOp::Overwrite => true,
+            other => {
+                return Err(datafusion::error::DataFusionError::NotImplemented(format!(
+                    "{other} is not supported for Paimon tables"
+                )));
+            }
+        };
+        let sink = PaimonDataSink::new(self.table.clone(), self.schema.clone(), overwrite);
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 
     fn supports_filters_pushdown(
@@ -372,5 +395,251 @@ mod tests {
             .expect("data filter should translate");
 
         assert_eq!(scan.pushed_predicate(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_and_read_back() {
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/test_df_insert_into";
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = paimon::table::Table::new(
+            file_io,
+            Identifier::new("default", "test_insert"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let provider = PaimonTableProvider::try_new(table).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+
+        // INSERT INTO
+        let result = ctx
+            .sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Verify count output
+        let count_array = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(count_array.value(0), 3);
+
+        // Read back
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((ids.value(i), vals.value(i)));
+            }
+        }
+        assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
+    }
+
+    #[tokio::test]
+    async fn test_insert_overwrite() {
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema, VarCharType};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/test_df_insert_overwrite";
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+
+        let schema = PaimonSchema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = paimon::table::Table::new(
+            file_io,
+            Identifier::new("default", "test_overwrite"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let provider = PaimonTableProvider::try_new(table).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+
+        // Initial INSERT: partition "a" and "b"
+        ctx.sql("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // INSERT OVERWRITE with only partition "a" data
+        // Should overwrite partition "a" but leave partition "b" intact
+        ctx.sql("INSERT OVERWRITE t VALUES ('a', 10), ('a', 20)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Read back
+        let batches = ctx
+            .sql("SELECT pt, id FROM t ORDER BY pt, id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let pts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((pts.value(i).to_string(), ids.value(i)));
+            }
+        }
+        // Partition "a" overwritten with new data, partition "b" untouched
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), 10),
+                ("a".to_string(), 20),
+                ("b".to_string(), 3),
+                ("b".to_string(), 4),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_overwrite_unpartitioned() {
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/test_df_insert_overwrite_unpart";
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = paimon::table::Table::new(
+            file_io,
+            Identifier::new("default", "test_overwrite_unpart"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let provider = PaimonTableProvider::try_new(table).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+
+        // Initial INSERT
+        ctx.sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // INSERT OVERWRITE on unpartitioned table — full table overwrite
+        ctx.sql("INSERT OVERWRITE t VALUES (4, 40), (5, 50)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((ids.value(i), vals.value(i)));
+            }
+        }
+        // Old data fully replaced
+        assert_eq!(rows, vec![(4, 40), (5, 50)]);
     }
 }

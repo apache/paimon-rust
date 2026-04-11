@@ -26,6 +26,7 @@ homepage.workspace = true
 [dependencies]
 paimon = { path = "../paimon" }
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 

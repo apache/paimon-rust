@@ -16,5 +16,7 @@
 // under the License.
 
 pub(crate) mod scan;
+pub(crate) mod sink;
 
 pub use scan::PaimonTableScan;
+pub use sink::PaimonDataSink;

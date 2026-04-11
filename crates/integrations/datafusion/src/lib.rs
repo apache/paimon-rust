@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache Paimon DataFusion Integration (read-only).
+//! Apache Paimon DataFusion Integration.
 //!
 //! Register a Paimon table as a DataFusion table provider to query it with SQL or DataFrame API.
 //!

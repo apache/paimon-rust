@@ -64,8 +64,10 @@ arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 futures = "0.3"
-parquet = { workspace = true, features = ["async", "zstd"] }
+tokio-util = { workspace = true, features = ["compat"] }
+parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
 orc-rust = "0.7.0"
 async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["json"] }

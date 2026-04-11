@@ -38,6 +38,7 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// (escaped directory path).
 ///
 /// Reference: `org.apache.paimon.utils.InternalRowPartitionComputer` in Java Paimon.
+#[derive(Debug)]
 pub(crate) struct PartitionComputer {
     partition_keys: Vec<String>,
     partition_fields: Vec<DataField>,

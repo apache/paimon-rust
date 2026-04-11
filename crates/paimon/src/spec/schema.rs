@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::spec::core_options::CoreOptions;
 use crate::spec::types::{DataType, RowType};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -114,6 +115,25 @@ impl TableSchema {
 
     pub fn time_millis(&self) -> i64 {
         self.time_millis
+    }
+
+    /// Compute the effective bucket key columns.
+    ///
+    /// Priority: explicit `bucket-key` option > primary keys > all non-partition fields.
+    pub fn bucket_keys(&self) -> Vec<String> {
+        let core_options = CoreOptions::new(&self.options);
+        if let Some(keys) = core_options.bucket_key() {
+            return keys;
+        }
+        if !self.primary_keys.is_empty() {
+            return self.primary_keys.clone();
+        }
+        let partition_set: HashSet<&str> = self.partition_keys.iter().map(String::as_str).collect();
+        self.fields
+            .iter()
+            .filter(|f| !partition_set.contains(f.name()))
+            .map(|f| f.name().to_string())
+            .collect()
     }
 }
 

@@ -33,6 +33,7 @@ mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
 mod table_scan;
+pub(crate) mod table_write;
 mod tag_manager;
 mod write_builder;
 
@@ -52,6 +53,7 @@ pub use source::{
 };
 pub use table_commit::TableCommit;
 pub use table_scan::TableScan;
+pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use write_builder::WriteBuilder;
 

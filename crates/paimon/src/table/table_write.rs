@@ -1,0 +1,783 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! TableWrite for writing Arrow data to Paimon tables.
+//!
+//! Reference: [pypaimon TableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
+//! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
+
+use crate::arrow::format::{create_format_writer, FormatFileWriter};
+use crate::io::FileIO;
+use crate::spec::stats::BinaryTableStats;
+use crate::spec::PartitionComputer;
+use crate::spec::{
+    extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
+    DataType, Datum, EMPTY_SERIALIZED_ROW,
+};
+use crate::table::commit_message::CommitMessage;
+use crate::table::Table;
+use crate::Result;
+use arrow_array::RecordBatch;
+use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::task::JoinSet;
+
+type PartitionBucketKey = (Vec<u8>, i32);
+
+/// TableWrite writes Arrow RecordBatches to Paimon data files.
+///
+/// Each (partition, bucket) pair gets its own `DataFileWriter` held in a HashMap.
+/// Batches are routed to the correct writer based on partition/bucket.
+///
+/// Call `prepare_commit()` to close all writers and collect
+/// `CommitMessage`s for use with `TableCommit`.
+///
+/// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
+pub struct TableWrite {
+    table: Table,
+    partition_writers: HashMap<PartitionBucketKey, DataFileWriter>,
+    partition_computer: PartitionComputer,
+    partition_keys: Vec<String>,
+    partition_field_indices: Vec<usize>,
+    bucket_key_indices: Vec<usize>,
+    total_buckets: i32,
+    schema_id: i64,
+    target_file_size: i64,
+    file_compression: String,
+    file_compression_zstd_level: i32,
+    write_buffer_size: i64,
+}
+
+impl TableWrite {
+    pub(crate) fn new(table: &Table) -> crate::Result<Self> {
+        let schema = table.schema();
+        let core_options = CoreOptions::new(schema.options());
+
+        if !schema.primary_keys().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "TableWrite does not support tables with primary keys".to_string(),
+            });
+        }
+        if core_options.data_evolution_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "TableWrite does not support data-evolution.enabled mode".to_string(),
+            });
+        }
+
+        let total_buckets = core_options.bucket();
+        if total_buckets != -1 && core_options.bucket_key().is_none() {
+            return Err(crate::Error::Unsupported {
+                message: "Append tables with fixed bucket must configure 'bucket-key'".to_string(),
+            });
+        }
+        let target_file_size = core_options.target_file_size();
+        let file_compression = core_options.file_compression().to_string();
+        let file_compression_zstd_level = core_options.file_compression_zstd_level();
+        let write_buffer_size = core_options.write_parquet_buffer_size();
+        let partition_keys: Vec<String> = schema.partition_keys().to_vec();
+        let fields = schema.fields();
+
+        let partition_field_indices: Vec<usize> = partition_keys
+            .iter()
+            .filter_map(|pk| fields.iter().position(|f| f.name() == pk))
+            .collect();
+
+        // Bucket keys: resolved by TableSchema
+        let bucket_keys = schema.bucket_keys();
+
+        let bucket_key_indices: Vec<usize> = bucket_keys
+            .iter()
+            .filter_map(|bk| fields.iter().position(|f| f.name() == bk))
+            .collect();
+
+        let partition_computer = PartitionComputer::new(
+            &partition_keys,
+            fields,
+            core_options.partition_default_name(),
+            core_options.legacy_partition_name(),
+        )
+        .unwrap();
+
+        Ok(Self {
+            table: table.clone(),
+            partition_writers: HashMap::new(),
+            partition_computer,
+            partition_keys,
+            partition_field_indices,
+            bucket_key_indices,
+            total_buckets,
+            schema_id: schema.id(),
+            target_file_size,
+            file_compression,
+            file_compression_zstd_level,
+            write_buffer_size,
+        })
+    }
+
+    /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
+    pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let grouped = self.divide_by_partition_bucket(batch)?;
+        for ((partition_bytes, bucket), sub_batch) in grouped {
+            self.write_bucket(partition_bytes, bucket, sub_batch)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Group rows by (partition_bytes, bucket) and return sub-batches.
+    fn divide_by_partition_bucket(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<Vec<(PartitionBucketKey, RecordBatch)>> {
+        // Fast path: no partitions and single bucket — skip per-row routing
+        if self.partition_field_indices.is_empty() && self.total_buckets <= 1 {
+            return Ok(vec![((EMPTY_SERIALIZED_ROW.clone(), 0), batch.clone())]);
+        }
+
+        let fields = self.table.schema().fields();
+        let mut groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
+
+        for row_idx in 0..batch.num_rows() {
+            let (partition_bytes, bucket) =
+                self.extract_partition_bucket(batch, row_idx, fields)?;
+            groups
+                .entry((partition_bytes, bucket))
+                .or_default()
+                .push(row_idx);
+        }
+
+        let mut result = Vec::with_capacity(groups.len());
+        for (key, row_indices) in groups {
+            let sub_batch = if row_indices.len() == batch.num_rows() {
+                batch.clone()
+            } else {
+                let indices = arrow_array::UInt32Array::from(
+                    row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                );
+                let columns: Vec<Arc<dyn arrow_array::Array>> = batch
+                    .columns()
+                    .iter()
+                    .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::DataInvalid {
+                        message: format!("Failed to take rows: {e}"),
+                        source: None,
+                    })?;
+                RecordBatch::try_new(batch.schema(), columns).map_err(|e| {
+                    crate::Error::DataInvalid {
+                        message: format!("Failed to create sub-batch: {e}"),
+                        source: None,
+                    }
+                })?
+            };
+            result.push((key, sub_batch));
+        }
+        Ok(result)
+    }
+
+    /// Write a batch directly to the DataFileWriter for the given (partition, bucket).
+    async fn write_bucket(
+        &mut self,
+        partition_bytes: Vec<u8>,
+        bucket: i32,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let key = (partition_bytes, bucket);
+        if !self.partition_writers.contains_key(&key) {
+            self.create_writer(key.0.clone(), key.1)?;
+        }
+        let writer = self.partition_writers.get_mut(&key).unwrap();
+        writer.write(&batch).await
+    }
+
+    /// Write multiple Arrow RecordBatches.
+    pub async fn write_arrow(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            self.write_arrow_batch(batch).await?;
+        }
+        Ok(())
+    }
+
+    /// Close all writers and collect CommitMessages for use with TableCommit.
+    /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        let writers: Vec<(PartitionBucketKey, DataFileWriter)> =
+            self.partition_writers.drain().collect();
+
+        let futures: Vec<_> = writers
+            .into_iter()
+            .map(|((partition_bytes, bucket), mut writer)| async move {
+                let files = writer.prepare_commit().await?;
+                Ok::<_, crate::Error>((partition_bytes, bucket, files))
+            })
+            .collect();
+
+        let results = futures::future::try_join_all(futures).await?;
+
+        let mut messages = Vec::new();
+        for (partition_bytes, bucket, files) in results {
+            if !files.is_empty() {
+                messages.push(CommitMessage::new(partition_bytes, bucket, files));
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Extract partition bytes and bucket for a single row.
+    fn extract_partition_bucket(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        fields: &[DataField],
+    ) -> Result<PartitionBucketKey> {
+        // Build partition BinaryRow
+        let partition_bytes = if self.partition_field_indices.is_empty() {
+            EMPTY_SERIALIZED_ROW.clone()
+        } else {
+            let mut builder = BinaryRowBuilder::new(self.partition_field_indices.len() as i32);
+            for (pos, &field_idx) in self.partition_field_indices.iter().enumerate() {
+                let field = &fields[field_idx];
+                match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
+                    Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
+                    None => builder.set_null_at(pos),
+                }
+            }
+            builder.build_serialized()
+        };
+
+        // Compute bucket
+        let bucket = if self.total_buckets <= 1 || self.bucket_key_indices.is_empty() {
+            0
+        } else {
+            let mut datums: Vec<(Datum, DataType)> = Vec::new();
+            for &field_idx in &self.bucket_key_indices {
+                let field = &fields[field_idx];
+                let datum = extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())?;
+                if let Some(d) = datum {
+                    datums.push((d, field.data_type().clone()));
+                }
+            }
+            let refs: Vec<(&Datum, &DataType)> = datums.iter().map(|(d, t)| (d, t)).collect();
+            BinaryRow::compute_bucket_from_datums(&refs, self.total_buckets).unwrap_or(0)
+        };
+
+        Ok((partition_bytes, bucket))
+    }
+
+    fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {
+        let partition_path = if self.partition_keys.is_empty() {
+            String::new()
+        } else {
+            let row = BinaryRow::from_serialized_bytes(&partition_bytes)?;
+            self.partition_computer.generate_partition_path(&row)?
+        };
+
+        let writer = DataFileWriter::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+            partition_path,
+            bucket,
+            self.schema_id,
+            self.target_file_size,
+            self.file_compression.clone(),
+            self.file_compression_zstd_level,
+            self.write_buffer_size,
+        );
+
+        self.partition_writers
+            .insert((partition_bytes, bucket), writer);
+        Ok(())
+    }
+}
+
+/// Internal writer that produces parquet data files for a single (partition, bucket).
+///
+/// Batches are accumulated into a single `FormatFileWriter` that streams directly
+/// to storage. Call `prepare_commit()` to finalize and collect file metadata.
+struct DataFileWriter {
+    file_io: FileIO,
+    table_location: String,
+    partition_path: String,
+    bucket: i32,
+    schema_id: i64,
+    target_file_size: i64,
+    file_compression: String,
+    file_compression_zstd_level: i32,
+    write_buffer_size: i64,
+    written_files: Vec<DataFileMeta>,
+    /// Background file close tasks spawned during rolling.
+    in_flight_closes: JoinSet<Result<DataFileMeta>>,
+    /// Current open format writer, lazily created on first write.
+    current_writer: Option<Box<dyn FormatFileWriter>>,
+    current_file_name: Option<String>,
+    current_row_count: i64,
+}
+
+impl DataFileWriter {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        file_io: FileIO,
+        table_location: String,
+        partition_path: String,
+        bucket: i32,
+        schema_id: i64,
+        target_file_size: i64,
+        file_compression: String,
+        file_compression_zstd_level: i32,
+        write_buffer_size: i64,
+    ) -> Self {
+        Self {
+            file_io,
+            table_location,
+            partition_path,
+            bucket,
+            schema_id,
+            target_file_size,
+            file_compression,
+            file_compression_zstd_level,
+            write_buffer_size,
+            written_files: Vec::new(),
+            in_flight_closes: JoinSet::new(),
+            current_writer: None,
+            current_file_name: None,
+            current_row_count: 0,
+        }
+    }
+
+    /// Write a RecordBatch. Rolls to a new file when target size is reached.
+    async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        if self.current_writer.is_none() {
+            self.open_new_file(batch.schema()).await?;
+        }
+
+        self.current_row_count += batch.num_rows() as i64;
+        self.current_writer.as_mut().unwrap().write(batch).await?;
+
+        // Roll to a new file if target size is reached — close in background
+        if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.target_file_size {
+            self.roll_file();
+        }
+
+        // Flush row group if in-progress buffer exceeds write_buffer_size
+        if let Some(w) = self.current_writer.as_mut() {
+            if w.in_progress_size() as i64 >= self.write_buffer_size {
+                w.flush().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
+        let file_name = format!(
+            "data-{}-{}.parquet",
+            uuid::Uuid::new_v4(),
+            self.written_files.len()
+        );
+
+        let bucket_dir = if self.partition_path.is_empty() {
+            format!("{}/bucket-{}", self.table_location, self.bucket)
+        } else {
+            format!(
+                "{}/{}/bucket-{}",
+                self.table_location, self.partition_path, self.bucket
+            )
+        };
+        self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
+
+        let file_path = format!("{}/{}", bucket_dir, file_name);
+        let output = self.file_io.new_output(&file_path)?;
+        let writer = create_format_writer(
+            &output,
+            schema,
+            &self.file_compression,
+            self.file_compression_zstd_level,
+        )
+        .await?;
+        self.current_writer = Some(writer);
+        self.current_file_name = Some(file_name);
+        self.current_row_count = 0;
+        Ok(())
+    }
+
+    /// Close the current file writer and record the file metadata.
+    async fn close_current_file(&mut self) -> Result<()> {
+        let writer = match self.current_writer.take() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let file_name = self.current_file_name.take().unwrap();
+
+        let row_count = self.current_row_count;
+        self.current_row_count = 0;
+        let file_size = writer.close().await? as i64;
+
+        let meta = Self::build_meta(file_name, file_size, row_count, self.schema_id);
+        self.written_files.push(meta);
+        Ok(())
+    }
+
+    /// Spawn the current writer's close in the background for non-blocking rolling.
+    fn roll_file(&mut self) {
+        let writer = match self.current_writer.take() {
+            Some(w) => w,
+            None => return,
+        };
+        let file_name = self.current_file_name.take().unwrap();
+        let row_count = self.current_row_count;
+        self.current_row_count = 0;
+        let schema_id = self.schema_id;
+
+        self.in_flight_closes.spawn(async move {
+            let file_size = writer.close().await? as i64;
+            Ok(Self::build_meta(file_name, file_size, row_count, schema_id))
+        });
+    }
+
+    /// Close the current writer and return all written file metadata.
+    async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
+        self.close_current_file().await?;
+        while let Some(result) = self.in_flight_closes.join_next().await {
+            let meta = result.map_err(|e| crate::Error::DataInvalid {
+                message: format!("Background file close task panicked: {e}"),
+                source: None,
+            })??;
+            self.written_files.push(meta);
+        }
+        Ok(std::mem::take(&mut self.written_files))
+    }
+
+    fn build_meta(
+        file_name: String,
+        file_size: i64,
+        row_count: i64,
+        schema_id: i64,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name,
+            file_size,
+            row_count,
+            min_key: EMPTY_SERIALIZED_ROW.clone(),
+            max_key: EMPTY_SERIALIZED_ROW.clone(),
+            key_stats: BinaryTableStats::new(
+                EMPTY_SERIALIZED_ROW.clone(),
+                EMPTY_SERIALIZED_ROW.clone(),
+                vec![],
+            ),
+            value_stats: BinaryTableStats::new(
+                EMPTY_SERIALIZED_ROW.clone(),
+                EMPTY_SERIALIZED_ROW.clone(),
+                vec![],
+            ),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id,
+            level: 0,
+            extra_files: vec![],
+            creation_time: Some(Utc::now()),
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0), // APPEND
+            value_stats_cols: Some(vec![]),
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{IntType, Schema, TableSchema, VarCharType};
+    use crate::table::{SnapshotManager, TableCommit};
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    fn test_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_partitioned_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_schema(),
+            None,
+        )
+    }
+
+    fn test_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_partitioned_schema(),
+            None,
+        )
+    }
+
+    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+    }
+
+    fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_partitioned_batch(pts: Vec<&str>, ids: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("pt", ArrowDataType::Utf8, false),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(pts)),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_and_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        let batch = make_batch(vec![1, 2, 3], vec![10, 20, 30]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, 0);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].row_count, 3);
+
+        // Commit and verify snapshot
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_write_partitioned() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_partitioned";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_partitioned_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        let batch = make_partitioned_batch(vec!["a", "b", "a"], vec![1, 2, 3]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        // Should have 2 commit messages (one per partition)
+        assert_eq!(messages.len(), 2);
+
+        let total_rows: i64 = messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(total_rows, 3);
+
+        // Commit and verify
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_batch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_empty";
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        let batch = make_batch(vec![], vec![]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_commit_reusable() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_reuse";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        // First write + prepare_commit
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages1 = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages1.len(), 1);
+        assert_eq!(messages1[0].new_files[0].row_count, 2);
+
+        // Second write + prepare_commit (reuse)
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4, 5], vec![30, 40, 50]))
+            .await
+            .unwrap();
+        let messages2 = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages2.len(), 1);
+        assert_eq!(messages2[0].new_files[0].row_count, 3);
+
+        // Empty prepare_commit is fine
+        let messages3 = table_write.prepare_commit().await.unwrap();
+        assert!(messages3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_batches() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_multi";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4], vec![30, 40]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        // Multiple batches accumulate into a single file
+        assert_eq!(messages[0].new_files.len(), 1);
+
+        let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 4);
+    }
+
+    #[tokio::test]
+    async fn test_write_rolling_on_target_file_size() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_rolling";
+        setup_dirs(&file_io, table_path).await;
+
+        // Create table with very small target-file-size to trigger rolling
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("target-file-size", "1b")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        // Write multiple batches — each should roll to a new file
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4], vec![30, 40]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        // With 1-byte target, each batch should produce a separate file
+        assert_eq!(messages[0].new_files.len(), 2);
+
+        let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 4);
+    }
+}

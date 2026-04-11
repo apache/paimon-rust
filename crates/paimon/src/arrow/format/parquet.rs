@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
-use crate::io::FileRead;
+use crate::io::{FileRead, OutputFile};
 use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -38,15 +38,100 @@ use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) struct ParquetFormatReader;
+
+/// Parquet implementation of [`FormatFileWriter`].
+/// Streams data directly to storage via `AsyncArrowWriter` + opendal.
+pub(crate) struct ParquetFormatWriter {
+    inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
+}
+
+impl ParquetFormatWriter {
+    pub(crate) async fn new(
+        output: &OutputFile,
+        schema: arrow_schema::SchemaRef,
+        compression: &str,
+        zstd_level: i32,
+    ) -> crate::Result<Self> {
+        let async_write = output.async_writer().await?;
+        let codec = parse_compression(compression, zstd_level);
+        let props = WriterProperties::builder().set_compression(codec).build();
+        let inner = AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to create parquet writer: {e}"),
+                source: None,
+            }
+        })?;
+        Ok(Self { inner })
+    }
+}
+
+/// Map Paimon `file.compression` value to parquet [`Compression`].
+fn parse_compression(codec: &str, zstd_level: i32) -> Compression {
+    match codec.to_ascii_lowercase().as_str() {
+        "zstd" => {
+            let level = ZstdLevel::try_new(zstd_level).unwrap_or_default();
+            Compression::ZSTD(level)
+        }
+        "lz4" => Compression::LZ4_RAW,
+        "snappy" => Compression::SNAPPY,
+        "gzip" | "gz" => Compression::GZIP(Default::default()),
+        "none" | "uncompressed" => Compression::UNCOMPRESSED,
+        _ => Compression::UNCOMPRESSED,
+    }
+}
+
+#[async_trait]
+impl FormatFileWriter for ParquetFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        self.inner
+            .write(batch)
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to write parquet batch: {e}"),
+                source: None,
+            })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.inner.bytes_written() + self.inner.in_progress_size()
+    }
+
+    fn in_progress_size(&self) -> usize {
+        self.inner.in_progress_size()
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to flush parquet writer: {e}"),
+                source: None,
+            })
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
+        self.inner
+            .finish()
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to close parquet writer: {e}"),
+                source: None,
+            })?;
+        Ok(self.inner.bytes_written() as u64)
+    }
+}
 
 #[async_trait]
 impl FormatFileReader for ParquetFormatReader {
@@ -1050,7 +1135,12 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::build_parquet_row_filter;
+    use super::ParquetFormatWriter;
+    use crate::arrow::format::FormatFileWriter;
+    use crate::io::FileIOBuilder;
     use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder};
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::sync::Arc;
 
@@ -1240,5 +1330,82 @@ mod tests {
         let merged: Vec<std::ops::Range<u64>> = vec![];
         let result = super::split_ranges_for_concurrency(merged, 4);
         assert!(result.is_empty());
+    }
+
+    fn writer_arrow_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]))
+    }
+
+    fn writer_test_batch(
+        schema: &Arc<ArrowSchema>,
+        ids: Vec<i32>,
+        values: Vec<i32>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_write_and_close() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_write_close.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+                .await
+                .unwrap(),
+        );
+
+        let batch = writer_test_batch(&schema, vec![1, 2, 3], vec![10, 20, 30]);
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        // Verify valid parquet by reading back
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_multiple_batches() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_multi.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+                .await
+                .unwrap(),
+        );
+
+        writer
+            .write(&writer_test_batch(&schema, vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        writer
+            .write(&writer_test_batch(&schema, vec![3, 4, 5], vec![30, 40, 50]))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
+        assert_eq!(total_rows, 5);
     }
 }
