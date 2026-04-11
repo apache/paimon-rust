@@ -18,6 +18,7 @@
 //! Paimon catalog integration for DataFusion.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -82,6 +83,50 @@ impl CatalogProvider for PaimonCatalogProvider {
                     Err(paimon::Error::DatabaseNotExist { .. }) => None,
                     Err(_) => None,
                 }
+            },
+            "paimon catalog access thread panicked",
+        )
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        _schema: Arc<dyn SchemaProvider>,
+    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
+        let catalog = Arc::clone(&self.catalog);
+        let name = name.to_string();
+        block_on_with_runtime(
+            async move {
+                catalog
+                    .create_database(&name, false, HashMap::new())
+                    .await
+                    .map_err(to_datafusion_error)?;
+                Ok(Some(
+                    Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
+                        as Arc<dyn SchemaProvider>,
+                ))
+            },
+            "paimon catalog access thread panicked",
+        )
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
+        let catalog = Arc::clone(&self.catalog);
+        let name = name.to_string();
+        block_on_with_runtime(
+            async move {
+                catalog
+                    .drop_database(&name, false, cascade)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                Ok(Some(
+                    Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
+                        as Arc<dyn SchemaProvider>,
+                ))
             },
             "paimon catalog access thread panicked",
         )
@@ -155,6 +200,39 @@ impl SchemaProvider for PaimonSchemaProvider {
                     Err(paimon::Error::TableNotExist { .. }) => false,
                     Err(_) => false,
                 }
+            },
+            "paimon catalog access thread panicked",
+        )
+    }
+
+    fn register_table(
+        &self,
+        _name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // The table is already created in the Paimon catalog by PaimonTableFactory.
+        // DataFusion calls register_table after the factory returns, so we just
+        // acknowledge it here.
+        Ok(Some(table))
+    }
+
+    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let catalog = Arc::clone(&self.catalog);
+        let identifier = Identifier::new(self.database.clone(), name);
+        block_on_with_runtime(
+            async move {
+                // Try to get the table first so we can return it.
+                let table = match catalog.get_table(&identifier).await {
+                    Ok(t) => t,
+                    Err(paimon::Error::TableNotExist { .. }) => return Ok(None),
+                    Err(e) => return Err(to_datafusion_error(e)),
+                };
+                let provider = PaimonTableProvider::try_new(table)?;
+                catalog
+                    .drop_table(&identifier, false)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
             },
             "paimon catalog access thread panicked",
         )
