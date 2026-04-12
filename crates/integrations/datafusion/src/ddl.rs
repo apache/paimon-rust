@@ -100,8 +100,11 @@ impl PaimonDdlHandler {
         match &statements[0] {
             Statement::CreateTable(create_table) => self.handle_create_table(create_table).await,
             Statement::AlterTable {
-                name, operations, ..
-            } => self.handle_alter_table(name, operations).await,
+                name,
+                operations,
+                if_exists,
+                ..
+            } => self.handle_alter_table(name, operations, *if_exists).await,
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -174,6 +177,7 @@ impl PaimonDdlHandler {
         &self,
         name: &ObjectName,
         operations: &[AlterTableOperation],
+        if_exists: bool,
     ) -> DFResult<DataFrame> {
         let identifier = self.resolve_table_name(name)?;
 
@@ -222,14 +226,14 @@ impl PaimonDdlHandler {
 
         if let Some(new_identifier) = rename_to {
             self.catalog
-                .rename_table(&identifier, &new_identifier, false)
+                .rename_table(&identifier, &new_identifier, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
         }
 
         if !changes.is_empty() {
             self.catalog
-                .alter_table(&identifier, changes, false)
+                .alter_table(&identifier, changes, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
         }
