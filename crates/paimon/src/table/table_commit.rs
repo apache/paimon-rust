@@ -54,6 +54,7 @@ pub struct TableCommit {
     commit_min_retry_wait_ms: u64,
     commit_max_retry_wait_ms: u64,
     row_tracking_enabled: bool,
+    partition_default_name: String,
 }
 
 impl TableCommit {
@@ -73,6 +74,7 @@ impl TableCommit {
         let commit_min_retry_wait_ms = core_options.commit_min_retry_wait_ms();
         let commit_max_retry_wait_ms = core_options.commit_max_retry_wait_ms();
         let row_tracking_enabled = core_options.row_tracking_enabled();
+        let partition_default_name = core_options.partition_default_name().to_string();
         Self {
             table,
             snapshot_manager,
@@ -84,6 +86,7 @@ impl TableCommit {
             commit_min_retry_wait_ms,
             commit_max_retry_wait_ms,
             row_tracking_enabled,
+            partition_default_name,
         }
     }
 
@@ -148,15 +151,13 @@ impl TableCommit {
 
         // Collect unique partition bytes
         let mut seen = std::collections::HashSet::new();
-        let mut partition_specs: Vec<HashMap<String, Datum>> = Vec::new();
+        let mut partition_specs: Vec<HashMap<String, Option<Datum>>> = Vec::new();
         for msg in commit_messages {
             if seen.insert(msg.partition.clone()) {
                 let row = BinaryRow::from_serialized_bytes(&msg.partition)?;
                 let mut spec = HashMap::new();
                 for (i, key) in partition_keys.iter().enumerate() {
-                    if let Some(datum) = extract_datum(&row, i, &data_types[i])? {
-                        spec.insert(key.clone(), datum);
-                    }
+                    spec.insert(key.clone(), extract_datum(&row, i, &data_types[i])?);
                 }
                 partition_specs.push(spec);
             }
@@ -170,18 +171,27 @@ impl TableCommit {
         Ok(Some(Predicate::or(predicates)))
     }
 
-    /// Build a partition predicate from key-value pairs.
-    fn build_partition_predicate(&self, partition: &HashMap<String, Datum>) -> Result<Predicate> {
+    /// Build a partition predicate from key-value pairs, handling NULL via IS NULL.
+    fn build_partition_predicate(
+        &self,
+        partition: &HashMap<String, Option<Datum>>,
+    ) -> Result<Predicate> {
         let pb = PredicateBuilder::new(&self.table.schema().partition_fields());
         let predicates: Vec<Predicate> = partition
             .iter()
-            .map(|(key, value)| pb.equal(key, value.clone()))
+            .map(|(key, value)| match value {
+                Some(v) => pb.equal(key, v.clone()),
+                None => pb.is_null(key),
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Predicate::and(predicates))
     }
 
     /// Drop specific partitions (OVERWRITE with only deletes).
-    pub async fn truncate_partitions(&self, partitions: Vec<HashMap<String, Datum>>) -> Result<()> {
+    pub async fn truncate_partitions(
+        &self,
+        partitions: Vec<HashMap<String, Option<Datum>>>,
+    ) -> Result<()> {
         if partitions.is_empty() {
             return Ok(());
         }
@@ -648,9 +658,11 @@ impl TableCommit {
         }
         let row = BinaryRow::from_serialized_bytes(partition_bytes)?;
         for (i, key) in partition_keys.iter().enumerate() {
-            if let Some(datum) = extract_datum(&row, i, &data_types[i])? {
-                spec.insert(key.clone(), datum.to_string());
-            }
+            let value = match extract_datum(&row, i, &data_types[i])? {
+                Some(datum) => datum.to_string(),
+                None => self.partition_default_name.clone(),
+            };
+            spec.insert(key.clone(), value);
         }
         Ok(spec)
     }
@@ -1018,8 +1030,8 @@ mod tests {
 
         // Drop partitions "a" and "c"
         let partitions = vec![
-            HashMap::from([("pt".to_string(), Datum::String("a".to_string()))]),
-            HashMap::from([("pt".to_string(), Datum::String("c".to_string()))]),
+            HashMap::from([("pt".to_string(), Some(Datum::String("a".to_string())))]),
+            HashMap::from([("pt".to_string(), Some(Datum::String("c".to_string())))]),
         ];
         commit.truncate_partitions(partitions).await.unwrap();
 
@@ -1029,5 +1041,59 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 600 - 100 (a) - 300 (c) = 200
         assert_eq!(snapshot.total_record_count(), Some(200));
+    }
+
+    fn null_partition_bytes() -> Vec<u8> {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.set_null_at(0);
+        builder.build_serialized()
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_null_partition() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_overwrite_null_partition";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_partitioned_commit(&file_io, table_path);
+
+        // Append data for partition "a", "b", and NULL
+        commit
+            .commit(vec![
+                CommitMessage::new(
+                    partition_bytes("a"),
+                    0,
+                    vec![test_data_file("data-a.parquet", 100)],
+                ),
+                CommitMessage::new(
+                    partition_bytes("b"),
+                    0,
+                    vec![test_data_file("data-b.parquet", 200)],
+                ),
+                CommitMessage::new(
+                    null_partition_bytes(),
+                    0,
+                    vec![test_data_file("data-null.parquet", 300)],
+                ),
+            ])
+            .await
+            .unwrap();
+
+        // Overwrite NULL partition only — should NOT affect "a" or "b"
+        commit
+            .overwrite(vec![CommitMessage::new(
+                null_partition_bytes(),
+                0,
+                vec![test_data_file("data-null2.parquet", 50)],
+            )])
+            .await
+            .unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 2);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        // 600 - 300 (delete null) + 50 (add null2) = 350
+        assert_eq!(snapshot.total_record_count(), Some(350));
     }
 }
