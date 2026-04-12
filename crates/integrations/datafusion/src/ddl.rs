@@ -389,3 +389,704 @@ fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     let df = ctx.read_batch(batch)?;
     Ok(df)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::TimeUnit;
+    use paimon::catalog::Database;
+    use paimon::spec::Schema as PaimonSchema;
+    use paimon::table::Table;
+
+    // ==================== Mock Catalog ====================
+
+    #[allow(clippy::enum_variant_names)]
+    #[derive(Debug)]
+    enum CatalogCall {
+        CreateTable {
+            identifier: Identifier,
+            schema: PaimonSchema,
+            ignore_if_exists: bool,
+        },
+        AlterTable {
+            identifier: Identifier,
+            changes: Vec<SchemaChange>,
+            ignore_if_not_exists: bool,
+        },
+        RenameTable {
+            from: Identifier,
+            to: Identifier,
+            ignore_if_not_exists: bool,
+        },
+    }
+
+    struct MockCatalog {
+        calls: Mutex<Vec<CatalogCall>>,
+    }
+
+    impl MockCatalog {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_calls(&self) -> Vec<CatalogCall> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    #[async_trait]
+    impl Catalog for MockCatalog {
+        async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn create_database(
+            &self,
+            _name: &str,
+            _ignore_if_exists: bool,
+            _properties: HashMap<String, String>,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn get_database(&self, _name: &str) -> paimon::Result<Database> {
+            unimplemented!()
+        }
+        async fn drop_database(
+            &self,
+            _name: &str,
+            _ignore_if_not_exists: bool,
+            _cascade: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn get_table(&self, _identifier: &Identifier) -> paimon::Result<Table> {
+            unimplemented!()
+        }
+        async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn create_table(
+            &self,
+            identifier: &Identifier,
+            creation: PaimonSchema,
+            ignore_if_exists: bool,
+        ) -> paimon::Result<()> {
+            self.calls.lock().unwrap().push(CatalogCall::CreateTable {
+                identifier: identifier.clone(),
+                schema: creation,
+                ignore_if_exists,
+            });
+            Ok(())
+        }
+        async fn drop_table(
+            &self,
+            _identifier: &Identifier,
+            _ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn rename_table(
+            &self,
+            from: &Identifier,
+            to: &Identifier,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            self.calls.lock().unwrap().push(CatalogCall::RenameTable {
+                from: from.clone(),
+                to: to.clone(),
+                ignore_if_not_exists,
+            });
+            Ok(())
+        }
+        async fn alter_table(
+            &self,
+            identifier: &Identifier,
+            changes: Vec<SchemaChange>,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            self.calls.lock().unwrap().push(CatalogCall::AlterTable {
+                identifier: identifier.clone(),
+                changes,
+                ignore_if_not_exists,
+            });
+            Ok(())
+        }
+    }
+
+    fn make_handler(catalog: Arc<MockCatalog>) -> PaimonDdlHandler {
+        PaimonDdlHandler::new(SessionContext::new(), catalog, "paimon")
+    }
+
+    // ==================== sql_data_type_to_arrow tests ====================
+
+    #[test]
+    fn test_sql_type_boolean() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Boolean).unwrap(),
+            ArrowDataType::Boolean
+        );
+    }
+
+    #[test]
+    fn test_sql_type_integers() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::TinyInt(None)).unwrap(),
+            ArrowDataType::Int8
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::SmallInt(None)).unwrap(),
+            ArrowDataType::Int16
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Int(None)).unwrap(),
+            ArrowDataType::Int32
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Integer(None)).unwrap(),
+            ArrowDataType::Int32
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::BigInt(None)).unwrap(),
+            ArrowDataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_sql_type_floats() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, ExactNumberInfo};
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Float(ExactNumberInfo::None)).unwrap(),
+            ArrowDataType::Float32
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Real).unwrap(),
+            ArrowDataType::Float32
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::DoublePrecision).unwrap(),
+            ArrowDataType::Float64
+        );
+    }
+
+    #[test]
+    fn test_sql_type_string_variants() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        for sql_type in [SqlType::Varchar(None), SqlType::Text, SqlType::String(None)] {
+            assert_eq!(
+                sql_data_type_to_arrow(&sql_type).unwrap(),
+                ArrowDataType::Utf8,
+                "failed for {sql_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_type_binary() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Bytea).unwrap(),
+            ArrowDataType::Binary
+        );
+    }
+
+    #[test]
+    fn test_sql_type_date() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Date).unwrap(),
+            ArrowDataType::Date32
+        );
+    }
+
+    #[test]
+    fn test_sql_type_timestamp_default() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
+        let result = sql_data_type_to_arrow(&SqlType::Timestamp(None, TimezoneInfo::None)).unwrap();
+        assert_eq!(
+            result,
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    #[test]
+    fn test_sql_type_timestamp_with_precision() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
+        // precision 0 => Second
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Timestamp(Some(0), TimezoneInfo::None)).unwrap(),
+            ArrowDataType::Timestamp(TimeUnit::Second, None)
+        );
+        // precision 3 => Millisecond
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Timestamp(Some(3), TimezoneInfo::None)).unwrap(),
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+        // precision 6 => Microsecond
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Timestamp(Some(6), TimezoneInfo::None)).unwrap(),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        // precision 9 => Nanosecond
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap(),
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+    }
+
+    #[test]
+    fn test_sql_type_timestamp_with_tz() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
+        let result =
+            sql_data_type_to_arrow(&SqlType::Timestamp(None, TimezoneInfo::WithTimeZone)).unwrap();
+        assert_eq!(
+            result,
+            ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn test_sql_type_decimal() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, ExactNumberInfo};
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::PrecisionAndScale(18, 2)))
+                .unwrap(),
+            ArrowDataType::Decimal128(18, 2)
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::Precision(10))).unwrap(),
+            ArrowDataType::Decimal128(10, 0)
+        );
+        assert_eq!(
+            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::None)).unwrap(),
+            ArrowDataType::Decimal128(10, 0)
+        );
+    }
+
+    #[test]
+    fn test_sql_type_unsupported() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        assert!(sql_data_type_to_arrow(&SqlType::Regclass).is_err());
+    }
+
+    // ==================== resolve_table_name tests ====================
+
+    #[test]
+    fn test_resolve_three_part_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, "SELECT * FROM paimon.mydb.mytable").unwrap();
+        if let Statement::Query(q) = &stmts[0] {
+            if let datafusion::sql::sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
+                    &sel.from[0].relation
+                {
+                    let id = handler.resolve_table_name(name).unwrap();
+                    assert_eq!(id.database(), "mydb");
+                    assert_eq!(id.object(), "mytable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_two_part_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, "SELECT * FROM mydb.mytable").unwrap();
+        if let Statement::Query(q) = &stmts[0] {
+            if let datafusion::sql::sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
+                    &sel.from[0].relation
+                {
+                    let id = handler.resolve_table_name(name).unwrap();
+                    assert_eq!(id.database(), "mydb");
+                    assert_eq!(id.object(), "mytable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_wrong_catalog_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, "SELECT * FROM other.mydb.mytable").unwrap();
+        if let Statement::Query(q) = &stmts[0] {
+            if let datafusion::sql::sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
+                    &sel.from[0].relation
+                {
+                    let err = handler.resolve_table_name(name).unwrap_err();
+                    assert!(err.to_string().contains("Unknown catalog"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_single_part_name_error() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, "SELECT * FROM mytable").unwrap();
+        if let Statement::Query(q) = &stmts[0] {
+            if let datafusion::sql::sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
+                if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
+                    &sel.from[0].relation
+                {
+                    let err = handler.resolve_table_name(name).unwrap_err();
+                    assert!(err.to_string().contains("at least database.table"));
+                }
+            }
+        }
+    }
+
+    // ==================== extract_options tests ====================
+
+    #[test]
+    fn test_extract_options_none() {
+        let opts = extract_options(&CreateTableOptions::None).unwrap();
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn test_extract_options_with_kv() {
+        // Parse a CREATE TABLE with WITH options to get a real CreateTableOptions
+        let dialect = GenericDialect {};
+        let stmts =
+            Parser::parse_sql(&dialect, "CREATE TABLE t (id INT) WITH ('bucket' = '4')").unwrap();
+        if let Statement::CreateTable(ct) = &stmts[0] {
+            let opts = extract_options(&ct.table_options).unwrap();
+            assert_eq!(opts.len(), 1);
+            assert_eq!(opts[0].0, "bucket");
+            assert_eq!(opts[0].1, "4");
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    // ==================== PaimonDdlHandler::sql integration tests ====================
+
+    #[tokio::test]
+    async fn test_create_table_basic() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("CREATE TABLE mydb.t1 (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id))")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable {
+            identifier,
+            schema,
+            ignore_if_exists,
+        } = &calls[0]
+        {
+            assert_eq!(identifier.database(), "mydb");
+            assert_eq!(identifier.object(), "t1");
+            assert!(!ignore_if_exists);
+            assert_eq!(schema.primary_keys(), &["id"]);
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_if_not_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("CREATE TABLE IF NOT EXISTS mydb.t1 (id INT)")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable {
+            ignore_if_exists, ..
+        } = &calls[0]
+        {
+            assert!(ignore_if_exists);
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_options() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("CREATE TABLE mydb.t1 (id INT) WITH ('bucket' = '4', 'file.format' = 'parquet')")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
+            let opts = schema.options();
+            assert_eq!(opts.get("bucket").unwrap(), "4");
+            assert_eq!(opts.get("file.format").unwrap(), "parquet");
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_three_part_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("CREATE TABLE paimon.mydb.t1 (id INT)")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        if let CatalogCall::CreateTable { identifier, .. } = &calls[0] {
+            assert_eq!(identifier.database(), "mydb");
+            assert_eq!(identifier.object(), "t1");
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 ADD COLUMN age INT")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable {
+            identifier,
+            changes,
+            ..
+        } = &calls[0]
+        {
+            assert_eq!(identifier.database(), "mydb");
+            assert_eq!(identifier.object(), "t1");
+            assert_eq!(changes.len(), 1);
+            assert!(
+                matches!(&changes[0], SchemaChange::AddColumn { field_name, .. } if field_name == "age")
+            );
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 DROP COLUMN age")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+            assert_eq!(changes.len(), 1);
+            assert!(
+                matches!(&changes[0], SchemaChange::DropColumn { field_name } if field_name == "age")
+            );
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rename_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 RENAME COLUMN old_name TO new_name")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+            assert_eq!(changes.len(), 1);
+            assert!(matches!(
+                &changes[0],
+                SchemaChange::RenameColumn { field_name, new_name }
+                    if field_name == "old_name" && new_name == "new_name"
+            ));
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rename_table() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 RENAME TO t2")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::RenameTable { from, to, .. } = &calls[0] {
+            assert_eq!(from.database(), "mydb");
+            assert_eq!(from.object(), "t1");
+            assert_eq!(to.database(), "mydb");
+            assert_eq!(to.object(), "t2");
+        } else {
+            panic!("expected RenameTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_if_exists_add_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE IF EXISTS mydb.t1 ADD COLUMN age INT")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable {
+            ignore_if_not_exists,
+            ..
+        } = &calls[0]
+        {
+            assert!(ignore_if_not_exists);
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_without_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 ADD COLUMN age INT")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        if let CatalogCall::AlterTable {
+            ignore_if_not_exists,
+            ..
+        } = &calls[0]
+        {
+            assert!(!ignore_if_not_exists);
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_if_exists_rename() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE IF EXISTS mydb.t1 RENAME TO t2")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::RenameTable {
+            from,
+            to,
+            ignore_if_not_exists,
+        } = &calls[0]
+        {
+            assert!(ignore_if_not_exists);
+            assert_eq!(from.object(), "t1");
+            assert_eq!(to.object(), "t2");
+        } else {
+            panic!("expected RenameTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rename_three_part_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE paimon.mydb.t1 RENAME TO t2")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::RenameTable { from, to, .. } = &calls[0] {
+            assert_eq!(from.database(), "mydb");
+            assert_eq!(from.object(), "t1");
+            assert_eq!(to.database(), "mydb");
+            assert_eq!(to.object(), "t2");
+        } else {
+            panic!("expected RenameTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_parse_error() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let result = handler.sql("NOT VALID SQL !!!").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("SQL parse error"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_statements_error() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let result = handler.sql("SELECT 1; SELECT 2").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one SQL statement"));
+    }
+
+    #[tokio::test]
+    async fn test_non_ddl_delegates_to_datafusion() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+        // SELECT should be delegated to DataFusion, not intercepted
+        let df = handler.sql("SELECT 1 AS x").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        // No catalog calls
+        assert!(catalog.take_calls().is_empty());
+    }
+}
