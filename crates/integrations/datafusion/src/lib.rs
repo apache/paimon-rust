@@ -46,7 +46,6 @@ mod physical_plan;
 mod relation_planner;
 pub mod runtime;
 mod table;
-mod table_factory;
 
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use ddl::PaimonDdlHandler;
@@ -56,4 +55,3 @@ pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
 pub use table::PaimonTableProvider;
-pub use table_factory::PaimonTableFactory;

@@ -210,8 +210,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         _name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // The table is already created in the Paimon catalog by PaimonTableFactory.
-        // DataFusion calls register_table after the factory returns, so we just
+        // DataFusion calls register_table after table creation, so we just
         // acknowledge it here.
         Ok(Some(table))
     }

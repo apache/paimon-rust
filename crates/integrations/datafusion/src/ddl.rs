@@ -110,6 +110,11 @@ impl PaimonDdlHandler {
     }
 
     async fn handle_create_table(&self, ct: &CreateTable) -> DFResult<DataFrame> {
+        if ct.external {
+            return Err(DataFusionError::Plan(
+                "CREATE EXTERNAL TABLE is not supported. Use CREATE TABLE instead.".to_string(),
+            ));
+        }
         if ct.location.is_some() {
             return Err(DataFusionError::Plan(
                 "LOCATION is not supported for Paimon tables. Table path is determined by the catalog warehouse.".to_string(),
@@ -1075,6 +1080,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly one SQL statement"));
+    }
+
+    #[tokio::test]
+    async fn test_create_external_table_rejected() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let result = handler
+            .sql("CREATE EXTERNAL TABLE mydb.t1 (id INT) STORED AS PARQUET")
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("CREATE EXTERNAL TABLE is not supported"));
     }
 
     #[tokio::test]

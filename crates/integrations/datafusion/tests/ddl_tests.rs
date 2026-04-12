@@ -208,7 +208,7 @@ async fn test_create_table_if_not_exists() {
 }
 
 #[tokio::test]
-async fn test_create_table_with_location_rejected() {
+async fn test_create_external_table_rejected() {
     let (_tmp, catalog) = create_test_env();
     let handler = create_handler(catalog.clone());
 
@@ -217,7 +217,6 @@ async fn test_create_table_with_location_rejected() {
         .await
         .unwrap();
 
-    // EXTERNAL TABLE with LOCATION is the only way sqlparser populates the location field
     let result = handler
         .sql(
             "CREATE EXTERNAL TABLE paimon.mydb.bad (
@@ -227,14 +226,11 @@ async fn test_create_table_with_location_rejected() {
         )
         .await;
 
-    assert!(
-        result.is_err(),
-        "LOCATION should be rejected for Paimon tables"
-    );
+    assert!(result.is_err(), "CREATE EXTERNAL TABLE should be rejected");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("LOCATION is not supported"),
-        "Error should mention LOCATION is not supported, got: {err_msg}"
+        err_msg.contains("CREATE EXTERNAL TABLE is not supported"),
+        "Error should mention CREATE EXTERNAL TABLE is not supported, got: {err_msg}"
     );
 }
 
