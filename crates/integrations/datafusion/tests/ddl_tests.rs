@@ -22,6 +22,7 @@ use std::sync::Arc;
 use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
+use paimon::spec::{ArrayType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, PaimonDdlHandler, PaimonRelationPlanner};
 use tempfile::TempDir;
@@ -232,6 +233,104 @@ async fn test_create_external_table_rejected() {
         err_msg.contains("CREATE EXTERNAL TABLE is not supported"),
         "Error should mention CREATE EXTERNAL TABLE is not supported, got: {err_msg}"
     );
+}
+
+// ======================= CREATE TABLE with complex types =======================
+
+#[tokio::test]
+async fn test_create_table_with_array_and_map() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.mydb.complex_types (
+                id INT NOT NULL,
+                tags ARRAY<STRING>,
+                props MAP(STRING, INT),
+                PRIMARY KEY (id)
+            )",
+        )
+        .await
+        .expect("CREATE TABLE with ARRAY and MAP should succeed");
+
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "complex_types"))
+        .await
+        .unwrap();
+    let schema = table.schema();
+    assert_eq!(schema.fields().len(), 3);
+    assert_eq!(schema.primary_keys(), &["id"]);
+
+    // Verify ARRAY<STRING> column
+    let tags_field = &schema.fields()[1];
+    assert_eq!(tags_field.name(), "tags");
+    assert_eq!(
+        *tags_field.data_type(),
+        DataType::Array(ArrayType::new(
+            DataType::VarChar(VarCharType::string_type())
+        ))
+    );
+
+    // Verify MAP(STRING, INT) column
+    let props_field = &schema.fields()[2];
+    assert_eq!(props_field.name(), "props");
+    assert_eq!(
+        *props_field.data_type(),
+        DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type())
+                .copy_with_nullable(false)
+                .unwrap(),
+            DataType::Int(IntType::new()),
+        ))
+    );
+}
+
+#[tokio::test]
+async fn test_create_table_with_row_type() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.mydb.row_table (
+                id INT NOT NULL,
+                address STRUCT<city STRING, zip INT>,
+                PRIMARY KEY (id)
+            )",
+        )
+        .await
+        .expect("CREATE TABLE with STRUCT should succeed");
+
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "row_table"))
+        .await
+        .unwrap();
+    let schema = table.schema();
+    assert_eq!(schema.fields().len(), 2);
+
+    // Verify STRUCT<city STRING, zip INT> column
+    let address_field = &schema.fields()[1];
+    assert_eq!(address_field.name(), "address");
+    if let DataType::Row(row) = address_field.data_type() {
+        assert_eq!(row.fields().len(), 2);
+        assert_eq!(row.fields()[0].name(), "city");
+        assert!(matches!(row.fields()[0].data_type(), DataType::VarChar(_)));
+        assert_eq!(row.fields()[1].name(), "zip");
+        assert!(matches!(row.fields()[1].data_type(), DataType::Int(_)));
+    } else {
+        panic!("expected Row type for address column");
+    }
 }
 
 // ======================= DROP TABLE =======================

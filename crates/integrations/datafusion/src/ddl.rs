@@ -292,11 +292,11 @@ fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
     ))
 }
 
-/// Minimal conversion from sqlparser SQL data types to Arrow data types.
+/// Convert a sqlparser SQL data type to an Arrow data type.
 fn sql_data_type_to_arrow(
     sql_type: &datafusion::sql::sqlparser::ast::DataType,
 ) -> DFResult<ArrowDataType> {
-    use datafusion::sql::sqlparser::ast::DataType as SqlType;
+    use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
     match sql_type {
         SqlType::Boolean => Ok(ArrowDataType::Boolean),
         SqlType::TinyInt(_) => Ok(ArrowDataType::Int8),
@@ -337,8 +337,54 @@ fn sql_data_type_to_arrow(
             };
             Ok(ArrowDataType::Decimal128(p, s))
         }
+        SqlType::Array(elem_def) => {
+            let elem_type = match elem_def {
+                ArrayElemTypeDef::AngleBracket(t)
+                | ArrayElemTypeDef::SquareBracket(t, _)
+                | ArrayElemTypeDef::Parenthesis(t) => sql_data_type_to_arrow(t)?,
+                ArrayElemTypeDef::None => {
+                    return Err(DataFusionError::Plan(
+                        "ARRAY type requires an element type".to_string(),
+                    ));
+                }
+            };
+            Ok(ArrowDataType::List(Arc::new(Field::new(
+                "element", elem_type, true,
+            ))))
+        }
+        SqlType::Map(key_type, value_type) => {
+            let key = sql_data_type_to_arrow(key_type)?;
+            let value = sql_data_type_to_arrow(value_type)?;
+            let entries = Field::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        Field::new("key", key, false),
+                        Field::new("value", value, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            );
+            Ok(ArrowDataType::Map(Arc::new(entries), false))
+        }
+        SqlType::Struct(fields, _) => {
+            let arrow_fields: Vec<Field> = fields
+                .iter()
+                .map(|f| {
+                    let name = f
+                        .field_name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_default();
+                    let dt = sql_data_type_to_arrow(&f.field_type)?;
+                    Ok(Field::new(name, dt, true))
+                })
+                .collect::<DFResult<_>>()?;
+            Ok(ArrowDataType::Struct(arrow_fields.into()))
+        }
         _ => Err(DataFusionError::Plan(format!(
-            "Unsupported SQL data type for ALTER TABLE: {sql_type}"
+            "Unsupported SQL data type: {sql_type}"
         ))),
     }
 }
@@ -678,6 +724,83 @@ mod tests {
     fn test_sql_type_unsupported() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
         assert!(sql_data_type_to_arrow(&SqlType::Regclass).is_err());
+    }
+
+    #[test]
+    fn test_sql_type_array() {
+        use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
+        let result = sql_data_type_to_arrow(&SqlType::Array(ArrayElemTypeDef::AngleBracket(
+            Box::new(SqlType::Int(None)),
+        )))
+        .unwrap();
+        assert_eq!(
+            result,
+            ArrowDataType::List(Arc::new(Field::new("element", ArrowDataType::Int32, true)))
+        );
+    }
+
+    #[test]
+    fn test_sql_type_array_no_element() {
+        use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
+        assert!(sql_data_type_to_arrow(&SqlType::Array(ArrayElemTypeDef::None)).is_err());
+    }
+
+    #[test]
+    fn test_sql_type_map() {
+        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        let result = sql_data_type_to_arrow(&SqlType::Map(
+            Box::new(SqlType::Varchar(None)),
+            Box::new(SqlType::Int(None)),
+        ))
+        .unwrap();
+        let expected = ArrowDataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        Field::new("key", ArrowDataType::Utf8, false),
+                        Field::new("value", ArrowDataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sql_type_struct() {
+        use datafusion::sql::sqlparser::ast::{
+            DataType as SqlType, Ident, StructBracketKind, StructField,
+        };
+        let result = sql_data_type_to_arrow(&SqlType::Struct(
+            vec![
+                StructField {
+                    field_name: Some(Ident::new("name")),
+                    field_type: SqlType::Varchar(None),
+                    options: None,
+                },
+                StructField {
+                    field_name: Some(Ident::new("age")),
+                    field_type: SqlType::Int(None),
+                    options: None,
+                },
+            ],
+            StructBracketKind::AngleBrackets,
+        ))
+        .unwrap();
+        assert_eq!(
+            result,
+            ArrowDataType::Struct(
+                vec![
+                    Field::new("name", ArrowDataType::Utf8, true),
+                    Field::new("age", ArrowDataType::Int32, true),
+                ]
+                .into()
+            )
+        );
     }
 
     // ==================== resolve_table_name tests ====================

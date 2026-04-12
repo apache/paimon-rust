@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::spec::core_options::CoreOptions;
-use crate::spec::types::{DataType, RowType};
+use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -473,23 +473,16 @@ impl SchemaBuilder {
     }
 
     /// Add a column with optional description.
-    ///
-    /// TODO: Support RowType in schema columns with field ID assignment for nested fields.
-    /// See <https://github.com/apache/paimon/pull/1547>.
     pub fn column_with_description(
         mut self,
         column_name: impl Into<String>,
         data_type: DataType,
         description: Option<String>,
     ) -> Self {
-        if data_type.contains_row_type() {
-            todo!(
-                "Column type containing RowType is not supported yet: field ID assignment for nested row fields is not implemented. See https://github.com/apache/paimon/pull/1547"
-            );
-        }
         let name = column_name.into();
         let id = self.next_field_id;
         self.next_field_id += 1;
+        let data_type = Self::assign_nested_field_ids(data_type, &mut self.next_field_id);
         self.columns
             .push(DataField::new(id, name, data_type).with_description(description));
         self
@@ -534,6 +527,40 @@ impl SchemaBuilder {
             self.options,
             self.comment,
         )
+    }
+
+    /// Recursively assign field IDs to nested fields in complex types.
+    fn assign_nested_field_ids(data_type: DataType, next_id: &mut i32) -> DataType {
+        let nullable = data_type.is_nullable();
+        match data_type {
+            DataType::Row(row) => {
+                let fields = row
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let id = *next_id;
+                        *next_id += 1;
+                        let typ = Self::assign_nested_field_ids(f.data_type().clone(), next_id);
+                        DataField::new(id, f.name().to_string(), typ)
+                    })
+                    .collect();
+                DataType::Row(RowType::with_nullable(nullable, fields))
+            }
+            DataType::Array(arr) => {
+                let element = Self::assign_nested_field_ids(arr.element_type().clone(), next_id);
+                DataType::Array(ArrayType::with_nullable(nullable, element))
+            }
+            DataType::Map(map) => {
+                let key = Self::assign_nested_field_ids(map.key_type().clone(), next_id);
+                let value = Self::assign_nested_field_ids(map.value_type().clone(), next_id);
+                DataType::Map(MapType::with_nullable(nullable, key, value))
+            }
+            DataType::Multiset(ms) => {
+                let element = Self::assign_nested_field_ids(ms.element_type().clone(), next_id);
+                DataType::Multiset(MultisetType::with_nullable(nullable, element))
+            }
+            other => other,
+        }
     }
 }
 
@@ -718,18 +745,29 @@ mod tests {
         assert_eq!(schema.primary_keys(), &["a", "b"]);
     }
 
-    /// Adding a column whose type is or contains RowType panics (todo! until field ID assignment for nested row fields).
-    /// See <https://github.com/apache/paimon/pull/1547>.
     #[test]
-    #[should_panic(expected = "RowType")]
-    fn test_schema_builder_column_row_type_panics() {
+    fn test_schema_builder_column_row_type() {
         let row_type = RowType::new(vec![DataField::new(
             0,
             "nested".into(),
             DataType::Int(IntType::new()),
         )]);
-        Schema::builder()
+        let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
-            .column("payload", DataType::Row(row_type));
+            .column("payload", DataType::Row(row_type))
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.fields().len(), 2);
+        // id gets field_id=0, payload gets field_id=1, nested gets field_id=2
+        assert_eq!(schema.fields()[0].id(), 0);
+        assert_eq!(schema.fields()[1].id(), 1);
+        if let DataType::Row(row) = schema.fields()[1].data_type() {
+            assert_eq!(row.fields().len(), 1);
+            assert_eq!(row.fields()[0].id(), 2);
+            assert_eq!(row.fields()[0].name(), "nested");
+        } else {
+            panic!("expected Row type");
+        }
     }
 }
