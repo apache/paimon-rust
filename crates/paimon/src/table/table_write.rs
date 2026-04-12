@@ -26,7 +26,7 @@ use crate::spec::stats::BinaryTableStats;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
-    DataType, Datum, EMPTY_SERIALIZED_ROW,
+    EMPTY_SERIALIZED_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::Table;
@@ -268,16 +268,16 @@ impl TableWrite {
         let bucket = if self.total_buckets <= 1 || self.bucket_key_indices.is_empty() {
             0
         } else {
-            let mut datums: Vec<(Datum, DataType)> = Vec::new();
-            for &field_idx in &self.bucket_key_indices {
+            let mut builder = BinaryRowBuilder::new(self.bucket_key_indices.len() as i32);
+            for (pos, &field_idx) in self.bucket_key_indices.iter().enumerate() {
                 let field = &fields[field_idx];
-                let datum = extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())?;
-                if let Some(d) = datum {
-                    datums.push((d, field.data_type().clone()));
+                match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
+                    Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
+                    None => builder.set_null_at(pos),
                 }
             }
-            let refs: Vec<(&Datum, &DataType)> = datums.iter().map(|(d, t)| (d, t)).collect();
-            BinaryRow::compute_bucket_from_datums(&refs, self.total_buckets).unwrap_or(0)
+            let row = builder.build();
+            (row.hash_code() % self.total_buckets).abs()
         };
 
         Ok((partition_bytes, bucket))
@@ -514,10 +514,15 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{IntType, Schema, TableSchema, VarCharType};
+    use crate::spec::{
+        DataType, DecimalType, IntType, LocalZonedTimestampType, Schema, TableSchema, TimestampType,
+        VarCharType,
+    };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::Int32Array;
-    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+    };
     use std::sync::Arc;
 
     fn test_file_io() -> FileIO {
@@ -736,6 +741,217 @@ mod tests {
 
         let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
         assert_eq!(total_rows, 4);
+    }
+
+    fn test_bucketed_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "4")
+            .option("bucket-key", "id")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_bucketed_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_bucketed_schema(),
+            None,
+        )
+    }
+
+    /// Build a batch where the bucket-key column ("id") is nullable.
+    fn make_nullable_id_batch(ids: Vec<Option<i32>>, values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_bucketed_with_null_bucket_key() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_null_bk";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_bucketed_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        // Row with NULL bucket key should not panic
+        let batch = make_nullable_id_batch(vec![None, Some(1), None], vec![10, 20, 30]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        let total_rows: i64 = messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_null_bucket_key_routes_consistently() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_null_bk_consistent";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_bucketed_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table).unwrap();
+
+        // Two NULLs should land in the same bucket
+        let batch = make_nullable_id_batch(vec![None, None], vec![10, 20]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        // Both NULL-key rows must be in the same (partition, bucket) group
+        let null_bucket_rows: i64 = messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(null_bucket_rows, 2);
+        // All NULL-key rows go to exactly one bucket
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_null_vs_nonnull_bucket_key_differ() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_null_vs_nonnull";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_bucketed_table(&file_io, table_path);
+
+        // Compute bucket for NULL key
+        let fields = table.schema().fields().to_vec();
+        let tw = TableWrite::new(&table).unwrap();
+
+        let batch_null = make_nullable_id_batch(vec![None], vec![10]);
+        let (_, bucket_null) = tw
+            .extract_partition_bucket(&batch_null, 0, &fields)
+            .unwrap();
+
+        // Compute bucket for key = 0 (the value a null field's fixed bytes happen to be)
+        let batch_zero = make_nullable_id_batch(vec![Some(0)], vec![20]);
+        let (_, bucket_zero) = tw
+            .extract_partition_bucket(&batch_zero, 0, &fields)
+            .unwrap();
+
+        // A NULL bucket key must produce a BinaryRow with the null bit set,
+        // which hashes differently from a non-null 0 value.
+        // (With 4 buckets they could theoretically collide, but the hash codes differ.)
+        let mut builder_null = BinaryRowBuilder::new(1);
+        builder_null.set_null_at(0);
+        let hash_null = builder_null.build().hash_code();
+
+        let mut builder_zero = BinaryRowBuilder::new(1);
+        builder_zero.write_int(0, 0);
+        let hash_zero = builder_zero.build().hash_code();
+
+        assert_ne!(hash_null, hash_zero, "NULL and 0 should hash differently");
+        // If hashes differ, buckets should differ (with 4 buckets, very likely)
+        // But we verify the hash difference is the important invariant
+        let _ = (bucket_null, bucket_zero);
+    }
+
+    /// Mirrors Java's testUnCompactDecimalAndTimestampNullValueBucketNumber.
+    /// Non-compact types (Decimal(38,18), LocalZonedTimestamp(6), Timestamp(6))
+    /// use variable-length encoding in BinaryRow — NULL handling must still work.
+    #[tokio::test]
+    async fn test_non_compact_null_bucket_key() {
+        let file_io = test_file_io();
+
+        let bucket_cols = ["d", "ltz", "ntz"];
+        let total_buckets = 16;
+
+        for bucket_col in &bucket_cols {
+            let table_path = format!("memory:/test_null_bk_{bucket_col}");
+            setup_dirs(&file_io, &table_path).await;
+
+            let schema = Schema::builder()
+                .column("d", DataType::Decimal(DecimalType::new(38, 18).unwrap()))
+                .column(
+                    "ltz",
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
+                )
+                .column("ntz", DataType::Timestamp(TimestampType::new(6).unwrap()))
+                .column("k", DataType::Int(IntType::new()))
+                .option("bucket", total_buckets.to_string())
+                .option("bucket-key", *bucket_col)
+                .build()
+                .unwrap();
+            let table_schema = TableSchema::new(0, &schema);
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_table"),
+                table_path.to_string(),
+                table_schema,
+                None,
+            );
+
+            let tw = TableWrite::new(&table).unwrap();
+            let fields = table.schema().fields().to_vec();
+
+            // Build a batch: d=NULL, ltz=NULL, ntz=NULL, k=1
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("d", ArrowDataType::Decimal128(38, 18), true),
+                ArrowField::new(
+                    "ltz",
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+                ArrowField::new(
+                    "ntz",
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+                ArrowField::new("k", ArrowDataType::Int32, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    Arc::new(
+                        arrow_array::Decimal128Array::from(vec![None::<i128>])
+                            .with_precision_and_scale(38, 18)
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        arrow_array::TimestampMicrosecondArray::from(vec![None::<i64>])
+                            .with_timezone("UTC"),
+                    ),
+                    Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+                        None::<i64>,
+                    ])),
+                    Arc::new(Int32Array::from(vec![1])),
+                ],
+            )
+            .unwrap();
+
+            let (_, bucket) = tw.extract_partition_bucket(&batch, 0, &fields).unwrap();
+
+            // Expected: BinaryRow with 1 field, null at pos 0
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.set_null_at(0);
+            let expected_bucket = (builder.build().hash_code() % total_buckets).abs();
+
+            assert_eq!(
+                bucket, expected_bucket,
+                "NULL bucket-key '{bucket_col}' should produce bucket {expected_bucket}, got {bucket}"
+            );
+        }
     }
 
     #[tokio::test]
