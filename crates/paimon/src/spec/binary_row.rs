@@ -281,82 +281,28 @@ impl BinaryRow {
     }
 
     /// Build a BinaryRow from typed Datum values using `BinaryRowBuilder`.
-    pub fn from_datums(datums: &[(&crate::spec::Datum, &crate::spec::DataType)]) -> Option<Self> {
+    /// `None` entries are written as null fields.
+    pub fn from_datums(datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)]) -> Self {
         let arity = datums.len() as i32;
         let mut builder = BinaryRowBuilder::new(arity);
 
-        for (pos, (datum, data_type)) in datums.iter().enumerate() {
-            match datum {
-                crate::spec::Datum::Bool(v) => builder.write_boolean(pos, *v),
-                crate::spec::Datum::TinyInt(v) => builder.write_byte(pos, *v),
-                crate::spec::Datum::SmallInt(v) => builder.write_short(pos, *v),
-                crate::spec::Datum::Int(v)
-                | crate::spec::Datum::Date(v)
-                | crate::spec::Datum::Time(v) => builder.write_int(pos, *v),
-                crate::spec::Datum::Long(v) => builder.write_long(pos, *v),
-                crate::spec::Datum::Float(v) => builder.write_float(pos, *v),
-                crate::spec::Datum::Double(v) => builder.write_double(pos, *v),
-                crate::spec::Datum::Timestamp { millis, nanos } => {
-                    let precision = match data_type {
-                        crate::spec::DataType::Timestamp(ts) => ts.precision(),
-                        _ => 3,
-                    };
-                    if precision <= 3 {
-                        builder.write_timestamp_compact(pos, *millis);
-                    } else {
-                        builder.write_timestamp_non_compact(pos, *millis, *nanos);
-                    }
-                }
-                crate::spec::Datum::LocalZonedTimestamp { millis, nanos } => {
-                    let precision = match data_type {
-                        crate::spec::DataType::LocalZonedTimestamp(ts) => ts.precision(),
-                        _ => 3,
-                    };
-                    if precision <= 3 {
-                        builder.write_timestamp_compact(pos, *millis);
-                    } else {
-                        builder.write_timestamp_non_compact(pos, *millis, *nanos);
-                    }
-                }
-                crate::spec::Datum::Decimal {
-                    unscaled,
-                    precision,
-                    ..
-                } => {
-                    if *precision <= 18 {
-                        builder.write_decimal_compact(pos, *unscaled as i64);
-                    } else {
-                        builder.write_decimal_var_len(pos, *unscaled);
-                    }
-                }
-                crate::spec::Datum::String(s) => {
-                    if s.len() <= 7 {
-                        builder.write_string_inline(pos, s);
-                    } else {
-                        builder.write_string(pos, s);
-                    }
-                }
-                crate::spec::Datum::Bytes(b) => {
-                    if b.len() <= 7 {
-                        builder.write_binary_inline(pos, b);
-                    } else {
-                        builder.write_binary(pos, b);
-                    }
-                }
+        for (pos, (datum_opt, data_type)) in datums.iter().enumerate() {
+            match datum_opt {
+                Some(datum) => builder.write_datum(pos, datum, data_type),
+                None => builder.set_null_at(pos),
             }
         }
 
-        let row = builder.build();
-        Some(row)
+        builder.build()
     }
 
     pub fn compute_bucket_from_datums(
-        datums: &[(&crate::spec::Datum, &crate::spec::DataType)],
+        datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)],
         total_buckets: i32,
-    ) -> Option<i32> {
-        let row = Self::from_datums(datums)?;
+    ) -> i32 {
+        let row = Self::from_datums(datums);
         let hash = row.hash_code();
-        Some((hash % total_buckets).abs())
+        (hash % total_buckets).abs()
     }
 }
 

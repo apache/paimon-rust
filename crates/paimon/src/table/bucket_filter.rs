@@ -101,14 +101,14 @@ pub(super) fn compute_target_buckets(
     }
 
     // Collect equal-value candidates per bucket key field (by projected index).
-    // Each field can have one value (Eq) or multiple values (In).
+    // Each field can have one value (Eq), multiple values (In), or NULL (IsNull).
     let num_keys = bucket_key_fields.len();
-    let mut field_candidates: Vec<Option<Vec<&Datum>>> = vec![None; num_keys];
+    let mut field_candidates: Vec<Option<Vec<Option<&Datum>>>> = vec![None; num_keys];
 
     collect_eq_candidates(bucket_predicate, &mut field_candidates);
 
     // All bucket key fields must have candidates.
-    let candidates: Vec<&Vec<&Datum>> =
+    let candidates: Vec<&Vec<Option<&Datum>>> =
         field_candidates.iter().filter_map(|c| c.as_ref()).collect();
     if candidates.len() != num_keys {
         return None;
@@ -118,18 +118,15 @@ pub(super) fn compute_target_buckets(
     let mut buckets = HashSet::new();
     let mut combo: Vec<usize> = vec![0; num_keys];
     loop {
-        let datums: Vec<(&Datum, &DataType)> = (0..num_keys)
+        let datums: Vec<(Option<&Datum>, &DataType)> = (0..num_keys)
             .map(|i| {
                 let vals = field_candidates[i].as_ref().unwrap();
                 (vals[combo[i]], bucket_key_fields[i].data_type())
             })
             .collect();
 
-        if let Some(bucket) = BinaryRow::compute_bucket_from_datums(&datums, total_buckets) {
-            buckets.insert(bucket);
-        } else {
-            return None;
-        }
+        let bucket = BinaryRow::compute_bucket_from_datums(&datums, total_buckets);
+        buckets.insert(bucket);
 
         // Advance the combination counter (rightmost first).
         let mut carry = true;
@@ -155,10 +152,10 @@ pub(super) fn compute_target_buckets(
     }
 }
 
-/// Recursively collect Eq/In literal candidates from a predicate for each bucket key field.
+/// Recursively collect Eq/In/IsNull literal candidates from a predicate for each bucket key field.
 fn collect_eq_candidates<'a>(
     predicate: &'a Predicate,
-    field_candidates: &mut Vec<Option<Vec<&'a Datum>>>,
+    field_candidates: &mut Vec<Option<Vec<Option<&'a Datum>>>>,
 ) {
     match predicate {
         Predicate::And(children) => {
@@ -176,13 +173,16 @@ fn collect_eq_candidates<'a>(
                 match op {
                     PredicateOperator::Eq => {
                         if let Some(lit) = literals.first() {
-                            field_candidates[*index] = Some(vec![lit]);
+                            field_candidates[*index] = Some(vec![Some(lit)]);
                         }
                     }
                     PredicateOperator::In => {
                         if !literals.is_empty() {
-                            field_candidates[*index] = Some(literals.iter().collect());
+                            field_candidates[*index] = Some(literals.iter().map(Some).collect());
                         }
+                    }
+                    PredicateOperator::IsNull => {
+                        field_candidates[*index] = Some(vec![None]);
                     }
                     _ => {}
                 }

@@ -813,11 +813,6 @@ mod tests {
     }
 
     fn partition_bytes(pt: &str) -> Vec<u8> {
-        use crate::spec::{DataType, VarCharType};
-        let datum = Datum::String(pt.to_string());
-        let dt = DataType::VarChar(VarCharType::string_type());
-        let datums = vec![(&datum, &dt)];
-        BinaryRow::from_datums(&datums).unwrap();
         let mut builder = BinaryRowBuilder::new(1);
         if pt.len() <= 7 {
             builder.write_string_inline(0, pt);

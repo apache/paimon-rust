@@ -26,7 +26,7 @@ use crate::spec::stats::BinaryTableStats;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
-    EMPTY_SERIALIZED_ROW,
+    DataType, Datum, EMPTY_SERIALIZED_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::Table;
@@ -268,16 +268,15 @@ impl TableWrite {
         let bucket = if self.total_buckets <= 1 || self.bucket_key_indices.is_empty() {
             0
         } else {
-            let mut builder = BinaryRowBuilder::new(self.bucket_key_indices.len() as i32);
-            for (pos, &field_idx) in self.bucket_key_indices.iter().enumerate() {
+            let mut datums: Vec<(Option<Datum>, DataType)> = Vec::new();
+            for &field_idx in &self.bucket_key_indices {
                 let field = &fields[field_idx];
-                match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
-                    Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
-                    None => builder.set_null_at(pos),
-                }
+                let datum = extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())?;
+                datums.push((datum, field.data_type().clone()));
             }
-            let row = builder.build();
-            (row.hash_code() % self.total_buckets).abs()
+            let refs: Vec<(Option<&Datum>, &DataType)> =
+                datums.iter().map(|(d, t)| (d.as_ref(), t)).collect();
+            BinaryRow::compute_bucket_from_datums(&refs, self.total_buckets)
         };
 
         Ok((partition_bytes, bucket))
@@ -515,8 +514,8 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataType, DecimalType, IntType, LocalZonedTimestampType, Schema, TableSchema, TimestampType,
-        VarCharType,
+        DataType, DecimalType, IntType, LocalZonedTimestampType, Schema, TableSchema,
+        TimestampType, VarCharType,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::Int32Array;

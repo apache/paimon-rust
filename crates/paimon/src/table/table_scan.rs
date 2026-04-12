@@ -1375,4 +1375,64 @@ mod tests {
         let bucket = *buckets.iter().next().unwrap();
         assert!((0..4).contains(&bucket));
     }
+
+    #[test]
+    fn test_compute_target_buckets_is_null() {
+        let fields = bucket_key_fields();
+        let pred = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::IsNull,
+            literals: vec![],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, 4);
+        assert!(buckets.is_some(), "IsNull should determine a target bucket");
+        let buckets = buckets.unwrap();
+        assert_eq!(buckets.len(), 1);
+        let bucket = *buckets.iter().next().unwrap();
+        assert!((0..4).contains(&bucket));
+
+        // Verify it matches the expected bucket from a null BinaryRow
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.set_null_at(0);
+        let expected = (builder.build().hash_code() % 4).abs();
+        assert_eq!(bucket, expected);
+    }
+
+    #[test]
+    fn test_compute_target_buckets_composite_key_with_null() {
+        let fields = vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        // a = 1 AND b IS NULL
+        let pred = Predicate::And(vec![
+            Predicate::Leaf {
+                column: "a".into(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Int(1)],
+            },
+            Predicate::Leaf {
+                column: "b".into(),
+                index: 1,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::IsNull,
+                literals: vec![],
+            },
+        ]);
+
+        let buckets = compute_target_buckets(&pred, &fields, 8);
+        assert!(
+            buckets.is_some(),
+            "Composite key with IsNull should determine a target bucket"
+        );
+        let buckets = buckets.unwrap();
+        assert_eq!(buckets.len(), 1);
+        let bucket = *buckets.iter().next().unwrap();
+        assert!((0..8).contains(&bucket));
+    }
 }
