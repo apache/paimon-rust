@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DDL support for Paimon tables.
+//! SQL support for Paimon tables.
 //!
-//! DataFusion does not natively support all DDL statements needed by Paimon.
-//! This module provides [`PaimonDdlHandler`] which intercepts CREATE TABLE and
-//! ALTER TABLE SQL, translates them to Paimon catalog operations, and delegates
-//! everything else (SELECT, CREATE/DROP SCHEMA, DROP TABLE, etc.) to the
-//! underlying [`SessionContext`].
+//! DataFusion does not natively support all SQL statements needed by Paimon.
+//! This module provides [`PaimonSqlHandler`] which intercepts CREATE TABLE,
+//! ALTER TABLE, MERGE INTO, UPDATE and other SQL, translates them to Paimon
+//! catalog operations, and delegates everything else (SELECT, CREATE/DROP
+//! SCHEMA, DROP TABLE, etc.) to the underlying [`SessionContext`].
 //!
 //! Supported DDL:
 //! - `CREATE TABLE db.t (col TYPE, ..., PRIMARY KEY (col, ...)) [PARTITIONED BY (col TYPE, ...)] [WITH ('key' = 'val')]`
@@ -38,8 +38,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
-    ObjectName, RenameTableNameKind, SqlOption, Statement,
+    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, HiveDistributionStyle, Merge,
+    ObjectName, RenameTableNameKind, SqlOption, Statement, TableFactor, Update,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -56,17 +56,17 @@ use paimon::arrow::arrow_to_paimon_type;
 ///
 /// # Example
 /// ```ignore
-/// let handler = PaimonDdlHandler::new(ctx, catalog);
+/// let handler = PaimonSqlHandler::new(ctx, catalog);
 /// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
-pub struct PaimonDdlHandler {
+pub struct PaimonSqlHandler {
     ctx: SessionContext,
     catalog: Arc<dyn Catalog>,
     /// The catalog name registered in the SessionContext (used to strip the catalog prefix).
     catalog_name: String,
 }
 
-impl PaimonDdlHandler {
+impl PaimonSqlHandler {
     pub fn new(
         ctx: SessionContext,
         catalog: Arc<dyn Catalog>,
@@ -107,6 +107,8 @@ impl PaimonDdlHandler {
                 )
                 .await
             }
+            Statement::Merge(merge) => self.handle_merge_into(merge).await,
+            Statement::Update(update) => self.handle_update(update).await,
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -246,6 +248,48 @@ impl PaimonDdlHandler {
         }
 
         ok_result(&self.ctx)
+    }
+
+    async fn handle_merge_into(&self, merge: &Merge) -> DFResult<DataFrame> {
+        // Resolve the target table name from the MERGE INTO clause
+        let table_name = match &merge.table {
+            TableFactor::Table { name, .. } => name.clone(),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported target table in MERGE INTO: {other}"
+                )))
+            }
+        };
+        let identifier = self.resolve_table_name(&table_name)?;
+
+        // Load the Paimon table from the catalog
+        let table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        crate::merge_into::execute_merge_into(&self.ctx, merge, table).await
+    }
+
+    async fn handle_update(&self, update: &Update) -> DFResult<DataFrame> {
+        let table_name = match &update.table.relation {
+            TableFactor::Table { name, .. } => name.clone(),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported target table in UPDATE: {other}"
+                )))
+            }
+        };
+        let identifier = self.resolve_table_name(&table_name)?;
+
+        let table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        crate::update::execute_update(&self.ctx, update, table).await
     }
 
     /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
@@ -571,8 +615,8 @@ mod tests {
         }
     }
 
-    fn make_handler(catalog: Arc<MockCatalog>) -> PaimonDdlHandler {
-        PaimonDdlHandler::new(SessionContext::new(), catalog, "paimon")
+    fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
+        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon")
     }
 
     // ==================== sql_data_type_to_arrow tests ====================
@@ -905,7 +949,7 @@ mod tests {
         }
     }
 
-    // ==================== PaimonDdlHandler::sql integration tests ====================
+    // ==================== PaimonSqlHandler::sql integration tests ====================
 
     #[tokio::test]
     async fn test_create_table_basic() {

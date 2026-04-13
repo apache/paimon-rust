@@ -43,7 +43,7 @@ pub use catalog::FileSystemCatalog;
 
 pub use table::{
     CommitMessage, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RESTEnv,
-    RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit, RowRange, SnapshotCommit,
-    SnapshotManager, Table, TableCommit, TableRead, TableScan, TableWrite, TagManager,
-    WriteBuilder,
+    RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit, RowIdUpdateWriter, RowRange,
+    SnapshotCommit, SnapshotManager, Table, TableCommit, TableRead, TableScan, TableWrite,
+    TagManager, WriteBuilder,
 };

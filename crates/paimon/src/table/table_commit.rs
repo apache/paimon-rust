@@ -32,7 +32,7 @@ use crate::table::commit_message::CommitMessage;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -292,6 +292,12 @@ impl TableCommit {
         let mut next_row_id: Option<i64> = None;
         if self.row_tracking_enabled {
             commit_entries = self.assign_snapshot_id(new_snapshot_id, commit_entries);
+
+            // Validate that files with pre-assigned first_row_id (from MERGE INTO)
+            // still align with the current snapshot's file layout.
+            self.validate_row_id_alignment(&commit_entries, latest_snapshot)
+                .await?;
+
             let first_row_id_start = latest_snapshot
                 .as_ref()
                 .and_then(|s| s.next_row_id())
@@ -520,6 +526,90 @@ impl TableCommit {
         }
 
         (result, start)
+    }
+
+    /// Validate that files with pre-assigned `first_row_id` (e.g. partial-column
+    /// files from MERGE INTO) still match existing files in the current snapshot.
+    ///
+    /// When MERGE INTO and COMPACT run concurrently, compaction may rewrite the
+    /// original files that partial-column files reference. If the original file's
+    /// row ID range no longer exists, the partial-column files become invalid and
+    /// the commit must be rejected.
+    async fn validate_row_id_alignment(
+        &self,
+        commit_entries: &[ManifestEntry],
+        latest_snapshot: &Option<Snapshot>,
+    ) -> Result<()> {
+        // Collect files that already have first_row_id assigned (pre-set by writer).
+        let files_to_check: Vec<_> = commit_entries
+            .iter()
+            .filter(|e| *e.kind() == FileKind::Add && e.file().first_row_id.is_some())
+            .collect();
+
+        if files_to_check.is_empty() {
+            return Ok(());
+        }
+
+        let snap = match latest_snapshot {
+            Some(s) => s,
+            None => {
+                // No existing snapshot means no existing files — any pre-assigned
+                // first_row_id cannot match anything.
+                let entry = &files_to_check[0];
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Row ID conflict: file '{}' has pre-assigned first_row_id={} \
+                         but no snapshot exists. The referenced files may have been removed \
+                         by a concurrent compaction.",
+                        entry.file().file_name,
+                        entry.file().first_row_id.unwrap(),
+                    ),
+                    source: None,
+                });
+            }
+        };
+
+        // Read all current files from the latest snapshot.
+        let scan = TableScan::new(&self.table, None, vec![], None, None, None);
+        let existing_entries = scan.plan_manifest_entries(snap).await?;
+
+        // Build index: (partition, bucket, first_row_id, row_count)
+        let existing_index: HashSet<(&[u8], i32, i64, i64)> = existing_entries
+            .iter()
+            .filter_map(|e| {
+                e.file()
+                    .first_row_id
+                    .map(|fid| (e.partition(), e.bucket(), fid, e.file().row_count))
+            })
+            .collect();
+
+        for entry in &files_to_check {
+            let fid = entry.file().first_row_id.unwrap();
+            let key = (
+                entry.partition(),
+                entry.bucket(),
+                fid,
+                entry.file().row_count,
+            );
+            if !existing_index.contains(&key) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Row ID conflict: file '{}' references first_row_id={}, row_count={} \
+                         in partition/bucket ({}, {}), but no matching file exists in the \
+                         current snapshot. The referenced file may have been rewritten by a \
+                         concurrent compaction.",
+                        entry.file().file_name,
+                        fid,
+                        entry.file().row_count,
+                        entry.bucket(),
+                        entry.file().row_count,
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Exponential backoff with jitter.
@@ -1042,6 +1132,135 @@ mod tests {
         let mut builder = BinaryRowBuilder::new(1);
         builder.set_null_at(0);
         builder.build_serialized()
+    }
+
+    fn test_row_tracking_schema() -> TableSchema {
+        use crate::spec::{DataType, IntType, Schema, VarCharType};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_row_tracking_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_row_tracking_schema(),
+            None,
+        )
+    }
+
+    fn setup_row_tracking_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
+        let table = test_row_tracking_table(file_io, table_path);
+        TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_row_id_conflict_rejects_stale_partial_file() {
+        // Simulate: initial commit creates a file with row IDs 0-99,
+        // then a "partial-column" commit references row IDs 0-49 (wrong range)
+        // which should be rejected.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_row_id_conflict";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_row_tracking_commit(&file_io, table_path);
+
+        // Step 1: Commit an initial file (row_count=100, first_row_id will be assigned as 0)
+        let mut initial_file = test_data_file("data-0.parquet", 100);
+        initial_file.file_source = Some(0); // APPEND
+        commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![initial_file])])
+            .await
+            .unwrap();
+
+        // Verify snapshot has next_row_id = 100
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.next_row_id(), Some(100));
+
+        // Step 2: Try to commit a partial-column file referencing row IDs 0-49
+        // (wrong row_count — original file has 100 rows, not 50)
+        let mut partial_file = test_data_file("partial-0.parquet", 50);
+        partial_file.first_row_id = Some(0);
+        partial_file.file_source = Some(0);
+        partial_file.write_cols = Some(vec!["name".to_string()]);
+
+        let result = commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Row ID conflict"),
+            "Expected 'Row ID conflict' error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_conflict_accepts_matching_partial_file() {
+        // Partial-column file with matching (first_row_id, row_count) should succeed.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_row_id_match";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_row_tracking_commit(&file_io, table_path);
+
+        // Step 1: Commit initial file (100 rows, will get first_row_id=0)
+        let mut initial_file = test_data_file("data-0.parquet", 100);
+        initial_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![initial_file])])
+            .await
+            .unwrap();
+
+        // Step 2: Commit a partial-column file with matching range (0, 100)
+        let mut partial_file = test_data_file("partial-0.parquet", 100);
+        partial_file.first_row_id = Some(0);
+        partial_file.file_source = Some(0);
+        partial_file.write_cols = Some(vec!["name".to_string()]);
+
+        commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .await
+            .unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_conflict_no_snapshot_rejects() {
+        // Committing a file with pre-assigned first_row_id when no snapshot exists
+        // should be rejected.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_row_id_no_snap";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_row_tracking_commit(&file_io, table_path);
+
+        let mut partial_file = test_data_file("partial-0.parquet", 100);
+        partial_file.first_row_id = Some(0);
+        partial_file.file_source = Some(0);
+        partial_file.write_cols = Some(vec!["name".to_string()]);
+
+        let result = commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Row ID conflict"),
+            "Expected 'Row ID conflict' error, got: {err_msg}"
+        );
     }
 
     #[tokio::test]

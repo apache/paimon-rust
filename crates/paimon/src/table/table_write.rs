@@ -20,22 +20,18 @@
 //! Reference: [pypaimon TableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
-use crate::arrow::format::{create_format_writer, FormatFileWriter};
-use crate::io::FileIO;
-use crate::spec::stats::BinaryTableStats;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
-    DataType, Datum, EMPTY_SERIALIZED_ROW,
+    extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum,
+    EMPTY_SERIALIZED_ROW,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::data_file_writer::DataFileWriter;
 use crate::table::Table;
 use crate::Result;
 use arrow_array::RecordBatch;
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::task::JoinSet;
 
 type PartitionBucketKey = (Vec<u8>, i32);
 
@@ -71,11 +67,6 @@ impl TableWrite {
         if !schema.primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
                 message: "TableWrite does not support tables with primary keys".to_string(),
-            });
-        }
-        if core_options.data_evolution_enabled() {
-            return Err(crate::Error::Unsupported {
-                message: "TableWrite does not support data-evolution.enabled mode".to_string(),
             });
         }
 
@@ -300,6 +291,9 @@ impl TableWrite {
             self.file_compression.clone(),
             self.file_compression_zstd_level,
             self.write_buffer_size,
+            Some(0), // file_source: APPEND
+            None,    // first_row_id: assigned by commit
+            None,    // write_cols: full-row write
         );
 
         self.partition_writers
@@ -308,211 +302,11 @@ impl TableWrite {
     }
 }
 
-/// Internal writer that produces parquet data files for a single (partition, bucket).
-///
-/// Batches are accumulated into a single `FormatFileWriter` that streams directly
-/// to storage. Call `prepare_commit()` to finalize and collect file metadata.
-struct DataFileWriter {
-    file_io: FileIO,
-    table_location: String,
-    partition_path: String,
-    bucket: i32,
-    schema_id: i64,
-    target_file_size: i64,
-    file_compression: String,
-    file_compression_zstd_level: i32,
-    write_buffer_size: i64,
-    written_files: Vec<DataFileMeta>,
-    /// Background file close tasks spawned during rolling.
-    in_flight_closes: JoinSet<Result<DataFileMeta>>,
-    /// Current open format writer, lazily created on first write.
-    current_writer: Option<Box<dyn FormatFileWriter>>,
-    current_file_name: Option<String>,
-    current_row_count: i64,
-}
-
-impl DataFileWriter {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        file_io: FileIO,
-        table_location: String,
-        partition_path: String,
-        bucket: i32,
-        schema_id: i64,
-        target_file_size: i64,
-        file_compression: String,
-        file_compression_zstd_level: i32,
-        write_buffer_size: i64,
-    ) -> Self {
-        Self {
-            file_io,
-            table_location,
-            partition_path,
-            bucket,
-            schema_id,
-            target_file_size,
-            file_compression,
-            file_compression_zstd_level,
-            write_buffer_size,
-            written_files: Vec::new(),
-            in_flight_closes: JoinSet::new(),
-            current_writer: None,
-            current_file_name: None,
-            current_row_count: 0,
-        }
-    }
-
-    /// Write a RecordBatch. Rolls to a new file when target size is reached.
-    async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        if self.current_writer.is_none() {
-            self.open_new_file(batch.schema()).await?;
-        }
-
-        self.current_row_count += batch.num_rows() as i64;
-        self.current_writer.as_mut().unwrap().write(batch).await?;
-
-        // Roll to a new file if target size is reached — close in background
-        if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.target_file_size {
-            self.roll_file();
-        }
-
-        // Flush row group if in-progress buffer exceeds write_buffer_size
-        if let Some(w) = self.current_writer.as_mut() {
-            if w.in_progress_size() as i64 >= self.write_buffer_size {
-                w.flush().await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
-        let file_name = format!(
-            "data-{}-{}.parquet",
-            uuid::Uuid::new_v4(),
-            self.written_files.len()
-        );
-
-        let bucket_dir = if self.partition_path.is_empty() {
-            format!("{}/bucket-{}", self.table_location, self.bucket)
-        } else {
-            format!(
-                "{}/{}/bucket-{}",
-                self.table_location, self.partition_path, self.bucket
-            )
-        };
-        self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
-
-        let file_path = format!("{}/{}", bucket_dir, file_name);
-        let output = self.file_io.new_output(&file_path)?;
-        let writer = create_format_writer(
-            &output,
-            schema,
-            &self.file_compression,
-            self.file_compression_zstd_level,
-        )
-        .await?;
-        self.current_writer = Some(writer);
-        self.current_file_name = Some(file_name);
-        self.current_row_count = 0;
-        Ok(())
-    }
-
-    /// Close the current file writer and record the file metadata.
-    async fn close_current_file(&mut self) -> Result<()> {
-        let writer = match self.current_writer.take() {
-            Some(w) => w,
-            None => return Ok(()),
-        };
-        let file_name = self.current_file_name.take().unwrap();
-
-        let row_count = self.current_row_count;
-        self.current_row_count = 0;
-        let file_size = writer.close().await? as i64;
-
-        let meta = Self::build_meta(file_name, file_size, row_count, self.schema_id);
-        self.written_files.push(meta);
-        Ok(())
-    }
-
-    /// Spawn the current writer's close in the background for non-blocking rolling.
-    fn roll_file(&mut self) {
-        let writer = match self.current_writer.take() {
-            Some(w) => w,
-            None => return,
-        };
-        let file_name = self.current_file_name.take().unwrap();
-        let row_count = self.current_row_count;
-        self.current_row_count = 0;
-        let schema_id = self.schema_id;
-
-        self.in_flight_closes.spawn(async move {
-            let file_size = writer.close().await? as i64;
-            Ok(Self::build_meta(file_name, file_size, row_count, schema_id))
-        });
-    }
-
-    /// Close the current writer and return all written file metadata.
-    async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
-        self.close_current_file().await?;
-        while let Some(result) = self.in_flight_closes.join_next().await {
-            let meta = result.map_err(|e| crate::Error::DataInvalid {
-                message: format!("Background file close task panicked: {e}"),
-                source: None,
-            })??;
-            self.written_files.push(meta);
-        }
-        Ok(std::mem::take(&mut self.written_files))
-    }
-
-    fn build_meta(
-        file_name: String,
-        file_size: i64,
-        row_count: i64,
-        schema_id: i64,
-    ) -> DataFileMeta {
-        DataFileMeta {
-            file_name,
-            file_size,
-            row_count,
-            min_key: EMPTY_SERIALIZED_ROW.clone(),
-            max_key: EMPTY_SERIALIZED_ROW.clone(),
-            key_stats: BinaryTableStats::new(
-                EMPTY_SERIALIZED_ROW.clone(),
-                EMPTY_SERIALIZED_ROW.clone(),
-                vec![],
-            ),
-            value_stats: BinaryTableStats::new(
-                EMPTY_SERIALIZED_ROW.clone(),
-                EMPTY_SERIALIZED_ROW.clone(),
-                vec![],
-            ),
-            min_sequence_number: 0,
-            max_sequence_number: 0,
-            schema_id,
-            level: 0,
-            extra_files: vec![],
-            creation_time: Some(Utc::now()),
-            delete_row_count: Some(0),
-            embedded_index: None,
-            file_source: Some(0), // APPEND
-            value_stats_cols: Some(vec![]),
-            external_path: None,
-            first_row_id: None,
-            write_cols: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::Identifier;
-    use crate::io::FileIOBuilder;
+    use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
         DataType, DecimalType, IntType, LocalZonedTimestampType, Schema, TableSchema,
         TimestampType, VarCharType,

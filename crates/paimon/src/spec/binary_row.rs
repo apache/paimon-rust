@@ -95,6 +95,14 @@ impl BinaryRow {
         Ok(Self::from_bytes(arity, data[4..].to_vec()))
     }
 
+    /// Serialize this BinaryRow to bytes (arity prefix + data), the inverse of `from_serialized_bytes`.
+    pub fn to_serialized_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + self.data.len());
+        buf.extend_from_slice(&self.arity.to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
     pub fn arity(&self) -> i32 {
         self.arity
     }

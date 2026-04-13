@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DDL integration tests for paimon-datafusion.
+//! SQL handler integration tests for paimon-datafusion.
 
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::spec::{ArrayType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonDdlHandler, PaimonRelationPlanner};
+use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler};
 use tempfile::TempDir;
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
@@ -36,7 +36,7 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonDdlHandler {
+fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "paimon",
@@ -44,7 +44,7 @@ fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonDdlHandler {
     );
     ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
         .expect("Failed to register relation planner");
-    PaimonDdlHandler::new(ctx, catalog, "paimon")
+    PaimonSqlHandler::new(ctx, catalog, "paimon")
 }
 
 // ======================= CREATE / DROP SCHEMA =======================

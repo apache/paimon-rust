@@ -295,14 +295,15 @@ pub(super) fn data_evolution_group_matches_predicates(
     sorted_files.sort_by(|a, b| b.max_sequence_number.cmp(&a.max_sequence_number));
 
     // For each table field, find which file (index in sorted_files) provides it.
-    // The field index remains a table-field index so FileStatsRows can resolve
-    // it through its own schema-to-stats mapping.
+    // Use file_data_columns (based on write_cols) to determine which file contains
+    // the field, not file_stats_columns (based on value_stats_cols) which only
+    // indicates stats coverage.
     let field_sources: Vec<Option<(usize, usize)>> = table_fields
         .iter()
         .enumerate()
         .map(|(field_idx, field)| {
             for (file_idx, file) in sorted_files.iter().enumerate() {
-                let file_columns = file_stats_columns(file, table_fields);
+                let file_columns = file_data_columns(file, table_fields);
                 for col_name in &file_columns {
                     if *col_name == field.name() {
                         return Some((file_idx, field_idx));
@@ -334,13 +335,10 @@ pub(super) fn data_evolution_group_matches_predicates(
     })
 }
 
-/// Resolve which columns a file's value stats cover.
-/// If `value_stats_cols` is set, those are the stats columns. Otherwise, the file's stats
-/// cover all table fields (or `write_cols` if present).
-fn file_stats_columns<'a>(file: &'a DataFileMeta, table_fields: &'a [DataField]) -> Vec<&'a str> {
-    if let Some(cols) = &file.value_stats_cols {
-        return cols.iter().map(|s| s.as_str()).collect();
-    }
+/// Resolve which columns a file actually contains (for field source resolution).
+/// Uses `write_cols` if present, otherwise assumes all table fields.
+/// This is distinct from `file_stats_columns` which resolves stats coverage.
+fn file_data_columns<'a>(file: &'a DataFileMeta, table_fields: &'a [DataField]) -> Vec<&'a str> {
     match &file.write_cols {
         Some(cols) => cols.iter().map(|s| s.as_str()).collect(),
         None => table_fields.iter().map(|f| f.name()).collect(),
