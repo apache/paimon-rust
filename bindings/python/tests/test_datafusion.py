@@ -31,7 +31,6 @@ def extract_rows(batches):
     return sorted(zip(table["id"].to_pylist(), table["name"].to_pylist()))
 
 
-@pytest.mark.skip(reason="Requires Python datafusion 53 (not yet released) to match Rust datafusion-ffi 53")
 def test_query_simple_table_via_catalog_provider():
     catalog = PaimonCatalog({"warehouse": WAREHOUSE})
     ctx = SessionContext()

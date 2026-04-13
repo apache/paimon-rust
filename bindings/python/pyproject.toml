@@ -53,5 +53,5 @@ dev = [
     "maturin>=1.9.4,<2.0",
     "pytest>=8.0",
     "pyarrow>=17.0",
-    "datafusion==52.3.0",
+    "datafusion==53.0.0",
 ]

@@ -99,12 +99,14 @@ impl PaimonDdlHandler {
 
         match &statements[0] {
             Statement::CreateTable(create_table) => self.handle_create_table(create_table).await,
-            Statement::AlterTable {
-                name,
-                operations,
-                if_exists,
-                ..
-            } => self.handle_alter_table(name, operations, *if_exists).await,
+            Statement::AlterTable(alter_table) => {
+                self.handle_alter_table(
+                    &alter_table.name,
+                    &alter_table.operations,
+                    alter_table.if_exists,
+                )
+                .await
+            }
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -146,12 +148,12 @@ impl PaimonDdlHandler {
 
         // Primary key from constraints: PRIMARY KEY (col, ...)
         for constraint in &ct.constraints {
-            if let datafusion::sql::sqlparser::ast::TableConstraint::PrimaryKey {
-                columns, ..
-            } = constraint
-            {
-                let pk_cols: Vec<String> =
-                    columns.iter().map(|c| c.column.expr.to_string()).collect();
+            if let datafusion::sql::sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
+                let pk_cols: Vec<String> = pk
+                    .columns
+                    .iter()
+                    .map(|c| c.column.expr.to_string())
+                    .collect();
                 builder = builder.primary_key(pk_cols);
             }
         }
