@@ -177,6 +177,6 @@ cargo test
 
 # Integration tests (requires Docker)
 make docker-up
-cargo test -p integration_tests
+cargo test -p paimon-integration-tests
 make docker-down
 ```
