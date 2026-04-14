@@ -631,11 +631,15 @@ pub fn extract_datum_from_arrow(
             Datum::Double(arr.value(row_idx))
         }
         DataType::Char(_) | DataType::VarChar(_) => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| type_mismatch_err("String", col_idx))?;
-            Datum::String(arr.value(row_idx).to_string())
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else {
+                return Err(type_mismatch_err("String", col_idx));
+            }
         }
         DataType::Date(_) => {
             let arr = col

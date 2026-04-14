@@ -45,8 +45,8 @@ mod merge_into;
 mod physical_plan;
 mod relation_planner;
 pub mod runtime;
-mod system_tables;
 mod sql_handler;
+mod system_tables;
 mod table;
 mod update;
 

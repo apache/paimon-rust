@@ -20,13 +20,13 @@
 //! This module provides the DataFusion-specific SQL parsing and execution layer for
 //! `UPDATE ... SET ... WHERE ...` statements. The engine-agnostic update logic
 //! (file metadata lookup, row grouping, reading originals, applying updates,
-//! writing partial files, committing) lives in [`paimon::table::RowIdUpdateWriter`].
+//! writing partial files, committing) lives in [`paimon::table::DataEvolutionWriter`].
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{AssignmentTarget, Update};
 
-use paimon::table::{RowIdUpdateWriter, Table};
+use paimon::table::{DataEvolutionWriter, Table};
 
 use crate::error::to_datafusion_error;
 use crate::merge_into::{is_row_id_conflict, ok_result, project_update_columns};
@@ -93,8 +93,9 @@ async fn execute_update_once(
         exprs.push(assignment.value.to_string());
     }
 
-    // 2. Create RowIdUpdateWriter (validates preconditions)
-    let mut writer = RowIdUpdateWriter::new(table, columns.clone()).map_err(to_datafusion_error)?;
+    // 2. Create DataEvolutionWriter (validates preconditions)
+    let mut writer =
+        DataEvolutionWriter::new(table, columns.clone()).map_err(to_datafusion_error)?;
 
     // 3. Query the target table directly with WHERE filter.
     let table_ref = update.table.to_string();

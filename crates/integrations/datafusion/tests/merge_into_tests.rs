@@ -913,6 +913,272 @@ async fn test_rejects_table_without_row_tracking() {
 }
 
 #[tokio::test]
+async fn test_successive_merges_read_file_group() {
+    // Verifies that a second MERGE INTO correctly reads columns from the file group
+    // (base file + partial-column files created by the first merge), not just a single file.
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog);
+    setup_data_evolution_table(&handler).await;
+
+    handler
+        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
+        .await.unwrap().collect().await.unwrap();
+
+    // First MERGE: update 'name' column → creates a partial-column file for 'name'
+    register_source(
+        &handler,
+        "CREATE TABLE src_m1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (2, 'BOB')",
+    )
+    .await;
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING src_m1 s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify first merge result
+    let rows = collect_rows_3col(
+        &handler,
+        "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, "ALICE".to_string(), 10), (2, "BOB".to_string(), 20),]
+    );
+
+    // Second MERGE: update 'name' again → must read the merged 'name' from file group
+    // (base file has original 'name', partial file has updated 'name' from first merge)
+    register_source(
+        &handler,
+        "CREATE TABLE src_m2 (id INT, name VARCHAR) AS VALUES (1, 'Alice_v2')",
+    )
+    .await;
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING src_m2 s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_rows_3col(
+        &handler,
+        "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, "Alice_v2".to_string(), 10), (2, "BOB".to_string(), 20),]
+    );
+}
+
+#[tokio::test]
+async fn test_successive_merges_different_columns_read_file_group() {
+    // First merge updates 'name', second merge updates 'value'.
+    // The second merge must correctly read 'value' from the file group
+    // even though a partial-column file for 'name' now exists.
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog);
+    setup_data_evolution_table(&handler).await;
+
+    handler
+        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
+        .await.unwrap().collect().await.unwrap();
+
+    // First MERGE: update 'name'
+    register_source(
+        &handler,
+        "CREATE TABLE src_dc1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+    )
+    .await;
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING src_dc1 s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Second MERGE: update 'value' — reads from file group (base + name-partial)
+    register_source(
+        &handler,
+        "CREATE TABLE src_dc2 (id INT, value INT) AS VALUES (1, 100), (2, 200)",
+    )
+    .await;
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING src_dc2 s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET value = s.value",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_rows_3col(
+        &handler,
+        "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, "ALICE".to_string(), 100), (2, "bob".to_string(), 200),]
+    );
+}
+
+#[tokio::test]
+async fn test_merge_insert_reordered_columns() {
+    // Verifies that INSERT with columns in a different order than the table schema
+    // still maps data correctly (columns matched by name, not position).
+    // Table schema: (id INT, name STRING, value INT)
+    // INSERT specifies: (value, name, id) — reversed order
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog);
+    setup_data_evolution_table(&handler).await;
+
+    handler
+        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    register_source(
+        &handler,
+        "CREATE TABLE src_reorder (id INT, name VARCHAR, value INT) AS VALUES (2, 'bob', 20), (1, 'ALICE', 11)",
+    )
+    .await;
+
+    // INSERT columns in reversed order: (value, name, id)
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING src_reorder s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (value, name, id) VALUES (s.value, s.name, s.id)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_rows_3col(
+        &handler,
+        "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".to_string(), 10), // untouched (matched, no UPDATE clause)
+            (2, "bob".to_string(), 20),   // inserted — columns must be correctly mapped
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_merge_insert_reordered_columns_on_partitioned_table() {
+    // Verifies column reordering on a partitioned table where mis-mapping
+    // would cause data to land in the wrong partition.
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog);
+
+    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.part_tbl (\
+                dt STRING, id INT NOT NULL, name STRING\
+            ) PARTITIONED BY (dt STRING) WITH (\
+                'data-evolution.enabled' = 'true', \
+                'row-tracking.enabled' = 'true'\
+            )",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql("INSERT INTO paimon.test_db.part_tbl (dt, id, name) VALUES ('2024-01-01', 1, 'alice')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    register_source(
+        &handler,
+        "CREATE TABLE src_pt_reorder (id INT, name VARCHAR, dt VARCHAR) AS VALUES (2, 'bob', '2024-02-01'), (1, 'ALICE', '2024-01-01')",
+    )
+    .await;
+
+    // INSERT with columns in different order than table schema: (name, id, dt) vs table (dt, id, name)
+    handler
+        .sql(
+            "MERGE INTO paimon.test_db.part_tbl t USING src_pt_reorder s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (name, id, dt) VALUES (s.name, s.id, s.dt)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = handler
+        .sql("SELECT dt, id, name FROM paimon.test_db.part_tbl ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let dts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dts.value(i).to_string(),
+                ids.value(i),
+                names.value(i).to_string(),
+            ));
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-01-01".to_string(), 1, "alice".to_string()), // untouched
+            ("2024-02-01".to_string(), 2, "bob".to_string()), // inserted — dt must be partition, not name
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_rejects_table_with_primary_keys() {
     let (_tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);

@@ -20,8 +20,9 @@
 //! This module provides the DataFusion-specific SQL parsing and JOIN execution layer.
 //! The engine-agnostic merge logic (file metadata lookup, row grouping, reading originals,
 //! applying updates, writing partial files, committing) lives in
-//! [`paimon::table::RowIdUpdateWriter`].
+//! [`paimon::table::DataEvolutionWriter`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, UInt64Array};
@@ -34,7 +35,7 @@ use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, Merge, MergeAction, MergeClauseKind, MergeInsertKind, TableFactor,
 };
 
-use paimon::table::{RowIdUpdateWriter, Table};
+use paimon::table::{DataEvolutionWriter, Table};
 
 use crate::error::to_datafusion_error;
 
@@ -94,7 +95,7 @@ async fn execute_merge_into_once(
 
     // Validate preconditions early and create writer (before executing any SQL)
     let update_writer = if let Some(ref upd) = parsed.update {
-        Some(RowIdUpdateWriter::new(table, upd.columns.clone()).map_err(to_datafusion_error)?)
+        Some(DataEvolutionWriter::new(table, upd.columns.clone()).map_err(to_datafusion_error)?)
     } else {
         None
     };
@@ -167,12 +168,20 @@ async fn execute_merge_into_once(
                 injected_columns.push(format!("__upd_{col}"));
             }
         }
+        // Table schema field names for reordering INSERT columns
+        let table_fields: Vec<String> = table
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
         let insert_batches = build_insert_batches(
             ctx,
             &not_matched_batches,
             &parsed.inserts,
             s_alias,
             &injected_columns,
+            &table_fields,
         )
         .await?;
         let insert_count: usize = insert_batches.iter().map(|b| b.num_rows()).sum();
@@ -280,6 +289,7 @@ async fn build_insert_batches(
     inserts: &[MergeInsertClause],
     s_alias: &str,
     injected_columns: &[String],
+    table_fields: &[String],
 ) -> DFResult<Vec<RecordBatch>> {
     if not_matched_batches.is_empty() || not_matched_batches.iter().all(|b| b.num_rows() == 0) {
         return Ok(Vec::new());
@@ -294,7 +304,7 @@ async fn build_insert_batches(
     let tmp_name = format!("__merge_not_matched_{}", std::process::id());
     ctx.register_table(&tmp_name, Arc::new(mem_table))?;
 
-    let result = build_insert_batches_inner(ctx, inserts, s_alias, &tmp_name).await;
+    let result = build_insert_batches_inner(ctx, inserts, s_alias, &tmp_name, table_fields).await;
 
     // Always clean up temp table, even on error
     let _ = ctx.deregister_table(&tmp_name);
@@ -308,6 +318,7 @@ async fn build_insert_batches_inner(
     inserts: &[MergeInsertClause],
     s_alias: &str,
     tmp_name: &str,
+    table_fields: &[String],
 ) -> DFResult<Vec<RecordBatch>> {
     let mut all_batches = Vec::new();
     let mut consumed_predicates: Vec<String> = Vec::new();
@@ -328,7 +339,7 @@ async fn build_insert_batches_inner(
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
-        let select_clause = insert_select_clause(ins);
+        let select_clause = insert_select_clause(ins, table_fields);
         let sql = format!("SELECT {select_clause} FROM {tmp_name} AS {s_alias}{where_clause}");
 
         let batches = ctx.sql(&sql).await?.collect().await?;
@@ -363,15 +374,34 @@ fn strip_non_source_columns(
     Ok(result)
 }
 
-/// Build the SELECT clause for an INSERT clause: `*` or `expr AS col, ...`.
-fn insert_select_clause(ins: &MergeInsertClause) -> String {
+/// Build the SELECT clause for an INSERT clause, ordered by table schema fields.
+///
+/// When the INSERT specifies explicit columns (`INSERT (col2, col1) VALUES (expr2, expr1)`),
+/// the output must be reordered to match the table schema so that `write_arrow_batch`
+/// (which reads columns by positional index) maps them correctly.
+fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[String]) -> String {
     if ins.columns.is_empty() && ins.value_exprs.is_empty() {
         "*".to_string()
     } else {
-        ins.columns
+        // Build column_name -> expression mapping from the INSERT clause
+        let col_expr_map: HashMap<String, &str> = ins
+            .columns
             .iter()
             .zip(ins.value_exprs.iter())
-            .map(|(col, expr)| format!("{expr} AS {col}"))
+            .map(|(col, expr)| (col.to_lowercase(), expr.as_str()))
+            .collect();
+
+        // Emit SELECT in table schema order
+        table_fields
+            .iter()
+            .map(|field| {
+                let key = field.to_lowercase();
+                match col_expr_map.get(&key) {
+                    Some(expr) => format!("{expr} AS \"{field}\""),
+                    // Column not in INSERT list — fill with NULL
+                    None => format!("NULL AS \"{field}\""),
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }

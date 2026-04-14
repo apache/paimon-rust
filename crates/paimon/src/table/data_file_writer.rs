@@ -16,7 +16,7 @@
 // under the License.
 
 //! Low-level data file writer shared by [`TableWrite`](super::TableWrite) and
-//! [`PartialColumnsWriter`](super::row_id_update_write::PartialColumnsWriter).
+//! [`DataEvolutionPartialWriter`](super::data_evolution_writer::DataEvolutionPartialWriter).
 //!
 //! `DataFileWriter` streams Arrow `RecordBatch`es to Parquet files on storage,
 //! handles file rolling when `target_file_size` is reached, and collects

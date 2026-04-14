@@ -20,6 +20,7 @@
 pub(crate) mod bin_pack;
 mod bucket_filter;
 mod commit_message;
+pub mod data_evolution_writer;
 mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
@@ -27,7 +28,6 @@ pub(crate) mod global_index_scanner;
 mod read_builder;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
-pub mod row_id_update_write;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
@@ -42,12 +42,12 @@ mod write_builder;
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use commit_message::CommitMessage;
+pub use data_evolution_writer::DataEvolutionWriter;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use read_builder::{ReadBuilder, TableRead};
 pub use rest_env::RESTEnv;
-pub use row_id_update_write::RowIdUpdateWriter;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;

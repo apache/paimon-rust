@@ -17,7 +17,7 @@
 
 //! Row-ID-based update writer for data evolution tables.
 //!
-//! [`RowIdUpdateWriter`] accepts rows to update (identified by `_ROW_ID`) along with
+//! [`DataEvolutionWriter`] accepts rows to update (identified by `_ROW_ID`) along with
 //! new column values, then handles file metadata lookup, row grouping,
 //! reading original columns, applying updates, and writing partial-column files.
 //!
@@ -30,6 +30,7 @@ use crate::io::FileIO;
 use crate::spec::{BinaryRow, CoreOptions, DataFileMeta, PartitionComputer};
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
+use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::DataSplitBuilder;
 use crate::table::Table;
 use crate::Result;
@@ -42,7 +43,7 @@ use std::collections::HashMap;
 /// Engine-agnostic writer for partial-column updates via `_ROW_ID`.
 ///
 /// Usage:
-/// 1. Create via [`RowIdUpdateWriter::new`] (validates preconditions).
+/// 1. Create via [`DataEvolutionWriter::new`] (validates preconditions).
 /// 2. Feed matched rows via [`add_matched_batch`](Self::add_matched_batch).
 ///    Each batch must contain a `_ROW_ID` (Int64) column plus the update columns.
 /// 3. Call [`prepare_commit`](Self::prepare_commit) to produce `CommitMessage`s.
@@ -54,13 +55,13 @@ use std::collections::HashMap;
 /// - Computing new column values
 /// - Passing the results as `RecordBatch`es with `_ROW_ID` + update columns
 #[must_use = "writer must be used to call prepare_commit()"]
-pub struct RowIdUpdateWriter {
+pub struct DataEvolutionWriter {
     table: Table,
     update_columns: Vec<String>,
     matched_batches: Vec<RecordBatch>,
 }
 
-impl RowIdUpdateWriter {
+impl DataEvolutionWriter {
     /// Create a new writer for the given table and update columns.
     ///
     /// Validates:
@@ -140,7 +141,10 @@ impl RowIdUpdateWriter {
             return Ok(Vec::new());
         }
 
-        // 1. Scan file metadata and build row_id -> file index
+        // 1. Scan file metadata and build row_id -> file group index.
+        //    In data-evolution tables, multiple files can share the same first_row_id
+        //    (base file + partial-column files). We must group them so the reader
+        //    can merge columns correctly.
         let scan = self.table.new_read_builder().new_scan();
         let plan = scan.plan().await?;
 
@@ -151,19 +155,38 @@ impl RowIdUpdateWriter {
             let bucket_path = split.bucket_path().to_string();
             let snapshot_id = split.snapshot_id();
             let total_buckets = split.total_buckets();
-            for file in split.data_files() {
-                if let Some(first_row_id) = file.first_row_id {
-                    file_index.push(FileRowRange {
-                        first_row_id,
-                        last_row_id: first_row_id + file.row_count - 1,
-                        partition: partition_bytes.clone(),
-                        bucket,
-                        bucket_path: bucket_path.clone(),
-                        snapshot_id,
-                        total_buckets,
-                        file: file.clone(),
-                    });
-                }
+
+            let all_files: Vec<DataFileMeta> = split
+                .data_files()
+                .iter()
+                .filter(|f| f.first_row_id.is_some())
+                .cloned()
+                .collect();
+
+            let groups = group_by_overlapping_row_id(all_files);
+            for group in groups {
+                // Compute the overall row_id range for this group.
+                // The base file has the widest range; partial-column files share it.
+                let first_row_id = group.iter().filter_map(|f| f.first_row_id).min().unwrap();
+                let last_row_id = group
+                    .iter()
+                    .filter_map(|f| f.row_id_range().map(|(_, end)| end))
+                    .max()
+                    .unwrap();
+                // The actual row count is the max among the group (base file's count).
+                let row_count = group.iter().map(|f| f.row_count).max().unwrap();
+
+                file_index.push(FileRowRange {
+                    first_row_id,
+                    last_row_id,
+                    row_count,
+                    partition: partition_bytes.clone(),
+                    bucket,
+                    bucket_path: bucket_path.clone(),
+                    snapshot_id,
+                    total_buckets,
+                    files: group,
+                });
             }
         }
         file_index.sort_by_key(|f| f.first_row_id);
@@ -209,28 +232,28 @@ impl RowIdUpdateWriter {
         }
 
         // 3. For each affected file: read original columns, apply updates, write partial files
-        let mut writer = PartialColumnsWriter::new(&self.table, self.update_columns.clone())?;
+        let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
 
         for (&file_pos, matched_rows) in &file_matches {
             let file_range = &file_index[file_pos];
-            let file = &file_range.file;
-            let first_row_id = file.first_row_id.unwrap();
-            let row_count = file.row_count as usize;
+            let first_row_id = file_range.first_row_id;
+            let row_count = file_range.row_count as usize;
 
-            // Read original columns from this file
+            // Read original columns from the entire file group (base + partial-column files).
             let col_refs: Vec<&str> = self.update_columns.iter().map(|s| s.as_str()).collect();
             let mut rb = self.table.new_read_builder();
             rb.with_projection(&col_refs);
             let read = rb.new_read()?;
 
+            let raw_convertible = file_range.files.len() == 1;
             let split = DataSplitBuilder::new()
                 .with_snapshot(file_range.snapshot_id)
                 .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
                 .with_bucket(file_range.bucket)
                 .with_bucket_path(file_range.bucket_path.clone())
                 .with_total_buckets(file_range.total_buckets)
-                .with_data_files(vec![file.clone()])
-                .with_raw_convertible(true)
+                .with_data_files(file_range.files.clone())
+                .with_raw_convertible(raw_convertible)
                 .build()?;
 
             let stream = read.to_arrow(&[split])?;
@@ -392,12 +415,14 @@ fn find_owning_file(file_index: &[FileRowRange], row_id: i64) -> Option<(usize, 
 struct FileRowRange {
     first_row_id: i64,
     last_row_id: i64,
+    row_count: i64,
     partition: Vec<u8>,
     bucket: i32,
     bucket_path: String,
     snapshot_id: i64,
     total_buckets: i32,
-    file: DataFileMeta,
+    /// All files in this row-id group (base file + partial-column files).
+    files: Vec<DataFileMeta>,
 }
 
 struct MatchedRow {
@@ -407,7 +432,7 @@ struct MatchedRow {
 }
 
 // ---------------------------------------------------------------------------
-// PartialColumnsWriter — writes partial-column parquet files for data evolution
+// DataEvolutionPartialWriter — writes partial-column parquet files for data evolution
 // ---------------------------------------------------------------------------
 
 /// Key: (partition_bytes, bucket, first_row_id)
@@ -416,13 +441,13 @@ type WriterKey = (Vec<u8>, i32, i64);
 /// Writer for data evolution partial-column files.
 ///
 /// Unlike [`TableWrite`](super::TableWrite) which writes full-row files for append-only tables,
-/// `PartialColumnsWriter` writes partial-column files used by MERGE INTO on data evolution tables.
+/// `DataEvolutionPartialWriter` writes partial-column files used by MERGE INTO on data evolution tables.
 /// Each output file contains only the updated columns and shares the same `first_row_id` range
 /// as the original file, allowing the reader to merge columns at read time.
 ///
 /// Produces parquet files containing only the specified `write_columns`, with
 /// `file_source = APPEND (0)`, caller-supplied `first_row_id`, and `write_cols`.
-pub(crate) struct PartialColumnsWriter {
+pub(crate) struct DataEvolutionPartialWriter {
     file_io: FileIO,
     table_location: String,
     partition_computer: PartitionComputer,
@@ -437,7 +462,7 @@ pub(crate) struct PartialColumnsWriter {
     writers: HashMap<WriterKey, DataFileWriter>,
 }
 
-impl PartialColumnsWriter {
+impl DataEvolutionPartialWriter {
     /// Create a new writer for partial-column data evolution files.
     ///
     /// `write_columns` specifies which table columns this write covers (the SET targets).
@@ -447,7 +472,8 @@ impl PartialColumnsWriter {
 
         if !core_options.data_evolution_enabled() {
             return Err(crate::Error::Unsupported {
-                message: "PartialColumnsWriter requires data-evolution.enabled = true".to_string(),
+                message: "DataEvolutionPartialWriter requires data-evolution.enabled = true"
+                    .to_string(),
             });
         }
 
@@ -569,6 +595,39 @@ mod tests {
         FileIOBuilder::new("memory").build().unwrap()
     }
 
+    fn make_test_file_meta(
+        file_name: &str,
+        row_count: i64,
+        first_row_id: Option<i64>,
+        max_seq: i64,
+        write_cols: Option<Vec<String>>,
+    ) -> DataFileMeta {
+        use crate::spec::stats::BinaryTableStats;
+        let empty_stats = BinaryTableStats::new(vec![], vec![], vec![]);
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size: 0,
+            row_count,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: empty_stats.clone(),
+            value_stats: empty_stats,
+            min_sequence_number: 0,
+            max_sequence_number: max_seq,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: Some(0),
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id,
+            write_cols,
+        }
+    }
+
     fn test_data_evolution_schema() -> TableSchema {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -618,7 +677,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut writer = PartialColumnsWriter::new(&table, vec!["name".to_string()]).unwrap();
+        let mut writer = DataEvolutionPartialWriter::new(&table, vec!["name".to_string()]).unwrap();
 
         let batch = make_partial_batch(vec!["alice", "bob", "charlie"]);
         writer
@@ -644,7 +703,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut writer = PartialColumnsWriter::new(&table, vec!["name".to_string()]).unwrap();
+        let mut writer = DataEvolutionPartialWriter::new(&table, vec!["name".to_string()]).unwrap();
 
         // Two batches with different first_row_id should produce two files
         let batch1 = make_partial_batch(vec!["alice", "bob"]);
@@ -671,6 +730,116 @@ mod tests {
         assert_eq!(files[1].row_count, 1);
     }
 
+    #[test]
+    fn test_find_owning_file_with_grouped_ranges() {
+        // Simulate a file group: base file (3 cols, 100 rows) + partial file (1 col, 100 rows)
+        // sharing the same first_row_id range [0, 99].
+        let base_file = make_test_file_meta("base-0.parquet", 100, Some(0), 1, None);
+        let partial_file = make_test_file_meta(
+            "partial-0.parquet",
+            100,
+            Some(0),
+            2,
+            Some(vec!["name".to_string()]),
+        );
+
+        let file_index = vec![
+            FileRowRange {
+                first_row_id: 0,
+                last_row_id: 99,
+                row_count: 100,
+                partition: vec![],
+                bucket: 0,
+                bucket_path: String::new(),
+                snapshot_id: 1,
+                total_buckets: 1,
+                files: vec![base_file, partial_file],
+            },
+            FileRowRange {
+                first_row_id: 100,
+                last_row_id: 149,
+                row_count: 50,
+                partition: vec![],
+                bucket: 0,
+                bucket_path: String::new(),
+                snapshot_id: 1,
+                total_buckets: 1,
+                files: vec![make_test_file_meta(
+                    "base-1.parquet",
+                    50,
+                    Some(100),
+                    1,
+                    None,
+                )],
+            },
+        ];
+
+        // row_id 0 -> first group (2 files)
+        let (pos, range) = find_owning_file(&file_index, 0).unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(range.files.len(), 2);
+
+        // row_id 50 -> still first group
+        let (pos, range) = find_owning_file(&file_index, 50).unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(range.row_count, 100);
+
+        // row_id 99 -> last row of first group
+        let (pos, _) = find_owning_file(&file_index, 99).unwrap();
+        assert_eq!(pos, 0);
+
+        // row_id 100 -> second group (1 file)
+        let (pos, range) = find_owning_file(&file_index, 100).unwrap();
+        assert_eq!(pos, 1);
+        assert_eq!(range.files.len(), 1);
+
+        // row_id 200 -> not found
+        assert!(find_owning_file(&file_index, 200).is_none());
+    }
+
+    #[test]
+    fn test_file_group_construction_from_overlapping_files() {
+        // Verify that group_by_overlapping_row_id correctly groups base + partial files,
+        // and that we can build FileRowRange from the result.
+        let base = make_test_file_meta("base.parquet", 100, Some(0), 1, None);
+        let partial1 = make_test_file_meta(
+            "partial1.parquet",
+            100,
+            Some(0),
+            2,
+            Some(vec!["name".to_string()]),
+        );
+        let partial2 = make_test_file_meta(
+            "partial2.parquet",
+            100,
+            Some(0),
+            3,
+            Some(vec!["value".to_string()]),
+        );
+        let separate = make_test_file_meta("separate.parquet", 50, Some(200), 1, None);
+
+        let groups = group_by_overlapping_row_id(vec![base, partial1, partial2, separate]);
+
+        // Should produce 2 groups: [base, partial1, partial2] and [separate]
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[1].len(), 1);
+
+        // Build FileRowRange from first group
+        let group = &groups[0];
+        let first_row_id = group.iter().filter_map(|f| f.first_row_id).min().unwrap();
+        let last_row_id = group
+            .iter()
+            .filter_map(|f| f.row_id_range().map(|(_, end)| end))
+            .max()
+            .unwrap();
+        let row_count = group.iter().map(|f| f.row_count).max().unwrap();
+
+        assert_eq!(first_row_id, 0);
+        assert_eq!(last_row_id, 99);
+        assert_eq!(row_count, 100);
+    }
+
     #[tokio::test]
     async fn test_rejects_non_data_evolution_table() {
         let file_io = test_file_io();
@@ -687,7 +856,7 @@ mod tests {
             None,
         );
 
-        let result = PartialColumnsWriter::new(&table, vec!["id".to_string()]);
+        let result = DataEvolutionPartialWriter::new(&table, vec!["id".to_string()]);
         assert!(result.is_err());
     }
 }
