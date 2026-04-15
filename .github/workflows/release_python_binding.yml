@@ -48,6 +48,8 @@ jobs:
           working-directory: bindings/python
           command: sdist
           args: -o dist
+          before-script-linux: |
+            yum install -y openssl-devel 2>/dev/null || apt-get update && apt-get install -y libssl-dev
 
       - name: Upload sdist
         uses: actions/upload-artifact@v7
@@ -75,6 +77,8 @@ jobs:
           command: build
           args: --release -o dist
           manylinux: ${{ matrix.manylinux || 'auto' }}
+          before-script-linux: |
+            yum install -y openssl-devel 2>/dev/null || apt-get update && apt-get install -y libssl-dev
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
