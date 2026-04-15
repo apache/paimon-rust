@@ -378,7 +378,11 @@ fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
 /// Intended for per-batch _ROW_ID attachment — callers should not pass
 /// whole-file ranges with millions of rows, as this allocates a Vec<i64>
 /// proportional to the selected range size.
-pub(super) fn expand_selected_row_ids(first_row_id: i64, row_count: i64, row_ranges: &[RowRange]) -> Vec<i64> {
+pub(super) fn expand_selected_row_ids(
+    first_row_id: i64,
+    row_count: i64,
+    row_ranges: &[RowRange],
+) -> Vec<i64> {
     if row_count == 0 {
         return Vec::new();
     }
@@ -407,7 +411,9 @@ pub(super) fn attach_row_id(
         return Err(Error::UnexpectedError {
             message: format!(
                 "Row ID offset out of bounds: need {}..{} but selected_row_ids has {} entries",
-                *row_id_offset, end, selected_row_ids.len()
+                *row_id_offset,
+                end,
+                selected_row_ids.len()
             ),
             source: None,
         });

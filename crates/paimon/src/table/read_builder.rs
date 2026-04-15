@@ -26,7 +26,7 @@ use super::{Table, TableScan};
 use crate::arrow::filtering::reader_pruning_predicates;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
-use crate::{Result, Error};
+use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
@@ -36,7 +36,10 @@ struct NormalizedFilter {
     bucket_predicate: Option<Predicate>,
 }
 
-pub(super) fn split_scan_predicates(table: &Table, filter: Predicate) -> (Option<Predicate>, Vec<Predicate>) {
+pub(super) fn split_scan_predicates(
+    table: &Table,
+    filter: Predicate,
+) -> (Option<Predicate>, Vec<Predicate>) {
     let partition_keys = table.schema().partition_keys();
     if partition_keys.is_empty() {
         (None, filter.split_and())
