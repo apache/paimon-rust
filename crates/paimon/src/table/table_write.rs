@@ -35,6 +35,12 @@ use std::sync::Arc;
 
 type PartitionBucketKey = (Vec<u8>, i32);
 
+fn schema_contains_blob_type(fields: &[DataField]) -> bool {
+    fields
+        .iter()
+        .any(|field| field.data_type().contains_blob_type())
+}
+
 /// TableWrite writes Arrow RecordBatches to Paimon data files.
 ///
 /// Each (partition, bucket) pair gets its own `DataFileWriter` held in a HashMap.
@@ -63,6 +69,14 @@ impl TableWrite {
     pub(crate) fn new(table: &Table) -> crate::Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
+
+        if schema_contains_blob_type(schema.fields()) {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "TableWrite does not support BlobType yet; blob write path is out of scope"
+                        .to_string(),
+            });
+        }
 
         if !schema.primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
@@ -308,8 +322,8 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
-        DataType, DecimalType, IntType, LocalZonedTimestampType, Schema, TableSchema,
-        TimestampType, VarCharType,
+        BlobType, DataField, DataType, DecimalType, IntType, LocalZonedTimestampType, RowType,
+        Schema, TableSchema, TimestampType, VarCharType,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::Int32Array;
@@ -359,6 +373,30 @@ mod tests {
             test_partitioned_schema(),
             None,
         )
+    }
+
+    fn test_blob_table_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_nested_blob_table_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column(
+                "payload",
+                DataType::Row(RowType::new(vec![DataField::new(
+                    1,
+                    "blob".into(),
+                    DataType::Blob(BlobType::new()),
+                )])),
+            )
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
     }
 
     async fn setup_dirs(file_io: &FileIO, table_path: &str) {
@@ -428,6 +466,38 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[test]
+    fn test_rejects_blob_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_blob_table"),
+            "memory:/test_blob_table".to_string(),
+            test_blob_table_schema(),
+            None,
+        );
+
+        let err = TableWrite::new(&table).err().unwrap();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
+        );
+    }
+
+    #[test]
+    fn test_rejects_nested_blob_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_nested_blob_table"),
+            "memory:/test_nested_blob_table".to_string(),
+            test_nested_blob_table_schema(),
+            None,
+        );
+
+        let err = TableWrite::new(&table).err().unwrap();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
+        );
     }
 
     #[tokio::test]

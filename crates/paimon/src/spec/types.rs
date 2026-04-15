@@ -76,6 +76,8 @@ pub enum DataType {
     Binary(BinaryType),
     /// Data type of a variable-length binary string (=a sequence of bytes).
     VarBinary(VarBinaryType),
+    /// Data type of binary large object.
+    Blob(BlobType),
     /// Data type of a fixed-length character string.
     Char(CharType),
     /// Data type of a variable-length character string.
@@ -117,6 +119,20 @@ impl DataType {
         }
     }
 
+    /// Returns whether this type is or contains (recursively) a [`BlobType`].
+    pub fn contains_blob_type(&self) -> bool {
+        match self {
+            DataType::Blob(_) => true,
+            DataType::Array(v) => v.element_type.contains_blob_type(),
+            DataType::Map(v) => {
+                v.key_type.contains_blob_type() || v.value_type.contains_blob_type()
+            }
+            DataType::Multiset(v) => v.element_type.contains_blob_type(),
+            DataType::Row(v) => v.fields.iter().any(|f| f.data_type().contains_blob_type()),
+            _ => false,
+        }
+    }
+
     /// Returns whether this type is nullable.
     pub fn is_nullable(&self) -> bool {
         match self {
@@ -130,6 +146,7 @@ impl DataType {
             DataType::Float(v) => v.nullable,
             DataType::Binary(v) => v.nullable,
             DataType::VarBinary(v) => v.nullable,
+            DataType::Blob(v) => v.nullable,
             DataType::Char(v) => v.nullable,
             DataType::VarChar(v) => v.nullable,
             DataType::Date(v) => v.nullable,
@@ -165,6 +182,7 @@ impl DataType {
             DataType::VarBinary(v) => {
                 DataType::VarBinary(VarBinaryType::try_new(nullable, v.length())?)
             }
+            DataType::Blob(_) => DataType::Blob(BlobType::with_nullable(nullable)),
             DataType::Char(v) => DataType::Char(CharType::with_nullable(nullable, v.length())?),
             DataType::VarChar(v) => {
                 DataType::VarChar(VarCharType::with_nullable(nullable, v.length())?)
@@ -373,6 +391,39 @@ impl Default for BooleanType {
 }
 
 impl BooleanType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+}
+
+/// BlobType for paimon.
+///
+/// Data type of binary large object.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/BlobType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlobType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BLOB>>")]
+    nullable: bool,
+}
+
+impl Default for BlobType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlobType {
     pub fn new() -> Self {
         Self::with_nullable(true)
     }
@@ -1470,6 +1521,11 @@ mod serde_utils {
         const NAME: &'static str = "BOOLEAN";
     }
 
+    pub struct BLOB;
+    impl DataTypeName for BLOB {
+        const NAME: &'static str = "BLOB";
+    }
+
     pub struct BINARY;
     impl DataTypeName for BINARY {
         const NAME: &'static str = "BINARY";
@@ -1655,7 +1711,10 @@ mod tests {
 
         let content = std::fs::read(&path)
             .unwrap_or_else(|err| panic!("fixtures {path:?} load failed: {err}"));
-        String::from_utf8(content).expect("fixtures content must be valid utf8")
+        String::from_utf8(content)
+            .expect("fixtures content must be valid utf8")
+            .trim_end_matches(['\n', '\r'])
+            .to_string()
     }
 
     fn test_cases() -> Vec<(&'static str, DataType)> {
@@ -1695,6 +1754,11 @@ mod tests {
                     nullable: true,
                     length: 22,
                 }),
+            ),
+            ("blob_type", DataType::Blob(BlobType { nullable: false })),
+            (
+                "blob_type_nullable",
+                DataType::Blob(BlobType { nullable: true }),
             ),
             (
                 "boolean_type",

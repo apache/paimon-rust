@@ -22,7 +22,7 @@ use std::sync::Arc;
 use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
-use paimon::spec::{ArrayType, DataType, IntType, MapType, VarCharType};
+use paimon::spec::{ArrayType, BlobType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler};
 use tempfile::TempDir;
@@ -145,6 +145,40 @@ async fn test_create_table() {
     let schema = table.schema();
     assert_eq!(schema.fields().len(), 3);
     assert_eq!(schema.primary_keys(), &["id"]);
+}
+
+#[tokio::test]
+async fn test_create_table_with_blob_type() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.mydb.assets (
+                id INT NOT NULL,
+                payload BLOB,
+                PRIMARY KEY (id)
+            )",
+        )
+        .await
+        .expect("CREATE TABLE with BLOB should succeed");
+
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "assets"))
+        .await
+        .unwrap();
+    let schema = table.schema();
+    assert_eq!(schema.fields().len(), 2);
+    assert_eq!(schema.primary_keys(), &["id"]);
+    assert_eq!(
+        *schema.fields()[1].data_type(),
+        DataType::Blob(BlobType::new())
+    );
 }
 
 #[tokio::test]

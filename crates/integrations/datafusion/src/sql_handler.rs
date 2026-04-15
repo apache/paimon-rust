@@ -44,7 +44,10 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier};
-use paimon::spec::SchemaChange;
+use paimon::spec::{
+    ArrayType as PaimonArrayType, BlobType, DataField as PaimonDataField,
+    DataType as PaimonDataType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
+};
 
 use crate::error::to_datafusion_error;
 use paimon::arrow::arrow_to_paimon_type;
@@ -136,15 +139,7 @@ impl PaimonSqlHandler {
 
         // Columns
         for col in &ct.columns {
-            let arrow_type = sql_data_type_to_arrow(&col.data_type)?;
-            let nullable = !col.options.iter().any(|opt| {
-                matches!(
-                    opt.option,
-                    datafusion::sql::sqlparser::ast::ColumnOption::NotNull
-                )
-            });
-            let paimon_type =
-                arrow_to_paimon_type(&arrow_type, nullable).map_err(to_datafusion_error)?;
+            let paimon_type = column_def_to_paimon_type(col)?;
             builder = builder.column(col.name.value.clone(), paimon_type);
         }
 
@@ -324,18 +319,85 @@ impl PaimonSqlHandler {
 
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].
 fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
-    let arrow_type = sql_data_type_to_arrow(&col.data_type)?;
-    let nullable = !col.options.iter().any(|opt| {
-        matches!(
-            opt.option,
-            datafusion::sql::sqlparser::ast::ColumnOption::NotNull
-        )
-    });
-    let paimon_type = arrow_to_paimon_type(&arrow_type, nullable).map_err(to_datafusion_error)?;
+    let paimon_type = column_def_to_paimon_type(col)?;
     Ok(SchemaChange::add_column(
         col.name.value.clone(),
         paimon_type,
     ))
+}
+
+fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
+    sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))
+}
+
+fn column_def_nullable(col: &ColumnDef) -> bool {
+    !col.options.iter().any(|opt| {
+        matches!(
+            opt.option,
+            datafusion::sql::sqlparser::ast::ColumnOption::NotNull
+        )
+    })
+}
+
+/// Convert a sqlparser SQL data type to a Paimon data type.
+///
+/// DDL schema translation must use this function instead of going through Arrow,
+/// because Arrow cannot preserve logical distinctions such as `BLOB` vs `VARBINARY`.
+fn sql_data_type_to_paimon_type(
+    sql_type: &datafusion::sql::sqlparser::ast::DataType,
+    nullable: bool,
+) -> DFResult<PaimonDataType> {
+    use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
+
+    match sql_type {
+        SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
+        SqlType::Array(elem_def) => {
+            let element_type = match elem_def {
+                ArrayElemTypeDef::AngleBracket(t)
+                | ArrayElemTypeDef::SquareBracket(t, _)
+                | ArrayElemTypeDef::Parenthesis(t) => sql_data_type_to_paimon_type(t, true)?,
+                ArrayElemTypeDef::None => {
+                    return Err(DataFusionError::Plan(
+                        "ARRAY type requires an element type".to_string(),
+                    ));
+                }
+            };
+            Ok(PaimonDataType::Array(PaimonArrayType::with_nullable(
+                nullable,
+                element_type,
+            )))
+        }
+        SqlType::Map(key_type, value_type) => {
+            let key = sql_data_type_to_paimon_type(key_type, false)?;
+            let value = sql_data_type_to_paimon_type(value_type, true)?;
+            Ok(PaimonDataType::Map(PaimonMapType::with_nullable(
+                nullable, key, value,
+            )))
+        }
+        SqlType::Struct(fields, _) => {
+            let paimon_fields = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let name = field
+                        .field_name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_default();
+                    let data_type = sql_data_type_to_paimon_type(&field.field_type, true)?;
+                    Ok(PaimonDataField::new(idx as i32, name, data_type))
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            Ok(PaimonDataType::Row(PaimonRowType::with_nullable(
+                nullable,
+                paimon_fields,
+            )))
+        }
+        _ => {
+            let arrow_type = sql_data_type_to_arrow(sql_type)?;
+            arrow_to_paimon_type(&arrow_type, nullable).map_err(to_datafusion_error)
+        }
+    }
 }
 
 /// Convert a sqlparser SQL data type to an Arrow data type.
@@ -496,7 +558,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::TimeUnit;
     use paimon::catalog::Database;
-    use paimon::spec::Schema as PaimonSchema;
+    use paimon::spec::{DataType as PaimonDataType, Schema as PaimonSchema};
     use paimon::table::Table;
 
     // ==================== Mock Catalog ====================
@@ -1041,6 +1103,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_table_blob_type_preserved() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("CREATE TABLE mydb.t1 (payload BLOB NOT NULL)")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
+            assert_eq!(schema.fields().len(), 1);
+            assert!(matches!(
+                schema.fields()[0].data_type(),
+                PaimonDataType::Blob(_)
+            ));
+            assert!(!schema.fields()[0].data_type().is_nullable());
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
     async fn test_alter_table_add_column() {
         let catalog = Arc::new(MockCatalog::new());
         let handler = make_handler(catalog.clone());
@@ -1064,6 +1150,33 @@ mod tests {
             assert!(
                 matches!(&changes[0], SchemaChange::AddColumn { field_name, .. } if field_name == "age")
             );
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_blob_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+
+        handler
+            .sql("ALTER TABLE mydb.t1 ADD COLUMN payload BLOB")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+            assert_eq!(changes.len(), 1);
+            assert!(matches!(
+                &changes[0],
+                SchemaChange::AddColumn {
+                    field_name,
+                    data_type,
+                    ..
+                } if field_name == "payload" && matches!(data_type, PaimonDataType::Blob(_))
+            ));
         } else {
             panic!("expected AlterTable call");
         }

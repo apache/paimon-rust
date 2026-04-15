@@ -39,7 +39,9 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
         PaimonDataType::Float(_) => ArrowDataType::Float32,
         PaimonDataType::Double(_) => ArrowDataType::Float64,
         PaimonDataType::VarChar(_) | PaimonDataType::Char(_) => ArrowDataType::Utf8,
-        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) => ArrowDataType::Binary,
+        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) | PaimonDataType::Blob(_) => {
+            ArrowDataType::Binary
+        }
         PaimonDataType::Date(_) => ArrowDataType::Date32,
         PaimonDataType::Time(_) => ArrowDataType::Time32(TimeUnit::Millisecond),
         PaimonDataType::Timestamp(t) => {
@@ -339,6 +341,17 @@ mod tests {
         ] {
             assert_arrow_to_paimon(arrow, true, &varbinary);
         }
+    }
+
+    #[test]
+    fn test_blob_type_maps_one_way_to_arrow_binary() {
+        let blob = PaimonDataType::Blob(BlobType::new());
+        let varbinary = PaimonDataType::VarBinary(
+            VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
+        );
+
+        assert_paimon_to_arrow(&blob, &ArrowDataType::Binary);
+        assert_arrow_to_paimon(&ArrowDataType::Binary, true, &varbinary);
     }
 
     #[test]
