@@ -288,6 +288,61 @@ impl BinaryRow {
         hash_by_words(&self.data)
     }
 
+    /// Read a Datum from the given position based on the DataType.
+    /// Returns `None` if the field is null.
+    pub fn get_datum(
+        &self,
+        pos: usize,
+        data_type: &crate::spec::DataType,
+    ) -> crate::Result<Option<crate::spec::Datum>> {
+        if self.is_null_at(pos) {
+            return Ok(None);
+        }
+        use crate::spec::{DataType, Datum};
+        let datum = match data_type {
+            DataType::Boolean(_) => Datum::Bool(self.get_boolean(pos)?),
+            DataType::TinyInt(_) => Datum::TinyInt(self.get_byte(pos)?),
+            DataType::SmallInt(_) => Datum::SmallInt(self.get_short(pos)?),
+            DataType::Int(_) => Datum::Int(self.get_int(pos)?),
+            DataType::BigInt(_) => Datum::Long(self.get_long(pos)?),
+            DataType::Float(_) => Datum::Float(self.get_float(pos)?),
+            DataType::Double(_) => Datum::Double(self.get_double(pos)?),
+            DataType::Date(_) => Datum::Date(self.get_int(pos)?),
+            DataType::Time(_) => Datum::Time(self.get_int(pos)?),
+            DataType::VarChar(_) | DataType::Char(_) => {
+                Datum::String(self.get_string(pos)?.to_string())
+            }
+            DataType::Binary(_) | DataType::VarBinary(_) => {
+                Datum::Bytes(self.get_binary(pos)?.to_vec())
+            }
+            DataType::Decimal(dt) => {
+                let unscaled = self.get_decimal_unscaled(pos, dt.precision())?;
+                Datum::Decimal {
+                    unscaled,
+                    precision: dt.precision(),
+                    scale: dt.scale(),
+                }
+            }
+            DataType::Timestamp(ts) => {
+                let (millis, nanos) = self.get_timestamp_raw(pos, ts.precision())?;
+                Datum::Timestamp { millis, nanos }
+            }
+            DataType::LocalZonedTimestamp(ts) => {
+                let (millis, nanos) = self.get_timestamp_raw(pos, ts.precision())?;
+                Datum::LocalZonedTimestamp { millis, nanos }
+            }
+            _ => {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "BinaryRow::get_datum: unsupported data type {:?} at pos {pos}",
+                        data_type
+                    ),
+                });
+            }
+        };
+        Ok(Some(datum))
+    }
+
     /// Build a BinaryRow from typed Datum values using `BinaryRowBuilder`.
     /// `None` entries are written as null fields.
     pub fn from_datums(datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)]) -> Self {

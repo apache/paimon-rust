@@ -177,14 +177,11 @@ impl TableCommit {
         partition: &HashMap<String, Option<Datum>>,
     ) -> Result<Predicate> {
         let pb = PredicateBuilder::new(&self.table.schema().partition_fields());
-        let predicates: Vec<Predicate> = partition
+        let fields: Vec<(&str, Option<Datum>)> = partition
             .iter()
-            .map(|(key, value)| match value {
-                Some(v) => pb.equal(key, v.clone()),
-                None => pb.is_null(key),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Predicate::and(predicates))
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        pb.partition_predicate(&fields)
     }
 
     /// Drop specific partitions (OVERWRITE with only deletes).

@@ -17,11 +17,12 @@
 
 use super::data_evolution_reader::DataEvolutionReader;
 use super::data_file_reader::DataFileReader;
+use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
 use crate::spec::{CoreOptions, DataField, Predicate};
-use crate::{DataSplit, Error};
+use crate::DataSplit;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
 ///
@@ -76,17 +77,37 @@ impl<'a> TableRead<'a> {
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let data_evolution = core_options.data_evolution_enabled();
 
+        // PK table without DV: route by merge engine.
+        // Exhaustive match ensures new MergeEngine variants trigger a compile error.
         if has_primary_keys && !deletion_vectors_enabled {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Reading primary-key tables without deletion vectors is not yet supported. Primary keys: {:?}",
-                    self.table.schema.primary_keys()
-                ),
-            });
+            match core_options.merge_engine()? {
+                crate::spec::MergeEngine::Deduplicate => {
+                    let reader = KeyValueFileReader::new(
+                        self.table.file_io.clone(),
+                        KeyValueReadConfig {
+                            schema_manager: self.table.schema_manager().clone(),
+                            table_schema_id: self.table.schema().id(),
+                            table_fields: self.table.schema.fields().to_vec(),
+                            read_type: self.read_type().to_vec(),
+                            predicates: self.data_predicates.clone(),
+                            primary_keys: self.table.schema.primary_keys().to_vec(),
+                            sequence_fields: core_options
+                                .sequence_fields()
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
+                        },
+                    );
+                    return reader.read(data_splits);
+                }
+                crate::spec::MergeEngine::FirstRow => {
+                    // Fall through to DataFileReader — scan already skips level-0
+                }
+            }
         }
 
+        // PK table with DV or append-only table: DataFileReader / DataEvolutionReader
         if data_evolution {
-            // TODO: data evolution mode does not support read-side predicate pruning yet.
             let reader = DataEvolutionReader::new(
                 self.table.file_io.clone(),
                 self.table.schema_manager().clone(),

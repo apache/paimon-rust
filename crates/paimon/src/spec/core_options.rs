@@ -36,6 +36,10 @@ const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
+const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
+const MERGE_ENGINE_OPTION: &str = "merge-engine";
+const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
+const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
@@ -47,6 +51,17 @@ const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
+
+/// Merge engine for primary-key tables.
+///
+/// Reference: Java `CoreOptions.MergeEngine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeEngine {
+    /// Keep the row with the highest sequence number (default).
+    Deduplicate,
+    /// Keep the first row for each key (ignore later updates).
+    FirstRow,
+}
 
 /// Typed accessors for common table options.
 ///
@@ -74,6 +89,43 @@ impl<'a> CoreOptions<'a> {
             .get(DELETION_VECTORS_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Returns the user-specified sequence field names, if configured.
+    /// When set, the values of these columns are used as `_SEQUENCE_NUMBER` instead of auto-increment.
+    /// Multiple fields can be comma-separated (e.g. `"col_a,col_b"`).
+    pub fn sequence_fields(&self) -> Vec<&str> {
+        self.options
+            .get(SEQUENCE_FIELD_OPTION)
+            .map(|s| s.split(',').map(str::trim).collect())
+            .unwrap_or_default()
+    }
+
+    /// Merge engine for primary-key tables. Default is `Deduplicate`.
+    pub fn merge_engine(&self) -> crate::Result<MergeEngine> {
+        match self.options.get(MERGE_ENGINE_OPTION) {
+            None => Ok(MergeEngine::Deduplicate),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "deduplicate" => Ok(MergeEngine::Deduplicate),
+                "first-row" => Ok(MergeEngine::FirstRow),
+                other => Err(crate::Error::Unsupported {
+                    message: format!("Unsupported merge-engine: '{other}'"),
+                }),
+            },
+        }
+    }
+
+    /// Changelog producer setting. Default is "none".
+    pub fn changelog_producer(&self) -> &str {
+        self.options
+            .get(CHANGELOG_PRODUCER_OPTION)
+            .map(String::as_str)
+            .unwrap_or("none")
+    }
+
+    /// The `rowkind.field` option: a user column whose value encodes the row kind.
+    pub fn rowkind_field(&self) -> Option<&str> {
+        self.options.get(ROWKIND_FIELD_OPTION).map(String::as_str)
     }
 
     pub fn data_evolution_enabled(&self) -> bool {

@@ -72,3 +72,6 @@ pub use predicate::{
 pub(crate) mod murmur_hash;
 mod partition_statistics;
 pub use partition_statistics::PartitionStatistics;
+
+mod row_kind;
+pub use row_kind::RowKind;

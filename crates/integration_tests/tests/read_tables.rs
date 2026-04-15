@@ -1478,9 +1478,9 @@ async fn test_read_complex_type_table() {
 // PK-without-DV and non-PK-with-DV tests
 // ---------------------------------------------------------------------------
 
-/// Reading a primary-key table without deletion vectors should return an Unsupported error.
+/// Reading a primary-key table without deletion vectors should work via sort-merge reader.
 #[tokio::test]
-async fn test_read_pk_table_without_dv_returns_error() {
+async fn test_read_pk_table_without_dv_via_sort_merge() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_pk_table").await;
 
@@ -1493,16 +1493,73 @@ async fn test_read_pk_table_without_dv_returns_error() {
     );
 
     let read = table.new_read_builder().new_read();
-    let result = read
+    let stream = read
         .expect("new_read should succeed")
-        .to_arrow(plan.splits());
-    let err = result
-        .err()
-        .expect("Reading PK table without DV should fail");
+        .to_arrow(plan.splits())
+        .expect("to_arrow should succeed for PK table via sort-merge");
 
+    let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
+        .await
+        .expect("Reading PK table without DV should succeed via sort-merge reader");
     assert!(
-        matches!(&err, Error::Unsupported { message } if message.contains("primary-key")),
-        "Expected Unsupported error about primary-key tables, got: {err:?}"
+        !batches.is_empty(),
+        "PK table read should return non-empty results"
+    );
+
+    let actual = extract_id_name(&batches);
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "PK table without DV should return correct rows via sort-merge reader"
+    );
+}
+
+/// Reading a first-row merge engine PK table should return only the first-inserted row per key.
+/// The table has been compacted so all files are level > 0, and the scan skips level-0 files.
+#[tokio::test]
+async fn test_read_first_row_pk_table() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "first_row_pk_table").await;
+
+    let read_builder = table.new_read_builder();
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+    assert!(
+        !plan.splits().is_empty(),
+        "first-row PK table should have splits to read"
+    );
+
+    let read = table.new_read_builder().new_read();
+    let stream = read
+        .expect("new_read should succeed")
+        .to_arrow(plan.splits())
+        .expect("to_arrow should succeed for first-row PK table");
+
+    let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
+        .await
+        .expect("Reading first-row PK table should succeed");
+    assert!(
+        !batches.is_empty(),
+        "first-row PK table read should return non-empty results"
+    );
+
+    let actual = extract_id_name(&batches);
+    // first-row keeps the earliest row per key:
+    // commit 1: (1, alice), (2, bob), (3, carol)
+    // commit 2: (2, bob-v2), (3, carol-v2), (4, dave) — id=2,3 ignored, id=4 is new
+    let expected = vec![
+        (1, "alice".to_string()),
+        (2, "bob".to_string()),
+        (3, "carol".to_string()),
+        (4, "dave".to_string()),
+    ];
+    assert_eq!(
+        actual, expected,
+        "first-row PK table should keep earliest row per key"
     );
 }
 

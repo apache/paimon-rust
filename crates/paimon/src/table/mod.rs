@@ -27,12 +27,15 @@ mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
+mod kv_file_reader;
+mod kv_file_writer;
 mod read_builder;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
+mod sort_merge;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;

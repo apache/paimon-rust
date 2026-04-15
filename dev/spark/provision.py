@@ -790,5 +790,42 @@ def main():
     )
 
 
+    # ===== First-Row merge engine PK table =====
+    # first-row keeps the earliest inserted row per key; later duplicates are ignored.
+    # After compaction, level-0 files are promoted so the batch reader (which skips
+    # level-0 for first-row) can see the compacted data.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS first_row_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '1',
+            'merge-engine' = 'first-row'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO first_row_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO first_row_pk_table VALUES
+            (2, 'bob-v2'),
+            (3, 'carol-v2'),
+            (4, 'dave')
+        """
+    )
+    # Compact to promote level-0 files so the batch reader can see them.
+    spark.sql("CALL sys.compact('default.first_row_pk_table')")
+
+
 if __name__ == "__main__":
     main()

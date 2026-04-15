@@ -126,7 +126,7 @@ fn manifest_partition_predicate_may_match(
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
 /// Applies filters during concurrent manifest reading to reduce entries early:
 /// - Manifest-file-level partition stats pruning (skip entire manifest files)
-/// - DV level-0 filtering per entry
+/// - Level-0 filtering per entry (DV mode or FirstRow engine)
 /// - Partition predicate filtering per entry
 /// - Data-level stats pruning per entry (current schema only, cross-schema fail-open)
 #[allow(clippy::too_many_arguments)]
@@ -134,7 +134,7 @@ async fn read_all_manifest_entries(
     file_io: &FileIO,
     table_path: &str,
     snapshot: &Snapshot,
-    deletion_vectors_enabled: bool,
+    skip_level_zero: bool,
     has_primary_keys: bool,
     partition_predicate: Option<&Predicate>,
     partition_fields: &[DataField],
@@ -170,7 +170,7 @@ async fn read_all_manifest_entries(
                 let filtered: Vec<ManifestEntry> = entries
                     .into_iter()
                     .filter(|entry| {
-                        if deletion_vectors_enabled && has_primary_keys && entry.file().level == 0 {
+                        if skip_level_zero && has_primary_keys && entry.file().level == 0 {
                             return false;
                         }
                         if has_primary_keys && entry.bucket() < 0 {
@@ -461,6 +461,21 @@ impl<'a> TableScan<'a> {
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
 
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+
+        // Skip level-0 files for PK tables when:
+        // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
+        // - FirstRow engine without DV: reads go through DataFileReader (no merge),
+        //   so only compacted (level > 0) files are safe to read directly
+        let skip_level_zero = if has_primary_keys {
+            deletion_vectors_enabled
+                || core_options
+                    .merge_engine()
+                    .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+        } else {
+            false
+        };
+
         let partition_fields = self.table.schema().partition_fields();
 
         let pushdown_data_predicates = if data_evolution_enabled {
@@ -468,8 +483,6 @@ impl<'a> TableScan<'a> {
         } else {
             self.data_predicates.as_slice()
         };
-
-        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
 
         let bucket_key_fields: Vec<DataField> =
             if self.bucket_predicate.is_none() || !core_options.is_default_bucket_function() {
@@ -504,7 +517,7 @@ impl<'a> TableScan<'a> {
             file_io,
             table_path,
             snapshot,
-            deletion_vectors_enabled,
+            skip_level_zero,
             has_primary_keys,
             self.partition_predicate.as_ref(),
             &partition_fields,

@@ -18,6 +18,9 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 
+use super::{extract_datum_from_arrow, BinaryRowBuilder, DataType, Datum};
+use arrow_array::RecordBatch;
+
 /// Deserialize `_NULL_COUNTS` which in Avro is `["null", {"type":"array","items":["null","long"]}]`.
 /// Preserves null items as `None` (meaning "unknown") rather than collapsing to 0.
 fn deserialize_null_counts<'de, D>(deserializer: D) -> Result<Vec<Option<i64>>, D::Error>
@@ -97,4 +100,57 @@ impl Display for BinaryTableStats {
     fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
+}
+
+/// Compute per-column independent min/max/null_count for the specified columns
+/// in a RecordBatch. Each entry in `col_indices` is the column index in the batch,
+/// and the corresponding entry in `col_types` is its Paimon DataType.
+pub fn compute_column_stats(
+    batch: &RecordBatch,
+    col_indices: &[usize],
+    col_types: &[DataType],
+) -> crate::Result<BinaryTableStats> {
+    let num_cols = col_indices.len();
+    let num_rows = batch.num_rows();
+    let mut min_datums: Vec<Option<Datum>> = vec![None; num_cols];
+    let mut max_datums: Vec<Option<Datum>> = vec![None; num_cols];
+    let mut null_counts: Vec<Option<i64>> = vec![Some(0); num_cols];
+
+    for row_idx in 0..num_rows {
+        for (pos, (&col_idx, data_type)) in col_indices.iter().zip(col_types.iter()).enumerate() {
+            let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
+            match datum {
+                Some(d) => {
+                    if min_datums[pos].as_ref().is_none_or(|m| d < *m) {
+                        min_datums[pos] = Some(d.clone());
+                    }
+                    if max_datums[pos].as_ref().is_none_or(|m| d > *m) {
+                        max_datums[pos] = Some(d);
+                    }
+                }
+                None => {
+                    *null_counts[pos].as_mut().unwrap() += 1;
+                }
+            }
+        }
+    }
+
+    let mut min_builder = BinaryRowBuilder::new(num_cols as i32);
+    let mut max_builder = BinaryRowBuilder::new(num_cols as i32);
+    for (pos, data_type) in col_types.iter().enumerate() {
+        match &min_datums[pos] {
+            Some(d) => min_builder.write_datum(pos, d, data_type),
+            None => min_builder.set_null_at(pos),
+        }
+        match &max_datums[pos] {
+            Some(d) => max_builder.write_datum(pos, d, data_type),
+            None => max_builder.set_null_at(pos),
+        }
+    }
+
+    Ok(BinaryTableStats::new(
+        min_builder.build_serialized(),
+        max_builder.build_serialized(),
+        null_counts,
+    ))
 }

@@ -563,33 +563,6 @@ async fn test_partitioned_fixed_bucket_write_read() {
     assert_eq!(collect_int_col(&result, "value"), vec![10, 20, 30, 40]);
 }
 
-// ---------------------------------------------------------------------------
-// Unsupported: primary key table should be rejected
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_reject_primary_key_table() {
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .column("value", DataType::Int(IntType::new()))
-        .primary_key(["id"])
-        .build()
-        .unwrap();
-    let table_schema = TableSchema::new(0, &schema);
-
-    let file_io = memory_file_io();
-    let path = "memory:/append_reject_pk";
-    let table = make_table(&file_io, path, table_schema);
-
-    let result = table.new_write_builder().new_write();
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        matches!(&err, paimon::Error::Unsupported { message } if message.contains("primary keys")),
-        "Expected Unsupported error for PK table, got: {err:?}"
-    );
-}
-
 #[tokio::test]
 async fn test_reject_fixed_bucket_without_bucket_key() {
     let schema = Schema::builder()

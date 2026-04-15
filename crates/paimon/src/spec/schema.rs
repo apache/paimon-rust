@@ -141,6 +141,16 @@ pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
 
 pub const ROW_ID_FIELD_ID: i32 = i32::MAX - 5;
 
+pub const SEQUENCE_NUMBER_FIELD_NAME: &str = "_SEQUENCE_NUMBER";
+
+/// Must match Java Paimon's `SpecialFields.SEQUENCE_NUMBER` (Integer.MAX_VALUE - 1).
+pub const SEQUENCE_NUMBER_FIELD_ID: i32 = i32::MAX - 1;
+
+pub const VALUE_KIND_FIELD_NAME: &str = "_VALUE_KIND";
+
+/// Must match Java Paimon's `SpecialFields.VALUE_KIND` (Integer.MAX_VALUE - 2).
+pub const VALUE_KIND_FIELD_ID: i32 = i32::MAX - 2;
+
 /// Data field for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>

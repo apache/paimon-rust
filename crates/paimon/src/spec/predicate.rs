@@ -622,6 +622,18 @@ impl PredicateBuilder {
         self.leaf(field, PredicateOperator::IsNotNull, vec![])
     }
 
+    /// Build a partition predicate: AND of equal/is_null for each (field_name, datum) pair.
+    pub fn partition_predicate(&self, fields: &[(&str, Option<Datum>)]) -> Result<Predicate> {
+        let predicates: Vec<Predicate> = fields
+            .iter()
+            .map(|(name, value)| match value {
+                Some(v) => self.equal(name, v.clone()),
+                None => self.is_null(name),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Predicate::and(predicates))
+    }
+
     // -- set operators --
 
     pub fn is_in(&self, field: &str, literals: Vec<Datum>) -> Result<Predicate> {
