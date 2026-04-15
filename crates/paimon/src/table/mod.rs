@@ -24,6 +24,8 @@ pub mod data_evolution_writer;
 mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
+mod data_evolution_reader;
+mod data_file_reader;
 pub(crate) mod global_index_scanner;
 mod read_builder;
 pub(crate) mod rest_env;
@@ -34,6 +36,7 @@ mod snapshot_manager;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
+mod table_read;
 mod table_scan;
 pub(crate) mod table_write;
 mod tag_manager;
@@ -46,7 +49,8 @@ pub use data_evolution_writer::DataEvolutionWriter;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
-pub use read_builder::{ReadBuilder, TableRead};
+pub use read_builder::ReadBuilder;
+pub use table_read::TableRead;
 pub use rest_env::RESTEnv;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};

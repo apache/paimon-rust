@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
 ///
-/// Provides `new_write` (TODO) and `new_commit` methods, with optional
+/// Provides `new_write` and `new_commit` methods, with optional
 /// `overwrite` support for partition-level overwrites.
 pub struct WriteBuilder<'a> {
     table: &'a Table,

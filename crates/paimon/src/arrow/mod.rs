@@ -17,10 +17,7 @@
 
 pub(crate) mod filtering;
 pub(crate) mod format;
-mod reader;
 pub(crate) mod schema_evolution;
-
-pub use crate::arrow::reader::ArrowReaderBuilder;
 
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,

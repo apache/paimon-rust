@@ -21,13 +21,12 @@
 //! and [TypeUtils.project](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/utils/TypeUtils.java).
 
 use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_predicates};
-use super::{ArrowRecordBatchStream, Table, TableScan};
+use super::table_read::TableRead;
+use super::{Table, TableScan};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::arrow::ArrowReaderBuilder;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
-use crate::Result;
-use crate::{DataSplit, Error};
+use crate::{Result, Error};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
@@ -37,7 +36,7 @@ struct NormalizedFilter {
     bucket_predicate: Option<Predicate>,
 }
 
-fn split_scan_predicates(table: &Table, filter: Predicate) -> (Option<Predicate>, Vec<Predicate>) {
+pub(super) fn split_scan_predicates(table: &Table, filter: Predicate) -> (Option<Predicate>, Vec<Predicate>) {
     let partition_keys = table.schema().partition_keys();
     if partition_keys.is_empty() {
         (None, filter.split_and())
@@ -89,11 +88,6 @@ fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
         data_predicates,
         bucket_predicate: bucket_predicate(table, &filter),
     }
-}
-
-fn read_data_predicates(table: &Table, filter: Predicate) -> Vec<Predicate> {
-    let (_, data_predicates) = split_scan_predicates(table, filter);
-    reader_pruning_predicates(data_predicates)
 }
 
 /// Builder for table scan and table read (new_scan, new_read).
@@ -262,95 +256,9 @@ impl<'a> ReadBuilder<'a> {
     }
 }
 
-/// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
-///
-/// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
-#[derive(Debug, Clone)]
-pub struct TableRead<'a> {
-    table: &'a Table,
-    read_type: Vec<DataField>,
-    data_predicates: Vec<Predicate>,
-}
-
-impl<'a> TableRead<'a> {
-    /// Create a new TableRead with a specific read type (projected fields).
-    pub fn new(
-        table: &'a Table,
-        read_type: Vec<DataField>,
-        data_predicates: Vec<Predicate>,
-    ) -> Self {
-        Self {
-            table,
-            read_type,
-            data_predicates,
-        }
-    }
-
-    /// Schema (fields) that this read will produce.
-    pub fn read_type(&self) -> &[DataField] {
-        &self.read_type
-    }
-
-    /// Data predicates for read-side pruning.
-    pub fn data_predicates(&self) -> &[Predicate] {
-        &self.data_predicates
-    }
-
-    /// Table for this read.
-    pub fn table(&self) -> &Table {
-        self.table
-    }
-
-    /// Set a filter predicate for conservative read-side pruning.
-    ///
-    /// This is the direct-`TableRead` equivalent of [`ReadBuilder::with_filter`].
-    /// Supported non-partition data predicates may be used only on the regular
-    /// Parquet read path for row-group pruning and native Parquet row
-    /// filtering. Callers should still keep residual filtering at the query
-    /// layer for unsupported predicates, non-Parquet files, and data-evolution
-    /// reads.
-    pub fn with_filter(mut self, filter: Predicate) -> Self {
-        self.data_predicates = read_data_predicates(self.table, filter);
-        self
-    }
-
-    /// Returns an [`ArrowRecordBatchStream`].
-    pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        // todo: consider get read batch size from table
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
-        let core_options = CoreOptions::new(self.table.schema.options());
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
-        let data_evolution = core_options.data_evolution_enabled();
-
-        if has_primary_keys && !deletion_vectors_enabled {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Reading primary-key tables without deletion vectors is not yet supported. Primary keys: {:?}",
-                    self.table.schema.primary_keys()
-                ),
-            });
-        }
-
-        let reader = ArrowReaderBuilder::new(
-            self.table.file_io.clone(),
-            self.table.schema_manager().clone(),
-            self.table.schema().id(),
-        )
-        .with_predicates(self.data_predicates.clone())
-        .with_table_fields(self.table.schema.fields().to_vec())
-        .build(self.read_type().to_vec());
-
-        if data_evolution {
-            reader.read_data_evolution(data_splits, self.table.schema.fields())
-        } else {
-            reader.read(data_splits)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::TableRead;
+    use crate::table::TableRead;
     mod test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
     }
