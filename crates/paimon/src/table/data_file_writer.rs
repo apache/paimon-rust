@@ -25,7 +25,7 @@
 use crate::arrow::format::{create_format_writer, FormatFileWriter};
 use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{bucket_dir_name, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -133,11 +133,13 @@ impl DataFileWriter {
         );
 
         let bucket_dir = if self.partition_path.is_empty() {
-            format!("{}/bucket-{}", self.table_location, self.bucket)
+            format!("{}/{}", self.table_location, bucket_dir_name(self.bucket))
         } else {
             format!(
-                "{}/{}/bucket-{}",
-                self.table_location, self.partition_path, self.bucket
+                "{}/{}/{}",
+                self.table_location,
+                self.partition_path,
+                bucket_dir_name(self.bucket)
             )
         };
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;

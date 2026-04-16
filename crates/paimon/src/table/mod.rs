@@ -29,6 +29,7 @@ mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
 mod kv_file_reader;
 mod kv_file_writer;
+mod postpone_file_writer;
 mod read_builder;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;

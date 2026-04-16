@@ -30,8 +30,9 @@ use super::Table;
 use crate::io::FileIO;
 use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
-    eval_row, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind, IndexManifest,
-    ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot, TimeTravelSelector,
+    bucket_dir_name, eval_row, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind,
+    IndexManifest, ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot,
+    TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -135,6 +136,7 @@ async fn read_all_manifest_entries(
     table_path: &str,
     snapshot: &Snapshot,
     skip_level_zero: bool,
+    scan_all_files: bool,
     has_primary_keys: bool,
     partition_predicate: Option<&Predicate>,
     partition_fields: &[DataField],
@@ -173,7 +175,7 @@ async fn read_all_manifest_entries(
                         if skip_level_zero && has_primary_keys && entry.file().level == 0 {
                             return false;
                         }
-                        if has_primary_keys && entry.bucket() < 0 {
+                        if has_primary_keys && !scan_all_files && entry.bucket() < 0 {
                             return false;
                         }
                         if let Some(pred) = bucket_predicate {
@@ -537,6 +539,7 @@ impl<'a> TableScan<'a> {
             table_path,
             snapshot,
             skip_level_zero,
+            self.scan_all_files,
             has_primary_keys,
             self.partition_predicate.as_ref(),
             &partition_fields,
@@ -673,9 +676,9 @@ impl<'a> TableScan<'a> {
 
             let bucket_path = if let Some(ref computer) = partition_computer {
                 let partition_path = computer.generate_partition_path(&partition_row)?;
-                format!("{base_path}/{partition_path}bucket-{bucket}")
+                format!("{base_path}/{partition_path}{}", bucket_dir_name(bucket))
             } else {
-                format!("{base_path}/bucket-{bucket}")
+                format!("{base_path}/{}", bucket_dir_name(bucket))
             };
 
             // Original `partition` Vec consumed by PartitionBucket for DV map lookup.

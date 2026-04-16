@@ -1259,3 +1259,124 @@ async fn test_pk_first_row_insert_overwrite() {
         "After second OVERWRITE: still 2 files (no stale level-0 files accumulated)"
     );
 }
+
+// ======================= Postpone Bucket (bucket = -2) =======================
+
+/// Postpone bucket files are invisible to normal SELECT but visible via scan_all_files.
+#[tokio::test]
+async fn test_postpone_write_invisible_to_select() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+    handler
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_postpone (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '-2')",
+        )
+        .await
+        .unwrap();
+
+    // Write data
+    handler
+        .sql("INSERT INTO paimon.test_db.t_postpone VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // scan_all_files should find the postpone file
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_postpone"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(file_count, 1, "scan_all_files should find 1 postpone file");
+
+    // Normal SELECT should return 0 rows (postpone files are invisible)
+    let count = row_count(&handler, "SELECT * FROM paimon.test_db.t_postpone").await;
+    assert_eq!(count, 0, "SELECT should return 0 rows for postpone table");
+}
+
+/// INSERT OVERWRITE on a postpone table should replace old files with new ones.
+#[tokio::test]
+async fn test_postpone_insert_overwrite() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+    handler
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_postpone_ow (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '-2')",
+        )
+        .await
+        .unwrap();
+
+    // First commit
+    handler
+        .sql("INSERT INTO paimon.test_db.t_postpone_ow VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_postpone_ow"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(file_count, 1, "After INSERT: 1 postpone file");
+
+    // INSERT OVERWRITE should replace old file
+    handler
+        .sql("INSERT OVERWRITE paimon.test_db.t_postpone_ow VALUES (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_postpone_ow"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(
+        file_count, 1,
+        "After OVERWRITE: only 1 new file (old file deleted)"
+    );
+}

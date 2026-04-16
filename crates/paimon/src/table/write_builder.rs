@@ -49,6 +49,6 @@ impl<'a> WriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
-        TableWrite::new(self.table)
+        TableWrite::new(self.table, self.commit_user.clone())
     }
 }

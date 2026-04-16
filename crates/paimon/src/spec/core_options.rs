@@ -28,6 +28,11 @@ const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
 const DEFAULT_BUCKET: i32 = -1;
+/// Postpone bucket mode: data is written to `bucket-postpone` directory
+/// and is invisible to readers until compaction assigns real bucket numbers.
+pub const POSTPONE_BUCKET: i32 = -2;
+/// Directory name for postpone bucket files.
+pub const POSTPONE_BUCKET_DIR: &str = "bucket-postpone";
 const COMMIT_MAX_RETRIES_OPTION: &str = "commit.max-retries";
 const COMMIT_TIMEOUT_OPTION: &str = "commit.timeout";
 const COMMIT_MIN_RETRY_WAIT_OPTION: &str = "commit.min-retry-wait";
@@ -61,6 +66,16 @@ pub enum MergeEngine {
     Deduplicate,
     /// Keep the first row for each key (ignore later updates).
     FirstRow,
+}
+
+/// Format the bucket directory name for a given bucket number.
+/// Returns `"bucket-postpone"` for `POSTPONE_BUCKET` (-2), otherwise `"bucket-{N}"`.
+pub fn bucket_dir_name(bucket: i32) -> String {
+    if bucket == POSTPONE_BUCKET {
+        POSTPONE_BUCKET_DIR.to_string()
+    } else {
+        format!("bucket-{bucket}")
+    }
 }
 
 /// Typed accessors for common table options.

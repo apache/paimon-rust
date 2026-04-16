@@ -24,11 +24,12 @@ use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     extract_datum_from_arrow, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum,
-    MergeEngine, Predicate, PredicateBuilder, EMPTY_SERIALIZED_ROW,
+    MergeEngine, Predicate, PredicateBuilder, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
+use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -43,10 +44,11 @@ fn schema_contains_blob_type(fields: &[DataField]) -> bool {
         .any(|field| field.data_type().contains_blob_type())
 }
 
-/// Enum to hold either an append-only writer or a key-value writer.
+/// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
     Append(DataFileWriter),
     KeyValue(KeyValueFileWriter),
+    Postpone(PostponeFileWriter),
 }
 
 impl FileWriter {
@@ -54,6 +56,7 @@ impl FileWriter {
         match self {
             FileWriter::Append(w) => w.write(batch).await,
             FileWriter::KeyValue(w) => w.write(batch).await,
+            FileWriter::Postpone(w) => w.write(batch).await,
         }
     }
 
@@ -61,6 +64,7 @@ impl FileWriter {
         match self {
             FileWriter::Append(ref mut w) => w.prepare_commit().await,
             FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
+            FileWriter::Postpone(ref mut w) => w.prepare_commit().await,
         }
     }
 }
@@ -95,14 +99,14 @@ pub struct TableWrite {
     sequence_field_indices: Vec<usize>,
     /// Merge engine for primary-key tables.
     merge_engine: MergeEngine,
-    /// Column index in user schema for row kind (resolved from rowkind.field or _VALUE_KIND).
-    value_kind_col_index: Option<usize>,
     /// Cache of per-partition bucket→max_sequence_number, lazily populated on first write.
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
+    /// Commit user identifier, used for postpone file naming.
+    commit_user: String,
 }
 
 impl TableWrite {
-    pub(crate) fn new(table: &Table) -> crate::Result<Self> {
+    pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
@@ -124,16 +128,17 @@ impl TableWrite {
         let has_primary_keys = !schema.primary_keys().is_empty();
 
         if has_primary_keys {
-            if total_buckets < 1 {
+            if total_buckets < 1 && total_buckets != POSTPONE_BUCKET {
                 return Err(crate::Error::Unsupported {
                     message: format!(
-                        "KeyValueFileWriter does not support bucket={total_buckets}, only fixed bucket (>= 1) is supported"
+                        "KeyValueFileWriter does not support bucket={total_buckets}, only fixed bucket (>= 1) or postpone bucket (= -2) is supported"
                     ),
                 });
             }
-            if core_options
-                .changelog_producer()
-                .eq_ignore_ascii_case("input")
+            if total_buckets != POSTPONE_BUCKET
+                && core_options
+                    .changelog_producer()
+                    .eq_ignore_ascii_case("input")
             {
                 return Err(crate::Error::Unsupported {
                     message: "KeyValueFileWriter does not support changelog-producer=input"
@@ -200,11 +205,6 @@ impl TableWrite {
             });
         }
 
-        // Resolve value_kind column from _VALUE_KIND in user schema, if present.
-        let value_kind_col_index = fields
-            .iter()
-            .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME);
-
         Ok(Self {
             table: table.clone(),
             partition_writers: HashMap::new(),
@@ -222,8 +222,8 @@ impl TableWrite {
             primary_key_types,
             sequence_field_indices,
             merge_engine,
-            value_kind_col_index,
             partition_seq_cache: HashMap::new(),
+            commit_user,
         })
     }
 
@@ -297,7 +297,15 @@ impl TableWrite {
     ) -> Result<Vec<(PartitionBucketKey, RecordBatch)>> {
         // Fast path: no partitions and single bucket — skip per-row routing
         if self.partition_field_indices.is_empty() && self.total_buckets <= 1 {
-            return Ok(vec![((EMPTY_SERIALIZED_ROW.clone(), 0), batch.clone())]);
+            let bucket = if self.total_buckets == POSTPONE_BUCKET {
+                POSTPONE_BUCKET
+            } else {
+                0
+            };
+            return Ok(vec![(
+                (EMPTY_SERIALIZED_ROW.clone(), bucket),
+                batch.clone(),
+            )]);
         }
 
         let fields = self.table.schema().fields();
@@ -412,7 +420,9 @@ impl TableWrite {
         };
 
         // Compute bucket
-        let bucket = if self.total_buckets <= 1 || self.bucket_key_indices.is_empty() {
+        let bucket = if self.total_buckets == POSTPONE_BUCKET {
+            POSTPONE_BUCKET
+        } else if self.total_buckets <= 1 || self.bucket_key_indices.is_empty() {
             0
         } else {
             let mut datums: Vec<(Option<Datum>, DataType)> = Vec::new();
@@ -438,6 +448,7 @@ impl TableWrite {
         };
 
         let writer = if self.primary_key_indices.is_empty() {
+            // Append-only writer for non-PK tables.
             FileWriter::Append(DataFileWriter::new(
                 self.table.file_io().clone(),
                 self.table.location().to_string(),
@@ -451,6 +462,23 @@ impl TableWrite {
                 Some(0), // file_source: APPEND
                 None,    // first_row_id: assigned by commit
                 None,    // write_cols: full-row write
+            ))
+        } else if bucket == POSTPONE_BUCKET {
+            // Postpone bucket: KV format but no sorting/dedup, special file naming.
+            let data_file_prefix = format!("data-u-{}-s-0-w-", self.commit_user);
+            FileWriter::Postpone(PostponeFileWriter::new(
+                self.table.file_io().clone(),
+                PostponeWriteConfig {
+                    table_location: self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    schema_id: self.schema_id,
+                    target_file_size: self.target_file_size,
+                    file_compression: self.file_compression.clone(),
+                    file_compression_zstd_level: self.file_compression_zstd_level,
+                    write_buffer_size: self.write_buffer_size,
+                    data_file_prefix,
+                },
             ))
         } else {
             // Lazily scan partition sequence numbers on first writer creation per partition.
@@ -481,7 +509,6 @@ impl TableWrite {
                     primary_key_types: self.primary_key_types.clone(),
                     sequence_field_indices: self.sequence_field_indices.clone(),
                     merge_engine: self.merge_engine,
-                    value_kind_col_index: self.value_kind_col_index,
                 },
                 next_seq,
             ))
@@ -504,6 +531,7 @@ mod tests {
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::Int32Array;
+    use arrow_array::RecordBatchReader as _;
     use arrow_schema::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
     };
@@ -624,7 +652,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![1, 2, 3], vec![10, 20, 30]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -655,7 +683,9 @@ mod tests {
             None,
         );
 
-        let err = TableWrite::new(&table).err().unwrap();
+        let err = TableWrite::new(&table, "test-user".to_string())
+            .err()
+            .unwrap();
         assert!(
             matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
         );
@@ -671,7 +701,9 @@ mod tests {
             None,
         );
 
-        let err = TableWrite::new(&table).err().unwrap();
+        let err = TableWrite::new(&table, "test-user".to_string())
+            .err()
+            .unwrap();
         assert!(
             matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
         );
@@ -684,7 +716,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_partitioned_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_partitioned_batch(vec!["a", "b", "a"], vec![1, 2, 3]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -715,7 +747,7 @@ mod tests {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_empty";
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![], vec![]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -731,7 +763,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // First write + prepare_commit
         table_write
@@ -763,7 +795,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         table_write
             .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
@@ -827,7 +859,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_bucketed_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Row with NULL bucket key should not panic
         let batch = make_nullable_id_batch(vec![None, Some(1), None], vec![10, 20, 30]);
@@ -849,7 +881,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_bucketed_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Two NULLs should land in the same bucket
         let batch = make_nullable_id_batch(vec![None, None], vec![10, 20]);
@@ -877,7 +909,7 @@ mod tests {
 
         // Compute bucket for NULL key
         let fields = table.schema().fields().to_vec();
-        let tw = TableWrite::new(&table).unwrap();
+        let tw = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch_null = make_nullable_id_batch(vec![None], vec![10]);
         let (_, bucket_null) = tw
@@ -942,7 +974,7 @@ mod tests {
                 None,
             );
 
-            let tw = TableWrite::new(&table).unwrap();
+            let tw = TableWrite::new(&table, "test-user".to_string()).unwrap();
             let fields = table.schema().fields().to_vec();
 
             // Build a batch: d=NULL, ltz=NULL, ntz=NULL, k=1
@@ -1016,7 +1048,7 @@ mod tests {
             None,
         );
 
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Write multiple batches — each should roll to a new file
         table_write
@@ -1069,7 +1101,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1104,7 +1136,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Write unsorted data
         let batch = make_batch(vec![5, 2, 4, 1, 3], vec![50, 20, 40, 10, 30]);
@@ -1162,7 +1194,7 @@ mod tests {
         let table = test_pk_table(&file_io, table_path);
 
         // First commit: id=1,2,3
-        let mut tw1 = TableWrite::new(&table).unwrap();
+        let mut tw1 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         tw1.write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
             .await
             .unwrap();
@@ -1171,7 +1203,7 @@ mod tests {
         commit.commit(msgs1).await.unwrap();
 
         // Second commit: id=2,3,4 with updated values, higher sequence numbers
-        let mut tw2 = TableWrite::new(&table).unwrap();
+        let mut tw2 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         tw2.write_arrow_batch(&make_batch(vec![2, 3, 4], vec![200, 300, 400]))
             .await
             .unwrap();
@@ -1224,7 +1256,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![1, 2], vec![10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1234,5 +1266,275 @@ mod tests {
         // Fresh table, seq starts at 0, 2 rows → min=0, max=1
         assert_eq!(file.min_sequence_number, 0);
         assert_eq!(file.max_sequence_number, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Postpone bucket (bucket = -2) write tests
+    // -----------------------------------------------------------------------
+
+    fn test_postpone_pk_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_postpone_table"),
+            table_path.to_string(),
+            test_postpone_pk_schema(),
+            None,
+        )
+    }
+
+    fn test_postpone_partitioned_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["pt", "id"])
+            .partition_keys(["pt"])
+            .option("bucket", "-2")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn test_postpone_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_postpone_table"),
+            table_path.to_string(),
+            test_postpone_partitioned_schema(),
+            None,
+        )
+    }
+
+    fn make_partitioned_batch_3col(pts: Vec<&str>, ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("pt", ArrowDataType::Utf8, false),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(pts)),
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_and_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_write";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].row_count, 3);
+
+        // Commit and verify snapshot
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_empty_batch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_empty";
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let batch = make_batch(vec![], vec![]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_multiple_batches() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_multi";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4], vec![30, 40]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bucket, POSTPONE_BUCKET);
+
+        let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 4);
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_partitioned() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_partitioned";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_partitioned_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let batch =
+            make_partitioned_batch_3col(vec!["a", "b", "a"], vec![1, 2, 3], vec![10, 20, 30]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        // 2 partitions
+        assert_eq!(messages.len(), 2);
+        // All messages should use POSTPONE_BUCKET
+        for msg in &messages {
+            assert_eq!(msg.bucket, POSTPONE_BUCKET);
+        }
+
+        let total_rows: i64 = messages
+            .iter()
+            .flat_map(|m| &m.new_files)
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(total_rows, 3);
+
+        // Commit and verify
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_reusable() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_reuse";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        // First write + prepare_commit
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages1 = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages1.len(), 1);
+        assert_eq!(messages1[0].new_files[0].row_count, 2);
+
+        // Second write + prepare_commit (reuse)
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4, 5], vec![30, 40, 50]))
+            .await
+            .unwrap();
+        let messages2 = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages2.len(), 1);
+        assert_eq!(messages2[0].new_files[0].row_count, 3);
+
+        // Empty prepare_commit
+        let messages3 = table_write.prepare_commit().await.unwrap();
+        assert!(messages3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_postpone_write_file_naming_and_kv_format() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_kv";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "my-commit-user".to_string()).unwrap();
+
+        let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
+        table_write.write_arrow_batch(&batch).await.unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+
+        // Verify postpone file naming: data-u-{commitUser}-s-{writeId}-w-{uuid}-{index}.parquet
+        assert!(
+            file.file_name.starts_with("data-u-my-commit-user-s-"),
+            "Expected postpone file prefix, got: {}",
+            file.file_name
+        );
+        assert!(
+            file.file_name.contains("-w-"),
+            "Expected -w- in file name, got: {}",
+            file.file_name
+        );
+
+        // Verify KV format: read the parquet file and check physical columns
+        let bucket_dir = format!("{table_path}/bucket-postpone");
+        let file_path = format!("{bucket_dir}/{}", file.file_name);
+        let input = file_io.new_input(&file_path).unwrap();
+        let data = input.read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(data, 1024).unwrap();
+        let schema = reader.schema();
+        // Physical schema: [_SEQUENCE_NUMBER, _VALUE_KIND, id, value]
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.field(0).name(), "_SEQUENCE_NUMBER");
+        assert_eq!(schema.field(1).name(), "_VALUE_KIND");
+        assert_eq!(schema.field(2).name(), "id");
+        assert_eq!(schema.field(3).name(), "value");
+
+        // Data should be in arrival order (not sorted by PK): 3, 1, 2
+        let batches: Vec<RecordBatch> = reader.into_iter().map(|r| r.unwrap()).collect();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(2)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![3, 1, 2],
+            "Postpone mode should preserve arrival order"
+        );
+
+        // Empty key stats for postpone mode
+        assert_eq!(file.min_key, EMPTY_SERIALIZED_ROW.clone());
+        assert_eq!(file.max_key, EMPTY_SERIALIZED_ROW.clone());
     }
 }

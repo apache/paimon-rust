@@ -74,9 +74,6 @@ pub(crate) struct KeyValueWriteConfig {
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
-    /// Column index in user schema that provides the row kind value.
-    /// Resolved from: `rowkind.field` option > `_VALUE_KIND` column > None (all INSERT).
-    pub value_kind_col_index: Option<usize>,
 }
 
 impl KeyValueFileWriter {
@@ -200,23 +197,8 @@ impl KeyValueFileWriter {
         let min_key = self.extract_key_binary_row(&combined, first_row)?;
         let max_key = self.extract_key_binary_row(&combined, last_row)?;
 
-        // Build physical schema (thin-mode): [_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]
-        let user_fields = user_schema.fields();
-        let mut physical_fields: Vec<Arc<ArrowField>> = Vec::new();
-        physical_fields.push(Arc::new(ArrowField::new(
-            SEQUENCE_NUMBER_FIELD_NAME,
-            ArrowDataType::Int64,
-            false,
-        )));
-        physical_fields.push(Arc::new(ArrowField::new(
-            VALUE_KIND_FIELD_NAME,
-            ArrowDataType::Int8,
-            false,
-        )));
-        for field in user_fields.iter() {
-            physical_fields.push(field.clone());
-        }
-        let physical_schema = Arc::new(ArrowSchema::new(physical_fields));
+        // Build physical schema and open writer.
+        let physical_schema = build_physical_schema(&user_schema);
 
         // Open parquet writer.
         let file_name = format!(
@@ -262,8 +244,13 @@ impl KeyValueFileWriter {
                     },
                 )?,
             );
-            // Value kind column.
-            match self.config.value_kind_col_index {
+            // Value kind column — resolve from batch schema.
+            let vk_idx = combined
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME);
+            match vk_idx {
                 Some(vk_idx) => {
                     physical_columns.push(
                         arrow_select::take::take(
@@ -282,8 +269,11 @@ impl KeyValueFileWriter {
                     physical_columns.push(Arc::new(Int8Array::from(vec![0i8; chunk_len])));
                 }
             }
-            // All user columns.
+            // All user columns (skip _VALUE_KIND if present — already handled above).
             for idx in 0..combined.num_columns() {
+                if Some(idx) == vk_idx {
+                    continue;
+                }
                 physical_columns.push(
                     arrow_select::take::take(combined.column(idx).as_ref(), &chunk_indices, None)
                         .map_err(|e| crate::Error::DataInvalid {
@@ -458,4 +448,25 @@ impl KeyValueFileWriter {
         }
         Ok(builder.build_serialized())
     }
+}
+
+/// Build the physical schema: [_SEQUENCE_NUMBER, _VALUE_KIND, user_cols (excluding _VALUE_KIND)...]
+pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchema> {
+    let mut physical_fields: Vec<Arc<ArrowField>> = Vec::new();
+    physical_fields.push(Arc::new(ArrowField::new(
+        SEQUENCE_NUMBER_FIELD_NAME,
+        ArrowDataType::Int64,
+        false,
+    )));
+    physical_fields.push(Arc::new(ArrowField::new(
+        VALUE_KIND_FIELD_NAME,
+        ArrowDataType::Int8,
+        false,
+    )));
+    for field in user_schema.fields().iter() {
+        if field.name() != VALUE_KIND_FIELD_NAME {
+            physical_fields.push(field.clone());
+        }
+    }
+    Arc::new(ArrowSchema::new(physical_fields))
 }
