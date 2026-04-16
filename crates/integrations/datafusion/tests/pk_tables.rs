@@ -1202,7 +1202,10 @@ async fn test_pk_first_row_insert_overwrite() {
         .await
         .unwrap();
     let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
-    assert_eq!(file_count, 2, "After INSERT: 2 level-0 files (one per partition)");
+    assert_eq!(
+        file_count, 2,
+        "After INSERT: 2 level-0 files (one per partition)"
+    );
 
     // INSERT OVERWRITE partition 2024-01-01 — must delete old level-0 file
     handler
