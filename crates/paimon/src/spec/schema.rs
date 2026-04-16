@@ -98,6 +98,22 @@ impl TableSchema {
         &self.primary_keys
     }
 
+    /// Primary keys with partition columns removed.
+    ///
+    /// Within a single partition the partition columns are constant, so they
+    /// are redundant in the KV key. Java Paimon calls these "trimmed primary keys".
+    pub fn trimmed_primary_keys(&self) -> Vec<String> {
+        if self.partition_keys.is_empty() {
+            return self.primary_keys.clone();
+        }
+        let partition_set: HashSet<&str> = self.partition_keys.iter().map(String::as_str).collect();
+        self.primary_keys
+            .iter()
+            .filter(|pk| !partition_set.contains(pk.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub fn options(&self) -> &HashMap<String, String> {
         &self.options
     }
@@ -477,6 +493,22 @@ impl Schema {
 
     pub fn primary_keys(&self) -> &[String] {
         &self.primary_keys
+    }
+
+    /// Primary keys with partition columns removed.
+    ///
+    /// Within a single partition the partition columns are constant, so they
+    /// are redundant in the KV key. Java Paimon calls these "trimmed primary keys".
+    pub fn trimmed_primary_keys(&self) -> Vec<String> {
+        if self.partition_keys.is_empty() {
+            return self.primary_keys.clone();
+        }
+        let partition_set: HashSet<&str> = self.partition_keys.iter().map(String::as_str).collect();
+        self.primary_keys
+            .iter()
+            .filter(|pk| !partition_set.contains(pk.as_str()))
+            .cloned()
+            .collect()
     }
 
     pub fn options(&self) -> &HashMap<String, String> {

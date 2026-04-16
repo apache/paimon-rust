@@ -55,15 +55,10 @@ fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     }
 
     let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-        if table.schema().primary_keys().is_empty() {
+        if table.schema().trimmed_primary_keys().is_empty() {
             Vec::new()
         } else {
-            table
-                .schema()
-                .primary_keys()
-                .iter()
-                .map(|key| key.to_string())
-                .collect()
+            table.schema().trimmed_primary_keys()
         }
     });
     if bucket_keys.is_empty() {
@@ -331,7 +326,6 @@ mod tests {
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
-            .with_raw_convertible(true)
             .build()
             .unwrap();
 
@@ -391,7 +385,6 @@ mod tests {
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
-            .with_raw_convertible(true)
             .build()
             .unwrap();
 
@@ -449,7 +442,6 @@ mod tests {
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
-            .with_raw_convertible(true)
             .build()
             .unwrap();
 
@@ -510,7 +502,6 @@ mod tests {
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
             .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
-            .with_raw_convertible(true)
             .build()
             .unwrap();
 

@@ -72,60 +72,112 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
+        let has_primary_keys = !self.table.schema.trimmed_primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
-        let data_evolution = core_options.data_evolution_enabled();
 
-        // PK table without DV: route by merge engine.
-        // Exhaustive match ensures new MergeEngine variants trigger a compile error.
-        if has_primary_keys && !deletion_vectors_enabled {
-            match core_options.merge_engine()? {
-                crate::spec::MergeEngine::Deduplicate => {
-                    let reader = KeyValueFileReader::new(
-                        self.table.file_io.clone(),
-                        KeyValueReadConfig {
-                            schema_manager: self.table.schema_manager().clone(),
-                            table_schema_id: self.table.schema().id(),
-                            table_fields: self.table.schema.fields().to_vec(),
-                            read_type: self.read_type().to_vec(),
-                            predicates: self.data_predicates.clone(),
-                            primary_keys: self.table.schema.primary_keys().to_vec(),
-                            sequence_fields: core_options
-                                .sequence_fields()
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect(),
-                        },
-                    );
-                    return reader.read(data_splits);
-                }
-                crate::spec::MergeEngine::FirstRow => {
-                    // Fall through to DataFileReader — scan already skips level-0
-                }
+        // PK table with Deduplicate engine: splits containing level-0 files
+        // need KeyValueFileReader for sort-merge dedup; splits with only
+        // compacted files (level > 0) can use the faster DataFileReader.
+        // FirstRow engine falls through — scan already skips level-0.
+        if has_primary_keys
+            && core_options
+                .merge_engine()
+                .is_ok_and(|e| e == crate::spec::MergeEngine::Deduplicate)
+        {
+            return self.read_pk_deduplicate(data_splits, &core_options);
+        }
+
+        if core_options.data_evolution_enabled() {
+            self.read_with_evolution(data_splits)
+        } else {
+            self.read_raw(data_splits)
+        }
+    }
+
+    /// Read PK table with Deduplicate engine: level-0 splits go through
+    /// KeyValueFileReader for sort-merge dedup, compacted splits use DataFileReader.
+    fn read_pk_deduplicate(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let mut kv_splits = Vec::new();
+        let mut raw_splits = Vec::new();
+        for split in data_splits {
+            if split.data_files().iter().any(|f| f.level == 0) {
+                kv_splits.push(split.clone());
+            } else {
+                raw_splits.push(split.clone());
             }
         }
 
-        // PK table with DV or append-only table: DataFileReader / DataEvolutionReader
-        if data_evolution {
-            let reader = DataEvolutionReader::new(
-                self.table.file_io.clone(),
-                self.table.schema_manager().clone(),
-                self.table.schema().id(),
-                self.table.schema.fields().to_vec(),
-                self.read_type().to_vec(),
-            )?;
-            reader.read(data_splits)
-        } else {
-            let reader = DataFileReader::new(
-                self.table.file_io.clone(),
-                self.table.schema_manager().clone(),
-                self.table.schema().id(),
-                self.table.schema.fields().to_vec(),
-                self.read_type().to_vec(),
-                self.data_predicates.clone(),
-            );
-            reader.read(data_splits)
+        if raw_splits.is_empty() {
+            return self.read_kv(&kv_splits, core_options);
         }
+        if kv_splits.is_empty() {
+            return self.read_raw(&raw_splits);
+        }
+
+        let kv_stream = self.read_kv(&kv_splits, core_options)?;
+        let raw_stream = self.read_raw(&raw_splits)?;
+        Ok(Box::pin(futures::stream::select_all([
+            kv_stream, raw_stream,
+        ])))
+    }
+
+    /// Read splits via KeyValueFileReader (sort-merge dedup).
+    fn read_kv(
+        &self,
+        splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let reader = KeyValueFileReader::new(
+            self.table.file_io.clone(),
+            KeyValueReadConfig {
+                schema_manager: self.table.schema_manager().clone(),
+                table_schema_id: self.table.schema().id(),
+                table_fields: self.table.schema.fields().to_vec(),
+                read_type: self.read_type().to_vec(),
+                predicates: self.data_predicates.clone(),
+                primary_keys: self.table.schema.trimmed_primary_keys(),
+                sequence_fields: core_options
+                    .sequence_fields()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+        );
+        reader.read(splits)
+    }
+
+    /// Read with data-evolution support.
+    fn read_with_evolution(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let reader = DataEvolutionReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            self.read_type().to_vec(),
+        )?;
+        reader.read(data_splits)
+    }
+
+    /// Read raw data files without dedup or evolution.
+    fn read_raw(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.new_data_file_reader().read(data_splits)
+    }
+
+    fn new_data_file_reader(&self) -> DataFileReader {
+        DataFileReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            self.read_type().to_vec(),
+            self.data_predicates.clone(),
+        )
     }
 }

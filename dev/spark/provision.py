@@ -622,6 +622,39 @@ def main():
     )
 
 
+    # ===== Dynamic bucket PK table (bucket=-1) =====
+    # Two commits with overlapping keys to exercise dynamic bucket assignment
+    # and index file generation. Used to verify that paimon-rust produces
+    # identical hash index values when writing the same data.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS dynamic_bucket_pk_table (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '-1'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO dynamic_bucket_pk_table VALUES
+            (1, 'alice'),
+            (2, 'bob'),
+            (3, 'carol')
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO dynamic_bucket_pk_table VALUES
+            (2, 'bob-v2'),
+            (3, 'carol-v2'),
+            (4, 'dave')
+        """
+    )
+
     # ===== Multi-bucket PK table for bucket predicate filtering tests =====
     # PK table with bucket=4 so data distributes across multiple buckets.
     # Bucket key defaults to primary key (id). Used to test that bucket predicate

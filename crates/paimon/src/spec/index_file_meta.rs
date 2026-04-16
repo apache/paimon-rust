@@ -51,7 +51,7 @@ pub struct GlobalIndexMeta {
 /// Metadata of index file.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/index/IndexFileMeta.java>
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexFileMeta {
     #[serde(rename = "_INDEX_TYPE")]
     pub index_type: String,

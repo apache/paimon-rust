@@ -56,6 +56,8 @@ const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
+const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
+const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 
 /// Merge engine for primary-key tables.
 ///
@@ -346,6 +348,16 @@ impl<'a> CoreOptions<'a> {
             .get(WRITE_PARQUET_BUFFER_SIZE_OPTION)
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_WRITE_PARQUET_BUFFER_SIZE)
+    }
+
+    /// Target row number per bucket for dynamic bucket mode (bucket=-1).
+    /// When a bucket reaches this number, a new bucket is created.
+    /// Default is 200,000 (matching Java Paimon).
+    pub fn dynamic_bucket_target_row_num(&self) -> i64 {
+        self.options
+            .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
     }
 }
 

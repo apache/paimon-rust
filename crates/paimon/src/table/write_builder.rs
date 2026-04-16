@@ -29,6 +29,7 @@ use uuid::Uuid;
 pub struct WriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
+    is_overwrite: bool,
 }
 
 impl<'a> WriteBuilder<'a> {
@@ -36,7 +37,17 @@ impl<'a> WriteBuilder<'a> {
         Self {
             table,
             commit_user: Uuid::new_v4().to_string(),
+            is_overwrite: false,
         }
+    }
+
+    /// Mark this write as an overwrite operation.
+    ///
+    /// Overwrite skips restoring sequence numbers and bucket index loading
+    /// since old data will be fully replaced at commit time.
+    pub fn with_overwrite(mut self) -> Self {
+        self.is_overwrite = true;
+        self
     }
 
     /// Create a new TableCommit for committing write results.
@@ -49,6 +60,6 @@ impl<'a> WriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
-        TableWrite::new(self.table, self.commit_user.clone())
+        TableWrite::new(self.table, self.commit_user.clone(), self.is_overwrite)
     }
 }

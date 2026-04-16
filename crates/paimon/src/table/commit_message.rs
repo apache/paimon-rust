@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::spec::DataFileMeta;
+use crate::spec::IndexFileMeta;
 
 /// A commit message representing new files to be committed for a specific partition and bucket.
 ///
@@ -28,6 +29,8 @@ pub struct CommitMessage {
     pub bucket: i32,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
+    /// New index files to be added (used by dynamic bucket mode).
+    pub new_index_files: Vec<IndexFileMeta>,
 }
 
 impl CommitMessage {
@@ -36,6 +39,7 @@ impl CommitMessage {
             partition,
             bucket,
             new_files,
+            new_index_files: Vec::new(),
         }
     }
 }

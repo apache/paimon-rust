@@ -474,25 +474,24 @@ impl<'a> TableScan<'a> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
 
-        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let has_primary_keys = !self.table.schema().trimmed_primary_keys().is_empty();
 
-        // Skip level-0 files for PK tables when:
-        // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
-        // - FirstRow engine without DV: reads go through DataFileReader (no merge),
-        //   so only compacted (level > 0) files are safe to read directly
+        // Skip level-0 files for PK tables with FirstRow engine only.
+        // FirstRow reads go through DataFileReader (no merge), so only compacted
+        // (level > 0) files are safe to read directly.
+        // Deduplicate engine always uses KeyValueFileReader which handles level-0
+        // via sort-merge, so level-0 files must remain visible.
         //
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
         let skip_level_zero = if self.scan_all_files {
             false
         } else if has_primary_keys {
-            deletion_vectors_enabled
-                || core_options
-                    .merge_engine()
-                    .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+            core_options
+                .merge_engine()
+                .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
         } else {
             false
         };
@@ -511,12 +510,7 @@ impl<'a> TableScan<'a> {
             } else {
                 let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
                     if has_primary_keys {
-                        self.table
-                            .schema()
-                            .primary_keys()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect()
+                        self.table.schema().trimmed_primary_keys()
                     } else {
                         Vec::new()
                     }
@@ -689,7 +683,7 @@ impl<'a> TableScan<'a> {
             // Data-evolution tables merge overlapping row-id groups column-wise during read.
             // Keep that split boundary intact and only bin-pack single-file groups.
             // Apply group-level predicate filtering after grouping by row_id range.
-            let file_groups_with_raw: Vec<(Vec<DataFileMeta>, bool)> = if data_evolution_enabled {
+            let file_groups: Vec<Vec<DataFileMeta>> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
 
                 // Filter groups by merged stats before splitting.
@@ -724,23 +718,20 @@ impl<'a> TableScan<'a> {
 
                 let mut result = Vec::new();
                 for group in multis {
-                    result.push((group, false));
+                    result.push(group);
                 }
 
                 let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
                 for file_group in split_for_batch(single_files, target_split_size, open_file_cost) {
-                    result.push((file_group, true));
+                    result.push(file_group);
                 }
 
                 result
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
-                    .into_iter()
-                    .map(|group| (group, true))
-                    .collect()
             };
 
-            for (file_group, raw_convertible) in file_groups_with_raw {
+            for file_group in file_groups {
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
@@ -770,8 +761,7 @@ impl<'a> TableScan<'a> {
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
-                    .with_data_files(file_group)
-                    .with_raw_convertible(raw_convertible);
+                    .with_data_files(file_group);
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
                 }

@@ -343,6 +343,29 @@ impl BinaryRow {
         Ok(Some(datum))
     }
 
+    /// Build a BinaryRow from selected columns of an Arrow RecordBatch at a given row.
+    ///
+    /// `field_indices` maps each position in the output BinaryRow to a column index
+    /// in the batch; `fields` provides the Paimon DataField metadata for every column
+    /// in the schema (indexed by the same column indices).
+    pub fn from_arrow(
+        batch: &RecordBatch,
+        row_idx: usize,
+        field_indices: &[usize],
+        fields: &[crate::spec::DataField],
+    ) -> crate::Result<Self> {
+        let arity = field_indices.len() as i32;
+        let mut builder = BinaryRowBuilder::new(arity);
+        for (pos, &field_idx) in field_indices.iter().enumerate() {
+            let field = &fields[field_idx];
+            match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
+                Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
+                None => builder.set_null_at(pos),
+            }
+        }
+        Ok(builder.build())
+    }
+
     /// Build a BinaryRow from typed Datum values using `BinaryRowBuilder`.
     /// `None` entries are written as null fields.
     pub fn from_datums(datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)]) -> Self {
@@ -365,7 +388,7 @@ impl BinaryRow {
     ) -> i32 {
         let row = Self::from_datums(datums);
         let hash = row.hash_code();
-        (hash % total_buckets).abs()
+        (hash % total_buckets).wrapping_abs()
     }
 }
 
@@ -788,6 +811,344 @@ fn type_mismatch_err(expected: &str, col_idx: usize) -> crate::Error {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batch-level BinaryRow utilities
+// ---------------------------------------------------------------------------
+
+/// Pre-downcast column reference to avoid per-row dynamic dispatch.
+enum TypedColumn<'a> {
+    Boolean(&'a arrow_array::BooleanArray),
+    Int8(&'a arrow_array::Int8Array),
+    Int16(&'a arrow_array::Int16Array),
+    Int32(&'a arrow_array::Int32Array),
+    Int64(&'a arrow_array::Int64Array),
+    Float32(&'a arrow_array::Float32Array),
+    Float64(&'a arrow_array::Float64Array),
+    Utf8(&'a arrow_array::StringArray),
+    Utf8View(&'a arrow_array::StringViewArray),
+    LargeUtf8(&'a arrow_array::LargeStringArray),
+    Date32(&'a arrow_array::Date32Array),
+    Decimal128(&'a arrow_array::Decimal128Array, u32, u32), // (array, precision, scale)
+    Binary(&'a arrow_array::BinaryArray),
+    TimestampMs(&'a arrow_array::TimestampMillisecondArray),
+    TimestampUs(&'a arrow_array::TimestampMicrosecondArray),
+}
+
+/// Downcast Arrow columns once, returning typed references paired with their DataType.
+fn downcast_columns<'a>(
+    batch: &'a RecordBatch,
+    field_indices: &[usize],
+    fields: &'a [crate::spec::DataField],
+) -> crate::Result<Vec<(TypedColumn<'a>, &'a crate::spec::DataField)>> {
+    use arrow_array::Array;
+    field_indices
+        .iter()
+        .map(|&col_idx| {
+            let field = &fields[col_idx];
+            let col = batch.column(col_idx);
+            let typed =
+                match field.data_type() {
+                    DataType::Boolean(_) => TypedColumn::Boolean(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?,
+                    ),
+                    DataType::TinyInt(_) => TypedColumn::Int8(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?,
+                    ),
+                    DataType::SmallInt(_) => TypedColumn::Int16(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?,
+                    ),
+                    DataType::Int(_) => TypedColumn::Int32(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Int", col_idx))?,
+                    ),
+                    DataType::BigInt(_) => TypedColumn::Int64(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?,
+                    ),
+                    DataType::Float(_) => TypedColumn::Float32(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Float", col_idx))?,
+                    ),
+                    DataType::Double(_) => TypedColumn::Float64(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Double", col_idx))?,
+                    ),
+                    DataType::Char(_) | DataType::VarChar(_) => {
+                        if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                            TypedColumn::Utf8(arr)
+                        } else if let Some(arr) =
+                            col.as_any().downcast_ref::<arrow_array::StringViewArray>()
+                        {
+                            TypedColumn::Utf8View(arr)
+                        } else if let Some(arr) =
+                            col.as_any().downcast_ref::<arrow_array::LargeStringArray>()
+                        {
+                            TypedColumn::LargeUtf8(arr)
+                        } else {
+                            return Err(type_mismatch_err("String", col_idx));
+                        }
+                    }
+                    DataType::Date(_) => TypedColumn::Date32(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Date", col_idx))?,
+                    ),
+                    DataType::Decimal(d) => TypedColumn::Decimal128(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?,
+                        d.precision(),
+                        d.scale(),
+                    ),
+                    DataType::Binary(_) | DataType::VarBinary(_) => TypedColumn::Binary(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,
+                    ),
+                    DataType::Timestamp(ts) => {
+                        if ts.precision() <= 3 {
+                            TypedColumn::TimestampMs(
+                                col.as_any()
+                                    .downcast_ref()
+                                    .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?,
+                            )
+                        } else {
+                            TypedColumn::TimestampUs(
+                                col.as_any()
+                                    .downcast_ref()
+                                    .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?,
+                            )
+                        }
+                    }
+                    DataType::LocalZonedTimestamp(ts) => {
+                        if ts.precision() <= 3 {
+                            TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
+                                || type_mismatch_err("LocalZonedTimestamp(ms)", col_idx),
+                            )?)
+                        } else {
+                            TypedColumn::TimestampUs(col.as_any().downcast_ref().ok_or_else(
+                                || type_mismatch_err("LocalZonedTimestamp(us)", col_idx),
+                            )?)
+                        }
+                    }
+                    other => {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Unsupported data type {:?} for batch column downcast at column {}",
+                                other, col_idx
+                            ),
+                        });
+                    }
+                };
+            Ok((typed, field))
+        })
+        .collect()
+}
+
+/// Write a value from a pre-downcast column into a BinaryRowBuilder at the given position.
+fn write_typed_value(
+    builder: &mut BinaryRowBuilder,
+    pos: usize,
+    row_idx: usize,
+    typed_col: &TypedColumn,
+    _data_type: &DataType,
+) {
+    use arrow_array::Array;
+    match typed_col {
+        TypedColumn::Boolean(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_boolean(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_byte(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int16(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_short(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_int(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int64(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_long(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Float32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_float(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Float64(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_double(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Utf8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::Utf8View(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::LargeUtf8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::Date32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_int(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Decimal128(arr, precision, _scale) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let unscaled = arr.value(row_idx);
+                if *precision <= 18 {
+                    builder.write_decimal_compact(pos, unscaled as i64);
+                } else {
+                    builder.write_decimal_var_len(pos, unscaled);
+                }
+            }
+        }
+        TypedColumn::Binary(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let b = arr.value(row_idx);
+                if b.len() <= 7 {
+                    builder.write_binary_inline(pos, b);
+                } else {
+                    builder.write_binary(pos, b);
+                }
+            }
+        }
+        TypedColumn::TimestampMs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_timestamp_compact(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::TimestampUs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let micros = arr.value(row_idx);
+                let millis = micros / 1000;
+                let nanos = ((micros % 1000) * 1000) as i32;
+                builder.write_timestamp_non_compact(pos, millis, nanos);
+            }
+        }
+    }
+}
+
+/// Build BinaryRows for all rows in the batch for the given field indices.
+/// Downcasts columns once, then iterates rows — O(F) downcasts instead of O(N*F).
+fn batch_build_binary_rows(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<BinaryRow>> {
+    let typed_columns = downcast_columns(batch, field_indices, fields)?;
+    let arity = field_indices.len() as i32;
+    let num_rows = batch.num_rows();
+    let mut rows = Vec::with_capacity(num_rows);
+
+    for row_idx in 0..num_rows {
+        let mut builder = BinaryRowBuilder::new(arity);
+        for (pos, (typed_col, field)) in typed_columns.iter().enumerate() {
+            write_typed_value(&mut builder, pos, row_idx, typed_col, field.data_type());
+        }
+        rows.push(builder.build());
+    }
+    Ok(rows)
+}
+
+/// Batch-compute serialized partition bytes for all rows.
+/// Returns one `Vec<u8>` per row, identical to calling
+/// `BinaryRow::from_arrow(batch, row_idx, field_indices, fields).to_serialized_bytes()`
+/// for each row, but with O(F) column downcasts instead of O(N*F).
+pub fn batch_to_serialized_bytes(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<Vec<u8>>> {
+    let rows = batch_build_binary_rows(batch, field_indices, fields)?;
+    Ok(rows.into_iter().map(|r| r.to_serialized_bytes()).collect())
+}
+
+/// Batch-compute Murmur3 hash codes for all rows.
+/// Returns one `i32` per row, identical to calling
+/// `BinaryRow::from_arrow(batch, row_idx, field_indices, fields).hash_code()`
+/// for each row, but with O(F) column downcasts instead of O(N*F).
+pub fn batch_hash_codes(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<i32>> {
+    let rows = batch_build_binary_rows(batch, field_indices, fields)?;
+    Ok(rows.into_iter().map(|r| r.hash_code()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,5 +1458,54 @@ mod tests {
         let (millis, nano) = row.get_timestamp_raw(0, 6).unwrap();
         assert_eq!(millis, epoch_millis);
         assert_eq!(nano, nano_of_milli);
+    }
+
+    #[test]
+    fn test_batch_vs_per_row_equivalence() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType as ArrowDT, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDT::Int32, true),
+            Field::new("name", ArrowDT::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+                Arc::new(StringArray::from(vec![Some("hello"), Some("world"), None])),
+            ],
+        )
+        .unwrap();
+
+        let fields = vec![
+            crate::spec::DataField::new(0, "id".into(), DataType::Int(crate::spec::IntType::new())),
+            crate::spec::DataField::new(
+                1,
+                "name".into(),
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+            ),
+        ];
+        let indices = vec![0, 1];
+
+        // Batch results
+        let batch_bytes = batch_to_serialized_bytes(&batch, &indices, &fields).unwrap();
+        let batch_hashes = batch_hash_codes(&batch, &indices, &fields).unwrap();
+
+        // Per-row results
+        for row_idx in 0..batch.num_rows() {
+            let row = BinaryRow::from_arrow(&batch, row_idx, &indices, &fields).unwrap();
+            assert_eq!(
+                batch_bytes[row_idx],
+                row.to_serialized_bytes(),
+                "serialized bytes mismatch at row {row_idx}"
+            );
+            assert_eq!(
+                batch_hashes[row_idx],
+                row.hash_code(),
+                "hash code mismatch at row {row_idx}"
+            );
+        }
     }
 }

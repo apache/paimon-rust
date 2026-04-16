@@ -20,92 +20,19 @@
 //! Covers: basic write+read, dedup within/across commits, partitioned PK tables,
 //! multi-bucket, column projection, FirstRow merge engine, sequence.field,
 //! INSERT OVERWRITE, filter pushdown, and error cases.
+//!
+//! Dynamic bucket and cross-partition tests are in separate files:
+//! - `dynamic_bucket_tables.rs`
+//! - `cross_partition_tables.rs`
 
-use std::sync::Arc;
+mod common;
 
+use common::{
+    collect_id_name, collect_id_value, create_handler, create_test_env, row_count, setup_handler,
+};
 use datafusion::arrow::array::{Int32Array, StringArray};
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler};
-use tempfile::TempDir;
-
-// ======================= Helpers =======================
-
-fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let warehouse = format!("file://{}", temp_dir.path().display());
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse);
-    let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-    (temp_dir, Arc::new(catalog))
-}
-
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(catalog.clone())),
-    );
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
-    PaimonSqlHandler::new(ctx, catalog, "paimon")
-}
-
-async fn setup_handler() -> (TempDir, PaimonSqlHandler) {
-    let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler
-        .sql("CREATE SCHEMA paimon.test_db")
-        .await
-        .expect("CREATE SCHEMA failed");
-    (tmp, handler)
-}
-
-async fn collect_id_name(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
-    let mut rows = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .expect("id column");
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .expect("name column");
-        for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), names.value(i).to_string()));
-        }
-    }
-    rows.sort_by_key(|(id, _)| *id);
-    rows
-}
-
-async fn collect_id_value(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, i32)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
-    let mut rows = Vec::new();
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .expect("id column");
-        let vals = batch
-            .column_by_name("value")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .expect("value column");
-        for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), vals.value(i)));
-        }
-    }
-    rows.sort_by_key(|(id, _)| *id);
-    rows
-}
-
-async fn row_count(handler: &PaimonSqlHandler, sql: &str) -> usize {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
-    batches.iter().map(|b| b.num_rows()).sum()
-}
+use paimon::Catalog;
 
 // ======================= Basic PK Write + Read =======================
 
@@ -942,34 +869,6 @@ async fn test_pk_partitioned_multi_bucket() {
 }
 
 // ======================= Error Cases =======================
-
-/// PK table with bucket=-1 (dynamic bucket) should be rejected.
-#[tokio::test]
-async fn test_pk_reject_dynamic_bucket() {
-    let (_tmp, handler) = setup_handler().await;
-
-    handler
-        .sql(
-            "CREATE TABLE paimon.test_db.t_dyn (
-                id INT NOT NULL, name STRING,
-                PRIMARY KEY (id)
-            )",
-        )
-        .await
-        .unwrap();
-
-    // bucket defaults to -1, PK write should fail
-    let result = handler
-        .sql("INSERT INTO paimon.test_db.t_dyn VALUES (1, 'alice')")
-        .await;
-
-    // The error may come from sql() or collect()
-    let is_err = match result {
-        Err(_) => true,
-        Ok(df) => df.collect().await.is_err(),
-    };
-    assert!(is_err, "PK table with dynamic bucket should reject writes");
-}
 
 /// PK table with changelog-producer=input should be rejected.
 #[tokio::test]

@@ -18,6 +18,11 @@
 //! Table API for Apache Paimon
 
 pub(crate) mod bin_pack;
+mod bucket_assigner;
+mod bucket_assigner_constant;
+mod bucket_assigner_cross;
+mod bucket_assigner_dynamic;
+mod bucket_assigner_fixed;
 mod bucket_filter;
 mod commit_message;
 mod data_evolution_reader;

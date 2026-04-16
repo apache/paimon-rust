@@ -33,6 +33,31 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Whether the files in a split can be read independently (no column-wise merge needed).
+fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
+    if files.len() <= 1 {
+        return true;
+    }
+    // If all files have first_row_id and their row_id ranges don't overlap, they're independent.
+    if files.iter().any(|f| f.first_row_id.is_none()) {
+        return false;
+    }
+    let mut ranges: Vec<(i64, i64)> = files
+        .iter()
+        .map(|f| {
+            let start = f.first_row_id.unwrap();
+            (start, start + f.row_count)
+        })
+        .collect();
+    ranges.sort_by_key(|r| r.0);
+    for w in ranges.windows(2) {
+        if w[0].1 > w[1].0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Reads data files in data evolution mode, merging columns from files
 /// that share the same row ID range.
 pub(crate) struct DataEvolutionReader {
@@ -96,7 +121,7 @@ impl DataEvolutionReader {
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
 
-                if split.raw_convertible() || split.data_files().len() == 1 {
+                if is_raw_convertible(split.data_files()) {
                     for file_meta in split.data_files().to_vec() {
                         let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != self.table_schema_id {
                             let data_schema = self.schema_manager.schema(file_meta.schema_id).await?;
