@@ -237,6 +237,7 @@ impl Schema {
         let primary_keys = Self::normalize_primary_keys(&primary_keys, &mut options)?;
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
+        Self::validate_blob_fields(&fields, &partition_keys, &options)?;
 
         Ok(Self {
             fields,
@@ -389,6 +390,54 @@ impl Schema {
             });
         }
         Ok(())
+    }
+
+    fn validate_blob_fields(
+        fields: &[DataField],
+        partition_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let blob_field_names = Self::top_level_blob_field_names(fields);
+        if blob_field_names.is_empty() {
+            return Ok(());
+        }
+
+        let core_options = CoreOptions::new(options);
+        if !core_options.data_evolution_enabled() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Data evolution config must enabled for table with BLOB type column."
+                    .to_string(),
+            });
+        }
+
+        if fields.len() == blob_field_names.len() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Table with BLOB type column must have other normal columns.".to_string(),
+            });
+        }
+
+        let partition_key_set: HashSet<&str> = partition_keys.iter().map(String::as_str).collect();
+        if blob_field_names
+            .iter()
+            .any(|name| partition_key_set.contains(name))
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: "The BLOB type column can not be part of partition keys.".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns top-level Blob field names for create-time Blob contract checks.
+    fn top_level_blob_field_names(fields: &[DataField]) -> Vec<&str> {
+        fields
+            .iter()
+            .filter_map(|field| match field.data_type() {
+                DataType::Blob(_) => Some(field.name()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Returns the set of names that appear more than once.
@@ -572,7 +621,7 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::IntType;
+    use crate::spec::{BlobType, IntType};
 
     use super::*;
 
@@ -743,6 +792,62 @@ mod tests {
             .unwrap();
         assert_eq!(schema.partition_keys(), &["a"]);
         assert_eq!(schema.primary_keys(), &["a", "b"]);
+    }
+
+    #[test]
+    fn test_blob_schema_validation_requires_data_evolution() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Data evolution config must enabled")),
+            "blob columns should require data-evolution.enabled"
+        );
+    }
+
+    #[test]
+    fn test_blob_schema_validation_rejects_all_blob_columns() {
+        let err = Schema::builder()
+            .column("payload", DataType::Blob(BlobType::new()))
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("must have other normal columns")),
+            "blob-only tables should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_blob_schema_validation_rejects_blob_partition_keys() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .partition_keys(["payload"])
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("can not be part of partition keys")),
+            "blob columns should be rejected as partition keys during schema validation"
+        );
+    }
+
+    #[test]
+    fn test_blob_schema_validation_accepts_valid_blob_table() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.fields().len(), 2);
     }
 
     #[test]

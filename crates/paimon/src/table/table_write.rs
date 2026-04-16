@@ -379,6 +379,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
+            .option("data-evolution.enabled", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
