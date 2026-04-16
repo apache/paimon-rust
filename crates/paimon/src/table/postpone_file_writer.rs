@@ -31,7 +31,7 @@ use crate::spec::{bucket_dir_name, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIN
 use crate::table::kv_file_writer::build_physical_schema;
 use crate::Result;
 use arrow_array::{Int64Array, Int8Array, RecordBatch};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -63,6 +63,8 @@ pub(crate) struct PostponeFileWriter {
     current_row_count: i64,
     /// Sequence number at which the current file started.
     current_file_start_seq: i64,
+    /// Timestamp captured when the current file was opened (used for deterministic replay order).
+    current_file_creation_time: DateTime<Utc>,
     written_files: Vec<DataFileMeta>,
     /// Background file close tasks spawned during rolling.
     in_flight_closes: JoinSet<Result<DataFileMeta>>,
@@ -78,6 +80,7 @@ impl PostponeFileWriter {
             current_file_name: None,
             current_row_count: 0,
             current_file_start_seq: 0,
+            current_file_creation_time: Utc::now(),
             written_files: Vec::new(),
             in_flight_closes: JoinSet::new(),
         }
@@ -175,11 +178,20 @@ impl PostponeFileWriter {
         let max_seq = self.next_sequence_number - 1;
         self.current_row_count = 0;
         let schema_id = self.config.schema_id;
+        // Capture creation_time from when the file was opened, not when the async close finishes.
+        // Java's postpone compaction sorts by creationTime for replay order.
+        let creation_time = self.current_file_creation_time;
 
         self.in_flight_closes.spawn(async move {
             let file_size = writer.close().await? as i64;
             Ok(build_meta(
-                file_name, file_size, row_count, min_seq, max_seq, schema_id,
+                file_name,
+                file_size,
+                row_count,
+                min_seq,
+                max_seq,
+                schema_id,
+                creation_time,
             ))
         });
     }
@@ -220,6 +232,7 @@ impl PostponeFileWriter {
         self.current_file_name = Some(file_name);
         self.current_row_count = 0;
         self.current_file_start_seq = self.next_sequence_number;
+        self.current_file_creation_time = Utc::now();
         Ok(())
     }
 
@@ -243,6 +256,7 @@ impl PostponeFileWriter {
             min_seq,
             max_seq,
             self.config.schema_id,
+            self.current_file_creation_time,
         );
         self.written_files.push(meta);
         Ok(())
@@ -256,6 +270,7 @@ fn build_meta(
     min_seq: i64,
     max_seq: i64,
     schema_id: i64,
+    creation_time: DateTime<Utc>,
 ) -> DataFileMeta {
     DataFileMeta {
         file_name,
@@ -278,7 +293,7 @@ fn build_meta(
         schema_id,
         level: 0,
         extra_files: vec![],
-        creation_time: Some(Utc::now()),
+        creation_time: Some(creation_time),
         delete_row_count: Some(0),
         embedded_index: None,
         file_source: Some(0), // FileSource.APPEND
