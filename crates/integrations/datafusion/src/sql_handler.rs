@@ -45,12 +45,13 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::{
-    ArrayType as PaimonArrayType, BlobType, DataField as PaimonDataField,
-    DataType as PaimonDataType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
+    ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
+    DataType as PaimonDataType, DateType, DecimalType, DoubleType, FloatType, IntType,
+    LocalZonedTimestampType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
+    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
 };
 
 use crate::error::to_datafusion_error;
-use paimon::arrow::arrow_to_paimon_type;
 
 /// Wraps a [`SessionContext`] and a Paimon [`Catalog`] to handle DDL statements
 /// that DataFusion does not natively support (e.g. ALTER TABLE).
@@ -347,10 +348,80 @@ fn sql_data_type_to_paimon_type(
     sql_type: &datafusion::sql::sqlparser::ast::DataType,
     nullable: bool,
 ) -> DFResult<PaimonDataType> {
-    use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
+    use datafusion::sql::sqlparser::ast::{
+        ArrayElemTypeDef, DataType as SqlType, ExactNumberInfo, TimezoneInfo,
+    };
 
     match sql_type {
+        SqlType::Boolean => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(
+            nullable,
+        ))),
+        SqlType::TinyInt(_) => Ok(PaimonDataType::TinyInt(TinyIntType::with_nullable(
+            nullable,
+        ))),
+        SqlType::SmallInt(_) => Ok(PaimonDataType::SmallInt(SmallIntType::with_nullable(
+            nullable,
+        ))),
+        SqlType::Int(_) | SqlType::Integer(_) => {
+            Ok(PaimonDataType::Int(IntType::with_nullable(nullable)))
+        }
+        SqlType::BigInt(_) => Ok(PaimonDataType::BigInt(BigIntType::with_nullable(nullable))),
+        SqlType::Float(_) | SqlType::Real => {
+            Ok(PaimonDataType::Float(FloatType::with_nullable(nullable)))
+        }
+        SqlType::Double(_) | SqlType::DoublePrecision => {
+            Ok(PaimonDataType::Double(DoubleType::with_nullable(nullable)))
+        }
+        SqlType::Varchar(_)
+        | SqlType::CharVarying(_)
+        | SqlType::Text
+        | SqlType::String(_)
+        | SqlType::Char(_)
+        | SqlType::Character(_) => Ok(PaimonDataType::VarChar(
+            VarCharType::with_nullable(nullable, VarCharType::MAX_LENGTH)
+                .map_err(to_datafusion_error)?,
+        )),
+        SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Bytea => {
+            Ok(PaimonDataType::VarBinary(
+                VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)
+                    .map_err(to_datafusion_error)?,
+            ))
+        }
         SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
+        SqlType::Date => Ok(PaimonDataType::Date(DateType::with_nullable(nullable))),
+        SqlType::Timestamp(precision, tz_info) => {
+            let precision = match precision {
+                Some(0) => 0,
+                Some(1..=3) | None => 3,
+                Some(4..=6) => 6,
+                _ => 9,
+            };
+            match tz_info {
+                TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => {
+                    Ok(PaimonDataType::Timestamp(
+                        TimestampType::with_nullable(nullable, precision)
+                            .map_err(to_datafusion_error)?,
+                    ))
+                }
+                _ => Ok(PaimonDataType::LocalZonedTimestamp(
+                    LocalZonedTimestampType::with_nullable(nullable, precision)
+                        .map_err(to_datafusion_error)?,
+                )),
+            }
+        }
+        SqlType::Decimal(info) => {
+            let (precision, scale) = match info {
+                ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+                    (*precision as u32, *scale as u32)
+                }
+                ExactNumberInfo::Precision(precision) => (*precision as u32, 0),
+                ExactNumberInfo::None => (10, 0),
+            };
+            Ok(PaimonDataType::Decimal(
+                DecimalType::with_nullable(nullable, precision, scale)
+                    .map_err(to_datafusion_error)?,
+            ))
+        }
         SqlType::Array(elem_def) => {
             let element_type = match elem_def {
                 ArrayElemTypeDef::AngleBracket(t)
@@ -392,104 +463,6 @@ fn sql_data_type_to_paimon_type(
                 nullable,
                 paimon_fields,
             )))
-        }
-        _ => {
-            let arrow_type = sql_data_type_to_arrow(sql_type)?;
-            arrow_to_paimon_type(&arrow_type, nullable).map_err(to_datafusion_error)
-        }
-    }
-}
-
-/// Convert a sqlparser SQL data type to an Arrow data type.
-fn sql_data_type_to_arrow(
-    sql_type: &datafusion::sql::sqlparser::ast::DataType,
-) -> DFResult<ArrowDataType> {
-    use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
-    match sql_type {
-        SqlType::Boolean => Ok(ArrowDataType::Boolean),
-        SqlType::TinyInt(_) => Ok(ArrowDataType::Int8),
-        SqlType::SmallInt(_) => Ok(ArrowDataType::Int16),
-        SqlType::Int(_) | SqlType::Integer(_) => Ok(ArrowDataType::Int32),
-        SqlType::BigInt(_) => Ok(ArrowDataType::Int64),
-        SqlType::Float(_) => Ok(ArrowDataType::Float32),
-        SqlType::Real => Ok(ArrowDataType::Float32),
-        SqlType::Double(_) | SqlType::DoublePrecision => Ok(ArrowDataType::Float64),
-        SqlType::Varchar(_) | SqlType::CharVarying(_) | SqlType::Text | SqlType::String(_) => {
-            Ok(ArrowDataType::Utf8)
-        }
-        SqlType::Char(_) | SqlType::Character(_) => Ok(ArrowDataType::Utf8),
-        SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Blob(_) | SqlType::Bytea => {
-            Ok(ArrowDataType::Binary)
-        }
-        SqlType::Date => Ok(ArrowDataType::Date32),
-        SqlType::Timestamp(precision, tz_info) => {
-            use datafusion::sql::sqlparser::ast::TimezoneInfo;
-            let unit = match precision {
-                Some(0) => datafusion::arrow::datatypes::TimeUnit::Second,
-                Some(1..=3) | None => datafusion::arrow::datatypes::TimeUnit::Millisecond,
-                Some(4..=6) => datafusion::arrow::datatypes::TimeUnit::Microsecond,
-                _ => datafusion::arrow::datatypes::TimeUnit::Nanosecond,
-            };
-            let tz = match tz_info {
-                TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => None,
-                _ => Some("UTC".into()),
-            };
-            Ok(ArrowDataType::Timestamp(unit, tz))
-        }
-        SqlType::Decimal(info) => {
-            use datafusion::sql::sqlparser::ast::ExactNumberInfo;
-            let (p, s) = match info {
-                ExactNumberInfo::PrecisionAndScale(p, s) => (*p as u8, *s as i8),
-                ExactNumberInfo::Precision(p) => (*p as u8, 0),
-                ExactNumberInfo::None => (10, 0),
-            };
-            Ok(ArrowDataType::Decimal128(p, s))
-        }
-        SqlType::Array(elem_def) => {
-            let elem_type = match elem_def {
-                ArrayElemTypeDef::AngleBracket(t)
-                | ArrayElemTypeDef::SquareBracket(t, _)
-                | ArrayElemTypeDef::Parenthesis(t) => sql_data_type_to_arrow(t)?,
-                ArrayElemTypeDef::None => {
-                    return Err(DataFusionError::Plan(
-                        "ARRAY type requires an element type".to_string(),
-                    ));
-                }
-            };
-            Ok(ArrowDataType::List(Arc::new(Field::new(
-                "element", elem_type, true,
-            ))))
-        }
-        SqlType::Map(key_type, value_type) => {
-            let key = sql_data_type_to_arrow(key_type)?;
-            let value = sql_data_type_to_arrow(value_type)?;
-            let entries = Field::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        Field::new("key", key, false),
-                        Field::new("value", value, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            );
-            Ok(ArrowDataType::Map(Arc::new(entries), false))
-        }
-        SqlType::Struct(fields, _) => {
-            let arrow_fields: Vec<Field> = fields
-                .iter()
-                .map(|f| {
-                    let name = f
-                        .field_name
-                        .as_ref()
-                        .map(|n| n.value.clone())
-                        .unwrap_or_default();
-                    let dt = sql_data_type_to_arrow(&f.field_type)?;
-                    Ok(Field::new(name, dt, true))
-                })
-                .collect::<DFResult<_>>()?;
-            Ok(ArrowDataType::Struct(arrow_fields.into()))
         }
         _ => Err(DataFusionError::Plan(format!(
             "Unsupported SQL data type: {sql_type}"
@@ -556,7 +529,6 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::TimeUnit;
     use paimon::catalog::Database;
     use paimon::spec::{DataType as PaimonDataType, Schema as PaimonSchema};
     use paimon::table::Table;
@@ -681,56 +653,57 @@ mod tests {
         PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon")
     }
 
-    // ==================== sql_data_type_to_arrow tests ====================
+    fn assert_sql_type_to_paimon(
+        sql_type: datafusion::sql::sqlparser::ast::DataType,
+        expected: PaimonDataType,
+    ) {
+        assert_eq!(
+            sql_data_type_to_paimon_type(&sql_type, true).unwrap(),
+            expected
+        );
+    }
+
+    // ==================== sql_data_type_to_paimon_type tests ====================
 
     #[test]
     fn test_sql_type_boolean() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Boolean).unwrap(),
-            ArrowDataType::Boolean
+        assert_sql_type_to_paimon(
+            SqlType::Boolean,
+            PaimonDataType::Boolean(BooleanType::new()),
         );
     }
 
     #[test]
     fn test_sql_type_integers() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::TinyInt(None)).unwrap(),
-            ArrowDataType::Int8
+        assert_sql_type_to_paimon(
+            SqlType::TinyInt(None),
+            PaimonDataType::TinyInt(TinyIntType::new()),
         );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::SmallInt(None)).unwrap(),
-            ArrowDataType::Int16
+        assert_sql_type_to_paimon(
+            SqlType::SmallInt(None),
+            PaimonDataType::SmallInt(SmallIntType::new()),
         );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Int(None)).unwrap(),
-            ArrowDataType::Int32
-        );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Integer(None)).unwrap(),
-            ArrowDataType::Int32
-        );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::BigInt(None)).unwrap(),
-            ArrowDataType::Int64
+        assert_sql_type_to_paimon(SqlType::Int(None), PaimonDataType::Int(IntType::new()));
+        assert_sql_type_to_paimon(SqlType::Integer(None), PaimonDataType::Int(IntType::new()));
+        assert_sql_type_to_paimon(
+            SqlType::BigInt(None),
+            PaimonDataType::BigInt(BigIntType::new()),
         );
     }
 
     #[test]
     fn test_sql_type_floats() {
         use datafusion::sql::sqlparser::ast::{DataType as SqlType, ExactNumberInfo};
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Float(ExactNumberInfo::None)).unwrap(),
-            ArrowDataType::Float32
+        assert_sql_type_to_paimon(
+            SqlType::Float(ExactNumberInfo::None),
+            PaimonDataType::Float(FloatType::new()),
         );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Real).unwrap(),
-            ArrowDataType::Float32
-        );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::DoublePrecision).unwrap(),
-            ArrowDataType::Float64
+        assert_sql_type_to_paimon(SqlType::Real, PaimonDataType::Float(FloatType::new()));
+        assert_sql_type_to_paimon(
+            SqlType::DoublePrecision,
+            PaimonDataType::Double(DoubleType::new()),
         );
     }
 
@@ -738,10 +711,11 @@ mod tests {
     fn test_sql_type_string_variants() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
         for sql_type in [SqlType::Varchar(None), SqlType::Text, SqlType::String(None)] {
-            assert_eq!(
-                sql_data_type_to_arrow(&sql_type).unwrap(),
-                ArrowDataType::Utf8,
-                "failed for {sql_type:?}"
+            assert_sql_type_to_paimon(
+                sql_type.clone(),
+                PaimonDataType::VarChar(
+                    VarCharType::with_nullable(true, VarCharType::MAX_LENGTH).unwrap(),
+                ),
             );
         }
     }
@@ -749,133 +723,120 @@ mod tests {
     #[test]
     fn test_sql_type_binary() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Bytea).unwrap(),
-            ArrowDataType::Binary
+        assert_sql_type_to_paimon(
+            SqlType::Bytea,
+            PaimonDataType::VarBinary(
+                VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
+            ),
         );
     }
 
     #[test]
     fn test_sql_type_date() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Date).unwrap(),
-            ArrowDataType::Date32
-        );
+        assert_sql_type_to_paimon(SqlType::Date, PaimonDataType::Date(DateType::new()));
     }
 
     #[test]
     fn test_sql_type_timestamp_default() {
         use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
-        let result = sql_data_type_to_arrow(&SqlType::Timestamp(None, TimezoneInfo::None)).unwrap();
-        assert_eq!(
-            result,
-            ArrowDataType::Timestamp(TimeUnit::Millisecond, None)
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(None, TimezoneInfo::None),
+            PaimonDataType::Timestamp(TimestampType::with_nullable(true, 3).unwrap()),
         );
     }
 
     #[test]
     fn test_sql_type_timestamp_with_precision() {
         use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
-        // precision 0 => Second
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Timestamp(Some(0), TimezoneInfo::None)).unwrap(),
-            ArrowDataType::Timestamp(TimeUnit::Second, None)
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(Some(0), TimezoneInfo::None),
+            PaimonDataType::Timestamp(TimestampType::with_nullable(true, 0).unwrap()),
         );
-        // precision 3 => Millisecond
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Timestamp(Some(3), TimezoneInfo::None)).unwrap(),
-            ArrowDataType::Timestamp(TimeUnit::Millisecond, None)
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(Some(3), TimezoneInfo::None),
+            PaimonDataType::Timestamp(TimestampType::with_nullable(true, 3).unwrap()),
         );
-        // precision 6 => Microsecond
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Timestamp(Some(6), TimezoneInfo::None)).unwrap(),
-            ArrowDataType::Timestamp(TimeUnit::Microsecond, None)
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(Some(6), TimezoneInfo::None),
+            PaimonDataType::Timestamp(TimestampType::with_nullable(true, 6).unwrap()),
         );
-        // precision 9 => Nanosecond
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Timestamp(Some(9), TimezoneInfo::None)).unwrap(),
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(Some(9), TimezoneInfo::None),
+            PaimonDataType::Timestamp(TimestampType::with_nullable(true, 9).unwrap()),
         );
     }
 
     #[test]
     fn test_sql_type_timestamp_with_tz() {
         use datafusion::sql::sqlparser::ast::{DataType as SqlType, TimezoneInfo};
-        let result =
-            sql_data_type_to_arrow(&SqlType::Timestamp(None, TimezoneInfo::WithTimeZone)).unwrap();
-        assert_eq!(
-            result,
-            ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        assert_sql_type_to_paimon(
+            SqlType::Timestamp(None, TimezoneInfo::WithTimeZone),
+            PaimonDataType::LocalZonedTimestamp(
+                LocalZonedTimestampType::with_nullable(true, 3).unwrap(),
+            ),
         );
     }
 
     #[test]
     fn test_sql_type_decimal() {
         use datafusion::sql::sqlparser::ast::{DataType as SqlType, ExactNumberInfo};
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::PrecisionAndScale(18, 2)))
-                .unwrap(),
-            ArrowDataType::Decimal128(18, 2)
+        assert_sql_type_to_paimon(
+            SqlType::Decimal(ExactNumberInfo::PrecisionAndScale(18, 2)),
+            PaimonDataType::Decimal(DecimalType::with_nullable(true, 18, 2).unwrap()),
         );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::Precision(10))).unwrap(),
-            ArrowDataType::Decimal128(10, 0)
+        assert_sql_type_to_paimon(
+            SqlType::Decimal(ExactNumberInfo::Precision(10)),
+            PaimonDataType::Decimal(DecimalType::with_nullable(true, 10, 0).unwrap()),
         );
-        assert_eq!(
-            sql_data_type_to_arrow(&SqlType::Decimal(ExactNumberInfo::None)).unwrap(),
-            ArrowDataType::Decimal128(10, 0)
+        assert_sql_type_to_paimon(
+            SqlType::Decimal(ExactNumberInfo::None),
+            PaimonDataType::Decimal(DecimalType::with_nullable(true, 10, 0).unwrap()),
         );
     }
 
     #[test]
     fn test_sql_type_unsupported() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        assert!(sql_data_type_to_arrow(&SqlType::Regclass).is_err());
+        assert!(sql_data_type_to_paimon_type(&SqlType::Regclass, true).is_err());
     }
 
     #[test]
     fn test_sql_type_array() {
         use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
-        let result = sql_data_type_to_arrow(&SqlType::Array(ArrayElemTypeDef::AngleBracket(
-            Box::new(SqlType::Int(None)),
-        )))
-        .unwrap();
-        assert_eq!(
-            result,
-            ArrowDataType::List(Arc::new(Field::new("element", ArrowDataType::Int32, true)))
+        assert_sql_type_to_paimon(
+            SqlType::Array(ArrayElemTypeDef::AngleBracket(Box::new(SqlType::Int(None)))),
+            PaimonDataType::Array(PaimonArrayType::with_nullable(
+                true,
+                PaimonDataType::Int(IntType::new()),
+            )),
         );
     }
 
     #[test]
     fn test_sql_type_array_no_element() {
         use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType as SqlType};
-        assert!(sql_data_type_to_arrow(&SqlType::Array(ArrayElemTypeDef::None)).is_err());
+        assert!(
+            sql_data_type_to_paimon_type(&SqlType::Array(ArrayElemTypeDef::None), true).is_err()
+        );
     }
 
     #[test]
     fn test_sql_type_map() {
         use datafusion::sql::sqlparser::ast::DataType as SqlType;
-        let result = sql_data_type_to_arrow(&SqlType::Map(
-            Box::new(SqlType::Varchar(None)),
-            Box::new(SqlType::Int(None)),
-        ))
-        .unwrap();
-        let expected = ArrowDataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        Field::new("key", ArrowDataType::Utf8, false),
-                        Field::new("value", ArrowDataType::Int32, true),
-                    ]
-                    .into(),
+        assert_sql_type_to_paimon(
+            SqlType::Map(
+                Box::new(SqlType::Varchar(None)),
+                Box::new(SqlType::Int(None)),
+            ),
+            PaimonDataType::Map(PaimonMapType::with_nullable(
+                true,
+                PaimonDataType::VarChar(
+                    VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap(),
                 ),
-                false,
+                PaimonDataType::Int(IntType::new()),
             )),
-            false,
         );
-        assert_eq!(result, expected);
     }
 
     #[test]
@@ -883,31 +844,35 @@ mod tests {
         use datafusion::sql::sqlparser::ast::{
             DataType as SqlType, Ident, StructBracketKind, StructField,
         };
-        let result = sql_data_type_to_arrow(&SqlType::Struct(
-            vec![
-                StructField {
-                    field_name: Some(Ident::new("name")),
-                    field_type: SqlType::Varchar(None),
-                    options: None,
-                },
-                StructField {
-                    field_name: Some(Ident::new("age")),
-                    field_type: SqlType::Int(None),
-                    options: None,
-                },
-            ],
-            StructBracketKind::AngleBrackets,
-        ))
-        .unwrap();
-        assert_eq!(
-            result,
-            ArrowDataType::Struct(
+        assert_sql_type_to_paimon(
+            SqlType::Struct(
                 vec![
-                    Field::new("name", ArrowDataType::Utf8, true),
-                    Field::new("age", ArrowDataType::Int32, true),
-                ]
-                .into()
-            )
+                    StructField {
+                        field_name: Some(Ident::new("name")),
+                        field_type: SqlType::Varchar(None),
+                        options: None,
+                    },
+                    StructField {
+                        field_name: Some(Ident::new("age")),
+                        field_type: SqlType::Int(None),
+                        options: None,
+                    },
+                ],
+                StructBracketKind::AngleBrackets,
+            ),
+            PaimonDataType::Row(PaimonRowType::with_nullable(
+                true,
+                vec![
+                    PaimonDataField::new(
+                        0,
+                        "name".to_string(),
+                        PaimonDataType::VarChar(
+                            VarCharType::with_nullable(true, VarCharType::MAX_LENGTH).unwrap(),
+                        ),
+                    ),
+                    PaimonDataField::new(1, "age".to_string(), PaimonDataType::Int(IntType::new())),
+                ],
+            )),
         );
     }
 
