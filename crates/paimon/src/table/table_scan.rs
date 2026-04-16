@@ -308,6 +308,10 @@ pub struct TableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
+    /// When true, disables level-0 filtering so all files are visible.
+    /// Used by non-read paths (overwrite, truncate, writer restore) that need
+    /// the complete file set. Normal read scans leave this as `false`.
+    scan_all_files: bool,
 }
 
 impl<'a> TableScan<'a> {
@@ -326,7 +330,17 @@ impl<'a> TableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
+            scan_all_files: false,
         }
+    }
+
+    /// Disable level-0 filtering so all files are visible.
+    ///
+    /// Used by non-read paths (overwrite, truncate, writer restore) that need
+    /// the complete file set regardless of merge engine or DV settings.
+    pub fn with_scan_all_files(mut self) -> Self {
+        self.scan_all_files = true;
+        self
     }
 
     /// Set row ranges for scan-time filtering.
@@ -467,7 +481,12 @@ impl<'a> TableScan<'a> {
         // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
         // - FirstRow engine without DV: reads go through DataFileReader (no merge),
         //   so only compacted (level > 0) files are safe to read directly
-        let skip_level_zero = if has_primary_keys {
+        //
+        // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
+        // to see all files including level-0, matching Java's CommitScanner behavior.
+        let skip_level_zero = if self.scan_all_files {
+            false
+        } else if has_primary_keys {
             deletion_vectors_enabled
                 || core_options
                     .merge_engine()

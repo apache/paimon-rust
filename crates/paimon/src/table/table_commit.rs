@@ -477,7 +477,8 @@ impl TableCommit {
                 None,
                 None,
                 None,
-            );
+            )
+            .with_scan_all_files();
             let current_entries = scan.plan_manifest_entries(snap).await?;
             for entry in current_entries {
                 entries.push(entry.with_kind(FileKind::Delete));
@@ -567,7 +568,8 @@ impl TableCommit {
         };
 
         // Read all current files from the latest snapshot.
-        let scan = TableScan::new(&self.table, None, vec![], None, None, None);
+        let scan =
+            TableScan::new(&self.table, None, vec![], None, None, None).with_scan_all_files();
         let existing_entries = scan.plan_manifest_entries(snap).await?;
 
         // Build index: (partition, bucket, first_row_id, row_count)

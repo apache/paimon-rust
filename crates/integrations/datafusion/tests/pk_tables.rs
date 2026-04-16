@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, StringArray};
 use datafusion::prelude::SessionContext;
-use paimon::{CatalogOptions, FileSystemCatalog, Options};
+use paimon::catalog::Identifier;
+use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler};
 use tempfile::TempDir;
 
@@ -1144,5 +1145,114 @@ async fn test_pk_multiple_value_columns() {
             (1, 11, "xx".to_string(), 111), // updated
             (2, 20, "y".to_string(), 200),  // untouched
         ]
+    );
+}
+
+// ======================= FirstRow Engine: INSERT OVERWRITE =======================
+
+/// INSERT OVERWRITE on a partitioned FirstRow-engine PK table should delete
+/// level-0 files. Before the fix, `skip_level_zero` was applied in the overwrite
+/// scan path, causing level-0 files to survive the overwrite.
+///
+/// Verifies via TableScan (scan_all_files) that the overwrite correctly produces
+/// delete entries for level-0 files, leaving only the new file per partition.
+#[tokio::test]
+async fn test_pk_first_row_insert_overwrite() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+    handler
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_fr_ow (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt STRING)
+            WITH ('bucket' = '1', 'merge-engine' = 'first-row')",
+        )
+        .await
+        .unwrap();
+
+    // First commit: two partitions, creates level-0 files
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_fr_ow VALUES \
+             ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
+             ('2024-01-02', 3, 'carol')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Verify via scan_all_files: 2 level-0 files (one per partition)
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(file_count, 2, "After INSERT: 2 level-0 files (one per partition)");
+
+    // INSERT OVERWRITE partition 2024-01-01 — must delete old level-0 file
+    handler
+        .sql("INSERT OVERWRITE paimon.test_db.t_fr_ow VALUES ('2024-01-01', 10, 'new_alice')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(
+        file_count, 2,
+        "After OVERWRITE: 2 files (1 replaced for 2024-01-01 + 1 unchanged for 2024-01-02)"
+    );
+
+    // Second overwrite on the same partition — no stale files should accumulate
+    handler
+        .sql("INSERT OVERWRITE paimon.test_db.t_fr_ow VALUES ('2024-01-01', 20, 'newer_alice')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
+    let file_count: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+    assert_eq!(
+        file_count, 2,
+        "After second OVERWRITE: still 2 files (no stale level-0 files accumulated)"
     );
 }

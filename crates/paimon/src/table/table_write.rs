@@ -239,7 +239,8 @@ impl TableWrite {
         let mut bucket_seq: HashMap<i32, i64> = HashMap::new();
         if let Some(snapshot) = latest_snapshot {
             let partition_predicate = Self::build_partition_predicate(table, partition_bytes)?;
-            let scan = TableScan::new(table, partition_predicate, vec![], None, None, None);
+            let scan = TableScan::new(table, partition_predicate, vec![], None, None, None)
+                .with_scan_all_files();
             let entries = scan.plan_manifest_entries(&snapshot).await?;
             for entry in &entries {
                 let bucket = entry.bucket();
