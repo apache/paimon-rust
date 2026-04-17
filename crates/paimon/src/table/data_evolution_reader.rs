@@ -1331,7 +1331,6 @@ mod tests {
                     Some(vec!["payload"]),
                 ),
             ])
-            .with_raw_convertible(false)
             .build()
             .unwrap();
 
@@ -1441,7 +1440,6 @@ mod tests {
                     Some(vec!["payload2"]),
                 ),
             ])
-            .with_raw_convertible(false)
             .with_row_ranges(vec![RowRange::new(1, 2)])
             .build()
             .unwrap();
