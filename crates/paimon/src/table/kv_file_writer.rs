@@ -201,7 +201,7 @@ impl KeyValueFileWriter {
         // Build physical schema and open writer.
         let physical_schema = build_physical_schema(&user_schema);
 
-        // Open parquet writer.
+        // Open file writer.
         let file_name = format!(
             "data-{}-{}.{}",
             uuid::Uuid::new_v4(),

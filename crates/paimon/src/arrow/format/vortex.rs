@@ -653,7 +653,6 @@ impl FormatFileWriter for VortexFormatWriter {
 impl Drop for VortexFormatWriter {
     fn drop(&mut self) {
         if let Some(task) = self.write_task.take() {
-            eprintln!("WARN: VortexFormatWriter dropped without calling close(), aborting background write task");
             task.abort();
         }
     }
