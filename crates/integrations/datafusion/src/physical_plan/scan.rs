@@ -52,7 +52,7 @@ pub struct PaimonTableScan {
     /// Wrapped in `Arc` to avoid deep-cloning `DataSplit` metadata in `execute()`.
     planned_partitions: Vec<Arc<[DataSplit]>>,
     plan_properties: Arc<PlanProperties>,
-    /// Optional limit on the number of rows to return.
+    /// Optional limit hint pushed to paimon-core planning.
     limit: Option<usize>,
 }
 

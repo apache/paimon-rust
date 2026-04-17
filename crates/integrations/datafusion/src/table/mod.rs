@@ -34,7 +34,9 @@ use paimon::table::Table;
 use crate::physical_plan::PaimonDataSink;
 
 use crate::error::to_datafusion_error;
-use crate::filter_pushdown::{build_pushed_predicate, classify_filter_pushdown};
+#[cfg(test)]
+use crate::filter_pushdown::build_pushed_predicate;
+use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
 
@@ -80,8 +82,8 @@ impl PaimonTableProvider {
 /// Distribute `items` into `num_buckets` groups using round-robin assignment.
 pub(crate) fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Vec<T>> {
     let mut buckets: Vec<Vec<T>> = (0..num_buckets).map(|_| Vec::new()).collect();
-    for (i, item) in items.into_iter().enumerate() {
-        buckets[i % num_buckets].push(item);
+    for (index, item) in items.into_iter().enumerate() {
+        buckets[index % num_buckets].push(item);
     }
     buckets
 }
@@ -151,14 +153,13 @@ impl TableProvider for PaimonTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Plan splits eagerly so we know partition count upfront.
-        let pushed_predicate = build_pushed_predicate(filters, self.table.schema().fields());
+        let filter_analysis = analyze_filters(filters, self.table.schema().fields());
         let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = pushed_predicate.clone() {
+        if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
-        // Push the limit hint to paimon-core planning to reduce splits when possible.
-        // DataFusion still enforces the final LIMIT semantics.
-        if let Some(limit) = limit {
+        let pushed_limit = limit.filter(|_| !filter_analysis.has_untranslated_residual);
+        if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
         let scan = read_builder.new_scan();
@@ -176,8 +177,8 @@ impl TableProvider for PaimonTableProvider {
             &self.schema,
             &plan,
             projection,
-            pushed_predicate,
-            limit,
+            filter_analysis.pushed_predicate,
+            pushed_limit,
             target,
         )
     }
@@ -206,11 +207,15 @@ impl TableProvider for PaimonTableProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let fields = self.table.schema().fields();
-        let partition_keys = self.table.schema().partition_keys();
+        let read_builder = self.table.new_read_builder();
 
         Ok(filters
             .iter()
-            .map(|filter| classify_filter_pushdown(filter, fields, partition_keys))
+            .map(|filter| {
+                classify_filter_pushdown(filter, fields, |predicate| {
+                    read_builder.is_exact_filter_pushdown(predicate)
+                })
+            })
             .collect())
     }
 }
@@ -273,20 +278,29 @@ mod tests {
     async fn plan_partitions(
         provider: &PaimonTableProvider,
         filters: Vec<Expr>,
+        limit: Option<usize>,
     ) -> Vec<Arc<[DataSplit]>> {
-        let config = SessionConfig::new().with_target_partitions(8);
-        let ctx = SessionContext::new_with_config(config);
-        let state = ctx.state();
-        let plan = provider
-            .scan(&state, None, &filters, None)
-            .await
-            .expect("scan() should succeed");
+        let plan = plan_scan(provider, filters, limit).await;
         let scan = plan
             .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
         scan.planned_partitions().to_vec()
+    }
+
+    async fn plan_scan(
+        provider: &PaimonTableProvider,
+        filters: Vec<Expr>,
+        limit: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let config = SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        let state = ctx.state();
+        provider
+            .scan(&state, None, &filters, limit)
+            .await
+            .expect("scan() should succeed")
     }
 
     fn extract_dt_partition_set(planned_partitions: &[Arc<[DataSplit]>]) -> BTreeSet<String> {
@@ -326,7 +340,7 @@ mod tests {
     async fn test_scan_partition_filter_plans_matching_partition_set() {
         let provider = create_provider("partitioned_log_table").await;
         let planned_partitions =
-            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))]).await;
+            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))], None).await;
 
         assert_eq!(
             extract_dt_partition_set(&planned_partitions),
@@ -340,6 +354,7 @@ mod tests {
         let planned_partitions = plan_partitions(
             &provider,
             vec![col("dt").eq(lit("2024-01-01")).and(col("id").gt(lit(1)))],
+            None,
         )
         .await;
 
@@ -354,10 +369,11 @@ mod tests {
         let provider = create_provider("multi_partitioned_log_table").await;
 
         let dt_only_partitions =
-            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))]).await;
+            plan_partitions(&provider, vec![col("dt").eq(lit("2024-01-01"))], None).await;
         let dt_hr_partitions = plan_partitions(
             &provider,
             vec![col("dt").eq(lit("2024-01-01")).and(col("hr").eq(lit(10)))],
+            None,
         )
         .await;
 
@@ -371,6 +387,39 @@ mod tests {
         assert_eq!(
             extract_dt_hr_partition_set(&dt_hr_partitions),
             BTreeSet::from([("2024-01-01".to_string(), 10)]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_partially_translated_filter_keeps_partition_pruning_but_skips_limit_hint() {
+        let provider = create_provider("multi_partitioned_log_table").await;
+        let filter = col("dt")
+            .eq(lit("2024-01-01"))
+            .and(Expr::Not(Box::new(col("hr").eq(lit(10)))));
+        let full_plan = plan_partitions(&provider, vec![filter.clone()], None).await;
+        let plan = plan_scan(&provider, vec![filter], Some(1)).await;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        assert_eq!(scan.limit(), None);
+        assert_eq!(
+            extract_dt_hr_partition_set(scan.planned_partitions()),
+            BTreeSet::from([
+                ("2024-01-01".to_string(), 10),
+                ("2024-01-01".to_string(), 20),
+            ]),
+        );
+        assert_eq!(
+            scan.planned_partitions()
+                .iter()
+                .map(|partition| partition.len())
+                .sum::<usize>(),
+            full_plan
+                .iter()
+                .map(|partition| partition.len())
+                .sum::<usize>()
         );
     }
 
@@ -395,6 +444,53 @@ mod tests {
             .expect("data filter should translate");
 
         assert_eq!(scan.pushed_predicate(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_scan_applies_limit_hint_only_when_safe() {
+        let provider = create_provider("partitioned_log_table").await;
+        let full_plan = plan_partitions(&provider, vec![], None).await;
+        let plan = plan_scan(&provider, vec![], Some(1)).await;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        assert_eq!(scan.limit(), Some(1));
+        assert!(
+            scan.planned_partitions()
+                .iter()
+                .map(|partition| partition.len())
+                .sum::<usize>()
+                < full_plan
+                    .iter()
+                    .map(|partition| partition.len())
+                    .sum::<usize>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_keeps_limit_but_skips_limit_pruning_for_data_filters() {
+        let provider = create_provider("partitioned_log_table").await;
+        let filter = col("id").gt(lit(1));
+        let full_plan = plan_partitions(&provider, vec![filter.clone()], None).await;
+        let plan = plan_scan(&provider, vec![filter], Some(1)).await;
+        let scan = plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        assert_eq!(scan.limit(), Some(1));
+        assert_eq!(
+            scan.planned_partitions()
+                .iter()
+                .map(|partition| partition.len())
+                .sum::<usize>(),
+            full_plan
+                .iter()
+                .map(|partition| partition.len())
+                .sum::<usize>()
+        );
     }
 
     #[tokio::test]

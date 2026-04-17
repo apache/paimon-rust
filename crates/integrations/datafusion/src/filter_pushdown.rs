@@ -20,15 +20,72 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
-pub(crate) fn classify_filter_pushdown(
+#[derive(Debug)]
+struct SingleFilterAnalysis {
+    translated_predicates: Vec<Predicate>,
+    has_untranslated_residual: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct FilterPushdownAnalysis {
+    pub(crate) pushed_predicate: Option<Predicate>,
+    pub(crate) has_untranslated_residual: bool,
+}
+
+fn analyze_filter(filter: &Expr, fields: &[DataField]) -> SingleFilterAnalysis {
+    let translator = FilterTranslator::new(fields);
+    if let Some(predicate) = translator.translate(filter) {
+        return SingleFilterAnalysis {
+            translated_predicates: vec![predicate],
+            has_untranslated_residual: false,
+        };
+    }
+
+    SingleFilterAnalysis {
+        translated_predicates: split_conjunction(filter)
+            .into_iter()
+            .filter_map(|expr| translator.translate(expr))
+            .collect(),
+        has_untranslated_residual: true,
+    }
+}
+
+pub(crate) fn analyze_filters(filters: &[Expr], fields: &[DataField]) -> FilterPushdownAnalysis {
+    let mut translated_predicates = Vec::new();
+    let mut has_untranslated_residual = false;
+
+    for filter in filters {
+        let analysis = analyze_filter(filter, fields);
+        translated_predicates.extend(analysis.translated_predicates);
+        has_untranslated_residual |= analysis.has_untranslated_residual;
+    }
+
+    FilterPushdownAnalysis {
+        pushed_predicate: if translated_predicates.is_empty() {
+            None
+        } else {
+            Some(Predicate::and(translated_predicates))
+        },
+        has_untranslated_residual,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn build_pushed_predicate(filters: &[Expr], fields: &[DataField]) -> Option<Predicate> {
+    analyze_filters(filters, fields).pushed_predicate
+}
+
+pub(crate) fn classify_filter_pushdown<F>(
     filter: &Expr,
     fields: &[DataField],
-    partition_keys: &[String],
-) -> TableProviderFilterPushDown {
+    is_exact_filter_pushdown: F,
+) -> TableProviderFilterPushDown
+where
+    F: Fn(&Predicate) -> bool,
+{
     let translator = FilterTranslator::new(fields);
-    if translator.translate(filter).is_some() {
-        let partition_translator = FilterTranslator::for_allowed_columns(fields, partition_keys);
-        if partition_translator.translate(filter).is_some() {
+    if let Some(predicate) = translator.translate(filter) {
+        if is_exact_filter_pushdown(&predicate) {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Inexact
@@ -40,21 +97,6 @@ pub(crate) fn classify_filter_pushdown(
         TableProviderFilterPushDown::Inexact
     } else {
         TableProviderFilterPushDown::Unsupported
-    }
-}
-
-pub(crate) fn build_pushed_predicate(filters: &[Expr], fields: &[DataField]) -> Option<Predicate> {
-    let translator = FilterTranslator::new(fields);
-    let pushed: Vec<_> = filters
-        .iter()
-        .flat_map(split_conjunction)
-        .filter_map(|filter| translator.translate(filter))
-        .collect();
-
-    if pushed.is_empty() {
-        None
-    } else {
-        Some(Predicate::and(pushed))
     }
 }
 
@@ -75,7 +117,6 @@ fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
 
 struct FilterTranslator<'a> {
     fields: &'a [DataField],
-    allowed_columns: Option<&'a [String]>,
     predicate_builder: PredicateBuilder,
 }
 
@@ -83,15 +124,6 @@ impl<'a> FilterTranslator<'a> {
     fn new(fields: &'a [DataField]) -> Self {
         Self {
             fields,
-            allowed_columns: None,
-            predicate_builder: PredicateBuilder::new(fields),
-        }
-    }
-
-    fn for_allowed_columns(fields: &'a [DataField], allowed_columns: &'a [String]) -> Self {
-        Self {
-            fields,
-            allowed_columns: Some(allowed_columns),
             predicate_builder: PredicateBuilder::new(fields),
         }
     }
@@ -240,12 +272,6 @@ impl<'a> FilterTranslator<'a> {
             return None;
         };
 
-        if let Some(allowed_columns) = self.allowed_columns {
-            if !allowed_columns.iter().any(|column| column == name) {
-                return None;
-            }
-        }
-
         self.fields.iter().find(|field| field.name() == name)
     }
 }
@@ -352,22 +378,40 @@ mod tests {
     use super::*;
     use datafusion::common::Column;
     use datafusion::logical_expr::{expr::InList, lit, TableProviderFilterPushDown};
-    use paimon::spec::{IntType, VarCharType};
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{IntType, Schema, TableSchema, VarCharType};
+    use paimon::table::Table;
 
-    fn test_fields() -> Vec<DataField> {
-        vec![
-            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(
-                1,
-                "dt".to_string(),
-                DataType::VarChar(VarCharType::string_type()),
-            ),
-            DataField::new(2, "hr".to_string(), DataType::Int(IntType::new())),
-        ]
+    fn test_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .column("hr", DataType::Int(IntType::new()))
+                .partition_keys(["dt", "hr"])
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-filter-pushdown".to_string(),
+            table_schema,
+            None,
+        )
     }
 
-    fn partition_keys() -> Vec<String> {
-        vec!["dt".to_string(), "hr".to_string()]
+    fn test_fields() -> Vec<DataField> {
+        test_table().schema().fields().to_vec()
+    }
+
+    fn is_exact_filter_pushdown(predicate: &Predicate) -> bool {
+        test_table()
+            .new_read_builder()
+            .is_exact_filter_pushdown(predicate)
     }
 
     #[test]
@@ -387,9 +431,57 @@ mod tests {
         let filter = Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01"));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, &partition_keys()),
+            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Exact
         );
+    }
+
+    #[test]
+    fn test_analyze_filters_for_supported_data_filter_has_no_untranslated_residual() {
+        let fields = test_fields();
+        let filters = vec![Expr::Column(Column::from_name("id")).gt(lit(10))];
+        let analysis = analyze_filters(&filters, &fields);
+
+        assert_eq!(
+            analysis
+                .pushed_predicate
+                .expect("data filter should translate")
+                .to_string(),
+            "id > 10"
+        );
+        assert!(!analysis.has_untranslated_residual);
+    }
+
+    #[test]
+    fn test_analyze_filters_marks_partial_translation_as_untranslated_residual() {
+        let fields = test_fields();
+        let filters = vec![Expr::Column(Column::from_name("dt"))
+            .eq(lit("2024-01-01"))
+            .and(Expr::Not(Box::new(
+                Expr::Column(Column::from_name("hr")).eq(lit(10)),
+            )))];
+        let analysis = analyze_filters(&filters, &fields);
+
+        assert_eq!(
+            analysis
+                .pushed_predicate
+                .expect("supported conjunct should still translate")
+                .to_string(),
+            "dt = '2024-01-01'"
+        );
+        assert!(analysis.has_untranslated_residual);
+    }
+
+    #[test]
+    fn test_analyze_filters_marks_unsupported_filter_as_untranslated_residual() {
+        let fields = test_fields();
+        let filters = vec![Expr::Not(Box::new(
+            Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01")),
+        ))];
+        let analysis = analyze_filters(&filters, &fields);
+
+        assert!(analysis.pushed_predicate.is_none());
+        assert!(analysis.has_untranslated_residual);
     }
 
     #[test]
@@ -448,7 +540,7 @@ mod tests {
         let filter = Expr::Column(Column::from_name("id")).gt(lit(10));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, &partition_keys()),
+            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Inexact
         );
     }
@@ -474,7 +566,7 @@ mod tests {
             .and(Expr::Column(Column::from_name("id")).gt(lit(10)));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, &partition_keys()),
+            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Inexact
         );
     }
@@ -500,7 +592,7 @@ mod tests {
         ));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, &partition_keys()),
+            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Unsupported
         );
     }

@@ -22,6 +22,7 @@ use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
+use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -97,6 +98,14 @@ async fn collect_query(
     ctx.sql(sql).await?.collect().await
 }
 
+async fn create_physical_plan(
+    table_name: &str,
+    sql: &str,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let ctx = create_context(table_name).await;
+    ctx.sql(sql).await?.create_physical_plan().await
+}
+
 fn extract_id_name_rows(
     batches: &[datafusion::arrow::record_batch::RecordBatch],
 ) -> Vec<(i32, String)> {
@@ -119,6 +128,17 @@ fn extract_id_name_rows(
         }
     }
     rows
+}
+
+fn format_physical_plan(plan: &Arc<dyn ExecutionPlan>) -> String {
+    displayable(plan.as_ref()).indent(true).to_string()
+}
+
+fn paimon_scan_lines(plan_text: &str) -> Vec<&str> {
+    plan_text
+        .lines()
+        .filter(|line| line.contains("PaimonTableScan:"))
+        .collect()
 }
 
 #[tokio::test]
@@ -302,52 +322,185 @@ async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
     assert_eq!(actual_rows, vec![(2, "bob".to_string())]);
 }
 
-/// Test limit pushdown: ensures that LIMIT queries return the correct number of rows.
 #[tokio::test]
-async fn test_limit_pushdown() {
-    // Test append-only table (simple_log_table)
-    {
-        let batches = collect_query(
-            "simple_log_table",
-            "SELECT id, name FROM simple_log_table LIMIT 2",
-        )
+async fn test_partially_translated_filter_keeps_partition_pruning_and_correctness() {
+    let sql = "SELECT id, name FROM multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr + 1 > 20 LIMIT 1";
+    let plan = create_physical_plan("multi_partitioned_log_table", sql)
         .await
-        .expect("Limit query should succeed");
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
 
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2, "LIMIT 2 should return exactly 2 rows");
-    }
+    assert!(
+        !scan_lines.is_empty(),
+        "plan should contain a PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("predicate=dt = '2024-01-01'")),
+        "The translated partition predicate should still be pushed into PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines.iter().all(|line| !line.contains("fetch=")),
+        "Partially translated filters should not revive the removed fetch contract, plan:\n{plan_text}"
+    );
 
-    // Test data evolution table
-    {
-        let batches = collect_query(
-            "data_evolution_table",
-            "SELECT id, name FROM data_evolution_table LIMIT 3",
-        )
+    let batches = collect_query("multi_partitioned_log_table", sql)
         .await
-        .expect("Limit query on data evolution table should succeed");
+        .expect("Partially translated filter + LIMIT query should succeed");
+    let rows = extract_id_name_rows(&batches);
 
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(
-            total_rows, 3,
-            "LIMIT 3 should return exactly 3 rows for data evolution table"
-        );
+    assert_eq!(
+        rows,
+        vec![(3, "carol".to_string())],
+        "The residual filter should still be enforced above the scan"
+    );
+}
 
-        // Verify the data is from the merged result (not raw files)
-        let mut rows = extract_id_name_rows(&batches);
-        rows.sort_by_key(|(id, _)| *id);
+#[tokio::test]
+async fn test_limit_pushdown_on_data_evolution_table_returns_merged_rows() {
+    let batches = collect_query(
+        "data_evolution_table",
+        "SELECT id, name FROM data_evolution_table LIMIT 3",
+    )
+    .await
+    .expect("Limit query on data evolution table should succeed");
 
-        // LIMIT 3 returns ids 1, 2, 3 with merged values
-        assert_eq!(
-            rows,
-            vec![
-                (1, "alice-v2".to_string()),
-                (2, "bob".to_string()),
-                (3, "carol-v2".to_string()),
-            ],
-            "Data evolution table LIMIT 3 should return merged rows"
-        );
-    }
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "LIMIT 3 should return exactly 3 rows for data evolution table"
+    );
+
+    let mut rows = extract_id_name_rows(&batches);
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice-v2".to_string()),
+            (2, "bob".to_string()),
+            (3, "carol-v2".to_string()),
+        ],
+        "Data evolution table LIMIT 3 should return merged rows"
+    );
+}
+
+#[tokio::test]
+async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() {
+    let sql = "SELECT id, name FROM simple_log_table LIMIT 2";
+    let plan = create_physical_plan("simple_log_table", sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("limit=2") && !line.contains("fetch=")),
+        "Safe LIMIT query should push a scan limit hint into PaimonTableScan, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query("simple_log_table", sql)
+        .await
+        .expect("LIMIT query should succeed");
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total_rows, 2, "LIMIT 2 should still return exactly 2 rows");
+}
+
+#[tokio::test]
+async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
+    let sql = "SELECT id, name FROM partitioned_log_table OFFSET 1 LIMIT 1";
+    let plan = create_physical_plan("partitioned_log_table", sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        plan_text.contains("GlobalLimitExec"),
+        "OFFSET queries should keep a GlobalLimitExec in DataFusion, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines.iter().all(|line| !line.contains("fetch=")),
+        "OFFSET + LIMIT should not rely on the removed DataFusion fetch contract in PaimonTableScan, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query("partitioned_log_table", sql)
+        .await
+        .expect("OFFSET + LIMIT query should succeed");
+
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total_rows, 1,
+        "OFFSET 1 LIMIT 1 should still return exactly 1 row"
+    );
+}
+
+#[tokio::test]
+async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
+    let sql = "SELECT id, name FROM partitioned_log_table WHERE id > 1 LIMIT 1";
+    let plan = create_physical_plan("partitioned_log_table", sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        !scan_lines.is_empty(),
+        "plan should contain a PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines.iter().all(|line| !line.contains("fetch=")),
+        "Inexact filter queries should not revive the removed fetch contract, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query("partitioned_log_table", sql)
+        .await
+        .expect("Inexact filter + LIMIT query should succeed");
+    let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(
+        total_rows, 1,
+        "Inexact filter + LIMIT should still return exactly 1 row"
+    );
+}
+
+#[tokio::test]
+async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
+    let sql = "SELECT id, name FROM simple_log_table WHERE id + 1 > 3 LIMIT 1";
+    let plan = create_physical_plan("simple_log_table", sql)
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        !scan_lines.is_empty(),
+        "plan should contain a PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines.iter().all(|line| !line.contains("fetch=")),
+        "Residual filter queries should not revive the removed fetch contract, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .all(|line| !line.contains("limit=")),
+        "Residual filter queries should not push a scan limit hint when residual filters stay above the scan, plan:\n{plan_text}"
+    );
+
+    let batches = collect_query("simple_log_table", sql)
+        .await
+        .expect("Residual filter + LIMIT query should succeed");
+    let rows = extract_id_name_rows(&batches);
+
+    assert_eq!(
+        rows,
+        vec![(3, "carol".to_string())],
+        "Residual filter + LIMIT should still return the matching row"
+    );
 }
 
 // ======================= Catalog Provider Tests =======================
