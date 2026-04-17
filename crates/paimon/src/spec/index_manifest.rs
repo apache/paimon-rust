@@ -28,6 +28,11 @@ use crate::Result;
 /// Avro schema for IndexManifestEntry OCF serialization.
 ///
 /// Must match the serde layout of `IndexManifestEntry`.
+///
+/// Note: `_FILE_SIZE` and `_ROW_COUNT` are declared as Avro `long` to match
+/// Java Paimon's schema, while the Rust `IndexFileMeta` fields are `i32`.
+/// `serde_avro_fast` transparently coerces between integer widths during
+/// serialization/deserialization, so the mismatch is intentional.
 pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
     "type": "record",
     "name": "org.apache.paimon.avro.generated.record",
@@ -55,6 +60,21 @@ pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
                         {"name": "_CARDINALITY", "type": ["null", "long"], "default": null}
                     ]
                 }]
+            }]
+        },
+        {
+            "default": null,
+            "name": "_GLOBAL_INDEX",
+            "type": ["null", {
+                "type": "record",
+                "name": "org.apache.paimon.avro.generated.record__GLOBAL_INDEX",
+                "fields": [
+                    {"name": "_ROW_RANGE_START", "type": "long"},
+                    {"name": "_ROW_RANGE_END", "type": "long"},
+                    {"name": "_INDEX_FIELD_ID", "type": "int"},
+                    {"name": "_EXTRA_FIELD_IDS", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                    {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null}
+                ]
             }]
         }
     ]

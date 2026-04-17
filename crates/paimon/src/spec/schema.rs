@@ -142,7 +142,7 @@ impl TableSchema {
             return keys;
         }
         if !self.primary_keys.is_empty() {
-            return self.primary_keys.clone();
+            return self.trimmed_primary_keys();
         }
         let partition_set: HashSet<&str> = self.partition_keys.iter().map(String::as_str).collect();
         self.fields

@@ -127,12 +127,16 @@ impl TableWrite {
         }
 
         let total_buckets = core_options.bucket();
-        let has_primary_keys = !schema.trimmed_primary_keys().is_empty();
+        let has_primary_keys = !schema.primary_keys().is_empty();
         let is_dynamic_bucket = has_primary_keys && total_buckets == -1;
 
-        let is_cross_partition = is_dynamic_bucket
-            && !schema.partition_keys().is_empty()
-            && schema.trimmed_primary_keys().len() == schema.primary_keys().len();
+        let is_cross_partition = is_dynamic_bucket && !schema.partition_keys().is_empty() && {
+            let pk_set: HashSet<&str> = schema.primary_keys().iter().map(String::as_str).collect();
+            schema
+                .partition_keys()
+                .iter()
+                .any(|p| !pk_set.contains(p.as_str()))
+        };
 
         if has_primary_keys
             && !is_dynamic_bucket
@@ -370,10 +374,16 @@ impl TableWrite {
         }
 
         let mut result = Vec::with_capacity(groups.len());
-        let has_deletes = !output.deletes.is_empty();
+        // Cross-partition writers must always include _VALUE_KIND to keep the
+        // Arrow schema stable across batches (some batches may have deletes,
+        // others may not — KeyValueFileWriter's concat_batches requires a
+        // consistent schema).
+        let needs_value_kind =
+            matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+                || !output.deletes.is_empty();
         for (key, row_indices) in groups {
             let sub_batch = Self::take_rows(batch, &row_indices)?;
-            let sub_batch = if has_deletes {
+            let sub_batch = if needs_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
                 sub_batch

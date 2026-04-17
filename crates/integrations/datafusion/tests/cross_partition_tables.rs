@@ -537,3 +537,118 @@ async fn test_cross_partition_first_row_skip() {
     // id=1 keeps original value 10, id=2 unchanged, id=3 is new
     assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
 }
+
+/// Regression: partial PK/partition overlap — `PARTITIONED BY (pt1, pt2) + PK (pt1, id)`.
+/// pt2 is NOT in PK, so cross-partition mode must be triggered.
+/// When same id is written under different pt2, old partition should get a DELETE.
+#[tokio::test]
+async fn test_cross_partition_partial_pk_partition_overlap() {
+    let (_tmp, handler) = setup_handler().await;
+
+    // PK = (pt1, id), partition = (pt1, pt2) — pt2 is NOT in PK → cross-partition
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_cross_partial (
+                pt1 STRING, pt2 STRING, id INT NOT NULL, value INT,
+                PRIMARY KEY (pt1, id)
+            ) PARTITIONED BY (pt1 STRING, pt2 STRING)",
+        )
+        .await
+        .unwrap();
+
+    // Commit 1: id=1 in (pt1='a', pt2='x')
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_cross_partial VALUES \
+             ('a', 'x', 1, 10), ('a', 'x', 2, 20)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_id_value(
+        &handler,
+        "SELECT id, value FROM paimon.test_db.t_cross_partial ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+
+    // Commit 2: id=1 moves to (pt1='a', pt2='y') — different pt2
+    handler
+        .sql("INSERT INTO paimon.test_db.t_cross_partial VALUES ('a', 'y', 1, 100)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // After dedup, id=1 should have value=100 and only appear once
+    let rows = collect_id_value(
+        &handler,
+        "SELECT id, value FROM paimon.test_db.t_cross_partial ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, 100), (2, 20)],
+        "id=1 should be deduplicated across pt2 partitions"
+    );
+}
+
+/// Regression: _VALUE_KIND schema stability across batches in cross-partition mode.
+/// A cross-partition writer must always include _VALUE_KIND in the Arrow schema,
+/// even when the current batch has no cross-partition migrations. Otherwise,
+/// KeyValueFileWriter's concat_batches fails with a schema mismatch when a later
+/// batch introduces deletes.
+///
+/// This test writes two commits to the same cross-partition table:
+/// 1. First commit: all new keys (no migration → no deletes)
+/// 2. Second commit: migrates keys (produces deletes)
+/// Both must succeed without schema errors.
+#[tokio::test]
+async fn test_cross_partition_value_kind_schema_stability() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_cross_vk (
+                dt STRING, id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) PARTITIONED BY (dt STRING)",
+        )
+        .await
+        .unwrap();
+
+    // Commit 1: all new keys, no migration — _VALUE_KIND must still be added
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_cross_vk VALUES \
+             ('a', 1, 10), ('a', 2, 20), ('b', 3, 30)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Commit 2: id=1 migrates from "a" to "b" — produces DELETE in "a"
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_cross_vk VALUES \
+             ('b', 1, 100), ('a', 2, 200)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_id_value(
+        &handler,
+        "SELECT id, value FROM paimon.test_db.t_cross_vk ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 100), (2, 200), (3, 30)]);
+}

@@ -476,11 +476,13 @@ impl<'a> TableScan<'a> {
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
 
-        let has_primary_keys = !self.table.schema().trimmed_primary_keys().is_empty();
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
 
-        // Skip level-0 files for PK tables with FirstRow engine only.
-        // FirstRow reads go through DataFileReader (no merge), so only compacted
-        // (level > 0) files are safe to read directly.
+        // Skip level-0 files for PK tables when:
+        // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
+        // - FirstRow engine without DV: reads go through DataFileReader (no merge),
+        //   so only compacted (level > 0) files are safe to read directly
         // Deduplicate engine always uses KeyValueFileReader which handles level-0
         // via sort-merge, so level-0 files must remain visible.
         //
@@ -489,9 +491,10 @@ impl<'a> TableScan<'a> {
         let skip_level_zero = if self.scan_all_files {
             false
         } else if has_primary_keys {
-            core_options
-                .merge_engine()
-                .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+            deletion_vectors_enabled
+                || core_options
+                    .merge_engine()
+                    .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
         } else {
             false
         };

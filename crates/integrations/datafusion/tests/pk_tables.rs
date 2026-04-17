@@ -1279,3 +1279,107 @@ async fn test_postpone_insert_overwrite() {
         "After OVERWRITE: only 1 new file (old file deleted)"
     );
 }
+
+// ======================= Bucket Keys Regression =======================
+
+/// Regression: partitioned PK fixed-bucket table — query with partition + PK
+/// predicate must return rows. Before the fix, `bucket_keys()` returned full
+/// primary keys (including partition columns), while the read path used
+/// `trimmed_primary_keys()`, causing bucket pruning to target the wrong bucket.
+#[tokio::test]
+async fn test_pk_partitioned_fixed_bucket_predicate_query() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_bk_pred (
+                pt STRING, id INT NOT NULL, value INT,
+                PRIMARY KEY (pt, id)
+            ) PARTITIONED BY (pt STRING)
+            WITH ('bucket' = '2')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_bk_pred VALUES \
+             ('a', 1, 10), ('a', 2, 20), ('b', 3, 30), ('b', 4, 40)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Query with both partition and PK columns in predicate
+    let rows = collect_id_value(
+        &handler,
+        "SELECT id, value FROM paimon.test_db.t_bk_pred WHERE pt = 'a' AND id = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 10)], "Predicate query must find the row");
+
+    let rows = collect_id_value(
+        &handler,
+        "SELECT id, value FROM paimon.test_db.t_bk_pred WHERE pt = 'b' AND id = 4",
+    )
+    .await;
+    assert_eq!(rows, vec![(4, 40)], "Predicate query must find the row");
+}
+
+// ======================= DV + Deduplicate Regression =======================
+
+/// Regression: DV-enabled Deduplicate PK table must not error on read.
+/// Before the fix, removing the DV guard caused level-0 files to reach
+/// KeyValueFileReader which rejects deletion-vector files with a hard error.
+/// With the guard restored, level-0 files are skipped in scan (DV mode relies
+/// on compaction to produce higher-level files).
+#[tokio::test]
+async fn test_pk_dv_deduplicate_read_no_error() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dv_dedup (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '1', 'deletion-vectors.enabled' = 'true')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql("INSERT INTO paimon.test_db.t_dv_dedup VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Second commit with overlapping key — creates level-0 files
+    handler
+        .sql("INSERT INTO paimon.test_db.t_dv_dedup VALUES (2, 200), (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Read must not error. DV mode skips level-0 files, so only compacted
+    // (level > 0) files are visible. Without compaction, all files are level-0
+    // and get skipped — count may be 0, but the read must succeed without error.
+    // Before the fix, this would hard-fail with "KeyValueFileReader does not
+    // support deletion vectors".
+    let result = handler
+        .sql("SELECT * FROM paimon.test_db.t_dv_dedup")
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(
+        result.is_ok(),
+        "DV + Deduplicate read should not error: {:?}",
+        result.err()
+    );
+}

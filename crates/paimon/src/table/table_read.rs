@@ -72,7 +72,7 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let has_primary_keys = !self.table.schema.trimmed_primary_keys().is_empty();
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
 
         // PK table with Deduplicate engine: splits containing level-0 files
