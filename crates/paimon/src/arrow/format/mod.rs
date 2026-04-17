@@ -16,6 +16,7 @@
 // under the License.
 
 mod avro;
+mod blob;
 mod orc;
 mod parquet;
 
@@ -88,6 +89,8 @@ pub(crate) trait FormatFileWriter: Send {
 pub(crate) fn create_format_reader(path: &str) -> crate::Result<Box<dyn FormatFileReader>> {
     if path.to_ascii_lowercase().ends_with(".parquet") {
         Ok(Box::new(parquet::ParquetFormatReader))
+    } else if path.to_ascii_lowercase().ends_with(".blob") {
+        Ok(Box::new(blob::BlobFormatReader))
     } else if path.to_ascii_lowercase().ends_with(".orc") {
         Ok(Box::new(orc::OrcFormatReader))
     } else if path.to_ascii_lowercase().ends_with(".avro") {
@@ -95,7 +98,7 @@ pub(crate) fn create_format_reader(path: &str) -> crate::Result<Box<dyn FormatFi
     } else {
         Err(Error::Unsupported {
             message: format!(
-                "unsupported file format: expected .parquet, .orc, or .avro, got: {path}"
+                "unsupported file format: expected .parquet, .blob, .orc, or .avro, got: {path}"
             ),
         })
     }
