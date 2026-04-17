@@ -66,6 +66,7 @@ pub(crate) struct KeyValueWriteConfig {
     pub file_compression: String,
     pub file_compression_zstd_level: i32,
     pub write_buffer_size: i64,
+    pub file_format: String,
     /// Primary key column indices in the user schema.
     pub primary_key_indices: Vec<usize>,
     /// Paimon DataTypes for each primary key column (same order as primary_key_indices).
@@ -202,9 +203,10 @@ impl KeyValueFileWriter {
 
         // Open parquet writer.
         let file_name = format!(
-            "data-{}-{}.parquet",
+            "data-{}-{}.{}",
             uuid::Uuid::new_v4(),
-            self.written_files.len()
+            self.written_files.len(),
+            self.config.file_format,
         );
         let bucket_dir = if self.config.partition_path.is_empty() {
             format!(

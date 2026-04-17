@@ -39,6 +39,7 @@ const COMMIT_MIN_RETRY_WAIT_OPTION: &str = "commit.min-retry-wait";
 const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
+const FILE_FORMAT_OPTION: &str = "file.format";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
@@ -321,6 +322,15 @@ impl<'a> CoreOptions<'a> {
             .get("target-file-size")
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
+    }
+
+    /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
+    /// Default is "parquet".
+    pub fn file_format(&self) -> &str {
+        self.options
+            .get(FILE_FORMAT_OPTION)
+            .map(String::as_str)
+            .unwrap_or("parquet")
     }
 
     /// File compression codec (e.g. "lz4", "zstd", "snappy", "none").

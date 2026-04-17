@@ -471,6 +471,7 @@ pub(crate) struct DataEvolutionPartialWriter {
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
+    file_format: String,
     write_columns: Vec<String>,
     /// Writers keyed by (partition_bytes, bucket, first_row_id).
     writers: HashMap<WriterKey, DataFileWriter>,
@@ -516,6 +517,7 @@ impl DataEvolutionPartialWriter {
             file_compression: core_options.file_compression().to_string(),
             file_compression_zstd_level: core_options.file_compression_zstd_level(),
             write_buffer_size: core_options.write_parquet_buffer_size(),
+            file_format: core_options.file_format().to_string(),
             write_columns,
             writers: HashMap::new(),
         })
@@ -555,6 +557,7 @@ impl DataEvolutionPartialWriter {
                 self.file_compression.clone(),
                 self.file_compression_zstd_level,
                 self.write_buffer_size,
+                self.file_format.clone(),
                 Some(0), // file_source: APPEND
                 Some(first_row_id),
                 Some(self.write_columns.clone()),

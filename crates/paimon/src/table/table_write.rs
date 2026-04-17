@@ -91,6 +91,7 @@ pub struct TableWrite {
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
+    file_format: String,
     primary_key_indices: Vec<usize>,
     primary_key_types: Vec<DataType>,
     sequence_field_indices: Vec<usize>,
@@ -168,6 +169,7 @@ impl TableWrite {
         let target_file_size = core_options.target_file_size();
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
+        let file_format = core_options.file_format().to_string();
         let write_buffer_size = core_options.write_parquet_buffer_size();
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
@@ -263,6 +265,7 @@ impl TableWrite {
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
+            file_format,
             primary_key_indices,
             primary_key_types,
             sequence_field_indices,
@@ -563,6 +566,7 @@ impl TableWrite {
             self.file_compression.clone(),
             self.file_compression_zstd_level,
             self.write_buffer_size,
+            self.file_format.clone(),
             Some(0), // file_source: APPEND
             None,    // first_row_id: assigned by commit
             None,    // write_cols: full-row write
@@ -583,6 +587,7 @@ impl TableWrite {
                 file_compression: self.file_compression.clone(),
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
+                file_format: self.file_format.clone(),
                 data_file_prefix,
             },
         ))
@@ -620,6 +625,7 @@ impl TableWrite {
                 file_compression: self.file_compression.clone(),
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
+                file_format: self.file_format.clone(),
                 primary_key_indices: self.primary_key_indices.clone(),
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),

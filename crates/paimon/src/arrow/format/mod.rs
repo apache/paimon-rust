@@ -19,6 +19,8 @@ mod avro;
 mod blob;
 mod orc;
 mod parquet;
+#[cfg(feature = "vortex")]
+mod vortex;
 
 use crate::io::{FileRead, OutputFile};
 use crate::spec::{DataField, Predicate};
@@ -87,15 +89,20 @@ pub(crate) trait FormatFileWriter: Send {
 
 /// Create a format reader based on the file extension.
 pub(crate) fn create_format_reader(path: &str) -> crate::Result<Box<dyn FormatFileReader>> {
-    if path.to_ascii_lowercase().ends_with(".parquet") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".parquet") {
         Ok(Box::new(parquet::ParquetFormatReader))
-    } else if path.to_ascii_lowercase().ends_with(".blob") {
+    } else if lower.ends_with(".blob") {
         Ok(Box::new(blob::BlobFormatReader))
-    } else if path.to_ascii_lowercase().ends_with(".orc") {
+    } else if lower.ends_with(".orc") {
         Ok(Box::new(orc::OrcFormatReader))
-    } else if path.to_ascii_lowercase().ends_with(".avro") {
+    } else if lower.ends_with(".avro") {
         Ok(Box::new(avro::AvroFormatReader))
     } else {
+        #[cfg(feature = "vortex")]
+        if lower.ends_with(".vortex") {
+            return Ok(Box::new(vortex::VortexFormatReader));
+        }
         Err(Error::Unsupported {
             message: format!(
                 "unsupported file format: expected .parquet, .blob, .orc, or .avro, got: {path}"
@@ -112,11 +119,18 @@ pub(crate) async fn create_format_writer(
     zstd_level: i32,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
     let path = output.location();
-    if path.to_ascii_lowercase().ends_with(".parquet") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".parquet") {
         Ok(Box::new(
             parquet::ParquetFormatWriter::new(output, schema, compression, zstd_level).await?,
         ))
     } else {
+        #[cfg(feature = "vortex")]
+        if lower.ends_with(".vortex") {
+            return Ok(Box::new(
+                vortex::VortexFormatWriter::new(output, schema).await?,
+            ));
+        }
         Err(Error::Unsupported {
             message: format!("unsupported write format: expected .parquet, got: {path}"),
         })

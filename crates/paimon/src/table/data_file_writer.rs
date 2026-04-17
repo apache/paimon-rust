@@ -48,6 +48,7 @@ pub(crate) struct DataFileWriter {
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
+    file_format: String,
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
@@ -72,6 +73,7 @@ impl DataFileWriter {
         file_compression: String,
         file_compression_zstd_level: i32,
         write_buffer_size: i64,
+        file_format: String,
         file_source: Option<i32>,
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
@@ -86,6 +88,7 @@ impl DataFileWriter {
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
+            file_format,
             file_source,
             first_row_id,
             write_cols,
@@ -127,9 +130,10 @@ impl DataFileWriter {
 
     async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
         let file_name = format!(
-            "data-{}-{}.parquet",
+            "data-{}-{}.{}",
             uuid::Uuid::new_v4(),
-            self.written_files.len()
+            self.written_files.len(),
+            self.file_format,
         );
 
         let bucket_dir = if self.partition_path.is_empty() {
