@@ -297,6 +297,18 @@ fn partition_matches_predicate(
     }
 }
 
+/// Whether scan-owned pruning still preserves `merged_row_count()` as a safe
+/// row-count hint.
+///
+/// Data predicates and row ranges can reduce rows within a split after planning,
+/// so split-level row counts stop being a conservative bound for final rows.
+pub(super) fn can_push_down_limit_hint_for_scan(
+    data_predicates: &[Predicate],
+    row_ranges: Option<&[RowRange]>,
+) -> bool {
+    data_predicates.is_empty() && row_ranges.is_none()
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -432,6 +444,9 @@ impl<'a> TableScan<'a> {
             Some(l) => l,
             None => return splits,
         };
+        if limit == 0 {
+            return Vec::new();
+        }
 
         if splits.is_empty() {
             return splits;
@@ -446,14 +461,10 @@ impl<'a> TableScan<'a> {
                     limited_splits.push(split);
                     scanned_row_count += merged_count;
                     if scanned_row_count >= limit as i64 {
-                        // We likely have enough rows for the limit hint.
                         return limited_splits;
                     }
                 }
                 None => {
-                    // Can't compute merged row count, so keep this split and
-                    // rely on the caller or query engine to enforce the final
-                    // LIMIT.
                     limited_splits.push(split);
                 }
             }
@@ -548,6 +559,10 @@ impl<'a> TableScan<'a> {
         )
         .await?;
         Ok(merge_manifest_entries(entries))
+    }
+
+    fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
+        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
     }
 
     async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
@@ -777,7 +792,7 @@ impl<'a> TableScan<'a> {
 
         // With data predicates or row_ranges, merged_row_count() reflects pre-filter
         // row counts, so stopping early could return fewer rows than the limit.
-        let splits = if self.data_predicates.is_empty() && effective_row_ranges.is_none() {
+        let splits = if self.can_push_down_limit_hint(effective_row_ranges.as_deref()) {
             self.apply_limit_pushdown(splits)
         } else {
             splits
@@ -789,15 +804,19 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::partition_matches_predicate;
+    use super::{partition_matches_predicate, TableScan};
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
     use crate::spec::{
-        stats::BinaryTableStats, ArrayType, BinaryRowBuilder, DataField, DataFileMeta, DataType,
-        Datum, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType, Predicate,
-        PredicateBuilder, PredicateOperator, VarCharType,
+        stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, DataField, DataFileMeta,
+        DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType,
+        Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema, TableSchema,
+        VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
-    use crate::table::source::DeletionFile;
+    use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
     use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
+    use crate::table::Table;
     use crate::Error;
     use chrono::{DateTime, Utc};
 
@@ -909,6 +928,97 @@ mod tests {
             file_source: None,
             value_stats_cols: None,
         }
+    }
+
+    fn limit_test_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let schema = PaimonSchema::builder().build().unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "test_table"),
+            "/tmp/test-table".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
+    fn limit_test_split(file_name: &str, row_count: i64) -> DataSplit {
+        let mut file = test_data_file_meta(Vec::new(), Vec::new(), Vec::new(), row_count);
+        file.file_name = file_name.to_string();
+
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:/tmp/{file_name}"))
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap()
+    }
+
+    fn limit_test_split_with_unknown_merged_row_count(
+        file_name: &str,
+        row_count: i64,
+    ) -> DataSplit {
+        let mut file = test_data_file_meta(Vec::new(), Vec::new(), Vec::new(), row_count);
+        file.file_name = file_name.to_string();
+
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("file:/tmp/{file_name}"))
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                format!("file:/tmp/{file_name}.dv"),
+                0,
+                0,
+                None,
+            ))])
+            .build()
+            .unwrap()
+    }
+
+    fn split_file_names(splits: &[DataSplit]) -> Vec<&str> {
+        splits
+            .iter()
+            .map(|split| split.data_files()[0].file_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_apply_limit_pushdown_zero_returns_empty() {
+        let table = limit_test_table();
+        let scan = TableScan::new(&table, None, vec![], None, Some(0), None);
+        let splits = vec![
+            limit_test_split("a.parquet", 2),
+            limit_test_split("b.parquet", 3),
+        ];
+
+        let pruned = scan.apply_limit_pushdown(splits);
+
+        assert!(pruned.is_empty());
+    }
+
+    #[test]
+    fn test_apply_limit_pushdown_keeps_unknown_merged_row_count() {
+        let table = limit_test_table();
+        let scan = TableScan::new(&table, None, vec![], None, Some(3), None);
+        let splits = vec![
+            limit_test_split("a.parquet", 2),
+            limit_test_split_with_unknown_merged_row_count("b.parquet", 4),
+            limit_test_split("c.parquet", 3),
+        ];
+
+        let pruned = scan.apply_limit_pushdown(splits);
+
+        assert_eq!(
+            split_file_names(&pruned),
+            vec!["a.parquet", "b.parquet", "c.parquet"]
+        );
     }
 
     #[test]

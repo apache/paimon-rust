@@ -36,6 +36,25 @@ struct NormalizedFilter {
     bucket_predicate: Option<Predicate>,
 }
 
+/// Whether a translated predicate is exact at the table-provider boundary.
+///
+/// Exact filters are fully enforced by paimon-core scan planning using only
+/// partition-owned semantics, without requiring residual filtering above the
+/// scan.
+fn is_exact_filter_pushdown_for_schema(
+    fields: &[DataField],
+    partition_keys: &[String],
+    filter: &Predicate,
+) -> bool {
+    if partition_keys.is_empty() {
+        return false;
+    }
+
+    let (_, data_predicates) =
+        split_partition_and_data_predicates(filter.clone(), fields, partition_keys);
+    data_predicates.is_empty()
+}
+
 pub(super) fn split_scan_predicates(
     table: &Table,
     filter: Predicate,
@@ -141,6 +160,18 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Whether a translated predicate is exact at the table-provider boundary.
+    ///
+    /// Exact filters are fully enforced by paimon-core scan planning, without
+    /// requiring residual filtering above the scan.
+    pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
+        is_exact_filter_pushdown_for_schema(
+            self.table.schema().fields(),
+            self.table.schema().partition_keys(),
+            filter,
+        )
+    }
+
     /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         self.row_ranges = if ranges.is_empty() {
@@ -171,8 +202,8 @@ impl<'a> ReadBuilder<'a> {
 
     /// Push a row-limit hint down to scan planning.
     ///
-    /// This allows the scan to generate fewer splits when possible. The hint is
-    /// applied based on the `merged_row_count()` of each split.
+    /// This allows paimon-core scan planning to generate fewer splits when the
+    /// current scan state keeps split-level `merged_row_count()` conservative.
     ///
     /// Note: This method does not guarantee that exactly `limit` rows will be
     /// returned by [`TableRead`]. It is only a pushdown hint for planning.
@@ -285,6 +316,50 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    fn simple_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("dt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .partition_keys(["dt"])
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_is_true_for_partition_only_filter() {
+        let table = simple_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("dt", crate::spec::Datum::String("2024-01-01".to_string()))
+            .unwrap();
+
+        let builder = table.new_read_builder();
+
+        assert!(builder.is_exact_filter_pushdown(&predicate));
+    }
+
+    #[test]
+    fn test_exact_filter_pushdown_is_false_for_data_filter() {
+        let table = simple_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_than("id", crate::spec::Datum::Int(1))
+            .unwrap();
+
+        let builder = table.new_read_builder();
+
+        assert!(!builder.is_exact_filter_pushdown(&predicate));
     }
 
     #[tokio::test]
