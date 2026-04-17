@@ -72,7 +72,7 @@ pub(crate) fn write_blob_file(path: &Path, rows: &[Option<&[u8]>]) {
         .unwrap_or_else(|e| panic!("Failed to write blob test file {path:?}: {e}"));
 }
 
-fn encode_delta_varints(values: &[i64]) -> Vec<u8> {
+pub(crate) fn encode_delta_varints(values: &[i64]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();
     }

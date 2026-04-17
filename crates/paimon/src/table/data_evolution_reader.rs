@@ -591,7 +591,7 @@ fn build_source_plan(
             } else {
                 let source_idx = sources.len();
                 sources.push(FieldSource::BlobBunch {
-                    bunch: BlobBunch::new(expected_row_count, false),
+                    bunch: BlobBunch::new(expected_row_count),
                     data_fields: info.data_fields.clone(),
                     read_fields: Vec::new(),
                 });
@@ -744,7 +744,6 @@ impl FieldSource {
 struct BlobBunch {
     files: Vec<DataFileMeta>,
     expected_row_count: i64,
-    row_id_push_down: bool,
     latest_first_row_id: i64,
     expected_next_first_row_id: i64,
     latest_max_sequence_number: i64,
@@ -752,11 +751,10 @@ struct BlobBunch {
 }
 
 impl BlobBunch {
-    fn new(expected_row_count: i64, row_id_push_down: bool) -> Self {
+    fn new(expected_row_count: i64) -> Self {
         Self {
             files: Vec::new(),
             expected_row_count,
-            row_id_push_down,
             latest_first_row_id: -1,
             expected_next_first_row_id: -1,
             latest_max_sequence_number: -1,
@@ -790,16 +788,7 @@ impl BlobBunch {
         }
 
         if !self.files.is_empty() {
-            if self.row_id_push_down {
-                if first_row_id < self.expected_next_first_row_id {
-                    if file.max_sequence_number > self.latest_max_sequence_number {
-                        let removed = self.files.pop().unwrap();
-                        self.row_count -= removed.row_count;
-                    } else {
-                        return Ok(());
-                    }
-                }
-            } else if first_row_id < self.expected_next_first_row_id {
+            if first_row_id < self.expected_next_first_row_id {
                 if file.max_sequence_number >= self.latest_max_sequence_number {
                     return Err(Error::DataInvalid {
                         message:
@@ -986,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_ignores_same_first_row_id_with_lower_sequence() {
-        let mut bunch = BlobBunch::new(1000, false);
+        let mut bunch = BlobBunch::new(1000);
         bunch
             .add(data_file(
                 "blob-high.blob",
@@ -1007,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_same_first_row_id_with_higher_sequence() {
-        let mut bunch = BlobBunch::new(1000, false);
+        let mut bunch = BlobBunch::new(1000);
         bunch
             .add(data_file("blob-low.blob", 0, 100, 2, Some(vec!["payload"])))
             .unwrap();
@@ -1029,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_overlapping_higher_sequence_file() {
-        let mut bunch = BlobBunch::new(1000, false);
+        let mut bunch = BlobBunch::new(1000);
         bunch
             .add(data_file("blob1.blob", 0, 100, 1, Some(vec!["payload"])))
             .unwrap();
@@ -1045,7 +1034,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_non_continuous_first_row_id() {
-        let mut bunch = BlobBunch::new(1000, false);
+        let mut bunch = BlobBunch::new(1000);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
@@ -1061,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_mixed_write_columns() {
-        let mut bunch = BlobBunch::new(200, false);
+        let mut bunch = BlobBunch::new(200);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
@@ -1077,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_mixed_schema_ids() {
-        let mut bunch = BlobBunch::new(200, false);
+        let mut bunch = BlobBunch::new(200);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
@@ -1093,7 +1082,7 @@ mod tests {
 
     #[test]
     fn test_blob_bunch_rejects_row_count_exceeding_expected() {
-        let mut bunch = BlobBunch::new(100, false);
+        let mut bunch = BlobBunch::new(100);
         bunch
             .add(data_file("blob1.blob", 0, 60, 3, Some(vec!["payload"])))
             .unwrap();

@@ -25,7 +25,8 @@ use arrow_array::builder::BinaryBuilder;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
+use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ const BLOB_INLINE_HEADER_SIZE: u64 = 4;
 const BLOB_TRAILER_SIZE: u64 = 12;
 const BLOB_ENTRY_OVERHEAD: u64 = BLOB_INLINE_HEADER_SIZE + BLOB_TRAILER_SIZE;
 const DEFAULT_BATCH_SIZE: usize = 128;
+const BLOB_READ_CONCURRENCY: usize = 8;
 
 #[async_trait]
 impl FormatFileReader for BlobFormatReader {
@@ -120,27 +122,13 @@ async fn read_blob_batch(
         });
     }
 
+    let planned_reads = plan_blob_reads(blob_index, positions)?;
+    let values = fetch_blob_values(reader, planned_reads).await?;
     let mut builder = BinaryBuilder::new();
-    for &position in positions {
-        let entry = blob_index
-            .entry(position)
-            .ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "Blob row selection referenced out-of-range position {position} for {} rows",
-                    blob_index.num_rows()
-                ),
-                source: None,
-            })?;
-
-        if let Some(range) = entry.inline_data_range() {
-            if range.start == range.end {
-                builder.append_value([]);
-            } else {
-                let bytes = reader.read(range).await?;
-                builder.append_value(bytes.as_ref());
-            }
-        } else {
-            builder.append_null();
+    for value in values {
+        match value {
+            BlobValue::Null => builder.append_null(),
+            BlobValue::Inline(bytes) => builder.append_value(bytes.as_ref()),
         }
     }
 
@@ -149,6 +137,61 @@ async fn read_blob_batch(
         message: format!("Failed to build blob RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
+}
+
+fn plan_blob_reads(
+    blob_index: &BlobFileIndex,
+    positions: &[usize],
+) -> crate::Result<Vec<PlannedBlobRead>> {
+    positions
+        .iter()
+        .map(|&position| {
+            let entry = blob_index
+                .entry(position)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Blob row selection referenced out-of-range position {position} for {} rows",
+                        blob_index.num_rows()
+                    ),
+                    source: None,
+                })?;
+
+            Ok(match entry.inline_data_range() {
+                Some(range) if range.start == range.end => PlannedBlobRead::Empty,
+                Some(range) => PlannedBlobRead::Read(range),
+                None => PlannedBlobRead::Null,
+            })
+        })
+        .collect()
+}
+
+async fn fetch_blob_values(
+    reader: &dyn FileRead,
+    planned_reads: Vec<PlannedBlobRead>,
+) -> crate::Result<Vec<BlobValue>> {
+    futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
+        match planned_read {
+            PlannedBlobRead::Null => Ok(BlobValue::Null),
+            PlannedBlobRead::Empty => Ok(BlobValue::Inline(Bytes::new())),
+            PlannedBlobRead::Read(range) => reader.read(range).await.map(BlobValue::Inline),
+        }
+    }))
+    .buffered(BLOB_READ_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
+#[derive(Debug, Clone)]
+enum PlannedBlobRead {
+    Null,
+    Empty,
+    Read(Range<u64>),
+}
+
+#[derive(Debug, Clone)]
+enum BlobValue {
+    Null,
+    Inline(Bytes),
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +524,8 @@ mod tests {
     use arrow_array::Array;
     use bytes::Bytes;
     use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[allow(dead_code)]
     mod blob_test_utils {
@@ -543,6 +588,44 @@ mod tests {
             collect_binary_values(&selected[0]),
             vec![Some(b"world".to_vec()), Some(Vec::new())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_reads_payloads_with_bounded_parallelism() {
+        let read_fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+
+        let batches = BlobFormatReader
+            .read_batch_stream(
+                Box::new(reader.clone()),
+                file_bytes.len() as u64,
+                &read_fields,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            collect_binary_values(&batches[0]),
+            vec![
+                Some(b"hello".to_vec()),
+                None,
+                Some(b"world".to_vec()),
+                Some(Vec::new()),
+            ]
+        );
+        assert!(reader.max_in_flight() > 1);
     }
 
     #[test]
@@ -670,7 +753,7 @@ mod tests {
         let lengths = decode_delta_varints(&file_bytes[index_start..footer_start]).unwrap();
         let mut replacement_lengths = lengths.clone();
         replacement_lengths[0] = 15;
-        let replacement = encode_delta_varints(&replacement_lengths);
+        let replacement = blob_test_utils::encode_delta_varints(&replacement_lengths);
         file_bytes.splice(index_start..footer_start, replacement.iter().copied());
         let footer_start = file_bytes.len() - BLOB_FOOTER_SIZE as usize;
         file_bytes[footer_start..footer_start + 4]
@@ -722,27 +805,35 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
     }
 
-    fn encode_delta_varints(values: &[i64]) -> Vec<u8> {
-        if values.is_empty() {
-            return Vec::new();
-        }
-
-        let mut encoded = Vec::new();
-        let mut previous = 0_i64;
-        for (idx, value) in values.iter().copied().enumerate() {
-            let delta = if idx == 0 { value } else { value - previous };
-            previous = value;
-            encode_varint(delta, &mut encoded);
-        }
-        encoded
+    #[derive(Clone)]
+    struct TrackingFileRead {
+        bytes: Bytes,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
     }
 
-    fn encode_varint(value: i64, out: &mut Vec<u8>) {
-        let mut remaining = ((value << 1) ^ (value >> 63)) as u64;
-        while (remaining & !0x7f) != 0 {
-            out.push(((remaining & 0x7f) as u8) | 0x80);
-            remaining >>= 7;
+    impl TrackingFileRead {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+            }
         }
-        out.push(remaining as u8);
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
     }
 }
