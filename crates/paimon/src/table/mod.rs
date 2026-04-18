@@ -167,18 +167,6 @@ impl Table {
             rest_env: self.rest_env.clone(),
         }
     }
-
-    /// Create a copy of this table with specified options removed from the schema.
-    pub fn copy_removing_options(&self, keys: &[&str]) -> Self {
-        Self {
-            file_io: self.file_io.clone(),
-            identifier: self.identifier.clone(),
-            location: self.location.clone(),
-            schema: self.schema.copy_removing_options(keys),
-            schema_manager: self.schema_manager.clone(),
-            rest_env: self.rest_env.clone(),
-        }
-    }
 }
 
 /// A stream of arrow [`RecordBatch`]es.

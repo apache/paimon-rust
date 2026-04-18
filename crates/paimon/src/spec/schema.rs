@@ -125,15 +125,6 @@ impl TableSchema {
         new_schema
     }
 
-    /// Create a copy of this schema with specified options removed.
-    pub fn copy_removing_options(&self, keys: &[&str]) -> Self {
-        let mut new_schema = self.clone();
-        for key in keys {
-            new_schema.options.remove(*key);
-        }
-        new_schema
-    }
-
     /// Apply a list of schema changes and return a new schema with incremented ID.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
         let mut new_schema = self.clone();
