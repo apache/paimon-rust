@@ -41,7 +41,7 @@ use paimon::catalog::{Catalog, Identifier};
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::table::{build_paimon_scan, PaimonTableProvider};
+use crate::table::{PaimonScanBuilder, PaimonTableProvider};
 
 /// Register the `full_text_search` table-valued function on a [`SessionContext`].
 pub fn register_full_text_search(
@@ -178,15 +178,17 @@ impl TableProvider for FullTextSearchTableProvider {
             .map_err(to_datafusion_error)?;
 
         let target = state.config_options().execution.target_partitions;
-        build_paimon_scan(
+        PaimonScanBuilder {
             table,
-            &self.schema(),
-            &plan,
+            schema: &self.schema(),
+            plan: &plan,
             projection,
-            None,
+            pushed_predicate: None,
             limit,
-            target,
-        )
+            target_partitions: target,
+            filter_exact: false, // FTS scan does not support exact filter pushdown
+        }
+        .build()
     }
 
     fn supports_filters_pushdown(

@@ -55,6 +55,7 @@ pub async fn setup_handler() -> (TempDir, PaimonSqlHandler) {
     (tmp, handler)
 }
 
+#[allow(dead_code)]
 pub async fn collect_id_name(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
@@ -75,6 +76,7 @@ pub async fn collect_id_name(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32,
     rows
 }
 
+#[allow(dead_code)]
 pub async fn collect_id_value(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, i32)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();

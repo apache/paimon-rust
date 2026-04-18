@@ -54,6 +54,9 @@ pub struct PaimonTableScan {
     plan_properties: Arc<PlanProperties>,
     /// Optional limit hint pushed to paimon-core planning.
     limit: Option<usize>,
+    /// Whether the pushed predicate is exact (no residual filtering needed).
+    /// When true and all splits have known merged_row_count, statistics can be exact.
+    filter_exact: bool,
 }
 
 impl PaimonTableScan {
@@ -64,6 +67,7 @@ impl PaimonTableScan {
         pushed_predicate: Option<Predicate>,
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
+        filter_exact: bool,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -78,6 +82,7 @@ impl PaimonTableScan {
             planned_partitions,
             plan_properties,
             limit,
+            filter_exact,
         }
     }
 
@@ -176,17 +181,34 @@ impl ExecutionPlan for PaimonTableScan {
 
         let mut total_rows: usize = 0;
         let mut total_bytes: usize = 0;
+        let mut all_row_counts_known = true;
         for splits in partitions {
             for split in splits.iter() {
-                total_rows += split.merged_row_count().unwrap_or(split.row_count()) as usize;
+                if let Some(row_count) = split.merged_row_count() {
+                    total_rows += row_count as usize;
+                } else {
+                    all_row_counts_known = false;
+                    total_rows += split.row_count() as usize;
+                }
                 for file in split.data_files() {
                     total_bytes += file.file_size as usize;
                 }
             }
         }
 
+        // Return exact statistics when:
+        // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
+        // 2. No limit is applied (limit would make row count inexact)
+        // 3. Filter is exact (no residual filtering needed above the scan)
+        let num_rows_precision =
+            if all_row_counts_known && self.limit.is_none() && self.filter_exact {
+                Precision::Exact(total_rows)
+            } else {
+                Precision::Inexact(total_rows)
+            };
+
         Ok(Statistics {
-            num_rows: Precision::Inexact(total_rows),
+            num_rows: num_rows_precision,
             total_byte_size: Precision::Inexact(total_bytes),
             column_statistics: Statistics::unknown_column(&self.schema()),
         })
@@ -267,6 +289,7 @@ mod tests {
             None,
             vec![Arc::from(Vec::new())],
             None,
+            false,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
@@ -279,8 +302,15 @@ mod tests {
             Arc::from(Vec::new()),
             Arc::from(Vec::new()),
         ];
-        let scan =
-            PaimonTableScan::new(schema, dummy_table(), None, None, planned_partitions, None);
+        let scan = PaimonTableScan::new(
+            schema,
+            dummy_table(),
+            None,
+            None,
+            planned_partitions,
+            None,
+            false,
+        );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
     }
 
@@ -356,6 +386,7 @@ mod tests {
             Some(pushed_predicate),
             vec![Arc::from(vec![split])],
             None,
+            false,
         );
 
         let ctx = SessionContext::new();
