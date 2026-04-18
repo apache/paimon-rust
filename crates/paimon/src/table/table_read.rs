@@ -21,7 +21,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::spec::{CoreOptions, DataField, PartialUpdateConfig, Predicate};
 use crate::DataSplit;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -73,6 +73,9 @@ impl<'a> TableRead<'a> {
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
+        let table_name = self.table.identifier().full_name();
+        PartialUpdateConfig::new(self.table.schema().options())
+            .ensure_read_supported(has_primary_keys, &table_name)?;
         let core_options = CoreOptions::new(self.table.schema.options());
 
         // PK table with Deduplicate engine: splits containing level-0 files

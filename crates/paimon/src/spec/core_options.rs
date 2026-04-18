@@ -66,6 +66,8 @@ const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 pub enum MergeEngine {
     /// Keep the row with the highest sequence number (default).
     Deduplicate,
+    /// Merge same-key rows field-by-field, usually keeping non-null updates.
+    PartialUpdate,
     /// Keep the first row for each key (ignore later updates).
     FirstRow,
 }
@@ -124,6 +126,7 @@ impl<'a> CoreOptions<'a> {
             None => Ok(MergeEngine::Deduplicate),
             Some(v) => match v.to_ascii_lowercase().as_str() {
                 "deduplicate" => Ok(MergeEngine::Deduplicate),
+                "partial-update" => Ok(MergeEngine::PartialUpdate),
                 "first-row" => Ok(MergeEngine::FirstRow),
                 other => Err(crate::Error::Unsupported {
                     message: format!("Unsupported merge-engine: '{other}'"),
@@ -496,6 +499,14 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_merge_engine_accepts_partial_update() {
+        let options = HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "partial-update".into())]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(core.merge_engine().unwrap(), MergeEngine::PartialUpdate);
     }
 
     #[test]

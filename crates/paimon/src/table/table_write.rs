@@ -23,8 +23,8 @@
 use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataField, DataType, Datum, MergeEngine, Predicate, PredicateBuilder,
-    EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    BinaryRow, CoreOptions, DataField, DataType, Datum, MergeEngine, PartialUpdateConfig,
+    Predicate, PredicateBuilder, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -128,6 +128,9 @@ impl TableWrite {
 
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
+        let table_name = table.identifier().full_name();
+        PartialUpdateConfig::new(schema.options())
+            .ensure_write_supported(has_primary_keys, &table_name)?;
         let is_dynamic_bucket = has_primary_keys && total_buckets == -1;
 
         let is_cross_partition = is_dynamic_bucket && !schema.partition_keys().is_empty() && {
@@ -817,6 +820,33 @@ mod tests {
             .unwrap();
         assert!(
             matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
+        );
+    }
+
+    #[test]
+    fn test_rejects_partial_update_primary_key_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_partial_update_table"),
+            "memory:/test_partial_update_table".to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("merge-engine", "partial-update")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let err = TableWrite::new(&table, "test-user".to_string(), false)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("partial-update writes are not implemented yet"))
         );
     }
 

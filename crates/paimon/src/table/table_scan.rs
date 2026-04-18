@@ -31,8 +31,8 @@ use crate::io::FileIO;
 use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
     bucket_dir_name, eval_row, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind,
-    IndexManifest, ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot,
-    TimeTravelSelector,
+    IndexManifest, ManifestEntry, ManifestFileMeta, PartialUpdateConfig, PartitionComputer,
+    Predicate, Snapshot, TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -305,8 +305,25 @@ fn partition_matches_predicate(
 pub(super) fn can_push_down_limit_hint_for_scan(
     data_predicates: &[Predicate],
     row_ranges: Option<&[RowRange]>,
+    partial_update_enabled: bool,
 ) -> bool {
-    data_predicates.is_empty() && row_ranges.is_none()
+    !partial_update_enabled && data_predicates.is_empty() && row_ranges.is_none()
+}
+
+fn should_skip_level_zero_for_scan(
+    scan_all_files: bool,
+    has_primary_keys: bool,
+    deletion_vectors_enabled: bool,
+    merge_engine: crate::Result<crate::spec::MergeEngine>,
+) -> bool {
+    if scan_all_files {
+        return false;
+    }
+    if !has_primary_keys {
+        return false;
+    }
+
+    deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
 }
 
 /// TableScan for full table scan (no incremental, no predicate).
@@ -499,16 +516,12 @@ impl<'a> TableScan<'a> {
         //
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
-        let skip_level_zero = if self.scan_all_files {
-            false
-        } else if has_primary_keys {
-            deletion_vectors_enabled
-                || core_options
-                    .merge_engine()
-                    .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
-        } else {
-            false
-        };
+        let skip_level_zero = should_skip_level_zero_for_scan(
+            self.scan_all_files,
+            has_primary_keys,
+            deletion_vectors_enabled,
+            core_options.merge_engine(),
+        );
 
         let partition_fields = self.table.schema().partition_fields();
 
@@ -562,7 +575,9 @@ impl<'a> TableScan<'a> {
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
-        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+        let partial_update_enabled = !self.table.schema().primary_keys().is_empty()
+            && PartialUpdateConfig::new(self.table.schema().options()).is_enabled();
+        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges, partial_update_enabled)
     }
 
     async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
@@ -804,7 +819,7 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{partition_matches_predicate, TableScan};
+    use super::{partition_matches_predicate, should_skip_level_zero_for_scan, TableScan};
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
@@ -943,6 +958,25 @@ mod tests {
         )
     }
 
+    fn limit_test_partial_update_pk_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "partial-update")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "partial_update_table"),
+            "/tmp/test-partial-update-table".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
     fn limit_test_split(file_name: &str, row_count: i64) -> DataSplit {
         let mut file = test_data_file_meta(Vec::new(), Vec::new(), Vec::new(), row_count);
         file.file_name = file_name.to_string();
@@ -1019,6 +1053,37 @@ mod tests {
             split_file_names(&pruned),
             vec!["a.parquet", "b.parquet", "c.parquet"]
         );
+    }
+
+    #[test]
+    fn test_partial_update_disables_limit_pushdown_hint() {
+        let table = limit_test_partial_update_pk_table();
+        let scan = TableScan::new(&table, None, vec![], None, Some(10), None);
+
+        assert!(
+            !scan.can_push_down_limit_hint(None),
+            "PK partial-update tables must not use limit pushdown hints"
+        );
+    }
+
+    #[test]
+    fn test_first_row_skips_level_zero_by_default() {
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::FirstRow),
+        ));
+    }
+
+    #[test]
+    fn test_scan_all_files_disables_first_row_level_zero_skip() {
+        assert!(!should_skip_level_zero_for_scan(
+            true,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::FirstRow),
+        ));
     }
 
     #[test]

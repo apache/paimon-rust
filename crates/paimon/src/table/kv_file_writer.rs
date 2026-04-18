@@ -412,6 +412,11 @@ impl KeyValueFileWriter {
                     MergeEngine::Deduplicate => group_winner = cur,
                     // FirstRow: keep first (lowest seq), so don't update.
                     MergeEngine::FirstRow => {}
+                    MergeEngine::PartialUpdate => {
+                        return Err(crate::Error::Unsupported {
+                            message: "KeyValueFileWriter does not support merge-engine=partial-update yet".to_string(),
+                        });
+                    }
                 }
             } else {
                 // New key group — emit the winner of the previous group.
@@ -469,4 +474,101 @@ pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchem
         }
     }
     Arc::new(ArrowSchema::new(physical_fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::IntType;
+    use arrow_array::{Int32Array, UInt32Array};
+
+    fn first_row_writer() -> KeyValueFileWriter {
+        KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            KeyValueWriteConfig {
+                table_location: "memory:/kv-first-row".to_string(),
+                partition_path: String::new(),
+                bucket: 0,
+                schema_id: 0,
+                file_compression: "none".to_string(),
+                file_compression_zstd_level: 0,
+                write_buffer_size: 1024,
+                primary_key_indices: vec![0],
+                primary_key_types: vec![DataType::Int(IntType::new())],
+                sequence_field_indices: vec![1],
+                merge_engine: MergeEngine::FirstRow,
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn test_dedup_sorted_indices_keeps_first_row_for_first_row_engine() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new("value", ArrowDataType::Int32, false)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20, 5, 6])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int32Array::from(vec![100, 200, 300, 400])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let sorted_indices = UInt32Array::from(vec![0, 1, 2, 3]);
+
+        let deduped = first_row_writer()
+            .dedup_sorted_indices(&batch, &sorted_indices)
+            .unwrap();
+
+        assert_eq!(deduped, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_dedup_sorted_indices_rejects_partial_update_engine() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let sorted_indices = UInt32Array::from(vec![0, 1]);
+        let writer = KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            KeyValueWriteConfig {
+                table_location: "memory:/kv-partial-update".to_string(),
+                partition_path: String::new(),
+                bucket: 0,
+                schema_id: 0,
+                file_compression: "none".to_string(),
+                file_compression_zstd_level: 0,
+                write_buffer_size: 1024,
+                primary_key_indices: vec![0],
+                primary_key_types: vec![DataType::Int(IntType::new())],
+                sequence_field_indices: vec![1],
+                merge_engine: MergeEngine::PartialUpdate,
+            },
+            0,
+        );
+
+        let err = writer
+            .dedup_sorted_indices(&batch, &sorted_indices)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("merge-engine=partial-update")
+        ));
+    }
 }

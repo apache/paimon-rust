@@ -41,6 +41,31 @@ use std::cmp::Ordering;
 // MergeFunction
 // ---------------------------------------------------------------------------
 
+/// Buffered batches used by the merge reader.
+///
+/// Source batches keep the internal read schema, while materialized batches
+/// already match the merge output schema.
+#[derive(Clone)]
+pub(crate) enum BufferedBatch {
+    Source(RecordBatch),
+    Materialized(RecordBatch),
+}
+
+impl BufferedBatch {
+    fn column_for_output<'a>(
+        &'a self,
+        output_col_idx: usize,
+        source_output_col_indices: &[usize],
+    ) -> &'a dyn arrow_array::Array {
+        match self {
+            Self::Source(batch) => batch
+                .column(source_output_col_indices[output_col_idx])
+                .as_ref(),
+            Self::Materialized(batch) => batch.column(output_col_idx).as_ref(),
+        }
+    }
+}
+
 /// A row reference as an index into the batch buffer.
 pub(crate) struct MergeRow {
     /// Index into the shared batch buffer.
@@ -52,15 +77,56 @@ pub(crate) struct MergeRow {
     pub user_sequences: Vec<Option<i128>>,
 }
 
+impl MergeRow {
+    #[allow(dead_code)]
+    fn source_batch<'a>(
+        &self,
+        batch_buffer: &'a [BufferedBatch],
+    ) -> crate::Result<&'a RecordBatch> {
+        match batch_buffer.get(self.batch_idx) {
+            Some(BufferedBatch::Source(batch)) => Ok(batch),
+            Some(BufferedBatch::Materialized(_)) => Err(Error::UnexpectedError {
+                message: format!(
+                    "Merge row unexpectedly referenced a materialized batch at index {}",
+                    self.batch_idx
+                ),
+                source: None,
+            }),
+            None => Err(Error::UnexpectedError {
+                message: format!(
+                    "Merge row referenced batch index {} outside the current buffer",
+                    self.batch_idx
+                ),
+                source: None,
+            }),
+        }
+    }
+}
+
+/// Merge result for rows sharing the same primary key.
+pub(crate) enum MergeResult {
+    /// Reuse an existing source row from the batch buffer.
+    SourceRow { batch_idx: usize, row_idx: usize },
+    /// Emit a synthesized one-row batch matching the merge output schema.
+    #[allow(dead_code)]
+    MaterializedRow(RecordBatch),
+    /// Omit this key from the output.
+    Omit,
+}
+
 /// Merge function applied to rows sharing the same primary key.
 ///
-/// For deduplicate: returns the single winner (batch_idx, row_idx), or None
-/// if the winning row should be filtered out (e.g. DELETE).
+/// Deduplicate-style engines can keep returning a source row. Future
+/// field-wise engines may instead materialize a new output row.
 pub(crate) trait MergeFunction: Send + Sync {
-    /// Pick the winning row from same-key candidates.
-    /// Returns `Some((batch_idx, row_idx))` of the winner, or `None` if the
-    /// key should be omitted from output (e.g. winner is a DELETE row).
-    fn pick_winner(&self, rows: &[MergeRow]) -> crate::Result<Option<(usize, usize)>>;
+    /// Merge all rows sharing the same key into a final output result.
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult>;
 }
 
 /// Deduplicate merge: keeps the row with the highest sequence.
@@ -72,7 +138,13 @@ pub(crate) trait MergeFunction: Send + Sync {
 pub(crate) struct DeduplicateMergeFunction;
 
 impl MergeFunction for DeduplicateMergeFunction {
-    fn pick_winner(&self, rows: &[MergeRow]) -> crate::Result<Option<(usize, usize)>> {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        _batch_buffer: &[BufferedBatch],
+        _source_output_col_indices: &[usize],
+        _output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
         let winner = rows
             .iter()
             .reduce(|best, r| {
@@ -93,9 +165,12 @@ impl MergeFunction for DeduplicateMergeFunction {
             })
             .expect("merge called with empty rows");
         if RowKind::from_value(winner.value_kind)?.is_add() {
-            Ok(Some((winner.batch_idx, winner.row_idx)))
+            Ok(MergeResult::SourceRow {
+                batch_idx: winner.batch_idx,
+                row_idx: winner.row_idx,
+            })
         } else {
-            Ok(None)
+            Ok(MergeResult::Omit)
         }
     }
 }
@@ -405,8 +480,9 @@ fn sort_merge_stream(
         return Ok(futures::stream::empty().boxed());
     }
 
-    // Output column indices: key columns + value columns (skip _SEQUENCE_NUMBER).
-    let output_col_indices: Vec<usize> = key_indices
+    // Output column indices for source batches: key columns + value columns
+    // (skip system columns like _SEQUENCE_NUMBER).
+    let source_output_col_indices: Vec<usize> = key_indices
         .iter()
         .chain(value_indices.iter())
         .copied()
@@ -440,7 +516,7 @@ fn sort_merge_stream(
         // Each cursor's current batch gets an entry; when a cursor advances
         // to a new batch, the old one stays in the buffer until the output
         // batch is flushed.
-        let mut batch_buffer: Vec<RecordBatch> = Vec::new();
+        let mut batch_buffer: Vec<BufferedBatch> = Vec::new();
         // Map from stream_idx -> current batch_buffer index.
         let mut stream_batch_idx: Vec<Option<usize>> = vec![None; num_streams];
 
@@ -448,7 +524,7 @@ fn sort_merge_stream(
         for (i, cursor) in cursors.iter().enumerate() {
             if let Some(c) = cursor {
                 let idx = batch_buffer.len();
-                batch_buffer.push(c.batch.clone());
+                batch_buffer.push(BufferedBatch::Source(c.batch.clone()));
                 stream_batch_idx[i] = Some(idx);
             }
         }
@@ -508,7 +584,7 @@ fn sort_merge_stream(
                             if batch.num_rows() > 0 {
                                 let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
                                 let buf_idx = batch_buffer.len();
-                                batch_buffer.push(batch.clone());
+                                batch_buffer.push(BufferedBatch::Source(batch.clone()));
                                 stream_batch_idx[current_winner] = Some(buf_idx);
                                 cursors[current_winner] = Some(SortMergeCursor { batch, rows, offset: 0 });
                                 break;
@@ -521,10 +597,36 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
-            // Apply merge function to pick the winner row.
-            // Returns None if the winning row is a DELETE/UPDATE_BEFORE — skip it.
-            if let Some((win_batch_idx, win_row_idx)) = merge_function.pick_winner(&same_key_rows)? {
-                output_indices.push((win_batch_idx, win_row_idx));
+            match merge_function.merge(
+                &same_key_rows,
+                &batch_buffer,
+                &source_output_col_indices,
+                &output_schema,
+            )? {
+                MergeResult::SourceRow { batch_idx, row_idx } => {
+                    output_indices.push((batch_idx, row_idx));
+                }
+                MergeResult::MaterializedRow(batch) => {
+                    if batch.num_rows() != 1 {
+                        Err(Error::UnexpectedError {
+                            message: format!(
+                                "Materialized merge result must contain exactly one row, got {}",
+                                batch.num_rows()
+                            ),
+                            source: None,
+                        })?;
+                    }
+                    if batch.schema().as_ref() != output_schema.as_ref() {
+                        Err(Error::UnexpectedError {
+                            message: "Materialized merge result schema does not match merge output schema".to_string(),
+                            source: None,
+                        })?;
+                    }
+                    let batch_idx = batch_buffer.len();
+                    batch_buffer.push(BufferedBatch::Materialized(batch));
+                    output_indices.push((batch_idx, 0));
+                }
+                MergeResult::Omit => {}
             }
 
             // Yield a batch when we've accumulated enough rows.
@@ -532,13 +634,14 @@ fn sort_merge_stream(
                 let batch = build_output_interleave(
                     &output_schema,
                     &batch_buffer,
-                    &output_col_indices,
+                    &source_output_col_indices,
                     &output_indices,
                 )?;
                 output_indices.clear();
-                // Compact batch buffer: only keep batches still referenced by cursors.
-                // SAFETY: output_indices was just cleared above, so no stale references
-                // exist into the buffer. The yield below happens after compaction.
+                // Compact batch buffer after the pending output rows have been
+                // materialized. Source batches still referenced by cursors stay
+                // alive; materialized batches can be dropped here because they
+                // are referenced only by the flushed output_indices above.
                 compact_batch_buffer(
                     &mut batch_buffer,
                     &mut stream_batch_idx,
@@ -553,7 +656,7 @@ fn sort_merge_stream(
             let batch = build_output_interleave(
                 &output_schema,
                 &batch_buffer,
-                &output_col_indices,
+                &source_output_col_indices,
                 &output_indices,
             )?;
             yield batch;
@@ -566,20 +669,18 @@ fn sort_merge_stream(
 /// batch buffer in one pass per column.
 fn build_output_interleave(
     schema: &SchemaRef,
-    batch_buffer: &[RecordBatch],
-    output_col_indices: &[usize],
+    batch_buffer: &[BufferedBatch],
+    source_output_col_indices: &[usize],
     indices: &[(usize, usize)],
 ) -> crate::Result<RecordBatch> {
-    let columns: Vec<ArrayRef> = output_col_indices
-        .iter()
-        .map(|&col_idx| {
-            // Collect all arrays for this column from the batch buffer.
+    let columns: Vec<ArrayRef> = (0..schema.fields().len())
+        .map(|output_col_idx| {
             let arrays: Vec<&dyn arrow_array::Array> = batch_buffer
                 .iter()
-                .map(|b| b.column(col_idx).as_ref())
+                .map(|batch| batch.column_for_output(output_col_idx, source_output_col_indices))
                 .collect();
             interleave(&arrays, indices).map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to interleave column {col_idx}: {e}"),
+                message: format!("Failed to interleave output column {output_col_idx}: {e}"),
                 source: Some(Box::new(e)),
             })
         })
@@ -594,7 +695,7 @@ fn build_output_interleave(
 /// Compact the batch buffer by removing batches no longer referenced by any
 /// cursor, and updating indices accordingly.
 fn compact_batch_buffer(
-    batch_buffer: &mut Vec<RecordBatch>,
+    batch_buffer: &mut Vec<BufferedBatch>,
     stream_batch_idx: &mut [Option<usize>],
     cursors: &[Option<SortMergeCursor>],
 ) {
@@ -610,7 +711,7 @@ fn compact_batch_buffer(
 
     // Build old->new index mapping.
     let mut new_indices: Vec<Option<usize>> = vec![None; batch_buffer.len()];
-    let mut new_buffer: Vec<RecordBatch> = Vec::new();
+    let mut new_buffer: Vec<BufferedBatch> = Vec::new();
     for (old_idx, is_alive) in alive.iter().enumerate() {
         if *is_alive {
             new_indices[old_idx] = Some(new_buffer.len());
@@ -691,6 +792,41 @@ mod tests {
 
     fn stream_from_batches(batches: Vec<RecordBatch>) -> ArrowRecordBatchStream {
         futures::stream::iter(batches.into_iter().map(Ok)).boxed()
+    }
+
+    struct MaterializingMergeFunction;
+
+    impl MergeFunction for MaterializingMergeFunction {
+        fn merge(
+            &self,
+            rows: &[MergeRow],
+            batch_buffer: &[BufferedBatch],
+            source_output_col_indices: &[usize],
+            output_schema: &SchemaRef,
+        ) -> crate::Result<MergeResult> {
+            let first = rows.first().expect("merge called with empty rows");
+            let source_batch = first.source_batch(batch_buffer)?;
+            let pk = source_batch
+                .column(source_output_col_indices[0])
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("pk column must be Int32")
+                .value(first.row_idx);
+
+            let batch = RecordBatch::try_new(
+                output_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![pk])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![Some("merged")])) as ArrayRef,
+                ],
+            )
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to build materialized merge batch: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+
+            Ok(MergeResult::MaterializedRow(batch))
+        }
     }
 
     #[tokio::test]
@@ -1263,5 +1399,64 @@ mod tests {
 
         assert_eq!(pks, vec![1, 2, 3, 4]);
         assert_eq!(values, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn test_materialized_merge_result_path() {
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2],
+            vec![1, 1],
+            vec![Some("old_a"), Some("old_b")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 3],
+            vec![2, 1],
+            vec![Some("new_a"), Some("c")],
+        )]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(MaterializingMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2, 3]);
+        assert_eq!(values, vec!["merged", "merged", "merged"]);
     }
 }
