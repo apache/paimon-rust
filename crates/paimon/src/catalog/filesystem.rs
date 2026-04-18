@@ -400,19 +400,28 @@ impl Catalog for FileSystemCatalog {
     async fn alter_table(
         &self,
         identifier: &Identifier,
-        _changes: Vec<crate::spec::SchemaChange>,
+        changes: Vec<crate::spec::SchemaChange>,
         ignore_if_not_exists: bool,
     ) -> Result<()> {
-        if !ignore_if_not_exists && !self.table_exists(identifier).await? {
+        let table_path = self.table_path(identifier);
+        if !self.table_exists(identifier).await? {
+            if ignore_if_not_exists {
+                return Ok(());
+            }
             return Err(Error::TableNotExist {
                 full_name: identifier.full_name(),
             });
         }
 
-        // TODO: Implement alter table with schema versioning
-        Err(Error::Unsupported {
-            message: "Alter table is not yet implemented for filesystem catalog".to_string(),
-        })
+        let current = self
+            .load_latest_table_schema(&table_path)
+            .await?
+            .ok_or_else(|| Error::TableNotExist {
+                full_name: identifier.full_name(),
+            })?;
+
+        let new_schema = current.apply_changes(changes)?;
+        self.save_table_schema(&table_path, &new_schema).await
     }
 }
 

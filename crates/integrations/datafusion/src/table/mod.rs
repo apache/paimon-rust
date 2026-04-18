@@ -184,15 +184,11 @@ impl TableProvider for PaimonTableProvider {
             .map_err(to_datafusion_error)?;
 
         let target = state.config_options().execution.target_partitions;
-        // Filter is exact when:
-        // - There's no predicate at all (nothing to filter residually), OR
-        // - There's a predicate that is fully pushed down with no residual
-        let filter_exact = filter_analysis.pushed_predicate.is_none()
-            || (filter_analysis
+        let filter_exact = !filter_analysis.has_untranslated_residual
+            && filter_analysis
                 .pushed_predicate
                 .as_ref()
-                .is_some_and(|p| read_builder.is_exact_filter_pushdown(p))
-                && !filter_analysis.has_untranslated_residual);
+                .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
         PaimonScanBuilder {
             table: &self.table,
             schema: &self.schema,

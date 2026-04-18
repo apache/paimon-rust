@@ -121,15 +121,12 @@ async fn test_count_star_no_filter_pushes_down() {
         .await
         .unwrap();
 
-    let plan = verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) should push down (no filter)");
 
     let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 3, "COUNT(*) should return 3");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*):\n{plan_str}");
 }
 
 // ============================================================================
@@ -203,30 +200,6 @@ async fn test_count_star_with_non_partition_equality_does_not_push_down() {
 }
 
 // ============================================================================
-// Test: Verify COUNT(*) returns correct value after pushdown
-// ============================================================================
-
-#[tokio::test]
-async fn test_count_star_pushdown_returns_correct_value() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
-
-    handler
-        .sql("INSERT INTO paimon.test_db.t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
-        .await
-        .expect("COUNT(*) should push down");
-
-    let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
-    assert_eq!(count, 5, "COUNT(*) should return 5");
-}
-
-// ============================================================================
 // Test: COUNT(*) on table with single row should push down
 // ============================================================================
 
@@ -242,15 +215,12 @@ async fn test_count_star_single_row_pushes_down() {
         .await
         .unwrap();
 
-    let plan = verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) should push down");
 
     let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 1, "COUNT(*) should return 1");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*) on single row table:\n{plan_str}");
 }
 
 // ============================================================================
@@ -261,15 +231,12 @@ async fn test_count_star_single_row_pushes_down() {
 async fn test_count_star_empty_table_pushes_down() {
     let (_tmp, handler) = setup_table("(id INT, value INT)").await;
 
-    let plan = verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) on empty table should push down");
 
     let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 0, "COUNT(*) should return 0");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*) on empty table:\n{plan_str}");
 }
 
 // ============================================================================
@@ -289,7 +256,7 @@ async fn test_count_star_with_partition_filter_pushes_down() {
         .await
         .unwrap();
 
-    let plan = verify_count_pushdown(
+    verify_count_pushdown(
         &handler,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt = '2024-01-01'",
     )
@@ -302,9 +269,6 @@ async fn test_count_star_with_partition_filter_pushes_down() {
     )
     .await;
     assert_eq!(count, 2, "COUNT(*) should return 2");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*) with partition filter:\n{plan_str}");
 }
 
 // ============================================================================
@@ -360,7 +324,7 @@ async fn test_count_star_with_partition_in_filter_pushes_down() {
         .await
         .unwrap();
 
-    let plan = verify_count_pushdown(
+    verify_count_pushdown(
         &handler,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt IN ('2024-01-01', '2024-01-02')",
     )
@@ -373,9 +337,6 @@ async fn test_count_star_with_partition_in_filter_pushes_down() {
     )
     .await;
     assert_eq!(count, 2, "COUNT(*) should return 2");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*) with partition IN filter:\n{plan_str}");
 }
 
 // ============================================================================
@@ -395,13 +356,10 @@ async fn test_count_star_partitioned_no_filter_pushes_down() {
         .await
         .unwrap();
 
-    let plan = verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) without filter should push down");
 
     let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 2, "COUNT(*) should return 2");
-
-    let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-    eprintln!("Physical plan for COUNT(*) on partitioned table:\n{plan_str}");
 }

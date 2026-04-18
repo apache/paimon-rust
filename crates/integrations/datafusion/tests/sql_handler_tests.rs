@@ -163,7 +163,7 @@ async fn test_create_table_with_blob_type() {
                 id INT NOT NULL,
                 payload BLOB,
                 PRIMARY KEY (id)
-            )",
+            ) WITH ('data-evolution.enabled' = 'true')",
         )
         .await
         .expect("CREATE TABLE with BLOB should succeed");
@@ -446,14 +446,16 @@ async fn test_alter_table_add_column() {
         .sql("ALTER TABLE paimon.mydb.alter_test ADD COLUMN age INT")
         .await;
 
-    // FileSystemCatalog returns Unsupported for alter_table, which is expected
+    // FileSystemCatalog does not support AddColumn schema change yet
     assert!(
         result.is_err(),
-        "ALTER TABLE should fail because FileSystemCatalog does not implement alter_table yet"
+        "ALTER TABLE ADD COLUMN should fail because AddColumn is not yet supported"
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet implemented") || err_msg.contains("Unsupported"),
+        err_msg.contains("not yet implemented")
+            || err_msg.contains("Unsupported")
+            || err_msg.contains("not yet supported"),
         "Error should indicate alter_table is not implemented, got: {err_msg}"
     );
 }
