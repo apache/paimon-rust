@@ -24,11 +24,13 @@
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
 use super::data_file_reader::DataFileReader;
-use super::sort_merge::{DeduplicateMergeFunction, SortMergeReaderBuilder};
+use super::sort_merge::{
+    DeduplicateMergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
+};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataType as PaimonDataType, Predicate, TinyIntType,
+    BigIntType, DataField, DataType as PaimonDataType, MergeEngine, Predicate, TinyIntType,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
@@ -55,6 +57,7 @@ pub(crate) struct KeyValueReadConfig {
     pub read_type: Vec<DataField>,
     pub predicates: Vec<Predicate>,
     pub primary_keys: Vec<String>,
+    pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
 }
 
@@ -252,9 +255,8 @@ impl KeyValueFileReader {
                     .data_deletion_files()
                     .is_some_and(|files| files.iter().any(Option::is_some))
                 {
-                    Err(Error::UnexpectedError {
+                    Err(Error::Unsupported {
                         message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                        source: None,
                     })?;
                 }
 
@@ -303,7 +305,13 @@ impl KeyValueFileReader {
                     user_sequence_indices.clone(),
                     value_indices.clone(),
                     merge_output_schema.clone(),
-                    Box::new(DeduplicateMergeFunction),
+                    match self.config.merge_engine {
+                        MergeEngine::Deduplicate => Box::new(DeduplicateMergeFunction),
+                        MergeEngine::PartialUpdate => Box::new(PartialUpdateMergeFunction),
+                        MergeEngine::FirstRow => Err(Error::Unsupported {
+                            message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
+                        })?,
+                    },
                 )
                 .build()?;
 

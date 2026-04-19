@@ -29,7 +29,7 @@
 use crate::spec::RowKind;
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
-use arrow_array::{ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
 use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::SchemaRef;
 use arrow_select::interleave::interleave;
@@ -137,6 +137,16 @@ pub(crate) trait MergeFunction: Send + Sync {
 /// Filters out DELETE and UPDATE_BEFORE rows.
 pub(crate) struct DeduplicateMergeFunction;
 
+fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
+    match (lhs.user_sequences.is_empty(), rhs.user_sequences.is_empty()) {
+        (false, false) => lhs
+            .user_sequences
+            .cmp(&rhs.user_sequences)
+            .then_with(|| lhs.sequence_number.cmp(&rhs.sequence_number)),
+        _ => lhs.sequence_number.cmp(&rhs.sequence_number),
+    }
+}
+
 impl MergeFunction for DeduplicateMergeFunction {
     fn merge(
         &self,
@@ -148,14 +158,7 @@ impl MergeFunction for DeduplicateMergeFunction {
         let winner = rows
             .iter()
             .reduce(|best, r| {
-                // Compare user sequences lexicographically first (if present), then system sequence.
-                let ord = match (r.user_sequences.is_empty(), best.user_sequences.is_empty()) {
-                    (false, false) => r
-                        .user_sequences
-                        .cmp(&best.user_sequences)
-                        .then_with(|| r.sequence_number.cmp(&best.sequence_number)),
-                    _ => r.sequence_number.cmp(&best.sequence_number),
-                };
+                let ord = compare_sequence_order(r, best);
                 // >= semantics: last-writer-wins for equal values.
                 if ord.is_ge() {
                     r
@@ -172,6 +175,89 @@ impl MergeFunction for DeduplicateMergeFunction {
         } else {
             Ok(MergeResult::Omit)
         }
+    }
+}
+
+/// Basic partial-update merge: for each non-key column, keep the latest
+/// non-null value ordered by user sequence (if configured) then system sequence.
+///
+/// DELETE / UPDATE_BEFORE rows are treated as unsupported in this mode.
+pub(crate) struct PartialUpdateMergeFunction;
+
+impl MergeFunction for PartialUpdateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if rows.is_empty() {
+            return Err(Error::UnexpectedError {
+                message: "merge called with empty rows".to_string(),
+                source: None,
+            });
+        }
+
+        let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
+        ordered_row_indices.sort_by(|&lhs_idx, &rhs_idx| {
+            compare_sequence_order(&rows[lhs_idx], &rows[rhs_idx])
+                .then_with(|| lhs_idx.cmp(&rhs_idx))
+        });
+
+        let mut latest_non_null_by_col: Vec<Option<(usize, usize)>> =
+            vec![None; output_schema.fields().len()];
+
+        for row_idx in ordered_row_indices {
+            let row = &rows[row_idx];
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                return Err(crate::Error::Unsupported {
+                    message: "merge-engine=partial-update basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
+                });
+            }
+
+            for (output_col_idx, latest_non_null) in latest_non_null_by_col.iter_mut().enumerate() {
+                let source_array = batch_buffer[row.batch_idx]
+                    .column_for_output(output_col_idx, source_output_col_indices);
+                if !source_array.is_null(row.row_idx) {
+                    *latest_non_null = Some((row.batch_idx, row.row_idx));
+                }
+            }
+        }
+
+        let output_columns: Vec<ArrayRef> = output_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(output_col_idx, field)| {
+                Ok(match latest_non_null_by_col[output_col_idx] {
+                    Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
+                        .column_for_output(output_col_idx, source_output_col_indices)
+                        .slice(row_idx, 1),
+                    None => {
+                        if !field.is_nullable() {
+                            return Err(Error::DataInvalid {
+                                message: format!(
+                                    "merge-engine=partial-update produced NULL for non-nullable field '{}'",
+                                    field.name()
+                                ),
+                                source: None,
+                            });
+                        }
+                        new_null_array(field.data_type(), 1)
+                    }
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build partial-update materialized row: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?;
+
+        Ok(MergeResult::MaterializedRow(batch))
     }
 }
 
@@ -1458,5 +1544,148 @@ mod tests {
 
         assert_eq!(pks, vec![1, 2, 3]);
         assert_eq!(values, vec!["merged", "merged", "merged"]);
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_keeps_latest_non_null_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec![Some("old-1"), Some("old-2")])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![2, 2, 1])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![None, Some(200), Some(30)])),
+                Arc::new(StringArray::from(vec![Some("new-1"), None, None])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let mut rows: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+        for batch in &result {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ints = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let strs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(i),
+                    if ints.is_null(i) {
+                        None
+                    } else {
+                        Some(ints.value(i))
+                    },
+                    if strs.is_null(i) {
+                        None
+                    } else {
+                        Some(strs.value(i).to_string())
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some(10), Some("new-1".to_string())),
+                (2, Some(200), Some("old-2".to_string())),
+                (3, Some(30), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_rejects_delete_like_rows() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+
+        let err = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { message }
+            if message.contains("partial-update basic mode does not support DELETE or UPDATE_BEFORE")
+        ));
     }
 }

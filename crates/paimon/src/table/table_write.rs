@@ -129,8 +129,18 @@ impl TableWrite {
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
         let table_name = table.identifier().full_name();
-        PartialUpdateConfig::new(schema.options())
-            .ensure_write_supported(has_primary_keys, &table_name)?;
+        let partial_update_mode = PartialUpdateConfig::new(schema.options())
+            .validate_runtime_mode(has_primary_keys, &table_name)?;
+        if partial_update_mode.is_some() && core_options.deletion_vectors_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "TableWrite does not support merge-engine=partial-update with deletion-vectors.enabled=true yet".to_string(),
+            });
+        }
+        if partial_update_mode.is_some() && total_buckets == -1 {
+            return Err(crate::Error::Unsupported {
+                message: "TableWrite does not support merge-engine=partial-update with bucket=-1 yet; currently only fixed-bucket partial-update is supported".to_string(),
+            });
+        }
         let is_dynamic_bucket = has_primary_keys && total_buckets == -1;
 
         let is_cross_partition = is_dynamic_bucket && !schema.partition_keys().is_empty() && {
@@ -824,11 +834,34 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_partial_update_primary_key_table() {
+    fn test_allows_partial_update_fixed_bucket_table() {
         let table = Table::new(
             test_file_io(),
             Identifier::new("default", "test_partial_update_table"),
             "memory:/test_partial_update_table".to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option("merge-engine", "partial-update")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+    }
+
+    #[test]
+    fn test_rejects_partial_update_dynamic_bucket_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_partial_update_dynamic_bucket_table"),
+            "memory:/test_partial_update_dynamic_bucket_table".to_string(),
             TableSchema::new(
                 0,
                 &Schema::builder()
@@ -846,7 +879,36 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("partial-update writes are not implemented yet"))
+            matches!(err, crate::Error::Unsupported { message } if message.contains("bucket=-1"))
+        );
+    }
+
+    #[test]
+    fn test_rejects_partial_update_with_deletion_vectors() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_partial_update_dv_table"),
+            "memory:/test_partial_update_dv_table".to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option("merge-engine", "partial-update")
+                    .option("deletion-vectors.enabled", "true")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let err = TableWrite::new(&table, "test-user".to_string(), false)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("deletion-vectors.enabled=true"))
         );
     }
 

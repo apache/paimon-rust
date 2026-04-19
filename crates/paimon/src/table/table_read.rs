@@ -21,7 +21,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::spec::{CoreOptions, DataField, PartialUpdateConfig, Predicate};
+use crate::spec::{CoreOptions, DataField, MergeEngine, PartialUpdateConfig, Predicate};
 use crate::DataSplit;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -75,19 +75,40 @@ impl<'a> TableRead<'a> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let table_name = self.table.identifier().full_name();
         PartialUpdateConfig::new(self.table.schema().options())
-            .ensure_read_supported(has_primary_keys, &table_name)?;
+            .validate_runtime_mode(has_primary_keys, &table_name)?;
         let core_options = CoreOptions::new(self.table.schema.options());
+        let merge_engine = core_options.merge_engine()?;
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+
+        if has_primary_keys
+            && merge_engine == MergeEngine::PartialUpdate
+            && deletion_vectors_enabled
+        {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Table '{table_name}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet"
+                ),
+            });
+        }
 
         // PK table with Deduplicate engine: splits containing level-0 files
         // need KeyValueFileReader for sort-merge dedup; splits with only
         // compacted files (level > 0) can use the faster DataFileReader.
         // FirstRow engine falls through — scan already skips level-0.
-        if has_primary_keys
-            && core_options
-                .merge_engine()
-                .is_ok_and(|e| e == crate::spec::MergeEngine::Deduplicate)
-        {
-            return self.read_pk_deduplicate(data_splits, &core_options);
+        if has_primary_keys {
+            return match merge_engine {
+                MergeEngine::Deduplicate => self.read_pk_deduplicate(data_splits, &core_options),
+                MergeEngine::PartialUpdate => {
+                    self.read_pk_partial_update(data_splits, &core_options)
+                }
+                MergeEngine::FirstRow => {
+                    if core_options.data_evolution_enabled() {
+                        self.read_with_evolution(data_splits)
+                    } else {
+                        self.read_raw(data_splits)
+                    }
+                }
+            };
         }
 
         if core_options.data_evolution_enabled() {
@@ -128,6 +149,18 @@ impl<'a> TableRead<'a> {
         ])))
     }
 
+    /// Read PK table with PartialUpdate engine via KeyValueFileReader.
+    ///
+    /// Unlike Deduplicate, partial-update rows cannot be safely treated as raw
+    /// rows, so all splits go through the merge reader.
+    fn read_pk_partial_update(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_kv(data_splits, core_options)
+    }
+
     /// Read splits via KeyValueFileReader (sort-merge dedup).
     fn read_kv(
         &self,
@@ -143,6 +176,7 @@ impl<'a> TableRead<'a> {
                 read_type: self.read_type().to_vec(),
                 predicates: self.data_predicates.clone(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
                     .sequence_fields()
                     .iter()

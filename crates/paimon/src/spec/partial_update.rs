@@ -87,42 +87,6 @@ impl<'a> PartialUpdateConfig<'a> {
         }
     }
 
-    pub(crate) fn ensure_read_supported(
-        &self,
-        has_primary_keys: bool,
-        table_name: &str,
-    ) -> crate::Result<()> {
-        if self
-            .validate_runtime_mode(has_primary_keys, table_name)?
-            .is_some()
-        {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Table '{table_name}' uses merge-engine=partial-update, but primary-key partial-update reads are not implemented yet"
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn ensure_write_supported(
-        &self,
-        has_primary_keys: bool,
-        table_name: &str,
-    ) -> crate::Result<()> {
-        if self
-            .validate_runtime_mode(has_primary_keys, table_name)?
-            .is_some()
-        {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Table '{table_name}' uses merge-engine=partial-update, but primary-key partial-update writes are not implemented yet"
-                ),
-            });
-        }
-        Ok(())
-    }
-
     fn validated_mode(
         &self,
         has_primary_keys: bool,

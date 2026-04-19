@@ -24,7 +24,7 @@ use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_
 use super::table_read::TableRead;
 use super::{Table, TableScan};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::spec::{CoreOptions, DataField, PartialUpdateConfig, Predicate};
+use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -231,9 +231,6 @@ impl<'a> ReadBuilder<'a> {
             None => self.table.schema.fields().to_vec(),
             Some(projected) => self.resolve_projected_fields(projected)?,
         };
-        let table_name = self.table.identifier().full_name();
-        PartialUpdateConfig::new(self.table.schema().options())
-            .ensure_read_supported(!self.table.schema().primary_keys().is_empty(), &table_name)?;
 
         Ok(TableRead::new(
             self.table,
@@ -341,7 +338,7 @@ mod tests {
         )
     }
 
-    fn partial_update_pk_table() -> Table {
+    fn partial_update_dv_pk_table() -> Table {
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
             0,
@@ -350,13 +347,14 @@ mod tests {
                 .column("value", DataType::Int(IntType::new()))
                 .primary_key(["id"])
                 .option("merge-engine", "partial-update")
+                .option("deletion-vectors.enabled", "true")
                 .build()
                 .unwrap(),
         );
         Table::new(
             file_io,
-            Identifier::new("default", "partial_update_t"),
-            "/tmp/test-partial-update-read-builder".to_string(),
+            Identifier::new("default", "partial_update_dv_t"),
+            "/tmp/test-partial-update-dv-read-builder".to_string(),
             table_schema,
             None,
         )
@@ -721,30 +719,18 @@ mod tests {
     }
 
     #[test]
-    fn test_new_read_rejects_partial_update_primary_key_table() {
-        let table = partial_update_pk_table();
-        let builder = table.new_read_builder();
-        let err = builder.new_read().unwrap_err();
-
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("partial-update reads are not implemented yet")),
-            "expected read builder to fail fast for PK partial-update tables, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_direct_table_read_rejects_partial_update_primary_key_table() {
-        let table = partial_update_pk_table();
+    fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
+        let table = partial_update_dv_pk_table();
         let err = match TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
             .to_arrow(&[])
         {
-            Ok(_) => panic!("direct TableRead should fail fast for PK partial-update tables"),
+            Ok(_) => panic!("partial-update+DV read should fail fast"),
             Err(err) => err,
         };
 
         assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("partial-update reads are not implemented yet")),
-            "expected direct table read to fail fast for PK partial-update tables, got {err:?}"
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
+            "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
         );
     }
 }
