@@ -31,6 +31,8 @@ pub struct CommitMessage {
     pub new_files: Vec<DataFileMeta>,
     /// New index files to be added (used by dynamic bucket mode).
     pub new_index_files: Vec<IndexFileMeta>,
+    /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
+    pub deleted_files: Vec<DataFileMeta>,
 }
 
 impl CommitMessage {
@@ -40,6 +42,7 @@ impl CommitMessage {
             bucket,
             new_files,
             new_index_files: Vec::new(),
+            deleted_files: Vec::new(),
         }
     }
 }

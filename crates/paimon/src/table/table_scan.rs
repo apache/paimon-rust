@@ -21,6 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::bucket_filter::compute_target_buckets;
+use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
     data_evolution_group_matches_predicates, data_file_matches_predicates,
     data_file_matches_predicates_for_table, group_by_overlapping_row_id, FileStatsRows,
@@ -28,11 +29,9 @@ use super::stats_filter::{
 };
 use super::Table;
 use crate::io::FileIO;
-use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
-    bucket_dir_name, eval_row, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind,
-    IndexManifest, ManifestEntry, ManifestFileMeta, PartitionComputer, Predicate, Snapshot,
-    TimeTravelSelector,
+    bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind, IndexManifest,
+    ManifestEntry, PartitionComputer, Predicate, Snapshot, TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -71,59 +70,6 @@ async fn read_manifest_list(
     crate::spec::from_avro_bytes::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
-/// Check whether a manifest file *may* contain entries matching the partition predicate,
-/// using the manifest-level partition stats (min/max over all entries in the manifest).
-///
-/// The `predicate` must already be projected to partition-field indices.
-fn manifest_file_matches_partition_predicate(
-    meta: &ManifestFileMeta,
-    predicate: &Predicate,
-    partition_fields: &[DataField],
-) -> bool {
-    let stats = meta.partition_stats();
-
-    let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
-    let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
-    let null_counts = stats.null_counts().clone();
-
-    let file_stats = FileStatsRows::for_manifest_partition(
-        meta.num_added_files() + meta.num_deleted_files(),
-        min_values,
-        max_values,
-        null_counts,
-    );
-
-    manifest_partition_predicate_may_match(predicate, &file_stats, partition_fields)
-}
-
-fn manifest_partition_predicate_may_match(
-    predicate: &Predicate,
-    stats: &FileStatsRows,
-    partition_fields: &[DataField],
-) -> bool {
-    match predicate {
-        Predicate::AlwaysTrue => true,
-        Predicate::AlwaysFalse => false,
-        Predicate::And(children) => children
-            .iter()
-            .all(|child| manifest_partition_predicate_may_match(child, stats, partition_fields)),
-        Predicate::Or(_) | Predicate::Not(_) => true,
-        Predicate::Leaf {
-            index,
-            data_type,
-            op,
-            literals,
-            ..
-        } => {
-            let stats_data_type = match partition_fields.get(*index) {
-                Some(f) => f.data_type(),
-                None => return true,
-            };
-            data_leaf_may_match(*index, stats_data_type, data_type, *op, literals, stats)
-        }
-    }
-}
-
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
 /// Applies filters during concurrent manifest reading to reduce entries early:
 /// - Manifest-file-level partition stats pruning (skip entire manifest files)
@@ -138,7 +84,7 @@ async fn read_all_manifest_entries(
     skip_level_zero: bool,
     scan_all_files: bool,
     has_primary_keys: bool,
-    partition_predicate: Option<&Predicate>,
+    partition_filter: Option<&PartitionFilter>,
     partition_fields: &[DataField],
     data_predicates: &[Predicate],
     current_schema_id: i64,
@@ -153,10 +99,20 @@ async fn read_all_manifest_entries(
 
     // Manifest-file-level partition stats pruning: skip entire manifest files
     // whose partition range doesn't overlap the partition predicate.
-    if let Some(pred) = partition_predicate {
+    if let Some(pf) = partition_filter {
         if !partition_fields.is_empty() {
             manifest_files.retain(|meta| {
-                manifest_file_matches_partition_predicate(meta, pred, partition_fields)
+                let stats = meta.partition_stats();
+                let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
+                let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
+                let null_counts = stats.null_counts().clone();
+                let file_stats = FileStatsRows::for_manifest_partition(
+                    meta.num_added_files() + meta.num_deleted_files(),
+                    min_values,
+                    max_values,
+                    null_counts,
+                );
+                pf.matches_manifest(&file_stats, partition_fields)
             });
         }
     }
@@ -189,8 +145,8 @@ async fn read_all_manifest_entries(
                                 }
                             }
                         }
-                        if let Some(pred) = partition_predicate {
-                            match partition_matches_predicate(entry.partition(), pred) {
+                        if let Some(pf) = partition_filter {
+                            match pf.matches_entry(entry.partition()) {
                                 Ok(false) => return false,
                                 Ok(true) => {}
                                 Err(_) => {}
@@ -283,20 +239,6 @@ fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
         .collect()
 }
 
-/// Evaluate a partition predicate against serialized manifest partition bytes.
-///
-/// - `BinaryRow::from_serialized_bytes` failure → fail-open (`Ok(true)`)
-/// - `eval_row` failure → fail-fast (`Err(_)`)
-fn partition_matches_predicate(
-    serialized_partition: &[u8],
-    predicate: &Predicate,
-) -> crate::Result<bool> {
-    match BinaryRow::from_serialized_bytes(serialized_partition) {
-        Ok(row) => eval_row(predicate, &row),
-        Err(_) => Ok(true),
-    }
-}
-
 /// Whether scan-owned pruning still preserves `merged_row_count()` as a safe
 /// row-count hint.
 ///
@@ -315,7 +257,7 @@ pub(super) fn can_push_down_limit_hint_for_scan(
 #[derive(Debug, Clone)]
 pub struct TableScan<'a> {
     table: &'a Table,
-    partition_predicate: Option<Predicate>,
+    partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
     bucket_predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return.
@@ -329,9 +271,9 @@ pub struct TableScan<'a> {
 }
 
 impl<'a> TableScan<'a> {
-    pub fn new(
+    pub(crate) fn new(
         table: &'a Table,
-        partition_predicate: Option<Predicate>,
+        partition_filter: Option<PartitionFilter>,
         data_predicates: Vec<Predicate>,
         bucket_predicate: Option<Predicate>,
         limit: Option<usize>,
@@ -339,7 +281,7 @@ impl<'a> TableScan<'a> {
     ) -> Self {
         Self {
             table,
-            partition_predicate,
+            partition_filter,
             data_predicates,
             bucket_predicate,
             limit,
@@ -549,7 +491,7 @@ impl<'a> TableScan<'a> {
             skip_level_zero,
             self.scan_all_files,
             has_primary_keys,
-            self.partition_predicate.as_ref(),
+            self.partition_filter.as_ref(),
             &partition_fields,
             pushdown_data_predicates,
             self.table.schema().id(),
@@ -804,7 +746,7 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{partition_matches_predicate, TableScan};
+    use super::TableScan;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
@@ -814,6 +756,7 @@ mod tests {
         VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
+    use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
     use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
     use crate::table::Table;
@@ -1022,16 +965,19 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_matches_predicate_decode_failure_fails_open() {
-        let predicate = PredicateBuilder::new(&partition_string_field())
+    fn test_partition_filter_decode_failure_fails_open() {
+        let fields = partition_string_field();
+        let predicate = PredicateBuilder::new(&fields)
             .equal("dt", Datum::String("2024-01-01".into()))
             .unwrap();
 
-        assert!(partition_matches_predicate(&[0xFF, 0x00], &predicate).unwrap());
+        // Range predicate to force Predicate variant (fail-open path)
+        let filter = PartitionFilter::Predicate(predicate);
+        assert!(filter.matches_entry(&[0xFF, 0x00]).unwrap());
     }
 
     #[test]
-    fn test_partition_matches_predicate_eval_error_fails_fast() {
+    fn test_partition_filter_eval_error_fails_fast() {
         let mut builder = BinaryRowBuilder::new(1);
         builder.write_string(0, "2024-01-01");
         let serialized = builder.build_serialized();
@@ -1044,7 +990,9 @@ mod tests {
             literals: vec![Datum::Int(42)],
         };
 
-        let err = partition_matches_predicate(&serialized, &predicate)
+        let filter = PartitionFilter::Predicate(predicate);
+        let err = filter
+            .matches_entry(&serialized)
             .expect_err("eval_row error should propagate");
 
         assert!(

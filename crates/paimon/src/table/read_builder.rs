@@ -21,6 +21,7 @@
 //! and [TypeUtils.project](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/utils/TypeUtils.java).
 
 use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_predicates};
+use super::partition_filter::PartitionFilter;
 use super::table_read::TableRead;
 use super::{Table, TableScan};
 use crate::arrow::filtering::reader_pruning_predicates;
@@ -215,9 +216,12 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
+        let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
+            PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
+        });
         TableScan::new(
             self.table,
-            self.filter.partition_predicate.clone(),
+            partition_filter,
             self.filter.data_predicates.clone(),
             self.filter.bucket_predicate.clone(),
             self.limit,

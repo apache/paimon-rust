@@ -64,6 +64,7 @@ pub use types::*;
 mod partition_utils;
 pub(crate) use partition_utils::PartitionComputer;
 mod predicate;
+pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
 pub(crate) use predicate::extract_datum;
 pub use predicate::{

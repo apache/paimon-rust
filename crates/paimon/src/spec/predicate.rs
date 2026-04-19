@@ -117,7 +117,7 @@ fn datum_eq(lhs: &Datum, rhs: &Datum) -> bool {
     datum_cmp(lhs, rhs) == Some(Ordering::Equal)
 }
 
-fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
+pub(crate) fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
     match (lhs, rhs) {
         (Datum::Bool(a), Datum::Bool(b)) => a.partial_cmp(b),
         (Datum::TinyInt(a), Datum::TinyInt(b)) => a.partial_cmp(b),

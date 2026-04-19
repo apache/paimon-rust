@@ -38,8 +38,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, HiveDistributionStyle, Merge,
-    ObjectName, RenameTableNameKind, SqlOption, Statement, TableFactor, Update,
+    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, FromTable,
+    HiveDistributionStyle, Merge, ObjectName, RenameTableNameKind, SqlOption, Statement,
+    TableFactor, Update,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -113,6 +114,7 @@ impl PaimonSqlHandler {
             }
             Statement::Merge(merge) => self.handle_merge_into(merge).await,
             Statement::Update(update) => self.handle_update(update).await,
+            Statement::Delete(delete) => self.handle_delete(delete).await,
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -299,6 +301,34 @@ impl PaimonSqlHandler {
             .map_err(to_datafusion_error)?;
 
         crate::update::execute_update(&self.ctx, update, table).await
+    }
+
+    async fn handle_delete(&self, delete: &Delete) -> DFResult<DataFrame> {
+        let tables = match &delete.from {
+            FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+        };
+        let table_factor = tables
+            .first()
+            .map(|t| &t.relation)
+            .ok_or_else(|| DataFusionError::Plan("DELETE requires a target table".to_string()))?;
+        let table_name = match table_factor {
+            TableFactor::Table { name, .. } => name.clone(),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported target table in DELETE: {other}"
+                )))
+            }
+        };
+        let identifier = self.resolve_table_name(&table_name)?;
+
+        let table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        let table_ref = table_name.to_string();
+        crate::delete::execute_delete(&self.ctx, delete, table, &table_ref).await
     }
 
     /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
