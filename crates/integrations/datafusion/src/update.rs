@@ -28,7 +28,7 @@ use datafusion::arrow::array::{Array, RecordBatch};
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion::sql::sqlparser::ast::{AssignmentTarget, Update};
+use datafusion::sql::sqlparser::ast::{AssignmentTarget, TableFactor, Update};
 
 use paimon::spec::CoreOptions;
 use paimon::table::{CopyOnWriteMergeWriter, DataEvolutionWriter, Table};
@@ -36,8 +36,8 @@ use paimon::table::{CopyOnWriteMergeWriter, DataEvolutionWriter, Table};
 use crate::error::to_datafusion_error;
 use crate::merge_into::{
     build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
-    is_row_id_conflict, ok_result, project_update_columns, register_cow_target_table,
-    retry_on_conflict,
+    is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
+    register_cow_target_table, retry_on_conflict,
 };
 
 /// Execute an UPDATE statement on a Paimon table.
@@ -50,6 +50,13 @@ pub(crate) async fn execute_update(
     update: &Update,
     table: Table,
 ) -> DFResult<DataFrame> {
+    if let TableFactor::Table { alias: Some(a), .. } = &update.table.relation {
+        return Err(DataFusionError::Plan(format!(
+            "Table alias '{}' in UPDATE is not yet supported",
+            a.name.value
+        )));
+    }
+
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
 
@@ -116,14 +123,12 @@ async fn execute_update_once(
     // 3. Query the target table directly with WHERE filter.
     let table_ref = update.table.to_string();
 
-    let select_parts: Vec<String> = std::iter::once("\"_ROW_ID\"".to_string())
-        .chain(
-            columns
-                .iter()
-                .zip(exprs.iter())
-                .map(|(col, expr)| format!("{expr} AS \"__upd_{col}\"")),
-        )
-        .collect();
+    let select_parts: Vec<String> =
+        std::iter::once("\"_ROW_ID\"".to_string())
+            .chain(columns.iter().zip(exprs.iter()).map(|(col, expr)| {
+                format!("{expr} AS {}", quote_identifier(&format!("__upd_{col}")))
+            }))
+            .collect();
 
     let select_clause = select_parts.join(", ");
     let where_clause = match &update.selection {
@@ -190,14 +195,21 @@ async fn execute_cow_update_once(
         .await
         .map_err(to_datafusion_error)?;
 
-    let (has_data, cow_table_name) = register_cow_target_table(ctx, table, &writer).await?;
+    let (has_data, cow_table_guard) = register_cow_target_table(ctx, table, &writer).await?;
     if !has_data {
         return ok_result(ctx, 0);
     }
 
-    let result =
-        execute_cow_update_inner(ctx, &columns, &exprs, &cow_table_name, update, &mut writer).await;
-    let _ = ctx.deregister_table(&cow_table_name);
+    let result = execute_cow_update_inner(
+        ctx,
+        &columns,
+        &exprs,
+        cow_table_guard.name(),
+        update,
+        &mut writer,
+    )
+    .await;
+    drop(cow_table_guard);
     let total_count = result?;
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
@@ -217,15 +229,13 @@ async fn execute_cow_update_inner(
     update: &Update,
     writer: &mut CopyOnWriteMergeWriter,
 ) -> DFResult<u64> {
-    let select_parts: Vec<String> = std::iter::once("\"__paimon_file_idx\"".to_string())
-        .chain(std::iter::once("\"__paimon_row_offset\"".to_string()))
-        .chain(
-            columns
-                .iter()
-                .zip(exprs.iter())
-                .map(|(col, expr)| format!("{expr} AS \"__upd_{col}\"")),
-        )
-        .collect();
+    let select_parts: Vec<String> =
+        std::iter::once("\"__paimon_file_idx\"".to_string())
+            .chain(std::iter::once("\"__paimon_row_offset\"".to_string()))
+            .chain(columns.iter().zip(exprs.iter()).map(|(col, expr)| {
+                format!("{expr} AS {}", quote_identifier(&format!("__upd_{col}")))
+            }))
+            .collect();
 
     let select_clause = select_parts.join(", ");
     let where_clause = match &update.selection {

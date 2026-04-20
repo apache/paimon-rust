@@ -21,7 +21,7 @@
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion::sql::sqlparser::ast::Delete;
+use datafusion::sql::sqlparser::ast::{Delete, FromTable, TableFactor};
 
 use paimon::spec::CoreOptions;
 use paimon::table::{CopyOnWriteMergeWriter, Table};
@@ -42,6 +42,18 @@ pub(crate) async fn execute_delete(
     table: Table,
     table_ref: &str,
 ) -> DFResult<DataFrame> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+    };
+    if let Some(first) = tables.first() {
+        if let TableFactor::Table { alias: Some(a), .. } = &first.relation {
+            return Err(DataFusionError::Plan(format!(
+                "Table alias '{}' in DELETE is not yet supported",
+                a.name.value
+            )));
+        }
+    }
+
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
 
@@ -87,13 +99,13 @@ async fn execute_cow_delete_once(
         .await
         .map_err(to_datafusion_error)?;
 
-    let (has_data, cow_table_name) = register_cow_target_table(ctx, table, &writer).await?;
+    let (has_data, cow_table_guard) = register_cow_target_table(ctx, table, &writer).await?;
     if !has_data {
         return ok_result(ctx, 0);
     }
 
-    let result = execute_cow_delete_inner(ctx, &cow_table_name, delete, &mut writer).await;
-    let _ = ctx.deregister_table(&cow_table_name);
+    let result = execute_cow_delete_inner(ctx, cow_table_guard.name(), delete, &mut writer).await;
+    drop(cow_table_guard);
     let total_count = result?;
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;

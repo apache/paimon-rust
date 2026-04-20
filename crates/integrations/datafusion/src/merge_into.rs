@@ -45,11 +45,42 @@ use crate::error::to_datafusion_error;
 /// Maximum number of retries when DML conflicts with concurrent compaction.
 const DML_MAX_RETRIES: u32 = 5;
 
+/// Quote a SQL identifier by wrapping in double-quotes and escaping embedded quotes.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 static COW_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_cow_table_name(prefix: &str) -> String {
     let id = COW_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{id}")
+}
+
+/// RAII guard that deregisters a MemTable from the SessionContext on drop.
+/// Prevents leaks when the future is cancelled between register and deregister.
+pub(crate) struct CowTableGuard {
+    ctx: SessionContext,
+    table_name: String,
+}
+
+impl CowTableGuard {
+    pub(crate) fn new(ctx: &SessionContext, table_name: String) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            table_name,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.table_name
+    }
+}
+
+impl Drop for CowTableGuard {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(&self.table_name);
+    }
 }
 
 /// Retry a DML operation on conflict, using `is_retryable` to detect retryable errors.
@@ -327,7 +358,8 @@ async fn execute_cow_merge_once(
     }
 
     // Read each target file individually, attach __paimon_file_idx and __paimon_row_offset
-    let (has_target_data, cow_target_name) = register_cow_target_table(ctx, table, &writer).await?;
+    let (has_target_data, cow_target_guard) =
+        register_cow_target_table(ctx, table, &writer).await?;
 
     let merge_ctx = CowMergeContext {
         source_ref: &source_ref,
@@ -335,15 +367,13 @@ async fn execute_cow_merge_once(
         t_alias,
         on_condition: &on_condition,
         has_target_data,
-        cow_target_name: &cow_target_name,
+        cow_target_name: cow_target_guard.name(),
         update_columns: &update_columns,
     };
 
     let result = execute_cow_merge_inner(ctx, &clauses, &mut writer, table, &merge_ctx).await;
 
-    if has_target_data {
-        let _ = ctx.deregister_table(&cow_target_name);
-    }
+    drop(cow_target_guard);
 
     let (insert_messages, total_count) = result?;
 
@@ -410,6 +440,8 @@ async fn execute_cow_merge_inner(
             if let Some(ref pred) = mc.predicate {
                 conditions.push(pred.clone());
                 consumed_predicates.push(pred.clone());
+            } else {
+                consumed_predicates.push("TRUE".to_string());
             }
             let where_clause = if conditions.is_empty() {
                 String::new()
@@ -430,10 +462,14 @@ async fn execute_cow_merge_inner(
                         .map(|(c, e)| (c.as_str(), e.as_str()))
                         .collect();
                     for col in update_columns {
+                        let quoted_alias = quote_identifier(&format!("__upd_{col}"));
                         if let Some(expr) = clause_col_map.get(&col.as_str()) {
-                            select_parts.push(format!("{expr} AS \"__upd_{col}\""));
+                            select_parts.push(format!("{expr} AS {quoted_alias}"));
                         } else {
-                            select_parts.push(format!("{t_alias}.\"{col}\" AS \"__upd_{col}\""));
+                            select_parts.push(format!(
+                                "{t_alias}.{} AS {quoted_alias}",
+                                quote_identifier(col)
+                            ));
                         }
                     }
                     let select_clause = select_parts.join(", ");
@@ -606,7 +642,10 @@ async fn execute_merge_into_once(
     // Add update expressions (prefixed to avoid collisions)
     if let Some(ref upd) = parsed.update {
         for (col, expr) in upd.columns.iter().zip(upd.exprs.iter()) {
-            select_parts.push(format!("{expr} AS \"__upd_{col}\""));
+            select_parts.push(format!(
+                "{expr} AS {}",
+                quote_identifier(&format!("__upd_{col}"))
+            ));
         }
     }
 
@@ -795,11 +834,9 @@ async fn build_insert_batches(
     let mem_table = MemTable::try_new(first_schema, vec![source_batches])?;
     let tmp_name = next_cow_table_name("__merge_not_matched");
     ctx.register_table(&tmp_name, Arc::new(mem_table))?;
+    let _guard = CowTableGuard::new(ctx, tmp_name.clone());
 
     let result = build_insert_batches_inner(ctx, inserts, s_alias, &tmp_name, table_fields).await;
-
-    // Always clean up temp table, even on error
-    let _ = ctx.deregister_table(&tmp_name);
 
     result
 }
@@ -823,6 +860,8 @@ async fn build_insert_batches_inner(
         if let Some(ref pred) = ins.predicate {
             conditions.push(pred.clone());
             consumed_predicates.push(pred.clone());
+        } else {
+            consumed_predicates.push("TRUE".to_string());
         }
 
         let where_clause = if conditions.is_empty() {
@@ -889,9 +928,9 @@ fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[String]) -> Str
             .map(|field| {
                 let key = field.to_lowercase();
                 match col_expr_map.get(&key) {
-                    Some(expr) => format!("{expr} AS \"{field}\""),
+                    Some(expr) => format!("{expr} AS {}", quote_identifier(field)),
                     // Column not in INSERT list — fill with NULL
-                    None => format!("NULL AS \"{field}\""),
+                    None => format!("NULL AS {}", quote_identifier(field)),
                 }
             })
             .collect::<Vec<_>>()
@@ -1100,7 +1139,7 @@ pub(crate) fn extract_tracking_columns(
 /// Read all files from a table via the CoW writer's file index, attach `__paimon_file_idx`
 /// and `__paimon_row_offset` tracking columns, and register the result as a MemTable.
 ///
-/// Returns `(has_data, table_name)`. The caller must deregister the table when done.
+/// Returns `(has_data, guard)`. The guard deregisters the table on drop.
 ///
 /// Note: all matching partition files are loaded into memory at once. For partitions
 /// with many large files this may cause significant memory pressure. A future
@@ -1109,11 +1148,11 @@ pub(crate) async fn register_cow_target_table(
     ctx: &SessionContext,
     table: &Table,
     writer: &CopyOnWriteMergeWriter,
-) -> DFResult<(bool, String)> {
+) -> DFResult<(bool, CowTableGuard)> {
     let file_index = writer.file_index();
     if file_index.is_empty() {
         let table_name = next_cow_table_name("__cow_target");
-        return Ok((false, table_name));
+        return Ok((false, CowTableGuard::new(ctx, table_name)));
     }
 
     // Read all files in parallel
@@ -1216,7 +1255,7 @@ pub(crate) async fn register_cow_target_table(
         ctx.register_table(&table_name, Arc::new(mem_table))?;
     }
 
-    Ok((has_data, table_name))
+    Ok((has_data, CowTableGuard::new(ctx, table_name)))
 }
 
 /// Build a partition set from Arrow batches containing partition column values.
@@ -1273,7 +1312,7 @@ pub(crate) async fn build_partition_set_from_where(
 
     let cols = partition_keys
         .iter()
-        .map(|k| format!("\"{k}\""))
+        .map(|k| quote_identifier(k))
         .collect::<Vec<_>>()
         .join(", ");
     let where_part = match where_clause {
@@ -1288,7 +1327,8 @@ pub(crate) async fn build_partition_set_from_where(
 
 /// Query source table for distinct partition values and build a partition set.
 ///
-/// Returns `None` for non-partitioned tables.
+/// Returns `None` for non-partitioned tables or when the source lacks matching
+/// partition key columns (falls back to full-partition scan).
 async fn build_source_partition_set(
     ctx: &SessionContext,
     table: &Table,
@@ -1302,13 +1342,17 @@ async fn build_source_partition_set(
 
     let cols = partition_keys
         .iter()
-        .map(|k| format!("{s_alias}.\"{k}\""))
+        .map(|k| format!("{s_alias}.{}", quote_identifier(k)))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!("SELECT DISTINCT {cols} FROM {source_ref} AS {s_alias}");
-    let batches = ctx.sql(&sql).await?.collect().await?;
-
-    build_partition_set_from_batches(table, &batches)
+    match ctx.sql(&sql).await {
+        Ok(df) => {
+            let batches = df.collect().await?;
+            build_partition_set_from_batches(table, &batches)
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// Rewrite SQL expressions by replacing original table references with aliases.
