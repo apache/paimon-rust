@@ -348,8 +348,8 @@ fn datum_to_vortex_lit(datum: &Datum, file_field: &DataField) -> Option<Expressi
     use vortex::array::scalar::{PValue, Scalar, ScalarValue};
     match datum {
         Datum::Bool(v) => Some(lit(*v)),
-        Datum::TinyInt(v) => Some(lit(i8::from(*v))),
-        Datum::SmallInt(v) => Some(lit(i16::from(*v))),
+        Datum::TinyInt(v) => Some(lit(*v)),
+        Datum::SmallInt(v) => Some(lit(*v)),
         Datum::Int(v) => Some(lit(*v)),
         Datum::Long(v) => Some(lit(*v)),
         Datum::Float(v) => Some(lit(*v)),
