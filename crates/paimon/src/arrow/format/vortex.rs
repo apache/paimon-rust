@@ -127,6 +127,25 @@ impl FormatFileReader for VortexFormatReader {
                 source: None,
             })?;
 
+        // Build the target Arrow schema for the projected fields.
+        let target_schema = crate::arrow::build_target_arrow_schema(read_fields)?;
+
+        // Empty projection (e.g. SELECT COUNT(*)): return a single zero-column batch
+        // with the correct row count, matching Parquet/ORC/Avro behavior.
+        if read_fields.is_empty() {
+            let row_count = vortex_file.row_count() as usize;
+            let batch = RecordBatch::try_new_with_options(
+                target_schema,
+                vec![],
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(row_count)),
+            )
+            .map_err(|e| Error::DataInvalid {
+                message: format!("Failed to build empty RecordBatch: {e}"),
+                source: None,
+            })?;
+            return Ok(Box::pin(futures::stream::once(async { Ok(batch) })));
+        }
+
         // Build projection expression for requested fields.
         let projected_names: Vec<&str> = read_fields.iter().map(|f| f.name()).collect();
 
@@ -136,7 +155,7 @@ impl FormatFileReader for VortexFormatReader {
         })?;
 
         // Apply column projection.
-        if !projected_names.is_empty() {
+        {
             use vortex::array::expr::{root, select};
             scan_builder = scan_builder.with_projection(select(projected_names, root()));
         }
@@ -167,9 +186,6 @@ impl FormatFileReader for VortexFormatReader {
                 message: format!("Failed to build Vortex array stream: {e}"),
                 source: None,
             })?;
-
-        // Build the target Arrow schema for the projected fields.
-        let target_schema = crate::arrow::build_target_arrow_schema(read_fields)?;
 
         // Convert Vortex stream to Arrow RecordBatch stream.
         let stream = vortex_stream
@@ -869,6 +885,54 @@ mod tests {
             all_ids.extend(id_col.values().iter().copied());
         }
         assert_eq!(all_ids, vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_vortex_read_with_empty_projection() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_vortex_empty_proj.vortex";
+        let output = file_io.new_output(path).unwrap();
+        let schema = test_arrow_schema();
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            VortexFormatWriter::new(&output, schema.clone())
+                .await
+                .unwrap(),
+        );
+        writer
+            .write(&test_batch(
+                &schema,
+                vec![1, 2, 3, 4, 5],
+                vec![10, 20, 30, 40, 50],
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let metadata = input.metadata().await.unwrap();
+
+        let reader = VortexFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                metadata.size,
+                &[], // empty projection
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut total_rows = 0;
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            assert_eq!(batch.num_columns(), 0);
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5);
     }
 
     // -----------------------------------------------------------------------
