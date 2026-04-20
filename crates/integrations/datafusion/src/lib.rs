@@ -37,6 +37,7 @@
 //! translatable partition-only conjuncts from DataFusion filters.
 
 mod catalog;
+mod delete;
 mod error;
 mod filter_pushdown;
 #[cfg(feature = "fulltext")]

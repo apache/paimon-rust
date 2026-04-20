@@ -45,6 +45,7 @@ pub(crate) struct PostponeWriteConfig {
     pub file_compression: String,
     pub file_compression_zstd_level: i32,
     pub write_buffer_size: i64,
+    pub file_format: String,
     /// Data file name prefix: `"data-u-{commitUser}-s-0-w-"`.
     pub data_file_prefix: String,
 }
@@ -198,10 +199,11 @@ impl PostponeFileWriter {
 
     async fn open_new_file(&mut self, user_schema: arrow_schema::SchemaRef) -> Result<()> {
         let file_name = format!(
-            "{}{}-{}.parquet",
+            "{}{}-{}.{}",
             self.config.data_file_prefix,
             uuid::Uuid::new_v4(),
-            self.written_files.len()
+            self.written_files.len(),
+            self.config.file_format,
         );
         let bucket_dir = if self.config.partition_path.is_empty() {
             format!(

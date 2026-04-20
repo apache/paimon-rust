@@ -23,8 +23,8 @@
 use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataField, DataType, Datum, MergeEngine, PartialUpdateConfig,
-    Predicate, PredicateBuilder, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    BinaryRow, CoreOptions, DataField, DataType, MergeEngine, PartialUpdateConfig,
+    EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -34,6 +34,7 @@ use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
@@ -91,6 +92,7 @@ pub struct TableWrite {
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
+    file_format: String,
     primary_key_indices: Vec<usize>,
     primary_key_types: Vec<DataType>,
     sequence_field_indices: Vec<usize>,
@@ -175,6 +177,7 @@ impl TableWrite {
         let target_file_size = core_options.target_file_size();
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
+        let file_format = core_options.file_format().to_string();
         let write_buffer_size = core_options.write_parquet_buffer_size();
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
@@ -270,6 +273,7 @@ impl TableWrite {
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
+            file_format,
             primary_key_indices,
             primary_key_types,
             sequence_field_indices,
@@ -292,8 +296,8 @@ impl TableWrite {
         let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
         let mut bucket_seq: HashMap<i32, i64> = HashMap::new();
         if let Some(snapshot) = latest_snapshot {
-            let partition_predicate = Self::build_partition_predicate(table, partition_bytes)?;
-            let scan = TableScan::new(table, partition_predicate, vec![], None, None, None)
+            let partition_filter = Self::build_partition_filter(table, partition_bytes)?;
+            let scan = TableScan::new(table, partition_filter, vec![], None, None, None)
                 .with_scan_all_files();
             let entries = scan.plan_manifest_entries(&snapshot).await?;
             for entry in &entries {
@@ -308,26 +312,22 @@ impl TableWrite {
         Ok(bucket_seq)
     }
 
-    /// Build a partition predicate from serialized partition bytes.
-    fn build_partition_predicate(
+    /// Build a partition filter from serialized partition bytes.
+    ///
+    /// Uses `PartitionSet` for O(1) byte-level matching when partition fields exist.
+    fn build_partition_filter(
         table: &Table,
         partition_bytes: &[u8],
-    ) -> crate::Result<Option<Predicate>> {
+    ) -> crate::Result<Option<PartitionFilter>> {
         let partition_fields = table.schema().partition_fields();
         if partition_fields.is_empty() {
             return Ok(None);
         }
-        let partition_row = BinaryRow::from_serialized_bytes(partition_bytes)?;
-        let fields: Vec<(&str, Option<Datum>)> = partition_fields
-            .iter()
-            .enumerate()
-            .map(|(pos, field)| {
-                let datum = partition_row.get_datum(pos, field.data_type())?;
-                Ok((field.name(), datum))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let pred_builder = PredicateBuilder::new(table.schema().fields());
-        Ok(Some(pred_builder.partition_predicate(&fields)?))
+        let partitions = HashSet::from([partition_bytes.to_vec()]);
+        Ok(Some(PartitionFilter::from_partition_set(
+            partitions,
+            &partition_fields,
+        )?))
     }
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
@@ -570,6 +570,7 @@ impl TableWrite {
             self.file_compression.clone(),
             self.file_compression_zstd_level,
             self.write_buffer_size,
+            self.file_format.clone(),
             Some(0), // file_source: APPEND
             None,    // first_row_id: assigned by commit
             None,    // write_cols: full-row write
@@ -590,6 +591,7 @@ impl TableWrite {
                 file_compression: self.file_compression.clone(),
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
+                file_format: self.file_format.clone(),
                 data_file_prefix,
             },
         ))
@@ -627,6 +629,7 @@ impl TableWrite {
                 file_compression: self.file_compression.clone(),
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
+                file_format: self.file_format.clone(),
                 primary_key_indices: self.primary_key_indices.clone(),
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),

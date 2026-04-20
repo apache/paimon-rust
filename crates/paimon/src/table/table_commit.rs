@@ -26,9 +26,10 @@ use crate::spec::FileKind;
 use crate::spec::{
     datums_to_binary_row, extract_datum, BinaryRow, CommitKind, CoreOptions, DataType, Datum,
     IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList,
-    PartitionStatistics, Predicate, PredicateBuilder, Snapshot,
+    PartitionStatistics, Snapshot,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
@@ -96,14 +97,12 @@ impl TableCommit {
             return Ok(());
         }
 
-        let commit_entries = self.messages_to_entries(&commit_messages);
-        let index_entries = self.messages_to_index_entries(&commit_messages);
-        self.try_commit(
-            CommitKind::APPEND,
-            CommitEntriesPlan::Static(commit_entries),
-            index_entries,
-            None, // APPEND: no overwrite
-        )
+        let entries = self.messages_to_entries(&commit_messages);
+        let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        self.try_commit(CommitEntriesPlan::Direct {
+            entries,
+            new_index_entries,
+        })
         .await
     }
 
@@ -116,79 +115,65 @@ impl TableCommit {
             return Ok(());
         }
 
-        let commit_entries = self.messages_to_entries(&commit_messages);
-        let index_entries = self.messages_to_index_entries(&commit_messages);
-        let partition_predicate = self.build_dynamic_partition_predicate(&commit_messages)?;
+        let new_entries = self.messages_to_entries(&commit_messages);
+        let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        let partition_filter = self.build_dynamic_partition_filter(&commit_messages)?;
         let overwrite_partitions = self.collect_overwrite_partitions(&commit_messages);
-        self.try_commit(
-            CommitKind::OVERWRITE,
-            CommitEntriesPlan::Overwrite {
-                partition_predicate,
-                new_entries: commit_entries,
-            },
-            index_entries,
-            Some(overwrite_partitions),
-        )
+        self.try_commit(CommitEntriesPlan::Overwrite {
+            partition_filter,
+            new_entries,
+            new_index_entries,
+            overwrite_partitions: Some(overwrite_partitions),
+        })
         .await
     }
 
-    /// Build a dynamic partition predicate from the partitions present in commit messages.
+    /// Build a dynamic partition filter from the partitions present in commit messages.
     ///
     /// Returns `None` for unpartitioned tables (full table overwrite).
-    fn build_dynamic_partition_predicate(
+    /// Uses `PartitionSet` for O(1) byte-level matching.
+    fn build_dynamic_partition_filter(
         &self,
         commit_messages: &[CommitMessage],
-    ) -> Result<Option<Predicate>> {
+    ) -> Result<Option<PartitionFilter>> {
         let partition_fields = self.table.schema().partition_fields();
         if partition_fields.is_empty() {
             return Ok(None);
         }
 
-        let data_types: Vec<_> = partition_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let partition_keys: Vec<_> = self
-            .table
-            .schema()
-            .partition_keys()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // Collect unique partition bytes
-        let mut seen = std::collections::HashSet::new();
-        let mut partition_specs: Vec<HashMap<String, Option<Datum>>> = Vec::new();
+        let mut partition_bytes_set: HashSet<Vec<u8>> = HashSet::new();
         for msg in commit_messages {
-            if seen.insert(msg.partition.clone()) {
-                let row = BinaryRow::from_serialized_bytes(&msg.partition)?;
-                let mut spec = HashMap::new();
-                for (i, key) in partition_keys.iter().enumerate() {
-                    spec.insert(key.clone(), extract_datum(&row, i, &data_types[i])?);
-                }
-                partition_specs.push(spec);
-            }
+            partition_bytes_set.insert(msg.partition.clone());
         }
 
-        let predicates: Vec<Predicate> = partition_specs
-            .iter()
-            .map(|p| self.build_partition_predicate(p))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Some(Predicate::or(predicates)))
+        Ok(Some(PartitionFilter::from_partition_set(
+            partition_bytes_set,
+            &partition_fields,
+        )?))
     }
 
-    /// Build a partition predicate from key-value pairs, handling NULL via IS NULL.
-    fn build_partition_predicate(
+    /// Build a partition filter from manifest entries for scan pushdown.
+    ///
+    /// Returns `None` for unpartitioned tables (scan everything).
+    /// Uses `PartitionSet` for O(1) byte-level matching.
+    fn build_entries_partition_filter(
         &self,
-        partition: &HashMap<String, Option<Datum>>,
-    ) -> Result<Predicate> {
-        let pb = PredicateBuilder::new(&self.table.schema().partition_fields());
-        let fields: Vec<(&str, Option<Datum>)> = partition
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.clone()))
-            .collect();
-        pb.partition_predicate(&fields)
+        entries: &[&ManifestEntry],
+    ) -> Result<Option<PartitionFilter>> {
+        let partition_fields = self.table.schema().partition_fields();
+        if partition_fields.is_empty() {
+            return Ok(None);
+        }
+
+        let mut partition_bytes_set: HashSet<Vec<u8>> = HashSet::new();
+        for entry in entries {
+            partition_bytes_set.insert(entry.partition().to_vec());
+        }
+
+        Ok(Some(PartitionFilter::from_partition_set(
+            partition_bytes_set,
+            &partition_fields,
+        )?))
     }
 
     /// Collect the set of unique partition bytes from commit messages.
@@ -211,17 +196,12 @@ impl TableCommit {
             return Ok(());
         }
 
-        let predicates: Vec<Predicate> = partitions
-            .iter()
-            .map(|p| self.build_partition_predicate(p))
-            .collect::<Result<Vec<_>>>()?;
-
         // Build partition bytes for index cleanup
+        let partition_fields = self.table.schema().partition_fields();
+        let partition_keys = self.table.schema().partition_keys();
         let overwrite_partitions: HashSet<Vec<u8>> = partitions
             .iter()
             .map(|p| {
-                let partition_fields = self.table.schema().partition_fields();
-                let partition_keys = self.table.schema().partition_keys();
                 let owned_datums: Vec<(Option<Datum>, DataType)> = partition_keys
                     .iter()
                     .enumerate()
@@ -237,73 +217,56 @@ impl TableCommit {
             })
             .collect();
 
-        self.try_commit(
-            CommitKind::OVERWRITE,
-            CommitEntriesPlan::Overwrite {
-                partition_predicate: Some(Predicate::or(predicates)),
-                new_entries: vec![],
-            },
-            vec![],
-            Some(overwrite_partitions),
-        )
+        let partition_filter =
+            PartitionFilter::from_partition_set(overwrite_partitions.clone(), &partition_fields)?;
+
+        self.try_commit(CommitEntriesPlan::Overwrite {
+            partition_filter: Some(partition_filter),
+            new_entries: vec![],
+            new_index_entries: vec![],
+            overwrite_partitions: Some(overwrite_partitions),
+        })
         .await
     }
 
     /// Truncate the entire table (OVERWRITE with no filter, only deletes).
     pub async fn truncate_table(&self) -> Result<()> {
-        self.try_commit(
-            CommitKind::OVERWRITE,
-            CommitEntriesPlan::Overwrite {
-                partition_predicate: None,
-                new_entries: vec![],
-            },
-            vec![],
-            Some(HashSet::new()), // empty set = full table overwrite
-        )
+        self.try_commit(CommitEntriesPlan::Overwrite {
+            partition_filter: None,
+            new_entries: vec![],
+            new_index_entries: vec![],
+            overwrite_partitions: Some(HashSet::new()),
+        })
         .await
     }
 
     /// Try to commit with retries.
-    ///
-    /// `overwrite_partitions`: `None` for APPEND; `Some(set)` for OVERWRITE.
-    /// An empty set means full table overwrite (all old index entries removed).
-    /// A non-empty set lists the partition bytes being overwritten.
-    async fn try_commit(
-        &self,
-        commit_kind: CommitKind,
-        plan: CommitEntriesPlan,
-        new_index_entries: Vec<IndexManifestEntry>,
-        overwrite_partitions: Option<HashSet<Vec<u8>>>,
-    ) -> Result<()> {
+    async fn try_commit(&self, plan: CommitEntriesPlan) -> Result<()> {
         let mut retry_count = 0u32;
         let mut last_snapshot_for_dup_check: Option<Snapshot> = None;
         let start_time_ms = current_time_millis();
 
         loop {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
-            let commit_entries = self.resolve_commit_entries(&plan, &latest_snapshot).await?;
+            let resolved = self.resolve_commit(&plan, &latest_snapshot).await?;
 
-            if commit_entries.is_empty() {
+            if resolved.entries.is_empty() {
                 break;
             }
 
             // Check for duplicate commit (idempotency on retry)
             if self
-                .is_duplicate_commit(&last_snapshot_for_dup_check, &latest_snapshot, &commit_kind)
+                .is_duplicate_commit(
+                    &last_snapshot_for_dup_check,
+                    &latest_snapshot,
+                    &resolved.kind,
+                )
                 .await
             {
                 break;
             }
 
-            let result = self
-                .try_commit_once(
-                    &commit_kind,
-                    commit_entries,
-                    &new_index_entries,
-                    overwrite_partitions.as_ref(),
-                    &latest_snapshot,
-                )
-                .await?;
+            let result = self.try_commit_once(resolved, &latest_snapshot).await?;
 
             match result {
                 true => break,
@@ -338,10 +301,7 @@ impl TableCommit {
     /// Single commit attempt.
     async fn try_commit_once(
         &self,
-        commit_kind: &CommitKind,
-        mut commit_entries: Vec<ManifestEntry>,
-        new_index_entries: &[IndexManifestEntry],
-        overwrite_partitions: Option<&HashSet<Vec<u8>>>,
+        mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
     ) -> Result<bool> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
@@ -349,20 +309,16 @@ impl TableCommit {
         // Row tracking
         let mut next_row_id: Option<i64> = None;
         if self.row_tracking_enabled {
-            commit_entries = self.assign_snapshot_id(new_snapshot_id, commit_entries);
-
-            // Validate that files with pre-assigned first_row_id (from MERGE INTO)
-            // still align with the current snapshot's file layout.
-            self.validate_row_id_alignment(&commit_entries, latest_snapshot)
-                .await?;
-
             let first_row_id_start = latest_snapshot
                 .as_ref()
                 .and_then(|s| s.next_row_id())
                 .unwrap_or(0);
-            let (assigned, nrid) =
-                self.assign_row_tracking_meta(first_row_id_start, commit_entries);
-            commit_entries = assigned;
+            let (assigned, nrid) = self.assign_row_tracking_meta(
+                new_snapshot_id,
+                first_row_id_start,
+                resolved.entries,
+            );
+            resolved.entries = assigned;
             next_row_id = Some(nrid);
         }
 
@@ -384,7 +340,7 @@ impl TableCommit {
                 file_io,
                 &new_manifest_path,
                 &new_manifest_name,
-                &commit_entries,
+                &resolved.entries,
             )
             .await?;
 
@@ -417,23 +373,13 @@ impl TableCommit {
 
         // Calculate delta record count
         let mut delta_record_count: i64 = 0;
-        for entry in &commit_entries {
+        for entry in &resolved.entries {
             match entry.kind() {
                 FileKind::Add => delta_record_count += entry.file().row_count,
                 FileKind::Delete => delta_record_count -= entry.file().row_count,
             }
         }
         total_record_count += delta_record_count;
-
-        // Handle index manifest (for dynamic bucket mode)
-        let index_manifest_name = Self::write_index_manifest(
-            file_io,
-            &manifest_dir,
-            new_index_entries,
-            overwrite_partitions,
-            latest_snapshot,
-        )
-        .await?;
 
         let snapshot = Snapshot::builder()
             .version(3)
@@ -443,92 +389,34 @@ impl TableCommit {
             .delta_manifest_list(delta_manifest_list_name)
             .commit_user(self.commit_user.clone())
             .commit_identifier(BATCH_COMMIT_IDENTIFIER)
-            .commit_kind(commit_kind.clone())
+            .commit_kind(resolved.kind)
             .time_millis(current_time_millis())
             .total_record_count(Some(total_record_count))
             .delta_record_count(Some(delta_record_count))
             .next_row_id(next_row_id)
-            .index_manifest(index_manifest_name)
+            .index_manifest(resolved.index_manifest_name)
             .build();
 
-        let statistics = self.generate_partition_statistics(&commit_entries)?;
+        let statistics = self.generate_partition_statistics(&resolved.entries)?;
 
         self.snapshot_commit.commit(&snapshot, &statistics).await
     }
 
-    /// Merge new index entries with existing ones and write the index manifest.
+    /// Write an index manifest file from already-merged entries.
     ///
-    /// For APPEND (`overwrite_partitions = None`): new HASH entries replace old ones
-    /// for the same (partition, bucket) key.
-    ///
-    /// For OVERWRITE (`overwrite_partitions = Some(set)`):
-    /// - Empty set = full table overwrite → discard all old index entries.
-    /// - Non-empty set = partition overwrite → remove all old index entries
-    ///   whose partition is in the set (not just matching bucket keys).
-    ///
-    /// Then append new entries and write the merged index manifest.
+    /// Returns `None` if `merged_index_entries` is empty.
     async fn write_index_manifest(
         file_io: &FileIO,
         manifest_dir: &str,
-        new_index_entries: &[IndexManifestEntry],
-        overwrite_partitions: Option<&HashSet<Vec<u8>>>,
-        latest_snapshot: &Option<Snapshot>,
+        merged_index_entries: &[IndexManifestEntry],
     ) -> Result<Option<String>> {
-        let is_overwrite = overwrite_partitions.is_some();
-
-        if !new_index_entries.is_empty() || is_overwrite {
-            let mut all_index_entries: Vec<IndexManifestEntry> = if let Some(snap) = latest_snapshot
-            {
-                if let Some(prev_index_manifest) = snap.index_manifest() {
-                    let prev_path = format!("{manifest_dir}/{prev_index_manifest}");
-                    IndexManifest::read(file_io, &prev_path).await?
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-            if let Some(partitions) = overwrite_partitions {
-                if partitions.is_empty() {
-                    // Full table overwrite: discard all old index entries
-                    all_index_entries.clear();
-                } else {
-                    // Partition overwrite: remove all old entries for overwritten partitions
-                    all_index_entries.retain(|e| !partitions.contains(&e.partition));
-                }
-            } else {
-                // APPEND: only replace entries with matching (partition, bucket) keys
-                let new_keys: HashSet<(Vec<u8>, i32)> = new_index_entries
-                    .iter()
-                    .filter(|e| e.index_file.index_type == "HASH")
-                    .map(|e| (e.partition.clone(), e.bucket))
-                    .collect();
-                all_index_entries.retain(|e| {
-                    if e.index_file.index_type == "HASH" {
-                        !new_keys.contains(&(e.partition.clone(), e.bucket))
-                    } else {
-                        true
-                    }
-                });
-            }
-
-            all_index_entries.extend_from_slice(new_index_entries);
-
-            if all_index_entries.is_empty() {
-                // All entries removed (e.g. full table truncate) — no index manifest needed
-                return Ok(None);
-            }
-
-            let name = format!("index-manifest-{}-0", uuid::Uuid::new_v4());
-            let path = format!("{manifest_dir}/{name}");
-            IndexManifest::write(file_io, &path, &all_index_entries).await?;
-            Ok(Some(name))
-        } else if let Some(snap) = latest_snapshot {
-            Ok(snap.index_manifest().map(|s| s.to_string()))
-        } else {
-            Ok(None)
+        if merged_index_entries.is_empty() {
+            return Ok(None);
         }
+        let name = format!("index-manifest-{}-0", uuid::Uuid::new_v4());
+        let path = format!("{manifest_dir}/{name}");
+        IndexManifest::write(file_io, &path, merged_index_entries).await?;
+        Ok(Some(name))
     }
 
     /// Write a manifest file and return its metadata.
@@ -585,33 +473,121 @@ impl TableCommit {
         false
     }
 
-    /// Resolve commit entries based on the plan type.
-    async fn resolve_commit_entries(
+    /// Resolve commit entries and merge index entries based on the plan type.
+    async fn resolve_commit(
         &self,
         plan: &CommitEntriesPlan,
         latest_snapshot: &Option<Snapshot>,
-    ) -> Result<Vec<ManifestEntry>> {
+    ) -> Result<ResolvedCommit> {
+        let file_io = self.snapshot_manager.file_io();
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+
         match plan {
-            CommitEntriesPlan::Static(entries) => Ok(entries.clone()),
-            CommitEntriesPlan::Overwrite {
-                partition_predicate,
-                new_entries,
+            CommitEntriesPlan::Direct {
+                entries,
+                new_index_entries,
             } => {
-                self.generate_overwrite_entries(
-                    latest_snapshot,
-                    partition_predicate.as_ref(),
-                    new_entries,
-                )
-                .await
+                if self.row_tracking_enabled {
+                    self.validate_row_id_alignment(entries, latest_snapshot)
+                        .await?;
+                }
+                self.validate_deleted_files(entries, latest_snapshot)
+                    .await?;
+                // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
+                // This ensures the snapshot correctly reflects file replacements.
+                let has_delete = entries.iter().any(|e| *e.kind() == FileKind::Delete);
+                let kind = if has_delete {
+                    CommitKind::OVERWRITE
+                } else {
+                    CommitKind::APPEND
+                };
+
+                let index_manifest_name = if new_index_entries.is_empty() {
+                    latest_snapshot
+                        .as_ref()
+                        .and_then(|s| s.index_manifest().map(|s| s.to_string()))
+                } else {
+                    let mut all =
+                        Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot)
+                            .await?;
+                    let new_keys: HashSet<(Vec<u8>, i32)> = new_index_entries
+                        .iter()
+                        .filter(|e| e.index_file.index_type == "HASH")
+                        .map(|e| (e.partition.clone(), e.bucket))
+                        .collect();
+                    all.retain(|e| {
+                        if e.index_file.index_type == "HASH" {
+                            !new_keys.contains(&(e.partition.clone(), e.bucket))
+                        } else {
+                            true
+                        }
+                    });
+                    all.extend_from_slice(new_index_entries);
+                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
+                };
+
+                Ok(ResolvedCommit {
+                    entries: entries.clone(),
+                    kind,
+                    index_manifest_name,
+                })
+            }
+            CommitEntriesPlan::Overwrite {
+                partition_filter,
+                new_entries,
+                new_index_entries,
+                overwrite_partitions,
+            } => {
+                let entries = self
+                    .generate_overwrite_entries(
+                        latest_snapshot,
+                        partition_filter.as_ref(),
+                        new_entries,
+                    )
+                    .await?;
+
+                let mut all =
+                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                if let Some(partitions) = overwrite_partitions {
+                    if partitions.is_empty() {
+                        all.clear();
+                    } else {
+                        all.retain(|e| !partitions.contains(&e.partition));
+                    }
+                }
+                all.extend_from_slice(new_index_entries);
+                let index_manifest_name =
+                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?;
+
+                Ok(ResolvedCommit {
+                    entries,
+                    kind: CommitKind::OVERWRITE,
+                    index_manifest_name,
+                })
             }
         }
+    }
+
+    /// Read index entries from the previous snapshot's index manifest.
+    async fn read_prev_index_entries(
+        file_io: &FileIO,
+        manifest_dir: &str,
+        latest_snapshot: &Option<Snapshot>,
+    ) -> Result<Vec<IndexManifestEntry>> {
+        if let Some(snap) = latest_snapshot {
+            if let Some(prev_index_manifest) = snap.index_manifest() {
+                let prev_path = format!("{manifest_dir}/{prev_index_manifest}");
+                return IndexManifest::read(file_io, &prev_path).await;
+            }
+        }
+        Ok(vec![])
     }
 
     /// Generate overwrite entries: DELETE existing + ADD new.
     async fn generate_overwrite_entries(
         &self,
         latest_snapshot: &Option<Snapshot>,
-        partition_predicate: Option<&Predicate>,
+        partition_filter: Option<&PartitionFilter>,
         new_entries: &[ManifestEntry],
     ) -> Result<Vec<ManifestEntry>> {
         let mut entries = Vec::new();
@@ -619,7 +595,7 @@ impl TableCommit {
         if let Some(snap) = latest_snapshot {
             let scan = TableScan::new(
                 &self.table,
-                partition_predicate.cloned(),
+                partition_filter.cloned(),
                 vec![],
                 None,
                 None,
@@ -636,21 +612,11 @@ impl TableCommit {
         Ok(entries)
     }
 
-    /// Assign snapshot ID as sequence number to entries.
-    fn assign_snapshot_id(
-        &self,
-        snapshot_id: i64,
-        entries: Vec<ManifestEntry>,
-    ) -> Vec<ManifestEntry> {
-        entries
-            .into_iter()
-            .map(|e| e.with_sequence_number(snapshot_id, snapshot_id))
-            .collect()
-    }
-
-    /// Assign row tracking metadata to new files.
+    /// Assign row tracking metadata: snapshot ID as sequence number, and
+    /// first_row_id for new APPEND files that don't already have one.
     fn assign_row_tracking_meta(
         &self,
+        snapshot_id: i64,
         first_row_id_start: i64,
         entries: Vec<ManifestEntry>,
     ) -> (Vec<ManifestEntry>, i64) {
@@ -658,16 +624,16 @@ impl TableCommit {
         let mut start = first_row_id_start;
 
         for entry in entries {
+            let mut entry = entry.with_sequence_number(snapshot_id, snapshot_id);
             if *entry.kind() == FileKind::Add
                 && entry.file().file_source == Some(0) // APPEND
                 && entry.file().first_row_id.is_none()
             {
                 let row_count = entry.file().row_count;
-                result.push(entry.with_first_row_id(start));
+                entry = entry.with_first_row_id(start);
                 start += row_count;
-            } else {
-                result.push(entry);
             }
+            result.push(entry);
         }
 
         (result, start)
@@ -714,9 +680,10 @@ impl TableCommit {
             }
         };
 
-        // Read all current files from the latest snapshot.
-        let scan =
-            TableScan::new(&self.table, None, vec![], None, None, None).with_scan_all_files();
+        // Read current files from the latest snapshot, filtered by partitions.
+        let partition_filter = self.build_entries_partition_filter(&files_to_check)?;
+        let scan = TableScan::new(&self.table, partition_filter, vec![], None, None, None)
+            .with_scan_all_files();
         let existing_entries = scan.plan_manifest_entries(snap).await?;
 
         // Build index: (partition, bucket, first_row_id, row_count)
@@ -749,6 +716,72 @@ impl TableCommit {
                         entry.file().row_count,
                         entry.bucket(),
                         entry.file().row_count,
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that files marked for deletion actually exist in the current snapshot.
+    ///
+    /// For CoW UPDATE/DELETE, the commit contains `FileKind::Delete` entries for
+    /// files being replaced. If a concurrent commit has already removed or rewritten
+    /// those files, the delete entries become stale and the commit must be rejected.
+    async fn validate_deleted_files(
+        &self,
+        commit_entries: &[ManifestEntry],
+        latest_snapshot: &Option<Snapshot>,
+    ) -> Result<()> {
+        let delete_entries: Vec<_> = commit_entries
+            .iter()
+            .filter(|e| *e.kind() == FileKind::Delete)
+            .collect();
+
+        if delete_entries.is_empty() {
+            return Ok(());
+        }
+
+        let snap = match latest_snapshot {
+            Some(s) => s,
+            None => {
+                let entry = &delete_entries[0];
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Delete conflict: file '{}' is marked for deletion but no snapshot exists.",
+                        entry.file().file_name,
+                    ),
+                    source: None,
+                });
+            }
+        };
+
+        let partition_filter = self.build_entries_partition_filter(&delete_entries)?;
+        let scan = TableScan::new(&self.table, partition_filter, vec![], None, None, None)
+            .with_scan_all_files();
+        let existing_entries = scan.plan_manifest_entries(snap).await?;
+
+        let existing_files: HashSet<(&[u8], i32, &str)> = existing_entries
+            .iter()
+            .map(|e| (e.partition(), e.bucket(), e.file().file_name.as_str()))
+            .collect();
+
+        for entry in &delete_entries {
+            let key = (
+                entry.partition(),
+                entry.bucket(),
+                entry.file().file_name.as_str(),
+            );
+            if !existing_files.contains(&key) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Delete conflict: file '{}' in partition/bucket ({}) \
+                         does not exist in the current snapshot. \
+                         It may have been removed by a concurrent operation.",
+                        entry.file().file_name,
+                        entry.bucket(),
                     ),
                     source: None,
                 });
@@ -903,12 +936,12 @@ impl TableCommit {
         Ok(spec)
     }
 
-    /// Convert commit messages to manifest entries (ADD kind).
+    /// Convert commit messages to manifest entries (ADD/DELETE kind).
     fn messages_to_entries(&self, messages: &[CommitMessage]) -> Vec<ManifestEntry> {
         messages
             .iter()
             .flat_map(|msg| {
-                msg.new_files.iter().map(move |file| {
+                let adds = msg.new_files.iter().map(|file| {
                     ManifestEntry::new(
                         FileKind::Add,
                         msg.partition.clone(),
@@ -917,7 +950,18 @@ impl TableCommit {
                         file.clone(),
                         2,
                     )
-                })
+                });
+                let deletes = msg.deleted_files.iter().map(|file| {
+                    ManifestEntry::new(
+                        FileKind::Delete,
+                        msg.partition.clone(),
+                        msg.bucket,
+                        self.total_buckets,
+                        file.clone(),
+                        2,
+                    )
+                });
+                adds.chain(deletes)
             })
             .collect()
     }
@@ -943,13 +987,26 @@ impl TableCommit {
 
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
-    /// Static entries (for APPEND).
-    Static(Vec<ManifestEntry>),
-    /// Overwrite with optional partition predicate.
-    Overwrite {
-        partition_predicate: Option<Predicate>,
-        new_entries: Vec<ManifestEntry>,
+    /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
+    /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
+    Direct {
+        entries: Vec<ManifestEntry>,
+        new_index_entries: Vec<IndexManifestEntry>,
     },
+    /// Overwrite with optional partition filter.
+    Overwrite {
+        partition_filter: Option<PartitionFilter>,
+        new_entries: Vec<ManifestEntry>,
+        new_index_entries: Vec<IndexManifestEntry>,
+        overwrite_partitions: Option<HashSet<Vec<u8>>>,
+    },
+}
+
+/// Fully resolved commit ready for writing.
+struct ResolvedCommit {
+    entries: Vec<ManifestEntry>,
+    kind: CommitKind,
+    index_manifest_name: Option<String>,
 }
 
 fn current_time_millis() -> u64 {
@@ -1473,5 +1530,84 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 600 - 300 (delete null) + 50 (add null2) = 350
         assert_eq!(snapshot.total_record_count(), Some(350));
+    }
+
+    #[tokio::test]
+    async fn test_delete_conflict_rejects_missing_file() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_delete_conflict_missing";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let mut msg = CommitMessage::new(vec![], 0, vec![test_data_file("data-new.parquet", 80)]);
+        msg.deleted_files = vec![test_data_file("nonexistent.parquet", 100)];
+
+        let result = commit.commit(vec![msg]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Delete conflict"),
+            "Expected 'Delete conflict' error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_conflict_accepts_existing_file() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_delete_conflict_ok";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let mut msg = CommitMessage::new(vec![], 0, vec![test_data_file("data-new.parquet", 80)]);
+        msg.deleted_files = vec![test_data_file("data-0.parquet", 100)];
+
+        commit.commit(vec![msg]).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 2);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        // 100 - 100 (delete) + 80 (add) = 80
+        assert_eq!(snapshot.total_record_count(), Some(80));
+    }
+
+    #[tokio::test]
+    async fn test_delete_conflict_no_snapshot_rejects() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_delete_conflict_no_snap";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        let mut msg = CommitMessage::new(vec![], 0, vec![]);
+        msg.deleted_files = vec![test_data_file("data-0.parquet", 100)];
+
+        let result = commit.commit(vec![msg]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Delete conflict"),
+            "Expected 'Delete conflict' error, got: {err_msg}"
+        );
     }
 }

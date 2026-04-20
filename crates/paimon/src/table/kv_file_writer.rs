@@ -66,6 +66,7 @@ pub(crate) struct KeyValueWriteConfig {
     pub file_compression: String,
     pub file_compression_zstd_level: i32,
     pub write_buffer_size: i64,
+    pub file_format: String,
     /// Primary key column indices in the user schema.
     pub primary_key_indices: Vec<usize>,
     /// Paimon DataTypes for each primary key column (same order as primary_key_indices).
@@ -200,11 +201,12 @@ impl KeyValueFileWriter {
         // Build physical schema and open writer.
         let physical_schema = build_physical_schema(&user_schema);
 
-        // Open parquet writer.
+        // Open file writer.
         let file_name = format!(
-            "data-{}-{}.parquet",
+            "data-{}-{}.{}",
             uuid::Uuid::new_v4(),
-            self.written_files.len()
+            self.written_files.len(),
+            self.config.file_format,
         );
         let bucket_dir = if self.config.partition_path.is_empty() {
             format!(
@@ -511,6 +513,7 @@ mod tests {
                 file_compression: "none".to_string(),
                 file_compression_zstd_level: 0,
                 write_buffer_size: 1024,
+                file_format: "parquet".to_string(),
                 primary_key_indices: vec![0],
                 primary_key_types: vec![DataType::Int(IntType::new())],
                 sequence_field_indices: vec![1],
@@ -570,6 +573,7 @@ mod tests {
                 file_compression: "none".to_string(),
                 file_compression_zstd_level: 0,
                 write_buffer_size: 1024,
+                file_format: "parquet".to_string(),
                 primary_key_indices: vec![0],
                 primary_key_types: vec![DataType::Int(IntType::new())],
                 sequence_field_indices: vec![1],
