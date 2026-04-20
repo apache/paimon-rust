@@ -130,10 +130,11 @@ impl FormatFileReader for VortexFormatReader {
         // Build the target Arrow schema for the projected fields.
         let target_schema = crate::arrow::build_target_arrow_schema(read_fields)?;
 
-        // Empty projection (e.g. SELECT COUNT(*)): return a single zero-column batch
-        // with the correct row count, matching Parquet/ORC/Avro behavior.
         if read_fields.is_empty() {
-            let row_count = vortex_file.row_count() as usize;
+            let row_count = match &row_selection {
+                Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
+                None => vortex_file.row_count() as usize,
+            };
             let batch = RecordBatch::try_new_with_options(
                 target_schema,
                 vec![],
