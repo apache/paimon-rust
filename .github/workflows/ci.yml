@@ -111,7 +111,7 @@ jobs:
           RUST_BACKTRACE: full
 
       - name: DataFusion Integration Test
-        run: cargo test -p paimon-datafusion --test read_tables
+        run: cargo test -p paimon-datafusion --all-targets
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full

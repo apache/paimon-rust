@@ -126,6 +126,31 @@ impl TableSchema {
         new_schema
     }
 
+    /// Apply a list of schema changes and return a new schema with incremented ID.
+    pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
+        let mut new_schema = self.clone();
+        new_schema.id += 1;
+        new_schema.time_millis = chrono::Utc::now().timestamp_millis();
+
+        for change in changes {
+            match change {
+                crate::spec::SchemaChange::SetOption { key, value } => {
+                    new_schema.options.insert(key, value);
+                }
+                crate::spec::SchemaChange::RemoveOption { key } => {
+                    new_schema.options.remove(&key);
+                }
+                other => {
+                    return Err(crate::Error::Unsupported {
+                        message: format!("Schema change not yet supported: {other:?}"),
+                    });
+                }
+            }
+        }
+
+        Ok(new_schema)
+    }
+
     pub fn comment(&self) -> Option<&str> {
         self.comment.as_deref()
     }

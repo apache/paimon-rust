@@ -88,47 +88,59 @@ pub(crate) fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Ve
     buckets
 }
 
-/// Build a [`PaimonTableScan`] from a planned [`paimon::table::Plan`].
-///
-/// Shared by [`PaimonTableProvider`] and the full-text search UDTF to avoid
-/// duplicating projection, partition distribution, and scan construction.
-pub(crate) fn build_paimon_scan(
-    table: &Table,
-    schema: &ArrowSchemaRef,
-    plan: &paimon::table::Plan,
-    projection: Option<&Vec<usize>>,
-    pushed_predicate: Option<paimon::spec::Predicate>,
-    limit: Option<usize>,
-    target_partitions: usize,
-) -> DFResult<Arc<dyn ExecutionPlan>> {
-    let (projected_schema, projected_columns) = if let Some(indices) = projection {
-        let fields: Vec<Field> = indices.iter().map(|&i| schema.field(i).clone()).collect();
-        let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
-        (Arc::new(Schema::new(fields)), Some(column_names))
-    } else {
-        let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        (schema.clone(), Some(column_names))
-    };
+/// Build parameters for [`PaimonTableScan`].
+pub(crate) struct PaimonScanBuilder<'a> {
+    pub(crate) table: &'a Table,
+    pub(crate) schema: &'a ArrowSchemaRef,
+    pub(crate) plan: &'a paimon::table::Plan,
+    pub(crate) projection: Option<&'a Vec<usize>>,
+    pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) target_partitions: usize,
+    pub(crate) filter_exact: bool,
+}
 
-    let splits = plan.splits().to_vec();
-    let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
-        vec![Arc::from(Vec::new())]
-    } else {
-        let num_partitions = splits.len().min(target_partitions.max(1));
-        bucket_round_robin(splits, num_partitions)
-            .into_iter()
-            .map(Arc::from)
-            .collect()
-    };
+impl PaimonScanBuilder<'_> {
+    /// Build a [`PaimonTableScan`] from the configured parameters.
+    pub(crate) fn build(self) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let (projected_schema, projected_columns) = if let Some(indices) = self.projection {
+            let fields: Vec<Field> = indices
+                .iter()
+                .map(|&i| self.schema.field(i).clone())
+                .collect();
+            let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+            (Arc::new(Schema::new(fields)), Some(column_names))
+        } else {
+            let column_names: Vec<String> = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            (self.schema.clone(), Some(column_names))
+        };
 
-    Ok(Arc::new(PaimonTableScan::new(
-        projected_schema,
-        table.clone(),
-        projected_columns,
-        pushed_predicate,
-        planned_partitions,
-        limit,
-    )))
+        let splits = self.plan.splits().to_vec();
+        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
+            vec![Arc::from(Vec::new())]
+        } else {
+            let num_partitions = splits.len().min(self.target_partitions.max(1));
+            bucket_round_robin(splits, num_partitions)
+                .into_iter()
+                .map(Arc::from)
+                .collect()
+        };
+
+        Ok(Arc::new(PaimonTableScan::new(
+            projected_schema,
+            self.table.clone(),
+            projected_columns,
+            self.pushed_predicate,
+            planned_partitions,
+            self.limit,
+            self.filter_exact,
+        )))
+    }
 }
 
 #[async_trait]
@@ -172,15 +184,22 @@ impl TableProvider for PaimonTableProvider {
             .map_err(to_datafusion_error)?;
 
         let target = state.config_options().execution.target_partitions;
-        build_paimon_scan(
-            &self.table,
-            &self.schema,
-            &plan,
+        let filter_exact = !filter_analysis.has_untranslated_residual
+            && filter_analysis
+                .pushed_predicate
+                .as_ref()
+                .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
+        PaimonScanBuilder {
+            table: &self.table,
+            schema: &self.schema,
+            plan: &plan,
             projection,
-            filter_analysis.pushed_predicate,
-            pushed_limit,
-            target,
-        )
+            pushed_predicate: filter_analysis.pushed_predicate,
+            limit: pushed_limit,
+            target_partitions: target,
+            filter_exact,
+        }
+        .build()
     }
 
     async fn insert_into(

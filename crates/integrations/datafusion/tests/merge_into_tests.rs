@@ -63,12 +63,18 @@ async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {
             "CREATE TABLE paimon.test_db.target (\
                 id INT NOT NULL, name STRING, value INT\
             ) WITH (\
-                'data-evolution.enabled' = 'true', \
                 'row-tracking.enabled' = 'true'\
             )",
         )
         .await
         .expect("CREATE TABLE failed");
+}
+
+async fn enable_data_evolution(handler: &PaimonSqlHandler) {
+    handler
+        .sql("ALTER TABLE paimon.test_db.target SET TBLPROPERTIES('data-evolution.enabled' = 'true')")
+        .await
+        .expect("ALTER TABLE failed");
 }
 
 async fn collect_rows_3col(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String, i32)> {
@@ -147,12 +153,14 @@ async fn register_source(handler: &PaimonSqlHandler, sql: &str) {
 #[tokio::test]
 async fn test_row_id_values_after_insert() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     let batches = handler
         .sql("SELECT \"_ROW_ID\" FROM paimon.test_db.target ORDER BY \"_ROW_ID\"")
@@ -193,12 +201,14 @@ async fn test_row_id_values_after_insert() {
 #[tokio::test]
 async fn test_row_id_stability_after_merge_into() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Capture _ROW_ID -> id mapping before merge
     let before = collect_row_ids(
@@ -257,12 +267,14 @@ async fn test_row_id_stability_after_merge_into() {
 #[tokio::test]
 async fn test_multiple_merge_into_different_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // First MERGE: update name for id=1
     register_source(
@@ -312,12 +324,14 @@ async fn test_multiple_merge_into_different_columns() {
 #[tokio::test]
 async fn test_merge_into_with_non_paimon_source() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Source is a plain DataFusion in-memory table, not Paimon
     register_source(
@@ -354,12 +368,14 @@ async fn test_merge_into_with_non_paimon_source() {
 #[tokio::test]
 async fn test_merge_into_join_on_row_id() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Get _ROW_ID for id=2
     let row_id_map = collect_row_ids(
@@ -407,12 +423,14 @@ async fn test_merge_into_join_on_row_id() {
 #[tokio::test]
 async fn test_self_merge() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Self-merge: target used as both target and source
     handler
@@ -447,6 +465,8 @@ async fn test_row_count_after_merge() {
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Snapshot 1: 3 rows inserted
     let table = catalog
@@ -490,12 +510,14 @@ async fn test_row_count_after_merge() {
 #[tokio::test]
 async fn test_merge_into_update_and_insert() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(
         &handler,
@@ -533,12 +555,14 @@ async fn test_merge_into_update_and_insert() {
 #[tokio::test]
 async fn test_merge_into_insert_only() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(
         &handler,
@@ -576,7 +600,7 @@ async fn test_merge_into_insert_only() {
 #[tokio::test]
 async fn test_merge_into_insert_all_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -586,6 +610,8 @@ async fn test_merge_into_insert_all_columns() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Source schema matches target: (id, name, value)
     register_source(
@@ -623,7 +649,7 @@ async fn test_merge_into_insert_all_columns() {
 #[tokio::test]
 async fn test_merge_into_insert_partial_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -633,6 +659,8 @@ async fn test_merge_into_insert_partial_columns() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(
         &handler,
@@ -669,7 +697,7 @@ async fn test_merge_into_insert_partial_columns() {
 #[tokio::test]
 async fn test_merge_into_insert_with_predicate() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -679,6 +707,8 @@ async fn test_merge_into_insert_with_predicate() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Source has 3 rows, only id=1 matches target
     register_source(
@@ -723,6 +753,8 @@ async fn test_merge_into_row_id_for_inserted_rows() {
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // Before merge: _ROW_ID should be 0, 1
     let before = collect_row_ids(
@@ -779,7 +811,7 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 #[tokio::test]
 async fn test_rejects_when_matched_delete() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -789,6 +821,8 @@ async fn test_rejects_when_matched_delete() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(&handler, "CREATE TABLE src_del (id INT) AS VALUES (1)").await;
 
@@ -804,7 +838,7 @@ async fn test_rejects_when_matched_delete() {
 #[tokio::test]
 async fn test_rejects_multiple_when_matched() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -814,6 +848,8 @@ async fn test_rejects_multiple_when_matched() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(
         &handler,
@@ -834,7 +870,7 @@ async fn test_rejects_multiple_when_matched() {
 #[tokio::test]
 async fn test_rejects_partition_column_in_set() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
 
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
     handler
@@ -842,7 +878,6 @@ async fn test_rejects_partition_column_in_set() {
             "CREATE TABLE paimon.test_db.part_target (\
                 pt STRING, id INT NOT NULL, name STRING\
             ) PARTITIONED BY (pt STRING) WITH (\
-                'data-evolution.enabled' = 'true', \
                 'row-tracking.enabled' = 'true'\
             )",
         )
@@ -856,6 +891,8 @@ async fn test_rejects_partition_column_in_set() {
         .collect()
         .await
         .unwrap();
+
+    handler.sql("ALTER TABLE paimon.test_db.part_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
         &handler,
@@ -875,15 +912,13 @@ async fn test_rejects_partition_column_in_set() {
 #[tokio::test]
 async fn test_rejects_table_without_row_tracking() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
 
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
     handler
         .sql(
             "CREATE TABLE paimon.test_db.no_tracking (\
                 id INT NOT NULL, name STRING\
-            ) WITH (\
-                'data-evolution.enabled' = 'true'\
             )",
         )
         .await
@@ -896,6 +931,8 @@ async fn test_rejects_table_without_row_tracking() {
         .collect()
         .await
         .unwrap();
+
+    handler.sql("ALTER TABLE paimon.test_db.no_tracking SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
         &handler,
@@ -917,12 +954,14 @@ async fn test_successive_merges_read_file_group() {
     // Verifies that a second MERGE INTO correctly reads columns from the file group
     // (base file + partial-column files created by the first merge), not just a single file.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // First MERGE: update 'name' column → creates a partial-column file for 'name'
     register_source(
@@ -987,12 +1026,14 @@ async fn test_successive_merges_different_columns_read_file_group() {
     // The second merge must correctly read 'value' from the file group
     // even though a partial-column file for 'name' now exists.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
+
+    enable_data_evolution(&handler).await;
 
     // First MERGE: update 'name'
     register_source(
@@ -1046,7 +1087,7 @@ async fn test_merge_insert_reordered_columns() {
     // Table schema: (id INT, name STRING, value INT)
     // INSERT specifies: (value, name, id) — reversed order
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
     setup_data_evolution_table(&handler).await;
 
     handler
@@ -1056,6 +1097,8 @@ async fn test_merge_insert_reordered_columns() {
         .collect()
         .await
         .unwrap();
+
+    enable_data_evolution(&handler).await;
 
     register_source(
         &handler,
@@ -1094,7 +1137,7 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
     // Verifies column reordering on a partitioned table where mis-mapping
     // would cause data to land in the wrong partition.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
 
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
     handler
@@ -1102,7 +1145,6 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
             "CREATE TABLE paimon.test_db.part_tbl (\
                 dt STRING, id INT NOT NULL, name STRING\
             ) PARTITIONED BY (dt STRING) WITH (\
-                'data-evolution.enabled' = 'true', \
                 'row-tracking.enabled' = 'true'\
             )",
         )
@@ -1116,6 +1158,8 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
         .collect()
         .await
         .unwrap();
+
+    handler.sql("ALTER TABLE paimon.test_db.part_tbl SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
         &handler,
@@ -1181,7 +1225,7 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
 #[tokio::test]
 async fn test_rejects_table_with_primary_keys() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
+    let handler = create_handler(catalog.clone());
 
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
     handler
@@ -1189,7 +1233,6 @@ async fn test_rejects_table_with_primary_keys() {
             "CREATE TABLE paimon.test_db.pk_target (\
                 id INT NOT NULL, name STRING, PRIMARY KEY (id)\
             ) WITH (\
-                'data-evolution.enabled' = 'true', \
                 'row-tracking.enabled' = 'true'\
             )",
         )
@@ -1201,6 +1244,8 @@ async fn test_rejects_table_with_primary_keys() {
         "CREATE TABLE src_pk (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
     )
     .await;
+
+    handler.sql("ALTER TABLE paimon.test_db.pk_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     assert_merge_error(
         &handler,

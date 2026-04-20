@@ -221,6 +221,19 @@ impl PaimonSqlHandler {
                     };
                     rename_to = Some(Identifier::new(identifier.database().to_string(), new_name));
                 }
+                AlterTableOperation::SetTblProperties { table_properties } => {
+                    for opt in table_properties {
+                        if let SqlOption::KeyValue { key, value } = opt {
+                            let v = value.to_string();
+                            let v = v
+                                .strip_prefix('\'')
+                                .and_then(|s| s.strip_suffix('\''))
+                                .unwrap_or(&v)
+                                .to_string();
+                            changes.push(SchemaChange::set_option(key.value.clone(), v));
+                        }
+                    }
+                }
                 other => {
                     return Err(DataFusionError::Plan(format!(
                         "Unsupported ALTER TABLE operation: {other}"
@@ -1073,19 +1086,19 @@ mod tests {
         let handler = make_handler(catalog.clone());
 
         handler
-            .sql("CREATE TABLE mydb.t1 (payload BLOB NOT NULL)")
+            .sql("CREATE TABLE mydb.t1 (id INT, payload BLOB NOT NULL) WITH ('data-evolution.enabled' = 'true')")
             .await
             .unwrap();
 
         let calls = catalog.take_calls();
         assert_eq!(calls.len(), 1);
         if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
-            assert_eq!(schema.fields().len(), 1);
+            assert_eq!(schema.fields().len(), 2);
             assert!(matches!(
-                schema.fields()[0].data_type(),
+                schema.fields()[1].data_type(),
                 PaimonDataType::Blob(_)
             ));
-            assert!(!schema.fields()[0].data_type().is_nullable());
+            assert!(!schema.fields()[1].data_type().is_nullable());
         } else {
             panic!("expected CreateTable call");
         }

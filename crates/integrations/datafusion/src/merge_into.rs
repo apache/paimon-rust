@@ -602,46 +602,70 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
-    use paimon::catalog::Identifier;
+    use paimon::catalog::{Catalog, Identifier};
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema, VarCharType};
+    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
+    use tempfile::TempDir;
 
-    use crate::PaimonTableProvider;
+    use crate::{
+        PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler, PaimonTableProvider,
+    };
 
-    async fn setup_data_evolution_table() -> (SessionContext, Table) {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/test_merge_into";
-        file_io
-            .mkdirs(&format!("{table_path}/snapshot/"))
-            .await
-            .unwrap();
-        file_io
-            .mkdirs(&format!("{table_path}/manifest/"))
-            .await
-            .unwrap();
+    async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse = format!("file://{}", temp_dir.path().display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let schema = PaimonSchema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("name", DataType::VarChar(VarCharType::string_type()))
-            .column("value", DataType::Int(IntType::new()))
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .build()
-            .unwrap();
-        let table_schema = TableSchema::new(0, &schema);
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "target"),
-            table_path.to_string(),
-            table_schema,
-            None,
-        );
-
-        let provider = PaimonTableProvider::try_new(table.clone()).unwrap();
         let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "paimon",
+            Arc::new(PaimonCatalogProvider::new(catalog.clone())),
+        );
+        ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
+            .unwrap();
+        let handler = PaimonSqlHandler::new(ctx, catalog.clone(), "paimon");
+        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+
+        (temp_dir, handler, catalog)
+    }
+
+    async fn setup_data_evolution_table(name: &str) -> (TempDir, SessionContext, Table) {
+        let (tmp, handler, catalog) = setup_handler().await;
+
+        handler
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true')"
+            ))
+            .await
+            .unwrap();
+
+        handler
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let table = catalog
+            .get_table(&Identifier::new("test_db", name))
+            .await
+            .unwrap();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("data-evolution.enabled".to_string(), "true".to_string());
+        extra.insert("row-tracking.enabled".to_string(), "true".to_string());
+        let de_table = table.copy_with_options(extra);
+
+        let ctx = handler.ctx().clone();
+        let provider = PaimonTableProvider::try_new(de_table.clone()).unwrap();
         ctx.register_table("target", Arc::new(provider)).unwrap();
 
-        (ctx, table)
+        (tmp, ctx, de_table)
     }
 
     fn parse_merge(sql: &str) -> Merge {
@@ -655,15 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_into_updates_matched_rows() {
-        let (ctx, table) = setup_data_evolution_table().await;
-
-        // Insert initial data
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_merge").await;
 
         // Create source table with updates
         ctx.sql(
@@ -724,14 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_into_no_matches() {
-        let (ctx, table) = setup_data_evolution_table().await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_merge2").await;
 
         ctx.sql("CREATE TABLE source (id INT, name VARCHAR) AS VALUES (99, 'nobody')")
             .await

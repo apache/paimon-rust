@@ -150,46 +150,71 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
-    use paimon::catalog::Identifier;
+    use paimon::catalog::{Catalog, Identifier};
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema, VarCharType};
+    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
+    use tempfile::TempDir;
 
-    use crate::PaimonTableProvider;
+    use crate::{
+        PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler, PaimonTableProvider,
+    };
 
-    async fn setup_data_evolution_table(name: &str) -> (SessionContext, Table) {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = format!("memory:/test_update_{name}");
-        file_io
-            .mkdirs(&format!("{table_path}/snapshot/"))
-            .await
-            .unwrap();
-        file_io
-            .mkdirs(&format!("{table_path}/manifest/"))
-            .await
-            .unwrap();
+    async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse = format!("file://{}", temp_dir.path().display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let schema = PaimonSchema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("name", DataType::VarChar(VarCharType::string_type()))
-            .column("value", DataType::Int(IntType::new()))
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .build()
-            .unwrap();
-        let table_schema = TableSchema::new(0, &schema);
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "target"),
-            table_path,
-            table_schema,
-            None,
-        );
-
-        let provider = PaimonTableProvider::try_new(table.clone()).unwrap();
         let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "paimon",
+            Arc::new(PaimonCatalogProvider::new(catalog.clone())),
+        );
+        ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
+            .unwrap();
+        let handler = PaimonSqlHandler::new(ctx, catalog.clone(), "paimon");
+        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+
+        (temp_dir, handler, catalog)
+    }
+
+    async fn setup_data_evolution_table(name: &str) -> (TempDir, SessionContext, Table) {
+        let (tmp, handler, catalog) = setup_handler().await;
+
+        handler
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true')"
+            ))
+            .await
+            .unwrap();
+
+        handler
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let table = catalog
+            .get_table(&Identifier::new("test_db", name))
+            .await
+            .unwrap();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("data-evolution.enabled".to_string(), "true".to_string());
+        extra.insert("row-tracking.enabled".to_string(), "true".to_string());
+        let de_table = table.copy_with_options(extra);
+
+        // Register the data-evolution table under a simple name so _ROW_ID is visible
+        let ctx = handler.ctx().clone();
+        let provider = PaimonTableProvider::try_new(de_table.clone()).unwrap();
         ctx.register_table("target", Arc::new(provider)).unwrap();
 
-        (ctx, table)
+        (tmp, ctx, de_table)
     }
 
     fn parse_update(sql: &str) -> Update {
@@ -228,10 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_with_where() {
-        let (ctx, table) = setup_data_evolution_table("with_where").await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
-            .await.unwrap().collect().await.unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_with_where").await;
 
         let update = parse_update("UPDATE target SET name = 'ALICE' WHERE id = 1");
         execute_update(&ctx, &update, table).await.unwrap();
@@ -257,14 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_without_where() {
-        let (ctx, table) = setup_data_evolution_table("without_where").await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_without_where").await;
 
         let update = parse_update("UPDATE target SET value = 99");
         execute_update(&ctx, &update, table).await.unwrap();
@@ -280,20 +295,17 @@ mod tests {
         let rows = collect_rows(&batches);
         assert_eq!(
             rows,
-            vec![(1, "alice".to_string(), 99), (2, "bob".to_string(), 99),]
+            vec![
+                (1, "alice".to_string(), 99),
+                (2, "bob".to_string(), 99),
+                (3, "charlie".to_string(), 99),
+            ]
         );
     }
 
     #[tokio::test]
     async fn test_update_multiple_columns() {
-        let (ctx, table) = setup_data_evolution_table("multi_col").await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_multi_col").await;
 
         let update = parse_update("UPDATE target SET name = 'updated', value = 0 WHERE id = 2");
         execute_update(&ctx, &update, table).await.unwrap();
@@ -309,20 +321,17 @@ mod tests {
         let rows = collect_rows(&batches);
         assert_eq!(
             rows,
-            vec![(1, "alice".to_string(), 10), (2, "updated".to_string(), 0),]
+            vec![
+                (1, "alice".to_string(), 10),
+                (2, "updated".to_string(), 0),
+                (3, "charlie".to_string(), 30),
+            ]
         );
     }
 
     #[tokio::test]
     async fn test_update_no_matching_rows() {
-        let (ctx, table) = setup_data_evolution_table("no_match").await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_no_match").await;
 
         let update = parse_update("UPDATE target SET name = 'nobody' WHERE id = 99");
         let result = execute_update(&ctx, &update, table).await.unwrap();
@@ -338,14 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_row_id_stability() {
-        let (ctx, table) = setup_data_evolution_table("row_id").await;
-
-        ctx.sql("INSERT INTO target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let (_tmp, ctx, table) = setup_data_evolution_table("t_row_id").await;
 
         // Get row IDs before update
         let before = ctx

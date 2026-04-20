@@ -120,12 +120,6 @@ impl TableWrite {
             });
         }
 
-        if core_options.data_evolution_enabled() {
-            return Err(crate::Error::Unsupported {
-                message: "TableWrite does not support data-evolution.enabled mode".to_string(),
-            });
-        }
-
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
         let table_name = table.identifier().full_name();
