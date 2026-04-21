@@ -461,7 +461,7 @@ async fn test_blob_with_partition() {
             id INT, \
             picture BLOB, \
             pt STRING \
-         ) PARTITIONED BY (pt STRING) WITH (\
+         ) PARTITIONED BY (pt) WITH (\
             'data-evolution.enabled' = 'true', \
             'row-tracking.enabled' = 'true'\
          )",

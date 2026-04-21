@@ -224,7 +224,7 @@ async fn test_pk_partitioned_write_read() {
             "CREATE TABLE paimon.test_db.t_part (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '1')",
         )
         .await
@@ -269,7 +269,7 @@ async fn test_pk_partitioned_dedup_across_commits() {
             "CREATE TABLE paimon.test_db.t_part_dedup (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '1')",
         )
         .await
@@ -351,7 +351,7 @@ async fn test_pk_partitioned_filter() {
             "CREATE TABLE paimon.test_db.t_part_filter (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '1')",
         )
         .await
@@ -564,7 +564,7 @@ async fn test_pk_insert_overwrite_partitioned() {
             "CREATE TABLE paimon.test_db.t_overwrite (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '1')",
         )
         .await
@@ -797,7 +797,7 @@ async fn test_pk_partitioned_multi_bucket() {
             "CREATE TABLE paimon.test_db.t_part_mb (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '2')",
         )
         .await
@@ -1069,7 +1069,7 @@ async fn test_pk_first_row_insert_overwrite() {
             "CREATE TABLE paimon.test_db.t_fr_ow (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '1', 'merge-engine' = 'first-row')",
         )
         .await
@@ -1295,7 +1295,7 @@ async fn test_pk_partitioned_fixed_bucket_predicate_query() {
             "CREATE TABLE paimon.test_db.t_bk_pred (
                 pt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (pt, id)
-            ) PARTITIONED BY (pt STRING)
+            ) PARTITIONED BY (pt)
             WITH ('bucket' = '2')",
         )
         .await

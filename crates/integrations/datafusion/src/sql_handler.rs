@@ -24,7 +24,7 @@
 //! SCHEMA, DROP TABLE, etc.) to the underlying [`SessionContext`].
 //!
 //! Supported DDL:
-//! - `CREATE TABLE db.t (col TYPE, ..., PRIMARY KEY (col, ...)) [PARTITIONED BY (col TYPE, ...)] [WITH ('key' = 'val')]`
+//! - `CREATE TABLE db.t (col TYPE, ..., PRIMARY KEY (col, ...)) [PARTITIONED BY (col, ...)] [WITH ('key' = 'val')]`
 //! - `ALTER TABLE db.t ADD COLUMN col TYPE`
 //! - `ALTER TABLE db.t DROP COLUMN col`
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
@@ -38,9 +38,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, FromTable,
-    HiveDistributionStyle, Merge, ObjectName, RenameTableNameKind, SqlOption, Statement,
-    TableFactor, Update,
+    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, FromTable, Merge,
+    ObjectName, RenameTableNameKind, SqlOption, Statement, TableFactor, Update,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -92,8 +91,9 @@ impl PaimonSqlHandler {
     /// Execute a SQL statement. ALTER TABLE is handled by Paimon directly;
     /// everything else is delegated to DataFusion.
     pub async fn sql(&self, sql: &str) -> DFResult<DataFrame> {
+        let (rewritten_sql, partition_keys) = extract_partition_by(sql)?;
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
+        let statements = Parser::parse_sql(&dialect, &rewritten_sql)
             .map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))?;
 
         if statements.len() != 1 {
@@ -103,7 +103,9 @@ impl PaimonSqlHandler {
         }
 
         match &statements[0] {
-            Statement::CreateTable(create_table) => self.handle_create_table(create_table).await,
+            Statement::CreateTable(create_table) => {
+                self.handle_create_table(create_table, partition_keys).await
+            }
             Statement::AlterTable(alter_table) => {
                 self.handle_alter_table(
                     &alter_table.name,
@@ -119,7 +121,11 @@ impl PaimonSqlHandler {
         }
     }
 
-    async fn handle_create_table(&self, ct: &CreateTable) -> DFResult<DataFrame> {
+    async fn handle_create_table(
+        &self,
+        ct: &CreateTable,
+        partition_keys: Vec<String>,
+    ) -> DFResult<DataFrame> {
         if ct.external {
             return Err(DataFusionError::Plan(
                 "CREATE EXTERNAL TABLE is not supported. Use CREATE TABLE instead.".to_string(),
@@ -158,10 +164,8 @@ impl PaimonSqlHandler {
             }
         }
 
-        // Partition keys from PARTITIONED BY (col, ...)
-        if let HiveDistributionStyle::PARTITIONED { columns } = &ct.hive_distribution {
-            let partition_keys: Vec<String> =
-                columns.iter().map(|c| c.name.value.clone()).collect();
+        // Partition keys (already extracted and validated before parsing)
+        if !partition_keys.is_empty() {
             builder = builder.partition_keys(partition_keys);
         }
 
@@ -359,6 +363,90 @@ impl PaimonSqlHandler {
             ))),
         }
     }
+}
+
+/// Extract `PARTITIONED BY (col1, col2, ...)` from SQL before parsing.
+///
+/// Paimon only allows column references (no types) in PARTITIONED BY.
+/// Since sqlparser's GenericDialect requires types in column definitions,
+/// we extract and validate the clause ourselves, then strip it from the SQL
+/// so sqlparser can parse the rest.
+fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
+    let upper = sql.to_uppercase();
+    let Some(kw_start) = upper.find("PARTITIONED") else {
+        return Ok((sql.to_string(), vec![]));
+    };
+
+    let after_partitioned = &upper[kw_start + "PARTITIONED".len()..];
+    let after_trimmed = after_partitioned.trim_start();
+    if !after_trimmed.starts_with("BY") {
+        return Ok((sql.to_string(), vec![]));
+    }
+
+    let by_offset =
+        kw_start + "PARTITIONED".len() + (after_partitioned.len() - after_trimmed.len()) + 2;
+    let after_by = sql[by_offset..].trim_start();
+    let by_ws = by_offset + (sql[by_offset..].len() - after_by.len());
+
+    if !after_by.starts_with('(') {
+        return Err(DataFusionError::Plan(
+            "Expected '(' after PARTITIONED BY".to_string(),
+        ));
+    }
+
+    let paren_start = by_ws;
+    let inner_start = paren_start + 1;
+    let mut depth = 1;
+    let mut paren_end = None;
+    for (i, ch) in sql[inner_start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(inner_start + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let paren_end = paren_end.ok_or_else(|| {
+        DataFusionError::Plan("Unmatched '(' in PARTITIONED BY clause".to_string())
+    })?;
+
+    let inner = sql[inner_start..paren_end].trim();
+    if inner.is_empty() {
+        return Err(DataFusionError::Plan(
+            "PARTITIONED BY must specify at least one column".to_string(),
+        ));
+    }
+
+    let mut partition_keys = Vec::new();
+    for token in inner.split(',') {
+        let parts: Vec<&str> = token.split_whitespace().collect();
+        match parts.len() {
+            1 => partition_keys.push(parts[0].to_string()),
+            0 => {
+                return Err(DataFusionError::Plan(
+                    "Empty column name in PARTITIONED BY".to_string(),
+                ))
+            }
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "PARTITIONED BY column '{}' should not specify a type. \
+                     Use column references only, e.g. PARTITIONED BY ({})",
+                    parts[0], parts[0]
+                )));
+            }
+        }
+    }
+
+    let clause_end = paren_end + 1;
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(&sql[..kw_start]);
+    rewritten.push_str(&sql[clause_end..]);
+    Ok((rewritten, partition_keys))
 }
 
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].

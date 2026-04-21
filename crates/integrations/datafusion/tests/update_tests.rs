@@ -48,7 +48,7 @@ async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
     let handler = create_handler(catalog);
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
     handler
-        .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) PARTITIONED BY (pt INT)")
+        .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) PARTITIONED BY (pt)")
         .await
         .unwrap();
     exec(

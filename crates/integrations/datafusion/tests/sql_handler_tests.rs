@@ -198,7 +198,7 @@ async fn test_create_table_with_partition() {
                 name STRING,
                 dt STRING,
                 PRIMARY KEY (id, dt)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('bucket' = '2')",
         )
         .await
@@ -215,6 +215,33 @@ async fn test_create_table_with_partition() {
         schema.options().get("bucket"),
         Some(&"2".to_string()),
         "Table option 'bucket' should be preserved"
+    );
+}
+
+#[tokio::test]
+async fn test_create_table_partitioned_by_rejects_typed_columns() {
+    let (_tmp, catalog) = create_test_env();
+    let handler = create_handler(catalog.clone());
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    let err = handler
+        .sql(
+            "CREATE TABLE paimon.mydb.events (
+                id INT NOT NULL,
+                dt STRING
+            ) PARTITIONED BY (dt STRING)",
+        )
+        .await
+        .expect_err("PARTITIONED BY with typed columns should fail");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("should not specify a type"),
+        "unexpected error: {msg}"
     );
 }
 

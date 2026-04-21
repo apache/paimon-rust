@@ -57,7 +57,7 @@ async fn setup_abc() -> (tempfile::TempDir, PaimonSqlHandler) {
 
 async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
     let (tmp, handler) =
-        setup("CREATE TABLE paimon.test_db.target (a INT, b INT, pt INT) PARTITIONED BY (pt INT)")
+        setup("CREATE TABLE paimon.test_db.target (a INT, b INT, pt INT) PARTITIONED BY (pt)")
             .await;
     exec(
         &handler,

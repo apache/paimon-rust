@@ -245,8 +245,7 @@ async fn test_count_star_empty_table_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_with_partition_filter_pushes_down() {
-    let (_tmp, handler) =
-        setup_partitioned_table("id INT, value INT, dt STRING", "dt STRING").await;
+    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
     handler
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-01'), (3, 30, '2024-01-02')")
@@ -277,8 +276,7 @@ async fn test_count_star_with_partition_filter_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
-    let (_tmp, handler) =
-        setup_partitioned_table("id INT, value INT, dt STRING", "dt STRING").await;
+    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
     handler
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-01'), (3, 30, '2024-01-02')")
@@ -313,8 +311,7 @@ async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
 
 #[tokio::test]
 async fn test_count_star_with_partition_in_filter_pushes_down() {
-    let (_tmp, handler) =
-        setup_partitioned_table("id INT, value INT, dt STRING", "dt STRING").await;
+    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
     handler
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-02'), (3, 30, '2024-01-03')")
@@ -345,8 +342,7 @@ async fn test_count_star_with_partition_in_filter_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_partitioned_no_filter_pushes_down() {
-    let (_tmp, handler) =
-        setup_partitioned_table("id INT, value INT, dt STRING", "dt STRING").await;
+    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
     handler
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-02')")

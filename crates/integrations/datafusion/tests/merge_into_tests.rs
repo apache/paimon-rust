@@ -877,7 +877,7 @@ async fn test_rejects_partition_column_in_set() {
         .sql(
             "CREATE TABLE paimon.test_db.part_target (\
                 pt STRING, id INT NOT NULL, name STRING\
-            ) PARTITIONED BY (pt STRING) WITH (\
+            ) PARTITIONED BY (pt) WITH (\
                 'row-tracking.enabled' = 'true'\
             )",
         )
@@ -1144,7 +1144,7 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
         .sql(
             "CREATE TABLE paimon.test_db.part_tbl (\
                 dt STRING, id INT NOT NULL, name STRING\
-            ) PARTITIONED BY (dt STRING) WITH (\
+            ) PARTITIONED BY (dt) WITH (\
                 'row-tracking.enabled' = 'true'\
             )",
         )

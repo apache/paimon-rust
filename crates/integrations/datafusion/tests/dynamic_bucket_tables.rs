@@ -90,7 +90,7 @@ async fn test_pk_dynamic_bucket_partitioned() {
             "CREATE TABLE paimon.test_db.t_dyn_part (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -349,7 +349,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
             "CREATE TABLE paimon.test_db.t_dyn_part_ow (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();

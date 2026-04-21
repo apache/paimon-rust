@@ -40,7 +40,7 @@ async fn test_cross_partition_update_basic() {
             "CREATE TABLE paimon.test_db.t_cross_pt (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -92,7 +92,7 @@ async fn test_cross_partition_update_multiple_keys() {
             "CREATE TABLE paimon.test_db.t_cross_multi (
                 dt STRING, id INT NOT NULL, name STRING,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -147,7 +147,7 @@ async fn test_cross_partition_update_three_commits() {
             "CREATE TABLE paimon.test_db.t_cross_3c (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -207,7 +207,7 @@ async fn test_cross_partition_new_keys_no_migration() {
             "CREATE TABLE paimon.test_db.t_cross_new (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -269,7 +269,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
             "CREATE TABLE paimon.test_db.t_cross_dv (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
@@ -451,7 +451,7 @@ async fn test_cross_partition_first_row_skip() {
             "CREATE TABLE paimon.test_db.t_cross_fr (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)
+            ) PARTITIONED BY (dt)
             WITH ('merge-engine' = 'first-row')",
         )
         .await
@@ -551,7 +551,7 @@ async fn test_cross_partition_partial_pk_partition_overlap() {
             "CREATE TABLE paimon.test_db.t_cross_partial (
                 pt1 STRING, pt2 STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (pt1, id)
-            ) PARTITIONED BY (pt1 STRING, pt2 STRING)",
+            ) PARTITIONED BY (pt1, pt2)",
         )
         .await
         .unwrap();
@@ -616,7 +616,7 @@ async fn test_cross_partition_value_kind_schema_stability() {
             "CREATE TABLE paimon.test_db.t_cross_vk (
                 dt STRING, id INT NOT NULL, value INT,
                 PRIMARY KEY (id)
-            ) PARTITIONED BY (dt STRING)",
+            ) PARTITIONED BY (dt)",
         )
         .await
         .unwrap();
