@@ -73,14 +73,6 @@ pub struct CopyOnWriteMergeWriter {
     update_batches: Vec<RecordBatch>,
 }
 
-fn schema_contains_blob_type(table: &Table) -> bool {
-    table
-        .schema()
-        .fields()
-        .iter()
-        .any(|field| field.data_type().contains_blob_type())
-}
-
 impl CopyOnWriteMergeWriter {
     /// Create a new CoW writer for the given table.
     ///
@@ -100,12 +92,6 @@ impl CopyOnWriteMergeWriter {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
-        if schema_contains_blob_type(table) {
-            return Err(crate::Error::Unsupported {
-                message: "Copy-on-write MERGE INTO does not support BlobType".to_string(),
-            });
-        }
-
         if !schema.trimmed_primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
                 message: "Copy-on-write MERGE INTO is only supported for append-only tables (no primary keys)".to_string(),
@@ -119,11 +105,22 @@ impl CopyOnWriteMergeWriter {
         }
 
         let partition_keys = schema.partition_keys();
+        let blob_descriptor_fields = core_options.blob_descriptor_fields();
         for col in &update_columns {
             if partition_keys.contains(col) {
                 return Err(crate::Error::Unsupported {
                     message: format!("Cannot update partition column '{col}' in MERGE INTO"),
                 });
+            }
+            if let Some(field) = schema.fields().iter().find(|f| f.name() == col) {
+                if field.data_type().is_blob_type() && !blob_descriptor_fields.contains(col) {
+                    return Err(crate::Error::Unsupported {
+                        message: format!(
+                            "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \
+                             Only BLOB columns listed in 'blob-descriptor-field' can be updated"
+                        ),
+                    });
+                }
             }
         }
 

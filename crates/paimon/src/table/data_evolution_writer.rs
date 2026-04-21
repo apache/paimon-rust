@@ -61,14 +61,6 @@ pub struct DataEvolutionWriter {
     matched_batches: Vec<RecordBatch>,
 }
 
-fn schema_contains_non_descriptor_blob(table: &Table) -> bool {
-    let core_options = CoreOptions::new(table.schema().options());
-    let descriptor_fields = core_options.blob_descriptor_fields();
-    table.schema().fields().iter().any(|field| {
-        field.data_type().contains_blob_type() && !descriptor_fields.contains(field.name())
-    })
-}
-
 impl DataEvolutionWriter {
     /// Create a new writer for the given table and update columns.
     ///
@@ -80,12 +72,6 @@ impl DataEvolutionWriter {
     pub fn new(table: &Table, update_columns: Vec<String>) -> Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
-
-        if schema_contains_non_descriptor_blob(table) {
-            return Err(crate::Error::Unsupported {
-                message: "MERGE INTO does not support non-descriptor BlobType fields".to_string(),
-            });
-        }
 
         if !core_options.data_evolution_enabled() {
             return Err(crate::Error::Unsupported {
@@ -107,11 +93,22 @@ impl DataEvolutionWriter {
         }
 
         let partition_keys = schema.partition_keys();
+        let blob_descriptor_fields = core_options.blob_descriptor_fields();
         for col in &update_columns {
             if partition_keys.contains(col) {
                 return Err(crate::Error::Unsupported {
                     message: format!("Cannot update partition column '{col}' in MERGE INTO"),
                 });
+            }
+            if let Some(field) = schema.fields().iter().find(|f| f.name() == col) {
+                if field.data_type().is_blob_type() && !blob_descriptor_fields.contains(col) {
+                    return Err(crate::Error::Unsupported {
+                        message: format!(
+                            "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \
+                             Only BLOB columns listed in 'blob-descriptor-field' can be updated"
+                        ),
+                    });
+                }
             }
         }
 
@@ -483,14 +480,6 @@ impl DataEvolutionPartialWriter {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
-        if schema_contains_non_descriptor_blob(table) {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "DataEvolutionPartialWriter does not support non-descriptor BlobType fields"
-                        .to_string(),
-            });
-        }
-
         if !core_options.data_evolution_enabled() {
             return Err(crate::Error::Unsupported {
                 message: "DataEvolutionPartialWriter requires data-evolution.enabled = true"
@@ -609,9 +598,7 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{
-        BlobType, DataField, DataType, IntType, RowType, Schema, TableSchema, VarCharType,
-    };
+    use crate::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
     use arrow_array::StringArray;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
@@ -665,40 +652,12 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    fn test_blob_data_evolution_schema() -> TableSchema {
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column(
-                "payload",
-                DataType::Row(RowType::new(vec![DataField::new(
-                    1,
-                    "blob".into(),
-                    DataType::Blob(BlobType::new()),
-                )])),
-            )
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .build()
-            .unwrap();
-        TableSchema::new(0, &schema)
-    }
-
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_de_table"),
             table_path.to_string(),
             test_data_evolution_schema(),
-            None,
-        )
-    }
-
-    fn test_blob_table(file_io: &FileIO, table_path: &str) -> Table {
-        Table::new(
-            file_io.clone(),
-            Identifier::new("default", "test_de_blob_table"),
-            table_path.to_string(),
-            test_blob_data_evolution_schema(),
             None,
         )
     }
@@ -911,31 +870,5 @@ mod tests {
 
         let result = DataEvolutionPartialWriter::new(&table, vec!["id".to_string()]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rejects_blob_data_evolution_writer() {
-        let file_io = test_file_io();
-        let table = test_blob_table(&file_io, "memory:/test_blob_de_writer");
-
-        let err = DataEvolutionWriter::new(&table, vec!["id".to_string()])
-            .err()
-            .unwrap();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
-        );
-    }
-
-    #[test]
-    fn test_rejects_blob_partial_writer() {
-        let file_io = test_file_io();
-        let table = test_blob_table(&file_io, "memory:/test_blob_partial_writer");
-
-        let err = DataEvolutionPartialWriter::new(&table, vec!["id".to_string()])
-            .err()
-            .unwrap();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
-        );
     }
 }

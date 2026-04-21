@@ -277,6 +277,48 @@ async fn test_blob_descriptor_field_inline() {
     assert_eq!(rows[0].2, Some(b"Hello".to_vec()));
 }
 
+/// MERGE INTO on a raw-blob table: updating a non-blob column should succeed,
+/// and the blob data should be preserved.
+#[tokio::test]
+async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
+    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+
+    exec(
+        &handler,
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Alice', X'4141'), \
+         (2, 'Bob', X'4242')",
+    )
+    .await;
+
+    ctx_exec(
+        &handler,
+        "CREATE TABLE src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
+    )
+    .await;
+
+    exec(
+        &handler,
+        "MERGE INTO paimon.test_db.t t \
+         USING src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET name = s.name",
+    )
+    .await;
+
+    let rows = query_id_name_picture(
+        &handler,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Updated".into(), Some(b"AA".to_vec())),
+            (2, "Bob".into(), Some(b"BB".to_vec())),
+        ]
+    );
+}
+
 /// Reference: BlobTestBase "Blob: merge-into rejects updating raw-data BLOB column"
 #[tokio::test]
 async fn test_merge_into_rejects_raw_blob_update() {
@@ -357,6 +399,58 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
         .unwrap();
     let rows = collect_id_name(&batches);
     assert_eq!(rows, vec![(1, "Updated".into()), (2, "Bob".into())]);
+}
+
+/// Merge-into on a descriptor blob table: updating the blob column should succeed.
+#[tokio::test]
+async fn test_merge_into_updates_blob_on_descriptor_table() {
+    let (_tmp, handler) = setup(
+        "CREATE TABLE paimon.test_db.t (\
+            id INT, \
+            name STRING, \
+            picture BLOB \
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true', \
+            'blob-descriptor-field' = 'picture'\
+         )",
+    )
+    .await;
+
+    exec(
+        &handler,
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Alice', X'4141'), \
+         (2, 'Bob', X'4242')",
+    )
+    .await;
+
+    ctx_exec(
+        &handler,
+        "CREATE TABLE src (id INT, picture BYTEA) AS VALUES (1, X'4343')",
+    )
+    .await;
+
+    exec(
+        &handler,
+        "MERGE INTO paimon.test_db.t t \
+         USING src s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET picture = s.picture",
+    )
+    .await;
+
+    let rows = query_id_name_picture(
+        &handler,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Alice".into(), Some(b"CC".to_vec())),
+            (2, "Bob".into(), Some(b"BB".to_vec())),
+        ]
+    );
 }
 
 /// Blob with partitioned table.

@@ -119,18 +119,8 @@ impl DataType {
         }
     }
 
-    /// Returns whether this type is or contains (recursively) a [`BlobType`].
-    pub fn contains_blob_type(&self) -> bool {
-        match self {
-            DataType::Blob(_) => true,
-            DataType::Array(v) => v.element_type.contains_blob_type(),
-            DataType::Map(v) => {
-                v.key_type.contains_blob_type() || v.value_type.contains_blob_type()
-            }
-            DataType::Multiset(v) => v.element_type.contains_blob_type(),
-            DataType::Row(v) => v.fields.iter().any(|f| f.data_type().contains_blob_type()),
-            _ => false,
-        }
+    pub fn is_blob_type(&self) -> bool {
+        matches!(self, DataType::Blob(_))
     }
 
     /// Returns whether this type is nullable.

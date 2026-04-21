@@ -72,7 +72,7 @@ impl AppendBlobFileWriter {
         let mut blob_writers = Vec::new();
 
         for (idx, field) in table_fields.iter().enumerate() {
-            let is_blob = field.data_type().contains_blob_type();
+            let is_blob = field.data_type().is_blob_type();
             let is_descriptor = blob_descriptor_fields.contains(field.name());
 
             if is_blob && !is_descriptor {

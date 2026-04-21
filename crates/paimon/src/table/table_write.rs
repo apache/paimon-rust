@@ -24,7 +24,7 @@ use crate::arrow::build_target_arrow_schema;
 use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataField, DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    BinaryRow, CoreOptions, DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -42,12 +42,6 @@ use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-fn schema_contains_blob_type(fields: &[DataField]) -> bool {
-    fields
-        .iter()
-        .any(|field| field.data_type().contains_blob_type())
-}
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
@@ -122,14 +116,27 @@ impl TableWrite {
     ) -> crate::Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
-
-        if schema_contains_blob_type(schema.fields()) && !schema.primary_keys().is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: "TableWrite does not support BlobType with primary keys".to_string(),
-            });
-        }
-
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
+
+        for name in &blob_descriptor_fields {
+            match schema.fields().iter().find(|f| f.name() == name) {
+                None => {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("blob-descriptor-field '{name}' does not exist in schema"),
+                        source: None,
+                    });
+                }
+                Some(f) if !f.data_type().is_blob_type() => {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "blob-descriptor-field '{name}' is not a top-level BLOB field"
+                        ),
+                        source: None,
+                    });
+                }
+                _ => {}
+            }
+        }
 
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
@@ -260,9 +267,10 @@ impl TableWrite {
             ))
         };
 
-        let has_blob_fields = schema.fields().iter().any(|f| {
-            f.data_type().contains_blob_type() && !blob_descriptor_fields.contains(f.name())
-        });
+        let has_blob_fields = schema
+            .fields()
+            .iter()
+            .any(|f| f.data_type().is_blob_type() && !blob_descriptor_fields.contains(f.name()));
 
         Ok(Self {
             table: table.clone(),
@@ -671,8 +679,8 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
-        BinaryRowBuilder, BlobType, DataField, DataType, DecimalType, IntType,
-        LocalZonedTimestampType, RowType, Schema, TableSchema, TimestampType, VarCharType,
+        BinaryRowBuilder, BlobType, DataType, DecimalType, IntType, LocalZonedTimestampType,
+        Schema, TableSchema, TimestampType, VarCharType,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::Int32Array;
@@ -730,21 +738,6 @@ mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
             .option("data-evolution.enabled", "true")
-            .build()
-            .unwrap();
-        TableSchema::new(0, &schema)
-    }
-
-    fn test_nested_blob_table_schema() -> TableSchema {
-        let schema = Schema::builder()
-            .column(
-                "payload",
-                DataType::Row(RowType::new(vec![DataField::new(
-                    1,
-                    "blob".into(),
-                    DataType::Blob(BlobType::new()),
-                )])),
-            )
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -820,51 +813,12 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_pk_blob_table() {
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("payload", DataType::Blob(BlobType::new()))
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .option("data-evolution.enabled", "true")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            test_file_io(),
-            Identifier::new("default", "test_blob_table"),
-            "memory:/test_blob_table".to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let err = TableWrite::new(&table, "test-user".to_string(), false)
-            .err()
-            .unwrap();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
-        );
-    }
-
-    #[test]
     fn test_allows_append_blob_table() {
         let table = Table::new(
             test_file_io(),
             Identifier::new("default", "test_blob_table"),
             "memory:/test_blob_table".to_string(),
             test_blob_table_schema(),
-            None,
-        );
-
-        assert!(TableWrite::new(&table, "test-user".to_string(), false).is_ok());
-    }
-
-    #[test]
-    fn test_allows_nested_blob_table() {
-        let table = Table::new(
-            test_file_io(),
-            Identifier::new("default", "test_nested_blob_table"),
-            "memory:/test_nested_blob_table".to_string(),
-            test_nested_blob_table_schema(),
             None,
         );
 
