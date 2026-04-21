@@ -227,6 +227,7 @@ impl KeyValueFileWriter {
             physical_schema.clone(),
             &self.config.file_compression,
             self.config.file_compression_zstd_level,
+            None,
         )
         .await?;
 

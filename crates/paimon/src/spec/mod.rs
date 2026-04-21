@@ -22,6 +22,9 @@
 mod binary_row;
 pub use binary_row::*;
 
+mod blob_descriptor;
+pub use blob_descriptor::BlobDescriptor;
+
 mod data_file;
 pub use data_file::*;
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
@@ -59,6 +59,8 @@ const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
+const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
+const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 
 /// Merge engine for primary-key tables.
 ///
@@ -324,6 +326,13 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    pub fn blob_target_file_size(&self) -> i64 {
+        self.options
+            .get("blob.target-file-size")
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or_else(|| self.target_file_size())
+    }
+
     /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
     /// Default is "parquet".
     pub fn file_format(&self) -> &str {
@@ -368,6 +377,24 @@ impl<'a> CoreOptions<'a> {
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
+    }
+
+    /// When true, blob field reads return serialized BlobDescriptor bytes
+    /// instead of actual blob bytes. Default is false.
+    pub fn blob_as_descriptor(&self) -> bool {
+        self.options
+            .get(BLOB_AS_DESCRIPTOR_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Comma-separated BLOB field names stored as serialized BlobDescriptor
+    /// bytes inline in normal data files (no .blob files for these fields).
+    pub fn blob_descriptor_fields(&self) -> HashSet<String> {
+        self.options
+            .get(BLOB_DESCRIPTOR_FIELD_OPTION)
+            .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
+            .unwrap_or_default()
     }
 }
 

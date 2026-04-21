@@ -22,14 +22,15 @@ use super::data_file_reader::{
 use crate::arrow::build_target_arrow_schema;
 use crate::io::FileIO;
 use crate::spec::{DataField, DataFileMeta, DataType, ROW_ID_FIELD_NAME};
+use crate::table::blob_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
 use crate::{DataSplit, Error};
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Whether the files in a split can be read independently (no column-wise merge needed).
@@ -70,6 +71,8 @@ pub(crate) struct DataEvolutionReader {
     row_id_index: Option<usize>,
     /// Arrow schema for the full output (including _ROW_ID if requested).
     output_schema: Arc<arrow_schema::Schema>,
+    blob_as_descriptor: bool,
+    blob_descriptor_fields: HashSet<String>,
 }
 
 impl DataEvolutionReader {
@@ -79,6 +82,8 @@ impl DataEvolutionReader {
         table_schema_id: i64,
         table_fields: Vec<DataField>,
         read_type: Vec<DataField>,
+        blob_as_descriptor: bool,
+        blob_descriptor_fields: HashSet<String>,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -96,6 +101,8 @@ impl DataEvolutionReader {
             file_read_type,
             row_id_index,
             output_schema,
+            blob_as_descriptor,
+            blob_descriptor_fields,
         })
     }
 
@@ -154,6 +161,11 @@ impl DataEvolutionReader {
                         )?;
                         while let Some(batch) = stream.next().await {
                             let batch = batch?;
+                            let batch = if !self.blob_as_descriptor && !self.blob_descriptor_fields.is_empty() {
+                                resolve_descriptor_columns(batch, &self.blob_descriptor_fields, &self.file_io).await?
+                            } else {
+                                batch
+                            };
                             let num_rows = batch.num_rows();
                             if let Some(idx) = self.row_id_index {
                                 if !has_row_id {
@@ -245,6 +257,8 @@ impl DataEvolutionReader {
         let prepared_group = prepared_group.clone();
         let read_type = self.file_read_type.clone();
         let table_fields = self.table_fields.clone();
+        let blob_descriptor_fields = self.blob_descriptor_fields.clone();
+        let blob_as_descriptor = self.blob_as_descriptor;
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
         const MERGE_BATCH_SIZE: usize = 1024;
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -257,7 +271,7 @@ impl DataEvolutionReader {
                 &prepared_group.files,
             )
             .await?;
-            let source_plan = build_source_plan(&prepared_group, &file_infos, &read_type)?;
+            let source_plan = build_source_plan(&prepared_group, &file_infos, &read_type, &blob_descriptor_fields)?;
 
             let active_source_indices: Vec<usize> = source_plan
                 .sources
@@ -310,6 +324,7 @@ impl DataEvolutionReader {
                             schema_manager.clone(),
                             table_schema_id,
                             table_fields.clone(),
+                            blob_as_descriptor,
                         )
                         .map(Some)
                     }
@@ -413,6 +428,11 @@ impl DataEvolutionReader {
                             source: Some(Box::new(e)),
                         }
                     })?;
+                let merged = if !blob_as_descriptor && !blob_descriptor_fields.is_empty() {
+                    resolve_descriptor_columns(merged, &blob_descriptor_fields, &file_io).await?
+                } else {
+                    merged
+                };
                 yield merged;
             }
         }
@@ -420,6 +440,43 @@ impl DataEvolutionReader {
     }
 }
 
+async fn resolve_descriptor_columns(
+    batch: RecordBatch,
+    blob_descriptor_fields: &HashSet<String>,
+    file_io: &FileIO,
+) -> crate::Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if blob_descriptor_fields.contains(field.name()) {
+            if let Some(bin_col) = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+            {
+                let resolved =
+                    super::blob_file_writer::resolve_blob_column(bin_col, file_io).await?;
+                columns.push(Arc::new(resolved));
+                changed = true;
+                continue;
+            }
+        }
+        columns.push(batch.column(idx).clone());
+    }
+
+    if !changed {
+        return Ok(batch);
+    }
+
+    RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to rebuild RecordBatch after resolving blob descriptors: {e}"),
+        source: Some(Box::new(e)),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn open_source_stream(
     split: &DataSplit,
     source: &FieldSource,
@@ -428,6 +485,7 @@ fn open_source_stream(
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    blob_as_descriptor: bool,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let file_reader = DataFileReader::new(
         file_io,
@@ -436,7 +494,8 @@ fn open_source_stream(
         table_fields,
         source.read_fields().to_vec(),
         Vec::new(),
-    );
+    )
+    .with_blob_as_descriptor(blob_as_descriptor);
 
     match source {
         FieldSource::DataFile {
@@ -593,6 +652,7 @@ fn build_source_plan(
     prepared_group: &PreparedMergeGroup,
     file_infos: &[ResolvedFileInfo],
     read_type: &[DataField],
+    blob_descriptor_fields: &HashSet<String>,
 ) -> crate::Result<SourcePlan> {
     let mut sources = Vec::new();
     let mut normal_source_indices: HashMap<usize, usize> = HashMap::new();
@@ -642,7 +702,9 @@ fn build_source_plan(
 
     let mut column_plan = Vec::with_capacity(read_type.len());
     for field in read_type {
-        let source_idx = if matches!(field.data_type(), DataType::Blob(_)) {
+        let source_idx = if matches!(field.data_type(), DataType::Blob(_))
+            && !blob_descriptor_fields.contains(field.name())
+        {
             blob_source_indices.get(&field.id()).copied()
         } else {
             select_normal_provider(
@@ -924,10 +986,6 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
     Ok(data_files)
 }
 
-fn is_blob_file_name(file_name: &str) -> bool {
-    file_name.to_ascii_lowercase().ends_with(".blob")
-}
-
 fn count_selected_rows(
     first_row_id: i64,
     row_count: i64,
@@ -1152,7 +1210,8 @@ mod tests {
             DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(2, "payload".to_string(), DataType::Blob(BlobType::new())),
         ];
-        let source_plan = build_source_plan(&prepared_group, &file_infos, &read_type).unwrap();
+        let source_plan =
+            build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new()).unwrap();
 
         assert_eq!(source_plan.sources.len(), 2);
         assert_eq!(source_plan.column_plan, vec![Some((0, 0)), Some((1, 0))]);
@@ -1191,7 +1250,8 @@ mod tests {
             DataField::new(2, "payload".to_string(), DataType::Blob(BlobType::new())),
         ];
 
-        let source_plan = build_source_plan(&prepared_group, &file_infos, &read_type).unwrap();
+        let source_plan =
+            build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new()).unwrap();
 
         assert_eq!(source_plan.column_plan, vec![Some((0, 0)), Some((2, 0))]);
     }
@@ -1227,7 +1287,8 @@ mod tests {
             DataField::new(2, "payload".to_string(), DataType::Blob(BlobType::new())),
             DataField::new(3, "payload2".to_string(), DataType::Blob(BlobType::new())),
         ];
-        let source_plan = build_source_plan(&prepared_group, &file_infos, &read_type).unwrap();
+        let source_plan =
+            build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new()).unwrap();
 
         assert_eq!(source_plan.sources.len(), 3);
         assert_eq!(

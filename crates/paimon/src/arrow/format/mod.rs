@@ -16,7 +16,7 @@
 // under the License.
 
 mod avro;
-mod blob;
+pub(crate) mod blob;
 mod orc;
 mod parquet;
 #[cfg(feature = "vortex")]
@@ -88,12 +88,18 @@ pub(crate) trait FormatFileWriter: Send {
 }
 
 /// Create a format reader based on the file extension.
-pub(crate) fn create_format_reader(path: &str) -> crate::Result<Box<dyn FormatFileReader>> {
+pub(crate) fn create_format_reader(
+    path: &str,
+    blob_as_descriptor: bool,
+) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         Ok(Box::new(parquet::ParquetFormatReader))
     } else if lower.ends_with(".blob") {
-        Ok(Box::new(blob::BlobFormatReader))
+        Ok(Box::new(blob::BlobFormatReader::new(
+            path.to_string(),
+            blob_as_descriptor,
+        )))
     } else if lower.ends_with(".orc") {
         Ok(Box::new(orc::OrcFormatReader))
     } else if lower.ends_with(".avro") {
@@ -117,12 +123,17 @@ pub(crate) async fn create_format_writer(
     schema: SchemaRef,
     compression: &str,
     zstd_level: i32,
+    file_io: Option<crate::io::FileIO>,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
     let path = output.location();
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         Ok(Box::new(
             parquet::ParquetFormatWriter::new(output, schema, compression, zstd_level).await?,
+        ))
+    } else if lower.ends_with(".blob") {
+        Ok(Box::new(
+            blob::BlobFormatWriter::new(output, file_io).await?,
         ))
     } else {
         #[cfg(feature = "vortex")]

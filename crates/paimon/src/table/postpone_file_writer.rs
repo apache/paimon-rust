@@ -228,6 +228,7 @@ impl PostponeFileWriter {
             physical_schema,
             &self.config.file_compression,
             self.config.file_compression_zstd_level,
+            None,
         )
         .await?;
         self.current_writer = Some(writer);

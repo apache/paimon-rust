@@ -155,6 +155,7 @@ impl DataFileWriter {
             schema,
             &self.file_compression,
             self.file_compression_zstd_level,
+            Some(self.file_io.clone()),
         )
         .await?;
         self.current_writer = Some(writer);

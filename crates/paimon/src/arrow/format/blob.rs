@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter};
 use crate::arrow::build_target_arrow_schema;
-use crate::io::FileRead;
-use crate::spec::{DataField, DataType};
+use crate::io::{FileRead, FileWrite};
+use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::BinaryBuilder;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,7 +30,19 @@ use futures::{StreamExt, TryStreamExt};
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(crate) struct BlobFormatReader;
+pub(crate) struct BlobFormatReader {
+    descriptor_mode: bool,
+    file_path: String,
+}
+
+impl BlobFormatReader {
+    pub(crate) fn new(file_path: String, descriptor_mode: bool) -> Self {
+        Self {
+            descriptor_mode,
+            file_path,
+        }
+    }
+}
 
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
@@ -59,19 +71,42 @@ impl FormatFileReader for BlobFormatReader {
         let mut selection = RowSelectionCursor::new(blob_index.num_rows(), row_selection)?;
         let project_values = !read_fields.is_empty();
 
-        Ok(try_stream! {
-            while let Some(positions) = selection.next_batch(batch_size) {
-                let batch = read_blob_batch(
-                    reader.as_ref(),
-                    &blob_index,
-                    &target_schema,
-                    &positions,
-                    project_values,
-                ).await?;
-                yield batch;
+        if self.descriptor_mode {
+            let file_path = self.file_path.clone();
+            Ok(try_stream! {
+                while let Some(positions) = selection.next_batch(batch_size) {
+                    let batch = if project_values {
+                        build_descriptor_batch(&blob_index, &target_schema, &positions, &file_path)?
+                    } else {
+                        RecordBatch::try_new_with_options(
+                            target_schema.clone(),
+                            Vec::new(),
+                            &RecordBatchOptions::new().with_row_count(Some(positions.len())),
+                        )
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!("Failed to build empty blob RecordBatch: {e}"),
+                            source: Some(Box::new(e)),
+                        })?
+                    };
+                    yield batch;
+                }
             }
+            .boxed())
+        } else {
+            Ok(try_stream! {
+                while let Some(positions) = selection.next_batch(batch_size) {
+                    let batch = read_blob_batch(
+                        reader.as_ref(),
+                        &blob_index,
+                        &target_schema,
+                        &positions,
+                        project_values,
+                    ).await?;
+                    yield batch;
+                }
+            }
+            .boxed())
         }
-        .boxed())
     }
 }
 
@@ -101,6 +136,44 @@ fn validate_read_fields(read_fields: &[DataField]) -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_descriptor_batch(
+    blob_index: &BlobFileIndex,
+    target_schema: &Arc<arrow_schema::Schema>,
+    positions: &[usize],
+    file_path: &str,
+) -> crate::Result<RecordBatch> {
+    let mut builder = BinaryBuilder::new();
+    for &position in positions {
+        let entry = blob_index
+            .entry(position)
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "Blob row selection referenced out-of-range position {position} for {} rows",
+                    blob_index.num_rows()
+                ),
+                source: None,
+            })?;
+
+        match entry.inline_data_range() {
+            None => builder.append_null(),
+            Some(range) => {
+                let descriptor = BlobDescriptor::new(
+                    file_path.to_string(),
+                    range.start as i64,
+                    (range.end - range.start) as i64,
+                );
+                builder.append_value(descriptor.serialize());
+            }
+        }
+    }
+
+    let columns: Vec<ArrayRef> = vec![Arc::new(builder.finish())];
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build descriptor blob RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 async fn read_blob_batch(
@@ -516,6 +589,183 @@ fn decode_varint(bytes: &[u8]) -> crate::Result<(i64, usize)> {
     })
 }
 
+// --- Blob Format Writer ---
+
+const BLOB_MAGIC_NUMBER_BYTES: [u8; 4] = 1481511375_i32.to_le_bytes();
+
+pub(crate) struct BlobFormatWriter {
+    writer: Box<dyn FileWrite>,
+    file_io: Option<crate::io::FileIO>,
+    bytes_written: u64,
+    lengths: Vec<i64>,
+}
+
+impl BlobFormatWriter {
+    pub(crate) async fn new(
+        output: &crate::io::OutputFile,
+        file_io: Option<crate::io::FileIO>,
+    ) -> crate::Result<Self> {
+        let writer = output.writer().await?;
+        Ok(Self {
+            writer,
+            file_io,
+            bytes_written: 0,
+            lengths: Vec::new(),
+        })
+    }
+}
+
+const BLOB_WRITE_BUFFER_SIZE: u64 = 8 * 1024 * 1024; // 8 MB
+
+#[async_trait]
+impl FormatFileWriter for BlobFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "BlobFormatWriter expects a single Binary column".to_string(),
+                source: None,
+            })?;
+
+        for row_idx in 0..col.len() {
+            if col.is_null(row_idx) {
+                self.lengths.push(-1);
+                continue;
+            }
+
+            let value = col.value(row_idx);
+
+            if BlobDescriptor::is_blob_descriptor(value) {
+                let desc = BlobDescriptor::deserialize(value)?;
+                let payload_len = desc.length() as u64;
+                let entry_length = (payload_len + BLOB_ENTRY_OVERHEAD) as i64;
+                self.lengths.push(entry_length);
+
+                let file_io = self.file_io.as_ref().ok_or_else(|| Error::DataInvalid {
+                    message:
+                        "BlobFormatWriter received a BlobDescriptor but has no FileIO to resolve it"
+                            .to_string(),
+                    source: None,
+                })?;
+                let input = file_io.new_input(desc.uri())?;
+                let reader = input.reader().await?;
+
+                let mut hasher = crc32fast::Hasher::new();
+
+                hasher.update(&BLOB_MAGIC_NUMBER_BYTES);
+                self.writer
+                    .write(Bytes::copy_from_slice(&BLOB_MAGIC_NUMBER_BYTES))
+                    .await?;
+
+                // Stream payload in chunks to avoid loading entire blob into memory
+                let start = desc.offset() as u64;
+                let end = start + payload_len;
+                let mut pos = start;
+                while pos < end {
+                    let chunk_end = (pos + BLOB_WRITE_BUFFER_SIZE).min(end);
+                    let chunk = reader.read(pos..chunk_end).await?;
+                    hasher.update(&chunk);
+                    self.writer.write(chunk).await?;
+                    pos = chunk_end;
+                }
+
+                let entry_length_bytes = entry_length.to_le_bytes();
+                hasher.update(&entry_length_bytes);
+                self.writer
+                    .write(Bytes::copy_from_slice(&entry_length_bytes))
+                    .await?;
+
+                self.writer
+                    .write(Bytes::copy_from_slice(&hasher.finalize().to_le_bytes()))
+                    .await?;
+
+                self.bytes_written += entry_length as u64;
+            } else {
+                let entry_length = (value.len() + BLOB_ENTRY_OVERHEAD as usize) as i64;
+                self.lengths.push(entry_length);
+
+                let mut buf = Vec::with_capacity(entry_length as usize);
+                let mut hasher = crc32fast::Hasher::new();
+
+                hasher.update(&BLOB_MAGIC_NUMBER_BYTES);
+                buf.extend_from_slice(&BLOB_MAGIC_NUMBER_BYTES);
+
+                hasher.update(value);
+                buf.extend_from_slice(value);
+
+                let entry_length_bytes = entry_length.to_le_bytes();
+                hasher.update(&entry_length_bytes);
+                buf.extend_from_slice(&entry_length_bytes);
+
+                buf.extend_from_slice(&hasher.finalize().to_le_bytes());
+
+                self.writer.write(Bytes::from(buf)).await?;
+                self.bytes_written += entry_length as u64;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.bytes_written as usize
+    }
+
+    fn in_progress_size(&self) -> usize {
+        0
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
+        let index_bytes = encode_delta_varints_write(&self.lengths);
+        let index_length = index_bytes.len() as i32;
+
+        self.writer.write(Bytes::from(index_bytes)).await?;
+        self.writer
+            .write(Bytes::copy_from_slice(&index_length.to_le_bytes()))
+            .await?;
+        self.writer
+            .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
+            .await?;
+
+        let total = self.bytes_written + index_length as u64 + BLOB_FOOTER_SIZE;
+        self.writer.close().await?;
+        Ok(total)
+    }
+}
+
+fn encode_delta_varints_write(values: &[i64]) -> Vec<u8> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut encoded = Vec::new();
+    let mut previous = 0_i64;
+    for (idx, &value) in values.iter().enumerate() {
+        let delta = if idx == 0 { value } else { value - previous };
+        previous = value;
+        encode_varint(delta, &mut encoded);
+    }
+    encoded
+}
+
+fn encode_varint(value: i64, out: &mut Vec<u8>) {
+    let mut remaining = ((value << 1) ^ (value >> 63)) as u64;
+    while (remaining & !0x7f) != 0 {
+        out.push(((remaining & 0x7f) as u8) | 0x80);
+        remaining >>= 7;
+    }
+    out.push(remaining as u8);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,7 +792,7 @@ mod tests {
             "payload".to_string(),
             DataType::Blob(BlobType::new()),
         )];
-        let reader = BlobFormatReader;
+        let reader = BlobFormatReader::new(String::new(), false);
         let file_bytes = load_blob_fixture("blob-basic.blob");
 
         let stream = reader
@@ -568,7 +818,7 @@ mod tests {
             vec![Some(b"world".to_vec()), Some(Vec::new())]
         );
 
-        let selected = reader
+        let selected = BlobFormatReader::new(String::new(), false)
             .read_batch_stream(
                 Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
                 file_bytes.len() as u64,
@@ -600,7 +850,7 @@ mod tests {
         let file_bytes = load_blob_fixture("blob-basic.blob");
         let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
 
-        let batches = BlobFormatReader
+        let batches = BlobFormatReader::new(String::new(), false)
             .read_batch_stream(
                 Box::new(reader.clone()),
                 file_bytes.len() as u64,
@@ -637,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_reader_supports_empty_projection() {
-        let reader = BlobFormatReader;
+        let reader = BlobFormatReader::new(String::new(), false);
         let file_bytes = load_blob_fixture("blob-basic.blob");
 
         let batches = reader
@@ -664,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_reader_rejects_out_of_range_selection() {
-        let reader = BlobFormatReader;
+        let reader = BlobFormatReader::new(String::new(), false);
         let file_bytes = load_blob_fixture("blob-basic.blob");
         let read_fields = vec![DataField::new(
             0,
@@ -690,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_reader_rejects_wrong_field_family() {
-        let reader = BlobFormatReader;
+        let reader = BlobFormatReader::new(String::new(), false);
         let file_bytes = load_blob_fixture("blob-basic.blob");
         let read_fields = vec![DataField::new(
             0,
@@ -720,7 +970,7 @@ mod tests {
         let last = file_bytes.len() - 1;
         file_bytes[last] = 2;
 
-        let result = BlobFormatReader
+        let result = BlobFormatReader::new(String::new(), false)
             .read_batch_stream(
                 Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
                 file_bytes.len() as u64,
@@ -759,7 +1009,7 @@ mod tests {
         file_bytes[footer_start..footer_start + 4]
             .copy_from_slice(&(replacement.len() as i32).to_le_bytes());
 
-        let result = BlobFormatReader
+        let result = BlobFormatReader::new(String::new(), false)
             .read_batch_stream(
                 Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
                 file_bytes.len() as u64,
@@ -778,6 +1028,26 @@ mod tests {
         assert!(
             matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("minimum overhead"))
         );
+    }
+
+    #[test]
+    fn test_varint_encode_decode_roundtrip() {
+        let values = vec![21, -1, 0, i64::MAX, i64::MIN + 1, 127, -128, 300, -300];
+        for &v in &values {
+            let mut buf = Vec::new();
+            encode_varint(v, &mut buf);
+            let (decoded, consumed) = decode_varint(&buf).unwrap();
+            assert_eq!(decoded, v, "roundtrip failed for {v}");
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[test]
+    fn test_delta_varints_encode_decode_roundtrip() {
+        let values = vec![21, -1, 0, 100, -50, 1000];
+        let encoded = encode_delta_varints_write(&values);
+        let decoded = decode_delta_varints(&encoded).unwrap();
+        assert_eq!(decoded, values);
     }
 
     fn basic_blob_rows() -> [Option<&'static [u8]>; 4] {

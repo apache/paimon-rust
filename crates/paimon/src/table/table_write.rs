@@ -20,11 +20,13 @@
 //! Reference: [pypaimon TableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
+use crate::arrow::build_target_arrow_schema;
 use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     BinaryRow, CoreOptions, DataField, DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
+use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
@@ -50,6 +52,7 @@ fn schema_contains_blob_type(fields: &[DataField]) -> bool {
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
     Append(DataFileWriter),
+    AppendBlob(AppendBlobFileWriter),
     KeyValue(KeyValueFileWriter),
     Postpone(PostponeFileWriter),
 }
@@ -58,6 +61,7 @@ impl FileWriter {
     async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         match self {
             FileWriter::Append(w) => w.write(batch).await,
+            FileWriter::AppendBlob(w) => w.write(batch).await,
             FileWriter::KeyValue(w) => w.write(batch).await,
             FileWriter::Postpone(w) => w.write(batch).await,
         }
@@ -66,6 +70,7 @@ impl FileWriter {
     async fn prepare_commit(mut self) -> Result<Vec<DataFileMeta>> {
         match self {
             FileWriter::Append(ref mut w) => w.prepare_commit().await,
+            FileWriter::AppendBlob(ref mut w) => w.prepare_commit().await,
             FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
             FileWriter::Postpone(ref mut w) => w.prepare_commit().await,
         }
@@ -88,6 +93,7 @@ pub struct TableWrite {
     partition_keys: Vec<String>,
     schema_id: i64,
     target_file_size: i64,
+    blob_target_file_size: i64,
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
@@ -102,6 +108,10 @@ pub struct TableWrite {
     bucket_assigner: BucketAssignerEnum,
     /// Whether this is an overwrite operation (skip seq/index restore).
     is_overwrite: bool,
+    /// Blob descriptor fields (stored inline in parquet, not as separate .blob files).
+    blob_descriptor_fields: HashSet<String>,
+    /// Whether the table has non-descriptor blob fields requiring AppendBlobFileWriter.
+    has_blob_fields: bool,
 }
 
 impl TableWrite {
@@ -113,13 +123,13 @@ impl TableWrite {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
-        if schema_contains_blob_type(schema.fields()) {
+        if schema_contains_blob_type(schema.fields()) && !schema.primary_keys().is_empty() {
             return Err(crate::Error::Unsupported {
-                message:
-                    "TableWrite does not support BlobType yet; blob write path is out of scope"
-                        .to_string(),
+                message: "TableWrite does not support BlobType with primary keys".to_string(),
             });
         }
+
+        let blob_descriptor_fields = core_options.blob_descriptor_fields();
 
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
@@ -161,6 +171,7 @@ impl TableWrite {
             });
         }
         let target_file_size = core_options.target_file_size();
+        let blob_target_file_size = core_options.blob_target_file_size();
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
@@ -249,6 +260,10 @@ impl TableWrite {
             ))
         };
 
+        let has_blob_fields = schema.fields().iter().any(|f| {
+            f.data_type().contains_blob_type() && !blob_descriptor_fields.contains(f.name())
+        });
+
         Ok(Self {
             table: table.clone(),
             partition_writers: HashMap::new(),
@@ -256,6 +271,7 @@ impl TableWrite {
             partition_keys,
             schema_id: schema.id(),
             target_file_size,
+            blob_target_file_size,
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
@@ -268,6 +284,8 @@ impl TableWrite {
             commit_user,
             bucket_assigner,
             is_overwrite,
+            blob_descriptor_fields,
+            has_blob_fields,
         })
     }
 
@@ -522,7 +540,7 @@ impl TableWrite {
         let partition_path = self.resolve_partition_path(&partition_bytes)?;
 
         let writer = if self.primary_key_indices.is_empty() {
-            self.create_append_writer(partition_path, bucket)
+            self.create_append_writer(partition_path, bucket)?
         } else if bucket == POSTPONE_BUCKET {
             self.create_postpone_writer(partition_path, bucket)
         } else {
@@ -545,22 +563,43 @@ impl TableWrite {
     }
 
     /// Create an append-only writer for non-PK tables.
-    fn create_append_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
-        FileWriter::Append(DataFileWriter::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-            partition_path,
-            bucket,
-            self.schema_id,
-            self.target_file_size,
-            self.file_compression.clone(),
-            self.file_compression_zstd_level,
-            self.write_buffer_size,
-            self.file_format.clone(),
-            Some(0), // file_source: APPEND
-            None,    // first_row_id: assigned by commit
-            None,    // write_cols: full-row write
-        ))
+    fn create_append_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
+        if self.has_blob_fields {
+            let fields = self.table.schema().fields();
+            let input_schema = build_target_arrow_schema(fields)?;
+            Ok(FileWriter::AppendBlob(AppendBlobFileWriter::new(
+                self.table.file_io().clone(),
+                self.table.location().to_string(),
+                partition_path,
+                bucket,
+                self.schema_id,
+                self.target_file_size,
+                self.blob_target_file_size,
+                self.file_compression.clone(),
+                self.file_compression_zstd_level,
+                self.write_buffer_size,
+                self.file_format.clone(),
+                &input_schema,
+                fields,
+                &self.blob_descriptor_fields,
+            )))
+        } else {
+            Ok(FileWriter::Append(DataFileWriter::new(
+                self.table.file_io().clone(),
+                self.table.location().to_string(),
+                partition_path,
+                bucket,
+                self.schema_id,
+                self.target_file_size,
+                self.file_compression.clone(),
+                self.file_compression_zstd_level,
+                self.write_buffer_size,
+                self.file_format.clone(),
+                Some(0),
+                None,
+                None,
+            )))
+        }
     }
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
@@ -781,12 +820,20 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_blob_table() {
+    fn test_rejects_pk_blob_table() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
         let table = Table::new(
             test_file_io(),
             Identifier::new("default", "test_blob_table"),
             "memory:/test_blob_table".to_string(),
-            test_blob_table_schema(),
+            TableSchema::new(0, &schema),
             None,
         );
 
@@ -799,7 +846,20 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_nested_blob_table() {
+    fn test_allows_append_blob_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_blob_table"),
+            "memory:/test_blob_table".to_string(),
+            test_blob_table_schema(),
+            None,
+        );
+
+        assert!(TableWrite::new(&table, "test-user".to_string(), false).is_ok());
+    }
+
+    #[test]
+    fn test_allows_nested_blob_table() {
         let table = Table::new(
             test_file_io(),
             Identifier::new("default", "test_nested_blob_table"),
@@ -808,12 +868,73 @@ mod tests {
             None,
         );
 
-        let err = TableWrite::new(&table, "test-user".to_string(), false)
-            .err()
-            .unwrap();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("BlobType"))
+        assert!(TableWrite::new(&table, "test-user".to_string(), false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_blob_write_and_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_blob_write";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_blob_table"),
+            table_path.to_string(),
+            test_blob_table_schema(),
+            None,
         );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("payload", ArrowDataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow_array::BinaryArray::from(vec![
+                    Some(b"hello" as &[u8]),
+                    None,
+                    Some(b"world"),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        // Should have 2 files: 1 parquet (normal cols) + 1 blob (payload)
+        assert_eq!(messages[0].new_files.len(), 2);
+
+        let parquet_files: Vec<_> = messages[0]
+            .new_files
+            .iter()
+            .filter(|f| f.file_name.ends_with(".parquet"))
+            .collect();
+        let blob_files: Vec<_> = messages[0]
+            .new_files
+            .iter()
+            .filter(|f| f.file_name.ends_with(".blob"))
+            .collect();
+        assert_eq!(parquet_files.len(), 1);
+        assert_eq!(blob_files.len(), 1);
+
+        assert_eq!(parquet_files[0].row_count, 3);
+        assert_eq!(blob_files[0].row_count, 3);
+        assert_eq!(blob_files[0].write_cols, Some(vec!["payload".to_string()]));
+
+        // Commit and verify snapshot
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
     }
 
     #[tokio::test]

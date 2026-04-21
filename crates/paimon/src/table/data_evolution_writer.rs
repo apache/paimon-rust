@@ -61,12 +61,12 @@ pub struct DataEvolutionWriter {
     matched_batches: Vec<RecordBatch>,
 }
 
-fn schema_contains_blob_type(table: &Table) -> bool {
-    table
-        .schema()
-        .fields()
-        .iter()
-        .any(|field| field.data_type().contains_blob_type())
+fn schema_contains_non_descriptor_blob(table: &Table) -> bool {
+    let core_options = CoreOptions::new(table.schema().options());
+    let descriptor_fields = core_options.blob_descriptor_fields();
+    table.schema().fields().iter().any(|field| {
+        field.data_type().contains_blob_type() && !descriptor_fields.contains(field.name())
+    })
 }
 
 impl DataEvolutionWriter {
@@ -81,11 +81,9 @@ impl DataEvolutionWriter {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
-        if schema_contains_blob_type(table) {
+        if schema_contains_non_descriptor_blob(table) {
             return Err(crate::Error::Unsupported {
-                message:
-                    "MERGE INTO does not support BlobType yet; blob write path is out of scope"
-                        .to_string(),
+                message: "MERGE INTO does not support non-descriptor BlobType fields".to_string(),
             });
         }
 
@@ -485,9 +483,11 @@ impl DataEvolutionPartialWriter {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
-        if schema_contains_blob_type(table) {
+        if schema_contains_non_descriptor_blob(table) {
             return Err(crate::Error::Unsupported {
-                message: "DataEvolutionPartialWriter does not support BlobType yet".to_string(),
+                message:
+                    "DataEvolutionPartialWriter does not support non-descriptor BlobType fields"
+                        .to_string(),
             });
         }
 

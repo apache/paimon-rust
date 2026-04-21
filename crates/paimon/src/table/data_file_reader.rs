@@ -41,6 +41,7 @@ pub(crate) struct DataFileReader {
     table_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
+    blob_as_descriptor: bool,
 }
 
 impl DataFileReader {
@@ -59,7 +60,13 @@ impl DataFileReader {
             table_fields,
             read_type,
             predicates,
+            blob_as_descriptor: false,
         }
+    }
+
+    pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
+        self.blob_as_descriptor = blob_as_descriptor;
+        self
     }
 
     /// Take a stream of DataSplits and read every data file in each split.
@@ -145,6 +152,7 @@ impl DataFileReader {
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
+        let blob_as_descriptor = self.blob_as_descriptor;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -187,7 +195,7 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader(&path_to_read)?;
+            let format_reader = create_format_reader(&path_to_read, blob_as_descriptor)?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
             let local_ranges = row_ranges.as_ref().map(|ranges| {

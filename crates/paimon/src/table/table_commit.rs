@@ -614,6 +614,9 @@ impl TableCommit {
 
     /// Assign row tracking metadata: snapshot ID as sequence number, and
     /// first_row_id for new APPEND files that don't already have one.
+    /// Normal files advance the main counter. Blob files (identified by file name)
+    /// use per-column counters starting from the same base, since each blob column
+    /// rolls independently.
     fn assign_row_tracking_meta(
         &self,
         snapshot_id: i64,
@@ -622,6 +625,8 @@ impl TableCommit {
     ) -> (Vec<ManifestEntry>, i64) {
         let mut result = Vec::with_capacity(entries.len());
         let mut start = first_row_id_start;
+        // Per blob column (write_cols key) counter, each starts from first_row_id_start.
+        let mut blob_starts: HashMap<Vec<String>, i64> = HashMap::new();
 
         for entry in entries {
             let mut entry = entry.with_sequence_number(snapshot_id, snapshot_id);
@@ -629,9 +634,17 @@ impl TableCommit {
                 && entry.file().file_source == Some(0) // APPEND
                 && entry.file().first_row_id.is_none()
             {
-                let row_count = entry.file().row_count;
-                entry = entry.with_first_row_id(start);
-                start += row_count;
+                let is_blob_file =
+                    crate::table::blob_file_writer::is_blob_file_name(&entry.file().file_name);
+                if is_blob_file {
+                    let key = entry.file().write_cols.clone().unwrap_or_default();
+                    let blob_start = blob_starts.entry(key).or_insert(first_row_id_start);
+                    entry = entry.with_first_row_id(*blob_start);
+                    *blob_start += entry.file().row_count;
+                } else {
+                    entry = entry.with_first_row_id(start);
+                    start += entry.file().row_count;
+                }
             }
             result.push(entry);
         }

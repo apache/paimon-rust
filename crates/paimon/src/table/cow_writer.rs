@@ -227,6 +227,7 @@ impl CopyOnWriteMergeWriter {
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let write_buffer_size = core_options.write_parquet_buffer_size();
+        let file_format = core_options.file_format().to_string();
         let schema_id = schema.id();
 
         let update_columns = &self.update_columns;
@@ -236,6 +237,7 @@ impl CopyOnWriteMergeWriter {
         let partition_keys = &partition_keys;
         let partition_computer = &partition_computer;
         let file_compression = file_compression.as_str();
+        let file_format = file_format.as_str();
 
         // Process each affected file in parallel
         let rewrite_futures: Vec<_> = self
@@ -297,6 +299,7 @@ impl CopyOnWriteMergeWriter {
                         file_compression.to_string(),
                         file_compression_zstd_level,
                         write_buffer_size,
+                        file_format.to_string(),
                         Some(0),
                         None,
                         None,

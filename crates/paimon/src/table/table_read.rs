@@ -88,7 +88,7 @@ impl<'a> TableRead<'a> {
         }
 
         if core_options.data_evolution_enabled() {
-            self.read_with_evolution(data_splits)
+            self.read_with_evolution(data_splits, &core_options)
         } else {
             self.read_raw(data_splits)
         }
@@ -154,6 +154,7 @@ impl<'a> TableRead<'a> {
     fn read_with_evolution(
         &self,
         data_splits: &[DataSplit],
+        core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let reader = DataEvolutionReader::new(
             self.table.file_io.clone(),
@@ -161,6 +162,8 @@ impl<'a> TableRead<'a> {
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
+            core_options.blob_as_descriptor(),
+            core_options.blob_descriptor_fields(),
         )?;
         reader.read(data_splits)
     }
