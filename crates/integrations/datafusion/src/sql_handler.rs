@@ -164,8 +164,16 @@ impl PaimonSqlHandler {
             }
         }
 
-        // Partition keys (already extracted and validated before parsing)
+        // Partition keys (extracted and validated before parsing)
         if !partition_keys.is_empty() {
+            let col_names: Vec<&str> = ct.columns.iter().map(|c| c.name.value.as_str()).collect();
+            for pk in &partition_keys {
+                if !col_names.contains(&pk.as_str()) {
+                    return Err(DataFusionError::Plan(format!(
+                        "PARTITIONED BY column '{pk}' is not defined in the table"
+                    )));
+                }
+            }
             builder = builder.partition_keys(partition_keys);
         }
 
@@ -365,6 +373,84 @@ impl PaimonSqlHandler {
     }
 }
 
+/// Find `PARTITIONED BY` keyword position, skipping string literals and comments.
+/// All offsets are byte-safe because SQL keywords and quote/comment delimiters are ASCII.
+fn find_partitioned_by(sql: &str) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < len && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => {
+                if sql[i..].len() >= 11 && sql[i..i + 11].eq_ignore_ascii_case("PARTITIONED") {
+                    let after = sql[i + 11..].trim_start();
+                    if after.len() >= 2 && after[..2].eq_ignore_ascii_case("BY") {
+                        let by_end = i + 11 + (sql[i + 11..].len() - after.len()) + 2;
+                        return Some((i, by_end));
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Parse a single partition column token, handling quoted identifiers.
+fn parse_partition_column(token: &str) -> DFResult<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(DataFusionError::Plan(
+            "Empty column name in PARTITIONED BY".to_string(),
+        ));
+    }
+
+    let first = trimmed.as_bytes()[0];
+    if first == b'"' || first == b'`' {
+        let close = if first == b'"' { b'"' } else { b'`' };
+        if let Some(end) = trimmed[1..].find(close as char) {
+            let after_quote = trimmed[1 + end + 1..].trim();
+            if after_quote.is_empty() {
+                return Ok(trimmed[1..1 + end].to_string());
+            }
+        }
+        return Err(DataFusionError::Plan(format!(
+            "Invalid quoted identifier in PARTITIONED BY: {trimmed}"
+        )));
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    match parts.len() {
+        1 => Ok(parts[0].to_string()),
+        _ => Err(DataFusionError::Plan(format!(
+            "PARTITIONED BY column '{}' should not specify a type. \
+             Use column references only, e.g. PARTITIONED BY ({})",
+            parts[0], parts[0]
+        ))),
+    }
+}
+
 /// Extract `PARTITIONED BY (col1, col2, ...)` from SQL before parsing.
 ///
 /// Paimon only allows column references (no types) in PARTITIONED BY.
@@ -372,21 +458,12 @@ impl PaimonSqlHandler {
 /// we extract and validate the clause ourselves, then strip it from the SQL
 /// so sqlparser can parse the rest.
 fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
-    let upper = sql.to_uppercase();
-    let Some(kw_start) = upper.find("PARTITIONED") else {
+    let Some((kw_start, by_end)) = find_partitioned_by(sql) else {
         return Ok((sql.to_string(), vec![]));
     };
 
-    let after_partitioned = &upper[kw_start + "PARTITIONED".len()..];
-    let after_trimmed = after_partitioned.trim_start();
-    if !after_trimmed.starts_with("BY") {
-        return Ok((sql.to_string(), vec![]));
-    }
-
-    let by_offset =
-        kw_start + "PARTITIONED".len() + (after_partitioned.len() - after_trimmed.len()) + 2;
-    let after_by = sql[by_offset..].trim_start();
-    let by_ws = by_offset + (sql[by_offset..].len() - after_by.len());
+    let after_by = sql[by_end..].trim_start();
+    let paren_start = by_end + (sql[by_end..].len() - after_by.len());
 
     if !after_by.starts_with('(') {
         return Err(DataFusionError::Plan(
@@ -394,7 +471,6 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
         ));
     }
 
-    let paren_start = by_ws;
     let inner_start = paren_start + 1;
     let mut depth = 1;
     let mut paren_end = None;
@@ -424,22 +500,7 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
 
     let mut partition_keys = Vec::new();
     for token in inner.split(',') {
-        let parts: Vec<&str> = token.split_whitespace().collect();
-        match parts.len() {
-            1 => partition_keys.push(parts[0].to_string()),
-            0 => {
-                return Err(DataFusionError::Plan(
-                    "Empty column name in PARTITIONED BY".to_string(),
-                ))
-            }
-            _ => {
-                return Err(DataFusionError::Plan(format!(
-                    "PARTITIONED BY column '{}' should not specify a type. \
-                     Use column references only, e.g. PARTITIONED BY ({})",
-                    parts[0], parts[0]
-                )));
-            }
-        }
+        partition_keys.push(parse_partition_column(token)?);
     }
 
     let clause_end = paren_end + 1;
@@ -1485,5 +1546,134 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 1);
         // No catalog calls
         assert!(catalog.take_calls().is_empty());
+    }
+
+    // ==================== extract_partition_by tests ====================
+
+    #[test]
+    fn test_extract_partition_by_no_clause() {
+        let (rewritten, keys) = extract_partition_by("CREATE TABLE t (id INT)").unwrap();
+        assert_eq!(rewritten, "CREATE TABLE t (id INT)");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_by_single_column() {
+        let (rewritten, keys) = extract_partition_by(
+            "CREATE TABLE t (id INT, dt STRING) PARTITIONED BY (dt) WITH ('k'='v')",
+        )
+        .unwrap();
+        assert_eq!(keys, vec!["dt"]);
+        assert!(!rewritten.contains("PARTITIONED"));
+        assert!(rewritten.contains("WITH"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_multiple_columns() {
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (a INT, b INT, c INT) PARTITIONED BY (a, b)")
+                .unwrap();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_mixed_case() {
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (dt INT) Partitioned by (dt)").unwrap();
+        assert_eq!(keys, vec!["dt"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_rejects_typed_column() {
+        let err = extract_partition_by("CREATE TABLE t (dt STRING) PARTITIONED BY (dt STRING)")
+            .unwrap_err();
+        assert!(err.to_string().contains("should not specify a type"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_empty_parens() {
+        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY ()").unwrap_err();
+        assert!(err.to_string().contains("at least one column"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_unmatched_paren() {
+        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY (dt").unwrap_err();
+        assert!(err.to_string().contains("Unmatched"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_skips_string_literal() {
+        let sql =
+            "CREATE TABLE t (id INT) WITH ('note' = 'PARTITIONED BY (x)') PARTITIONED BY (id)";
+        let (rewritten, keys) = extract_partition_by(sql).unwrap();
+        assert_eq!(keys, vec!["id"]);
+        assert!(rewritten.contains("WITH"));
+        assert!(rewritten.contains("'PARTITIONED BY (x)'"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_skips_line_comment() {
+        let sql = "CREATE TABLE t (id INT) -- PARTITIONED BY (x)\nPARTITIONED BY (id)";
+        let (_, keys) = extract_partition_by(sql).unwrap();
+        assert_eq!(keys, vec!["id"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_double_quoted_identifier() {
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (\"order\" INT) PARTITIONED BY (\"order\")")
+                .unwrap();
+        assert_eq!(keys, vec!["order"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_backtick_quoted_identifier() {
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (`order` INT) PARTITIONED BY (`order`)").unwrap();
+        assert_eq!(keys, vec!["order"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_no_paren_after_by() {
+        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY dt").unwrap_err();
+        assert!(err.to_string().contains("Expected '('"));
+    }
+
+    #[test]
+    fn test_extract_partition_by_only_partitioned_no_by() {
+        let (rewritten, keys) = extract_partition_by("CREATE TABLE partitioned (id INT)").unwrap();
+        assert_eq!(rewritten, "CREATE TABLE partitioned (id INT)");
+        assert!(keys.is_empty());
+    }
+
+    // ==================== partition key validation tests ====================
+
+    #[tokio::test]
+    async fn test_create_table_partition_key_not_in_columns() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        let err = handler
+            .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (nonexistent)")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is not defined in the table"));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_partition_key_matches_column() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog.clone());
+        handler
+            .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (dt)")
+            .await
+            .unwrap();
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
+            assert_eq!(schema.partition_keys(), &["dt"]);
+        } else {
+            panic!("expected CreateTable call");
+        }
     }
 }
