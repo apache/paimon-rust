@@ -31,7 +31,7 @@ use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind, IndexManifest,
-    ManifestEntry, PartialUpdateConfig, PartitionComputer, Predicate, Snapshot, TimeTravelSelector,
+    ManifestEntry, PartitionComputer, Predicate, Snapshot, TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -247,9 +247,8 @@ fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
 pub(super) fn can_push_down_limit_hint_for_scan(
     data_predicates: &[Predicate],
     row_ranges: Option<&[RowRange]>,
-    partial_update_enabled: bool,
 ) -> bool {
-    !partial_update_enabled && data_predicates.is_empty() && row_ranges.is_none()
+    data_predicates.is_empty() && row_ranges.is_none()
 }
 
 fn should_skip_level_zero_for_scan(
@@ -517,9 +516,7 @@ impl<'a> TableScan<'a> {
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
-        let partial_update_enabled = !self.table.schema().primary_keys().is_empty()
-            && PartialUpdateConfig::new(self.table.schema().options()).is_enabled();
-        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges, partial_update_enabled)
+        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
     }
 
     async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
@@ -901,25 +898,6 @@ mod tests {
         )
     }
 
-    fn limit_test_partial_update_pk_table() -> Table {
-        let file_io = FileIOBuilder::new("file").build().unwrap();
-        let schema = PaimonSchema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("merge-engine", "partial-update")
-            .build()
-            .unwrap();
-        let table_schema = TableSchema::new(0, &schema);
-        Table::new(
-            file_io,
-            Identifier::new("test_db", "partial_update_table"),
-            "/tmp/test-partial-update-table".to_string(),
-            table_schema,
-            None,
-        )
-    }
-
     fn limit_test_split(file_name: &str, row_count: i64) -> DataSplit {
         let mut file = test_data_file_meta(Vec::new(), Vec::new(), Vec::new(), row_count);
         file.file_name = file_name.to_string();
@@ -995,17 +973,6 @@ mod tests {
         assert_eq!(
             split_file_names(&pruned),
             vec!["a.parquet", "b.parquet", "c.parquet"]
-        );
-    }
-
-    #[test]
-    fn test_partial_update_disables_limit_pushdown_hint() {
-        let table = limit_test_partial_update_pk_table();
-        let scan = TableScan::new(&table, None, vec![], None, Some(10), None);
-
-        assert!(
-            !scan.can_push_down_limit_hint(None),
-            "PK partial-update tables must not use limit pushdown hints"
         );
     }
 

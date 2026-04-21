@@ -722,18 +722,33 @@ mod tests {
         assert_eq!(ranges[0].to(), 5);
     }
 
-    #[test]
-    fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
+    #[tokio::test]
+    async fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
         let table = partial_update_dv_pk_table();
-        let err = match TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
-            .to_arrow(&[])
-        {
-            Ok(_) => panic!("partial-update+DV read should fail fast"),
-            Err(err) => err,
-        };
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("/tmp/test-partial-update-dv-read-builder/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 1, 0)])
+            .with_data_deletion_files(vec![Some(crate::table::source::DeletionFile::new(
+                "/tmp/test-partial-update-dv-read-builder/index/dv".to_string(),
+                0,
+                0,
+                None,
+            ))])
+            .build()
+            .unwrap();
+        let err = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
 
         assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion vectors")),
             "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
         );
     }

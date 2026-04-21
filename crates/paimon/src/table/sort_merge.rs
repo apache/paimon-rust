@@ -26,7 +26,7 @@
 //! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
 //! - Arrow-row: `RowConverter` for efficient key comparison
 
-use crate::spec::RowKind;
+use crate::spec::{PartialUpdateConfig, RowKind};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
@@ -36,6 +36,7 @@ use arrow_select::interleave::interleave;
 use async_stream::try_stream;
 use futures::StreamExt;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -77,8 +78,8 @@ pub(crate) struct MergeRow {
     pub user_sequences: Vec<Option<i128>>,
 }
 
+#[cfg(test)]
 impl MergeRow {
-    #[allow(dead_code)]
     fn source_batch<'a>(
         &self,
         batch_buffer: &'a [BufferedBatch],
@@ -108,7 +109,6 @@ pub(crate) enum MergeResult {
     /// Reuse an existing source row from the batch buffer.
     SourceRow { batch_idx: usize, row_idx: usize },
     /// Emit a synthesized one-row batch matching the merge output schema.
-    #[allow(dead_code)]
     MaterializedRow(RecordBatch),
     /// Omit this key from the output.
     Omit,
@@ -182,7 +182,18 @@ impl MergeFunction for DeduplicateMergeFunction {
 /// non-null value ordered by user sequence (if configured) then system sequence.
 ///
 /// DELETE / UPDATE_BEFORE rows are treated as unsupported in this mode.
-pub(crate) struct PartialUpdateMergeFunction;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartialUpdateMergeFunction(());
+
+impl PartialUpdateMergeFunction {
+    pub(crate) fn new(
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+    ) -> crate::Result<Self> {
+        PartialUpdateConfig::new(table_options).validate_runtime_mode(true, table_name)?;
+        Ok(Self(()))
+    }
+}
 
 impl MergeFunction for PartialUpdateMergeFunction {
     fn merge(
@@ -479,7 +490,7 @@ impl SortMergeReaderBuilder {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -829,6 +840,7 @@ mod tests {
     use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn make_schema() -> SchemaRef {
@@ -1593,7 +1605,7 @@ mod tests {
             vec![],
             vec![3, 4],
             output_schema,
-            Box::new(PartialUpdateMergeFunction),
+            Box::new(PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap()),
         )
         .build()
         .unwrap()
@@ -1674,7 +1686,7 @@ mod tests {
             vec![],
             vec![3],
             output_schema,
-            Box::new(PartialUpdateMergeFunction),
+            Box::new(PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap()),
         )
         .build()
         .unwrap()
@@ -1686,6 +1698,25 @@ mod tests {
             err,
             Error::Unsupported { message }
             if message.contains("partial-update basic mode does not support DELETE or UPDATE_BEFORE")
+        ));
+    }
+
+    #[test]
+    fn test_partial_update_merge_function_new_rejects_unsupported_options() {
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.price.aggregate-function".to_string(),
+                "last_non_null".to_string(),
+            ),
+        ]);
+
+        let err = PartialUpdateMergeFunction::new(&options, "default.t").unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { message }
+            if message.contains("fields.price.aggregate-function")
         ));
     }
 }

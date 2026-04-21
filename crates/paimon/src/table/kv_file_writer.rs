@@ -31,7 +31,7 @@ use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     extract_datum_from_arrow, BinaryRowBuilder, DataFileMeta, DataType, MergeEngine,
-    EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    PartialUpdateConfig, EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::Result;
 use arrow_array::{Int64Array, Int8Array, RecordBatch};
@@ -39,6 +39,7 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn, SortOptions};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Internal writer for primary-key tables that buffers data in memory,
@@ -59,6 +60,8 @@ pub(crate) struct KeyValueFileWriter {
 /// Configuration for [`KeyValueFileWriter`], grouping file-location, schema,
 /// and key/merge parameters.
 pub(crate) struct KeyValueWriteConfig {
+    pub table_name: String,
+    pub table_options: HashMap<String, String>,
     pub table_location: String,
     pub partition_path: String,
     pub bucket: i32,
@@ -75,6 +78,8 @@ pub(crate) struct KeyValueWriteConfig {
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
+    pub dynamic_bucket_enabled: bool,
+    pub deletion_vectors_enabled: bool,
 }
 
 impl KeyValueFileWriter {
@@ -82,15 +87,38 @@ impl KeyValueFileWriter {
         file_io: FileIO,
         config: KeyValueWriteConfig,
         next_sequence_number: i64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if config.merge_engine == MergeEngine::PartialUpdate {
+            PartialUpdateConfig::new(&config.table_options)
+                .validate_runtime_mode(true, &config.table_name)?;
+
+            if config.deletion_vectors_enabled {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Table '{}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet",
+                        config.table_name
+                    ),
+                });
+            }
+
+            if config.dynamic_bucket_enabled {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Table '{}' uses merge-engine=partial-update with bucket=-1, which is not supported yet; currently only fixed-bucket partial-update is supported",
+                        config.table_name
+                    ),
+                });
+            }
+        }
+
+        Ok(Self {
             file_io,
             config,
             next_sequence_number,
             buffer: Vec::new(),
             buffer_bytes: 0,
             written_files: Vec::new(),
-        }
+        })
     }
 
     /// Buffer a RecordBatch. Flushes when buffer exceeds write_buffer_size.
@@ -501,26 +529,41 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::IntType;
     use arrow_array::{Int32Array, UInt32Array};
+    use std::collections::HashMap;
+
+    fn test_write_config(merge_engine: MergeEngine) -> KeyValueWriteConfig {
+        let mut table_options = HashMap::new();
+        if merge_engine == MergeEngine::PartialUpdate {
+            table_options.insert("merge-engine".to_string(), "partial-update".to_string());
+        }
+
+        KeyValueWriteConfig {
+            table_name: "default.test_table".to_string(),
+            table_options,
+            table_location: "memory:/kv-test".to_string(),
+            partition_path: String::new(),
+            bucket: 0,
+            schema_id: 0,
+            file_compression: "none".to_string(),
+            file_compression_zstd_level: 0,
+            write_buffer_size: 1024,
+            file_format: "parquet".to_string(),
+            primary_key_indices: vec![0],
+            primary_key_types: vec![DataType::Int(IntType::new())],
+            sequence_field_indices: vec![1],
+            merge_engine,
+            dynamic_bucket_enabled: false,
+            deletion_vectors_enabled: false,
+        }
+    }
 
     fn first_row_writer() -> KeyValueFileWriter {
         KeyValueFileWriter::new(
             FileIOBuilder::new("memory").build().unwrap(),
-            KeyValueWriteConfig {
-                table_location: "memory:/kv-first-row".to_string(),
-                partition_path: String::new(),
-                bucket: 0,
-                schema_id: 0,
-                file_compression: "none".to_string(),
-                file_compression_zstd_level: 0,
-                write_buffer_size: 1024,
-                file_format: "parquet".to_string(),
-                primary_key_indices: vec![0],
-                primary_key_types: vec![DataType::Int(IntType::new())],
-                sequence_field_indices: vec![1],
-                merge_engine: MergeEngine::FirstRow,
-            },
+            test_write_config(MergeEngine::FirstRow),
             0,
         )
+        .unwrap()
     }
 
     #[test]
@@ -565,27 +608,68 @@ mod tests {
         let sorted_indices = UInt32Array::from(vec![0, 1]);
         let writer = KeyValueFileWriter::new(
             FileIOBuilder::new("memory").build().unwrap(),
-            KeyValueWriteConfig {
-                table_location: "memory:/kv-partial-update".to_string(),
-                partition_path: String::new(),
-                bucket: 0,
-                schema_id: 0,
-                file_compression: "none".to_string(),
-                file_compression_zstd_level: 0,
-                write_buffer_size: 1024,
-                file_format: "parquet".to_string(),
-                primary_key_indices: vec![0],
-                primary_key_types: vec![DataType::Int(IntType::new())],
-                sequence_field_indices: vec![1],
-                merge_engine: MergeEngine::PartialUpdate,
-            },
+            test_write_config(MergeEngine::PartialUpdate),
             0,
-        );
+        )
+        .unwrap();
 
         let selected = writer
             .select_flush_indices(&batch, &sorted_indices)
             .unwrap();
 
         assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_new_rejects_partial_update_dynamic_bucket() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.dynamic_bucket_enabled = true;
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message } if message.contains("bucket=-1")
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_partial_update_with_deletion_vectors() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.deletion_vectors_enabled = true;
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("deletion-vectors.enabled=true")
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_unsupported_partial_update_options() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.table_options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.price.aggregate-function".to_string(),
+                "last_non_null".to_string(),
+            ),
+        ]);
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("fields.price.aggregate-function")
+        ));
     }
 }

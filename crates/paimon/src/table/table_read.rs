@@ -21,7 +21,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::spec::{CoreOptions, DataField, MergeEngine, PartialUpdateConfig, Predicate};
+use crate::spec::{CoreOptions, DataField, MergeEngine, Predicate};
 use crate::DataSplit;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -73,42 +73,19 @@ impl<'a> TableRead<'a> {
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
-        let table_name = self.table.identifier().full_name();
-        PartialUpdateConfig::new(self.table.schema().options())
-            .validate_runtime_mode(has_primary_keys, &table_name)?;
         let core_options = CoreOptions::new(self.table.schema.options());
         let merge_engine = core_options.merge_engine()?;
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
-
-        if has_primary_keys
-            && merge_engine == MergeEngine::PartialUpdate
-            && deletion_vectors_enabled
-        {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Table '{table_name}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet"
-                ),
-            });
-        }
 
         // PK table with Deduplicate engine: splits containing level-0 files
         // need KeyValueFileReader for sort-merge dedup; splits with only
         // compacted files (level > 0) can use the faster DataFileReader.
-        // FirstRow engine falls through — scan already skips level-0.
-        if has_primary_keys {
-            return match merge_engine {
-                MergeEngine::Deduplicate => self.read_pk_deduplicate(data_splits, &core_options),
-                MergeEngine::PartialUpdate => {
-                    self.read_pk_partial_update(data_splits, &core_options)
-                }
-                MergeEngine::FirstRow => {
-                    if core_options.data_evolution_enabled() {
-                        self.read_with_evolution(data_splits)
-                    } else {
-                        self.read_raw(data_splits)
-                    }
-                }
-            };
+        if has_primary_keys
+            && matches!(
+                merge_engine,
+                MergeEngine::Deduplicate | MergeEngine::PartialUpdate
+            )
+        {
+            return self.read_pk(data_splits, &core_options);
         }
 
         if core_options.data_evolution_enabled() {
@@ -120,11 +97,15 @@ impl<'a> TableRead<'a> {
 
     /// Read PK table with Deduplicate engine: level-0 splits go through
     /// KeyValueFileReader for sort-merge dedup, compacted splits use DataFileReader.
-    fn read_pk_deduplicate(
+    fn read_pk(
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if core_options.merge_engine()? == MergeEngine::PartialUpdate {
+            return self.read_kv(data_splits, core_options);
+        }
+
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
@@ -149,18 +130,6 @@ impl<'a> TableRead<'a> {
         ])))
     }
 
-    /// Read PK table with PartialUpdate engine via KeyValueFileReader.
-    ///
-    /// Unlike Deduplicate, partial-update rows cannot be safely treated as raw
-    /// rows, so all splits go through the merge reader.
-    fn read_pk_partial_update(
-        &self,
-        data_splits: &[DataSplit],
-        core_options: &CoreOptions,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        self.read_kv(data_splits, core_options)
-    }
-
     /// Read splits via KeyValueFileReader (sort-merge dedup).
     fn read_kv(
         &self,
@@ -170,6 +139,8 @@ impl<'a> TableRead<'a> {
         let reader = KeyValueFileReader::new(
             self.table.file_io.clone(),
             KeyValueReadConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
                 schema_manager: self.table.schema_manager().clone(),
                 table_schema_id: self.table.schema().id(),
                 table_fields: self.table.schema.fields().to_vec(),

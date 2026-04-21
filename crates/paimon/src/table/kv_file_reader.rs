@@ -41,6 +41,7 @@ use arrow_array::RecordBatch;
 
 use async_stream::try_stream;
 use futures::StreamExt;
+use std::collections::HashMap;
 
 /// Reads primary-key table data files using sort-merge deduplication.
 pub(crate) struct KeyValueFileReader {
@@ -51,6 +52,8 @@ pub(crate) struct KeyValueFileReader {
 /// Configuration for [`KeyValueFileReader`], grouping table schema and
 /// key/predicate parameters.
 pub(crate) struct KeyValueReadConfig {
+    pub table_name: String,
+    pub table_options: HashMap<String, String>,
     pub schema_manager: SchemaManager,
     pub table_schema_id: i64,
     pub table_fields: Vec<DataField>,
@@ -92,6 +95,23 @@ impl KeyValueFileReader {
                 predicates: pk_predicates,
                 ..config
             },
+        }
+    }
+
+    fn new_merge_function(
+        merge_engine: MergeEngine,
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+    ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
+        match merge_engine {
+            MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
+            MergeEngine::PartialUpdate => Ok(Box::new(PartialUpdateMergeFunction::new(
+                table_options,
+                table_name,
+            )?)),
+            MergeEngine::FirstRow => Err(Error::Unsupported {
+                message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
+            }),
         }
     }
 
@@ -237,9 +257,12 @@ impl KeyValueFileReader {
 
         let splits: Vec<DataSplit> = data_splits.to_vec();
         let file_io = self.file_io;
+        let merge_engine = self.config.merge_engine;
         let schema_manager = self.config.schema_manager;
         let table_schema_id = self.config.table_schema_id;
         let table_fields = self.config.table_fields;
+        let table_name = self.config.table_name;
+        let table_options = self.config.table_options;
         let predicates = self.config.predicates;
 
         // Build the merge output schema (keys + values, no system columns).
@@ -305,13 +328,7 @@ impl KeyValueFileReader {
                     user_sequence_indices.clone(),
                     value_indices.clone(),
                     merge_output_schema.clone(),
-                    match self.config.merge_engine {
-                        MergeEngine::Deduplicate => Box::new(DeduplicateMergeFunction),
-                        MergeEngine::PartialUpdate => Box::new(PartialUpdateMergeFunction),
-                        MergeEngine::FirstRow => Err(Error::Unsupported {
-                            message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
-                        })?,
-                    },
+                    Self::new_merge_function(merge_engine, &table_options, &table_name)?,
                 )
                 .build()?;
 
