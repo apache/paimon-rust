@@ -702,3 +702,63 @@ async fn test_blob_descriptor_field_resolve_descriptor_value() {
         ]
     );
 }
+
+/// SET 'paimon.blob-as-descriptor' = 'true' should return serialized BlobDescriptor
+/// bytes instead of the actual blob content.
+#[tokio::test]
+async fn test_blob_as_descriptor_dynamic_option() {
+    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+
+    exec(
+        &handler,
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Alice', X'48656C6C6F'), \
+         (2, 'Bob', X'576F726C64')",
+    )
+    .await;
+
+    // Without the option, we get raw blob data.
+    let rows = query_id_name_picture(
+        &handler,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows[0].2, Some(b"Hello".to_vec()));
+
+    // Enable blob-as-descriptor via dynamic option.
+    handler
+        .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+        .await
+        .unwrap();
+
+    let rows = query_id_name_picture(
+        &handler,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+
+    // The returned bytes should be valid BlobDescriptors, not raw data.
+    let desc_bytes = rows[0].2.as_ref().expect("expected descriptor bytes");
+    assert!(
+        BlobDescriptor::is_blob_descriptor(desc_bytes),
+        "expected BlobDescriptor, got raw data"
+    );
+    let desc = BlobDescriptor::deserialize(desc_bytes).expect("failed to deserialize descriptor");
+    assert!(desc.uri().starts_with("file://"), "uri: {}", desc.uri());
+    assert!(desc.length() > 0);
+
+    // RESET should go back to raw data.
+    handler
+        .sql("RESET 'paimon.blob-as-descriptor'")
+        .await
+        .unwrap();
+
+    let rows = query_id_name_picture(
+        &handler,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows[0].2, Some(b"Hello".to_vec()));
+    assert_eq!(rows[1].2, Some(b"World".to_vec()));
+}
