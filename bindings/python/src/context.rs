@@ -37,7 +37,10 @@ fn build_paimon_catalog_provider(
         let options = Options::from_map(catalog_options);
         let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
         let dynamic_options = Arc::new(RwLock::new(HashMap::new()));
-        Ok::<_, PyErr>(Arc::new(PaimonCatalogProvider::new(catalog, dynamic_options)))
+        Ok::<_, PyErr>(Arc::new(PaimonCatalogProvider::new(
+            catalog,
+            dynamic_options,
+        )))
     })
 }
 
