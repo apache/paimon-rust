@@ -39,7 +39,8 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, FromTable, Merge,
-    ObjectName, RenameTableNameKind, SqlOption, Statement, TableFactor, Update,
+    ObjectName, RenameTableNameKind, Reset, ResetStatement, Set, SqlOption, Statement, TableFactor,
+    Update,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -52,6 +53,7 @@ use paimon::spec::{
 };
 
 use crate::error::to_datafusion_error;
+use crate::DynamicOptions;
 
 /// Wraps a [`SessionContext`] and a Paimon [`Catalog`] to handle DDL statements
 /// that DataFusion does not natively support (e.g. ALTER TABLE).
@@ -68,6 +70,8 @@ pub struct PaimonSqlHandler {
     catalog: Arc<dyn Catalog>,
     /// The catalog name registered in the SessionContext (used to strip the catalog prefix).
     catalog_name: String,
+    /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
+    dynamic_options: DynamicOptions,
 }
 
 impl PaimonSqlHandler {
@@ -76,16 +80,36 @@ impl PaimonSqlHandler {
         catalog: Arc<dyn Catalog>,
         catalog_name: impl Into<String>,
     ) -> Self {
+        Self::with_dynamic_options(ctx, catalog, catalog_name, Default::default())
+    }
+
+    /// Creates a new handler with shared dynamic options.
+    ///
+    /// Use this when the same `DynamicOptions` is also passed to
+    /// [`PaimonCatalogProvider::with_dynamic_options`] so that `SET` mutations
+    /// are visible to subsequent table scans.
+    pub fn with_dynamic_options(
+        ctx: SessionContext,
+        catalog: Arc<dyn Catalog>,
+        catalog_name: impl Into<String>,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
         Self {
             ctx,
             catalog,
             catalog_name: catalog_name.into(),
+            dynamic_options,
         }
     }
 
     /// Returns a reference to the inner [`SessionContext`].
     pub fn ctx(&self) -> &SessionContext {
         &self.ctx
+    }
+
+    /// Returns a reference to the shared dynamic options.
+    pub fn dynamic_options(&self) -> &DynamicOptions {
+        &self.dynamic_options
     }
 
     /// Execute a SQL statement. ALTER TABLE is handled by Paimon directly;
@@ -122,6 +146,40 @@ impl PaimonSqlHandler {
             Statement::Merge(merge) => self.handle_merge_into(merge).await,
             Statement::Update(update) => self.handle_update(update).await,
             Statement::Delete(delete) => self.handle_delete(delete).await,
+            Statement::Set(Set::SingleAssignment {
+                variable, values, ..
+            }) => {
+                let key = variable.to_string();
+                let key = key.trim_matches('\'').trim_matches('"');
+                if let Some(paimon_key) = key.strip_prefix("paimon.") {
+                    let value = values
+                        .first()
+                        .ok_or_else(|| DataFusionError::Plan("SET requires a value".to_string()))?
+                        .to_string();
+                    let value = value
+                        .strip_prefix('\'')
+                        .and_then(|s| s.strip_suffix('\''))
+                        .unwrap_or(&value)
+                        .to_string();
+                    self.dynamic_options
+                        .write()
+                        .unwrap()
+                        .insert(paimon_key.to_string(), value);
+                    return ok_result(&self.ctx);
+                }
+                self.ctx.sql(sql).await
+            }
+            Statement::Reset(ResetStatement {
+                reset: Reset::ConfigurationParameter(name),
+            }) => {
+                let key = name.to_string();
+                let key = key.trim_matches('\'').trim_matches('"');
+                if let Some(paimon_key) = key.strip_prefix("paimon.") {
+                    self.dynamic_options.write().unwrap().remove(paimon_key);
+                    return ok_result(&self.ctx);
+                }
+                self.ctx.sql(sql).await
+            }
             _ => self.ctx.sql(sql).await,
         }
     }
@@ -1772,5 +1830,86 @@ mod tests {
         } else {
             panic!("expected CreateTable call");
         }
+    }
+
+    // ==================== SET / RESET dynamic options tests ====================
+
+    #[tokio::test]
+    async fn test_set_paimon_option() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        handler
+            .sql("SET 'paimon.scan.version' = '1'")
+            .await
+            .unwrap();
+        let opts = handler.dynamic_options().read().unwrap();
+        assert_eq!(opts.get("scan.version").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn test_set_paimon_option_overwrites() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        handler
+            .sql("SET 'paimon.scan.version' = '1'")
+            .await
+            .unwrap();
+        handler
+            .sql("SET 'paimon.scan.version' = '2'")
+            .await
+            .unwrap();
+        let opts = handler.dynamic_options().read().unwrap();
+        assert_eq!(opts.get("scan.version").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn test_reset_paimon_option() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        handler
+            .sql("SET 'paimon.scan.version' = '1'")
+            .await
+            .unwrap();
+        handler.sql("RESET 'paimon.scan.version'").await.unwrap();
+        let opts = handler.dynamic_options().read().unwrap();
+        assert!(opts.get("scan.version").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_non_paimon_option_delegates() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        // DataFusion handles non-paimon SET; should not error and should not
+        // appear in dynamic_options.
+        let _ = handler.sql("SET datafusion.optimizer.max_passes = 3").await;
+        let opts = handler.dynamic_options().read().unwrap();
+        assert!(opts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_multiple_paimon_options() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        handler
+            .sql("SET 'paimon.scan.version' = '1'")
+            .await
+            .unwrap();
+        handler
+            .sql("SET 'paimon.scan.timestamp-millis' = '1000'")
+            .await
+            .unwrap();
+        let opts = handler.dynamic_options().read().unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.get("scan.version").unwrap(), "1");
+        assert_eq!(opts.get("scan.timestamp-millis").unwrap(), "1000");
+    }
+
+    #[tokio::test]
+    async fn test_reset_nonexistent_paimon_option_is_noop() {
+        let catalog = Arc::new(MockCatalog::new());
+        let handler = make_handler(catalog);
+        handler.sql("RESET 'paimon.scan.version'").await.unwrap();
+        let opts = handler.dynamic_options().read().unwrap();
+        assert!(opts.is_empty());
     }
 }

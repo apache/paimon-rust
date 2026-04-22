@@ -32,6 +32,7 @@ use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::system_tables;
 use crate::table::PaimonTableProvider;
+use crate::DynamicOptions;
 
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
@@ -41,6 +42,8 @@ use crate::table::PaimonTableProvider;
 pub struct PaimonCatalogProvider {
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
+    /// Session-scoped dynamic options shared with the SQL handler.
+    dynamic_options: DynamicOptions,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -54,7 +57,18 @@ impl PaimonCatalogProvider {
     ///
     /// All data is loaded lazily when accessed.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        PaimonCatalogProvider { catalog }
+        Self::with_dynamic_options(catalog, Default::default())
+    }
+
+    /// Creates a new [`PaimonCatalogProvider`] with shared dynamic options.
+    pub fn with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
+        PaimonCatalogProvider {
+            catalog,
+            dynamic_options,
+        }
     }
 }
 
@@ -81,14 +95,16 @@ impl CatalogProvider for PaimonCatalogProvider {
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = Arc::clone(&self.dynamic_options);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(
-                        Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
-                            as Arc<dyn SchemaProvider>,
-                    ),
+                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                        Arc::clone(&catalog),
+                        name,
+                        dynamic_options,
+                    )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => None,
                     Err(e) => {
                         log::error!("failed to get database '{}': {e}", name);
@@ -106,6 +122,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         _schema: Arc<dyn SchemaProvider>,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = Arc::clone(&self.dynamic_options);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -113,10 +130,11 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(
-                    Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
-                        as Arc<dyn SchemaProvider>,
-                ))
+                Ok(Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                    Arc::clone(&catalog),
+                    name,
+                    dynamic_options,
+                )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
         )
@@ -128,6 +146,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         cascade: bool,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = Arc::clone(&self.dynamic_options);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -135,10 +154,11 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(
-                    Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
-                        as Arc<dyn SchemaProvider>,
-                ))
+                Ok(Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                    Arc::clone(&catalog),
+                    name,
+                    dynamic_options,
+                )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
         )
@@ -154,6 +174,8 @@ pub struct PaimonSchemaProvider {
     catalog: Arc<dyn Catalog>,
     /// Database name this schema represents.
     database: String,
+    /// Session-scoped dynamic options shared with the SQL handler.
+    dynamic_options: DynamicOptions,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -167,7 +189,20 @@ impl Debug for PaimonSchemaProvider {
 impl PaimonSchemaProvider {
     /// Creates a new [`PaimonSchemaProvider`] for the given database.
     pub fn new(catalog: Arc<dyn Catalog>, database: String) -> Self {
-        PaimonSchemaProvider { catalog, database }
+        Self::with_dynamic_options(catalog, database, Default::default())
+    }
+
+    /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
+    pub fn with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        database: String,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
+        PaimonSchemaProvider {
+            catalog,
+            database,
+            dynamic_options,
+        }
     }
 }
 
@@ -207,10 +242,17 @@ impl SchemaProvider for PaimonSchemaProvider {
         }
 
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = Arc::clone(&self.dynamic_options);
         let identifier = Identifier::new(self.database.clone(), base);
         await_with_runtime(async move {
             match catalog.get_table(&identifier).await {
                 Ok(table) => {
+                    let opts = dynamic_options.read().unwrap().clone();
+                    let table = if opts.is_empty() {
+                        table
+                    } else {
+                        table.copy_with_options(opts)
+                    };
                     let provider = PaimonTableProvider::try_new(table)?;
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }

@@ -51,6 +51,16 @@ mod system_tables;
 mod table;
 mod update;
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
+///
+/// Shared across [`PaimonSqlHandler`], [`PaimonCatalogProvider`], and
+/// [`PaimonSchemaProvider`] so that SET/RESET mutations are visible to
+/// subsequent table scans.
+pub type DynamicOptions = Arc<RwLock<HashMap<String, String>>>;
+
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]
