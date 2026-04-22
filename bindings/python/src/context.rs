@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use datafusion::catalog::CatalogProvider;
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
@@ -36,7 +36,8 @@ fn build_paimon_catalog_provider(
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
         let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
-        Ok::<_, PyErr>(Arc::new(PaimonCatalogProvider::new(catalog)))
+        let dynamic_options = Arc::new(RwLock::new(HashMap::new()));
+        Ok::<_, PyErr>(Arc::new(PaimonCatalogProvider::new(catalog, dynamic_options)))
     })
 }
 
