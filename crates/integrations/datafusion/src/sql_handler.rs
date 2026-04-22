@@ -91,7 +91,12 @@ impl PaimonSqlHandler {
     /// Execute a SQL statement. ALTER TABLE is handled by Paimon directly;
     /// everything else is delegated to DataFusion.
     pub async fn sql(&self, sql: &str) -> DFResult<DataFrame> {
-        let (rewritten_sql, partition_keys) = extract_partition_by(sql)?;
+        let is_create_table = looks_like_create_table(sql);
+        let (rewritten_sql, partition_keys) = if is_create_table {
+            extract_partition_by(sql)?
+        } else {
+            (sql.to_string(), vec![])
+        };
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, &rewritten_sql)
             .map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))?;
@@ -373,8 +378,19 @@ impl PaimonSqlHandler {
     }
 }
 
+/// Quick check whether the SQL looks like a CREATE TABLE statement.
+fn looks_like_create_table(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let upper = &trimmed[..trimmed.len().min(30)];
+    let mut it = upper.split_ascii_whitespace();
+    matches!(
+        (it.next(), it.next()),
+        (Some(c), Some(t))
+        if c.eq_ignore_ascii_case("CREATE") && t.eq_ignore_ascii_case("TABLE")
+    )
+}
+
 /// Find `PARTITIONED BY` keyword position, skipping string literals and comments.
-/// All offsets are byte-safe because SQL keywords and quote/comment delimiters are ASCII.
 fn find_partitioned_by(sql: &str) -> Option<(usize, usize)> {
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -402,14 +418,31 @@ fn find_partitioned_by(sql: &str) -> Option<(usize, usize)> {
                     i += 1;
                 }
             }
-            _ => {
-                if sql[i..].len() >= 11 && sql[i..i + 11].eq_ignore_ascii_case("PARTITIONED") {
-                    let after = sql[i + 11..].trim_start();
-                    if after.len() >= 2 && after[..2].eq_ignore_ascii_case("BY") {
-                        let by_end = i + 11 + (sql[i + 11..].len() - after.len()) + 2;
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b if b.is_ascii_alphabetic() && i + 11 <= len => {
+                if bytes[i..i + 11].eq_ignore_ascii_case(b"PARTITIONED") {
+                    let rest = &bytes[i + 11..];
+                    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+                    if ws > 0
+                        && i + 11 + ws + 2 <= len
+                        && rest[ws..ws + 2].eq_ignore_ascii_case(b"BY")
+                    {
+                        let by_end = i + 11 + ws + 2;
                         return Some((i, by_end));
                     }
                 }
+                i += 1;
+            }
+            _ => {
                 i += 1;
             }
         }
@@ -1645,6 +1678,25 @@ mod tests {
         let (rewritten, keys) = extract_partition_by("CREATE TABLE partitioned (id INT)").unwrap();
         assert_eq!(rewritten, "CREATE TABLE partitioned (id INT)");
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_extract_partition_by_skips_block_comment() {
+        let sql = "CREATE TABLE t (id INT) /* PARTITIONED BY (x) */ PARTITIONED BY (id)";
+        let (rewritten, keys) = extract_partition_by(sql).unwrap();
+        assert_eq!(keys, vec!["id"]);
+        assert!(rewritten.contains("/* PARTITIONED BY (x) */"));
+    }
+
+    #[test]
+    fn test_looks_like_create_table() {
+        assert!(looks_like_create_table("CREATE TABLE t (id INT)"));
+        assert!(looks_like_create_table("  create  table t (id INT)"));
+        assert!(looks_like_create_table(
+            "CREATE TABLE IF NOT EXISTS t (id INT)"
+        ));
+        assert!(!looks_like_create_table("ALTER TABLE t ADD COLUMN x INT"));
+        assert!(!looks_like_create_table("SELECT 1"));
     }
 
     // ==================== partition key validation tests ====================
