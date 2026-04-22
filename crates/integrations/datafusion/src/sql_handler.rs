@@ -379,15 +379,48 @@ impl PaimonSqlHandler {
 }
 
 /// Quick check whether the SQL looks like a CREATE TABLE statement.
+/// Skips leading whitespace, `--` line comments, and `/* */` block comments.
 fn looks_like_create_table(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    let upper = &trimmed[..trimmed.len().min(30)];
-    let mut it = upper.split_ascii_whitespace();
-    matches!(
-        (it.next(), it.next()),
-        (Some(c), Some(t))
-        if c.eq_ignore_ascii_case("CREATE") && t.eq_ignore_ascii_case("TABLE")
-    )
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    // Skip leading whitespace and comments
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    // Match "CREATE" then whitespace then "TABLE" (all ASCII, byte-safe)
+    if i + 6 > len || !bytes[i..i + 6].eq_ignore_ascii_case(b"CREATE") {
+        return false;
+    }
+    i += 6;
+    if i >= len || !bytes[i].is_ascii_whitespace() {
+        return false;
+    }
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i + 5 <= len && bytes[i..i + 5].eq_ignore_ascii_case(b"TABLE")
 }
 
 /// Find `PARTITIONED BY` keyword position, skipping string literals and comments.
@@ -1693,10 +1726,22 @@ mod tests {
         assert!(looks_like_create_table("CREATE TABLE t (id INT)"));
         assert!(looks_like_create_table("  create  table t (id INT)"));
         assert!(looks_like_create_table(
-            "CREATE TABLE IF NOT EXISTS t (id INT)"
+            "CREATE TABLE IF NOT EXISTS t (id INT)",
+        ));
+        assert!(looks_like_create_table(
+            "/* note */ CREATE TABLE t (id INT)",
+        ));
+        assert!(looks_like_create_table(
+            "-- comment\nCREATE TABLE t (id INT)",
+        ));
+        assert!(looks_like_create_table(
+            "/* a */ /* b */ CREATE TABLE t (id INT)",
         ));
         assert!(!looks_like_create_table("ALTER TABLE t ADD COLUMN x INT"));
         assert!(!looks_like_create_table("SELECT 1"));
+        assert!(!looks_like_create_table(
+            "SELECT aaaaaaaaaaaaaaaaaaaa中文 FROM t",
+        ));
     }
 
     // ==================== partition key validation tests ====================
