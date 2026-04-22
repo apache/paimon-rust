@@ -543,7 +543,10 @@ async fn create_time_travel_context() -> SessionContext {
     let ctx = SessionContext::new_with_config(config);
     ctx.register_catalog(
         "paimon",
-        Arc::new(PaimonCatalogProvider::new(Arc::new(catalog), Default::default())),
+        Arc::new(PaimonCatalogProvider::new(
+            Arc::new(catalog),
+            Default::default(),
+        )),
     );
     ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
         .expect("Failed to register relation planner");
@@ -963,7 +966,10 @@ mod fulltext_tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "paimon",
-            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog), Default::default())),
+            Arc::new(PaimonCatalogProvider::new(
+                Arc::clone(&catalog),
+                Default::default(),
+            )),
         );
         register_full_text_search(&ctx, catalog, "default");
         (ctx, tmp)
