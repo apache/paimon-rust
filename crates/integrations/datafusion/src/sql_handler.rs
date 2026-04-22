@@ -62,7 +62,8 @@ use crate::DynamicOptions;
 ///
 /// # Example
 /// ```ignore
-/// let handler = PaimonSqlHandler::new(ctx, catalog);
+/// let dynamic_options: DynamicOptions = Default::default();
+/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options);
 /// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
 pub struct PaimonSqlHandler {
@@ -75,20 +76,12 @@ pub struct PaimonSqlHandler {
 }
 
 impl PaimonSqlHandler {
-    pub fn new(
-        ctx: SessionContext,
-        catalog: Arc<dyn Catalog>,
-        catalog_name: impl Into<String>,
-    ) -> Self {
-        Self::with_dynamic_options(ctx, catalog, catalog_name, Default::default())
-    }
-
     /// Creates a new handler with shared dynamic options.
     ///
-    /// Use this when the same `DynamicOptions` is also passed to
-    /// [`PaimonCatalogProvider::with_dynamic_options`] so that `SET` mutations
+    /// The same `DynamicOptions` should also be passed to
+    /// [`PaimonCatalogProvider::new`] so that `SET` mutations
     /// are visible to subsequent table scans.
-    pub fn with_dynamic_options(
+    pub fn new(
         ctx: SessionContext,
         catalog: Arc<dyn Catalog>,
         catalog_name: impl Into<String>,
@@ -966,7 +959,7 @@ mod tests {
     }
 
     fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
-        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon")
+        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon", Default::default())
     }
 
     fn assert_sql_type_to_paimon(

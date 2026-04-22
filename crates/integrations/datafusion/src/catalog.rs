@@ -53,18 +53,10 @@ impl Debug for PaimonCatalogProvider {
 }
 
 impl PaimonCatalogProvider {
-    /// Creates a new [`PaimonCatalogProvider`].
+    /// Creates a new [`PaimonCatalogProvider`] with shared dynamic options.
     ///
     /// All data is loaded lazily when accessed.
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self::with_dynamic_options(catalog, Default::default())
-    }
-
-    /// Creates a new [`PaimonCatalogProvider`] with shared dynamic options.
-    pub fn with_dynamic_options(
-        catalog: Arc<dyn Catalog>,
-        dynamic_options: DynamicOptions,
-    ) -> Self {
+    pub fn new(catalog: Arc<dyn Catalog>, dynamic_options: DynamicOptions) -> Self {
         PaimonCatalogProvider {
             catalog,
             dynamic_options,
@@ -100,7 +92,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
                         Arc::clone(&catalog),
                         name,
                         dynamic_options,
@@ -130,7 +122,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
@@ -154,7 +146,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_dynamic_options(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
@@ -187,13 +179,8 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`] for the given database.
-    pub fn new(catalog: Arc<dyn Catalog>, database: String) -> Self {
-        Self::with_dynamic_options(catalog, database, Default::default())
-    }
-
     /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
-    pub fn with_dynamic_options(
+    pub fn new(
         catalog: Arc<dyn Catalog>,
         database: String,
         dynamic_options: DynamicOptions,

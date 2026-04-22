@@ -44,14 +44,14 @@ pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "paimon",
-        Arc::new(PaimonCatalogProvider::with_dynamic_options(
+        Arc::new(PaimonCatalogProvider::new(
             catalog.clone(),
             dynamic_options.clone(),
         )),
     );
     ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
         .expect("Failed to register relation planner");
-    PaimonSqlHandler::with_dynamic_options(ctx, catalog, "paimon", dynamic_options)
+    PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options)
 }
 
 #[allow(dead_code)]
