@@ -450,10 +450,10 @@ impl PaimonSqlHandler {
         let batches = self.ctx.sql(&source.to_string()).await?.collect().await?;
 
         let all_fields = table.schema().fields();
-        let source_fields: Vec<_> = all_fields
+        let expected_source_cols = all_fields
             .iter()
             .filter(|f| !static_partitions.contains_key(f.name()))
-            .collect();
+            .count();
 
         let wb = table.new_write_builder().with_overwrite();
         let mut tw = wb.new_write().map_err(to_datafusion_error)?;
@@ -464,7 +464,7 @@ impl PaimonSqlHandler {
                 continue;
             }
             let augmented =
-                append_partition_columns(batch, &static_partitions, &source_fields, all_fields)?;
+                append_partition_columns(batch, &static_partitions, expected_source_cols, all_fields)?;
             row_count += augmented.num_rows() as u64;
             tw.write_arrow_batch(&augmented)
                 .await
@@ -927,7 +927,7 @@ fn parse_static_partitions(
                         )))
                     }
                 };
-                (col, Some(right.as_ref()))
+                (col, right.as_ref())
             }
             // Dynamic partition: bare column name without value — skip it,
             // the column will be read from the source query.
@@ -956,7 +956,7 @@ fn parse_static_partitions(
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
-        let datum = sql_expr_to_datum(val_expr.unwrap(), field.data_type())?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type())?;
         result.insert(col_name, Some(datum));
     }
 
@@ -1008,37 +1008,35 @@ fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Dat
 }
 
 fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFResult<Datum> {
-    let sign: i8 = if negate { -1 } else { 1 };
+    let s: String = if negate {
+        format!("-{n}")
+    } else {
+        n.to_string()
+    };
     match data_type {
         PaimonDataType::TinyInt(_) => Ok(Datum::TinyInt(
-            sign as i8
-                * n.parse::<i8>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid TINYINT: {e}")))?,
+            s.parse::<i8>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid TINYINT: {e}")))?,
         )),
         PaimonDataType::SmallInt(_) => Ok(Datum::SmallInt(
-            sign as i16
-                * n.parse::<i16>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid SMALLINT: {e}")))?,
+            s.parse::<i16>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid SMALLINT: {e}")))?,
         )),
         PaimonDataType::Int(_) => Ok(Datum::Int(
-            sign as i32
-                * n.parse::<i32>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid INT: {e}")))?,
+            s.parse::<i32>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid INT: {e}")))?,
         )),
         PaimonDataType::BigInt(_) => Ok(Datum::Long(
-            sign as i64
-                * n.parse::<i64>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid BIGINT: {e}")))?,
+            s.parse::<i64>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid BIGINT: {e}")))?,
         )),
         PaimonDataType::Float(_) => Ok(Datum::Float(
-            sign as f32
-                * n.parse::<f32>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid FLOAT: {e}")))?,
+            s.parse::<f32>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid FLOAT: {e}")))?,
         )),
         PaimonDataType::Double(_) => Ok(Datum::Double(
-            sign as f64
-                * n.parse::<f64>()
-                    .map_err(|e| DataFusionError::Plan(format!("Invalid DOUBLE: {e}")))?,
+            s.parse::<f64>()
+                .map_err(|e| DataFusionError::Plan(format!("Invalid DOUBLE: {e}")))?,
         )),
         _ if negate => Err(DataFusionError::Plan(format!(
             "Cannot negate value for type {data_type:?}"
@@ -1053,7 +1051,7 @@ fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFRe
 fn append_partition_columns(
     batch: &RecordBatch,
     partitions: &HashMap<String, Option<Datum>>,
-    source_fields: &[&PaimonDataField],
+    expected_source_cols: usize,
     all_fields: &[PaimonDataField],
 ) -> DFResult<RecordBatch> {
     let num_rows = batch.num_rows();
@@ -1092,11 +1090,11 @@ fn append_partition_columns(
         }
     }
 
-    if source_col_idx != batch.num_columns() || source_col_idx != source_fields.len() {
+    if source_col_idx != batch.num_columns() || source_col_idx != expected_source_cols {
         return Err(DataFusionError::Plan(format!(
             "Source query has {} columns, but expected {} non-partition columns",
             batch.num_columns(),
-            source_fields.len()
+            expected_source_cols
         )));
     }
 

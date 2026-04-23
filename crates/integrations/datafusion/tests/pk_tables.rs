@@ -817,6 +817,115 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
     );
 }
 
+/// INSERT OVERWRITE with PARTITION clause and empty source truncates the partition.
+#[tokio::test]
+async fn test_pk_insert_overwrite_partition_truncate() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_trunc (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_trunc VALUES \
+             ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
+             ('2024-01-02', 3, 'carol')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Overwrite dt='2024-01-01' with empty source — should truncate that partition
+    handler
+        .sql(
+            "INSERT OVERWRITE paimon.test_db.t_trunc PARTITION (dt = '2024-01-01') \
+             SELECT id, name FROM paimon.test_db.t_trunc WHERE false",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = handler
+        .sql("SELECT dt, id, name FROM paimon.test_db.t_trunc ORDER BY dt, id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let dts = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dts.value(i).to_string(),
+                ids.value(i),
+                names.value(i).to_string(),
+            ));
+        }
+    }
+
+    // dt='2024-01-01' truncated, dt='2024-01-02' untouched
+    assert_eq!(
+        rows,
+        vec![("2024-01-02".to_string(), 3, "carol".to_string()),]
+    );
+}
+
+/// PARTITION clause with a non-partition column should fail.
+#[tokio::test]
+async fn test_pk_insert_overwrite_partition_non_partition_column_error() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_err (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    let result = handler
+        .sql(
+            "INSERT OVERWRITE paimon.test_db.t_err PARTITION (name = 'alice') \
+             VALUES (1)",
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not a partition column"),
+        "Expected 'not a partition column' error, got: {err_msg}"
+    );
+}
+
 // ======================= Composite Primary Key =======================
 
 /// Composite PK with multiple columns.
