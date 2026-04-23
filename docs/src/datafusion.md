@@ -41,7 +41,7 @@ use datafusion::prelude::SessionContext;
 use paimon_datafusion::PaimonSqlHandler;
 
 let ctx = SessionContext::new();
-let handler = PaimonSqlHandler::new(ctx, catalog, "paimon");
+let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
 let df = handler.sql("SELECT * FROM paimon.default.my_table").await?;
 df.show().await?;
 ```
@@ -470,7 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create handler (registers catalog provider and relation planner automatically)
     let ctx = SessionContext::new();
-    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon");
+    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
 
     // Create database and table
     handler.sql("CREATE SCHEMA paimon.my_db").await?;

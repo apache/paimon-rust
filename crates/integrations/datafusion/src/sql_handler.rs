@@ -68,7 +68,7 @@ use crate::DynamicOptions;
 /// # Example
 /// ```ignore
 /// let ctx = SessionContext::new();
-/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon");
+/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
 /// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
 pub struct PaimonSqlHandler {
@@ -89,7 +89,7 @@ impl PaimonSqlHandler {
         ctx: SessionContext,
         catalog: Arc<dyn Catalog>,
         catalog_name: impl Into<String>,
-    ) -> Self {
+    ) -> DFResult<Self> {
         let catalog_name = catalog_name.into();
         let dynamic_options: DynamicOptions = Default::default();
         ctx.register_catalog(
@@ -101,14 +101,13 @@ impl PaimonSqlHandler {
         );
         ctx.register_relation_planner(Arc::new(
             crate::relation_planner::PaimonRelationPlanner::new(),
-        ))
-        .expect("Failed to register PaimonRelationPlanner");
-        Self {
+        ))?;
+        Ok(Self {
             ctx,
             catalog,
             catalog_name,
             dynamic_options,
-        }
+        })
     }
 
     /// Returns a reference to the inner [`SessionContext`].
@@ -464,12 +463,8 @@ impl PaimonSqlHandler {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let augmented = append_partition_columns(
-                batch,
-                &static_partitions,
-                &source_fields,
-                all_fields,
-            )?;
+            let augmented =
+                append_partition_columns(batch, &static_partitions, &source_fields, all_fields)?;
             row_count += augmented.num_rows() as u64;
             tw.write_arrow_batch(&augmented)
                 .await
@@ -1097,7 +1092,7 @@ fn append_partition_columns(
         }
     }
 
-    if source_col_idx != batch.num_columns() && source_col_idx != source_fields.len() {
+    if source_col_idx != batch.num_columns() || source_col_idx != source_fields.len() {
         return Err(DataFusionError::Plan(format!(
             "Source query has {} columns, but expected {} non-partition columns",
             batch.num_columns(),
@@ -1286,7 +1281,7 @@ mod tests {
     }
 
     fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
-        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon")
+        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon").unwrap()
     }
 
     fn assert_sql_type_to_paimon(

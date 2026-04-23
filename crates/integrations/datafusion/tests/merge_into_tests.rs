@@ -44,7 +44,7 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 
 fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
     let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon")
+    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
 }
 
 async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {

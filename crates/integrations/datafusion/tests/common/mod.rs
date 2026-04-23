@@ -38,7 +38,7 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 
 pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
     let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon")
+    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
 }
 
 #[allow(dead_code)]

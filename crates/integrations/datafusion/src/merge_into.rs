@@ -1446,7 +1446,8 @@ mod tests {
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler = PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon");
+        let handler =
+            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
         handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
 
         (temp_dir, handler, catalog)
