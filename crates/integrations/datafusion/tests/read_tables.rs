@@ -507,7 +507,7 @@ async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
 #[tokio::test]
 async fn test_query_via_catalog_provider() {
     let catalog = create_catalog();
-    let provider = PaimonCatalogProvider::new(Arc::new(catalog), Default::default());
+    let provider = PaimonCatalogProvider::new(Arc::new(catalog));
 
     let ctx = SessionContext::new();
     ctx.register_catalog("paimon", Arc::new(provider));
@@ -525,7 +525,7 @@ async fn test_query_via_catalog_provider() {
 #[tokio::test]
 async fn test_missing_database_returns_no_schema() {
     let catalog = create_catalog();
-    let provider = PaimonCatalogProvider::new(Arc::new(catalog), Default::default());
+    let provider = PaimonCatalogProvider::new(Arc::new(catalog));
 
     assert!(
         provider.schema("definitely_missing_database").is_none(),
@@ -543,10 +543,7 @@ async fn create_time_travel_context() -> SessionContext {
     let ctx = SessionContext::new_with_config(config);
     ctx.register_catalog(
         "paimon",
-        Arc::new(PaimonCatalogProvider::new(
-            Arc::new(catalog),
-            Default::default(),
-        )),
+        Arc::new(PaimonCatalogProvider::new(Arc::new(catalog))),
     );
     ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
         .expect("Failed to register relation planner");
@@ -966,10 +963,7 @@ mod fulltext_tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "paimon",
-            Arc::new(PaimonCatalogProvider::new(
-                Arc::clone(&catalog),
-                Default::default(),
-            )),
+            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
         );
         register_full_text_search(&ctx, catalog, "default");
         (ctx, tmp)

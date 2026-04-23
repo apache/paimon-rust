@@ -28,9 +28,7 @@ use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::table::SnapshotManager;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{
-    DynamicOptions, PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler,
-};
+use paimon_datafusion::PaimonSqlHandler;
 use tempfile::TempDir;
 
 // ======================= Helpers =======================
@@ -45,18 +43,8 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 }
 
 fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let dynamic_options: DynamicOptions = Default::default();
     let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(
-            catalog.clone(),
-            dynamic_options.clone(),
-        )),
-    );
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
-    PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options)
+    PaimonSqlHandler::new(ctx, catalog, "paimon")
 }
 
 async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {

@@ -30,24 +30,29 @@
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
 //! - `ALTER TABLE db.t RENAME TO new_name`
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::StringArray;
+use datafusion::arrow::array::{
+    new_null_array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, StringArray,
+};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, FromTable, Merge,
-    ObjectName, RenameTableNameKind, Reset, ResetStatement, Set, SqlOption, Statement, TableFactor,
-    Update,
+    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, Expr as SqlExpr,
+    FromTable, Insert, Merge, ObjectName, RenameTableNameKind, Reset, ResetStatement, Set,
+    SqlOption, Statement, TableFactor, TableObject, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
-    DataType as PaimonDataType, DateType, DecimalType, DoubleType, FloatType, IntType,
+    DataType as PaimonDataType, DateType, Datum, DecimalType, DoubleType, FloatType, IntType,
     LocalZonedTimestampType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
     SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
 };
@@ -62,8 +67,8 @@ use crate::DynamicOptions;
 ///
 /// # Example
 /// ```ignore
-/// let dynamic_options: DynamicOptions = Default::default();
-/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options);
+/// let ctx = SessionContext::new();
+/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon");
 /// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
 pub struct PaimonSqlHandler {
@@ -76,21 +81,32 @@ pub struct PaimonSqlHandler {
 }
 
 impl PaimonSqlHandler {
-    /// Creates a new handler with shared dynamic options.
+    /// Creates a new handler that registers the Paimon catalog and relation planner
+    /// on the given [`SessionContext`].
     ///
-    /// The same `DynamicOptions` should also be passed to
-    /// [`PaimonCatalogProvider::new`] so that `SET` mutations
-    /// are visible to subsequent table scans.
+    /// Dynamic options for `SET`/`RESET` are managed internally.
     pub fn new(
         ctx: SessionContext,
         catalog: Arc<dyn Catalog>,
         catalog_name: impl Into<String>,
-        dynamic_options: DynamicOptions,
     ) -> Self {
+        let catalog_name = catalog_name.into();
+        let dynamic_options: DynamicOptions = Default::default();
+        ctx.register_catalog(
+            &catalog_name,
+            Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
+                catalog.clone(),
+                dynamic_options.clone(),
+            )),
+        );
+        ctx.register_relation_planner(Arc::new(
+            crate::relation_planner::PaimonRelationPlanner::new(),
+        ))
+        .expect("Failed to register PaimonRelationPlanner");
         Self {
             ctx,
             catalog,
-            catalog_name: catalog_name.into(),
+            catalog_name,
             dynamic_options,
         }
     }
@@ -100,8 +116,8 @@ impl PaimonSqlHandler {
         &self.ctx
     }
 
-    /// Returns a reference to the shared dynamic options.
-    pub fn dynamic_options(&self) -> &DynamicOptions {
+    #[cfg(test)]
+    pub(crate) fn dynamic_options(&self) -> &DynamicOptions {
         &self.dynamic_options
     }
 
@@ -139,6 +155,12 @@ impl PaimonSqlHandler {
             Statement::Merge(merge) => self.handle_merge_into(merge).await,
             Statement::Update(update) => self.handle_update(update).await,
             Statement::Delete(delete) => self.handle_delete(delete).await,
+            Statement::Insert(insert)
+                if insert.overwrite
+                    && insert.partitioned.as_ref().is_some_and(|p| !p.is_empty()) =>
+            {
+                self.handle_insert_overwrite_partition(insert).await
+            }
             Statement::Set(Set::SingleAssignment {
                 variable, values, ..
             }) => {
@@ -397,6 +419,69 @@ impl PaimonSqlHandler {
 
         let table_ref = table_name.to_string();
         crate::delete::execute_delete(&self.ctx, delete, table, &table_ref).await
+    }
+
+    async fn handle_insert_overwrite_partition(&self, insert: &Insert) -> DFResult<DataFrame> {
+        let table_name = match &insert.table {
+            TableObject::TableName(name) => name.clone(),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported target table in INSERT OVERWRITE: {other}"
+                )))
+            }
+        };
+        let identifier = self.resolve_table_name(&table_name)?;
+        let table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        let partition_exprs = insert.partitioned.as_ref().unwrap();
+        let partition_fields = table.schema().partition_fields();
+        let static_partitions =
+            parse_static_partitions(partition_exprs, &partition_fields, table.schema().fields())?;
+
+        let source = insert.source.as_ref().ok_or_else(|| {
+            DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
+        })?;
+        let batches = self.ctx.sql(&source.to_string()).await?.collect().await?;
+
+        let all_fields = table.schema().fields();
+        let non_static_fields: Vec<_> = all_fields
+            .iter()
+            .filter(|f| !static_partitions.contains_key(f.name()))
+            .collect();
+
+        let wb = table.new_write_builder().with_overwrite();
+        let mut tw = wb.new_write().map_err(to_datafusion_error)?;
+        let mut row_count = 0u64;
+
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let augmented = append_partition_columns(
+                batch,
+                &static_partitions,
+                &non_static_fields,
+                all_fields,
+            )?;
+            row_count += augmented.num_rows() as u64;
+            tw.write_arrow_batch(&augmented)
+                .await
+                .map_err(to_datafusion_error)?;
+        }
+
+        let messages = tw.prepare_commit().await.map_err(to_datafusion_error)?;
+        let commit = wb.new_commit();
+
+        commit
+            .overwrite(messages, Some(static_partitions))
+            .await
+            .map_err(to_datafusion_error)?;
+
+        crate::merge_into::ok_result(&self.ctx, row_count)
     }
 
     /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
@@ -816,6 +901,262 @@ fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>>
         .collect()
 }
 
+/// Parse static partition assignments from `PARTITION (col = val, ...)` expressions.
+/// Dynamic partition columns (bare identifiers without `= val`) are skipped —
+/// they will be read from the source query.
+fn parse_static_partitions(
+    exprs: &[SqlExpr],
+    partition_fields: &[PaimonDataField],
+    all_fields: &[PaimonDataField],
+) -> DFResult<HashMap<String, Option<Datum>>> {
+    let mut result = HashMap::new();
+    let field_map: HashMap<&str, &PaimonDataField> =
+        all_fields.iter().map(|f| (f.name(), f)).collect();
+    let partition_names: Vec<&str> = partition_fields.iter().map(|f| f.name()).collect();
+
+    for expr in exprs {
+        let (col_name, val_expr) = match expr {
+            SqlExpr::BinaryOp {
+                left,
+                op: datafusion::sql::sqlparser::ast::BinaryOperator::Eq,
+                right,
+            } => {
+                let col = match left.as_ref() {
+                    SqlExpr::Identifier(ident) => ident.value.clone(),
+                    other => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Expected column name in PARTITION clause, got: {other}"
+                        )))
+                    }
+                };
+                (col, Some(right.as_ref()))
+            }
+            // Dynamic partition: bare column name without value — skip it,
+            // the column will be read from the source query.
+            SqlExpr::Identifier(ident) => {
+                let col_name = &ident.value;
+                if !partition_names.contains(&col_name.as_str()) {
+                    return Err(DataFusionError::Plan(format!(
+                        "Column '{col_name}' is not a partition column"
+                    )));
+                }
+                continue;
+            }
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported expression in PARTITION clause: {other}"
+                )))
+            }
+        };
+
+        if !partition_names.contains(&col_name.as_str()) {
+            return Err(DataFusionError::Plan(format!(
+                "Column '{col_name}' is not a partition column"
+            )));
+        }
+
+        let field = field_map.get(col_name.as_str()).ok_or_else(|| {
+            DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
+        })?;
+        let datum = sql_expr_to_datum(val_expr.unwrap(), field.data_type())?;
+        result.insert(col_name, Some(datum));
+    }
+
+    Ok(result)
+}
+
+/// Convert a SQL literal expression to a Paimon Datum.
+fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Datum> {
+    let value = match expr {
+        SqlExpr::Value(v) => &v.value,
+        SqlExpr::UnaryOp {
+            op: datafusion::sql::sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            if let SqlExpr::Value(v) = inner.as_ref() {
+                return match (&v.value, data_type) {
+                    (SqlValue::Number(n, _), PaimonDataType::TinyInt(_)) => {
+                        Ok(Datum::TinyInt(-n.parse::<i8>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid TINYINT: {e}"))
+                        })?))
+                    }
+                    (SqlValue::Number(n, _), PaimonDataType::SmallInt(_)) => {
+                        Ok(Datum::SmallInt(-n.parse::<i16>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid SMALLINT: {e}"))
+                        })?))
+                    }
+                    (SqlValue::Number(n, _), PaimonDataType::Int(_)) => {
+                        Ok(Datum::Int(-n.parse::<i32>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid INT: {e}"))
+                        })?))
+                    }
+                    (SqlValue::Number(n, _), PaimonDataType::BigInt(_)) => {
+                        Ok(Datum::Long(-n.parse::<i64>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid BIGINT: {e}"))
+                        })?))
+                    }
+                    (SqlValue::Number(n, _), PaimonDataType::Float(_)) => {
+                        Ok(Datum::Float(-n.parse::<f32>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid FLOAT: {e}"))
+                        })?))
+                    }
+                    (SqlValue::Number(n, _), PaimonDataType::Double(_)) => {
+                        Ok(Datum::Double(-n.parse::<f64>().map_err(|e| {
+                            DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
+                        })?))
+                    }
+                    _ => Err(DataFusionError::Plan(format!(
+                        "Cannot negate value for type {data_type:?}"
+                    ))),
+                };
+            }
+            return Err(DataFusionError::Plan(format!(
+                "Unsupported partition value expression: {expr}"
+            )));
+        }
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "Unsupported partition value expression: {other}"
+            )))
+        }
+    };
+
+    match (value, data_type) {
+        (SqlValue::Number(n, _), PaimonDataType::TinyInt(_)) => {
+            Ok(Datum::TinyInt(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid TINYINT: {e}"))
+            })?))
+        }
+        (SqlValue::Number(n, _), PaimonDataType::SmallInt(_)) => {
+            Ok(Datum::SmallInt(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid SMALLINT: {e}"))
+            })?))
+        }
+        (SqlValue::Number(n, _), PaimonDataType::Int(_)) => {
+            Ok(Datum::Int(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid INT: {e}"))
+            })?))
+        }
+        (SqlValue::Number(n, _), PaimonDataType::BigInt(_)) => {
+            Ok(Datum::Long(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid BIGINT: {e}"))
+            })?))
+        }
+        (SqlValue::Number(n, _), PaimonDataType::Float(_)) => {
+            Ok(Datum::Float(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid FLOAT: {e}"))
+            })?))
+        }
+        (SqlValue::Number(n, _), PaimonDataType::Double(_)) => {
+            Ok(Datum::Double(n.parse().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
+            })?))
+        }
+        (SqlValue::SingleQuotedString(s), PaimonDataType::VarChar(_)) => {
+            Ok(Datum::String(s.clone()))
+        }
+        (SqlValue::SingleQuotedString(s), PaimonDataType::Date(_)) => {
+            let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| DataFusionError::Plan(format!("Invalid DATE '{s}': {e}")))?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            Ok(Datum::Date((date - epoch).num_days() as i32))
+        }
+        (SqlValue::Boolean(b), PaimonDataType::Boolean(_)) => Ok(Datum::Bool(*b)),
+        _ => Err(DataFusionError::Plan(format!(
+            "Cannot convert {value} to {data_type:?}"
+        ))),
+    }
+}
+
+/// Append static partition columns to a RecordBatch.
+fn append_partition_columns(
+    batch: &RecordBatch,
+    partitions: &HashMap<String, Option<Datum>>,
+    non_partition_fields: &[&PaimonDataField],
+    all_fields: &[PaimonDataField],
+) -> DFResult<RecordBatch> {
+    let num_rows = batch.num_rows();
+
+    let mut columns: Vec<(String, ArrayRef)> = Vec::with_capacity(all_fields.len());
+
+    let mut source_col_idx = 0;
+    for field in all_fields {
+        let name = field.name().to_string();
+        if let Some(datum_opt) = partitions.get(&name) {
+            let array = datum_to_constant_array(datum_opt, field.data_type(), num_rows)?;
+            columns.push((name, array));
+        } else {
+            if source_col_idx >= batch.num_columns() {
+                return Err(DataFusionError::Plan(format!(
+                    "Source query has fewer columns than expected non-partition columns. \
+                     Expected column '{name}' at position {source_col_idx}"
+                )));
+            }
+            let col = batch.column(source_col_idx).clone();
+            let target_type = paimon::arrow::paimon_type_to_arrow(field.data_type())
+                .map_err(to_datafusion_error)?;
+            let col = if col.data_type() != &target_type {
+                cast(&col, &target_type).map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "Cannot cast column '{name}' from {:?} to {:?}: {e}",
+                        col.data_type(),
+                        target_type
+                    ))
+                })?
+            } else {
+                col
+            };
+            columns.push((name, col));
+            source_col_idx += 1;
+        }
+    }
+
+    if source_col_idx != batch.num_columns() && source_col_idx != non_partition_fields.len() {
+        return Err(DataFusionError::Plan(format!(
+            "Source query has {} columns, but expected {} non-partition columns",
+            batch.num_columns(),
+            non_partition_fields.len()
+        )));
+    }
+
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, arr)| Field::new(name, arr.data_type().clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, arr)| arr).collect();
+    RecordBatch::try_new(schema, arrays).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Create a constant Arrow array from a Datum value.
+fn datum_to_constant_array(
+    datum: &Option<Datum>,
+    data_type: &PaimonDataType,
+    num_rows: usize,
+) -> DFResult<ArrayRef> {
+    match datum {
+        None => {
+            let arrow_type =
+                paimon::arrow::paimon_type_to_arrow(data_type).map_err(to_datafusion_error)?;
+            Ok(new_null_array(&arrow_type, num_rows))
+        }
+        Some(d) => match d {
+            Datum::Bool(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
+            Datum::TinyInt(v) => Ok(Arc::new(Int8Array::from(vec![*v; num_rows]))),
+            Datum::SmallInt(v) => Ok(Arc::new(Int16Array::from(vec![*v; num_rows]))),
+            Datum::Int(v) => Ok(Arc::new(Int32Array::from(vec![*v; num_rows]))),
+            Datum::Long(v) => Ok(Arc::new(Int64Array::from(vec![*v; num_rows]))),
+            Datum::Float(v) => Ok(Arc::new(Float32Array::from(vec![*v; num_rows]))),
+            Datum::Double(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
+            Datum::String(v) => Ok(Arc::new(StringArray::from(vec![v.as_str(); num_rows]))),
+            Datum::Date(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
+            other => Err(DataFusionError::Plan(format!(
+                "Unsupported datum type for partition column: {other}"
+            ))),
+        },
+    }
+}
+
 /// Return an empty DataFrame with a single "result" column containing "OK".
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -959,7 +1300,7 @@ mod tests {
     }
 
     fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
-        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon", Default::default())
+        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon")
     }
 
     fn assert_sql_type_to_paimon(

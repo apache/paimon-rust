@@ -106,26 +106,75 @@ impl TableCommit {
         .await
     }
 
-    /// Overwrite with dynamic partition detection.
+    /// Overwrite partitions with new data.
     ///
-    /// Extracts the set of partitions touched by `commit_messages` and overwrites
-    /// only those partitions. For unpartitioned tables this is a full table overwrite.
-    pub async fn overwrite(&self, commit_messages: Vec<CommitMessage>) -> Result<()> {
-        if commit_messages.is_empty() {
+    /// When `static_partitions` is `None`, extracts the set of partitions
+    /// touched by `commit_messages` and overwrites only those (dynamic partition overwrite).
+    /// When `static_partitions` is `Some`, uses the caller-provided partition spec
+    /// to determine which partitions to replace (static partition overwrite).
+    /// A partial spec (not all partition keys specified) uses predicate-based filtering
+    /// so that all matching partitions are overwritten.
+    /// For unpartitioned tables this is a full table overwrite.
+    pub async fn overwrite(
+        &self,
+        commit_messages: Vec<CommitMessage>,
+        static_partitions: Option<HashMap<String, Option<Datum>>>,
+    ) -> Result<()> {
+        if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
         }
 
         let new_entries = self.messages_to_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let partition_filter = self.build_dynamic_partition_filter(&commit_messages)?;
-        let overwrite_partitions = self.collect_overwrite_partitions(&commit_messages);
+
+        let partition_filter = if let Some(sp) = static_partitions {
+            let partition_keys = self.table.schema().partition_keys();
+            let partition_fields = self.table.schema().partition_fields();
+            let is_full_spec = partition_keys.iter().all(|k| sp.contains_key(k));
+
+            if is_full_spec {
+                let bytes = self.partitions_to_bytes(&[sp]);
+                Some(PartitionFilter::from_partition_set(
+                    bytes,
+                    &partition_fields,
+                )?)
+            } else {
+                Some(self.build_static_partition_predicate(&sp, &partition_fields)?)
+            }
+        } else {
+            self.build_dynamic_partition_filter(&commit_messages)?
+        };
+
         self.try_commit(CommitEntriesPlan::Overwrite {
             partition_filter,
             new_entries,
             new_index_entries,
-            overwrite_partitions: Some(overwrite_partitions),
         })
         .await
+    }
+
+    /// Build a predicate-based partition filter from a partial static partition spec.
+    fn build_static_partition_predicate(
+        &self,
+        static_partitions: &HashMap<String, Option<Datum>>,
+        partition_fields: &[crate::spec::DataField],
+    ) -> Result<PartitionFilter> {
+        use crate::spec::PredicateBuilder;
+        let pb = PredicateBuilder::new(partition_fields);
+        let mut predicates = Vec::new();
+        for (key, value) in static_partitions {
+            let pred = match value {
+                Some(datum) => pb.equal(key, datum.clone())?,
+                None => pb.is_null(key)?,
+            };
+            predicates.push(pred);
+        }
+        let combined = if predicates.len() == 1 {
+            predicates.into_iter().next().unwrap()
+        } else {
+            crate::spec::Predicate::and(predicates)
+        };
+        Ok(PartitionFilter::from_predicate(combined, partition_fields))
     }
 
     /// Build a dynamic partition filter from the partitions present in commit messages.
@@ -176,17 +225,6 @@ impl TableCommit {
         )?))
     }
 
-    /// Collect the set of unique partition bytes from commit messages.
-    ///
-    /// For unpartitioned tables, returns an empty set (meaning full table overwrite).
-    fn collect_overwrite_partitions(&self, commit_messages: &[CommitMessage]) -> HashSet<Vec<u8>> {
-        let mut partitions = HashSet::new();
-        for msg in commit_messages {
-            partitions.insert(msg.partition.clone());
-        }
-        partitions
-    }
-
     /// Drop specific partitions (OVERWRITE with only deletes).
     pub async fn truncate_partitions(
         &self,
@@ -196,10 +234,27 @@ impl TableCommit {
             return Ok(());
         }
 
-        // Build partition bytes for index cleanup
+        let partition_fields = self.table.schema().partition_fields();
+        let partition_filter = PartitionFilter::from_partition_set(
+            self.partitions_to_bytes(&partitions),
+            &partition_fields,
+        )?;
+
+        self.try_commit(CommitEntriesPlan::Overwrite {
+            partition_filter: Some(partition_filter),
+            new_entries: vec![],
+            new_index_entries: vec![],
+        })
+        .await
+    }
+
+    fn partitions_to_bytes(
+        &self,
+        partitions: &[HashMap<String, Option<Datum>>],
+    ) -> HashSet<Vec<u8>> {
         let partition_fields = self.table.schema().partition_fields();
         let partition_keys = self.table.schema().partition_keys();
-        let overwrite_partitions: HashSet<Vec<u8>> = partitions
+        partitions
             .iter()
             .map(|p| {
                 let owned_datums: Vec<(Option<Datum>, DataType)> = partition_keys
@@ -215,18 +270,7 @@ impl TableCommit {
                     owned_datums.iter().map(|(d, t)| (d, t)).collect();
                 datums_to_binary_row(&refs)
             })
-            .collect();
-
-        let partition_filter =
-            PartitionFilter::from_partition_set(overwrite_partitions.clone(), &partition_fields)?;
-
-        self.try_commit(CommitEntriesPlan::Overwrite {
-            partition_filter: Some(partition_filter),
-            new_entries: vec![],
-            new_index_entries: vec![],
-            overwrite_partitions: Some(overwrite_partitions),
-        })
-        .await
+            .collect()
     }
 
     /// Truncate the entire table (OVERWRITE with no filter, only deletes).
@@ -235,7 +279,6 @@ impl TableCommit {
             partition_filter: None,
             new_entries: vec![],
             new_index_entries: vec![],
-            overwrite_partitions: Some(HashSet::new()),
         })
         .await
     }
@@ -536,7 +579,6 @@ impl TableCommit {
                 partition_filter,
                 new_entries,
                 new_index_entries,
-                overwrite_partitions,
             } => {
                 let entries = self
                     .generate_overwrite_entries(
@@ -548,11 +590,10 @@ impl TableCommit {
 
                 let mut all =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
-                if let Some(partitions) = overwrite_partitions {
-                    if partitions.is_empty() {
-                        all.clear();
-                    } else {
-                        all.retain(|e| !partitions.contains(&e.partition));
+                match partition_filter.as_ref() {
+                    None => all.clear(),
+                    Some(filter) => {
+                        all.retain(|e| !filter.matches_entry(&e.partition).unwrap_or(false));
                     }
                 }
                 all.extend_from_slice(new_index_entries);
@@ -1011,7 +1052,6 @@ enum CommitEntriesPlan {
         partition_filter: Option<PartitionFilter>,
         new_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
-        overwrite_partitions: Option<HashSet<Vec<u8>>>,
     },
 }
 
@@ -1301,11 +1341,14 @@ mod tests {
 
         // Overwrite partition "a" with new data (dynamic partition overwrite)
         commit
-            .overwrite(vec![CommitMessage::new(
-                partition_bytes("a"),
-                0,
-                vec![test_data_file("data-a2.parquet", 50)],
-            )])
+            .overwrite(
+                vec![CommitMessage::new(
+                    partition_bytes("a"),
+                    0,
+                    vec![test_data_file("data-a2.parquet", 50)],
+                )],
+                None,
+            )
             .await
             .unwrap();
 
@@ -1549,11 +1592,14 @@ mod tests {
 
         // Overwrite NULL partition only — should NOT affect "a" or "b"
         commit
-            .overwrite(vec![CommitMessage::new(
-                null_partition_bytes(),
-                0,
-                vec![test_data_file("data-null2.parquet", 50)],
-            )])
+            .overwrite(
+                vec![CommitMessage::new(
+                    null_partition_bytes(),
+                    0,
+                    vec![test_data_file("data-null2.parquet", 50)],
+                )],
+                None,
+            )
             .await
             .unwrap();
 

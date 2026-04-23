@@ -17,15 +17,12 @@
 
 //! Shared test helpers for DataFusion integration tests.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, StringArray};
 use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{
-    DynamicOptions, PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler,
-};
+use paimon_datafusion::PaimonSqlHandler;
 use tempfile::TempDir;
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -40,18 +37,8 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 }
 
 pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let dynamic_options: DynamicOptions = Arc::new(RwLock::new(HashMap::new()));
     let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(
-            catalog.clone(),
-            dynamic_options.clone(),
-        )),
-    );
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
-    PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options)
+    PaimonSqlHandler::new(ctx, catalog, "paimon")
 }
 
 #[allow(dead_code)]

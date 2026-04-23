@@ -1437,10 +1437,7 @@ mod tests {
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
-    use crate::{
-        DynamicOptions, PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler,
-        PaimonTableProvider,
-    };
+    use crate::{PaimonSqlHandler, PaimonTableProvider};
 
     async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
@@ -1449,18 +1446,7 @@ mod tests {
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let dynamic_options: DynamicOptions = Default::default();
-        let ctx = SessionContext::new();
-        ctx.register_catalog(
-            "paimon",
-            Arc::new(PaimonCatalogProvider::new(
-                catalog.clone(),
-                dynamic_options.clone(),
-            )),
-        );
-        ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-            .unwrap();
-        let handler = PaimonSqlHandler::new(ctx, catalog.clone(), "paimon", dynamic_options);
+        let handler = PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon");
         handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
 
         (temp_dir, handler, catalog)

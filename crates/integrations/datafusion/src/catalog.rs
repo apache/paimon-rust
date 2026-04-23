@@ -53,10 +53,22 @@ impl Debug for PaimonCatalogProvider {
 }
 
 impl PaimonCatalogProvider {
-    /// Creates a new [`PaimonCatalogProvider`] with shared dynamic options.
+    /// Creates a new [`PaimonCatalogProvider`].
     ///
-    /// All data is loaded lazily when accessed.
-    pub fn new(catalog: Arc<dyn Catalog>, dynamic_options: DynamicOptions) -> Self {
+    /// For standalone use without `SET`/`RESET` support.
+    /// When used via [`PaimonSqlHandler`], the handler creates the provider
+    /// internally with shared dynamic options.
+    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        PaimonCatalogProvider {
+            catalog,
+            dynamic_options: Default::default(),
+        }
+    }
+
+    pub(crate) fn with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
         PaimonCatalogProvider {
             catalog,
             dynamic_options,

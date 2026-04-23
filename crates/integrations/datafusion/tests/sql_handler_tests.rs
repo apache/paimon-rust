@@ -24,9 +24,7 @@ use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::spec::{ArrayType, BlobType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{
-    DynamicOptions, PaimonCatalogProvider, PaimonRelationPlanner, PaimonSqlHandler,
-};
+use paimon_datafusion::{PaimonCatalogProvider, PaimonSqlHandler};
 use tempfile::TempDir;
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
@@ -39,18 +37,8 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 }
 
 fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let dynamic_options: DynamicOptions = Default::default();
     let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(
-            catalog.clone(),
-            dynamic_options.clone(),
-        )),
-    );
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
-    PaimonSqlHandler::new(ctx, catalog, "paimon", dynamic_options)
+    PaimonSqlHandler::new(ctx, catalog, "paimon")
 }
 
 // ======================= CREATE / DROP SCHEMA =======================
@@ -97,7 +85,7 @@ async fn test_drop_schema() {
 #[tokio::test]
 async fn test_schema_names_via_catalog_provider() {
     let (_tmp, catalog) = create_test_env();
-    let provider = PaimonCatalogProvider::new(catalog.clone(), Default::default());
+    let provider = PaimonCatalogProvider::new(catalog.clone());
 
     catalog
         .create_database("db_a", false, Default::default())

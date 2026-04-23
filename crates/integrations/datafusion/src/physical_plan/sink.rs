@@ -100,7 +100,7 @@ impl DataSink for PaimonDataSink {
 
         if self.overwrite {
             commit
-                .overwrite(messages)
+                .overwrite(messages, None)
                 .await
                 .map_err(to_datafusion_error)?;
         } else {

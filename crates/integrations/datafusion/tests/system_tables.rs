@@ -56,10 +56,7 @@ async fn create_context() -> (SessionContext, Arc<dyn Catalog>, tempfile::TempDi
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "paimon",
-        Arc::new(PaimonCatalogProvider::new(
-            Arc::clone(&catalog),
-            Default::default(),
-        )),
+        Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
     );
     (ctx, catalog, tmp)
 }
