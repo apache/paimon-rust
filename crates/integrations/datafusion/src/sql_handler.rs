@@ -437,7 +437,10 @@ impl PaimonSqlHandler {
             .await
             .map_err(to_datafusion_error)?;
 
-        let partition_exprs = insert.partitioned.as_ref().unwrap();
+        let partition_exprs = insert
+            .partitioned
+            .as_ref()
+            .expect("guarded by match: partitioned is Some and non-empty");
         let partition_fields = table.schema().partition_fields();
         let static_partitions =
             parse_static_partitions(partition_exprs, &partition_fields, table.schema().fields())?;
@@ -448,7 +451,7 @@ impl PaimonSqlHandler {
         let batches = self.ctx.sql(&source.to_string()).await?.collect().await?;
 
         let all_fields = table.schema().fields();
-        let non_static_fields: Vec<_> = all_fields
+        let source_fields: Vec<_> = all_fields
             .iter()
             .filter(|f| !static_partitions.contains_key(f.name()))
             .collect();
@@ -464,7 +467,7 @@ impl PaimonSqlHandler {
             let augmented = append_partition_columns(
                 batch,
                 &static_partitions,
-                &non_static_fields,
+                &source_fields,
                 all_fields,
             )?;
             row_count += augmented.num_rows() as u64;
@@ -967,52 +970,19 @@ fn parse_static_partitions(
 
 /// Convert a SQL literal expression to a Paimon Datum.
 fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Datum> {
-    let value = match expr {
-        SqlExpr::Value(v) => &v.value,
+    let (value, negate) = match expr {
+        SqlExpr::Value(v) => (&v.value, false),
         SqlExpr::UnaryOp {
             op: datafusion::sql::sqlparser::ast::UnaryOperator::Minus,
             expr: inner,
         } => {
             if let SqlExpr::Value(v) = inner.as_ref() {
-                return match (&v.value, data_type) {
-                    (SqlValue::Number(n, _), PaimonDataType::TinyInt(_)) => {
-                        Ok(Datum::TinyInt(-n.parse::<i8>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid TINYINT: {e}"))
-                        })?))
-                    }
-                    (SqlValue::Number(n, _), PaimonDataType::SmallInt(_)) => {
-                        Ok(Datum::SmallInt(-n.parse::<i16>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid SMALLINT: {e}"))
-                        })?))
-                    }
-                    (SqlValue::Number(n, _), PaimonDataType::Int(_)) => {
-                        Ok(Datum::Int(-n.parse::<i32>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid INT: {e}"))
-                        })?))
-                    }
-                    (SqlValue::Number(n, _), PaimonDataType::BigInt(_)) => {
-                        Ok(Datum::Long(-n.parse::<i64>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid BIGINT: {e}"))
-                        })?))
-                    }
-                    (SqlValue::Number(n, _), PaimonDataType::Float(_)) => {
-                        Ok(Datum::Float(-n.parse::<f32>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid FLOAT: {e}"))
-                        })?))
-                    }
-                    (SqlValue::Number(n, _), PaimonDataType::Double(_)) => {
-                        Ok(Datum::Double(-n.parse::<f64>().map_err(|e| {
-                            DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
-                        })?))
-                    }
-                    _ => Err(DataFusionError::Plan(format!(
-                        "Cannot negate value for type {data_type:?}"
-                    ))),
-                };
+                (&v.value, true)
+            } else {
+                return Err(DataFusionError::Plan(format!(
+                    "Unsupported partition value expression: {expr}"
+                )));
             }
-            return Err(DataFusionError::Plan(format!(
-                "Unsupported partition value expression: {expr}"
-            )));
         }
         other => {
             return Err(DataFusionError::Plan(format!(
@@ -1022,48 +992,64 @@ fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Dat
     };
 
     match (value, data_type) {
-        (SqlValue::Number(n, _), PaimonDataType::TinyInt(_)) => {
-            Ok(Datum::TinyInt(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid TINYINT: {e}"))
-            })?))
-        }
-        (SqlValue::Number(n, _), PaimonDataType::SmallInt(_)) => {
-            Ok(Datum::SmallInt(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid SMALLINT: {e}"))
-            })?))
-        }
-        (SqlValue::Number(n, _), PaimonDataType::Int(_)) => {
-            Ok(Datum::Int(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid INT: {e}"))
-            })?))
-        }
-        (SqlValue::Number(n, _), PaimonDataType::BigInt(_)) => {
-            Ok(Datum::Long(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid BIGINT: {e}"))
-            })?))
-        }
-        (SqlValue::Number(n, _), PaimonDataType::Float(_)) => {
-            Ok(Datum::Float(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid FLOAT: {e}"))
-            })?))
-        }
-        (SqlValue::Number(n, _), PaimonDataType::Double(_)) => {
-            Ok(Datum::Double(n.parse().map_err(|e| {
-                DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
-            })?))
-        }
-        (SqlValue::SingleQuotedString(s), PaimonDataType::VarChar(_)) => {
+        (SqlValue::Number(n, _), _) => parse_number_datum(n, data_type, negate),
+        (SqlValue::SingleQuotedString(s), PaimonDataType::VarChar(_)) if !negate => {
             Ok(Datum::String(s.clone()))
         }
-        (SqlValue::SingleQuotedString(s), PaimonDataType::Date(_)) => {
+        (SqlValue::SingleQuotedString(s), PaimonDataType::Date(_)) if !negate => {
             let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .map_err(|e| DataFusionError::Plan(format!("Invalid DATE '{s}': {e}")))?;
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             Ok(Datum::Date((date - epoch).num_days() as i32))
         }
-        (SqlValue::Boolean(b), PaimonDataType::Boolean(_)) => Ok(Datum::Bool(*b)),
+        (SqlValue::Boolean(b), PaimonDataType::Boolean(_)) if !negate => Ok(Datum::Bool(*b)),
+        _ if negate => Err(DataFusionError::Plan(format!(
+            "Cannot negate value for type {data_type:?}"
+        ))),
         _ => Err(DataFusionError::Plan(format!(
             "Cannot convert {value} to {data_type:?}"
+        ))),
+    }
+}
+
+fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFResult<Datum> {
+    let sign: i8 = if negate { -1 } else { 1 };
+    match data_type {
+        PaimonDataType::TinyInt(_) => Ok(Datum::TinyInt(
+            sign as i8
+                * n.parse::<i8>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid TINYINT: {e}")))?,
+        )),
+        PaimonDataType::SmallInt(_) => Ok(Datum::SmallInt(
+            sign as i16
+                * n.parse::<i16>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid SMALLINT: {e}")))?,
+        )),
+        PaimonDataType::Int(_) => Ok(Datum::Int(
+            sign as i32
+                * n.parse::<i32>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid INT: {e}")))?,
+        )),
+        PaimonDataType::BigInt(_) => Ok(Datum::Long(
+            sign as i64
+                * n.parse::<i64>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid BIGINT: {e}")))?,
+        )),
+        PaimonDataType::Float(_) => Ok(Datum::Float(
+            sign as f32
+                * n.parse::<f32>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid FLOAT: {e}")))?,
+        )),
+        PaimonDataType::Double(_) => Ok(Datum::Double(
+            sign as f64
+                * n.parse::<f64>()
+                    .map_err(|e| DataFusionError::Plan(format!("Invalid DOUBLE: {e}")))?,
+        )),
+        _ if negate => Err(DataFusionError::Plan(format!(
+            "Cannot negate value for type {data_type:?}"
+        ))),
+        _ => Err(DataFusionError::Plan(format!(
+            "Cannot convert {n} to {data_type:?}"
         ))),
     }
 }
@@ -1072,7 +1058,7 @@ fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Dat
 fn append_partition_columns(
     batch: &RecordBatch,
     partitions: &HashMap<String, Option<Datum>>,
-    non_partition_fields: &[&PaimonDataField],
+    source_fields: &[&PaimonDataField],
     all_fields: &[PaimonDataField],
 ) -> DFResult<RecordBatch> {
     let num_rows = batch.num_rows();
@@ -1111,11 +1097,11 @@ fn append_partition_columns(
         }
     }
 
-    if source_col_idx != batch.num_columns() && source_col_idx != non_partition_fields.len() {
+    if source_col_idx != batch.num_columns() && source_col_idx != source_fields.len() {
         return Err(DataFusionError::Plan(format!(
             "Source query has {} columns, but expected {} non-partition columns",
             batch.num_columns(),
-            non_partition_fields.len()
+            source_fields.len()
         )));
     }
 

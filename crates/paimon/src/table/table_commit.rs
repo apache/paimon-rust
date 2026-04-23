@@ -115,6 +115,9 @@ impl TableCommit {
     /// A partial spec (not all partition keys specified) uses predicate-based filtering
     /// so that all matching partitions are overwritten.
     /// For unpartitioned tables this is a full table overwrite.
+    ///
+    /// When `static_partitions` is `Some` but `commit_messages` is empty,
+    /// the specified partitions are truncated (all existing data removed, nothing written).
     pub async fn overwrite(
         &self,
         commit_messages: Vec<CommitMessage>,
@@ -593,7 +596,13 @@ impl TableCommit {
                 match partition_filter.as_ref() {
                     None => all.clear(),
                     Some(filter) => {
-                        all.retain(|e| !filter.matches_entry(&e.partition).unwrap_or(false));
+                        let mut retained = Vec::new();
+                        for e in all {
+                            if !filter.matches_entry(&e.partition)? {
+                                retained.push(e);
+                            }
+                        }
+                        all = retained;
                     }
                 }
                 all.extend_from_slice(new_index_entries);
