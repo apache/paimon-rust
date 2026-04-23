@@ -18,11 +18,12 @@
 use crate::spec::manifest_common::FileKind;
 use crate::spec::DataFileMeta;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 
 /// The same {@link Identifier} indicates that the {@link ManifestEntry} refers to the same data file.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java#L58>
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identifier {
     pub partition: Vec<u8>,
     pub bucket: i32,
@@ -31,6 +32,14 @@ pub struct Identifier {
     pub extra_files: Vec<String>,
     pub embedded_index: Option<Vec<u8>>,
     pub external_path: Option<String>,
+}
+
+impl Hash for Identifier {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.partition.hash(state);
+        self.bucket.hash(state);
+        self.file_name.hash(state);
+    }
 }
 
 /// Entry of a manifest file, representing an addition / deletion of a data file.
@@ -97,6 +106,23 @@ impl ManifestEntry {
             embedded_index: self.file.embedded_index.clone(),
             external_path: self.file.external_path.clone(),
         }
+    }
+
+    pub(crate) fn into_identifier(self) -> Identifier {
+        Identifier {
+            partition: self.partition,
+            bucket: self.bucket,
+            level: self.file.level,
+            file_name: self.file.file_name,
+            extra_files: self.file.extra_files,
+            embedded_index: self.file.embedded_index,
+            external_path: self.file.external_path,
+        }
+    }
+
+    /// Consume the entry and return (partition, bucket, total_buckets, file).
+    pub(crate) fn into_parts(self) -> (Vec<u8>, i32, i32, DataFileMeta) {
+        (self.partition, self.bucket, self.total_buckets, self.file)
     }
 
     pub fn total_buckets(&self) -> i32 {

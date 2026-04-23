@@ -61,18 +61,26 @@ impl FileStatsRows {
     /// When `value_stats_cols` is `Some`, stats are in dense mode — only covering those
     /// columns, and the mapping from schema field index to stats index is built by name.
     pub(super) fn from_data_file(file: &DataFileMeta, schema_fields: &[DataField]) -> Self {
-        // Determine which columns the stats cover and build the mapping.
-        // Priority: value_stats_cols > write_cols > all schema fields.
         let stats_col_mapping = if let Some(cols) = &file.value_stats_cols {
+            let col_index: HashMap<&str, usize> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.as_str(), i))
+                .collect();
             let mapping: Vec<Option<usize>> = schema_fields
                 .iter()
-                .map(|field| cols.iter().position(|c| c == field.name()))
+                .map(|field| col_index.get(field.name()).copied())
                 .collect();
             Some(mapping)
         } else if let Some(cols) = &file.write_cols {
+            let col_index: HashMap<&str, usize> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.as_str(), i))
+                .collect();
             let mapping: Vec<Option<usize>> = schema_fields
                 .iter()
-                .map(|field| cols.iter().position(|c| c == field.name()))
+                .map(|field| col_index.get(field.name()).copied())
                 .collect();
             Some(mapping)
         } else {
@@ -292,27 +300,30 @@ pub(super) fn data_evolution_group_matches_predicates(
 
     // Sort files by max_sequence_number descending so the highest-seq file wins per field.
     let mut sorted_files: Vec<&DataFileMeta> = group.iter().collect();
-    sorted_files.sort_by(|a, b| b.max_sequence_number.cmp(&a.max_sequence_number));
+    sorted_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
 
     // For each table field, find which file (index in sorted_files) provides it.
     // Use file_data_columns (based on write_cols) to determine which file contains
     // the field, not file_stats_columns (based on value_stats_cols) which only
     // indicates stats coverage.
-    let field_sources: Vec<Option<(usize, usize)>> = table_fields
-        .iter()
-        .enumerate()
-        .map(|(field_idx, field)| {
-            for (file_idx, file) in sorted_files.iter().enumerate() {
-                let file_columns = file_data_columns(file, table_fields);
-                for col_name in &file_columns {
-                    if *col_name == field.name() {
+    let field_sources: Vec<Option<(usize, usize)>> = {
+        let per_file_columns: Vec<Vec<&str>> = sorted_files
+            .iter()
+            .map(|file| file_data_columns(file, table_fields))
+            .collect();
+        table_fields
+            .iter()
+            .enumerate()
+            .map(|(field_idx, field)| {
+                for (file_idx, cols) in per_file_columns.iter().enumerate() {
+                    if cols.iter().any(|c| *c == field.name()) {
                         return Some((file_idx, field_idx));
                     }
                 }
-            }
-            None
-        })
-        .collect();
+                None
+            })
+            .collect()
+    };
 
     // Build per-file stats without arity validation — data evolution files
     // may have fewer columns than the current table schema.

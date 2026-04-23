@@ -113,6 +113,27 @@ impl ManifestFileMeta {
             schema_id,
         }
     }
+
+    #[inline]
+    pub(crate) fn new_with_version(
+        version: i32,
+        file_name: String,
+        file_size: i64,
+        num_added_files: i64,
+        num_deleted_files: i64,
+        partition_stats: BinaryTableStats,
+        schema_id: i64,
+    ) -> ManifestFileMeta {
+        Self {
+            version,
+            file_name,
+            file_size,
+            num_added_files,
+            num_deleted_files,
+            partition_stats,
+            schema_id,
+        }
+    }
 }
 
 /// Avro schema for ManifestFileMeta (used in manifest-list files).

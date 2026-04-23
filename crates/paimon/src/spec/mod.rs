@@ -61,6 +61,7 @@ pub use manifest_list::ManifestList;
 mod objects_file;
 pub use objects_file::from_avro_bytes;
 pub use objects_file::to_avro_bytes;
+pub(crate) mod avro;
 pub(crate) mod stats;
 mod types;
 pub use types::*;

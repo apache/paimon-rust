@@ -61,6 +61,7 @@ indexmap = "2.5.0"
 roaring = "0.11"
 crc32fast = "1"
 zstd = "0.13"
+snap = "1"
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }

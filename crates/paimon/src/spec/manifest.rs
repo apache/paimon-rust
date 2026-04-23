@@ -16,8 +16,10 @@
 // under the License.
 
 use crate::io::FileIO;
+use crate::spec::avro::SchemaCache;
 use crate::spec::manifest_entry::ManifestEntry;
 use crate::spec::manifest_entry::MANIFEST_ENTRY_SCHEMA;
+use crate::spec::FileKind;
 
 use crate::Result;
 
@@ -33,18 +35,29 @@ impl Manifest {
     /// Read manifest entries from a file.
     pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<ManifestEntry>> {
         let input_file = file_io.new_input(path)?;
-
-        if !input_file.exists().await? {
-            return Ok(Vec::new());
-        }
-
         let content = input_file.read().await?;
         Self::read_from_bytes(&content)
     }
 
     /// Read manifest entries from bytes.
     fn read_from_bytes(bytes: &[u8]) -> Result<Vec<ManifestEntry>> {
-        crate::spec::from_avro_bytes(bytes)
+        crate::spec::avro::from_avro_bytes_fast(bytes)
+    }
+
+    /// Read manifest entries with a lightweight filter on (kind, partition, bucket, total_buckets).
+    /// Entries that fail the filter skip DataFileMeta decoding entirely.
+    pub async fn read_filtered<F>(
+        file_io: &FileIO,
+        path: &str,
+        cache: &mut SchemaCache,
+        filter: &mut F,
+    ) -> Result<Vec<ManifestEntry>>
+    where
+        F: FnMut(FileKind, &[u8], i32, i32) -> bool,
+    {
+        let input_file = file_io.new_input(path)?;
+        let content = input_file.read().await?;
+        crate::spec::avro::from_manifest_bytes_filtered(&content, cache, filter)
     }
 
     /// Write manifest entries to a file.

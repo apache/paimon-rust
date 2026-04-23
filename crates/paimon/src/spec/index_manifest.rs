@@ -118,16 +118,13 @@ impl IndexManifest {
     /// Read index manifest entries from a file.
     pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<IndexManifestEntry>> {
         let input_file = file_io.new_input(path)?;
-        if !input_file.exists().await? {
-            return Ok(Vec::new());
-        }
         let content = input_file.read().await?;
         Self::read_from_bytes(&content)
     }
 
     /// Read index manifest entries from Avro-encoded bytes.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Vec<IndexManifestEntry>> {
-        crate::spec::from_avro_bytes(bytes)
+        crate::spec::avro::from_avro_bytes_fast(bytes)
     }
 
     /// Write index manifest entries to a file.

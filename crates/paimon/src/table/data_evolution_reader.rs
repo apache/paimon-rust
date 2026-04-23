@@ -948,7 +948,7 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
         }
     }
 
-    data_files.sort_by(|left, right| right.max_sequence_number.cmp(&left.max_sequence_number));
+    data_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
     if let Some(first) = data_files.first() {
         let first_row_id = first.first_row_id.ok_or_else(|| Error::DataInvalid {
             message: "All data files in a field merge split should have first_row_id".to_string(),

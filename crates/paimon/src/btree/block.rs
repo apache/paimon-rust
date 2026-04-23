@@ -327,11 +327,7 @@ impl BlockReader {
             BlockAlignedType::Aligned => {
                 let record_size = int_value as usize;
                 let data_len = block.len() - 5;
-                let record_count = if record_size > 0 {
-                    data_len / record_size
-                } else {
-                    0
-                };
+                let record_count = data_len.checked_div(record_size).unwrap_or(0);
                 block.truncate(data_len);
                 Ok(Self {
                     data: block,

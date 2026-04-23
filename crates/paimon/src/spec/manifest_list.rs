@@ -32,11 +32,8 @@ impl ManifestList {
     /// Read manifest file metas from a manifest list file.
     pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<ManifestFileMeta>> {
         let input = file_io.new_input(path)?;
-        if !input.exists().await? {
-            return Ok(Vec::new());
-        }
         let content = input.read().await?;
-        crate::spec::from_avro_bytes(&content)
+        crate::spec::avro::from_avro_bytes_fast(&content)
     }
 
     /// Write manifest file metas to a manifest list file.
@@ -98,10 +95,8 @@ mod tests {
     #[tokio::test]
     async fn test_manifest_list_read_nonexistent() {
         let file_io = test_file_io();
-        let result = ManifestList::read(&file_io, "memory:/nonexistent/manifest-list")
-            .await
-            .unwrap();
-        assert!(result.is_empty());
+        let result = ManifestList::read(&file_io, "memory:/nonexistent/manifest-list").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

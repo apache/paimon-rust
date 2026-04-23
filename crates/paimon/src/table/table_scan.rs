@@ -30,8 +30,9 @@ use super::stats_filter::{
 use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
-    bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, FileKind, IndexManifest,
-    ManifestEntry, PartitionComputer, Predicate, Snapshot, TimeTravelSelector,
+    avro::SharedSchemaCache, bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta,
+    FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
+    TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -56,6 +57,9 @@ async fn read_manifest_list(
     table_path: &str,
     list_name: &str,
 ) -> crate::Result<Vec<crate::spec::ManifestFileMeta>> {
+    if list_name.is_empty() {
+        return Ok(Vec::new());
+    }
     let path = format!(
         "{}/{}/{}",
         table_path.trim_end_matches('/'),
@@ -63,11 +67,8 @@ async fn read_manifest_list(
         list_name
     );
     let input = file_io.new_input(&path)?;
-    if !input.exists().await? {
-        return Ok(Vec::new());
-    }
     let bytes = input.read().await?;
-    crate::spec::from_avro_bytes::<crate::spec::ManifestFileMeta>(&bytes)
+    crate::spec::avro::from_avro_bytes_fast::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
@@ -92,9 +93,10 @@ async fn read_all_manifest_entries(
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
 ) -> crate::Result<Vec<ManifestEntry>> {
-    let mut manifest_files =
-        read_manifest_list(file_io, table_path, snapshot.base_manifest_list()).await?;
-    let delta = read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()).await?;
+    let (mut manifest_files, delta) = futures::try_join!(
+        read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
+        read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
+    )?;
     manifest_files.extend(delta);
 
     // Manifest-file-level partition stats pruning: skip entire manifest files
@@ -118,39 +120,56 @@ async fn read_all_manifest_entries(
     }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
+    let shared_cache = SharedSchemaCache::new();
     let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
         .map(|meta| {
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+            let cache = shared_cache.clone();
             async move {
-                let entries = crate::spec::Manifest::read(file_io, &path).await?;
+                let input_file = file_io.new_input(&path)?;
+                let content = input_file.read().await?;
+
                 // Per-task bucket cache (few distinct total_buckets values per manifest).
                 let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+
+                let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
+                    &content,
+                    &cache,
+                    &mut |_kind, partition_bytes, bucket, total_buckets| {
+                        // Bucket filter (negative bucket = unassigned)
+                        if has_primary_keys && !scan_all_files && bucket < 0 {
+                            return false;
+                        }
+                        if let Some(pred) = bucket_predicate {
+                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
+                                compute_target_buckets(pred, bucket_key_fields, total_buckets)
+                            });
+                            if let Some(targets) = targets {
+                                if !targets.contains(&bucket) {
+                                    return false;
+                                }
+                            }
+                        }
+
+                        // Partition filter
+                        if let Some(pf) = partition_filter {
+                            match pf.matches_entry(partition_bytes) {
+                                Ok(false) => return false,
+                                Ok(true) => {}
+                                Err(_) => {}
+                            }
+                        }
+
+                        true
+                    },
+                )?;
+
+                // Post-filter: level-0 and data predicates (need DataFileMeta)
                 let filtered: Vec<ManifestEntry> = entries
                     .into_iter()
                     .filter(|entry| {
                         if skip_level_zero && has_primary_keys && entry.file().level == 0 {
                             return false;
-                        }
-                        if has_primary_keys && !scan_all_files && entry.bucket() < 0 {
-                            return false;
-                        }
-                        if let Some(pred) = bucket_predicate {
-                            let total = entry.total_buckets();
-                            let targets = bucket_cache.entry(total).or_insert_with(|| {
-                                compute_target_buckets(pred, bucket_key_fields, total)
-                            });
-                            if let Some(targets) = targets {
-                                if !targets.contains(&entry.bucket()) {
-                                    return false;
-                                }
-                            }
-                        }
-                        if let Some(pf) = partition_filter {
-                            match pf.matches_entry(entry.partition()) {
-                                Ok(false) => return false,
-                                Ok(true) => {}
-                                Err(_) => {}
-                            }
                         }
                         if !data_predicates.is_empty()
                             && !data_file_matches_predicates(
@@ -186,7 +205,8 @@ fn build_deletion_files_map(
     use crate::spec::FileKind;
     let table_path = table_path.trim_end_matches('/');
     let index_path_prefix = format!("{table_path}/{INDEX_DIR}");
-    let mut map: HashMap<PartitionBucket, HashMap<String, DeletionFile>> = HashMap::new();
+    let mut map: HashMap<PartitionBucket, HashMap<String, DeletionFile>> =
+        HashMap::with_capacity(index_entries.len());
     for entry in index_entries {
         if entry.kind != FileKind::Add {
             continue;
@@ -221,21 +241,34 @@ fn build_deletion_files_map(
 /// The identifier must be rich enough to match Paimon's file identity, otherwise a delete
 /// for one file version can incorrectly remove another with the same file name.
 fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
-    let mut deleted_entry_keys = HashSet::new();
-    let mut added_entries = Vec::new();
+    let mut delete_entries = Vec::with_capacity(entries.len() / 4);
+    let mut added_entries = Vec::with_capacity(entries.len());
 
     for entry in entries {
         match entry.kind() {
             FileKind::Add => added_entries.push(entry),
-            FileKind::Delete => {
-                deleted_entry_keys.insert(entry.identifier());
-            }
+            FileKind::Delete => delete_entries.push(entry),
         }
     }
 
+    if delete_entries.is_empty() {
+        return added_entries;
+    }
+
+    let deleted_keys: HashSet<(&[u8], i32, &str)> = delete_entries
+        .iter()
+        .map(|e| (e.partition(), e.bucket(), e.file().file_name.as_str()))
+        .collect();
+
     added_entries
         .into_iter()
-        .filter(|entry| !deleted_entry_keys.contains(&entry.identifier()))
+        .filter(|entry| {
+            !deleted_keys.contains(&(
+                entry.partition(),
+                entry.bucket(),
+                entry.file().file_name.as_str(),
+            ))
+        })
         .collect()
 }
 
@@ -556,16 +589,20 @@ impl<'a> TableScan<'a> {
             return Ok(Plan::new(Vec::new()));
         }
 
-        // Group by (partition, bucket). Key = (partition_bytes, bucket).
-        let mut groups: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>> = HashMap::new();
+        // Group by (partition, bucket), decomposing entries to avoid cloning partition.
+        let mut groups: HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)> =
+            HashMap::with_capacity(entries.len());
         for e in entries {
-            let key = (e.partition().to_vec(), e.bucket());
-            groups.entry(key).or_default().push(e);
+            let (partition, bucket, total_buckets, file) = e.into_parts();
+            let entry = groups
+                .entry((partition, bucket))
+                .or_insert_with(|| (total_buckets, Vec::new()));
+            entry.1.push(file);
         }
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
-        let mut splits = Vec::new();
+        let mut splits = Vec::with_capacity(groups.len());
 
         let partition_computer = if !partition_keys.is_empty() {
             Some(PartitionComputer::new(
@@ -610,23 +647,8 @@ impl<'a> TableScan<'a> {
                 (None, self.row_ranges.clone())
             };
 
-        for ((partition, bucket), group_entries) in groups {
+        for ((partition, bucket), (total_buckets, data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
-
-            let total_buckets = group_entries
-                .first()
-                .map(|e| e.total_buckets())
-                .ok_or_else(|| Error::UnexpectedError {
-                    message: format!("Manifest entry group for bucket {bucket} is empty, cannot determine total_buckets"),
-                    source: None,
-                })?;
-            let data_files: Vec<_> = group_entries
-                .into_iter()
-                .map(|e| {
-                    let ManifestEntry { file, .. } = e;
-                    file
-                })
-                .collect();
 
             let bucket_path = if let Some(ref computer) = partition_computer {
                 let partition_path = computer.generate_partition_path(&partition_row)?;

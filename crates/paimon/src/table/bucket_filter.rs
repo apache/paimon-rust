@@ -168,26 +168,20 @@ fn collect_eq_candidates<'a>(
             op,
             literals,
             ..
-        } => {
-            if *index < field_candidates.len() {
-                match op {
-                    PredicateOperator::Eq => {
-                        if let Some(lit) = literals.first() {
-                            field_candidates[*index] = Some(vec![Some(lit)]);
-                        }
-                    }
-                    PredicateOperator::In => {
-                        if !literals.is_empty() {
-                            field_candidates[*index] = Some(literals.iter().map(Some).collect());
-                        }
-                    }
-                    PredicateOperator::IsNull => {
-                        field_candidates[*index] = Some(vec![None]);
-                    }
-                    _ => {}
+        } if *index < field_candidates.len() => match op {
+            PredicateOperator::Eq => {
+                if let Some(lit) = literals.first() {
+                    field_candidates[*index] = Some(vec![Some(lit)]);
                 }
             }
-        }
+            PredicateOperator::In if !literals.is_empty() => {
+                field_candidates[*index] = Some(literals.iter().map(Some).collect());
+            }
+            PredicateOperator::IsNull => {
+                field_candidates[*index] = Some(vec![None]);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }

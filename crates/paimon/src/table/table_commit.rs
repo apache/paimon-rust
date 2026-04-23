@@ -1409,7 +1409,11 @@ mod tests {
         let mut initial_file = test_data_file("data-0.parquet", 100);
         initial_file.file_source = Some(0); // APPEND
         commit
-            .commit(vec![CommitMessage::new(vec![], 0, vec![initial_file])])
+            .commit(vec![CommitMessage::new(
+                vec![0, 0, 0, 0],
+                0,
+                vec![initial_file],
+            )])
             .await
             .unwrap();
 
@@ -1426,7 +1430,11 @@ mod tests {
         partial_file.write_cols = Some(vec!["name".to_string()]);
 
         let result = commit
-            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .commit(vec![CommitMessage::new(
+                vec![0, 0, 0, 0],
+                0,
+                vec![partial_file],
+            )])
             .await;
 
         assert!(result.is_err());
@@ -1450,7 +1458,11 @@ mod tests {
         let mut initial_file = test_data_file("data-0.parquet", 100);
         initial_file.file_source = Some(0);
         commit
-            .commit(vec![CommitMessage::new(vec![], 0, vec![initial_file])])
+            .commit(vec![CommitMessage::new(
+                vec![0, 0, 0, 0],
+                0,
+                vec![initial_file],
+            )])
             .await
             .unwrap();
 
@@ -1461,7 +1473,11 @@ mod tests {
         partial_file.write_cols = Some(vec!["name".to_string()]);
 
         commit
-            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .commit(vec![CommitMessage::new(
+                vec![0, 0, 0, 0],
+                0,
+                vec![partial_file],
+            )])
             .await
             .unwrap();
 
@@ -1486,7 +1502,11 @@ mod tests {
         partial_file.write_cols = Some(vec!["name".to_string()]);
 
         let result = commit
-            .commit(vec![CommitMessage::new(vec![], 0, vec![partial_file])])
+            .commit(vec![CommitMessage::new(
+                vec![0, 0, 0, 0],
+                0,
+                vec![partial_file],
+            )])
             .await;
 
         assert!(result.is_err());
@@ -1562,7 +1582,11 @@ mod tests {
             .await
             .unwrap();
 
-        let mut msg = CommitMessage::new(vec![], 0, vec![test_data_file("data-new.parquet", 80)]);
+        let mut msg = CommitMessage::new(
+            vec![0, 0, 0, 0],
+            0,
+            vec![test_data_file("data-new.parquet", 80)],
+        );
         msg.deleted_files = vec![test_data_file("nonexistent.parquet", 100)];
 
         let result = commit.commit(vec![msg]).await;
@@ -1591,7 +1615,11 @@ mod tests {
             .await
             .unwrap();
 
-        let mut msg = CommitMessage::new(vec![], 0, vec![test_data_file("data-new.parquet", 80)]);
+        let mut msg = CommitMessage::new(
+            vec![0, 0, 0, 0],
+            0,
+            vec![test_data_file("data-new.parquet", 80)],
+        );
         msg.deleted_files = vec![test_data_file("data-0.parquet", 100)];
 
         commit.commit(vec![msg]).await.unwrap();
@@ -1612,7 +1640,7 @@ mod tests {
 
         let commit = setup_commit(&file_io, table_path);
 
-        let mut msg = CommitMessage::new(vec![], 0, vec![]);
+        let mut msg = CommitMessage::new(vec![0, 0, 0, 0], 0, vec![]);
         msg.deleted_files = vec![test_data_file("data-0.parquet", 100)];
 
         let result = commit.commit(vec![msg]).await;

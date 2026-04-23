@@ -15,23 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde_repr::{Deserialize_repr, Serialize_repr};
+use super::cursor::AvroCursor;
+use super::schema::WriterSchema;
 
-/// Kind of a file.
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java>
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
-pub enum FileKind {
-    Add = 0,
-    Delete = 1,
+/// Trait for types that can be decoded directly from Avro binary data.
+pub trait AvroRecordDecode: Sized {
+    fn decode(cursor: &mut AvroCursor, writer_schema: &WriterSchema) -> crate::Result<Self>;
 }
 
-/// The Source of a file.
-/// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/FileSource.java>
-#[allow(dead_code)] // Part of spec; used when file source is needed.
-#[derive(PartialEq, Eq, Debug, Clone, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
-pub enum FileSource {
-    Append = 0,
-    Compact = 1,
+/// Safely negate a negative Avro block count to usize.
+/// Avro uses negative counts to indicate that a block-size-in-bytes follows.
+#[inline]
+pub(crate) fn neg_count_to_usize(count: i64) -> crate::Result<usize> {
+    count
+        .checked_neg()
+        .map(|v| v as usize)
+        .ok_or_else(|| crate::Error::UnexpectedError {
+            message: format!("avro decode: block count overflow: {count}"),
+            source: None,
+        })
 }

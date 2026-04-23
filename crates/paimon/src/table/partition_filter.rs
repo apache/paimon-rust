@@ -195,7 +195,10 @@ fn build_bounds_from_partition_bytes(
     partition_fields: &[DataField],
 ) -> crate::Result<Vec<FieldBounds>> {
     let num_fields = partition_fields.len();
-    let mut field_values: Vec<Vec<Option<Datum>>> = vec![Vec::new(); num_fields];
+    let partition_count = partitions.len();
+    let mut field_values: Vec<Vec<Option<Datum>>> = (0..num_fields)
+        .map(|_| Vec::with_capacity(partition_count))
+        .collect();
 
     for bytes in partitions {
         let row = BinaryRow::from_serialized_bytes(bytes)?;
@@ -283,26 +286,20 @@ fn collect_eq_candidates<'a>(
             op,
             literals,
             ..
-        } => {
-            if *index < field_candidates.len() {
-                match op {
-                    PredicateOperator::Eq => {
-                        if let Some(lit) = literals.first() {
-                            field_candidates[*index] = Some(vec![Some(lit)]);
-                        }
-                    }
-                    PredicateOperator::In => {
-                        if !literals.is_empty() {
-                            field_candidates[*index] = Some(literals.iter().map(Some).collect());
-                        }
-                    }
-                    PredicateOperator::IsNull => {
-                        field_candidates[*index] = Some(vec![None]);
-                    }
-                    _ => {}
+        } if *index < field_candidates.len() => match op {
+            PredicateOperator::Eq => {
+                if let Some(lit) = literals.first() {
+                    field_candidates[*index] = Some(vec![Some(lit)]);
                 }
             }
-        }
+            PredicateOperator::In if !literals.is_empty() => {
+                field_candidates[*index] = Some(literals.iter().map(Some).collect());
+            }
+            PredicateOperator::IsNull => {
+                field_candidates[*index] = Some(vec![None]);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
