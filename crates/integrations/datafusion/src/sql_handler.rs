@@ -447,6 +447,7 @@ impl PaimonSqlHandler {
         let source = insert.source.as_ref().ok_or_else(|| {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
         })?;
+        // Re-parse via to_string(); may lose dialect-specific syntax for complex queries.
         let batches = self.ctx.sql(&source.to_string()).await?.collect().await?;
 
         let all_fields = table.schema().fields();
@@ -454,6 +455,16 @@ impl PaimonSqlHandler {
             .iter()
             .filter(|f| !static_partitions.contains_key(f.name()))
             .count();
+
+        if let Some(first) = batches.iter().find(|b| b.num_rows() > 0) {
+            if first.num_columns() != expected_source_cols {
+                return Err(DataFusionError::Plan(format!(
+                    "Source query has {} columns, but expected {} non-partition columns",
+                    first.num_columns(),
+                    expected_source_cols
+                )));
+            }
+        }
 
         let wb = table.new_write_builder().with_overwrite();
         let mut tw = wb.new_write().map_err(to_datafusion_error)?;
@@ -463,8 +474,12 @@ impl PaimonSqlHandler {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let augmented =
-                append_partition_columns(batch, &static_partitions, expected_source_cols, all_fields)?;
+            let augmented = append_partition_columns(
+                batch,
+                &static_partitions,
+                expected_source_cols,
+                all_fields,
+            )?;
             row_count += augmented.num_rows() as u64;
             tw.write_arrow_batch(&augmented)
                 .await
@@ -1014,30 +1029,36 @@ fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFRe
         n.to_string()
     };
     match data_type {
-        PaimonDataType::TinyInt(_) => Ok(Datum::TinyInt(
-            s.parse::<i8>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid TINYINT: {e}")))?,
-        )),
-        PaimonDataType::SmallInt(_) => Ok(Datum::SmallInt(
-            s.parse::<i16>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid SMALLINT: {e}")))?,
-        )),
-        PaimonDataType::Int(_) => Ok(Datum::Int(
-            s.parse::<i32>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid INT: {e}")))?,
-        )),
-        PaimonDataType::BigInt(_) => Ok(Datum::Long(
-            s.parse::<i64>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid BIGINT: {e}")))?,
-        )),
-        PaimonDataType::Float(_) => Ok(Datum::Float(
-            s.parse::<f32>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid FLOAT: {e}")))?,
-        )),
-        PaimonDataType::Double(_) => Ok(Datum::Double(
-            s.parse::<f64>()
-                .map_err(|e| DataFusionError::Plan(format!("Invalid DOUBLE: {e}")))?,
-        )),
+        PaimonDataType::TinyInt(_) => {
+            Ok(Datum::TinyInt(s.parse::<i8>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid TINYINT: {e}"))
+            })?))
+        }
+        PaimonDataType::SmallInt(_) => {
+            Ok(Datum::SmallInt(s.parse::<i16>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid SMALLINT: {e}"))
+            })?))
+        }
+        PaimonDataType::Int(_) => {
+            Ok(Datum::Int(s.parse::<i32>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid INT: {e}"))
+            })?))
+        }
+        PaimonDataType::BigInt(_) => {
+            Ok(Datum::Long(s.parse::<i64>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid BIGINT: {e}"))
+            })?))
+        }
+        PaimonDataType::Float(_) => {
+            Ok(Datum::Float(s.parse::<f32>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid FLOAT: {e}"))
+            })?))
+        }
+        PaimonDataType::Double(_) => {
+            Ok(Datum::Double(s.parse::<f64>().map_err(|e| {
+                DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
+            })?))
+        }
         _ if negate => Err(DataFusionError::Plan(format!(
             "Cannot negate value for type {data_type:?}"
         ))),
@@ -1129,8 +1150,12 @@ fn datum_to_constant_array(
             Datum::Double(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
             Datum::String(v) => Ok(Arc::new(StringArray::from(vec![v.as_str(); num_rows]))),
             Datum::Date(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
-            other => Err(DataFusionError::Plan(format!(
-                "Unsupported datum type for partition column: {other}"
+            Datum::Time(_)
+            | Datum::Timestamp { .. }
+            | Datum::LocalZonedTimestamp { .. }
+            | Datum::Decimal { .. }
+            | Datum::Bytes(_) => Err(DataFusionError::Plan(format!(
+                "Unsupported datum type for partition column: {d}"
             ))),
         },
     }

@@ -38,7 +38,12 @@ Register an entire Paimon catalog so all databases and tables are accessible via
 ```rust
 use std::sync::Arc;
 use datafusion::prelude::SessionContext;
+use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::PaimonSqlHandler;
+
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
+let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
 let ctx = SessionContext::new();
 let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;

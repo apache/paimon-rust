@@ -166,6 +166,8 @@ impl TableCommit {
         let pb = PredicateBuilder::new(partition_fields);
         let mut predicates = Vec::new();
         for (key, value) in static_partitions {
+            // Currently all values from parse_static_partitions are Some;
+            // None would represent an explicit NULL partition value.
             let pred = match value {
                 Some(datum) => pb.equal(key, datum.clone())?,
                 None => pb.is_null(key)?,
