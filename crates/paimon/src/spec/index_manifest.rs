@@ -19,8 +19,6 @@ use crate::io::FileIO;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::IndexFileMeta;
 use serde::{Deserialize, Serialize};
-use serde_avro_fast::object_container_file_encoding::Reader;
-use snafu::ResultExt;
 use std::fmt::{Display, Formatter};
 
 use crate::Result;
@@ -74,17 +72,13 @@ impl IndexManifest {
 
     /// Read index manifest entries from Avro-encoded bytes.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Vec<IndexManifestEntry>> {
-        let mut reader = Reader::from_slice(bytes)
-            .whatever_context::<_, crate::Error>("read index manifest avro")?;
-        reader
-            .deserialize::<IndexManifestEntry>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .whatever_context::<_, crate::Error>("deserialize index manifest entry")
+        crate::spec::from_avro_bytes(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value, types::Value, Schema};
     use indexmap::IndexMap;
 
     use super::*;
@@ -148,7 +142,7 @@ mod tests {
             },
         };
 
-        let schema: serde_avro_fast::Schema = r#"["null", {
+        let schema = Schema::parse_str(r#"["null", {
             "type": "record", 
             "name": "org.apache.paimon.avro.generated.record", 
             "fields": [
@@ -179,12 +173,16 @@ mod tests {
                 }
             ]
             }]"#
-            .parse().unwrap();
+        )
+        .unwrap();
 
-        let serializer_config = &mut serde_avro_fast::ser::SerializerConfig::new(&schema);
-        let encoded = serde_avro_fast::to_single_object_vec(&sample, serializer_config).unwrap();
-        let decoded: IndexManifestEntry =
-            serde_avro_fast::from_single_object_slice(encoded.as_slice(), &schema).unwrap();
+        let value = to_value(&sample).unwrap().resolve(&schema).unwrap();
+        let encoded = to_avro_datum(&schema, value).unwrap();
+        let decoded_value = from_avro_datum(&schema, &mut encoded.as_slice(), None).unwrap();
+        let decoded: IndexManifestEntry = match decoded_value {
+            Value::Union(_, inner) => from_value(inner.as_ref()).unwrap(),
+            other => from_value(&other).unwrap(),
+        };
         assert_eq!(sample, decoded);
     }
 }

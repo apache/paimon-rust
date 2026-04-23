@@ -18,8 +18,6 @@
 use crate::io::FileIO;
 use crate::spec::manifest_entry::ManifestEntry;
 use crate::spec::manifest_entry::MANIFEST_ENTRY_SCHEMA;
-use serde_avro_fast::object_container_file_encoding::Reader;
-use snafu::ResultExt;
 
 use crate::Result;
 
@@ -46,12 +44,7 @@ impl Manifest {
 
     /// Read manifest entries from bytes.
     fn read_from_bytes(bytes: &[u8]) -> Result<Vec<ManifestEntry>> {
-        let mut reader =
-            Reader::from_slice(bytes).whatever_context::<_, crate::Error>("read manifest avro")?;
-        reader
-            .deserialize::<ManifestEntry>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .whatever_context::<_, crate::Error>("deserialize manifest entry")
+        crate::spec::from_avro_bytes(bytes)
     }
 
     /// Write manifest entries to a file.

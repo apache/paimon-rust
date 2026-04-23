@@ -15,18 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use apache_avro::{from_value, to_value, Codec, Reader, Schema, Writer};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_avro_fast::object_container_file_encoding::{Compression, Reader};
-use snafu::ResultExt;
 
 pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T>> {
-    let mut reader = Reader::from_slice(bytes)
-        .whatever_context::<_, crate::Error>("read avro object container")?;
-    reader
-        .deserialize::<T>()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .whatever_context::<_, crate::Error>("deserialize avro records")
+    Reader::new(bytes)?
+        .map(|r| {
+            let value = r?;
+            from_value::<T>(&value).map_err(crate::Error::from)
+        })
+        .collect()
 }
 
 /// Serialize records into Avro Object Container File bytes.
@@ -34,25 +33,13 @@ pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T
 /// The `schema_json` must be a valid Avro schema JSON string that matches
 /// the serde serialization layout of `T`.
 pub fn to_avro_bytes<T: Serialize>(schema_json: &str, records: &[T]) -> crate::Result<Vec<u8>> {
-    let schema: serde_avro_fast::Schema =
-        schema_json
-            .parse()
-            .map_err(
-                |e: serde_avro_fast::schema::SchemaError| crate::Error::DataInvalid {
-                    message: format!("invalid avro schema: {e}"),
-                    source: Some(Box::new(e)),
-                },
-            )?;
-    serde_avro_fast::object_container_file_encoding::write_all(
-        &schema,
-        Compression::Null,
-        Vec::new(),
-        records.iter(),
-    )
-    .map_err(|e| crate::Error::DataInvalid {
-        message: format!("avro serialization failed: {e}"),
-        source: Some(Box::new(e)),
-    })
+    let schema = Schema::parse_str(schema_json)?;
+    let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+    for record in records {
+        let value = to_value(record).and_then(|v| v.resolve(&schema))?;
+        writer.append(value)?;
+    }
+    Ok(writer.into_inner()?)
 }
 
 #[cfg(test)]

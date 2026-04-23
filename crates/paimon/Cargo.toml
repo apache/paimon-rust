@@ -55,7 +55,7 @@ snafu = "0.9.0"
 typed-builder = "^0.19"
 opendal = { version = "0.55", features = ["services-fs"] }
 pretty_assertions = "1"
-serde_avro_fast = { version = "2.0.2", features = ["snappy", "zstandard"] }
+apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
 indexmap = "2.5.0"
 roaring = "0.11"
 crc32fast = "1"
