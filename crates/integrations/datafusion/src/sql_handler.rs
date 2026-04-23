@@ -49,6 +49,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use futures::StreamExt;
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
@@ -447,7 +448,8 @@ impl PaimonSqlHandler {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
         })?;
         // Re-parse via to_string(); may lose dialect-specific syntax for complex queries.
-        let batches = self.ctx.sql(&source.to_string()).await?.collect().await?;
+        let df = self.ctx.sql(&source.to_string()).await?;
+        let mut stream = df.execute_stream().await?;
 
         let all_fields = table.schema().fields();
         let expected_source_cols = all_fields
@@ -455,26 +457,28 @@ impl PaimonSqlHandler {
             .filter(|f| !static_partitions.contains_key(f.name()))
             .count();
 
-        if let Some(first) = batches.first() {
-            if first.num_columns() != expected_source_cols {
-                return Err(DataFusionError::Plan(format!(
-                    "Source query has {} columns, but expected {} non-partition columns",
-                    first.num_columns(),
-                    expected_source_cols
-                )));
-            }
-        }
-
         let wb = table.new_write_builder().with_overwrite();
         let mut tw = wb.new_write().map_err(to_datafusion_error)?;
         let mut row_count = 0u64;
+        let mut col_checked = false;
 
-        for batch in &batches {
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
             if batch.num_rows() == 0 {
                 continue;
             }
+            if !col_checked {
+                if batch.num_columns() != expected_source_cols {
+                    return Err(DataFusionError::Plan(format!(
+                        "Source query has {} columns, but expected {} non-partition columns",
+                        batch.num_columns(),
+                        expected_source_cols
+                    )));
+                }
+                col_checked = true;
+            }
             let augmented = append_partition_columns(
-                batch,
+                &batch,
                 &static_partitions,
                 expected_source_cols,
                 all_fields,
