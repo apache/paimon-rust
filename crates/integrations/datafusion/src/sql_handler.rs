@@ -436,10 +436,9 @@ impl PaimonSqlHandler {
             .await
             .map_err(to_datafusion_error)?;
 
-        let partition_exprs = insert
-            .partitioned
-            .as_ref()
-            .expect("guarded by match: partitioned is Some and non-empty");
+        let partition_exprs = insert.partitioned.as_ref().ok_or_else(|| {
+            DataFusionError::Plan("INSERT OVERWRITE PARTITION requires a PARTITION clause".into())
+        })?;
         let partition_fields = table.schema().partition_fields();
         let static_partitions =
             parse_static_partitions(partition_exprs, &partition_fields, table.schema().fields())?;
@@ -456,7 +455,7 @@ impl PaimonSqlHandler {
             .filter(|f| !static_partitions.contains_key(f.name()))
             .count();
 
-        if let Some(first) = batches.iter().find(|b| b.num_rows() > 0) {
+        if let Some(first) = batches.first() {
             if first.num_columns() != expected_source_cols {
                 return Err(DataFusionError::Plan(format!(
                     "Source query has {} columns, but expected {} non-partition columns",
@@ -1059,9 +1058,6 @@ fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFRe
                 DataFusionError::Plan(format!("Invalid DOUBLE: {e}"))
             })?))
         }
-        _ if negate => Err(DataFusionError::Plan(format!(
-            "Cannot negate value for type {data_type:?}"
-        ))),
         _ => Err(DataFusionError::Plan(format!(
             "Cannot convert {n} to {data_type:?}"
         ))),
@@ -1129,6 +1125,7 @@ fn append_partition_columns(
 }
 
 /// Create a constant Arrow array from a Datum value.
+/// Only variants produced by `sql_expr_to_datum` are supported here.
 fn datum_to_constant_array(
     datum: &Option<Datum>,
     data_type: &PaimonDataType,

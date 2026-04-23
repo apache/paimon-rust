@@ -41,14 +41,17 @@ use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::PaimonSqlHandler;
 
-let mut options = Options::new();
-options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
-let catalog = Arc::new(FileSystemCatalog::new(options)?);
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
+    let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
-let ctx = SessionContext::new();
-let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
-let df = handler.sql("SELECT * FROM paimon.default.my_table").await?;
-df.show().await?;
+    let ctx = SessionContext::new();
+    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
+    let df = handler.sql("SELECT * FROM paimon.default.my_table").await?;
+    df.show().await?;
+    Ok(())
+}
 ```
 
 `PaimonSqlHandler::new` automatically registers the Paimon catalog provider and relation planner on the session context. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
