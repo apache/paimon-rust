@@ -97,4 +97,10 @@ impl BucketAssignerEnum {
             Self::CrossPartition(a) => a.prepare_commit_index(file_io, index_dir).await,
         }
     }
+
+    pub fn set_overwrite(&mut self, is_overwrite: bool) {
+        if let Self::Dynamic(a) = self {
+            a.set_overwrite(is_overwrite);
+        }
+    }
 }

@@ -353,6 +353,10 @@ impl DynamicBucketAssigner {
         }
     }
 
+    pub fn set_overwrite(&mut self, is_overwrite: bool) {
+        self.is_overwrite = is_overwrite;
+    }
+
     /// Load all index manifest entries from the latest snapshot (cached).
     /// Overwrite mode skips loading — old index is irrelevant.
     async fn ensure_index_entries_loaded(&mut self) -> Result<()> {

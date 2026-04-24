@@ -345,6 +345,7 @@ impl TableWrite {
     /// since old data will be fully replaced at commit time.
     pub fn with_overwrite(mut self) -> Self {
         self.is_overwrite = true;
+        self.bucket_assigner.set_overwrite(true);
         self
     }
 
