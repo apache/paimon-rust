@@ -109,11 +109,8 @@ pub struct TableWrite {
 }
 
 impl TableWrite {
-    pub(crate) fn new(
-        table: &Table,
-        commit_user: String,
-        is_overwrite: bool,
-    ) -> crate::Result<Self> {
+    pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
+        let is_overwrite = false;
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
@@ -340,6 +337,15 @@ impl TableWrite {
             partitions,
             &partition_fields,
         )?))
+    }
+
+    /// Mark this write as an overwrite operation.
+    ///
+    /// Overwrite skips restoring sequence numbers and bucket index loading
+    /// since old data will be fully replaced at commit time.
+    pub fn with_overwrite(mut self) -> Self {
+        self.is_overwrite = true;
+        self
     }
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
@@ -791,7 +797,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![1, 2, 3], vec![10, 20, 30]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -822,7 +828,7 @@ mod tests {
             None,
         );
 
-        assert!(TableWrite::new(&table, "test-user".to_string(), false).is_ok());
+        assert!(TableWrite::new(&table, "test-user".to_string()).is_ok());
     }
 
     #[tokio::test]
@@ -839,7 +845,7 @@ mod tests {
             None,
         );
 
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -898,7 +904,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_partitioned_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_partitioned_batch(vec!["a", "b", "a"], vec![1, 2, 3]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -929,7 +935,7 @@ mod tests {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_empty";
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![], vec![]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -945,7 +951,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // First write + prepare_commit
         table_write
@@ -977,7 +983,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         table_write
             .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
@@ -1041,7 +1047,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_bucketed_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Row with NULL bucket key should not panic
         let batch = make_nullable_id_batch(vec![None, Some(1), None], vec![10, 20, 30]);
@@ -1063,7 +1069,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_bucketed_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Two NULLs should land in the same bucket
         let batch = make_nullable_id_batch(vec![None, None], vec![10, 20]);
@@ -1091,7 +1097,7 @@ mod tests {
 
         // Compute bucket for NULL key
         let fields = table.schema().fields().to_vec();
-        let mut tw = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut tw = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch_null = make_nullable_id_batch(vec![None], vec![10]);
         let out_null = tw
@@ -1162,7 +1168,7 @@ mod tests {
                 None,
             );
 
-            let mut tw = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+            let mut tw = TableWrite::new(&table, "test-user".to_string()).unwrap();
             let fields = table.schema().fields().to_vec();
 
             // Build a batch: d=NULL, ltz=NULL, ntz=NULL, k=1
@@ -1241,7 +1247,7 @@ mod tests {
             None,
         );
 
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Write multiple batches — each should roll to a new file
         table_write
@@ -1294,7 +1300,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1329,7 +1335,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // Write unsorted data
         let batch = make_batch(vec![5, 2, 4, 1, 3], vec![50, 20, 40, 10, 30]);
@@ -1387,7 +1393,7 @@ mod tests {
         let table = test_pk_table(&file_io, table_path);
 
         // First commit: id=1,2,3
-        let mut tw1 = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut tw1 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         tw1.write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
             .await
             .unwrap();
@@ -1396,7 +1402,7 @@ mod tests {
         commit.commit(msgs1).await.unwrap();
 
         // Second commit: id=2,3,4 with updated values, higher sequence numbers
-        let mut tw2 = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut tw2 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         tw2.write_arrow_batch(&make_batch(vec![2, 3, 4], vec![200, 300, 400]))
             .await
             .unwrap();
@@ -1449,7 +1455,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![1, 2], vec![10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1533,7 +1539,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_postpone_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1559,7 +1565,7 @@ mod tests {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_empty";
         let table = test_postpone_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch = make_batch(vec![], vec![]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1575,7 +1581,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_postpone_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         table_write
             .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
@@ -1601,7 +1607,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_postpone_partitioned_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let batch =
             make_partitioned_batch_3col(vec!["a", "b", "a"], vec![1, 2, 3], vec![10, 20, 30]);
@@ -1639,7 +1645,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_postpone_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // First write + prepare_commit
         table_write
@@ -1671,7 +1677,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_postpone_pk_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "my-commit-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "my-commit-user".to_string()).unwrap();
 
         let batch = make_batch(vec![3, 1, 2], vec![30, 10, 20]);
         table_write.write_arrow_batch(&batch).await.unwrap();
@@ -1765,7 +1771,7 @@ mod tests {
 
         // Cross-partition: PK=id, partition=pt, bucket=-1
         let table = test_cross_partition_table(&file_io, table_path);
-        let tw = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let tw = TableWrite::new(&table, "test-user".to_string()).unwrap();
         assert!(matches!(
             tw.bucket_assigner,
             BucketAssignerEnum::CrossPartition(_)
@@ -1787,7 +1793,7 @@ mod tests {
             TableSchema::new(0, &schema),
             None,
         );
-        let tw2 = TableWrite::new(&table2, "test-user".to_string(), false).unwrap();
+        let tw2 = TableWrite::new(&table2, "test-user".to_string()).unwrap();
         assert!(matches!(
             tw2.bucket_assigner,
             BucketAssignerEnum::Dynamic(_)
@@ -1801,7 +1807,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let table = test_cross_partition_table(&file_io, table_path);
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         // All rows in same partition — no cross-partition deletes
         let batch =
@@ -1829,7 +1835,7 @@ mod tests {
         let table = test_cross_partition_table(&file_io, table_path);
 
         // First commit: id=1 in partition "a"
-        let mut tw1 = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut tw1 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         let batch1 = make_partitioned_batch_3col(vec!["a"], vec![1], vec![10]);
         tw1.write_arrow_batch(&batch1).await.unwrap();
         let msgs1 = tw1.prepare_commit().await.unwrap();
@@ -1837,7 +1843,7 @@ mod tests {
         commit.commit(msgs1).await.unwrap();
 
         // Second commit: id=1 moves to partition "b"
-        let mut tw2 = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut tw2 = TableWrite::new(&table, "test-user".to_string()).unwrap();
         let batch2 = make_partitioned_batch_3col(vec!["b"], vec![1], vec![20]);
         tw2.write_arrow_batch(&batch2).await.unwrap();
         let msgs2 = tw2.prepare_commit().await.unwrap();

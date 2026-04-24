@@ -457,8 +457,11 @@ impl PaimonSqlHandler {
             .filter(|f| !static_partitions.contains_key(f.name()))
             .count();
 
-        let wb = table.new_write_builder().with_overwrite();
-        let mut tw = wb.new_write().map_err(to_datafusion_error)?;
+        let wb = table.new_write_builder();
+        let mut tw = wb
+            .new_write()
+            .map_err(to_datafusion_error)?
+            .with_overwrite();
         let mut row_count = 0u64;
         let mut col_checked = false;
 

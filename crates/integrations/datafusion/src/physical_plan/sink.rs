@@ -80,11 +80,11 @@ impl DataSink for PaimonDataSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
-        let mut wb = self.table.new_write_builder();
-        if self.overwrite {
-            wb = wb.with_overwrite();
-        }
+        let wb = self.table.new_write_builder();
         let mut tw = wb.new_write().map_err(to_datafusion_error)?;
+        if self.overwrite {
+            tw = tw.with_overwrite();
+        }
         let mut row_count = 0u64;
 
         while let Some(batch) = data.next().await {
