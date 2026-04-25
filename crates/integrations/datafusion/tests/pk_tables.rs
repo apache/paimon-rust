@@ -926,6 +926,200 @@ async fn test_pk_insert_overwrite_partition_non_partition_column_error() {
     );
 }
 
+/// All-dynamic PARTITION clause (no static values) should use dynamic partition overwrite,
+/// not drop all partitions.
+#[tokio::test]
+async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dyn (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn VALUES \
+             ('2024-01-01', 1, 'alice'), ('2024-01-02', 2, 'bob')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Dynamic partition overwrite: PARTITION (dt) with no static value.
+    // Should only overwrite partitions present in the source data.
+    handler
+        .sql(
+            "INSERT OVERWRITE paimon.test_db.t_dyn PARTITION (dt) \
+             VALUES ('2024-01-01', 10, 'new_alice')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = handler
+        .sql("SELECT dt, id, name FROM paimon.test_db.t_dyn ORDER BY dt, id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let dts = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dts.value(i).to_string(),
+                ids.value(i),
+                names.value(i).to_string(),
+            ));
+        }
+    }
+
+    // dt='2024-01-01' overwritten, dt='2024-01-02' preserved
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-01-01".to_string(), 10, "new_alice".to_string()),
+            ("2024-01-02".to_string(), 2, "bob".to_string()),
+        ]
+    );
+}
+
+/// Source query with wrong column count should fail even when the result is empty.
+#[tokio::test]
+async fn test_pk_insert_overwrite_empty_source_wrong_columns_error() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_empty_err (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_empty_err VALUES \
+             ('2024-01-01', 1, 'alice')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Source only produces `id` but target expects `id, name` — should fail
+    let result = handler
+        .sql(
+            "INSERT OVERWRITE paimon.test_db.t_empty_err PARTITION (dt = '2024-01-01') \
+             SELECT id FROM paimon.test_db.t_empty_err WHERE false",
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("expected 2 non-partition columns"),
+        "Expected column count mismatch error, got: {err_msg}"
+    );
+}
+
+/// Explicit target column list after PARTITION should reorder source columns to match schema.
+#[tokio::test]
+async fn test_pk_insert_overwrite_with_after_columns_reorder() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_reorder (
+                dt STRING, id INT NOT NULL, name STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    // Insert with columns in reversed order: (name, id) instead of schema order (id, name)
+    handler
+        .sql(
+            "INSERT OVERWRITE paimon.test_db.t_reorder (name, id) PARTITION (dt = '2024-01-01') \
+             VALUES ('alice', 1), ('bob', 2)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = handler
+        .sql("SELECT dt, id, name FROM paimon.test_db.t_reorder ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let dts = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dts.value(i).to_string(),
+                ids.value(i),
+                names.value(i).to_string(),
+            ));
+        }
+    }
+
+    // Values should be correctly mapped: name='alice'/id=1, name='bob'/id=2
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-01-01".to_string(), 1, "alice".to_string()),
+            ("2024-01-01".to_string(), 2, "bob".to_string()),
+        ]
+    );
+}
+
 // ======================= Composite Primary Key =======================
 
 /// Composite PK with multiple columns.

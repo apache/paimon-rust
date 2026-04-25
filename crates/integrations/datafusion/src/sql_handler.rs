@@ -447,15 +447,58 @@ impl PaimonSqlHandler {
         let source = insert.source.as_ref().ok_or_else(|| {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
         })?;
-        // Re-parse via to_string(); may lose dialect-specific syntax for complex queries.
         let df = self.ctx.sql(&source.to_string()).await?;
-        let mut stream = df.execute_stream().await?;
 
         let all_fields = table.schema().fields();
-        let expected_source_cols = all_fields
+        let non_static_fields: Vec<&PaimonDataField> = all_fields
             .iter()
             .filter(|f| !static_partitions.contains_key(f.name()))
-            .count();
+            .collect();
+        let expected_source_cols = non_static_fields.len();
+
+        // Resolve target column mapping from the explicit column list.
+        // `columns` = before PARTITION, `after_columns` = after PARTITION (Hive-style).
+        let target_columns = if !insert.columns.is_empty() {
+            Some(&insert.columns)
+        } else if !insert.after_columns.is_empty() {
+            Some(&insert.after_columns)
+        } else {
+            None
+        };
+        let column_reorder: Option<Vec<usize>> = if let Some(cols) = target_columns {
+            if cols.len() != expected_source_cols {
+                return Err(DataFusionError::Plan(format!(
+                    "Column list has {} columns, but expected {} non-partition columns",
+                    cols.len(),
+                    expected_source_cols
+                )));
+            }
+            let col_names: Vec<&str> = cols.iter().map(|id| id.value.as_str()).collect();
+            let mut reorder = Vec::with_capacity(expected_source_cols);
+            for field in &non_static_fields {
+                let pos = col_names.iter().position(|c| c == &field.name()).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Column '{}' not found in target column list",
+                        field.name()
+                    ))
+                })?;
+                reorder.push(pos);
+            }
+            Some(reorder)
+        } else {
+            None
+        };
+
+        // Validate column count from the DataFrame schema before consuming any batches.
+        let source_col_count = df.schema().fields().len();
+        if source_col_count != expected_source_cols {
+            return Err(DataFusionError::Plan(format!(
+                "Source query has {} columns, but expected {} non-partition columns",
+                source_col_count, expected_source_cols
+            )));
+        }
+
+        let mut stream = df.execute_stream().await?;
 
         let wb = table.new_write_builder();
         let mut tw = wb
@@ -463,23 +506,25 @@ impl PaimonSqlHandler {
             .map_err(to_datafusion_error)?
             .with_overwrite();
         let mut row_count = 0u64;
-        let mut col_checked = false;
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             if batch.num_rows() == 0 {
                 continue;
             }
-            if !col_checked {
-                if batch.num_columns() != expected_source_cols {
-                    return Err(DataFusionError::Plan(format!(
-                        "Source query has {} columns, but expected {} non-partition columns",
-                        batch.num_columns(),
-                        expected_source_cols
-                    )));
-                }
-                col_checked = true;
-            }
+            let batch = if let Some(ref reorder) = column_reorder {
+                let reordered_cols: Vec<ArrayRef> =
+                    reorder.iter().map(|&i| batch.column(i).clone()).collect();
+                let reordered_fields: Vec<Field> = reorder
+                    .iter()
+                    .map(|&i| batch.schema().field(i).clone())
+                    .collect();
+                let reordered_schema = Arc::new(Schema::new(reordered_fields));
+                RecordBatch::try_new(reordered_schema, reordered_cols)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+            } else {
+                batch
+            };
             let augmented = append_partition_columns(
                 &batch,
                 &static_partitions,
@@ -495,8 +540,13 @@ impl PaimonSqlHandler {
         let messages = tw.prepare_commit().await.map_err(to_datafusion_error)?;
         let commit = wb.new_commit();
 
+        let overwrite_partitions = if static_partitions.is_empty() {
+            None
+        } else {
+            Some(static_partitions)
+        };
         commit
-            .overwrite(messages, Some(static_partitions))
+            .overwrite(messages, overwrite_partitions)
             .await
             .map_err(to_datafusion_error)?;
 
