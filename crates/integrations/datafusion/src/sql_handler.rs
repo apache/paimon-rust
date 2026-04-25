@@ -476,12 +476,15 @@ impl PaimonSqlHandler {
             let col_names: Vec<&str> = cols.iter().map(|id| id.value.as_str()).collect();
             let mut reorder = Vec::with_capacity(expected_source_cols);
             for field in &non_static_fields {
-                let pos = col_names.iter().position(|c| c == &field.name()).ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "Column '{}' not found in target column list",
-                        field.name()
-                    ))
-                })?;
+                let pos = col_names
+                    .iter()
+                    .position(|c| c == &field.name())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "Column '{}' not found in target column list",
+                            field.name()
+                        ))
+                    })?;
                 reorder.push(pos);
             }
             Some(reorder)
