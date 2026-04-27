@@ -282,40 +282,97 @@ impl SnapshotManager {
             .await
     }
 
-    /// Returns the snapshot whose commit time is earlier than or equal to the given
+    /// Delete a snapshot file by id.
+    pub async fn delete_snapshot(&self, snapshot_id: i64) -> crate::Result<()> {
+        let path = self.snapshot_path(snapshot_id);
+        self.file_io.delete_file(&path).await
+    }
+
+    /// Update the EARLIEST hint file.
+    pub async fn write_earliest_hint(&self, snapshot_id: i64) -> crate::Result<()> {
+        let hint_path = self.earliest_hint_path();
+        let output = self.file_io.new_output(&hint_path)?;
+        output
+            .write(bytes::Bytes::from(snapshot_id.to_string()))
+            .await
+    }
+
+    /// Returns the first snapshot whose commit time is later than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///
-    /// Uses binary search over snapshot IDs (assumes monotonically increasing commit times).
-    ///
-    /// Reference: [SnapshotManager.earlierOrEqualTimeMills](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java)
-    pub async fn earlier_or_equal_time_mills(
+    /// Uses binary search over the actual snapshot ID list to handle gaps from deleted snapshots.
+    pub async fn later_or_equal_time_millis(
         &self,
         timestamp_millis: i64,
     ) -> crate::Result<Option<Snapshot>> {
-        let mut latest = match self.get_latest_snapshot_id().await? {
-            Some(id) => id,
-            None => return Ok(None),
-        };
+        let ids = self.list_all_ids().await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
 
-        let earliest_snapshot = match self.earliest_snapshot_id().await? {
-            Some(id) => self.get_snapshot(id).await?,
-            None => return Ok(None),
-        };
+        let latest_snapshot = self.get_snapshot(*ids.last().unwrap()).await?;
+        if (latest_snapshot.time_millis() as i64) < timestamp_millis {
+            return Ok(None);
+        }
 
+        let mut lo: usize = 0;
+        let mut hi: usize = ids.len() - 1;
+        let mut result: Option<Snapshot> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let snapshot = self.get_snapshot(ids[mid]).await?;
+            let commit_time = snapshot.time_millis() as i64;
+            if commit_time < timestamp_millis {
+                lo = mid + 1;
+            } else if commit_time > timestamp_millis {
+                if mid == 0 {
+                    result = Some(snapshot);
+                    break;
+                }
+                hi = mid - 1;
+                result = Some(snapshot);
+            } else {
+                result = Some(snapshot);
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Returns the snapshot whose commit time is earlier than or equal to the given
+    /// `timestamp_millis`. If no such snapshot exists, returns None.
+    ///
+    /// Uses binary search over the actual snapshot ID list to handle gaps from deleted snapshots.
+    ///
+    /// Reference: [SnapshotManager.earlierOrEqualTimeMills](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java)
+    pub async fn earlier_or_equal_time_millis(
+        &self,
+        timestamp_millis: i64,
+    ) -> crate::Result<Option<Snapshot>> {
+        let ids = self.list_all_ids().await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+
+        let earliest_snapshot = self.get_snapshot(ids[0]).await?;
         if (earliest_snapshot.time_millis() as i64) > timestamp_millis {
             return Ok(None);
         }
-        let mut earliest = earliest_snapshot.id();
 
+        let mut lo: usize = 0;
+        let mut hi: usize = ids.len() - 1;
         let mut result: Option<Snapshot> = None;
-        while earliest <= latest {
-            let mid = earliest + (latest - earliest) / 2;
-            let snapshot = self.get_snapshot(mid).await?;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let snapshot = self.get_snapshot(ids[mid]).await?;
             let commit_time = snapshot.time_millis() as i64;
             if commit_time > timestamp_millis {
-                latest = mid - 1;
+                if mid == 0 {
+                    break;
+                }
+                hi = mid - 1;
             } else if commit_time < timestamp_millis {
-                earliest = mid + 1;
+                lo = mid + 1;
                 result = Some(snapshot);
             } else {
                 result = Some(snapshot);

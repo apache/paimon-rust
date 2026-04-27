@@ -50,6 +50,16 @@ impl RESTEnv {
         }
     }
 
+    /// Get the REST API client.
+    pub fn api(&self) -> &Arc<RESTApi> {
+        &self.api
+    }
+
+    /// Get the table identifier.
+    pub fn identifier(&self) -> &Identifier {
+        &self.identifier
+    }
+
     /// Create a `RESTSnapshotCommit` from this environment.
     pub fn snapshot_commit(&self) -> Arc<dyn SnapshotCommit> {
         Arc::new(RESTSnapshotCommit::new(

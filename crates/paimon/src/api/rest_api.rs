@@ -419,4 +419,44 @@ impl RESTApi {
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
     }
+
+    /// Rollback a table to a specific snapshot.
+    pub async fn rollback_to_snapshot(
+        &self,
+        identifier: &Identifier,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.rollback(database, table);
+        let request = serde_json::json!({
+            "instant": {
+                "type": "snapshot",
+                "snapshotId": snapshot_id,
+            }
+        });
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Rollback a table to a specific tag.
+    pub async fn rollback_to_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.rollback(database, table);
+        let request = serde_json::json!({
+            "instant": {
+                "type": "tag",
+                "tagName": tag_name,
+            }
+        });
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
 }

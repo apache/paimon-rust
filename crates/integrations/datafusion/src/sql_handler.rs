@@ -199,6 +199,10 @@ impl PaimonSqlHandler {
                 self.ctx.sql(sql).await
             }
             Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
+            Statement::Call(func) => {
+                crate::procedures::execute_call(&self.ctx, &self.catalog, &self.catalog_name, func)
+                    .await
+            }
             _ => self.ctx.sql(sql).await,
         }
     }

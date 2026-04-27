@@ -115,6 +115,23 @@ impl TagManager {
         Ok(names)
     }
 
+    /// Create a tag by writing the snapshot JSON to the tag path.
+    pub async fn create(&self, tag_name: &str, snapshot: &Snapshot) -> crate::Result<()> {
+        let path = self.tag_path(tag_name);
+        let json = serde_json::to_string(snapshot).map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to serialize snapshot for tag '{tag_name}': {e}"),
+            source: Some(Box::new(e)),
+        })?;
+        let output = self.file_io.new_output(&path)?;
+        output.write(bytes::Bytes::from(json)).await
+    }
+
+    /// Delete a tag file.
+    pub async fn delete(&self, tag_name: &str) -> crate::Result<()> {
+        let path = self.tag_path(tag_name);
+        self.file_io.delete_file(&path).await
+    }
+
     /// List all tags as `(name, snapshot)` pairs sorted by name ascending.
     pub async fn list_all(&self) -> crate::Result<Vec<(String, Snapshot)>> {
         let names = self.list_all_names().await?;

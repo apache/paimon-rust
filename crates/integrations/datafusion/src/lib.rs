@@ -44,6 +44,7 @@ mod filter_pushdown;
 mod full_text_search;
 mod merge_into;
 mod physical_plan;
+mod procedures;
 mod relation_planner;
 pub mod runtime;
 mod sql_handler;

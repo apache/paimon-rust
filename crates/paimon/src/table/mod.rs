@@ -140,6 +140,11 @@ impl Table {
         &self.schema_manager
     }
 
+    /// Get the REST environment, if this table was loaded from a REST catalog.
+    pub fn rest_env(&self) -> Option<&RESTEnv> {
+        self.rest_env.as_ref()
+    }
+
     /// Create a read builder for scan/read.
     ///
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).

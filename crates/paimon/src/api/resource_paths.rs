@@ -143,6 +143,18 @@ impl ResourcePaths {
             RESTUtil::encode_string(table_name)
         )
     }
+
+    /// Get the rollback endpoint path for a table.
+    pub fn rollback(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/{}/{}/{}/{}/rollback",
+            self.base_path,
+            Self::DATABASES,
+            RESTUtil::encode_string(database_name),
+            Self::TABLES,
+            RESTUtil::encode_string(table_name)
+        )
+    }
 }
 
 #[cfg(test)]

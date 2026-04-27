@@ -370,7 +370,7 @@ impl<'a> TableScan<'a> {
 
         match core_options.try_time_travel_selector()? {
             Some(TimeTravelSelector::TimestampMillis(ts)) => {
-                match snapshot_manager.earlier_or_equal_time_mills(ts).await? {
+                match snapshot_manager.earlier_or_equal_time_millis(ts).await? {
                     Some(s) => Ok(Some(s)),
                     None => Err(Error::DataInvalid {
                         message: format!("No snapshot found with timestamp <= {ts}"),
