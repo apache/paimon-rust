@@ -320,6 +320,104 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 - No LIMIT clause
 - Filter predicates only involve partition columns (Exact level)
 
+## Vector Search
+
+Paimon supports approximate nearest neighbor (ANN) vector search via the Lumina vector index. The `vector_search` table-valued function is registered as a UDTF on the DataFusion session context.
+
+### Registration
+
+```rust
+use paimon_datafusion::register_vector_search;
+
+register_vector_search(&ctx, catalog.clone(), "default");
+```
+
+### Usage
+
+```sql
+SELECT * FROM vector_search('table_name', 'column_name', 'query_vector_json', limit)
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form |
+| `column_name` | STRING | The vector column to search |
+| `query_vector_json` | STRING | Query vector as a JSON array of floats |
+| `limit` | INT | Maximum number of results (top-k) |
+
+Example:
+
+```sql
+SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
+```
+
+The function performs ANN search across all Lumina vector index files for the target column, merges results, and returns the top-k rows ordered by relevance score. If no matching index is found, an empty result is returned.
+
+### Supported Metrics
+
+The distance metric is configured at index creation time via table options:
+
+| Metric | Description |
+|---|---|
+| `inner_product` | Inner product (default) |
+| `cosine` | Cosine similarity |
+| `l2` | Euclidean (L2) distance |
+
+### Vector Index Options
+
+Vector index behavior is configured via table options prefixed with `lumina.`:
+
+| Option | Description |
+|---|---|
+| `lumina.dimension` | Vector dimension |
+| `lumina.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
+| `lumina.index-type` | Index type (default: `diskann`) |
+
+### Environment
+
+The Lumina native library must be available at runtime. Set the `LUMINA_LIB_PATH` environment variable to the path of the shared library, or place it in the platform default location.
+
+## Full-Text Search
+
+Paimon supports full-text search via the Tantivy search engine. The `full_text_search` table-valued function is registered as a UDTF on the DataFusion session context.
+
+> **Note:** Full-text search requires the `fulltext` feature flag to be enabled on both `paimon` and `paimon-datafusion` crates.
+
+```toml
+[dependencies]
+paimon = { version = "0.1.0", features = ["fulltext"] }
+paimon-datafusion = { version = "0.1.0", features = ["fulltext"] }
+```
+
+### Registration
+
+```rust
+use paimon_datafusion::register_full_text_search;
+
+register_full_text_search(&ctx, catalog.clone(), "default");
+```
+
+### Usage
+
+```sql
+SELECT * FROM full_text_search('table_name', 'column_name', 'query_text', limit)
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form |
+| `column_name` | STRING | The text column to search |
+| `query_text` | STRING | Search query (Tantivy query syntax) |
+| `limit` | INT | Maximum number of results (top-k) |
+
+Example:
+
+```sql
+SELECT * FROM full_text_search('paimon.my_db.docs', 'content', 'paimon search', 10);
+```
+
+The function searches across all Tantivy full-text index files for the target column, merges results by relevance score, and returns the top-k matching rows. If no matching index is found, an empty result is returned.
+
 ## Time Travel
 
 Paimon supports time travel queries to read historical data.
