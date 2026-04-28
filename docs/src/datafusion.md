@@ -283,6 +283,80 @@ WHEN MATCHED THEN UPDATE SET name = source.name;
 
 For data-evolution tables, MERGE INTO uses the `_ROW_ID` virtual column for row-level tracking. For append-only tables, it uses Copy-on-Write file rewriting.
 
+### TRUNCATE TABLE
+
+Truncate an entire table or specific partitions:
+
+```sql
+-- Truncate the entire table
+TRUNCATE TABLE paimon.my_db.users;
+
+-- Truncate specific partitions
+TRUNCATE TABLE paimon.my_db.events PARTITION (dt = '2024-01-01');
+```
+
+### DROP PARTITION
+
+Drop specific partitions from a table using `ALTER TABLE ... DROP PARTITION`:
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01');
+```
+
+Multiple partition key-value pairs can be specified:
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01', region = 'us');
+```
+
+## Procedures
+
+Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
+
+### create_tag
+
+Create a named tag from a snapshot:
+
+```sql
+CALL sys.create_tag(table => 'paimon.my_db.my_table', tag => 'my_tag', snapshot_id => 1);
+```
+
+### create_tag_from_timestamp
+
+Create a named tag from a timestamp (finds the latest snapshot at or before the given time):
+
+```sql
+CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
+```
+
+### delete_tag
+
+Delete a named tag:
+
+```sql
+CALL sys.delete_tag(table => 'paimon.my_db.my_table', tag => 'my_tag');
+```
+
+### rollback_to
+
+Rollback a table to a specific snapshot or tag:
+
+```sql
+-- Rollback to a snapshot
+CALL sys.rollback_to(table => 'paimon.my_db.my_table', snapshot_id => 1);
+
+-- Rollback to a tag
+CALL sys.rollback_to(table => 'paimon.my_db.my_table', tag => 'my_tag');
+```
+
+### rollback_to_timestamp
+
+Rollback a table to a specific timestamp:
+
+```sql
+CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
+```
+
 ## Queries
 
 ### Basic Queries
