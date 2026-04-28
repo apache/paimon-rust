@@ -37,9 +37,92 @@ use datafusion::sql::sqlparser::ast::{
     FunctionArguments, ObjectName, Value as SqlValue,
 };
 use paimon::catalog::{Catalog, Identifier};
+use paimon::spec::Snapshot;
 use paimon::table::{SnapshotManager, Table, TagManager};
 
 use crate::error::to_datafusion_error;
+
+/// Resolve a snapshot by id: try live snapshot file first, then fall back to tag metadata.
+async fn resolve_snapshot_by_id(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    snapshot_id: i64,
+) -> DFResult<Snapshot> {
+    if let Ok(snap) = sm.get_snapshot(snapshot_id).await {
+        return Ok(snap);
+    }
+    let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+    for (_, snap) in &tags {
+        if snap.id() == snapshot_id {
+            return Ok(snap.clone());
+        }
+    }
+    Err(DataFusionError::Plan(format!(
+        "Snapshot '{snapshot_id}' does not exist in live files or tag metadata"
+    )))
+}
+
+/// Find the earliest snapshot with commit time >= timestamp_millis,
+/// considering both live snapshots and tag-retained snapshots.
+async fn later_or_equal_from_all(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    timestamp_millis: i64,
+) -> DFResult<Option<Snapshot>> {
+    let live = sm
+        .later_or_equal_time_millis(timestamp_millis)
+        .await
+        .map_err(to_datafusion_error)?;
+    let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+    let tag_candidate = tags
+        .into_iter()
+        .map(|(_, snap)| snap)
+        .filter(|s| (s.time_millis() as i64) >= timestamp_millis)
+        .min_by_key(|s| s.time_millis());
+    match (live, tag_candidate) {
+        (Some(a), Some(b)) => {
+            if a.time_millis() <= b.time_millis() {
+                Ok(Some(a))
+            } else {
+                Ok(Some(b))
+            }
+        }
+        (Some(a), None) => Ok(Some(a)),
+        (None, Some(b)) => Ok(Some(b)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Find the latest snapshot with commit time <= timestamp_millis,
+/// considering both live snapshots and tag-retained snapshots.
+async fn earlier_or_equal_from_all(
+    sm: &SnapshotManager,
+    tm: &TagManager,
+    timestamp_millis: i64,
+) -> DFResult<Option<Snapshot>> {
+    let live = sm
+        .earlier_or_equal_time_millis(timestamp_millis)
+        .await
+        .map_err(to_datafusion_error)?;
+    let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+    let tag_candidate = tags
+        .into_iter()
+        .map(|(_, snap)| snap)
+        .filter(|s| (s.time_millis() as i64) <= timestamp_millis)
+        .max_by_key(|s| s.time_millis());
+    match (live, tag_candidate) {
+        (Some(a), Some(b)) => {
+            if a.time_millis() >= b.time_millis() {
+                Ok(Some(a))
+            } else {
+                Ok(Some(b))
+            }
+        }
+        (Some(a), None) => Ok(Some(a)),
+        (None, Some(b)) => Ok(Some(b)),
+        (None, None) => Ok(None),
+    }
+}
 
 pub async fn execute_call(
     ctx: &SessionContext,
@@ -202,7 +285,7 @@ async fn proc_create_tag(
         )));
     }
     let snapshot = if let Some(id) = snapshot_id {
-        sm.get_snapshot(id).await.map_err(to_datafusion_error)?
+        resolve_snapshot_by_id(&sm, &tm, id).await?
     } else {
         sm.get_latest_snapshot()
             .await
@@ -227,10 +310,11 @@ async fn proc_delete_tag(
     let (_, tm) = managers(&table);
     for tag_name in tag_str.split(',') {
         let tag_name = tag_name.trim();
+        if tag_name.is_empty() {
+            continue;
+        }
         if !tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
-            return Err(DataFusionError::Plan(format!(
-                "Tag '{tag_name}' does not exist"
-            )));
+            continue;
         }
         tm.delete(tag_name).await.map_err(to_datafusion_error)?;
     }
@@ -255,6 +339,10 @@ async fn clean_larger_than(
         }
         sm.delete_snapshot(id).await.map_err(to_datafusion_error)?;
     }
+
+    // TODO: clean long-lived changelogs newer than retained_snapshot_id
+    // Java's RollbackHelper.cleanLargerThan also calls cleanLongLivedChangelogs here.
+    // Implement once ChangelogManager is available.
 
     // 3. Delete tags that reference snapshots newer than the target
     let tags = tm.list_all().await.map_err(to_datafusion_error)?;
@@ -303,8 +391,21 @@ async fn proc_rollback_to(
             let id: i64 = id_str
                 .parse()
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
-            sm.get_snapshot(id).await.map_err(to_datafusion_error)?;
+            let snapshot = resolve_snapshot_by_id(&sm, &tm, id).await?;
             clean_larger_than(&sm, &tm, id).await?;
+            if !sm
+                .file_io()
+                .exists(&sm.snapshot_path(id))
+                .await
+                .map_err(to_datafusion_error)?
+            {
+                sm.commit_snapshot(&snapshot)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                sm.write_earliest_hint(id)
+                    .await
+                    .map_err(to_datafusion_error)?;
+            }
         } else if let Some(tag_name) = args.get("tag") {
             let snapshot = tm
                 .get(tag_name)
@@ -349,10 +450,8 @@ async fn proc_rollback_to_timestamp(
         .map_err(|_| DataFusionError::Plan(format!("Invalid timestamp: '{ts_str}'")))?;
 
     let (sm, tm) = managers(&table);
-    let snapshot = sm
-        .earlier_or_equal_time_millis(timestamp)
-        .await
-        .map_err(to_datafusion_error)?
+    let snapshot = earlier_or_equal_from_all(&sm, &tm, timestamp)
+        .await?
         .ok_or_else(|| {
             DataFusionError::Plan(format!("No snapshot found with commit time <= {timestamp}"))
         })?;
@@ -383,10 +482,8 @@ async fn proc_create_tag_from_timestamp(
         .map_err(|_| DataFusionError::Plan(format!("Invalid timestamp: '{ts_str}'")))?;
 
     let (sm, tm) = managers(&table);
-    let snapshot = sm
-        .later_or_equal_time_millis(timestamp)
-        .await
-        .map_err(to_datafusion_error)?
+    let snapshot = later_or_equal_from_all(&sm, &tm, timestamp)
+        .await?
         .ok_or_else(|| {
             DataFusionError::Plan(format!("No snapshot found with commit time >= {timestamp}"))
         })?;
@@ -413,4 +510,126 @@ fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
         vec![Arc::new(StringArray::from(vec!["OK"]))],
     )?;
     ctx.read_batch(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::CommitKind;
+
+    fn test_file_io() -> paimon::io::FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    fn test_snapshot(id: i64, time_millis: u64) -> Snapshot {
+        Snapshot::builder()
+            .version(3)
+            .id(id)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(time_millis)
+            .build()
+    }
+
+    async fn setup(table_path: &str) -> (paimon::io::FileIO, SnapshotManager, TagManager) {
+        let file_io = test_file_io();
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let tm = TagManager::new(file_io.clone(), table_path.to_string());
+        (file_io, sm, tm)
+    }
+
+    #[tokio::test]
+    async fn test_resolve_snapshot_by_id_live() {
+        let (_, sm, tm) = setup("memory:/test_resolve_live").await;
+        let snap = test_snapshot(1, 1000);
+        sm.commit_snapshot(&snap).await.unwrap();
+
+        let result = resolve_snapshot_by_id(&sm, &tm, 1).await.unwrap();
+        assert_eq!(result.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_snapshot_by_id_tag_fallback() {
+        let (_, sm, tm) = setup("memory:/test_resolve_tag").await;
+        let snap = test_snapshot(1, 1000);
+        tm.create("v1", &snap).await.unwrap();
+
+        let result = resolve_snapshot_by_id(&sm, &tm, 1).await.unwrap();
+        assert_eq!(result.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_snapshot_by_id_not_found() {
+        let (_, sm, tm) = setup("memory:/test_resolve_none").await;
+        let result = resolve_snapshot_by_id(&sm, &tm, 99).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_later_or_equal_exact_live() {
+        let (_, sm, tm) = setup("memory:/test_later_exact").await;
+        sm.commit_snapshot(&test_snapshot(1, 1000)).await.unwrap();
+        sm.commit_snapshot(&test_snapshot(2, 2000)).await.unwrap();
+
+        let result = later_or_equal_from_all(&sm, &tm, 1000).await.unwrap();
+        assert_eq!(result.unwrap().id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_later_or_equal_tag_better() {
+        let (_, sm, tm) = setup("memory:/test_later_tag_better").await;
+        sm.commit_snapshot(&test_snapshot(3, 3000)).await.unwrap();
+        tm.create("v2", &test_snapshot(2, 2000)).await.unwrap();
+
+        let result = later_or_equal_from_all(&sm, &tm, 1500).await.unwrap();
+        assert_eq!(result.unwrap().id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_later_or_equal_only_tag() {
+        let (_, sm, tm) = setup("memory:/test_later_only_tag").await;
+        tm.create("v1", &test_snapshot(1, 1000)).await.unwrap();
+
+        let result = later_or_equal_from_all(&sm, &tm, 500).await.unwrap();
+        assert_eq!(result.unwrap().id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_exact_live() {
+        let (_, sm, tm) = setup("memory:/test_earlier_exact").await;
+        sm.commit_snapshot(&test_snapshot(1, 1000)).await.unwrap();
+        sm.commit_snapshot(&test_snapshot(2, 2000)).await.unwrap();
+
+        let result = earlier_or_equal_from_all(&sm, &tm, 2000).await.unwrap();
+        assert_eq!(result.unwrap().id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_tag_better() {
+        let (_, sm, tm) = setup("memory:/test_earlier_tag_better").await;
+        sm.commit_snapshot(&test_snapshot(1, 1000)).await.unwrap();
+        tm.create("v2", &test_snapshot(2, 2000)).await.unwrap();
+
+        let result = earlier_or_equal_from_all(&sm, &tm, 2500).await.unwrap();
+        assert_eq!(result.unwrap().id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_only_tag() {
+        let (_, sm, tm) = setup("memory:/test_earlier_only_tag").await;
+        tm.create("v1", &test_snapshot(1, 1000)).await.unwrap();
+
+        let result = earlier_or_equal_from_all(&sm, &tm, 1500).await.unwrap();
+        assert_eq!(result.unwrap().id(), 1);
+    }
 }

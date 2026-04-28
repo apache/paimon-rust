@@ -381,6 +381,14 @@ impl SnapshotManager {
         }
         Ok(result)
     }
+
+    #[deprecated(note = "Renamed to earlier_or_equal_time_millis")]
+    pub async fn earlier_or_equal_time_mills(
+        &self,
+        timestamp_millis: i64,
+    ) -> crate::Result<Option<Snapshot>> {
+        self.earlier_or_equal_time_millis(timestamp_millis).await
+    }
 }
 
 #[cfg(test)]
