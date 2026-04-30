@@ -335,17 +335,17 @@ mod tests {
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
-    use crate::{PaimonSqlHandler, PaimonTableProvider};
+    use crate::{PaimonTableProvider, SQLContext};
 
-    async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
+    async fn setup_handler() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = format!("file://{}", temp_dir.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler =
-            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
+        let mut handler = SQLContext::new();
+        handler.register_catalog("paimon", catalog.clone()).unwrap();
         handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
 
         (temp_dir, handler, catalog)
@@ -587,7 +587,7 @@ mod tests {
     // CoW UPDATE tests (append-only tables)
     // -----------------------------------------------------------------------
 
-    async fn setup_append_only_table(name: &str) -> (TempDir, PaimonSqlHandler) {
+    async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext) {
         let (tmp, handler, _catalog) = setup_handler().await;
 
         handler
@@ -610,7 +610,7 @@ mod tests {
         (tmp, handler)
     }
 
-    async fn query_rows(handler: &PaimonSqlHandler, table: &str) -> Vec<(i32, String, i32)> {
+    async fn query_rows(handler: &SQLContext, table: &str) -> Vec<(i32, String, i32)> {
         let batches = handler
             .sql(&format!("SELECT id, name, value FROM {table} ORDER BY id"))
             .await

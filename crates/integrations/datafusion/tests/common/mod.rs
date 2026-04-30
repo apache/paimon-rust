@@ -20,9 +20,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, StringArray};
-use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 use tempfile::TempDir;
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -36,13 +35,14 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
+pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).unwrap();
+    ctx
 }
 
 #[allow(dead_code)]
-pub async fn setup_handler() -> (TempDir, PaimonSqlHandler) {
+pub async fn setup_handler() -> (TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);
     handler
@@ -53,7 +53,7 @@ pub async fn setup_handler() -> (TempDir, PaimonSqlHandler) {
 }
 
 #[allow(dead_code)]
-pub async fn collect_id_name(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String)> {
+pub async fn collect_id_name(handler: &SQLContext, sql: &str) -> Vec<(i32, String)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
@@ -74,7 +74,7 @@ pub async fn collect_id_name(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32,
 }
 
 #[allow(dead_code)]
-pub async fn collect_id_value(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, i32)> {
+pub async fn collect_id_value(handler: &SQLContext, sql: &str) -> Vec<(i32, i32)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
@@ -95,26 +95,26 @@ pub async fn collect_id_value(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32
 }
 
 #[allow(dead_code)]
-pub async fn row_count(handler: &PaimonSqlHandler, sql: &str) -> usize {
+pub async fn row_count(handler: &SQLContext, sql: &str) -> usize {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
 /// Execute SQL and collect results, discarding the output.
 #[allow(dead_code)]
-pub async fn exec(handler: &PaimonSqlHandler, s: &str) {
+pub async fn exec(handler: &SQLContext, s: &str) {
     handler.sql(s).await.unwrap().collect().await.unwrap();
 }
 
 /// Execute SQL on the raw DataFusion context (for non-Paimon source tables).
 #[allow(dead_code)]
-pub async fn ctx_exec(handler: &PaimonSqlHandler, s: &str) {
+pub async fn ctx_exec(handler: &SQLContext, s: &str) {
     handler.ctx().sql(s).await.unwrap().collect().await.unwrap();
 }
 
 /// Extract the count from a DML result (returns a single UInt64 column).
 #[allow(dead_code)]
-pub async fn dml_count(handler: &PaimonSqlHandler, sql_str: &str) -> u64 {
+pub async fn dml_count(handler: &SQLContext, sql_str: &str) -> u64 {
     let result = handler.sql(sql_str).await.unwrap().collect().await.unwrap();
     result[0]
         .column(0)
@@ -233,7 +233,7 @@ pub fn collect_int_str_int(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
 
 /// Query a 3-column (i32, String, i32) table and return sorted rows.
 #[allow(dead_code)]
-pub async fn query_int_str_int(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String, i32)> {
+pub async fn query_int_str_int(handler: &SQLContext, sql: &str) -> Vec<(i32, String, i32)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     collect_int_str_int(&batches)
 }

@@ -56,7 +56,7 @@ impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
     ///
     /// For standalone use without `SET`/`RESET` support.
-    /// When used via [`PaimonSqlHandler`], the handler creates the provider
+    /// When used via [`SQLContext`], the handler creates the provider
     /// internally with shared dynamic options.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
         PaimonCatalogProvider {

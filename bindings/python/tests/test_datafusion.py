@@ -16,11 +16,12 @@
 # under the License.
 
 import os
+import tempfile
 
 import pyarrow as pa
 from datafusion import SessionContext
 
-from pypaimon_rust.datafusion import PaimonCatalog
+from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 WAREHOUSE = os.environ.get("PAIMON_TEST_WAREHOUSE", "/tmp/paimon-warehouse")
 
@@ -42,3 +43,25 @@ def test_query_simple_table_via_catalog_provider():
         (2, "bob"),
         (3, "carol"),
     ]
+
+
+def test_sql_context_ddl_dml():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        ctx.sql("CREATE SCHEMA paimon.test_db")
+        ctx.sql(
+            "CREATE TABLE paimon.test_db.users "
+            "(id INT, name STRING, PRIMARY KEY (id))"
+        )
+
+        ctx.sql("INSERT INTO paimon.test_db.users VALUES (1, 'alice'), (2, 'bob')")
+
+        batches = ctx.sql("SELECT id, name FROM paimon.test_db.users")
+        table = pa.Table.from_batches(batches)
+        rows = sorted(zip(table["id"].to_pylist(), table["name"].to_pylist()))
+        assert rows == [(1, "alice"), (2, "bob")]
+
+        ctx.sql("DROP TABLE paimon.test_db.users")
+        ctx.sql("DROP SCHEMA paimon.test_db")

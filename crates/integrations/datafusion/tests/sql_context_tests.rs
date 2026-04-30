@@ -20,11 +20,10 @@
 use std::sync::Arc;
 
 use datafusion::catalog::CatalogProvider;
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::spec::{ArrayType, BlobType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonSqlHandler};
+use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
@@ -36,9 +35,10 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
+fn create_handler(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).unwrap();
+    ctx
 }
 
 // ======================= CREATE / DROP SCHEMA =======================
@@ -551,4 +551,86 @@ async fn test_ddl_handler_delegates_select() {
     // Empty table, but should succeed
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Empty table should return 0 rows");
+}
+
+// ======================= MULTI-CATALOG =======================
+
+#[tokio::test]
+async fn test_multi_catalog_register_and_query() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).unwrap();
+    ctx.register_catalog("cat2", catalog2).unwrap();
+
+    ctx.sql("CREATE SCHEMA cat1.db1").await.unwrap();
+    ctx.sql("CREATE SCHEMA cat2.db2").await.unwrap();
+
+    ctx.sql("CREATE TABLE cat1.db1.t (id INT NOT NULL, name STRING, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+    ctx.sql("CREATE TABLE cat2.db2.t (id INT NOT NULL, value STRING, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+
+    ctx.sql("INSERT INTO cat1.db1.t VALUES (1, 'alice')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO cat2.db2.t VALUES (2, 'hello')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("SELECT id, name FROM cat1.db1.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let batches = ctx
+        .sql("SELECT id, value FROM cat2.db2.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn test_set_current_catalog() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).unwrap();
+    ctx.register_catalog("cat2", catalog2).unwrap();
+
+    ctx.sql("CREATE SCHEMA cat1.mydb").await.unwrap();
+    ctx.sql("CREATE TABLE cat1.mydb.t (id INT NOT NULL, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+
+    ctx.set_current_catalog("cat1").await.unwrap();
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // Unqualified query should resolve against cat1.mydb
+    let df = ctx.sql("SELECT * FROM t").await;
+    assert!(
+        df.is_ok(),
+        "Unqualified table should resolve via current catalog/database"
+    );
+
+    // Switching to unknown catalog should fail
+    let err = ctx.set_current_catalog("nonexistent").await;
+    assert!(err.is_err());
 }

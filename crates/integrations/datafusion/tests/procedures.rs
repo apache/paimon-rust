@@ -19,7 +19,7 @@ mod common;
 
 use common::{exec, row_count, setup_handler};
 
-async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::PaimonSqlHandler) {
+async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, handler) = setup_handler().await;
     exec(
         &handler,

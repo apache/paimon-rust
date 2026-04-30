@@ -31,10 +31,10 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Int64Array;
 use datafusion::physical_plan::{displayable, ExecutionPlan};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 /// Creates a test handler with a table ready for inserts.
-async fn setup_table(schema_sql: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_table(schema_sql: &str) -> (tempfile::TempDir, SQLContext) {
     let (tmp, handler) = common::setup_handler().await;
     handler
         .sql(&format!("CREATE TABLE paimon.test_db.t {schema_sql}"))
@@ -47,7 +47,7 @@ async fn setup_table(schema_sql: &str) -> (tempfile::TempDir, PaimonSqlHandler) 
 async fn setup_partitioned_table(
     columns: &str,
     partition_cols: &str,
-) -> (tempfile::TempDir, PaimonSqlHandler) {
+) -> (tempfile::TempDir, SQLContext) {
     let (tmp, handler) = common::setup_handler().await;
     handler
         .sql(&format!(
@@ -67,7 +67,7 @@ fn plan_contains_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Creates a physical plan for the given SQL and checks if COUNT was pushed down.
 /// Returns Ok(plan) if pushdown succeeded (no scan in plan), Err(plan) if it fell back to scanning.
 async fn verify_count_pushdown(
-    handler: &PaimonSqlHandler,
+    handler: &SQLContext,
     sql: &str,
 ) -> Result<Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>> {
     let df = handler.sql(sql).await.expect("Query should succeed");
@@ -84,7 +84,7 @@ async fn verify_count_pushdown(
 }
 
 /// Executes a COUNT(*) query and returns the count value.
-async fn run_count_query(handler: &PaimonSqlHandler, sql: &str) -> i64 {
+async fn run_count_query(handler: &SQLContext, sql: &str) -> i64 {
     let batches = handler
         .sql(sql)
         .await

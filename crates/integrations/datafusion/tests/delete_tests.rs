@@ -21,13 +21,13 @@
 
 mod common;
 
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 use common::{create_handler, create_test_env, dml_count, exec, query_int_str_int};
 
 // ======================= Helpers =======================
 
-async fn setup() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
@@ -43,7 +43,7 @@ async fn setup() -> (tempfile::TempDir, PaimonSqlHandler) {
     (tmp, handler)
 }
 
-async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_partitioned() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
@@ -59,7 +59,7 @@ async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
     (tmp, handler)
 }
 
-async fn query(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
+async fn query(handler: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
         handler,
         "SELECT id, name, age FROM paimon.test_db.t ORDER BY id",
@@ -67,7 +67,7 @@ async fn query(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
     .await
 }
 
-async fn query_pt(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
+async fn query_pt(handler: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
         handler,
         "SELECT id, name, pt FROM paimon.test_db.t ORDER BY id",

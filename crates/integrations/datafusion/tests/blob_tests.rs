@@ -24,7 +24,7 @@ mod common;
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
 use common::{create_handler, create_test_env, ctx_exec, exec};
 use paimon::spec::BlobDescriptor;
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 // ======================= Helpers =======================
 
@@ -32,7 +32,7 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
-async fn setup(table_ddl: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup(table_ddl: &str) -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
@@ -72,7 +72,7 @@ fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<
 }
 
 async fn query_id_name_picture(
-    handler: &PaimonSqlHandler,
+    handler: &SQLContext,
     sql: &str,
 ) -> Vec<(i32, String, Option<Vec<u8>>)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();

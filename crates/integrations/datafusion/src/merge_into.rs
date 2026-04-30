@@ -1437,17 +1437,17 @@ mod tests {
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
-    use crate::{PaimonSqlHandler, PaimonTableProvider};
+    use crate::{PaimonTableProvider, SQLContext};
 
-    async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
+    async fn setup_handler() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = format!("file://{}", temp_dir.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler =
-            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
+        let mut handler = SQLContext::new();
+        handler.register_catalog("paimon", catalog.clone()).unwrap();
         handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
 
         (temp_dir, handler, catalog)

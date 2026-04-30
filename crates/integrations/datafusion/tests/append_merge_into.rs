@@ -23,7 +23,7 @@
 mod common;
 
 use arrow_array::{Array, Int32Array, StringArray};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 use common::{
     collect_int_int_str, collect_int_str, collect_three_ints, create_handler, create_test_env,
@@ -32,7 +32,7 @@ use common::{
 
 // ======================= Helpers =======================
 
-async fn setup(table_ddl: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup(table_ddl: &str) -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
     let handler = create_handler(catalog);
     handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
@@ -40,7 +40,7 @@ async fn setup(table_ddl: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
     (tmp, handler)
 }
 
-async fn query_abc(handler: &PaimonSqlHandler) -> Vec<(i32, i32, String)> {
+async fn query_abc(handler: &SQLContext) -> Vec<(i32, i32, String)> {
     let batches = handler
         .sql("SELECT a, b, c FROM paimon.test_db.target ORDER BY a, b")
         .await
@@ -51,11 +51,11 @@ async fn query_abc(handler: &PaimonSqlHandler) -> Vec<(i32, i32, String)> {
     collect_int_int_str(&batches)
 }
 
-async fn setup_abc() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_abc() -> (tempfile::TempDir, SQLContext) {
     setup("CREATE TABLE paimon.test_db.target (a INT, b INT, c VARCHAR)").await
 }
 
-async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_partitioned() -> (tempfile::TempDir, SQLContext) {
     let (tmp, handler) =
         setup("CREATE TABLE paimon.test_db.target (a INT, b INT, pt INT) PARTITIONED BY (pt)")
             .await;
@@ -67,7 +67,7 @@ async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
     (tmp, handler)
 }
 
-async fn query_a_b_pt(handler: &PaimonSqlHandler) -> Vec<(i32, i32, i32)> {
+async fn query_a_b_pt(handler: &SQLContext) -> Vec<(i32, i32, i32)> {
     let batches = handler
         .sql("SELECT a, b, pt FROM paimon.test_db.target ORDER BY pt, a")
         .await

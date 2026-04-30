@@ -18,7 +18,7 @@
 //! SQL support for Paimon tables.
 //!
 //! DataFusion does not natively support all SQL statements needed by Paimon.
-//! This module provides [`PaimonSqlHandler`] which intercepts CREATE TABLE,
+//! This module provides [`SQLContext`] which intercepts CREATE TABLE,
 //! ALTER TABLE, MERGE INTO, UPDATE and other SQL, translates them to Paimon
 //! catalog operations, and delegates everything else (SELECT, CREATE/DROP
 //! SCHEMA, DROP TABLE, etc.) to the underlying [`SessionContext`].
@@ -64,54 +64,101 @@ use paimon::spec::{
 use crate::error::to_datafusion_error;
 use crate::DynamicOptions;
 
-/// Wraps a [`SessionContext`] and a Paimon [`Catalog`] to handle DDL statements
-/// that DataFusion does not natively support (e.g. ALTER TABLE).
-///
-/// For all other SQL, it delegates to the inner `SessionContext`.
+/// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 ///
 /// # Example
 /// ```ignore
-/// let ctx = SessionContext::new();
-/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
-/// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
+/// let mut ctx = SQLContext::new();
+/// ctx.register_catalog("paimon", catalog)?;
+/// ctx.set_current_catalog("paimon").await?;
+/// let df = ctx.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
-pub struct PaimonSqlHandler {
+pub struct SQLContext {
     ctx: SessionContext,
-    catalog: Arc<dyn Catalog>,
-    /// The catalog name registered in the SessionContext (used to strip the catalog prefix).
-    catalog_name: String,
+    catalogs: HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: String,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
 }
 
-impl PaimonSqlHandler {
-    /// Creates a new handler that registers the Paimon catalog and relation planner
-    /// on the given [`SessionContext`].
-    ///
-    /// Dynamic options for `SET`/`RESET` are managed internally.
-    pub fn new(
-        ctx: SessionContext,
-        catalog: Arc<dyn Catalog>,
+impl Default for SQLContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SQLContext {
+    /// Creates a new empty SQL context.
+    pub fn new() -> Self {
+        let ctx = SessionContext::new();
+        ctx.register_relation_planner(Arc::new(
+            crate::relation_planner::PaimonRelationPlanner::new(),
+        ))
+        .expect("failed to register relation planner");
+        Self {
+            ctx,
+            catalogs: HashMap::new(),
+            current_catalog: String::new(),
+            dynamic_options: Default::default(),
+        }
+    }
+
+    /// Registers a Paimon catalog under the given name.
+    pub fn register_catalog(
+        &mut self,
         catalog_name: impl Into<String>,
-    ) -> DFResult<Self> {
+        catalog: Arc<dyn Catalog>,
+    ) -> DFResult<()> {
         let catalog_name = catalog_name.into();
-        let dynamic_options: DynamicOptions = Default::default();
-        ctx.register_catalog(
+        self.ctx.register_catalog(
             &catalog_name,
             Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
                 catalog.clone(),
-                dynamic_options.clone(),
+                self.dynamic_options.clone(),
             )),
         );
-        ctx.register_relation_planner(Arc::new(
-            crate::relation_planner::PaimonRelationPlanner::new(),
-        ))?;
-        Ok(Self {
-            ctx,
-            catalog,
-            catalog_name,
-            dynamic_options,
-        })
+        if self.catalogs.is_empty() {
+            self.current_catalog = catalog_name.clone();
+        }
+        self.catalogs.insert(catalog_name, catalog);
+        Ok(())
+    }
+
+    /// Sets the current catalog for unqualified table references.
+    pub async fn set_current_catalog(&mut self, catalog_name: impl Into<String>) -> DFResult<()> {
+        let catalog_name = catalog_name.into();
+        if !self.catalogs.contains_key(&catalog_name) {
+            return Err(DataFusionError::Plan(format!(
+                "Unknown catalog '{catalog_name}'"
+            )));
+        }
+        if catalog_name.contains('\'') {
+            return Err(DataFusionError::Plan(
+                "Catalog name must not contain single quotes".to_string(),
+            ));
+        }
+        self.ctx
+            .sql(&format!(
+                "SET datafusion.catalog.default_catalog = '{catalog_name}'"
+            ))
+            .await?;
+        self.current_catalog = catalog_name;
+        Ok(())
+    }
+
+    /// Sets the current database (schema) for unqualified table references.
+    pub async fn set_current_database(&self, database_name: &str) -> DFResult<()> {
+        if database_name.contains('\'') {
+            return Err(DataFusionError::Plan(
+                "Database name must not contain single quotes".to_string(),
+            ));
+        }
+        self.ctx
+            .sql(&format!(
+                "SET datafusion.catalog.default_schema = '{database_name}'"
+            ))
+            .await?;
+        Ok(())
     }
 
     /// Returns a reference to the inner [`SessionContext`].
@@ -145,10 +192,16 @@ impl PaimonSqlHandler {
 
         match &statements[0] {
             Statement::CreateTable(create_table) => {
-                self.handle_create_table(create_table, partition_keys).await
+                let (catalog, _catalog_name, _) =
+                    self.resolve_catalog_and_table(&create_table.name)?;
+                self.handle_create_table(&catalog, create_table, partition_keys)
+                    .await
             }
             Statement::AlterTable(alter_table) => {
+                let (catalog, _catalog_name, _) =
+                    self.resolve_catalog_and_table(&alter_table.name)?;
                 self.handle_alter_table(
+                    &catalog,
                     &alter_table.name,
                     &alter_table.operations,
                     alter_table.if_exists,
@@ -200,8 +253,13 @@ impl PaimonSqlHandler {
             }
             Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
             Statement::Call(func) => {
-                crate::procedures::execute_call(&self.ctx, &self.catalog, &self.catalog_name, func)
-                    .await
+                crate::procedures::execute_call(
+                    &self.ctx,
+                    &self.catalogs,
+                    &self.current_catalog,
+                    func,
+                )
+                .await
             }
             _ => self.ctx.sql(sql).await,
         }
@@ -209,6 +267,7 @@ impl PaimonSqlHandler {
 
     async fn handle_create_table(
         &self,
+        catalog: &Arc<dyn Catalog>,
         ct: &CreateTable,
         partition_keys: Vec<String>,
     ) -> DFResult<DataFrame> {
@@ -270,7 +329,7 @@ impl PaimonSqlHandler {
 
         let schema = builder.build().map_err(to_datafusion_error)?;
 
-        self.catalog
+        catalog
             .create_table(&identifier, schema, ct.if_not_exists)
             .await
             .map_err(to_datafusion_error)?;
@@ -280,6 +339,7 @@ impl PaimonSqlHandler {
 
     async fn handle_alter_table(
         &self,
+        catalog: &Arc<dyn Catalog>,
         name: &ObjectName,
         operations: &[AlterTableOperation],
         if_exists: bool,
@@ -340,6 +400,7 @@ impl PaimonSqlHandler {
                 } => {
                     return self
                         .handle_drop_partitions(
+                            catalog,
                             &identifier,
                             partitions,
                             if_exists || *partition_if_exists,
@@ -355,14 +416,14 @@ impl PaimonSqlHandler {
         }
 
         if let Some(new_identifier) = rename_to {
-            self.catalog
+            catalog
                 .rename_table(&identifier, &new_identifier, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
         }
 
         if !changes.is_empty() {
-            self.catalog
+            catalog
                 .alter_table(&identifier, changes, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
@@ -372,7 +433,6 @@ impl PaimonSqlHandler {
     }
 
     async fn handle_merge_into(&self, merge: &Merge) -> DFResult<DataFrame> {
-        // Resolve the target table name from the MERGE INTO clause
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
             other => {
@@ -381,11 +441,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        // Load the Paimon table from the catalog
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -402,10 +460,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -429,10 +486,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -450,9 +506,8 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
-        let table = self
-            .catalog
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -585,8 +640,8 @@ impl PaimonSqlHandler {
         let target = truncate.table_names.first().ok_or_else(|| {
             DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
         })?;
-        let identifier = self.resolve_table_name(&target.name)?;
-        let table = match self.catalog.get_table(&identifier).await {
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&target.name)?;
+        let table = match catalog.get_table(&identifier).await {
             Ok(t) => t,
             Err(e) if truncate.if_exists && is_table_not_exist(&e) => {
                 return ok_result(&self.ctx);
@@ -621,6 +676,7 @@ impl PaimonSqlHandler {
 
     async fn handle_drop_partitions(
         &self,
+        catalog: &Arc<dyn Catalog>,
         identifier: &Identifier,
         partitions: &[SqlExpr],
         if_exists: bool,
@@ -630,7 +686,7 @@ impl PaimonSqlHandler {
                 "DROP PARTITIONS requires at least one partition specification".to_string(),
             ));
         }
-        let table = match self.catalog.get_table(identifier).await {
+        let table = match catalog.get_table(identifier).await {
             Ok(t) => t,
             Err(e) if if_exists && is_table_not_exist(&e) => {
                 return ok_result(&self.ctx);
@@ -654,8 +710,22 @@ impl PaimonSqlHandler {
         ok_result(&self.ctx)
     }
 
-    /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
-    fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
+    fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
+        self.catalogs
+            .get(&self.current_catalog)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "No catalog registered. Call register_catalog() first.".to_string(),
+                )
+            })
+    }
+
+    /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
+    fn resolve_catalog_and_table(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
         let parts: Vec<String> = name
             .0
             .iter()
@@ -663,24 +733,37 @@ impl PaimonSqlHandler {
             .collect();
         match parts.len() {
             3 => {
-                // catalog.database.table — strip catalog prefix
-                if parts[0] != self.catalog_name {
-                    return Err(DataFusionError::Plan(format!(
-                        "Unknown catalog '{}', expected '{}'",
-                        parts[0], self.catalog_name
-                    )));
-                }
-                Ok(Identifier::new(parts[1].clone(), parts[2].clone()))
+                let catalog = self.catalogs.get(&parts[0]).ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown catalog '{}'", parts[0]))
+                })?;
+                Ok((
+                    catalog.clone(),
+                    parts[0].clone(),
+                    Identifier::new(parts[1].clone(), parts[2].clone()),
+                ))
             }
-            2 => Ok(Identifier::new(parts[0].clone(), parts[1].clone())),
+            2 => {
+                let catalog = self.current_catalog()?;
+                Ok((
+                    catalog,
+                    self.current_catalog.clone(),
+                    Identifier::new(parts[0].clone(), parts[1].clone()),
+                ))
+            }
             1 => Err(DataFusionError::Plan(format!(
-                "ALTER TABLE requires at least database.table, got: {}",
+                "Table reference requires at least database.table, got: {}",
                 parts[0]
             ))),
             _ => Err(DataFusionError::Plan(format!(
                 "Invalid table reference: {name}"
             ))),
         }
+    }
+
+    /// Resolve an ObjectName to just the Identifier (for backward compat in handle_alter_table).
+    fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
+        let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
+        Ok(identifier)
     }
 }
 
@@ -1528,8 +1611,10 @@ mod tests {
         }
     }
 
-    fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
-        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon").unwrap()
+    fn make_handler(catalog: Arc<MockCatalog>) -> SQLContext {
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog).unwrap();
+        ctx
     }
 
     fn assert_sql_type_to_paimon(
@@ -1855,7 +1940,7 @@ mod tests {
         }
     }
 
-    // ==================== PaimonSqlHandler::sql integration tests ====================
+    // ==================== SQLContext::sql integration tests ====================
 
     #[tokio::test]
     async fn test_create_table_basic() {
@@ -2478,7 +2563,7 @@ mod tests {
 
     // ==================== TRUNCATE TABLE / DROP PARTITIONS tests ====================
 
-    async fn setup_fs_handler() -> (tempfile::TempDir, PaimonSqlHandler) {
+    async fn setup_fs_handler() -> (tempfile::TempDir, SQLContext) {
         use paimon::{CatalogOptions, FileSystemCatalog, Options};
 
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2487,8 +2572,8 @@ mod tests {
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler =
-            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
+        let mut handler = SQLContext::new();
+        handler.register_catalog("paimon", catalog.clone()).unwrap();
         handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
 
         (temp_dir, handler)

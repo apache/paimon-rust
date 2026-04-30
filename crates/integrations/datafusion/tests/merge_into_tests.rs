@@ -24,11 +24,10 @@
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, StringArray};
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::table::SnapshotManager;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 use tempfile::TempDir;
 
 // ======================= Helpers =======================
@@ -42,12 +41,13 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
+fn create_handler(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).unwrap();
+    ctx
 }
 
-async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {
+async fn setup_data_evolution_table(handler: &SQLContext) {
     handler
         .sql("CREATE SCHEMA paimon.test_db")
         .await
@@ -64,14 +64,14 @@ async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {
         .expect("CREATE TABLE failed");
 }
 
-async fn enable_data_evolution(handler: &PaimonSqlHandler) {
+async fn enable_data_evolution(handler: &SQLContext) {
     handler
         .sql("ALTER TABLE paimon.test_db.target SET TBLPROPERTIES('data-evolution.enabled' = 'true')")
         .await
         .expect("ALTER TABLE failed");
 }
 
-async fn collect_rows_3col(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String, i32)> {
+async fn collect_rows_3col(handler: &SQLContext, sql: &str) -> Vec<(i32, String, i32)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
@@ -97,7 +97,7 @@ async fn collect_rows_3col(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, S
     rows
 }
 
-async fn collect_row_ids(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i64, i32)> {
+async fn collect_row_ids(handler: &SQLContext, sql: &str) -> Vec<(i64, i32)> {
     let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
@@ -118,7 +118,7 @@ async fn collect_row_ids(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i64, i32
     rows
 }
 
-async fn assert_merge_error(handler: &PaimonSqlHandler, sql: &str, expected_substring: &str) {
+async fn assert_merge_error(handler: &SQLContext, sql: &str, expected_substring: &str) {
     let result = handler.sql(sql).await;
     assert!(
         result.is_err(),
@@ -131,7 +131,7 @@ async fn assert_merge_error(handler: &PaimonSqlHandler, sql: &str, expected_subs
     );
 }
 
-async fn register_source(handler: &PaimonSqlHandler, sql: &str) {
+async fn register_source(handler: &SQLContext, sql: &str) {
     handler
         .ctx()
         .sql(sql)

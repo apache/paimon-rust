@@ -47,7 +47,7 @@ mod physical_plan;
 mod procedures;
 mod relation_planner;
 pub mod runtime;
-mod sql_handler;
+mod sql_context;
 mod system_tables;
 mod table;
 mod table_function_args;
@@ -59,7 +59,7 @@ use std::sync::{Arc, RwLock};
 
 /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
 ///
-/// Shared internally across [`PaimonSqlHandler`] and [`PaimonCatalogProvider`]
+/// Shared internally across [`SQLContext`] and [`PaimonCatalogProvider`]
 /// so that SET/RESET mutations are visible to subsequent table scans.
 pub(crate) type DynamicOptions = Arc<RwLock<HashMap<String, String>>>;
 
@@ -69,6 +69,6 @@ pub use error::to_datafusion_error;
 pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
-pub use sql_handler::PaimonSqlHandler;
+pub use sql_context::SQLContext;
 pub use table::PaimonTableProvider;
 pub use vector_search::{register_vector_search, VectorSearchFunction};

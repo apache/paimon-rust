@@ -18,15 +18,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::pyarrow::ToPyArrow;
 use datafusion::catalog::CatalogProvider;
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use paimon::{CatalogFactory, Options};
-use paimon_datafusion::PaimonCatalogProvider;
+use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
-use crate::error::to_py_err;
+use crate::error::{df_to_py_err, to_py_err};
 use paimon_datafusion::runtime::runtime;
 
 fn build_paimon_catalog_provider(
@@ -86,9 +87,73 @@ impl PaimonCatalog {
     }
 }
 
+/// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
+#[pyclass(name = "SQLContext")]
+pub struct PySQLContext {
+    inner: SQLContext,
+}
+
+#[pymethods]
+impl PySQLContext {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: SQLContext::new(),
+        }
+    }
+
+    fn register_catalog(
+        &mut self,
+        catalog_name: String,
+        catalog_options: HashMap<String, String>,
+    ) -> PyResult<()> {
+        let rt = runtime();
+        let catalog = rt.block_on(async {
+            let options = Options::from_map(catalog_options);
+            CatalogFactory::create(options).await.map_err(to_py_err)
+        })?;
+        self.inner
+            .register_catalog(catalog_name, catalog)
+            .map_err(df_to_py_err)
+    }
+
+    fn set_current_catalog(&mut self, catalog_name: String) -> PyResult<()> {
+        let rt = runtime();
+        rt.block_on(async {
+            self.inner
+                .set_current_catalog(catalog_name)
+                .await
+                .map_err(df_to_py_err)
+        })
+    }
+
+    fn set_current_database(&self, database_name: String) -> PyResult<()> {
+        let rt = runtime();
+        rt.block_on(async {
+            self.inner
+                .set_current_database(&database_name)
+                .await
+                .map_err(df_to_py_err)
+        })
+    }
+
+    fn sql(&self, py: Python<'_>, sql: String) -> PyResult<Vec<Py<PyAny>>> {
+        let rt = runtime();
+        let batches = rt.block_on(async {
+            let df = self.inner.sql(&sql).await.map_err(df_to_py_err)?;
+            df.collect().await.map_err(df_to_py_err)
+        })?;
+        batches
+            .iter()
+            .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
+            .collect()
+    }
+}
+
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
+    this.add_class::<PySQLContext>()?;
     m.add_submodule(&this)?;
     py.import("sys")?
         .getattr("modules")?

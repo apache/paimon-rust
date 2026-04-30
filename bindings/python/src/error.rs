@@ -21,3 +21,7 @@ use pyo3::PyErr;
 pub fn to_py_err(err: paimon::Error) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
+
+pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}

@@ -37,24 +37,23 @@ Register an entire Paimon catalog so all databases and tables are accessible via
 
 ```rust
 use std::sync::Arc;
-use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
-    let ctx = SessionContext::new();
-    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
-    let df = handler.sql("SELECT * FROM paimon.default.my_table").await?;
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)?;
+    let df = ctx.sql("SELECT * FROM paimon.default.my_table").await?;
     df.show().await?;
     Ok(())
 }
 ```
 
-`PaimonSqlHandler::new` automatically registers the Paimon catalog provider and relation planner on the session context. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -706,9 +705,8 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 
 ```rust
 use std::sync::Arc;
-use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -717,13 +715,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
-    // Create handler (registers catalog provider and relation planner automatically)
-    let ctx = SessionContext::new();
-    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
+    // Create SQL context and register catalog
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)?;
 
     // Create database and table
-    handler.sql("CREATE SCHEMA paimon.my_db").await?;
-    handler.sql(
+    ctx.sql("CREATE SCHEMA paimon.my_db").await?;
+    ctx.sql(
         "CREATE TABLE paimon.my_db.users (
             id INT NOT NULL,
             name STRING,
@@ -732,11 +730,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
 
     // Insert data
-    handler.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
+    ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
         .await?.collect().await?;
 
     // Query
-    let df = handler.sql("SELECT * FROM paimon.my_db.users ORDER BY id").await?;
+    let df = ctx.sql("SELECT * FROM paimon.my_db.users ORDER BY id").await?;
     df.show().await?;
 
     Ok(())
