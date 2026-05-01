@@ -22,7 +22,7 @@
 mod common;
 
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
-use common::{create_handler, create_test_env, ctx_exec, exec};
+use common::{create_sql_context, create_test_env, ctx_exec, exec};
 use paimon::spec::BlobDescriptor;
 use paimon_datafusion::SQLContext;
 
@@ -34,10 +34,13 @@ fn to_hex(bytes: &[u8]) -> String {
 
 async fn setup(table_ddl: &str) -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler.sql(table_ddl).await.unwrap();
-    (tmp, handler)
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context.sql(table_ddl).await.unwrap();
+    (tmp, sql_context)
 }
 
 fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<Vec<u8>>)> {
@@ -72,10 +75,10 @@ fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<
 }
 
 async fn query_id_name_picture(
-    handler: &SQLContext,
+    sql_context: &SQLContext,
     sql: &str,
 ) -> Vec<(i32, String, Option<Vec<u8>>)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     collect_id_name_picture(&batches)
 }
 
@@ -115,16 +118,16 @@ const BLOB_TABLE_DDL: &str = "\
 /// Reference: BlobTestBase "Blob: test basic"
 #[tokio::test]
 async fn test_blob_basic() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Alice', X'48656C6C6F')",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -137,7 +140,7 @@ async fn test_blob_basic() {
 /// Reference: BlobTestBase "Blob: test multiple blobs"
 #[tokio::test]
 async fn test_blob_multiple_columns() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             pic1 BLOB, \
@@ -150,12 +153,12 @@ async fn test_blob_multiple_columns() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, pic1, pic2) VALUES (1, X'414141', X'424242')",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT id, pic1, pic2 FROM paimon.test_db.t")
         .await
         .unwrap()
@@ -188,10 +191,10 @@ async fn test_blob_multiple_columns() {
 /// Blob with NULL values.
 #[tokio::test]
 async fn test_blob_with_nulls() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'48656C6C6F'), \
          (2, 'Bob', NULL), \
@@ -200,7 +203,7 @@ async fn test_blob_with_nulls() {
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -217,21 +220,21 @@ async fn test_blob_with_nulls() {
 /// Multiple inserts produce multiple file pairs, all readable.
 #[tokio::test]
 async fn test_blob_multiple_inserts() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Alice', X'4141')",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (2, 'Bob', X'4242')",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -247,7 +250,7 @@ async fn test_blob_multiple_inserts() {
 /// blob-descriptor-field: listed fields are stored inline in parquet (no .blob files).
 #[tokio::test]
 async fn test_blob_descriptor_field_inline() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -261,13 +264,13 @@ async fn test_blob_descriptor_field_inline() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Alice', X'48656C6C6F')",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -281,10 +284,10 @@ async fn test_blob_descriptor_field_inline() {
 /// and the blob data should be preserved.
 #[tokio::test]
 async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'4141'), \
          (2, 'Bob', X'4242')",
@@ -292,21 +295,21 @@ async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
     .await;
 
     ctx_exec(
-        &handler,
-        "CREATE TABLE src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING src s ON t.id = s.id \
+         USING datafusion.public.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -322,24 +325,24 @@ async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
 /// Reference: BlobTestBase "Blob: merge-into rejects updating raw-data BLOB column"
 #[tokio::test]
 async fn test_merge_into_rejects_raw_blob_update() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Alice', X'4141')",
     )
     .await;
 
     ctx_exec(
-        &handler,
-        "CREATE TABLE src (id INT, picture BYTEA) AS VALUES (1, X'4242')",
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT, picture BYTEA) AS VALUES (1, X'4242')",
     )
     .await;
 
-    let result = handler
+    let result = sql_context
         .sql(
             "MERGE INTO paimon.test_db.t t \
-             USING src s ON t.id = s.id \
+             USING datafusion.public.src s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET picture = s.picture",
         )
         .await;
@@ -355,7 +358,7 @@ async fn test_merge_into_rejects_raw_blob_update() {
 /// Reference: BlobTestBase "Blob: merge-into updates non-blob column on descriptor blob table"
 #[tokio::test]
 async fn test_merge_into_updates_non_blob_on_descriptor_table() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -369,7 +372,7 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'4141'), \
          (2, 'Bob', X'4242')",
@@ -377,20 +380,20 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
     .await;
 
     ctx_exec(
-        &handler,
-        "CREATE TABLE src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING src s ON t.id = s.id \
+         USING datafusion.public.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT id, name FROM paimon.test_db.t ORDER BY id")
         .await
         .unwrap()
@@ -404,7 +407,7 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
 /// Merge-into on a descriptor blob table: updating the blob column should succeed.
 #[tokio::test]
 async fn test_merge_into_updates_blob_on_descriptor_table() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -418,7 +421,7 @@ async fn test_merge_into_updates_blob_on_descriptor_table() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'4141'), \
          (2, 'Bob', X'4242')",
@@ -426,21 +429,21 @@ async fn test_merge_into_updates_blob_on_descriptor_table() {
     .await;
 
     ctx_exec(
-        &handler,
-        "CREATE TABLE src (id INT, picture BYTEA) AS VALUES (1, X'4343')",
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT, picture BYTEA) AS VALUES (1, X'4343')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING src s ON t.id = s.id \
+         USING datafusion.public.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET picture = s.picture",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -456,7 +459,7 @@ async fn test_merge_into_updates_blob_on_descriptor_table() {
 /// Blob with partitioned table.
 #[tokio::test]
 async fn test_blob_with_partition() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             picture BLOB, \
@@ -469,14 +472,14 @@ async fn test_blob_with_partition() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, picture, pt) VALUES \
          (1, X'4141', 'a'), \
          (2, X'4242', 'b')",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT id, picture FROM paimon.test_db.t ORDER BY id")
         .await
         .unwrap()
@@ -509,7 +512,7 @@ async fn test_blob_with_partition() {
 /// resolve it by reading actual data from the referenced URI.
 #[tokio::test]
 async fn test_blob_resolve_descriptor() {
-    let (tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     // Write a source file that the BlobDescriptor will reference.
     let source_data = b"ResolvedBlobContent";
@@ -526,10 +529,10 @@ async fn test_blob_resolve_descriptor() {
          (1, 'Descriptor', X'{desc_hex}'), \
          (2, 'Raw', X'48656C6C6F')"
     );
-    exec(&handler, &sql).await;
+    exec(&sql_context, &sql).await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -546,7 +549,7 @@ async fn test_blob_resolve_descriptor() {
 /// BlobDescriptor with non-zero offset and partial length.
 #[tokio::test]
 async fn test_blob_resolve_descriptor_with_offset() {
-    let (tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     let source_data = b"HEADER_PAYLOAD_TRAILER";
     let source_path = tmp.path().join("blob_offset.bin");
@@ -560,10 +563,10 @@ async fn test_blob_resolve_descriptor_with_offset() {
     let sql = format!(
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Partial', X'{desc_hex}')"
     );
-    exec(&handler, &sql).await;
+    exec(&sql_context, &sql).await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -574,7 +577,7 @@ async fn test_blob_resolve_descriptor_with_offset() {
 /// Blob files roll independently when `blob.target-file-size` is small.
 #[tokio::test]
 async fn test_blob_rolling() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -589,7 +592,7 @@ async fn test_blob_rolling() {
 
     // Insert multiple rows with blob data large enough to trigger rolling at 50 bytes.
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'A', X'4141414141414141414141414141414141414141414141414141414141414141'), \
          (2, 'B', X'4242424242424242424242424242424242424242424242424242424242424242'), \
@@ -598,7 +601,7 @@ async fn test_blob_rolling() {
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -611,7 +614,7 @@ async fn test_blob_rolling() {
 /// blob-descriptor-field with multiple inserts: descriptor values are resolved to actual data.
 #[tokio::test]
 async fn test_blob_descriptor_field_resolve_on_read() {
-    let (_tmp, handler) = setup(
+    let (_tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -625,7 +628,7 @@ async fn test_blob_descriptor_field_resolve_on_read() {
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'48656C6C6F'), \
          (2, 'Bob', NULL), \
@@ -635,14 +638,14 @@ async fn test_blob_descriptor_field_resolve_on_read() {
 
     // Second insert to exercise multi-file merge path.
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (4, 'Dave', X'5061696D6F6E')",
     )
     .await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -660,7 +663,7 @@ async fn test_blob_descriptor_field_resolve_on_read() {
 /// blob-descriptor-field: inserting a serialized BlobDescriptor resolves to actual data on read.
 #[tokio::test]
 async fn test_blob_descriptor_field_resolve_descriptor_value() {
-    let (tmp, handler) = setup(
+    let (tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
             name STRING, \
@@ -687,10 +690,10 @@ async fn test_blob_descriptor_field_resolve_descriptor_value() {
          (1, 'FromDesc', X'{desc_hex}'), \
          (2, 'Raw', X'48656C6C6F')"
     );
-    exec(&handler, &sql).await;
+    exec(&sql_context, &sql).await;
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -707,10 +710,10 @@ async fn test_blob_descriptor_field_resolve_descriptor_value() {
 /// bytes instead of the actual blob content.
 #[tokio::test]
 async fn test_blob_as_descriptor_dynamic_option() {
-    let (_tmp, handler) = setup(BLOB_TABLE_DDL).await;
+    let (_tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
          (1, 'Alice', X'48656C6C6F'), \
          (2, 'Bob', X'576F726C64')",
@@ -719,20 +722,20 @@ async fn test_blob_as_descriptor_dynamic_option() {
 
     // Without the option, we get raw blob data.
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
     assert_eq!(rows[0].2, Some(b"Hello".to_vec()));
 
     // Enable blob-as-descriptor via dynamic option.
-    handler
+    sql_context
         .sql("SET 'paimon.blob-as-descriptor' = 'true'")
         .await
         .unwrap();
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;
@@ -749,13 +752,13 @@ async fn test_blob_as_descriptor_dynamic_option() {
     assert!(desc.length() > 0);
 
     // RESET should go back to raw data.
-    handler
+    sql_context
         .sql("RESET 'paimon.blob-as-descriptor'")
         .await
         .unwrap();
 
     let rows = query_id_name_picture(
-        &handler,
+        &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
     )
     .await;

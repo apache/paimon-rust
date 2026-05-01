@@ -23,53 +23,59 @@ mod common;
 
 use paimon_datafusion::SQLContext;
 
-use common::{create_handler, create_test_env, dml_count, exec, query_int_str_int};
+use common::{create_sql_context, create_test_env, ctx_exec, dml_count, exec, query_int_str_int};
 
 // ======================= Helpers =======================
 
 async fn setup() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40)",
     )
     .await;
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
 async fn setup_partitioned() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) PARTITIONED BY (pt)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', 2)",
     )
     .await;
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
-async fn query(handler: &SQLContext) -> Vec<(i32, String, i32)> {
+async fn query(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
-        handler,
+        sql_context,
         "SELECT id, name, age FROM paimon.test_db.t ORDER BY id",
     )
     .await
 }
 
-async fn query_pt(handler: &SQLContext) -> Vec<(i32, String, i32)> {
+async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
-        handler,
+        sql_context,
         "SELECT id, name, pt FROM paimon.test_db.t ORDER BY id",
     )
     .await
@@ -79,12 +85,16 @@ async fn query_pt(handler: &SQLContext) -> Vec<(i32, String, i32)> {
 
 #[tokio::test]
 async fn test_delete_by_non_partition_column() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE name = 'b'").await;
+    exec(
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE name = 'b'",
+    )
+    .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (3, "c".into(), 30),
@@ -95,13 +105,13 @@ async fn test_delete_by_non_partition_column() {
 
 #[tokio::test]
 async fn test_delete_no_match() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    let cnt = dml_count(&handler, "DELETE FROM paimon.test_db.t WHERE id = 99").await;
+    let cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 99").await;
     assert_eq!(cnt, 0);
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (2, "b".into(), 20),
@@ -113,64 +123,68 @@ async fn test_delete_no_match() {
 
 #[tokio::test]
 async fn test_delete_full_table() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t").await;
 
-    assert_eq!(query(&handler).await, vec![]);
+    assert_eq!(query(&sql_context).await, vec![]);
 }
 
 // ======================= Partitioned table DELETE =======================
 
 #[tokio::test]
 async fn test_delete_partitioned_by_name() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE name = 'a'").await;
+    exec(
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE name = 'a'",
+    )
+    .await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![(2, "b".into(), 1), (3, "c".into(), 2), (4, "d".into(), 2),]
     );
 }
 
 #[tokio::test]
 async fn test_delete_partitioned_by_partition_column() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE pt = 1").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE pt = 1").await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![(3, "c".into(), 2), (4, "d".into(), 2),]
     );
 }
 
 #[tokio::test]
 async fn test_delete_partitioned_in_list() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
     exec(
-        &handler,
+        &sql_context,
         "DELETE FROM paimon.test_db.t WHERE pt IN (1, 2) AND id = 1",
     )
     .await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![(2, "b".into(), 1), (3, "c".into(), 2), (4, "d".into(), 2),]
     );
 }
 
 #[tokio::test]
 async fn test_delete_partitioned_no_match() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
-    let cnt = dml_count(&handler, "DELETE FROM paimon.test_db.t WHERE pt = 99").await;
+    let cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.t WHERE pt = 99").await;
     assert_eq!(cnt, 0);
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![
             (1, "a".into(), 1),
             (2, "b".into(), 1),
@@ -182,52 +196,56 @@ async fn test_delete_partitioned_no_match() {
 
 #[tokio::test]
 async fn test_delete_partitioned_full_table() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t").await;
 
-    assert_eq!(query_pt(&handler).await, vec![]);
+    assert_eq!(query_pt(&sql_context).await, vec![]);
 }
 
 #[tokio::test]
 async fn test_delete_partitioned_or_condition() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
     exec(
-        &handler,
+        &sql_context,
         "DELETE FROM paimon.test_db.t WHERE pt = 1 OR id = 3",
     )
     .await;
 
-    assert_eq!(query_pt(&handler).await, vec![(4, "d".into(), 2)]);
+    assert_eq!(query_pt(&sql_context).await, vec![(4, "d".into(), 2)]);
 }
 
 // ======================= IN / NOT IN =======================
 
 #[tokio::test]
 async fn test_delete_in_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE id IN (1, 3)").await;
+    exec(
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE id IN (1, 3)",
+    )
+    .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(2, "b".into(), 20), (4, "d".into(), 40),]
     );
 }
 
 #[tokio::test]
 async fn test_delete_not_in_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "DELETE FROM paimon.test_db.t WHERE id NOT IN (1, 3)",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(1, "a".into(), 10), (3, "c".into(), 30),]
     );
 }
@@ -236,65 +254,59 @@ async fn test_delete_not_in_condition() {
 
 #[tokio::test]
 async fn test_delete_in_subquery() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    handler
-        .ctx()
-        .sql("CREATE TABLE src (id INT) AS VALUES (1), (3)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    ctx_exec(
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT) AS VALUES (1), (3)",
+    )
+    .await;
 
     exec(
-        &handler,
-        "DELETE FROM paimon.test_db.t WHERE id IN (SELECT id FROM src)",
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE id IN (SELECT id FROM datafusion.public.src)",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(2, "b".into(), 20), (4, "d".into(), 40),]
     );
 }
 
 #[tokio::test]
 async fn test_delete_scalar_subquery() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    handler
-        .ctx()
-        .sql("CREATE TABLE src (id INT) AS VALUES (2)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    exec(
-        &handler,
-        "DELETE FROM paimon.test_db.t WHERE id >= (SELECT MAX(id) FROM src)",
+    ctx_exec(
+        &sql_context,
+        "CREATE TABLE datafusion.public.src (id INT) AS VALUES (2)",
     )
     .await;
 
-    assert_eq!(query(&handler).await, vec![(1, "a".into(), 10)]);
+    exec(
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE id >= (SELECT MAX(id) FROM datafusion.public.src)",
+    )
+    .await;
+
+    assert_eq!(query(&sql_context).await, vec![(1, "a".into(), 10)]);
 }
 
 // ======================= Range condition =======================
 
 #[tokio::test]
 async fn test_delete_range_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "DELETE FROM paimon.test_db.t WHERE id >= 2 AND id <= 3",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(1, "a".into(), 10), (4, "d".into(), 40),]
     );
 }
@@ -304,13 +316,16 @@ async fn test_delete_range_condition() {
 #[tokio::test]
 async fn test_delete_should_not_remove_null_rows() {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 'a', 10), (2, NULL, 20), (3, 'c', 30)")
         .await
         .unwrap()
@@ -318,9 +333,13 @@ async fn test_delete_should_not_remove_null_rows() {
         .await
         .unwrap();
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE name = 'a'").await;
+    exec(
+        &sql_context,
+        "DELETE FROM paimon.test_db.t WHERE name = 'a'",
+    )
+    .await;
 
-    let rows = query(&handler).await;
+    let rows = query(&sql_context).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, 2);
     assert_eq!(rows[0].2, 20);
@@ -332,13 +351,13 @@ async fn test_delete_should_not_remove_null_rows() {
 
 #[tokio::test]
 async fn test_successive_deletes() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE id = 3").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 3").await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(2, "b".into(), 20), (4, "d".into(), 40),]
     );
 }
@@ -347,13 +366,17 @@ async fn test_successive_deletes() {
 
 #[tokio::test]
 async fn test_delete_then_insert() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
-    exec(&handler, "INSERT INTO paimon.test_db.t VALUES (5, 'e', 50)").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t VALUES (5, 'e', 50)",
+    )
+    .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (2, "b".into(), 20),
             (3, "c".into(), 30),
@@ -365,17 +388,17 @@ async fn test_delete_then_insert() {
 
 #[tokio::test]
 async fn test_delete_all_then_insert() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t").await;
-    assert_eq!(query(&handler).await, vec![]);
+    exec(&sql_context, "DELETE FROM paimon.test_db.t").await;
+    assert_eq!(query(&sql_context).await, vec![]);
 
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t VALUES (10, 'new', 100)",
     )
     .await;
-    assert_eq!(query(&handler).await, vec![(10, "new".into(), 100)]);
+    assert_eq!(query(&sql_context).await, vec![(10, "new".into(), 100)]);
 }
 
 // ======================= Empty table =======================
@@ -383,14 +406,17 @@ async fn test_delete_all_then_insert() {
 #[tokio::test]
 async fn test_delete_empty_table() {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
 
-    let cnt = dml_count(&handler, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
+    let cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 1").await;
     assert_eq!(cnt, 0);
     drop(tmp);
 }
@@ -399,16 +425,16 @@ async fn test_delete_empty_table() {
 
 #[tokio::test]
 async fn test_delete_or_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "DELETE FROM paimon.test_db.t WHERE id = 1 OR id = 4",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![(2, "b".into(), 20), (3, "c".into(), 30),]
     );
 }
@@ -417,9 +443,9 @@ async fn test_delete_or_condition() {
 
 #[tokio::test]
 async fn test_delete_multiple_rows_from_single_commit() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "DELETE FROM paimon.test_db.t WHERE id >= 2").await;
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE id >= 2").await;
 
-    assert_eq!(query(&handler).await, vec![(1, "a".into(), 10)]);
+    assert_eq!(query(&sql_context).await, vec![(1, "a".into(), 10)]);
 }

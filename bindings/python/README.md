@@ -23,7 +23,19 @@ This project builds the Rust-powered core for [PyPaimon](https://paimon.apache.o
 
 ## Usage
 
-For DataFusion queries, use the native `SessionContext` and register a `PaimonCatalog`:
+The recommended way to query Paimon tables is through `SQLContext`, which supports
+multi-catalog registration, DDL, DML, and all Paimon-specific SQL extensions:
+
+```python
+from pypaimon_rust.datafusion import SQLContext
+
+ctx = SQLContext()
+ctx.register_catalog("paimon", {"warehouse": "/path/to/warehouse"})
+
+batches = ctx.sql("SELECT * FROM paimon.default.my_table")
+```
+
+Alternatively, you can register a `PaimonCatalog` into DataFusion's native `SessionContext`:
 
 ```python
 from datafusion import SessionContext

@@ -108,13 +108,14 @@ impl PySQLContext {
         catalog_options: HashMap<String, String>,
     ) -> PyResult<()> {
         let rt = runtime();
-        let catalog = rt.block_on(async {
+        rt.block_on(async {
             let options = Options::from_map(catalog_options);
-            CatalogFactory::create(options).await.map_err(to_py_err)
-        })?;
-        self.inner
-            .register_catalog(catalog_name, catalog)
-            .map_err(df_to_py_err)
+            let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
+            self.inner
+                .register_catalog(catalog_name, catalog)
+                .await
+                .map_err(df_to_py_err)
+        })
     }
 
     fn set_current_catalog(&mut self, catalog_name: String) -> PyResult<()> {

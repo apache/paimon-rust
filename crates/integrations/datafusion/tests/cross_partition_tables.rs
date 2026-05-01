@@ -23,7 +23,9 @@
 
 mod common;
 
-use common::{collect_id_name, collect_id_value, create_handler, create_test_env, setup_handler};
+use common::{
+    collect_id_name, collect_id_value, create_sql_context, create_test_env, setup_sql_context,
+};
 use datafusion::arrow::array::Int32Array;
 use paimon::catalog::Identifier;
 use paimon::Catalog;
@@ -32,10 +34,10 @@ use paimon::Catalog;
 /// A record's partition can change — old partition gets a DELETE, new partition gets an ADD.
 #[tokio::test]
 async fn test_cross_partition_update_basic() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
     // PK is only "id", partition is "dt" — PK does NOT include partition field
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_pt (
                 dt STRING, id INT NOT NULL, value INT,
@@ -46,7 +48,7 @@ async fn test_cross_partition_update_basic() {
         .unwrap();
 
     // First commit: id=1,2 in partition "2024-01-01"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_pt VALUES \
              ('2024-01-01', 1, 10), ('2024-01-01', 2, 20)",
@@ -58,14 +60,14 @@ async fn test_cross_partition_update_basic() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_pt ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, 10), (2, 20)]);
 
     // Second commit: id=1 moves to partition "2024-01-02"
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross_pt VALUES ('2024-01-02', 1, 100)")
         .await
         .unwrap()
@@ -75,7 +77,7 @@ async fn test_cross_partition_update_basic() {
 
     // Read back — id=1 should have value=100, id=2 unchanged
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_pt ORDER BY id",
     )
     .await;
@@ -85,9 +87,9 @@ async fn test_cross_partition_update_basic() {
 /// Cross-partition: multiple records moving between partitions in one commit.
 #[tokio::test]
 async fn test_cross_partition_update_multiple_keys() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_multi (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -98,7 +100,7 @@ async fn test_cross_partition_update_multiple_keys() {
         .unwrap();
 
     // First commit: 3 records in partition "a"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_multi VALUES \
              ('a', 1, 'alice'), ('a', 2, 'bob'), ('a', 3, 'carol')",
@@ -110,7 +112,7 @@ async fn test_cross_partition_update_multiple_keys() {
         .unwrap();
 
     // Second commit: id=1 moves to "b", id=2 moves to "c", id=3 stays in "a" with update
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_multi VALUES \
              ('b', 1, 'alice-v2'), ('c', 2, 'bob-v2'), ('a', 3, 'carol-v2')",
@@ -122,7 +124,7 @@ async fn test_cross_partition_update_multiple_keys() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_cross_multi ORDER BY id",
     )
     .await;
@@ -140,9 +142,9 @@ async fn test_cross_partition_update_multiple_keys() {
 /// Cross-partition: three commits with records bouncing between partitions.
 #[tokio::test]
 async fn test_cross_partition_update_three_commits() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_3c (
                 dt STRING, id INT NOT NULL, value INT,
@@ -153,7 +155,7 @@ async fn test_cross_partition_update_three_commits() {
         .unwrap();
 
     // Commit 1: id=1 in "a", id=2 in "b"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_3c VALUES \
              ('a', 1, 10), ('b', 2, 20)",
@@ -165,7 +167,7 @@ async fn test_cross_partition_update_three_commits() {
         .unwrap();
 
     // Commit 2: id=1 moves to "b", id=2 moves to "a", add id=3 in "a"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_3c VALUES \
              ('b', 1, 100), ('a', 2, 200), ('a', 3, 30)",
@@ -177,7 +179,7 @@ async fn test_cross_partition_update_three_commits() {
         .unwrap();
 
     // Commit 3: id=1 moves back to "a", id=3 moves to "b"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_3c VALUES \
              ('a', 1, 1000), ('b', 3, 300)",
@@ -189,7 +191,7 @@ async fn test_cross_partition_update_three_commits() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_3c ORDER BY id",
     )
     .await;
@@ -200,9 +202,9 @@ async fn test_cross_partition_update_three_commits() {
 /// Cross-partition: new records in different partitions (no migration, just new keys).
 #[tokio::test]
 async fn test_cross_partition_new_keys_no_migration() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_new (
                 dt STRING, id INT NOT NULL, value INT,
@@ -213,7 +215,7 @@ async fn test_cross_partition_new_keys_no_migration() {
         .unwrap();
 
     // All new keys in different partitions — no cross-partition migration
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_new VALUES \
              ('a', 1, 10), ('b', 2, 20), ('c', 3, 30)",
@@ -225,14 +227,14 @@ async fn test_cross_partition_new_keys_no_migration() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_new ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
 
     // Add more new keys
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_new VALUES \
              ('a', 4, 40), ('b', 5, 50)",
@@ -244,7 +246,7 @@ async fn test_cross_partition_new_keys_no_migration() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_new ORDER BY id",
     )
     .await;
@@ -257,14 +259,14 @@ async fn test_cross_partition_new_keys_no_migration() {
 #[tokio::test]
 async fn test_cross_partition_delete_file_in_old_partition() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
     // PK = (id), partition = dt — cross-partition mode
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_dv (
                 dt STRING, id INT NOT NULL, value INT,
@@ -275,7 +277,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
         .unwrap();
 
     // Commit 1: id=1,2 in partition "a", id=3 in partition "b"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_dv VALUES \
              ('a', 1, 10), ('a', 2, 20), ('b', 3, 30)",
@@ -305,7 +307,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
     );
 
     // Commit 2: id=1 moves from partition "a" to partition "c"
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross_dv VALUES ('c', 1, 100)")
         .await
         .unwrap()
@@ -374,14 +376,14 @@ async fn test_cross_partition_delete_file_in_old_partition() {
 
     // Final read: dedup should produce correct results
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_dv ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, 100), (2, 20), (3, 30)]);
 
     // Commit 3: id=2 also moves from "a" to "b", id=3 stays in "b" with update
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_dv VALUES \
              ('b', 2, 200), ('b', 3, 300)",
@@ -428,7 +430,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
 
     // Final read after 3 commits
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_dv ORDER BY id",
     )
     .await;
@@ -439,14 +441,14 @@ async fn test_cross_partition_delete_file_in_old_partition() {
 #[tokio::test]
 async fn test_cross_partition_first_row_skip() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
     // PK is only "id", partition is "dt", merge-engine = first-row
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_fr (
                 dt STRING, id INT NOT NULL, value INT,
@@ -458,7 +460,7 @@ async fn test_cross_partition_first_row_skip() {
         .unwrap();
 
     // Commit 1: id=1,2 in partition "a"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_fr VALUES \
              ('a', 1, 10), ('a', 2, 20)",
@@ -471,7 +473,7 @@ async fn test_cross_partition_first_row_skip() {
 
     // Commit 2: try to move id=1 to partition "b" and insert new id=3 in "b"
     // FIRST_ROW should discard id=1 (already exists in "a"), but accept id=3
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_fr VALUES \
              ('b', 1, 100), ('b', 3, 30)",
@@ -543,10 +545,10 @@ async fn test_cross_partition_first_row_skip() {
 /// When same id is written under different pt2, old partition should get a DELETE.
 #[tokio::test]
 async fn test_cross_partition_partial_pk_partition_overlap() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
     // PK = (pt1, id), partition = (pt1, pt2) — pt2 is NOT in PK → cross-partition
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_partial (
                 pt1 STRING, pt2 STRING, id INT NOT NULL, value INT,
@@ -557,7 +559,7 @@ async fn test_cross_partition_partial_pk_partition_overlap() {
         .unwrap();
 
     // Commit 1: id=1 in (pt1='a', pt2='x')
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_partial VALUES \
              ('a', 'x', 1, 10), ('a', 'x', 2, 20)",
@@ -569,14 +571,14 @@ async fn test_cross_partition_partial_pk_partition_overlap() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_partial ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, 10), (2, 20)]);
 
     // Commit 2: id=1 moves to (pt1='a', pt2='y') — different pt2
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross_partial VALUES ('a', 'y', 1, 100)")
         .await
         .unwrap()
@@ -586,7 +588,7 @@ async fn test_cross_partition_partial_pk_partition_overlap() {
 
     // After dedup, id=1 should have value=100 and only appear once
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_partial ORDER BY id",
     )
     .await;
@@ -609,9 +611,9 @@ async fn test_cross_partition_partial_pk_partition_overlap() {
 /// Both must succeed without schema errors.
 #[tokio::test]
 async fn test_cross_partition_value_kind_schema_stability() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross_vk (
                 dt STRING, id INT NOT NULL, value INT,
@@ -622,7 +624,7 @@ async fn test_cross_partition_value_kind_schema_stability() {
         .unwrap();
 
     // Commit 1: all new keys, no migration — _VALUE_KIND must still be added
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_vk VALUES \
              ('a', 1, 10), ('a', 2, 20), ('b', 3, 30)",
@@ -634,7 +636,7 @@ async fn test_cross_partition_value_kind_schema_stability() {
         .unwrap();
 
     // Commit 2: id=1 migrates from "a" to "b" — produces DELETE in "a"
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_cross_vk VALUES \
              ('b', 1, 100), ('a', 2, 200)",
@@ -646,7 +648,7 @@ async fn test_cross_partition_value_kind_schema_stability() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_cross_vk ORDER BY id",
     )
     .await;

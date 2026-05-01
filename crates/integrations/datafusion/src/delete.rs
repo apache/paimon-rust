@@ -104,7 +104,8 @@ async fn execute_cow_delete_once(
         return ok_result(ctx, 0);
     }
 
-    let result = execute_cow_delete_inner(ctx, cow_table_guard.name(), delete, &mut writer).await;
+    let result =
+        execute_cow_delete_inner(ctx, &cow_table_guard.qualified_name(), delete, &mut writer).await;
     drop(cow_table_guard);
     let total_count = result?;
 

@@ -204,7 +204,7 @@ async fn execute_cow_update_once(
         ctx,
         &columns,
         &exprs,
-        cow_table_guard.name(),
+        &cow_table_guard.qualified_name(),
         update,
         &mut writer,
     )
@@ -337,31 +337,37 @@ mod tests {
 
     use crate::{PaimonTableProvider, SQLContext};
 
-    async fn setup_handler() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
+    async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = format!("file://{}", temp_dir.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let mut handler = SQLContext::new();
-        handler.register_catalog("paimon", catalog.clone()).unwrap();
-        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+        let mut sql_context = SQLContext::new();
+        sql_context
+            .register_catalog("paimon", catalog.clone())
+            .await
+            .unwrap();
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
 
-        (temp_dir, handler, catalog)
+        (temp_dir, sql_context, catalog)
     }
 
     async fn setup_data_evolution_table(name: &str) -> (TempDir, SessionContext, Table) {
-        let (tmp, handler, catalog) = setup_handler().await;
+        let (tmp, sql_context, catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
                 "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true')"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -380,10 +386,10 @@ mod tests {
         extra.insert("row-tracking.enabled".to_string(), "true".to_string());
         let de_table = table.copy_with_options(extra);
 
-        // Register the data-evolution table under a simple name so _ROW_ID is visible
-        let ctx = handler.ctx().clone();
+        let ctx = sql_context.ctx().clone();
         let provider = PaimonTableProvider::try_new(de_table.clone()).unwrap();
-        ctx.register_table("target", Arc::new(provider)).unwrap();
+        ctx.register_table("datafusion.public.target", Arc::new(provider))
+            .unwrap();
 
         (tmp, ctx, de_table)
     }
@@ -426,11 +432,12 @@ mod tests {
     async fn test_update_with_where() {
         let (_tmp, ctx, table) = setup_data_evolution_table("t_with_where").await;
 
-        let update = parse_update("UPDATE target SET name = 'ALICE' WHERE id = 1");
+        let update =
+            parse_update("UPDATE datafusion.public.target SET name = 'ALICE' WHERE id = 1");
         execute_update(&ctx, &update, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -452,11 +459,11 @@ mod tests {
     async fn test_update_without_where() {
         let (_tmp, ctx, table) = setup_data_evolution_table("t_without_where").await;
 
-        let update = parse_update("UPDATE target SET value = 99");
+        let update = parse_update("UPDATE datafusion.public.target SET value = 99");
         execute_update(&ctx, &update, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -478,11 +485,13 @@ mod tests {
     async fn test_update_multiple_columns() {
         let (_tmp, ctx, table) = setup_data_evolution_table("t_multi_col").await;
 
-        let update = parse_update("UPDATE target SET name = 'updated', value = 0 WHERE id = 2");
+        let update = parse_update(
+            "UPDATE datafusion.public.target SET name = 'updated', value = 0 WHERE id = 2",
+        );
         execute_update(&ctx, &update, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -504,7 +513,8 @@ mod tests {
     async fn test_update_no_matching_rows() {
         let (_tmp, ctx, table) = setup_data_evolution_table("t_no_match").await;
 
-        let update = parse_update("UPDATE target SET name = 'nobody' WHERE id = 99");
+        let update =
+            parse_update("UPDATE datafusion.public.target SET name = 'nobody' WHERE id = 99");
         let result = execute_update(&ctx, &update, table).await.unwrap();
         let batches = result.collect().await.unwrap();
         let count = batches[0]
@@ -522,19 +532,20 @@ mod tests {
 
         // Get row IDs before update
         let before = ctx
-            .sql("SELECT id, \"_ROW_ID\" FROM target ORDER BY id")
+            .sql("SELECT id, \"_ROW_ID\" FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
             .await
             .unwrap();
 
-        let update = parse_update("UPDATE target SET name = 'ALICE' WHERE id = 1");
+        let update =
+            parse_update("UPDATE datafusion.public.target SET name = 'ALICE' WHERE id = 1");
         execute_update(&ctx, &update, table).await.unwrap();
 
         // Get row IDs after update
         let after = ctx
-            .sql("SELECT id, \"_ROW_ID\" FROM target ORDER BY id")
+            .sql("SELECT id, \"_ROW_ID\" FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -588,16 +599,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext) {
-        let (tmp, handler, _catalog) = setup_handler().await;
+        let (tmp, sql_context, _catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
                 "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT)"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -607,11 +618,11 @@ mod tests {
             .await
             .unwrap();
 
-        (tmp, handler)
+        (tmp, sql_context)
     }
 
-    async fn query_rows(handler: &SQLContext, table: &str) -> Vec<(i32, String, i32)> {
-        let batches = handler
+    async fn query_rows(sql_context: &SQLContext, table: &str) -> Vec<(i32, String, i32)> {
+        let batches = sql_context
             .sql(&format!("SELECT id, name, value FROM {table} ORDER BY id"))
             .await
             .unwrap()
@@ -623,14 +634,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_with_where() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_where").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_where").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_where SET name = 'ALICE' WHERE id = 1")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_where").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_where").await;
         assert_eq!(
             rows,
             vec![
@@ -643,14 +654,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_without_where() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_no_where").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_no_where").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_no_where SET value = 99")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_no_where").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_no_where").await;
         assert_eq!(
             rows,
             vec![
@@ -663,14 +674,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_multiple_columns() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_multi").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_multi").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_multi SET name = 'updated', value = 0 WHERE id = 2")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_multi").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_multi").await;
         assert_eq!(
             rows,
             vec![
@@ -683,9 +694,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_no_matching_rows() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_nomatch").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_nomatch").await;
 
-        let result = handler
+        let result = sql_context
             .sql("UPDATE paimon.test_db.t_cow_nomatch SET name = 'nobody' WHERE id = 99")
             .await
             .unwrap()
@@ -703,14 +714,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_expression() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_expr").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_expr").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_expr SET value = value + 100 WHERE id >= 2")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_expr").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_expr").await;
         assert_eq!(
             rows,
             vec![

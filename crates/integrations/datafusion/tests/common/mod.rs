@@ -35,26 +35,26 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-pub fn create_handler(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+pub async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog).unwrap();
+    ctx.register_catalog("paimon", catalog).await.unwrap();
     ctx
 }
 
 #[allow(dead_code)]
-pub async fn setup_handler() -> (TempDir, SQLContext) {
+pub async fn setup_sql_context() -> (TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
 #[allow(dead_code)]
-pub async fn collect_id_name(handler: &SQLContext, sql: &str) -> Vec<(i32, String)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+pub async fn collect_id_name(sql_context: &SQLContext, sql: &str) -> Vec<(i32, String)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
         let ids = batch
@@ -74,8 +74,8 @@ pub async fn collect_id_name(handler: &SQLContext, sql: &str) -> Vec<(i32, Strin
 }
 
 #[allow(dead_code)]
-pub async fn collect_id_value(handler: &SQLContext, sql: &str) -> Vec<(i32, i32)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+pub async fn collect_id_value(sql_context: &SQLContext, sql: &str) -> Vec<(i32, i32)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
         let ids = batch
@@ -95,27 +95,42 @@ pub async fn collect_id_value(handler: &SQLContext, sql: &str) -> Vec<(i32, i32)
 }
 
 #[allow(dead_code)]
-pub async fn row_count(handler: &SQLContext, sql: &str) -> usize {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+pub async fn row_count(sql_context: &SQLContext, sql: &str) -> usize {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
 /// Execute SQL and collect results, discarding the output.
 #[allow(dead_code)]
-pub async fn exec(handler: &SQLContext, s: &str) {
-    handler.sql(s).await.unwrap().collect().await.unwrap();
+pub async fn exec(sql_context: &SQLContext, s: &str) {
+    sql_context.sql(s).await.unwrap().collect().await.unwrap();
 }
 
 /// Execute SQL on the raw DataFusion context (for non-Paimon source tables).
+/// Temporarily switches to datafusion.public so CREATE TABLE lands in the
+/// built-in catalog, then restores the Paimon defaults.
 #[allow(dead_code)]
-pub async fn ctx_exec(handler: &SQLContext, s: &str) {
-    handler.ctx().sql(s).await.unwrap().collect().await.unwrap();
+pub async fn ctx_exec(sql_context: &SQLContext, s: &str) {
+    sql_context
+        .ctx()
+        .sql(s)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 }
 
 /// Extract the count from a DML result (returns a single UInt64 column).
 #[allow(dead_code)]
-pub async fn dml_count(handler: &SQLContext, sql_str: &str) -> u64 {
-    let result = handler.sql(sql_str).await.unwrap().collect().await.unwrap();
+pub async fn dml_count(sql_context: &SQLContext, sql_str: &str) -> u64 {
+    let result = sql_context
+        .sql(sql_str)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     result[0]
         .column(0)
         .as_any()
@@ -233,7 +248,7 @@ pub fn collect_int_str_int(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
 
 /// Query a 3-column (i32, String, i32) table and return sorted rows.
 #[allow(dead_code)]
-pub async fn query_int_str_int(handler: &SQLContext, sql: &str) -> Vec<(i32, String, i32)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+pub async fn query_int_str_int(sql_context: &SQLContext, sql: &str) -> Vec<(i32, String, i32)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     collect_int_str_int(&batches)
 }

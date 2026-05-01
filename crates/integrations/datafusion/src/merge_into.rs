@@ -64,6 +64,9 @@ pub(crate) struct CowTableGuard {
     table_name: String,
 }
 
+const COW_CATALOG: &str = "datafusion";
+const COW_SCHEMA: &str = "public";
+
 impl CowTableGuard {
     pub(crate) fn new(ctx: &SessionContext, table_name: String) -> Self {
         Self {
@@ -72,14 +75,14 @@ impl CowTableGuard {
         }
     }
 
-    pub(crate) fn name(&self) -> &str {
-        &self.table_name
+    pub(crate) fn qualified_name(&self) -> String {
+        format!("{COW_CATALOG}.{COW_SCHEMA}.{}", self.table_name)
     }
 }
 
 impl Drop for CowTableGuard {
     fn drop(&mut self) {
-        let _ = self.ctx.deregister_table(&self.table_name);
+        let _ = self.ctx.deregister_table(self.qualified_name());
     }
 }
 
@@ -367,7 +370,7 @@ async fn execute_cow_merge_once(
         t_alias,
         on_condition: &on_condition,
         has_target_data,
-        cow_target_name: cow_target_guard.name(),
+        cow_target_name: cow_target_guard.qualified_name(),
         update_columns: &update_columns,
     };
 
@@ -401,7 +404,7 @@ struct CowMergeContext<'a> {
     t_alias: &'a str,
     on_condition: &'a str,
     has_target_data: bool,
-    cow_target_name: &'a str,
+    cow_target_name: String,
     update_columns: &'a [String],
 }
 
@@ -419,7 +422,7 @@ async fn execute_cow_merge_inner(
     let t_alias = merge_ctx.t_alias;
     let on_condition = merge_ctx.on_condition;
     let has_target_data = merge_ctx.has_target_data;
-    let cow_target_name = merge_ctx.cow_target_name;
+    let cow_target_name = &merge_ctx.cow_target_name;
     let update_columns = merge_ctx.update_columns;
     let mut insert_messages = Vec::new();
     let mut total_count: u64 = 0;
@@ -833,10 +836,12 @@ async fn build_insert_batches(
     let first_schema = source_batches[0].schema();
     let mem_table = MemTable::try_new(first_schema, vec![source_batches])?;
     let tmp_name = next_cow_table_name("__merge_not_matched");
-    ctx.register_table(&tmp_name, Arc::new(mem_table))?;
+    let qualified_tmp = format!("{COW_CATALOG}.{COW_SCHEMA}.{tmp_name}");
+    ctx.register_table(&qualified_tmp, Arc::new(mem_table))?;
     let _guard = CowTableGuard::new(ctx, tmp_name.clone());
 
-    let result = build_insert_batches_inner(ctx, inserts, s_alias, &tmp_name, table_fields).await;
+    let result =
+        build_insert_batches_inner(ctx, inserts, s_alias, &qualified_tmp, table_fields).await;
 
     result
 }
@@ -1252,7 +1257,10 @@ pub(crate) async fn register_cow_target_table(
     if has_data {
         let s = schema.unwrap();
         let mem_table = MemTable::try_new(s, vec![all_batches])?;
-        ctx.register_table(&table_name, Arc::new(mem_table))?;
+        ctx.register_table(
+            format!("{COW_CATALOG}.{COW_SCHEMA}.{table_name}"),
+            Arc::new(mem_table),
+        )?;
     }
 
     Ok((has_data, CowTableGuard::new(ctx, table_name)))
@@ -1439,31 +1447,37 @@ mod tests {
 
     use crate::{PaimonTableProvider, SQLContext};
 
-    async fn setup_handler() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
+    async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = format!("file://{}", temp_dir.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let mut handler = SQLContext::new();
-        handler.register_catalog("paimon", catalog.clone()).unwrap();
-        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+        let mut sql_context = SQLContext::new();
+        sql_context
+            .register_catalog("paimon", catalog.clone())
+            .await
+            .unwrap();
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
 
-        (temp_dir, handler, catalog)
+        (temp_dir, sql_context, catalog)
     }
 
     async fn setup_data_evolution_table(name: &str) -> (TempDir, SessionContext, Table) {
-        let (tmp, handler, catalog) = setup_handler().await;
+        let (tmp, sql_context, catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
                 "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true')"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -1482,9 +1496,10 @@ mod tests {
         extra.insert("row-tracking.enabled".to_string(), "true".to_string());
         let de_table = table.copy_with_options(extra);
 
-        let ctx = handler.ctx().clone();
+        let ctx = sql_context.ctx().clone();
         let provider = PaimonTableProvider::try_new(de_table.clone()).unwrap();
-        ctx.register_table("target", Arc::new(provider)).unwrap();
+        ctx.register_table("datafusion.public.target", Arc::new(provider))
+            .unwrap();
 
         (tmp, ctx, de_table)
     }
@@ -1504,7 +1519,7 @@ mod tests {
 
         // Create source table with updates
         ctx.sql(
-            "CREATE TABLE source (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
+            "CREATE TABLE datafusion.public.source (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
         )
         .await
         .unwrap()
@@ -1514,13 +1529,13 @@ mod tests {
 
         // Execute MERGE INTO
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
         execute_merge_into(&ctx, &merge, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -1563,15 +1578,17 @@ mod tests {
     async fn test_merge_into_no_matches() {
         let (_tmp, ctx, table) = setup_data_evolution_table("t_merge2").await;
 
-        ctx.sql("CREATE TABLE source (id INT, name VARCHAR) AS VALUES (99, 'nobody')")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        ctx.sql(
+            "CREATE TABLE datafusion.public.source (id INT, name VARCHAR) AS VALUES (99, 'nobody')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
         let result = execute_merge_into(&ctx, &merge, table).await.unwrap();
@@ -1631,16 +1648,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn setup_append_only_table(name: &str) -> (TempDir, SessionContext, Table) {
-        let (tmp, handler, catalog) = setup_handler().await;
+        let (tmp, sql_context, catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
                 "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT)"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -1655,9 +1672,10 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = handler.ctx().clone();
+        let ctx = sql_context.ctx().clone();
         let provider = PaimonTableProvider::try_new(table.clone()).unwrap();
-        ctx.register_table("target", Arc::new(provider)).unwrap();
+        ctx.register_table("datafusion.public.target", Arc::new(provider))
+            .unwrap();
 
         (tmp, ctx, table)
     }
@@ -1693,7 +1711,7 @@ mod tests {
         let (_tmp, ctx, table) = setup_append_only_table("t_cow_upd").await;
 
         ctx.sql(
-            "CREATE TABLE source (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
+            "CREATE TABLE datafusion.public.source (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
         )
         .await
         .unwrap()
@@ -1702,13 +1720,13 @@ mod tests {
         .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
         execute_merge_into(&ctx, &merge, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -1730,7 +1748,7 @@ mod tests {
     async fn test_cow_merge_delete_matched_rows() {
         let (_tmp, ctx, table) = setup_append_only_table("t_cow_del").await;
 
-        ctx.sql("CREATE TABLE source (id INT) AS VALUES (2)")
+        ctx.sql("CREATE TABLE datafusion.public.source (id INT) AS VALUES (2)")
             .await
             .unwrap()
             .collect()
@@ -1738,13 +1756,13 @@ mod tests {
             .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN DELETE",
         );
         execute_merge_into(&ctx, &merge, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -1762,7 +1780,7 @@ mod tests {
     async fn test_cow_merge_insert_not_matched() {
         let (_tmp, ctx, table) = setup_append_only_table("t_cow_ins").await;
 
-        ctx.sql("CREATE TABLE source (id INT, name VARCHAR, value INT) AS VALUES (4, 'dave', 40), (5, 'eve', 50)")
+        ctx.sql("CREATE TABLE datafusion.public.source (id INT, name VARCHAR, value INT) AS VALUES (4, 'dave', 40), (5, 'eve', 50)")
             .await
             .unwrap()
             .collect()
@@ -1770,13 +1788,13 @@ mod tests {
             .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         );
         execute_merge_into(&ctx, &merge, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -1800,7 +1818,7 @@ mod tests {
     async fn test_cow_merge_update_and_insert() {
         let (_tmp, ctx, table) = setup_append_only_table("t_cow_upsert").await;
 
-        ctx.sql("CREATE TABLE source (id INT, name VARCHAR, value INT) AS VALUES (2, 'BOB', 200), (4, 'dave', 40)")
+        ctx.sql("CREATE TABLE datafusion.public.source (id INT, name VARCHAR, value INT) AS VALUES (2, 'BOB', 200), (4, 'dave', 40)")
             .await
             .unwrap()
             .collect()
@@ -1808,14 +1826,14 @@ mod tests {
             .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         );
         execute_merge_into(&ctx, &merge, table).await.unwrap();
 
         let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+            .sql("SELECT id, name, value FROM datafusion.public.target ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -1838,15 +1856,17 @@ mod tests {
     async fn test_cow_merge_no_matches() {
         let (_tmp, ctx, table) = setup_append_only_table("t_cow_nomatch").await;
 
-        ctx.sql("CREATE TABLE source (id INT, name VARCHAR) AS VALUES (99, 'nobody')")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        ctx.sql(
+            "CREATE TABLE datafusion.public.source (id INT, name VARCHAR) AS VALUES (99, 'nobody')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
         let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.id = s.id \
+            "MERGE INTO datafusion.public.target t USING datafusion.public.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
         let result = execute_merge_into(&ctx, &merge, table).await.unwrap();

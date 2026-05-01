@@ -19,7 +19,9 @@
 
 mod common;
 
-use common::{collect_id_name, collect_id_value, create_handler, create_test_env, setup_handler};
+use common::{
+    collect_id_name, collect_id_value, create_sql_context, create_test_env, setup_sql_context,
+};
 use datafusion::arrow::array::{Int32Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::spec::{IndexManifest, IndexManifestEntry};
@@ -28,9 +30,9 @@ use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, SnapshotManage
 /// PK table with bucket=-1 (dynamic bucket) should write and read correctly.
 #[tokio::test]
 async fn test_pk_dynamic_bucket() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn (
                 id INT NOT NULL, name STRING,
@@ -41,7 +43,7 @@ async fn test_pk_dynamic_bucket() {
         .unwrap();
 
     // First insert — no 'bucket' option, defaults to -1 (dynamic bucket)
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn VALUES (1, 'alice'), (2, 'bob')")
         .await
         .unwrap()
@@ -50,14 +52,14 @@ async fn test_pk_dynamic_bucket() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_dyn ORDER BY id",
     )
     .await;
     assert_eq!(rows, vec![(1, "alice".to_string()), (2, "bob".to_string())]);
 
     // Second insert with overlapping key — dedup should keep latest
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn VALUES (2, 'bobby'), (3, 'carol')")
         .await
         .unwrap()
@@ -66,7 +68,7 @@ async fn test_pk_dynamic_bucket() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_dyn ORDER BY id",
     )
     .await;
@@ -83,9 +85,9 @@ async fn test_pk_dynamic_bucket() {
 /// Dynamic bucket with partitioned table.
 #[tokio::test]
 async fn test_pk_dynamic_bucket_partitioned() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn_part (
                 dt STRING, id INT NOT NULL, value INT,
@@ -95,7 +97,7 @@ async fn test_pk_dynamic_bucket_partitioned() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_dyn_part VALUES \
              ('2024-01-01', 1, 10), ('2024-01-01', 2, 20), \
@@ -108,7 +110,7 @@ async fn test_pk_dynamic_bucket_partitioned() {
         .unwrap();
 
     // Update within each partition
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_dyn_part VALUES \
              ('2024-01-01', 1, 11), ('2024-01-02', 2, 222)",
@@ -119,7 +121,7 @@ async fn test_pk_dynamic_bucket_partitioned() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, value FROM paimon.test_db.t_dyn_part ORDER BY dt, id")
         .await
         .unwrap()
@@ -161,9 +163,9 @@ async fn test_pk_dynamic_bucket_partitioned() {
 /// Dynamic bucket with three commits — verifies sequence number tracking.
 #[tokio::test]
 async fn test_pk_dynamic_bucket_three_commits() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn3 (
                 id INT NOT NULL, value INT,
@@ -173,7 +175,7 @@ async fn test_pk_dynamic_bucket_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn3 VALUES (1, 10), (2, 20)")
         .await
         .unwrap()
@@ -181,7 +183,7 @@ async fn test_pk_dynamic_bucket_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn3 VALUES (2, 200), (3, 30)")
         .await
         .unwrap()
@@ -189,7 +191,7 @@ async fn test_pk_dynamic_bucket_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn3 VALUES (1, 100), (3, 300), (4, 40)")
         .await
         .unwrap()
@@ -198,7 +200,7 @@ async fn test_pk_dynamic_bucket_three_commits() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_dyn3 ORDER BY id",
     )
     .await;
@@ -259,13 +261,13 @@ async fn collect_all_hashes(table: &paimon::Table) -> Vec<i32> {
 #[tokio::test]
 async fn test_pk_dynamic_bucket_insert_overwrite() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn_ow (
                 id INT NOT NULL, name STRING,
@@ -276,7 +278,7 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
         .unwrap();
 
     // Commit 1: insert 3 rows
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn_ow VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
         .unwrap()
@@ -292,7 +294,7 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
     assert_eq!(hashes_before.len(), 3, "Should have 3 hash entries");
 
     // INSERT OVERWRITE with only 2 rows — old index entries must be cleared
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_dyn_ow VALUES (10, 'new_a'), (20, 'new_b')")
         .await
         .unwrap()
@@ -302,7 +304,7 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
 
     // Verify data
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_dyn_ow ORDER BY id",
     )
     .await;
@@ -338,13 +340,13 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
 #[tokio::test]
 async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn_part_ow (
                 dt STRING, id INT NOT NULL, value INT,
@@ -355,7 +357,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
         .unwrap();
 
     // Commit 1: two partitions
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_dyn_part_ow VALUES \
              ('a', 1, 10), ('a', 2, 20), \
@@ -379,7 +381,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
     );
 
     // INSERT OVERWRITE partition 'a' with only 1 row
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_dyn_part_ow VALUES ('a', 5, 50)")
         .await
         .unwrap()
@@ -389,7 +391,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
 
     // Verify data: partition 'a' replaced, partition 'b' untouched
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_dyn_part_ow ORDER BY id",
     )
     .await;
@@ -488,9 +490,9 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
     );
 
     // --- Write the same data into a new dynamic bucket table ---
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn_cmp (
                 id INT NOT NULL, name STRING,
@@ -501,7 +503,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
         .unwrap();
 
     // Replicate the same two commits as provision.py
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dyn_cmp VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
         .unwrap()
@@ -509,7 +511,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_dyn_cmp VALUES \
              (2, 'bob-v2'), (3, 'carol-v2'), (4, 'dave')",
@@ -522,7 +524,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
 
     // Verify written data matches
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_dyn_cmp ORDER BY id",
     )
     .await;
