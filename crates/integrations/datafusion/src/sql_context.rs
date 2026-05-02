@@ -76,7 +76,6 @@ use crate::DynamicOptions;
 pub struct SQLContext {
     ctx: SessionContext,
     catalogs: HashMap<String, Arc<dyn Catalog>>,
-    current_catalog: String,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
 }
@@ -98,7 +97,6 @@ impl SQLContext {
         Self {
             ctx,
             catalogs: HashMap::new(),
-            current_catalog: String::new(),
             dynamic_options: Default::default(),
         }
     }
@@ -155,7 +153,6 @@ impl SQLContext {
                 "SET datafusion.catalog.default_catalog = '{catalog_name}'"
             ))
             .await?;
-        self.current_catalog = catalog_name;
         Ok(())
     }
 
@@ -269,7 +266,7 @@ impl SQLContext {
                 crate::procedures::execute_call(
                     &self.ctx,
                     &self.catalogs,
-                    &self.current_catalog,
+                    &self.current_catalog_name(),
                     func,
                 )
                 .await
@@ -723,15 +720,23 @@ impl SQLContext {
         ok_result(&self.ctx)
     }
 
+    /// Returns the name of the current default catalog from DataFusion config.
+    fn current_catalog_name(&self) -> String {
+        self.ctx
+            .state()
+            .config_options()
+            .catalog
+            .default_catalog
+            .clone()
+    }
+
     fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
-        self.catalogs
-            .get(&self.current_catalog)
-            .cloned()
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "No catalog registered. Call register_catalog() first.".to_string(),
-                )
-            })
+        let name = self.current_catalog_name();
+        self.catalogs.get(&name).cloned().ok_or_else(|| {
+            DataFusionError::Plan(
+                "No catalog registered. Call register_catalog() first.".to_string(),
+            )
+        })
     }
 
     /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
@@ -759,7 +764,7 @@ impl SQLContext {
                 let catalog = self.current_catalog()?;
                 Ok((
                     catalog,
-                    self.current_catalog.clone(),
+                    self.current_catalog_name(),
                     Identifier::new(parts[0].clone(), parts[1].clone()),
                 ))
             }
@@ -774,7 +779,7 @@ impl SQLContext {
                     .clone();
                 Ok((
                     catalog,
-                    self.current_catalog.clone(),
+                    self.current_catalog_name(),
                     Identifier::new(default_schema, parts[0].clone()),
                 ))
             }

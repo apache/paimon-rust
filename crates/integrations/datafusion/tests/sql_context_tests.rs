@@ -639,6 +639,58 @@ async fn test_set_current_catalog() {
 }
 
 #[tokio::test]
+async fn test_set_default_catalog_via_datafusion_config() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).await.unwrap();
+    ctx.register_catalog("cat2", catalog2).await.unwrap();
+
+    // Create a table in cat2
+    ctx.sql("CREATE SCHEMA cat2.mydb").await.unwrap();
+    ctx.sql("CREATE TABLE cat2.mydb.t (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO cat2.mydb.t VALUES (1, 'hello')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Switch default catalog via raw DataFusion SET instead of set_current_catalog()
+    ctx.sql("SET datafusion.catalog.default_catalog = 'cat2'")
+        .await
+        .unwrap();
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // Unqualified query should now resolve against cat2.mydb
+    let batches = ctx
+        .sql("SELECT id, name FROM t")
+        .await
+        .expect("Unqualified table should resolve via DataFusion default_catalog config")
+        .collect()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+
+    // DDL on unqualified name should also go to cat2.
+    // CREATE TABLE in mydb should succeed because cat2.mydb exists.
+    ctx.sql("CREATE TABLE mydb.t2 (id INT NOT NULL, PRIMARY KEY (id))")
+        .await
+        .expect("CREATE TABLE should resolve against cat2 after SET default_catalog");
+
+    // Verify the table was created in cat2 by querying with fully qualified name
+    let df = ctx.sql("SELECT * FROM cat2.mydb.t2").await;
+    assert!(
+        df.is_ok(),
+        "Table t2 should exist in cat2.mydb after unqualified CREATE TABLE"
+    );
+}
+
+#[tokio::test]
 async fn test_first_registered_catalog_is_default() {
     let (_tmp, catalog) = create_test_env();
     let mut ctx = SQLContext::new();
