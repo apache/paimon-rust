@@ -382,6 +382,9 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyTableCommit>()?;
     this.add_class::<crate::write::PyCommitMessage>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
+    this.add_class::<crate::snapshot::PySnapshot>()?;
+    this.add_class::<crate::tag::PyTag>()?;
+    this.add_class::<crate::partition::PyPartitionStat>()?;
     m.add_submodule(&this)?;
     py.import("sys")?
         .getattr("modules")?

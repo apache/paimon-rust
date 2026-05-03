@@ -15,24 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
+use paimon::table::PartitionStat;
 use pyo3::prelude::*;
 
-mod blob;
-mod context;
-mod error;
-mod predicate;
-mod read;
-mod schema;
-mod table;
-mod udf;
-mod write;
-// ---- #285: observability ----
-mod partition;
-mod snapshot;
-mod tag;
+#[pyclass(name = "PartitionStat", module = "pypaimon_rust.datafusion")]
+pub struct PyPartitionStat {
+    inner: PartitionStat,
+}
 
-#[pymodule]
-fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    context::register_module(py, m)?;
-    Ok(())
+impl From<PartitionStat> for PyPartitionStat {
+    fn from(inner: PartitionStat) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyPartitionStat {
+    fn partition(&self) -> HashMap<String, String> {
+        self.inner.partition.clone()
+    }
+
+    fn record_count(&self) -> i64 {
+        self.inner.record_count
+    }
+
+    fn file_count(&self) -> u64 {
+        self.inner.file_count
+    }
+
+    fn total_size_bytes(&self) -> u64 {
+        self.inner.total_size_bytes
+    }
 }

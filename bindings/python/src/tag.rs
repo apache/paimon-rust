@@ -17,22 +17,25 @@
 
 use pyo3::prelude::*;
 
-mod blob;
-mod context;
-mod error;
-mod predicate;
-mod read;
-mod schema;
-mod table;
-mod udf;
-mod write;
-// ---- #285: observability ----
-mod partition;
-mod snapshot;
-mod tag;
+#[pyclass(name = "Tag", module = "pypaimon_rust.datafusion")]
+pub struct PyTag {
+    name: String,
+    snapshot_id: i64,
+}
 
-#[pymodule]
-fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    context::register_module(py, m)?;
-    Ok(())
+impl PyTag {
+    pub fn new(name: String, snapshot_id: i64) -> Self {
+        Self { name, snapshot_id }
+    }
+}
+
+#[pymethods]
+impl PyTag {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
 }

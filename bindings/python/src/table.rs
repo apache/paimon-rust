@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use paimon::table::{SnapshotManager, TagManager};
+use paimon_datafusion::runtime::runtime;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::error::to_py_err;
+use crate::partition::PyPartitionStat;
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
+use crate::snapshot::PySnapshot;
+use crate::tag::PyTag;
 use crate::write::PyWriteBuilder;
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
@@ -67,5 +74,52 @@ impl PyTable {
     /// Create a [`PyWriteBuilder`] for the batch write loop.
     fn new_write_builder(&self) -> PyWriteBuilder {
         PyWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    // ---------------- #285: observability ----------------
+    fn latest_snapshot(&self) -> PyResult<Option<PySnapshot>> {
+        let sm = SnapshotManager::new(
+            self.inner.file_io().clone(),
+            self.inner.location().to_string(),
+        );
+        let snap = runtime()
+            .block_on(sm.get_latest_snapshot())
+            .map_err(to_py_err)?;
+        Ok(snap.map(PySnapshot::new))
+    }
+
+    fn list_snapshots(&self) -> PyResult<Vec<PySnapshot>> {
+        let sm = SnapshotManager::new(
+            self.inner.file_io().clone(),
+            self.inner.location().to_string(),
+        );
+        let snaps = runtime().block_on(sm.list_all()).map_err(to_py_err)?;
+        Ok(snaps.into_iter().rev().map(PySnapshot::new).collect())
+    }
+
+    fn list_tags(&self) -> PyResult<Vec<PyTag>> {
+        let tm = TagManager::new(
+            self.inner.file_io().clone(),
+            self.inner.location().to_string(),
+        );
+        let tags = runtime().block_on(tm.list_all()).map_err(to_py_err)?;
+        Ok(tags
+            .into_iter()
+            .map(|(name, snap)| PyTag::new(name, snap.id()))
+            .collect())
+    }
+
+    fn list_partitions(&self) -> PyResult<Vec<HashMap<String, String>>> {
+        let stats = runtime()
+            .block_on(self.inner.partition_stats())
+            .map_err(to_py_err)?;
+        Ok(stats.into_iter().map(|s| s.partition).collect())
+    }
+
+    fn partition_stats(&self) -> PyResult<Vec<PyPartitionStat>> {
+        let stats = runtime()
+            .block_on(self.inner.partition_stats())
+            .map_err(to_py_err)?;
+        Ok(stats.into_iter().map(PyPartitionStat::from).collect())
     }
 }

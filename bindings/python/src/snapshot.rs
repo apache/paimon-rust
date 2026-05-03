@@ -15,24 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use paimon::spec::Snapshot;
 use pyo3::prelude::*;
 
-mod blob;
-mod context;
-mod error;
-mod predicate;
-mod read;
-mod schema;
-mod table;
-mod udf;
-mod write;
-// ---- #285: observability ----
-mod partition;
-mod snapshot;
-mod tag;
+#[pyclass(name = "Snapshot", module = "pypaimon_rust.datafusion")]
+pub struct PySnapshot {
+    inner: Snapshot,
+}
 
-#[pymodule]
-fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    context::register_module(py, m)?;
-    Ok(())
+impl PySnapshot {
+    pub fn new(inner: Snapshot) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PySnapshot {
+    fn id(&self) -> i64 {
+        self.inner.id()
+    }
+
+    fn commit_time_ms(&self) -> u64 {
+        self.inner.time_millis()
+    }
+
+    fn total_record_count(&self) -> Option<i64> {
+        self.inner.total_record_count()
+    }
+
+    fn delta_record_count(&self) -> Option<i64> {
+        self.inner.delta_record_count()
+    }
+
+    fn commit_kind(&self) -> String {
+        self.inner.commit_kind().to_string()
+    }
 }
