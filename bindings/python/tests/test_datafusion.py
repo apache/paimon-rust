@@ -868,3 +868,94 @@ def test_list_databases_and_tables():
     assert "name" in field_names
     # simple_log_table is non-partitioned, so partition keys are empty.
     assert schema.partition_keys() == []
+
+# ---------------- #285: observability ----------------
+def test_snapshots_for_simple_table():
+    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+    table = catalog.get_table("default.simple_log_table")
+
+    snap = table.latest_snapshot()
+    assert snap is not None
+    assert snap.id() >= 1
+    assert snap.commit_time_ms() > 0
+    assert snap.commit_kind() in {"APPEND", "COMPACT", "OVERWRITE", "ANALYZE"}
+
+    snaps = table.list_snapshots()
+    assert len(snaps) >= 1
+    # Newest first.
+    assert snaps[0].id() == snap.id()
+
+
+def test_partitions_and_tags_smoke():
+    catalog = PaimonCatalog({"warehouse": WAREHOUSE})
+    table = catalog.get_table("default.simple_log_table")
+
+    # Non-partitioned, non-tagged table: both should be empty but well-typed.
+    parts = table.list_partitions()
+    stats = table.partition_stats()
+    tags = table.list_tags()
+
+    assert isinstance(parts, list)
+    assert isinstance(stats, list)
+    assert isinstance(tags, list)
+    # simple_log_table has no partition keys -> partition_stats yields a single
+    # empty-partition bucket or zero buckets depending on how the snapshot was
+    # written. Either is acceptable; we just check the shape.
+    for p in parts:
+        assert isinstance(p, dict)
+    for t in tags:
+        assert isinstance(t.name(), str)
+        assert isinstance(t.snapshot_id(), int)
+
+
+def test_partition_stats_with_partitioned_table():
+    """Validates partition_stats() on a real partitioned table created in a
+    temporary warehouse:
+    - list_partitions() returns the correct partition values
+    - partition_stats() returns correct record / file / size counts per partition
+    This exercises PartitionComputer.generate_part_values and the per-partition
+    aggregation in aggregate_partition_stats.
+    """
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        ctx.sql(
+            "CREATE TABLE paimon.default.events "
+            "(id INT, name STRING, dt STRING) "
+            "PARTITIONED BY (dt)"
+        )
+        ctx.sql(
+            "INSERT INTO paimon.default.events VALUES "
+            "(1, 'alice', '2024-01-01'), "
+            "(2, 'bob',   '2024-01-01'), "
+            "(3, 'carol', '2024-01-02')"
+        )
+
+        catalog = PaimonCatalog({"warehouse": warehouse})
+        table = catalog.get_table("default.events")
+
+        # list_partitions() must return exactly the two inserted partitions.
+        parts = table.list_partitions()
+        assert len(parts) == 2
+        part_values = sorted(p["dt"] for p in parts)
+        assert part_values == ["2024-01-01", "2024-01-02"]
+
+        # partition_stats() must report concrete record / file / size counts.
+        stats = table.partition_stats()
+        assert len(stats) == 2
+
+        by_dt = {s.partition()["dt"]: s for s in stats}
+
+        s1 = by_dt["2024-01-01"]
+        assert s1.record_count() == 2
+        assert s1.file_count() >= 1
+        assert s1.total_size_bytes() > 0
+
+        s2 = by_dt["2024-01-02"]
+        assert s2.record_count() == 1
+        assert s2.file_count() >= 1
+        assert s2.total_size_bytes() > 0
+
+        ctx.sql("DROP TABLE paimon.default.events")
+
