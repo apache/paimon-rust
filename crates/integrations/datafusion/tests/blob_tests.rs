@@ -22,7 +22,7 @@
 mod common;
 
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
-use common::{create_sql_context, create_test_env, ctx_exec, exec};
+use common::{create_sql_context, create_test_env, exec};
 use paimon::spec::BlobDescriptor;
 use paimon_datafusion::SQLContext;
 
@@ -294,16 +294,16 @@ async fn test_merge_into_updates_non_blob_on_raw_blob_table() {
     )
     .await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, 'Updated')) AS t(id, name)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING datafusion.public.src s ON t.id = s.id \
+         USING paimon.test_db.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     )
     .await;
@@ -333,16 +333,16 @@ async fn test_merge_into_rejects_raw_blob_update() {
     )
     .await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT, picture BYTEA) AS VALUES (1, X'4242')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, X'4242')) AS t(id, picture)",
     )
     .await;
 
     let result = sql_context
         .sql(
             "MERGE INTO paimon.test_db.t t \
-             USING datafusion.public.src s ON t.id = s.id \
+             USING paimon.test_db.src s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET picture = s.picture",
         )
         .await;
@@ -379,16 +379,16 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
     )
     .await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT, name VARCHAR) AS VALUES (1, 'Updated')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, 'Updated')) AS t(id, name)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING datafusion.public.src s ON t.id = s.id \
+         USING paimon.test_db.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     )
     .await;
@@ -428,16 +428,16 @@ async fn test_merge_into_updates_blob_on_descriptor_table() {
     )
     .await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT, picture BYTEA) AS VALUES (1, X'4343')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, X'4343')) AS t(id, picture)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.t t \
-         USING datafusion.public.src s ON t.id = s.id \
+         USING paimon.test_db.src s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET picture = s.picture",
     )
     .await;

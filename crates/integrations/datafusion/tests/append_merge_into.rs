@@ -27,7 +27,7 @@ use paimon_datafusion::SQLContext;
 
 use common::{
     collect_int_int_str, collect_int_str, collect_three_ints, create_sql_context, create_test_env,
-    ctx_exec, exec,
+    exec,
 };
 
 // ======================= Helpers =======================
@@ -92,16 +92,16 @@ async fn test_only_update() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c",
     )
     .await;
@@ -121,16 +121,16 @@ async fn test_only_delete() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE",
     )
     .await;
@@ -147,16 +147,16 @@ async fn test_only_insert() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
@@ -180,16 +180,16 @@ async fn test_update_and_insert() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -214,16 +214,16 @@ async fn test_delete_and_insert() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -244,16 +244,16 @@ async fn test_partial_insert_with_null() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a) VALUES (s.a)",
     )
     .await;
@@ -316,16 +316,16 @@ async fn test_update_from_both_source_and_target() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = t.b * 11, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b * 2, s.c)",
     )
@@ -350,16 +350,16 @@ async fn test_columns_in_wrong_order() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c, b = s.b \
          WHEN NOT MATCHED THEN INSERT (b, c, a) VALUES (b, c, a)",
     )
@@ -384,16 +384,16 @@ async fn test_partial_update() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -418,12 +418,12 @@ async fn test_source_is_subquery() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(&sql_context, "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33'), (4, 400, 'c44')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33'), (4, 400, 'c44')) AS t(a, b, c)").await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING (SELECT a, b, c FROM datafusion.public.source WHERE a % 2 = 1) AS src \
+         USING (SELECT a, b, c FROM paimon.test_db.source WHERE a % 2 = 1) AS src \
          ON t.a = src.a \
          WHEN MATCHED THEN UPDATE SET b = src.b, c = src.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (src.a, src.b, src.c)",
@@ -445,12 +445,12 @@ async fn test_source_is_subquery() {
 async fn test_source_and_target_empty() {
     let (_tmp, sql_context) = setup_abc().await;
     // target is empty, source is empty
-    ctx_exec(&sql_context, "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS SELECT * FROM (VALUES (1, 1, 'x')) AS t(a, b, c) WHERE 1=0").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 1, 'x')) AS t(a, b, c) WHERE 1=0").await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -471,16 +471,16 @@ async fn test_with_alias() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -505,16 +505,16 @@ async fn test_reversed_on_condition() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON s.a = t.a \
+         USING paimon.test_db.source s ON s.a = t.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c",
     )
     .await;
@@ -634,16 +634,16 @@ async fn test_coalesce_source_and_target() {
         "INSERT INTO paimon.test_db.target VALUES (1, 'guid_tgt_1'), (2, 'guid_tgt_2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b VARCHAR) AS VALUES (1, 'guid_src_1'), (3, 'guid_src_3')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 'guid_src_1'), (3, 'guid_src_3')) AS t(a, b)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target AS dest \
-         USING datafusion.public.source AS src ON dest.a = src.a \
+         USING paimon.test_db.source AS src ON dest.a = src.a \
          WHEN MATCHED AND (nullif(cast(src.b as STRING), '') IS NOT NULL) THEN \
          UPDATE SET b = COALESCE(nullif(cast(src.b as STRING), ''), dest.b) \
          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b)",
@@ -676,16 +676,16 @@ async fn test_subquery_source_with_coalesce() {
         "INSERT INTO paimon.test_db.target VALUES (1, 'guid_tgt_1'), (2, 'guid_tgt_2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b VARCHAR) AS VALUES (1, 'guid_src_1'), (3, 'guid_src_3')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 'guid_src_1'), (3, 'guid_src_3')) AS t(a, b)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target AS dest \
-         USING (SELECT * FROM datafusion.public.source) AS src ON dest.a = src.a \
+         USING (SELECT * FROM paimon.test_db.source) AS src ON dest.a = src.a \
          WHEN MATCHED AND (nullif(cast(src.b as STRING), '') IS NOT NULL) THEN \
          UPDATE SET b = COALESCE(nullif(cast(src.b as STRING), ''), dest.b) \
          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b)",
@@ -718,16 +718,16 @@ async fn test_insert_only_is_append_commit() {
         "INSERT INTO paimon.test_db.target VALUES (2, 2, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 1, 'c1')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 1, 'c1')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
@@ -749,15 +749,15 @@ async fn test_successive_merges() {
     .await;
 
     // First merge: update b for a=1
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src1 (a INT, b INT) AS VALUES (1, 100)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src1 AS SELECT * FROM (VALUES (1, 100)) AS t(a, b)",
     )
     .await;
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.src1 s ON t.a = s.a \
+         USING paimon.test_db.src1 s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
@@ -768,15 +768,15 @@ async fn test_successive_merges() {
     );
 
     // Second merge: update c for a=2
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src2 (a INT, c VARCHAR) AS VALUES (2, 'C2_UPDATED')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src2 AS SELECT * FROM (VALUES (2, 'C2_UPDATED')) AS t(a, c)",
     )
     .await;
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.src2 s ON t.a = s.a \
+         USING paimon.test_db.src2 s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c",
     )
     .await;
@@ -796,16 +796,16 @@ async fn test_no_match_no_change() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (99, 990, 'c99')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (99, 990, 'c99')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c",
     )
     .await;
@@ -825,16 +825,16 @@ async fn test_delete_all_rows() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT) AS VALUES (1), (2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1), (2)) AS t(a)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE",
     )
     .await;
@@ -854,12 +854,12 @@ async fn test_insert_many_rows() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1')",
     )
     .await;
-    ctx_exec(&sql_context, "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')) AS t(a, b, c)").await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
@@ -885,16 +885,16 @@ async fn test_conditional_update() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2'), (3, 30, 'c3')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND s.b > 200 THEN UPDATE SET b = s.b, c = s.c \
          WHEN MATCHED THEN DELETE \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
@@ -916,16 +916,16 @@ async fn test_conditional_insert() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c \
          WHEN NOT MATCHED AND s.b < 300 THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -947,16 +947,16 @@ async fn test_conditional_delete() {
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND t.c < 'c1' THEN DELETE \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -978,11 +978,11 @@ async fn test_conditional_delete() {
 async fn test_multiple_matched_clauses() {
     let (_tmp, sql_context) = setup_abc().await;
     exec(&sql_context, "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')").await;
-    ctx_exec(&sql_context, "CREATE TABLE datafusion.public.source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33'), (5, 500, 'c55'), (7, 700, 'c77'), (9, 900, 'c99')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, c VARCHAR) AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33'), (5, 500, 'c55'), (7, 700, 'c77'), (9, 900, 'c99')) AS t(a, b, c)").await;
 
     exec(&sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND t.a = 5 THEN UPDATE SET b = s.b + t.b \
          WHEN MATCHED AND s.c > 'c2' THEN UPDATE SET a = s.a, b = s.b, c = s.c \
          WHEN MATCHED THEN DELETE \
@@ -1012,16 +1012,16 @@ async fn test_multiple_matched_clauses() {
 #[tokio::test]
 async fn test_partitioned_update_single_partition() {
     let (_tmp, sql_context) = setup_partitioned().await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, pt INT) AS VALUES (1, 100, 1)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
@@ -1035,16 +1035,16 @@ async fn test_partitioned_update_single_partition() {
 #[tokio::test]
 async fn test_partitioned_update_multiple_partitions() {
     let (_tmp, sql_context) = setup_partitioned().await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, pt INT) AS VALUES (1, 100, 1), (3, 300, 2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1), (3, 300, 2)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
@@ -1058,16 +1058,16 @@ async fn test_partitioned_update_multiple_partitions() {
 #[tokio::test]
 async fn test_partitioned_delete() {
     let (_tmp, sql_context) = setup_partitioned().await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, pt INT) AS VALUES (1, 1), (3, 2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, pt INT) AS SELECT * FROM (VALUES (1, 1), (3, 2)) AS t(a, pt)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN DELETE",
     )
     .await;
@@ -1081,16 +1081,16 @@ async fn test_partitioned_delete() {
 #[tokio::test]
 async fn test_partitioned_insert_new_partition() {
     let (_tmp, sql_context) = setup_partitioned().await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, pt INT) AS VALUES (5, 50, 3), (6, 60, 3)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (5, 50, 3), (6, 60, 3)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN NOT MATCHED THEN INSERT (a, b, pt) VALUES (s.a, s.b, s.pt)",
     )
     .await;
@@ -1111,16 +1111,16 @@ async fn test_partitioned_insert_new_partition() {
 #[tokio::test]
 async fn test_partitioned_update_and_insert() {
     let (_tmp, sql_context) = setup_partitioned().await;
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.source (a INT, b INT, pt INT) AS VALUES (1, 100, 1), (5, 50, 2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1), (5, 50, 2)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b \
          WHEN NOT MATCHED THEN INSERT (a, b, pt) VALUES (s.a, s.b, s.pt)",
     )
@@ -1136,28 +1136,28 @@ async fn test_partitioned_update_and_insert() {
 async fn test_partitioned_successive_merges() {
     let (_tmp, sql_context) = setup_partitioned().await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src1 (a INT, b INT, pt INT) AS VALUES (1, 100, 1)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src1 (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1)) AS t(a, b, pt)",
     )
     .await;
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.src1 s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.src1 s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src2 (a INT, b INT, pt INT) AS VALUES (3, 300, 2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src2 (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (3, 300, 2)) AS t(a, b, pt)",
     )
     .await;
     exec(
         &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING datafusion.public.src2 s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.src2 s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;

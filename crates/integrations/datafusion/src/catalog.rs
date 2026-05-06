@@ -21,9 +21,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
+use datafusion::common::plan_datafusion_err;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use paimon::catalog::{Catalog, Identifier};
@@ -44,6 +46,14 @@ pub struct PaimonCatalogProvider {
     catalog: Arc<dyn Catalog>,
     /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
+    /// Temporary in-memory tables and views stored in MemorySchemaProvider per database.
+    ///
+    /// Uses `RwLock` with poison recovery (`unwrap_or_else(|e| e.into_inner())`) throughout.
+    /// This is a deliberate choice: since temp tables are session-scoped and non-critical,
+    /// it is preferable to continue with potentially stale data after a panic rather than
+    /// propagate the panic to all subsequent operations. The worst case is a temp table
+    /// becoming invisible or stale, which is recoverable by re-registering it.
+    temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -62,6 +72,7 @@ impl PaimonCatalogProvider {
         PaimonCatalogProvider {
             catalog,
             dynamic_options: Default::default(),
+            temp_tables: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -72,6 +83,7 @@ impl PaimonCatalogProvider {
         PaimonCatalogProvider {
             catalog,
             dynamic_options,
+            temp_tables: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -85,13 +97,10 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
             async move {
-                match catalog.list_databases().await {
-                    Ok(names) => names,
-                    Err(e) => {
-                        log::error!("failed to list databases: {e}");
-                        vec![]
-                    }
-                }
+                catalog.list_databases().await.unwrap_or_else(|e| {
+                    log::error!("failed to list databases: {e}");
+                    vec![]
+                })
             },
             "paimon catalog access thread panicked",
         )
@@ -101,6 +110,12 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let name = name.to_string();
+
+        let temp_provider = {
+            let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
+            databases.get(&name).cloned()
+        };
+
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
@@ -108,8 +123,20 @@ impl CatalogProvider for PaimonCatalogProvider {
                         Arc::clone(&catalog),
                         name,
                         dynamic_options,
+                        temp_provider,
                     )) as Arc<dyn SchemaProvider>),
-                    Err(paimon::Error::DatabaseNotExist { .. }) => None,
+                    Err(paimon::Error::DatabaseNotExist { .. }) => {
+                        if temp_provider.is_some() {
+                            Some(Arc::new(PaimonSchemaProvider::new(
+                                Arc::clone(&catalog),
+                                name,
+                                dynamic_options,
+                                temp_provider,
+                            )) as Arc<dyn SchemaProvider>)
+                        } else {
+                            None
+                        }
+                    }
                     Err(e) => {
                         log::error!("failed to get database '{}': {e}", name);
                         None
@@ -138,6 +165,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
+                    None,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -162,10 +190,99 @@ impl CatalogProvider for PaimonCatalogProvider {
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
+                    None,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
         )
+    }
+}
+
+impl PaimonCatalogProvider {
+    /// Creates or returns an existing temporary in-memory database for temp tables/views.
+    fn get_or_create_temp_database(&self, name: &str) -> Arc<MemorySchemaProvider> {
+        let mut databases = self.temp_tables.write().unwrap_or_else(|e| e.into_inner());
+        databases
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(MemorySchemaProvider::new()))
+            .clone()
+    }
+
+    /// Registers a temporary table or view in the specified database.
+    /// Creates the database if it does not exist.
+    ///
+    /// Returns an error if a temp table with the same name already exists in
+    /// the same database. Logs a warning if the name shadows a real Paimon table.
+    pub fn register_temp_table(
+        &self,
+        database: &str,
+        table_name: &str,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<()> {
+        // Check if a temp table with this name already exists
+        {
+            let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(mem_db) = databases.get(database) {
+                if mem_db.table_exist(table_name) {
+                    return Err(plan_datafusion_err!(
+                        "Temporary table '{database}.{table_name}' already exists"
+                    ));
+                }
+            }
+        }
+
+        // Warn if this shadows a real Paimon table
+        let catalog = Arc::clone(&self.catalog);
+        let db = database.to_string();
+        let tbl = table_name.to_string();
+        let identifier = Identifier::new(db, tbl);
+        if let Ok(true) = block_on_with_runtime(
+            async move {
+                match catalog.get_table(&identifier).await {
+                    Ok(_) => Ok::<bool, paimon::Error>(true),
+                    Err(paimon::Error::TableNotExist { .. }) => Ok(false),
+                    Err(_) => Ok(false),
+                }
+            },
+            "paimon catalog access thread panicked",
+        ) {
+            log::warn!(
+                "Temporary table '{database}.{table_name}' shadows an existing Paimon table"
+            );
+        }
+
+        let mem_database = self.get_or_create_temp_database(database);
+        mem_database.register_table(table_name.to_string(), table)?;
+        Ok(())
+    }
+
+    /// Deregisters a temporary table or view from the specified database.
+    pub fn deregister_temp_table(
+        &self,
+        database: &str,
+        table_name: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
+        let mem_database = databases
+            .get(database)
+            .ok_or_else(|| plan_datafusion_err!("Unknown temp database '{database}'"))?;
+        mem_database.deregister_table(table_name)
+    }
+
+    /// Returns whether a temp table database exists with the given name.
+    pub fn has_temp_table_database(&self, name: &str) -> bool {
+        self.temp_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
+    }
+
+    /// Returns whether a temp table with the given name exists in the specified database.
+    pub fn temp_table_exist(&self, database: &str, table_name: &str) -> bool {
+        let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
+        databases
+            .get(database)
+            .is_some_and(|db| db.table_exist(table_name))
     }
 }
 
@@ -180,12 +297,15 @@ pub struct PaimonSchemaProvider {
     database: String,
     /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
+    /// Optional temporary in-memory provider for temp tables and views.
+    temp_provider: Option<Arc<MemorySchemaProvider>>,
 }
 
 impl Debug for PaimonSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaimonSchemaProvider")
             .field("database", &self.database)
+            .field("has_temp_provider", &self.temp_provider.is_some())
             .finish()
     }
 }
@@ -196,11 +316,13 @@ impl PaimonSchemaProvider {
         catalog: Arc<dyn Catalog>,
         database: String,
         dynamic_options: DynamicOptions,
+        temp_provider: Option<Arc<MemorySchemaProvider>>,
     ) -> Self {
         PaimonSchemaProvider {
             catalog,
             database,
             dynamic_options,
+            temp_provider,
         }
     }
 }
@@ -214,21 +336,39 @@ impl SchemaProvider for PaimonSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
-        block_on_with_runtime(
-            async move {
-                match catalog.list_tables(&database).await {
-                    Ok(names) => names,
-                    Err(e) => {
-                        log::error!("failed to list tables in '{}': {e}", database);
-                        vec![]
+        let mut names = block_on_with_runtime(
+            {
+                let db = database.clone();
+                async move {
+                    match catalog.list_tables(&db).await {
+                        Ok(names) => names,
+                        Err(e) => {
+                            log::error!("failed to list tables in '{}': {e}", db);
+                            vec![]
+                        }
                     }
                 }
             },
             "paimon catalog access thread panicked",
-        )
+        );
+
+        if let Some(temp) = &self.temp_provider {
+            names.extend(temp.table_names());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
+
+        names
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        if let Some(temp) = &self.temp_provider {
+            if let Some(table) = temp.table(name).await? {
+                return Ok(Some(table));
+            }
+        }
+
         let (base, system_name) = system_tables::split_object_name(name);
         if let Some(system_name) = system_name {
             return await_with_runtime(system_tables::load(
@@ -263,6 +403,12 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        if let Some(temp) = &self.temp_provider {
+            if temp.table_exist(name) {
+                return true;
+            }
+        }
+
         let (base, system_name) = system_tables::split_object_name(name);
         if let Some(system_name) = system_name {
             if !system_tables::is_registered(system_name) {

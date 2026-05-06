@@ -53,6 +53,25 @@ ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
 batches = ctx.sql("SELECT * FROM paimon.my_db.users")
 ```
 
+### Temporary Tables
+
+You can register temporary in-memory tables programmatically. Names support the same resolution rules as SQL: bare names use the current catalog and database, partially qualified names use the current catalog, and fully qualified names specify catalog.database.table.
+
+Register a single PyArrow RecordBatch as a temporary table:
+
+```python
+import pyarrow as pa
+
+batch = pa.record_batch([[1, 2], ["alice", "bob"]], names=["id", "name"])
+
+ctx.register_batch("paimon.default.my_temp", batch)
+
+batches = ctx.sql("SELECT * FROM paimon.default.my_temp")
+
+# Drop it via SQL when no longer needed
+ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+```
+
 Alternatively, if you want to use the native Python DataFusion `SessionContext`,
 install `datafusion` and register a `PaimonCatalog`:
 

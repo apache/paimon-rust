@@ -23,7 +23,7 @@ mod common;
 
 use paimon_datafusion::SQLContext;
 
-use common::{create_sql_context, create_test_env, ctx_exec, dml_count, exec, query_int_str_int};
+use common::{create_sql_context, create_test_env, dml_count, exec, query_int_str_int};
 
 // ======================= Helpers =======================
 
@@ -256,15 +256,15 @@ async fn test_delete_not_in_condition() {
 async fn test_delete_in_subquery() {
     let (_tmp, sql_context) = setup().await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT) AS VALUES (1), (3)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1), (3)) AS t(id)",
     )
     .await;
 
     exec(
         &sql_context,
-        "DELETE FROM paimon.test_db.t WHERE id IN (SELECT id FROM datafusion.public.src)",
+        "DELETE FROM paimon.test_db.t WHERE id IN (SELECT id FROM paimon.test_db.src)",
     )
     .await;
 
@@ -278,15 +278,15 @@ async fn test_delete_in_subquery() {
 async fn test_delete_scalar_subquery() {
     let (_tmp, sql_context) = setup().await;
 
-    ctx_exec(
+    exec(
         &sql_context,
-        "CREATE TABLE datafusion.public.src (id INT) AS VALUES (2)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (2)) AS t(id)",
     )
     .await;
 
     exec(
         &sql_context,
-        "DELETE FROM paimon.test_db.t WHERE id >= (SELECT MAX(id) FROM datafusion.public.src)",
+        "DELETE FROM paimon.test_db.t WHERE id >= (SELECT MAX(id) FROM paimon.test_db.src)",
     )
     .await;
 

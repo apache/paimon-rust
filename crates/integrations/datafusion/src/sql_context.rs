@@ -43,12 +43,15 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::TableReference;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, Delete, Expr as SqlExpr,
-    FromTable, Insert, Merge, ObjectName, RenameTableNameKind, Reset, ResetStatement, Set,
-    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
+    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, CreateView, Delete,
+    Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
+    ResetStatement, Set, SqlOption, Statement, TableFactor, TableObject, Truncate, Update,
+    Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -156,7 +159,7 @@ impl SQLContext {
         Ok(())
     }
 
-    /// Sets the current database (schema) for unqualified table references.
+    /// Sets the current database for unqualified table references.
     pub async fn set_current_database(&self, database_name: &str) -> DFResult<()> {
         if database_name.contains('\'') {
             return Err(DataFusionError::Plan(
@@ -176,6 +179,104 @@ impl SQLContext {
         &self.ctx
     }
 
+    /// Registers a temporary in-memory table or view.
+    ///
+    /// The `name` parameter accepts flexible table references, similar to DataFusion:
+    /// - `"my_table"` — uses the current catalog and current database
+    /// - `"database.my_table"` — uses the current catalog with the specified database
+    /// - `"catalog.database.my_table"` — fully qualified
+    ///
+    /// The table exists only for the lifetime of this SQLContext instance.
+    pub fn register_temp_table(
+        &self,
+        name: impl Into<TableReference>,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<()> {
+        let (catalog, database, table_name) = self.resolve_temp_table_name(name.into())?;
+        let catalog_provider = self
+            .ctx
+            .catalog(&catalog)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
+
+        let paimon_provider = catalog_provider
+            .as_any()
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
+            })?;
+
+        paimon_provider.register_temp_table(&database, &table_name, table)
+    }
+
+    /// Deregisters a temporary table or view.
+    ///
+    /// Accepts the same flexible name format as `register_temp_table`.
+    pub fn deregister_temp_table(
+        &self,
+        name: impl Into<TableReference>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let (catalog, database, table_name) = self.resolve_temp_table_name(name.into())?;
+        let catalog_provider = self
+            .ctx
+            .catalog(&catalog)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
+
+        let paimon_provider = catalog_provider
+            .as_any()
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
+            })?;
+
+        paimon_provider.deregister_temp_table(&database, &table_name)
+    }
+
+    /// Returns whether a temporary table or view with the given name already exists.
+    ///
+    /// Accepts the same flexible name format as `register_temp_table`.
+    pub fn temp_table_exist(&self, name: impl Into<TableReference>) -> DFResult<bool> {
+        let (catalog, database, table_name) = self.resolve_temp_table_name(name.into())?;
+        let catalog_provider = self
+            .ctx
+            .catalog(&catalog)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
+
+        let paimon_provider = catalog_provider
+            .as_any()
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
+            })?;
+
+        Ok(paimon_provider.temp_table_exist(&database, &table_name))
+    }
+
+    /// Resolve a TableReference into (catalog, database, table_name).
+    fn resolve_temp_table_name(&self, name: TableReference) -> DFResult<(String, String, String)> {
+        match name {
+            TableReference::Bare { table } => {
+                let catalog = self.current_catalog_name();
+                let database = self
+                    .ctx
+                    .state()
+                    .config_options()
+                    .catalog
+                    .default_schema
+                    .clone();
+                Ok((catalog, database, table.to_string()))
+            }
+            TableReference::Partial { schema, table } => {
+                let catalog = self.current_catalog_name();
+                Ok((catalog, schema.to_string(), table.to_string()))
+            }
+            TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => Ok((catalog.to_string(), schema.to_string(), table.to_string())),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn dynamic_options(&self) -> &DynamicOptions {
         &self.dynamic_options
@@ -190,8 +291,16 @@ impl SQLContext {
         } else {
             (sql.to_string(), vec![])
         };
-        let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, &rewritten_sql)
+        let sql_lower = rewritten_sql.to_lowercase();
+        let has_time_travel =
+            sql_lower.contains("version as of") || sql_lower.contains("timestamp as of");
+
+        if has_time_travel {
+            // Time-travel queries are not DDL; skip our own parsing and handle directly.
+            return self.handle_time_travel_query(&rewritten_sql).await;
+        }
+
+        let statements = Parser::parse_sql(&GenericDialect {}, &rewritten_sql)
             .map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))?;
 
         if statements.len() != 1 {
@@ -202,10 +311,14 @@ impl SQLContext {
 
         match &statements[0] {
             Statement::CreateTable(create_table) => {
-                let (catalog, _catalog_name, _) =
-                    self.resolve_catalog_and_table(&create_table.name)?;
-                self.handle_create_table(&catalog, create_table, partition_keys)
-                    .await
+                if create_table.temporary {
+                    self.handle_create_temp_table(create_table).await
+                } else {
+                    let (catalog, _catalog_name, _) =
+                        self.resolve_catalog_and_table(&create_table.name)?;
+                    self.handle_create_table(&catalog, create_table, partition_keys)
+                        .await
+                }
             }
             Statement::AlterTable(alter_table) => {
                 let (catalog, _catalog_name, _) =
@@ -262,6 +375,23 @@ impl SQLContext {
                 self.ctx.sql(sql).await
             }
             Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
+            Statement::CreateView(create_view) => self.handle_create_view(create_view).await,
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                temporary,
+                ..
+            } if matches!(*object_type, ObjectType::Table | ObjectType::View) => {
+                if *temporary {
+                    self.handle_drop_temp_table(names, *if_exists)
+                } else if *object_type == ObjectType::Table {
+                    let (catalog, _catalog_name, _) = self.resolve_catalog_and_table(&names[0])?;
+                    self.handle_drop_table(&catalog, names, *if_exists).await
+                } else {
+                    self.ctx.sql(sql).await
+                }
+            }
             Statement::Call(func) => {
                 crate::procedures::execute_call(
                     &self.ctx,
@@ -272,6 +402,130 @@ impl SQLContext {
                 .await
             }
             _ => self.ctx.sql(sql).await,
+        }
+    }
+
+    /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
+    ///
+    /// DataFusion's default SQL parser does not support these clauses, so we:
+    /// 1. Extract the table name and version/timestamp value via regex
+    /// 2. Strip the time-travel clause from the SQL
+    /// 3. Create a `PaimonTableProvider` with the appropriate scan options
+    /// 4. Register it, execute the stripped SQL, then deregister
+    async fn handle_time_travel_query(&self, sql: &str) -> DFResult<DataFrame> {
+        use crate::table::PaimonTableProvider;
+        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+
+        let (table_name, options, clause_range) = if let Some(info) = extract_version_as_of(sql) {
+            let options = HashMap::from([(SCAN_VERSION_OPTION.to_string(), info.version)]);
+            (info.table_name, options, info.clause_range)
+        } else if let Some(info) = extract_timestamp_as_of(sql) {
+            let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
+            let options =
+                HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string())]);
+            (info.table_name, options, info.clause_range)
+        } else {
+            return Err(DataFusionError::Plan(
+                "Failed to parse time-travel clause in SQL".to_string(),
+            ));
+        };
+
+        // Resolve the table from our catalog and create a provider with scan options
+        let table_ref: datafusion::common::TableReference = table_name.as_str().into();
+        let (catalog, _catalog_name, identifier) = self.resolve_table_name_from_ref(&table_ref)?;
+
+        let paimon_table = catalog
+            .get_table(&identifier)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let table_with_options = paimon_table.copy_with_options(options);
+        let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
+
+        // Use a UUID-based temp table name to avoid conflicts with existing tables.
+        let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
+
+        // Replace the original table name + time-travel clause with just the UUID name
+        let rewritten_sql = format!(
+            "{}{}{}",
+            &sql[..clause_range.0],
+            uuid_name,
+            &sql[clause_range.1..]
+        );
+
+        // Register the provider under the UUID temp table name
+        self.register_temp_table(uuid_name.as_str(), provider)?;
+
+        // Execute the rewritten SQL
+        let result = self.ctx.sql(&rewritten_sql).await;
+
+        // Clean up the temp table
+        let _ = self.deregister_temp_table(uuid_name.as_str());
+
+        result
+    }
+
+    /// Parse a timestamp string to milliseconds since epoch (using local timezone).
+    fn parse_timestamp_to_millis(ts: &str) -> DFResult<i64> {
+        use chrono::{Local, NaiveDateTime, TimeZone};
+
+        let naive = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Cannot parse time travel timestamp '{ts}': {e}. Expected format: YYYY-MM-DD HH:MM:SS"
+            ))
+        })?;
+        let local = Local.from_local_datetime(&naive).single().ok_or_else(|| {
+            DataFusionError::Plan(format!("Ambiguous or invalid local time: '{ts}'"))
+        })?;
+        Ok(local.timestamp_millis())
+    }
+
+    /// Resolve a TableReference to (catalog, catalog_name, Identifier).
+    fn resolve_table_name_from_ref(
+        &self,
+        table_ref: &datafusion::common::TableReference,
+    ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
+        match table_ref {
+            datafusion::common::TableReference::Full {
+                catalog,
+                schema,
+                table,
+            } => {
+                let catalog_arc = self
+                    .catalogs
+                    .get(catalog.as_ref())
+                    .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
+                Ok((
+                    catalog_arc.clone(),
+                    catalog.to_string(),
+                    Identifier::new(schema.as_ref(), table.as_ref()),
+                ))
+            }
+            datafusion::common::TableReference::Partial { schema, table } => {
+                let catalog = self.current_catalog()?;
+                let catalog_name = self.current_catalog_name();
+                Ok((
+                    catalog,
+                    catalog_name,
+                    Identifier::new(schema.as_ref(), table.as_ref()),
+                ))
+            }
+            datafusion::common::TableReference::Bare { table } => {
+                let catalog = self.current_catalog()?;
+                let catalog_name = self.current_catalog_name();
+                let default_schema = self
+                    .ctx
+                    .state()
+                    .config_options()
+                    .catalog
+                    .default_schema
+                    .clone();
+                Ok((
+                    catalog,
+                    catalog_name,
+                    Identifier::new(default_schema, table.as_ref()),
+                ))
+            }
         }
     }
 
@@ -344,6 +598,150 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_create_temp_table(&self, ct: &CreateTable) -> DFResult<DataFrame> {
+        let table_ref: TableReference = ct.name.to_string().as_str().into();
+
+        if ct.if_not_exists && self.temp_table_exist(table_ref.clone())? {
+            return ok_result(&self.ctx);
+        }
+
+        // Build the schema from column definitions if provided
+        let declared_schema = if !ct.columns.is_empty() {
+            let fields: Vec<Field> = ct
+                .columns
+                .iter()
+                .map(|col| {
+                    let paimon_type =
+                        sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))?;
+                    let arrow_type = paimon::arrow::paimon_type_to_arrow(&paimon_type)
+                        .map_err(to_datafusion_error)?;
+                    Ok(Field::new(
+                        &col.name.value,
+                        arrow_type,
+                        column_def_nullable(col),
+                    ))
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            Some(Arc::new(Schema::new(fields)))
+        } else {
+            None
+        };
+
+        if let Some(query) = &ct.query {
+            // CREATE TEMPORARY TABLE ... AS SELECT ...
+            let query_sql = query.to_string();
+            let df = self.ctx.sql(&query_sql).await?;
+            let schema = df.schema().inner().clone();
+            let batches = df.collect().await?;
+
+            // If column types are specified, cast each column to the declared type
+            let batches = if ct.columns.is_empty() {
+                batches
+            } else {
+                let target_fields: Vec<(String, ArrowDataType)> = ct
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        let paimon_type =
+                            sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))?;
+                        let arrow_type = paimon::arrow::paimon_type_to_arrow(&paimon_type)
+                            .map_err(to_datafusion_error)?;
+                        Ok((col.name.value.clone(), arrow_type))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+
+                let select_col_count = schema.fields().len();
+                let declared_col_count = target_fields.len();
+                if select_col_count < declared_col_count {
+                    return Err(DataFusionError::Plan(format!(
+                        "CREATE TEMPORARY TABLE AS SELECT: declared {declared_col_count} column(s) \
+                         but SELECT query returns only {select_col_count} column(s)"
+                    )));
+                }
+
+                batches
+                    .into_iter()
+                    .map(|batch| {
+                        let columns = batch
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| {
+                                if i < target_fields.len() {
+                                    let target_dt = &target_fields[i].1;
+                                    if *col.data_type() != *target_dt {
+                                        cast(col, target_dt)
+                                            .map_err(|e| DataFusionError::External(e.into()))
+                                    } else {
+                                        Ok(col.clone())
+                                    }
+                                } else {
+                                    Ok(col.clone())
+                                }
+                            })
+                            .collect::<DFResult<Vec<_>>>()?;
+                        let new_fields = target_fields
+                            .iter()
+                            .zip(schema.fields().iter())
+                            .map(|((name, dt), _)| Field::new(name, dt.clone(), true))
+                            .chain(
+                                schema
+                                    .fields()
+                                    .iter()
+                                    .skip(target_fields.len())
+                                    .map(|f| f.as_ref().clone()),
+                            )
+                            .collect::<Vec<_>>();
+                        let new_schema = Schema::new(new_fields);
+                        RecordBatch::try_new(Arc::new(new_schema), columns)
+                            .map_err(|e| DataFusionError::External(e.into()))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?
+            };
+
+            let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
+            let mem_table = MemTable::try_new(schema, vec![batches])?;
+            self.register_temp_table(table_ref, Arc::new(mem_table))?;
+        } else if let Some(schema) = declared_schema {
+            // CREATE TEMPORARY TABLE (col1 TYPE, col2 TYPE, ...) — no data, just the schema
+            let mem_table = MemTable::try_new(schema, vec![vec![]])?;
+            self.register_temp_table(table_ref, Arc::new(mem_table))?;
+        } else {
+            return Err(DataFusionError::Plan(
+                "CREATE TEMPORARY TABLE requires column definitions or AS SELECT".to_string(),
+            ));
+        }
+
+        ok_result(&self.ctx)
+    }
+
+    fn handle_drop_temp_table(&self, names: &[ObjectName], if_exists: bool) -> DFResult<DataFrame> {
+        for name in names {
+            let table_ref: TableReference = name.to_string().as_str().into();
+            if if_exists && !self.temp_table_exist(table_ref.clone())? {
+                continue;
+            }
+            self.deregister_temp_table(table_ref)?;
+        }
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_drop_table(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        names: &[ObjectName],
+        if_exists: bool,
+    ) -> DFResult<DataFrame> {
+        for name in names {
+            let identifier = self.resolve_table_name(name)?;
+            catalog
+                .drop_table(&identifier, if_exists)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
         ok_result(&self.ctx)
     }
 
@@ -458,7 +856,7 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        crate::merge_into::execute_merge_into(&self.ctx, merge, table).await
+        crate::merge_into::execute_merge_into(self, merge, table).await
     }
 
     async fn handle_update(&self, update: &Update) -> DFResult<DataFrame> {
@@ -477,7 +875,7 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        crate::update::execute_update(&self.ctx, update, table).await
+        crate::update::execute_update(self, update, table).await
     }
 
     async fn handle_delete(&self, delete: &Delete) -> DFResult<DataFrame> {
@@ -504,7 +902,7 @@ impl SQLContext {
             .map_err(to_datafusion_error)?;
 
         let table_ref = table_name.to_string();
-        crate::delete::execute_delete(&self.ctx, delete, table, &table_ref).await
+        crate::delete::execute_delete(self, delete, table, &table_ref).await
     }
 
     async fn handle_insert_overwrite_partition(&self, insert: &Insert) -> DFResult<DataFrame> {
@@ -684,6 +1082,40 @@ impl SQLContext {
         ok_result(&self.ctx)
     }
 
+    async fn handle_create_view(&self, create_view: &CreateView) -> DFResult<DataFrame> {
+        if create_view.materialized {
+            return Err(DataFusionError::Plan(
+                "CREATE MATERIALIZED VIEW is not supported".to_string(),
+            ));
+        }
+
+        let view_name = create_view.name.to_string();
+        let table_ref: TableReference = view_name.as_str().into();
+        let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
+
+        // Use DataFusion's SQL planner to convert the sqlparser Query into a LogicalPlan
+        let query_sql = create_view.query.to_string();
+        let df = self.ctx.sql(&query_sql).await?;
+        let logical_plan = df.logical_plan().clone();
+
+        if create_view.temporary {
+            if create_view.if_not_exists
+                && self.temp_table_exist(format!("{catalog}.{database}.{name}"))?
+            {
+                return ok_result(&self.ctx);
+            }
+            // Create a ViewTable and register it as a temp table
+            let view_table = datafusion::datasource::ViewTable::new(logical_plan, Some(query_sql));
+            self.register_temp_table(format!("{catalog}.{database}.{name}"), Arc::new(view_table))?;
+            ok_result(&self.ctx)
+        } else {
+            Err(DataFusionError::Plan(
+                "CREATE VIEW (non-temporary) is not supported. Use CREATE TEMPORARY VIEW instead."
+                    .to_string(),
+            ))
+        }
+    }
+
     async fn handle_drop_partitions(
         &self,
         catalog: &Arc<dyn Catalog>,
@@ -721,7 +1153,7 @@ impl SQLContext {
     }
 
     /// Returns the name of the current default catalog from DataFusion config.
-    fn current_catalog_name(&self) -> String {
+    pub(crate) fn current_catalog_name(&self) -> String {
         self.ctx
             .state()
             .config_options()
@@ -827,7 +1259,7 @@ fn looks_like_create_table(sql: &str) -> bool {
         }
         break;
     }
-    // Match "CREATE" then whitespace then "TABLE" (all ASCII, byte-safe)
+    // Match "CREATE" then whitespace then optional "TEMPORARY"/"TEMP" then "TABLE" (all ASCII, byte-safe)
     if i + 6 > len || !bytes[i..i + 6].eq_ignore_ascii_case(b"CREATE") {
         return false;
     }
@@ -837,6 +1269,18 @@ fn looks_like_create_table(sql: &str) -> bool {
     }
     while i < len && bytes[i].is_ascii_whitespace() {
         i += 1;
+    }
+    // Skip optional TEMPORARY or TEMP keyword
+    if i + 9 <= len && bytes[i..i + 9].eq_ignore_ascii_case(b"TEMPORARY") {
+        i += 9;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    } else if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"TEMP") {
+        i += 4;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
     }
     i + 5 <= len && bytes[i..i + 5].eq_ignore_ascii_case(b"TABLE")
 }
@@ -1498,6 +1942,115 @@ fn datum_to_constant_array(
     }
 }
 
+struct VersionAsOfInfo {
+    table_name: String,
+    version: String,
+    /// Byte range (start, end) covering "table_name VERSION AS OF n"
+    clause_range: (usize, usize),
+}
+
+struct TimestampAsOfInfo {
+    table_name: String,
+    timestamp: String,
+    /// Byte range (start, end) covering "table_name TIMESTAMP AS OF 'ts'"
+    clause_range: (usize, usize),
+}
+
+/// Extract `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` from a SQL string.
+///
+/// Looks for the pattern (case-insensitive):
+/// - `... VERSION AS OF <number>` — numeric snapshot ID
+/// - `... VERSION AS OF '<tag>'` — tag name (quoted string)
+///
+/// Returns the table name, version/tag value, and byte range of the full clause.
+fn extract_version_as_of(sql: &str) -> Option<VersionAsOfInfo> {
+    let lower = sql.to_lowercase();
+    let keyword = "version as of ";
+    let kw_start = lower.find(keyword)?;
+    let val_start = kw_start + keyword.len();
+
+    let remaining = &sql[val_start..];
+
+    // Parse either a quoted tag name or a numeric snapshot ID
+    let version = if let Some(after_quote) = remaining.strip_prefix('\'') {
+        // Tag name: VERSION AS OF 'tagname'
+        let close_quote = after_quote.find('\'')?;
+        after_quote[..close_quote].to_string()
+    } else {
+        // Numeric snapshot ID: VERSION AS OF 1
+        let v: String = remaining
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if v.is_empty() {
+            return None;
+        }
+        v
+    };
+
+    let is_quoted = remaining.starts_with('\'');
+    let val_end = if is_quoted {
+        val_start + version.len() + 2 // 2 quotes
+    } else {
+        val_start + version.len()
+    };
+
+    // Walk backwards from kw_start to find the table name boundary
+    let table_end = sql[..kw_start].trim_end_matches(' ').len();
+    let table_start = sql[..table_end]
+        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let table_name = sql[table_start..table_end].to_string();
+    if table_name.is_empty() {
+        return None;
+    }
+
+    Some(VersionAsOfInfo {
+        table_name,
+        version,
+        clause_range: (table_start, val_end),
+    })
+}
+
+/// Extract `TIMESTAMP AS OF '<ts>'` from a SQL string.
+///
+/// Looks for the pattern `... TIMESTAMP AS OF '<timestamp>'` (case-insensitive),
+/// returns the table name, timestamp string, and byte range of the full clause
+/// (from table name start to closing quote end).
+fn extract_timestamp_as_of(sql: &str) -> Option<TimestampAsOfInfo> {
+    let lower = sql.to_lowercase();
+    let keyword = "timestamp as of ";
+    let kw_start = lower.find(keyword)?;
+    let val_start = kw_start + keyword.len();
+
+    // Read the quoted timestamp string
+    let remaining = &sql[val_start..];
+    if !remaining.starts_with('\'') {
+        return None;
+    }
+    let close_quote = remaining[1..].find('\'')?;
+    let timestamp = remaining[1..close_quote + 1].to_string();
+    let val_end = val_start + close_quote + 2; // skip both quotes
+
+    // Walk backwards to find the table name boundary
+    let table_end = sql[..kw_start].trim_end_matches(' ').len();
+    let table_start = sql[..table_end]
+        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let table_name = sql[table_start..table_end].to_string();
+    if table_name.is_empty() {
+        return None;
+    }
+
+    Some(TimestampAsOfInfo {
+        table_name,
+        timestamp,
+        clause_range: (table_start, val_end),
+    })
+}
+
 /// Return an empty DataFrame with a single "result" column containing "OK".
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1576,7 +2129,9 @@ mod tests {
             Ok(())
         }
         async fn get_database(&self, _name: &str) -> paimon::Result<Database> {
-            unimplemented!()
+            Err(paimon::Error::DatabaseNotExist {
+                database: _name.to_string(),
+            })
         }
         async fn drop_database(
             &self,
@@ -1587,7 +2142,9 @@ mod tests {
             Ok(())
         }
         async fn get_table(&self, _identifier: &Identifier) -> paimon::Result<Table> {
-            unimplemented!()
+            Err(paimon::Error::TableNotExist {
+                full_name: _identifier.to_string(),
+            })
         }
         async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
             Ok(vec![])
@@ -2835,5 +3392,302 @@ mod tests {
             err.to_string().contains("Incomplete partition spec"),
             "Expected incomplete partition spec error, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_temp_table_if_not_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog).await;
+
+        // First creation succeeds
+        sql_context
+            .sql("CREATE TEMPORARY TABLE mydb.t1 (id INT)")
+            .await
+            .unwrap();
+
+        // Second creation without IF NOT EXISTS should fail
+        let err = sql_context
+            .sql("CREATE TEMPORARY TABLE mydb.t1 (id INT)")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "Expected already-exists error, got: {err}"
+        );
+
+        // With IF NOT EXISTS, it should succeed silently
+        sql_context
+            .sql("CREATE TEMPORARY TABLE IF NOT EXISTS mydb.t1 (id INT)")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_temp_table_if_not_exists_as_select() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog).await;
+
+        // Create temp table with AS SELECT
+        sql_context
+            .sql("CREATE TEMPORARY TABLE mydb.t2 AS SELECT 1 AS id")
+            .await
+            .unwrap();
+
+        // IF NOT EXISTS should skip when the table already exists
+        sql_context
+            .sql("CREATE TEMPORARY TABLE IF NOT EXISTS mydb.t2 AS SELECT 2 AS id")
+            .await
+            .unwrap();
+
+        // Verify the original data is still there (not overwritten)
+        let df = sql_context.sql("SELECT * FROM mydb.t2").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let val = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(val.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_temp_view_if_not_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog).await;
+
+        // First creation succeeds
+        sql_context
+            .sql("CREATE TEMPORARY VIEW mydb.v1 AS SELECT 1 AS id")
+            .await
+            .unwrap();
+
+        // Second creation without IF NOT EXISTS should fail
+        let err = sql_context
+            .sql("CREATE TEMPORARY VIEW mydb.v1 AS SELECT 2 AS id")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "Expected already-exists error, got: {err}"
+        );
+
+        // With IF NOT EXISTS, it should succeed silently
+        sql_context
+            .sql("CREATE TEMPORARY VIEW IF NOT EXISTS mydb.v1 AS SELECT 3 AS id")
+            .await
+            .unwrap();
+
+        // Verify the original view is still intact
+        let df = sql_context.sql("SELECT * FROM mydb.v1").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let val = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(val.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_drop_temp_table_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog).await;
+
+        // Dropping a nonexistent temp table without IF EXISTS should error
+        let err = sql_context
+            .sql("DROP TEMPORARY TABLE mydb.nonexistent")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doesn't exist")
+                || msg.contains("does not exist")
+                || msg.contains("Unknown temp database"),
+            "Expected table-not-exist error, got: {msg}"
+        );
+
+        // Dropping with IF EXISTS should succeed silently
+        sql_context
+            .sql("DROP TEMPORARY TABLE IF EXISTS mydb.nonexistent")
+            .await
+            .unwrap();
+
+        // Create, then drop with IF EXISTS should actually drop it
+        sql_context
+            .sql("CREATE TEMPORARY TABLE mydb.t1 (id INT)")
+            .await
+            .unwrap();
+
+        sql_context
+            .sql("DROP TEMPORARY TABLE IF EXISTS mydb.t1")
+            .await
+            .unwrap();
+
+        // Verify the table is gone
+        assert!(
+            !sql_context.temp_table_exist("mydb.t1").unwrap(),
+            "Expected temp table to be gone after DROP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_temp_view_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog).await;
+
+        // Dropping a nonexistent temp view without IF EXISTS should error
+        let err = sql_context
+            .sql("DROP TEMPORARY VIEW mydb.nonexistent")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doesn't exist")
+                || msg.contains("does not exist")
+                || msg.contains("Unknown temp database"),
+            "Expected view-not-exist error, got: {msg}"
+        );
+
+        // Dropping with IF EXISTS should succeed silently
+        sql_context
+            .sql("DROP TEMPORARY VIEW IF EXISTS mydb.nonexistent")
+            .await
+            .unwrap();
+
+        // Create a temp view, then drop with IF EXISTS
+        sql_context
+            .sql("CREATE TEMPORARY VIEW mydb.v1 AS SELECT 1 AS id")
+            .await
+            .unwrap();
+
+        sql_context
+            .sql("DROP TEMPORARY VIEW IF EXISTS mydb.v1")
+            .await
+            .unwrap();
+
+        // Verify the view is gone
+        assert!(
+            !sql_context.temp_table_exist("mydb.v1").unwrap(),
+            "Expected temp view to be gone after DROP"
+        );
+    }
+
+    #[test]
+    fn test_extract_version_as_of() {
+        let sql = "SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 1";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "1");
+        assert_eq!(info.table_name, "paimon.default.time_travel_table");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT id, name FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_multi_digit() {
+        let sql = "SELECT * FROM mydb.t VERSION AS OF 42";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "42");
+        assert_eq!(info.table_name, "mydb.t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT * FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_case_insensitive() {
+        let sql = "SELECT * FROM t version as of 5";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "5");
+        assert_eq!(info.table_name, "t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT * FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_not_present() {
+        let sql = "SELECT * FROM t";
+        assert!(extract_version_as_of(sql).is_none());
+    }
+
+    #[test]
+    fn test_extract_version_as_of_tag() {
+        let sql = "SELECT id, name FROM paimon.default.t VERSION AS OF 'snapshot1'";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "snapshot1");
+        assert_eq!(info.table_name, "paimon.default.t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT id, name FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_tag_case_insensitive() {
+        let sql = "SELECT * FROM t version as of 'my_tag'";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "my_tag");
+        assert_eq!(info.table_name, "t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT * FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_numeric_still_works() {
+        // Ensure numeric snapshot ID still works alongside tag support
+        let sql = "SELECT * FROM t VERSION AS OF 123";
+        let info = extract_version_as_of(sql).unwrap();
+        assert_eq!(info.version, "123");
+        assert_eq!(info.table_name, "t");
+    }
+
+    #[test]
+    fn test_extract_timestamp_as_of() {
+        let sql = "SELECT * FROM paimon.default.t TIMESTAMP AS OF '2024-01-15 10:30:00'";
+        let info = extract_timestamp_as_of(sql).unwrap();
+        assert_eq!(info.timestamp, "2024-01-15 10:30:00");
+        assert_eq!(info.table_name, "paimon.default.t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT * FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_timestamp_as_of_case_insensitive() {
+        let sql = "SELECT * FROM t timestamp as of '2024-06-01 00:00:00'";
+        let info = extract_timestamp_as_of(sql).unwrap();
+        assert_eq!(info.timestamp, "2024-06-01 00:00:00");
+        assert_eq!(info.table_name, "t");
+        let rewritten = format!(
+            "{}__uuid{}",
+            &sql[..info.clause_range.0],
+            &sql[info.clause_range.1..]
+        );
+        assert_eq!(rewritten, "SELECT * FROM __uuid");
+    }
+
+    #[test]
+    fn test_extract_timestamp_as_of_not_present() {
+        let sql = "SELECT * FROM t";
+        assert!(extract_timestamp_as_of(sql).is_none());
     }
 }

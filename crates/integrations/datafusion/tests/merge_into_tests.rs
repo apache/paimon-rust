@@ -132,8 +132,7 @@ async fn assert_merge_error(sql_context: &SQLContext, sql: &str, expected_substr
 }
 
 async fn register_source(sql_context: &SQLContext, sql: &str) {
-    let ctx = sql_context.ctx();
-    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    sql_context.sql(sql).await.unwrap().collect().await.unwrap();
 }
 
 // ======================= Functional Tests =======================
@@ -208,13 +207,13 @@ async fn test_row_id_stability_after_merge_into() {
     // Register source and execute MERGE INTO
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.source1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.source1 AS SELECT * FROM (VALUES (1, 'ALICE'), (3, 'CHARLIE')) AS t(id, name)",
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.source1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.source1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -267,12 +266,12 @@ async fn test_multiple_merge_into_different_columns() {
     // First MERGE: update name for id=1
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_name (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_name AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_name s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_name s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -284,12 +283,12 @@ async fn test_multiple_merge_into_different_columns() {
     // Second MERGE: update value for id=2
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_value (id INT, value INT) AS VALUES (2, 200)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_value AS SELECT * FROM (VALUES (2, 200)) AS t(id, value)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_value s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_value s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET value = s.value",
         )
         .await
@@ -324,13 +323,13 @@ async fn test_merge_into_with_non_paimon_source() {
     // Source is a plain DataFusion in-memory table, not Paimon
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.df_source (id INT, name VARCHAR) AS VALUES (2, 'BOB_UPDATED')",
+        "CREATE TEMPORARY TABLE paimon.test_db.df_source AS SELECT * FROM (VALUES (2, 'BOB_UPDATED')) AS t(id, name)",
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.df_source s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.df_source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -377,14 +376,14 @@ async fn test_merge_into_join_on_row_id() {
     register_source(
         &sql_context,
         &format!(
-            "CREATE TABLE datafusion.public.rid_source (row_id BIGINT, name VARCHAR) AS VALUES ({row_id_of_2}, 'BOB')"
+            "CREATE TEMPORARY TABLE paimon.test_db.rid_source AS SELECT * FROM (VALUES ({row_id_of_2}, 'BOB')) AS t(row_id, name)"
         ),
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.rid_source s ON t.\"_ROW_ID\" = s.row_id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.rid_source s ON t.\"_ROW_ID\" = s.row_id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -468,12 +467,12 @@ async fn test_row_count_after_merge() {
     // MERGE INTO: update 1 row
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_count (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_count AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_count s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_count s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -509,13 +508,13 @@ async fn test_merge_into_update_and_insert() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_ui (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_ui AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_ui s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_ui s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -554,14 +553,14 @@ async fn test_merge_into_insert_only() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_io (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_io AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
     // Only INSERT, no MATCHED clause — matched row id=2 should be untouched
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_io s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_io s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
         .await
@@ -604,13 +603,13 @@ async fn test_merge_into_insert_all_columns() {
     // Source schema matches target: (id, name, value)
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_star (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 10), (2, 'BOB', 22)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_star AS SELECT * FROM (VALUES (1, 'alice', 10), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_star s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_star s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -652,14 +651,14 @@ async fn test_merge_into_insert_partial_columns() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_partial (id INT, name VARCHAR) AS VALUES (1, 'alice'), (2, 'BOB')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_partial AS SELECT * FROM (VALUES (1, 'alice'), (2, 'BOB')) AS t(id, name)",
     )
     .await;
 
     // INSERT only id and name, value should be NULL (but our schema has INT, so this tests partial insert)
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_partial s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_partial s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, 0)",
         )
         .await
@@ -701,14 +700,14 @@ async fn test_merge_into_insert_with_predicate() {
     // Source has 3 rows, only id=1 matches target
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_pred (id INT, name VARCHAR, value INT) AS VALUES (1, 'ALICE', 11), (2, 'bob', 20), (3, 'charlie', 30)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pred AS SELECT * FROM (VALUES (1, 'ALICE', 11), (2, 'bob', 20), (3, 'charlie', 30)) AS t(id, name, value)",
     )
     .await;
 
     // Only insert when value > 25
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_pred s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_pred s ON t.id = s.id \
              WHEN NOT MATCHED AND s.value > 25 THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
         .await
@@ -754,13 +753,13 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_rid (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_rid AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_rid s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_rid s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -814,13 +813,13 @@ async fn test_rejects_when_matched_delete() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_del (id INT) AS VALUES (1)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_del AS SELECT * FROM (VALUES (1)) AS t(id)",
     )
     .await;
 
     assert_merge_error(
         &sql_context,
-        "MERGE INTO paimon.test_db.target t USING datafusion.public.src_del s ON t.id = s.id \
+        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_del s ON t.id = s.id \
          WHEN MATCHED THEN DELETE",
         "WHEN MATCHED THEN DELETE is not supported",
     )
@@ -845,13 +844,13 @@ async fn test_rejects_multiple_when_matched() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_multi (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_multi AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
     assert_merge_error(
         &sql_context,
-        "MERGE INTO paimon.test_db.target t USING datafusion.public.src_multi s ON t.id = s.id \
+        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_multi s ON t.id = s.id \
          WHEN MATCHED AND t.id = 1 THEN UPDATE SET name = s.name \
          WHEN MATCHED THEN UPDATE SET name = 'default'",
         "WHEN MATCHED AND <predicate> is not yet supported",
@@ -891,13 +890,13 @@ async fn test_rejects_partition_column_in_set() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_pt (id INT, pt VARCHAR) AS VALUES (1, 'b')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pt AS SELECT * FROM (VALUES (1, 'b')) AS t(id, pt)",
     )
     .await;
 
     assert_merge_error(
         &sql_context,
-        "MERGE INTO paimon.test_db.part_target t USING datafusion.public.src_pt s ON t.id = s.id \
+        "MERGE INTO paimon.test_db.part_target t USING paimon.test_db.src_pt s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET pt = s.pt",
         "Cannot update partition column",
     )
@@ -934,13 +933,13 @@ async fn test_rejects_table_without_row_tracking() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_nrt (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_nrt AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
     assert_merge_error(
         &sql_context,
-        "MERGE INTO paimon.test_db.no_tracking t USING datafusion.public.src_nrt s ON t.id = s.id \
+        "MERGE INTO paimon.test_db.no_tracking t USING paimon.test_db.src_nrt s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
         "row-tracking.enabled",
     )
@@ -964,12 +963,12 @@ async fn test_successive_merges_read_file_group() {
     // First MERGE: update 'name' column → creates a partial-column file for 'name'
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_m1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (2, 'BOB')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_m1 AS SELECT * FROM (VALUES (1, 'ALICE'), (2, 'BOB')) AS t(id, name)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_m1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_m1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -993,12 +992,12 @@ async fn test_successive_merges_read_file_group() {
     // (base file has original 'name', partial file has updated 'name' from first merge)
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_m2 (id INT, name VARCHAR) AS VALUES (1, 'Alice_v2')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_m2 AS SELECT * FROM (VALUES (1, 'Alice_v2')) AS t(id, name)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_m2 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_m2 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -1036,12 +1035,12 @@ async fn test_successive_merges_different_columns_read_file_group() {
     // First MERGE: update 'name'
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_dc1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_dc1 AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_dc1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_dc1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -1053,12 +1052,12 @@ async fn test_successive_merges_different_columns_read_file_group() {
     // Second MERGE: update 'value' — reads from file group (base + name-partial)
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_dc2 (id INT, value INT) AS VALUES (1, 100), (2, 200)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_dc2 AS SELECT * FROM (VALUES (1, 100), (2, 200)) AS t(id, value)",
     )
     .await;
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_dc2 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_dc2 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET value = s.value",
         )
         .await
@@ -1100,14 +1099,14 @@ async fn test_merge_insert_reordered_columns() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_reorder (id INT, name VARCHAR, value INT) AS VALUES (2, 'bob', 20), (1, 'ALICE', 11)",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_reorder AS SELECT * FROM (VALUES (2, 'bob', 20), (1, 'ALICE', 11)) AS t(id, name, value)",
     )
     .await;
 
     // INSERT columns in reversed order: (value, name, id)
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING datafusion.public.src_reorder s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_reorder s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (value, name, id) VALUES (s.value, s.name, s.id)",
         )
         .await
@@ -1164,14 +1163,14 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_pt_reorder (id INT, name VARCHAR, dt VARCHAR) AS VALUES (2, 'bob', '2024-02-01'), (1, 'ALICE', '2024-01-01')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pt_reorder AS SELECT * FROM (VALUES (2, 'bob', '2024-02-01'), (1, 'ALICE', '2024-01-01')) AS t(id, name, dt)",
     )
     .await;
 
     // INSERT with columns in different order than table schema: (name, id, dt) vs table (dt, id, name)
     sql_context
         .sql(
-            "MERGE INTO paimon.test_db.part_tbl t USING datafusion.public.src_pt_reorder s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.part_tbl t USING paimon.test_db.src_pt_reorder s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (name, id, dt) VALUES (s.name, s.id, s.dt)",
         )
         .await
@@ -1245,7 +1244,7 @@ async fn test_rejects_table_with_primary_keys() {
 
     register_source(
         &sql_context,
-        "CREATE TABLE datafusion.public.src_pk (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pk AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
@@ -1253,7 +1252,7 @@ async fn test_rejects_table_with_primary_keys() {
 
     assert_merge_error(
         &sql_context,
-        "MERGE INTO paimon.test_db.pk_target t USING datafusion.public.src_pk s ON t.id = s.id \
+        "MERGE INTO paimon.test_db.pk_target t USING paimon.test_db.src_pk s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
         "does not support primary keys",
     )

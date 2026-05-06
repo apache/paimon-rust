@@ -22,10 +22,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonCatalogProvider;
+use paimon_datafusion::SQLContext;
 
 const FIXTURE_TABLE: &str = "test_tantivy_fulltext";
 
@@ -46,22 +45,21 @@ fn extract_test_warehouse() -> (tempfile::TempDir, String) {
     (tmp, warehouse)
 }
 
-async fn create_context() -> (SessionContext, Arc<dyn Catalog>, tempfile::TempDir) {
+async fn create_context() -> (SQLContext, Arc<dyn Catalog>, tempfile::TempDir) {
     let (tmp, warehouse) = extract_test_warehouse();
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
 
-    let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
-    );
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog.clone())
+        .await
+        .expect("Failed to register catalog");
     (ctx, catalog, tmp)
 }
 
-async fn run_sql(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+async fn run_sql(ctx: &SQLContext, sql: &str) -> Vec<RecordBatch> {
     ctx.sql(sql)
         .await
         .unwrap_or_else(|e| panic!("Failed to plan `{sql}`: {e}"))

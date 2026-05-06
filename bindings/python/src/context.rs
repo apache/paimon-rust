@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::pyarrow::ToPyArrow;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use datafusion::catalog::CatalogProvider;
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
@@ -136,6 +136,16 @@ impl PySQLContext {
                 .await
                 .map_err(df_to_py_err)
         })
+    }
+
+    fn register_batch(&self, name: String, batch: Bound<'_, PyAny>) -> PyResult<()> {
+        let batch = datafusion::arrow::record_batch::RecordBatch::from_pyarrow_bound(&batch)?;
+        let schema = batch.schema();
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+            .map_err(df_to_py_err)?;
+        self.inner
+            .register_temp_table(&name, Arc::new(mem_table))
+            .map_err(df_to_py_err)
     }
 
     fn sql(&self, py: Python<'_>, sql: String) -> PyResult<Vec<Py<PyAny>>> {

@@ -48,7 +48,7 @@ theme:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - DataFusion Integration: datafusion.md
+  - SQL Integration: sql.md
   - Go Integration: go-binding.md
   - Architecture: architecture.md
   - Contributing: contributing.md

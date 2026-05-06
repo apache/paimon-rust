@@ -106,21 +106,6 @@ pub async fn exec(sql_context: &SQLContext, s: &str) {
     sql_context.sql(s).await.unwrap().collect().await.unwrap();
 }
 
-/// Execute SQL on the raw DataFusion context (for non-Paimon source tables).
-/// Temporarily switches to datafusion.public so CREATE TABLE lands in the
-/// built-in catalog, then restores the Paimon defaults.
-#[allow(dead_code)]
-pub async fn ctx_exec(sql_context: &SQLContext, s: &str) {
-    sql_context
-        .ctx()
-        .sql(s)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-}
-
 /// Extract the count from a DML result (returns a single UInt64 column).
 #[allow(dead_code)]
 pub async fn dml_count(sql_context: &SQLContext, sql_str: &str) -> u64 {

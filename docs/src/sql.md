@@ -17,7 +17,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# DataFusion Integration
+# SQL Integration
 
 [Apache DataFusion](https://datafusion.apache.org/) is a fast, extensible query engine for building data-centric systems in Rust. The `paimon-datafusion` crate provides a full SQL integration that lets you create, query, and modify Paimon tables.
 
@@ -152,6 +152,52 @@ CREATE TABLE paimon.my_db.complex_types (
 
 ```sql
 DROP TABLE paimon.my_db.users;
+DROP TABLE IF EXISTS paimon.my_db.users;
+```
+
+### CREATE TEMPORARY TABLE
+
+Create an in-memory temporary table from a query result. Temporary tables exist only for the lifetime of the `SQLContext` instance and are automatically cleaned up when the context is dropped.
+
+```sql
+-- Without column types (types inferred from the query)
+CREATE TEMPORARY TABLE paimon.my_db.source AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+
+-- With explicit column types (recommended when integer precision matters)
+CREATE TEMPORARY TABLE paimon.my_db.source (id INT, name STRING) AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+```
+
+`IF NOT EXISTS` is supported — if the table already exists, the statement is silently ignored:
+
+```sql
+CREATE TEMPORARY TABLE IF NOT EXISTS paimon.my_db.source AS SELECT 1;
+```
+
+> **Note:** When using `VALUES` without explicit column types, DataFusion infers integer literals as `Int64`. If the temporary table will be used as a source in `MERGE INTO` against a Paimon table with `Int32` columns, specify the column types explicitly to avoid type mismatch errors.
+
+### CREATE TEMPORARY VIEW
+
+Create a temporary view from a query:
+
+```sql
+CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+`IF NOT EXISTS` is supported:
+
+```sql
+CREATE TEMPORARY VIEW IF NOT EXISTS paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+### DROP TEMPORARY TABLE / DROP TEMPORARY VIEW
+
+Remove a temporary table or view:
+
+```sql
+DROP TEMPORARY TABLE paimon.my_db.source;
+DROP TEMPORARY TABLE IF EXISTS paimon.my_db.source;
+DROP TEMPORARY VIEW paimon.my_db.active_users;
+DROP TEMPORARY VIEW IF EXISTS paimon.my_db.active_users;
 ```
 
 ### ALTER TABLE
@@ -503,12 +549,10 @@ SELECT * FROM paimon.default.my_table VERSION AS OF 1;
 
 ### By Tag Name
 
-`VERSION AS OF` in SQL only accepts numeric values. Tag-based time travel is done via the `scan.version` table option:
+Use a quoted tag name with `VERSION AS OF`:
 
-```rust
-let table = table.copy_with_options(HashMap::from([
-    ("scan.version".to_string(), "my_tag".to_string()),
-]));
+```sql
+SELECT * FROM paimon.default.my_table VERSION AS OF 'my_tag';
 ```
 
 Resolution order: first checks if a tag with that name exists, then tries to parse it as a snapshot ID.
@@ -522,21 +566,6 @@ SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00';
 ```
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
-
-### Enabling Time Travel Syntax
-
-DataFusion requires the Databricks SQL dialect to parse `VERSION AS OF` and `TIMESTAMP AS OF`:
-
-```rust
-use datafusion::prelude::{SessionConfig, SessionContext};
-
-let config = SessionConfig::new()
-    .set_str("datafusion.sql_parser.dialect", "Databricks");
-let ctx = SessionContext::new_with_config(config);
-
-ctx.register_catalog("paimon", Arc::new(PaimonCatalogProvider::new(catalog)));
-ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))?;
-```
 
 ## Dynamic Options (SET / RESET)
 
@@ -558,6 +587,94 @@ Example — enable BLOB descriptor mode:
 SET 'paimon.blob-as-descriptor' = 'true';
 SELECT * FROM paimon.my_db.assets;
 RESET 'paimon.blob-as-descriptor';
+```
+
+## Temporary Tables
+
+You can register in-memory temporary tables under any catalog. Temporary tables exist only for the lifetime of the `SQLContext` instance and are automatically cleaned up when the context is dropped.
+
+The table name accepts flexible references, similar to DataFusion:
+- `"my_table"` — uses the current catalog and current database
+- `"database.my_table"` — uses the current catalog with the specified database
+- `"catalog.database.my_table"` — fully qualified
+
+### register_mem_table
+
+The easiest way to register a temporary table from a schema and record batches:
+
+```rust
+use datafusion::arrow::array::Int32Array;
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+
+let schema = Arc::new(Schema::new(vec![
+    Field::new("id", ArrowDataType::Int32, false),
+    Field::new("name", ArrowDataType::Utf8, true),
+]));
+let batch = RecordBatch::try_new(
+    schema.clone(),
+    vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])),
+        Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+    ],
+)?;
+
+// Fully qualified
+ctx.register_mem_table("paimon.my_db.users", schema.clone(), vec![batch.clone()])?;
+let df = ctx.sql("SELECT * FROM paimon.my_db.users WHERE id > 1").await?;
+df.show().await?;
+
+// Database-qualified (uses current catalog)
+ctx.register_mem_table("my_db.other_table", schema.clone(), vec![batch.clone()])?;
+
+// Bare table name (uses current catalog + current database)
+ctx.register_mem_table("quick_lookup", schema, vec![batch])?;
+```
+
+### register_temp_table
+
+For advanced use cases, `register_temp_table` accepts any `Arc<dyn TableProvider>` (including `ViewTable`, custom providers, etc.):
+
+```rust
+use datafusion::datasource::ViewTable;
+
+// Register a view as a temporary table
+let view_table = ViewTable::new(logical_plan, Some(query_sql));
+ctx.register_temp_table("paimon.my_db.my_view", Arc::new(view_table))?;
+```
+
+### CREATE TEMPORARY TABLE
+
+You can also create temporary tables directly from SQL. See the [DDL section](#create-temporary-table) for details.
+
+```sql
+CREATE TEMPORARY TABLE paimon.my_db.source (id INT, name STRING) AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+```
+
+### CREATE TEMPORARY VIEW
+
+Create a temporary view directly from SQL. See the [DDL section](#create-temporary-view) for details.
+
+```sql
+CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+### Deregister
+
+Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table--drop-temporary-view)):
+
+```rust
+ctx.deregister_temp_table("paimon.my_db.users")?;
+```
+
+Multiple temporary tables can share the same database — the database is created automatically on first use:
+
+```rust
+ctx.register_mem_table("my_db.table_a", schema_a, vec![batch_a])?;
+ctx.register_mem_table("my_db.table_b", schema_b, vec![batch_b])?;
+
+// Join two temp tables
+let df = ctx.sql("SELECT * FROM paimon.my_db.table_a JOIN paimon.my_db.table_b ON a.id = b.id").await?;
 ```
 
 ## System Tables
