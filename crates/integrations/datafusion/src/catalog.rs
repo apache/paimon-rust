@@ -199,15 +199,6 @@ impl CatalogProvider for PaimonCatalogProvider {
 }
 
 impl PaimonCatalogProvider {
-    /// Creates or returns an existing temporary in-memory database for temp tables/views.
-    fn get_or_create_temp_database(&self, name: &str) -> Arc<MemorySchemaProvider> {
-        let mut databases = self.temp_tables.write().unwrap_or_else(|e| e.into_inner());
-        databases
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(MemorySchemaProvider::new()))
-            .clone()
-    }
-
     /// Registers a temporary table or view in the specified database.
     /// Creates the database if it does not exist.
     ///
@@ -219,19 +210,7 @@ impl PaimonCatalogProvider {
         table_name: &str,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<()> {
-        // Check if a temp table with this name already exists
-        {
-            let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(mem_db) = databases.get(database) {
-                if mem_db.table_exist(table_name) {
-                    return Err(plan_datafusion_err!(
-                        "Temporary table '{database}.{table_name}' already exists"
-                    ));
-                }
-            }
-        }
-
-        // Warn if this shadows a real Paimon table
+        // Warn if this shadows a real Paimon table (outside the lock — not critical)
         let catalog = Arc::clone(&self.catalog);
         let db = database.to_string();
         let tbl = table_name.to_string();
@@ -251,8 +230,19 @@ impl PaimonCatalogProvider {
             );
         }
 
-        let mem_database = self.get_or_create_temp_database(database);
-        mem_database.register_table(table_name.to_string(), table)?;
+        // Atomically check-then-register under a single write lock to avoid TOCTOU
+        let mut databases = self.temp_tables.write().unwrap_or_else(|e| e.into_inner());
+        let mem_database = databases
+            .entry(database.to_string())
+            .or_insert_with(|| Arc::new(MemorySchemaProvider::new()));
+
+        // register_table returns Ok(Some(old_table)) if the name already existed
+        let old = mem_database.register_table(table_name.to_string(), table)?;
+        if old.is_some() {
+            return Err(plan_datafusion_err!(
+                "Temporary table '{database}.{table_name}' already exists"
+            ));
+        }
         Ok(())
     }
 

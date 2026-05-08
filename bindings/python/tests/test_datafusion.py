@@ -164,3 +164,16 @@ def test_multi_catalog_temp_table():
 
         ctx.sql("DROP TEMPORARY TABLE cat1.default.t1")
         ctx.sql("DROP TEMPORARY TABLE cat2.default.t2")
+
+
+def test_register_batch_invalid_catalog():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        batch = pa.record_batch([[1]], names=["id"])
+        try:
+            ctx.register_batch("unknown_catalog.default.my_temp", batch)
+            assert False, "Expected an error for unknown catalog"
+        except Exception as e:
+            assert "unknown_catalog" in str(e).lower() or "not a paimon" in str(e).lower() or "unknown" in str(e).lower()

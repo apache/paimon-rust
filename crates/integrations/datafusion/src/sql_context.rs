@@ -291,11 +291,7 @@ impl SQLContext {
         } else {
             (sql.to_string(), vec![])
         };
-        let sql_lower = rewritten_sql.to_lowercase();
-        let has_time_travel =
-            sql_lower.contains("version as of") || sql_lower.contains("timestamp as of");
-
-        if has_time_travel {
+        if contains_time_travel_keyword(&rewritten_sql) {
             // Time-travel queries are not DDL; skip our own parsing and handle directly.
             return self.handle_time_travel_query(&rewritten_sql).await;
         }
@@ -375,7 +371,21 @@ impl SQLContext {
                 self.ctx.sql(sql).await
             }
             Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
-            Statement::CreateView(create_view) => self.handle_create_view(create_view).await,
+            Statement::CreateView(create_view) => {
+                if create_view.temporary {
+                    // Temporary views are always handled by us (Paimon catalog temp storage)
+                    self.handle_create_view(create_view).await
+                } else {
+                    // Non-temporary views: only intercept if the target catalog is Paimon
+                    let view_name = create_view.name.to_string();
+                    let table_ref: TableReference = view_name.as_str().into();
+                    if self.is_paimon_catalog_ref(&table_ref) {
+                        self.handle_create_view(create_view).await
+                    } else {
+                        self.ctx.sql(sql).await
+                    }
+                }
+            }
             Statement::Drop {
                 object_type,
                 if_exists,
@@ -386,8 +396,15 @@ impl SQLContext {
                 if *temporary {
                     self.handle_drop_temp_table(names, *if_exists)
                 } else if *object_type == ObjectType::Table {
-                    let (catalog, _catalog_name, _) = self.resolve_catalog_and_table(&names[0])?;
-                    self.handle_drop_table(&catalog, names, *if_exists).await
+                    // Only intercept DROP TABLE for Paimon catalogs; fall through for others
+                    let table_ref: TableReference = names[0].to_string().as_str().into();
+                    if self.is_paimon_catalog_ref(&table_ref) {
+                        let (catalog, _catalog_name, _) =
+                            self.resolve_catalog_and_table(&names[0])?;
+                        self.handle_drop_table(&catalog, names, *if_exists).await
+                    } else {
+                        self.ctx.sql(sql).await
+                    }
                 } else {
                     self.ctx.sql(sql).await
                 }
@@ -408,61 +425,96 @@ impl SQLContext {
     /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
     ///
     /// DataFusion's default SQL parser does not support these clauses, so we:
-    /// 1. Extract the table name and version/timestamp value via regex
-    /// 2. Strip the time-travel clause from the SQL
-    /// 3. Create a `PaimonTableProvider` with the appropriate scan options
-    /// 4. Register it, execute the stripped SQL, then deregister
+    /// 1. Extract all table name + version/timestamp pairs (skipping string literals and comments)
+    /// 2. Strip the time-travel clauses from the SQL
+    /// 3. For each table, create a `PaimonTableProvider` with the appropriate scan options
+    ///    (merged with session-scoped dynamic options)
+    /// 4. Register them as UUID-named temp tables, execute the rewritten SQL, then deregister
     async fn handle_time_travel_query(&self, sql: &str) -> DFResult<DataFrame> {
         use crate::table::PaimonTableProvider;
         use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
-        let (table_name, options, clause_range) = if let Some(info) = extract_version_as_of(sql) {
-            let options = HashMap::from([(SCAN_VERSION_OPTION.to_string(), info.version)]);
-            (info.table_name, options, info.clause_range)
-        } else if let Some(info) = extract_timestamp_as_of(sql) {
-            let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
-            let options =
-                HashMap::from([(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string())]);
-            (info.table_name, options, info.clause_range)
-        } else {
+        let mut tracker = crate::merge_into::TempTableTracker::new(self);
+
+        let version_clauses = extract_all_version_as_of(sql);
+        let timestamp_clauses = extract_all_timestamp_as_of(sql);
+
+        if version_clauses.is_empty() && timestamp_clauses.is_empty() {
             return Err(DataFusionError::Plan(
                 "Failed to parse time-travel clause in SQL".to_string(),
             ));
-        };
+        }
 
-        // Resolve the table from our catalog and create a provider with scan options
-        let table_ref: datafusion::common::TableReference = table_name.as_str().into();
-        let (catalog, _catalog_name, identifier) = self.resolve_table_name_from_ref(&table_ref)?;
+        // Collect all replacements: (clause_range, uuid_name)
+        let mut replacements: Vec<((usize, usize), String)> = Vec::new();
 
-        let paimon_table = catalog
-            .get_table(&identifier)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Process all VERSION AS OF clauses
+        for info in &version_clauses {
+            let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
+            let (catalog, _catalog_name, identifier) =
+                self.resolve_table_name_from_ref(&table_ref)?;
 
-        let table_with_options = paimon_table.copy_with_options(options);
-        let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
+            let paimon_table = catalog
+                .get_table(&identifier)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Use a UUID-based temp table name to avoid conflicts with existing tables.
-        let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
+            // Merge dynamic options with time-travel options
+            let mut options = self.dynamic_options.read().unwrap().clone();
+            options.insert(SCAN_VERSION_OPTION.to_string(), info.version.clone());
 
-        // Replace the original table name + time-travel clause with just the UUID name
-        let rewritten_sql = format!(
-            "{}{}{}",
-            &sql[..clause_range.0],
-            uuid_name,
-            &sql[clause_range.1..]
-        );
+            let table_with_options = paimon_table.copy_with_options(options);
+            let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
 
-        // Register the provider under the UUID temp table name
-        self.register_temp_table(uuid_name.as_str(), provider)?;
+            let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
+            self.register_temp_table(uuid_name.as_str(), provider)?;
+            tracker.register(&uuid_name);
+            replacements.push((info.clause_range, uuid_name));
+        }
 
-        // Execute the rewritten SQL
-        let result = self.ctx.sql(&rewritten_sql).await;
+        // Process all TIMESTAMP AS OF clauses
+        for info in &timestamp_clauses {
+            let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
+            let (catalog, _catalog_name, identifier) =
+                self.resolve_table_name_from_ref(&table_ref)?;
 
-        // Clean up the temp table
-        let _ = self.deregister_temp_table(uuid_name.as_str());
+            let paimon_table = catalog
+                .get_table(&identifier)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        result
+            let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
+
+            // Merge dynamic options with time-travel options
+            let mut options = self.dynamic_options.read().unwrap().clone();
+            options.insert(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string());
+
+            let table_with_options = paimon_table.copy_with_options(options);
+            let provider = Arc::new(PaimonTableProvider::try_new(table_with_options)?);
+
+            let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
+            self.register_temp_table(uuid_name.as_str(), provider)?;
+            tracker.register(&uuid_name);
+            replacements.push((info.clause_range, uuid_name));
+        }
+
+        // Sort replacements by position (descending) so that replacements
+        // from right to left don't shift indices of earlier ones
+        replacements.sort_by(|a, b| b.0 .0.cmp(&a.0 .0));
+
+        // Build the rewritten SQL by replacing each clause from right to left
+        let mut rewritten_sql = sql.to_string();
+        for ((start, end), uuid_name) in &replacements {
+            rewritten_sql = format!(
+                "{}{}{}",
+                &rewritten_sql[..*start],
+                uuid_name,
+                &rewritten_sql[*end..]
+            );
+        }
+
+        // Execute the rewritten SQL; tracker auto-deregisters on drop
+        self.ctx.sql(&rewritten_sql).await
     }
 
     /// Parse a timestamp string to milliseconds since epoch (using local timezone).
@@ -1171,6 +1223,17 @@ impl SQLContext {
         })
     }
 
+    /// Check whether a TableReference targets a registered Paimon catalog.
+    fn is_paimon_catalog_ref(&self, table_ref: &TableReference) -> bool {
+        let catalog_name = match table_ref {
+            TableReference::Full { catalog, .. } => catalog.to_string(),
+            TableReference::Partial { .. } | TableReference::Bare { .. } => {
+                self.current_catalog_name()
+            }
+        };
+        self.catalogs.contains_key(&catalog_name)
+    }
+
     /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
     fn resolve_catalog_and_table(
         &self,
@@ -1281,6 +1344,10 @@ fn looks_like_create_table(sql: &str) -> bool {
         while i < len && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+    }
+    // After optional TEMPORARY/TEMP, reject CREATE TEMPORARY VIEW / CREATE TEMP VIEW
+    if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"VIEW") {
+        return false;
     }
     i + 5 <= len && bytes[i..i + 5].eq_ignore_ascii_case(b"TABLE")
 }
@@ -1956,99 +2023,262 @@ struct TimestampAsOfInfo {
     clause_range: (usize, usize),
 }
 
-/// Extract `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` from a SQL string.
-///
-/// Looks for the pattern (case-insensitive):
-/// - `... VERSION AS OF <number>` — numeric snapshot ID
-/// - `... VERSION AS OF '<tag>'` — tag name (quoted string)
-///
-/// Returns the table name, version/tag value, and byte range of the full clause.
-fn extract_version_as_of(sql: &str) -> Option<VersionAsOfInfo> {
+/// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
+/// `TIMESTAMP AS OF`) **outside** of single-quoted string literals, `--` line
+/// comments, and `/* */` block comments.
+fn contains_time_travel_keyword(sql: &str) -> bool {
     let lower = sql.to_lowercase();
-    let keyword = "version as of ";
-    let kw_start = lower.find(keyword)?;
-    let val_start = kw_start + keyword.len();
-
-    let remaining = &sql[val_start..];
-
-    // Parse either a quoted tag name or a numeric snapshot ID
-    let version = if let Some(after_quote) = remaining.strip_prefix('\'') {
-        // Tag name: VERSION AS OF 'tagname'
-        let close_quote = after_quote.find('\'')?;
-        after_quote[..close_quote].to_string()
-    } else {
-        // Numeric snapshot ID: VERSION AS OF 1
-        let v: String = remaining
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if v.is_empty() {
-            return None;
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                // Skip string literal
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < len && bytes[i] == b'\'' {
+                            i += 1; // escaped quote
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // Skip line comment
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Skip block comment
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                // Check for keywords
+                if i + 14 <= len && bytes[i..i + 14].eq_ignore_ascii_case(b"version as of ") {
+                    return true;
+                }
+                if i + 16 <= len && bytes[i..i + 16].eq_ignore_ascii_case(b"timestamp as of ") {
+                    return true;
+                }
+                i += 1;
+            }
         }
-        v
-    };
-
-    let is_quoted = remaining.starts_with('\'');
-    let val_end = if is_quoted {
-        val_start + version.len() + 2 // 2 quotes
-    } else {
-        val_start + version.len()
-    };
-
-    // Walk backwards from kw_start to find the table name boundary
-    let table_end = sql[..kw_start].trim_end_matches(' ').len();
-    let table_start = sql[..table_end]
-        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let table_name = sql[table_start..table_end].to_string();
-    if table_name.is_empty() {
-        return None;
     }
-
-    Some(VersionAsOfInfo {
-        table_name,
-        version,
-        clause_range: (table_start, val_end),
-    })
+    false
 }
 
-/// Extract `TIMESTAMP AS OF '<ts>'` from a SQL string.
-///
-/// Looks for the pattern `... TIMESTAMP AS OF '<timestamp>'` (case-insensitive),
-/// returns the table name, timestamp string, and byte range of the full clause
-/// (from table name start to closing quote end).
-fn extract_timestamp_as_of(sql: &str) -> Option<TimestampAsOfInfo> {
+/// Extract **all** `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` clauses from a
+/// SQL string, skipping string literals and comments.
+fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
     let lower = sql.to_lowercase();
-    let keyword = "timestamp as of ";
-    let kw_start = lower.find(keyword)?;
-    let val_start = kw_start + keyword.len();
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+    let sql_bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut results = Vec::new();
 
-    // Read the quoted timestamp string
-    let remaining = &sql[val_start..];
-    if !remaining.starts_with('\'') {
-        return None;
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                // Skip string literal
+                i += 1;
+                while i < len {
+                    if sql_bytes[i] == b'\'' {
+                        i += 1;
+                        if i < len && sql_bytes[i] == b'\'' {
+                            i += 1; // escaped quote
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // Skip line comment
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Skip block comment
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if i + 14 <= len && bytes[i..i + 14].eq_ignore_ascii_case(b"version as of ") {
+                    let kw_start = i;
+                    let val_start = i + 14;
+                    let remaining = &sql[val_start..];
+
+                    // Parse either a quoted tag name or a numeric snapshot ID
+                    let version = if let Some(after_quote) = remaining.strip_prefix('\'') {
+                        // Tag name: VERSION AS OF 'tagname'
+                        if let Some(close_quote) = after_quote.find('\'') {
+                            after_quote[..close_quote].to_string()
+                        } else {
+                            i += 1;
+                            continue;
+                        }
+                    } else {
+                        // Numeric snapshot ID: VERSION AS OF 1
+                        let v: String = remaining
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if v.is_empty() {
+                            i += 1;
+                            continue;
+                        }
+                        v
+                    };
+
+                    let is_quoted = remaining.starts_with('\'');
+                    let val_end = if is_quoted {
+                        val_start + version.len() + 2 // 2 quotes
+                    } else {
+                        val_start + version.len()
+                    };
+
+                    // Walk backwards from kw_start to find the table name boundary
+                    let table_end = sql[..kw_start].trim_end_matches(' ').len();
+                    let table_start = sql[..table_end]
+                        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
+                        .map(|idx| idx + 1)
+                        .unwrap_or(0);
+                    let table_name = sql[table_start..table_end].to_string();
+
+                    if !table_name.is_empty() {
+                        results.push(VersionAsOfInfo {
+                            table_name,
+                            version,
+                            clause_range: (table_start, val_end),
+                        });
+                    }
+
+                    i = val_end;
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
-    let close_quote = remaining[1..].find('\'')?;
-    let timestamp = remaining[1..close_quote + 1].to_string();
-    let val_end = val_start + close_quote + 2; // skip both quotes
 
-    // Walk backwards to find the table name boundary
-    let table_end = sql[..kw_start].trim_end_matches(' ').len();
-    let table_start = sql[..table_end]
-        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let table_name = sql[table_start..table_end].to_string();
-    if table_name.is_empty() {
-        return None;
+    results
+}
+
+/// Extract **all** `TIMESTAMP AS OF '<ts>'` clauses from a SQL string, skipping
+/// string literals and comments.
+fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
+    let lower = sql.to_lowercase();
+    let bytes = lower.as_bytes();
+    let len = bytes.len();
+    let sql_bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut results = Vec::new();
+
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                // Skip string literal
+                i += 1;
+                while i < len {
+                    if sql_bytes[i] == b'\'' {
+                        i += 1;
+                        if i < len && sql_bytes[i] == b'\'' {
+                            i += 1; // escaped quote
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // Skip line comment
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Skip block comment
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if i + 16 <= len && bytes[i..i + 16].eq_ignore_ascii_case(b"timestamp as of ") {
+                    let kw_start = i;
+                    let val_start = i + 16;
+                    let remaining = &sql[val_start..];
+
+                    // Read the quoted timestamp string
+                    if !remaining.starts_with('\'') {
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(close_quote) = remaining[1..].find('\'') {
+                        let timestamp = remaining[1..close_quote + 1].to_string();
+                        let val_end = val_start + close_quote + 2; // skip both quotes
+
+                        // Walk backwards to find the table name boundary
+                        let table_end = sql[..kw_start].trim_end_matches(' ').len();
+                        let table_start = sql[..table_end]
+                            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
+                            .map(|idx| idx + 1)
+                            .unwrap_or(0);
+                        let table_name = sql[table_start..table_end].to_string();
+
+                        if !table_name.is_empty() {
+                            results.push(TimestampAsOfInfo {
+                                table_name,
+                                timestamp,
+                                clause_range: (table_start, val_end),
+                            });
+                        }
+
+                        i = val_end;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 
-    Some(TimestampAsOfInfo {
-        table_name,
-        timestamp,
-        clause_range: (table_start, val_end),
-    })
+    results
 }
 
 /// Return an empty DataFrame with a single "result" column containing "OK".
@@ -3575,7 +3805,9 @@ mod tests {
     #[test]
     fn test_extract_version_as_of() {
         let sql = "SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 1";
-        let info = extract_version_as_of(sql).unwrap();
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.version, "1");
         assert_eq!(info.table_name, "paimon.default.time_travel_table");
         let rewritten = format!(
@@ -3589,7 +3821,9 @@ mod tests {
     #[test]
     fn test_extract_version_as_of_multi_digit() {
         let sql = "SELECT * FROM mydb.t VERSION AS OF 42";
-        let info = extract_version_as_of(sql).unwrap();
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.version, "42");
         assert_eq!(info.table_name, "mydb.t");
         let rewritten = format!(
@@ -3603,7 +3837,9 @@ mod tests {
     #[test]
     fn test_extract_version_as_of_case_insensitive() {
         let sql = "SELECT * FROM t version as of 5";
-        let info = extract_version_as_of(sql).unwrap();
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.version, "5");
         assert_eq!(info.table_name, "t");
         let rewritten = format!(
@@ -3617,13 +3853,15 @@ mod tests {
     #[test]
     fn test_extract_version_as_of_not_present() {
         let sql = "SELECT * FROM t";
-        assert!(extract_version_as_of(sql).is_none());
+        assert!(extract_all_version_as_of(sql).is_empty());
     }
 
     #[test]
     fn test_extract_version_as_of_tag() {
         let sql = "SELECT id, name FROM paimon.default.t VERSION AS OF 'snapshot1'";
-        let info = extract_version_as_of(sql).unwrap();
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.version, "snapshot1");
         assert_eq!(info.table_name, "paimon.default.t");
         let rewritten = format!(
@@ -3637,7 +3875,9 @@ mod tests {
     #[test]
     fn test_extract_version_as_of_tag_case_insensitive() {
         let sql = "SELECT * FROM t version as of 'my_tag'";
-        let info = extract_version_as_of(sql).unwrap();
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.version, "my_tag");
         assert_eq!(info.table_name, "t");
         let rewritten = format!(
@@ -3650,17 +3890,68 @@ mod tests {
 
     #[test]
     fn test_extract_version_as_of_numeric_still_works() {
-        // Ensure numeric snapshot ID still works alongside tag support
         let sql = "SELECT * FROM t VERSION AS OF 123";
-        let info = extract_version_as_of(sql).unwrap();
-        assert_eq!(info.version, "123");
-        assert_eq!(info.table_name, "t");
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].version, "123");
+        assert_eq!(infos[0].table_name, "t");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_multiple() {
+        // JOIN two time-travel tables
+        let sql = "SELECT * FROM t1 VERSION AS OF 1 JOIN t2 VERSION AS OF 2 ON t1.id = t2.id";
+        let infos = extract_all_version_as_of(sql);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].version, "1");
+        assert_eq!(infos[0].table_name, "t1");
+        assert_eq!(infos[1].version, "2");
+        assert_eq!(infos[1].table_name, "t2");
+    }
+
+    #[test]
+    fn test_extract_version_as_of_skips_string_literal() {
+        let sql = "SELECT * FROM t WHERE note = 'version as of 1'";
+        let infos = extract_all_version_as_of(sql);
+        assert!(infos.is_empty());
+    }
+
+    #[test]
+    fn test_extract_version_as_of_skips_comment() {
+        let sql = "SELECT * FROM t -- version as of 1\n WHERE id > 0";
+        let infos = extract_all_version_as_of(sql);
+        assert!(infos.is_empty());
+    }
+
+    #[test]
+    fn test_contains_time_travel_keyword() {
+        assert!(contains_time_travel_keyword(
+            "SELECT * FROM t VERSION AS OF 1"
+        ));
+        assert!(contains_time_travel_keyword(
+            "SELECT * FROM t TIMESTAMP AS OF '2024-01-01 00:00:00'"
+        ));
+        // Inside string literal — should NOT match
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM t WHERE note = 'version as of 1'"
+        ));
+        // Inside comment — should NOT match
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM t -- version as of 1"
+        ));
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM t /* timestamp as of now */ WHERE id > 0"
+        ));
+        // No keyword at all
+        assert!(!contains_time_travel_keyword("SELECT * FROM t"));
     }
 
     #[test]
     fn test_extract_timestamp_as_of() {
         let sql = "SELECT * FROM paimon.default.t TIMESTAMP AS OF '2024-01-15 10:30:00'";
-        let info = extract_timestamp_as_of(sql).unwrap();
+        let infos = extract_all_timestamp_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.timestamp, "2024-01-15 10:30:00");
         assert_eq!(info.table_name, "paimon.default.t");
         let rewritten = format!(
@@ -3674,7 +3965,9 @@ mod tests {
     #[test]
     fn test_extract_timestamp_as_of_case_insensitive() {
         let sql = "SELECT * FROM t timestamp as of '2024-06-01 00:00:00'";
-        let info = extract_timestamp_as_of(sql).unwrap();
+        let infos = extract_all_timestamp_as_of(sql);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
         assert_eq!(info.timestamp, "2024-06-01 00:00:00");
         assert_eq!(info.table_name, "t");
         let rewritten = format!(
@@ -3688,6 +3981,6 @@ mod tests {
     #[test]
     fn test_extract_timestamp_as_of_not_present() {
         let sql = "SELECT * FROM t";
-        assert!(extract_timestamp_as_of(sql).is_none());
+        assert!(extract_all_timestamp_as_of(sql).is_empty());
     }
 }

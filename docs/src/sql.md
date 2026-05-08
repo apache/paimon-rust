@@ -598,14 +598,15 @@ The table name accepts flexible references, similar to DataFusion:
 - `"database.my_table"` — uses the current catalog with the specified database
 - `"catalog.database.my_table"` — fully qualified
 
-### register_mem_table
+### register_temp_table
 
-The easiest way to register a temporary table from a schema and record batches:
+Register any `Arc<dyn TableProvider>` as a temporary table (including `MemTable`, `ViewTable`, custom providers, etc.):
 
 ```rust
 use datafusion::arrow::array::Int32Array;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
 
 let schema = Arc::new(Schema::new(vec![
     Field::new("id", ArrowDataType::Int32, false),
@@ -619,28 +620,16 @@ let batch = RecordBatch::try_new(
     ],
 )?;
 
-// Fully qualified
-ctx.register_mem_table("paimon.my_db.users", schema.clone(), vec![batch.clone()])?;
+// Register a MemTable as a temp table
+let mem_table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]])?);
+ctx.register_temp_table("paimon.my_db.users", mem_table)?;
 let df = ctx.sql("SELECT * FROM paimon.my_db.users WHERE id > 1").await?;
 df.show().await?;
 
-// Database-qualified (uses current catalog)
-ctx.register_mem_table("my_db.other_table", schema.clone(), vec![batch.clone()])?;
-
-// Bare table name (uses current catalog + current database)
-ctx.register_mem_table("quick_lookup", schema, vec![batch])?;
-```
-
-### register_temp_table
-
-For advanced use cases, `register_temp_table` accepts any `Arc<dyn TableProvider>` (including `ViewTable`, custom providers, etc.):
-
-```rust
+// Register a ViewTable as a temp table
 use datafusion::datasource::ViewTable;
-
-// Register a view as a temporary table
-let view_table = ViewTable::new(logical_plan, Some(query_sql));
-ctx.register_temp_table("paimon.my_db.my_view", Arc::new(view_table))?;
+let view_table = Arc::new(ViewTable::new(logical_plan, Some(query_sql)));
+ctx.register_temp_table("paimon.my_db.my_view", view_table)?;
 ```
 
 ### CREATE TEMPORARY TABLE
@@ -670,8 +659,10 @@ ctx.deregister_temp_table("paimon.my_db.users")?;
 Multiple temporary tables can share the same database — the database is created automatically on first use:
 
 ```rust
-ctx.register_mem_table("my_db.table_a", schema_a, vec![batch_a])?;
-ctx.register_mem_table("my_db.table_b", schema_b, vec![batch_b])?;
+let mem_a = Arc::new(MemTable::try_new(schema_a, vec![vec![batch_a]])?);
+let mem_b = Arc::new(MemTable::try_new(schema_b, vec![vec![batch_b]])?);
+ctx.register_temp_table("my_db.table_a", mem_a)?;
+ctx.register_temp_table("my_db.table_b", mem_b)?;
 
 // Join two temp tables
 let df = ctx.sql("SELECT * FROM paimon.my_db.table_a JOIN paimon.my_db.table_b ON a.id = b.id").await?;

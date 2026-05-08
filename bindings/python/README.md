@@ -21,6 +21,35 @@
 
 This project builds the Rust-powered core for [PyPaimon](https://paimon.apache.org/docs/master/pypaimon/overview/) while also providing DataFusion integration for querying Paimon tables.
 
+## Usage
+
+```python
+import pyarrow as pa
+from pypaimon_rust.datafusion import SQLContext
+
+# Create a SQL context and register a Paimon catalog
+ctx = SQLContext()
+ctx.register_catalog("paimon", {"warehouse": "/tmp/paimon-warehouse"})
+
+# Create a table and insert data
+ctx.sql("CREATE SCHEMA paimon.my_db")
+ctx.sql("CREATE TABLE paimon.my_db.users (id INT, name STRING, PRIMARY KEY (id))")
+ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
+
+# Query data
+batches = ctx.sql("SELECT id, name FROM paimon.my_db.users ORDER BY id")
+
+# Register a temporary table from a PyArrow RecordBatch
+batch = pa.record_batch([[1, 2], ["alice", "bob"]], names=["id", "name"])
+ctx.register_batch("paimon.default.my_temp", batch)
+batches = ctx.sql("SELECT * FROM paimon.default.my_temp")
+
+# Drop it via SQL when no longer needed
+ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+```
+
+For the full SQL reference, see the [SQL Integration docs](https://paimon.apache.org/docs/master/sql/).
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/):
