@@ -31,31 +31,31 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Int64Array;
 use datafusion::physical_plan::{displayable, ExecutionPlan};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
-/// Creates a test handler with a table ready for inserts.
-async fn setup_table(schema_sql: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
-    let (tmp, handler) = common::setup_handler().await;
-    handler
+/// Creates a test sql_context with a table ready for inserts.
+async fn setup_table(schema_sql: &str) -> (tempfile::TempDir, SQLContext) {
+    let (tmp, sql_context) = common::setup_sql_context().await;
+    sql_context
         .sql(&format!("CREATE TABLE paimon.test_db.t {schema_sql}"))
         .await
         .expect("CREATE TABLE should succeed");
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
-/// Creates a test handler with a partitioned table ready for inserts.
+/// Creates a test sql_context with a partitioned table ready for inserts.
 async fn setup_partitioned_table(
     columns: &str,
     partition_cols: &str,
-) -> (tempfile::TempDir, PaimonSqlHandler) {
-    let (tmp, handler) = common::setup_handler().await;
-    handler
+) -> (tempfile::TempDir, SQLContext) {
+    let (tmp, sql_context) = common::setup_sql_context().await;
+    sql_context
         .sql(&format!(
             "CREATE TABLE paimon.test_db.t ({columns}) PARTITIONED BY ({partition_cols})"
         ))
         .await
         .expect("CREATE TABLE should succeed");
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
 /// Checks if the physical plan contains a PaimonTableScan (meaning data would be scanned).
@@ -67,10 +67,10 @@ fn plan_contains_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Creates a physical plan for the given SQL and checks if COUNT was pushed down.
 /// Returns Ok(plan) if pushdown succeeded (no scan in plan), Err(plan) if it fell back to scanning.
 async fn verify_count_pushdown(
-    handler: &PaimonSqlHandler,
+    sql_context: &SQLContext,
     sql: &str,
 ) -> Result<Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>> {
-    let df = handler.sql(sql).await.expect("Query should succeed");
+    let df = sql_context.sql(sql).await.expect("Query should succeed");
     let plan = df
         .create_physical_plan()
         .await
@@ -84,8 +84,8 @@ async fn verify_count_pushdown(
 }
 
 /// Executes a COUNT(*) query and returns the count value.
-async fn run_count_query(handler: &PaimonSqlHandler, sql: &str) -> i64 {
-    let batches = handler
+async fn run_count_query(sql_context: &SQLContext, sql: &str) -> i64 {
+    let batches = sql_context
         .sql(sql)
         .await
         .expect("Query should succeed")
@@ -111,9 +111,9 @@ async fn run_count_query(handler: &PaimonSqlHandler, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn test_count_star_no_filter_pushes_down() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
+    let (_tmp, sql_context) = setup_table("(id INT, value INT)").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10), (2, 20), (3, 30)")
         .await
         .unwrap()
@@ -121,11 +121,11 @@ async fn test_count_star_no_filter_pushes_down() {
         .await
         .unwrap();
 
-    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) should push down (no filter)");
 
-    let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
+    let count = run_count_query(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 3, "COUNT(*) should return 3");
 }
 
@@ -135,9 +135,9 @@ async fn test_count_star_no_filter_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_with_data_filter_does_not_push_down() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
+    let (_tmp, sql_context) = setup_table("(id INT, value INT)").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10), (2, 20), (3, 30)")
         .await
         .unwrap()
@@ -146,7 +146,7 @@ async fn test_count_star_with_data_filter_does_not_push_down() {
         .unwrap();
 
     let plan = verify_count_pushdown(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE id > 1",
     )
     .await;
@@ -157,7 +157,7 @@ async fn test_count_star_with_data_filter_does_not_push_down() {
     );
 
     let count = run_count_query(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE id > 1",
     )
     .await;
@@ -170,9 +170,9 @@ async fn test_count_star_with_data_filter_does_not_push_down() {
 
 #[tokio::test]
 async fn test_count_star_with_non_partition_equality_does_not_push_down() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
+    let (_tmp, sql_context) = setup_table("(id INT, value INT)").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10), (2, 20), (3, 30)")
         .await
         .unwrap()
@@ -181,7 +181,7 @@ async fn test_count_star_with_non_partition_equality_does_not_push_down() {
         .unwrap();
 
     let plan = verify_count_pushdown(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE id = 2",
     )
     .await;
@@ -192,7 +192,7 @@ async fn test_count_star_with_non_partition_equality_does_not_push_down() {
     );
 
     let count = run_count_query(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE id = 2",
     )
     .await;
@@ -205,9 +205,9 @@ async fn test_count_star_with_non_partition_equality_does_not_push_down() {
 
 #[tokio::test]
 async fn test_count_star_single_row_pushes_down() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
+    let (_tmp, sql_context) = setup_table("(id INT, value INT)").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10)")
         .await
         .unwrap()
@@ -215,11 +215,11 @@ async fn test_count_star_single_row_pushes_down() {
         .await
         .unwrap();
 
-    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) should push down");
 
-    let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
+    let count = run_count_query(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 1, "COUNT(*) should return 1");
 }
 
@@ -229,13 +229,13 @@ async fn test_count_star_single_row_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_empty_table_pushes_down() {
-    let (_tmp, handler) = setup_table("(id INT, value INT)").await;
+    let (_tmp, sql_context) = setup_table("(id INT, value INT)").await;
 
-    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) on empty table should push down");
 
-    let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
+    let count = run_count_query(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 0, "COUNT(*) should return 0");
 }
 
@@ -245,9 +245,9 @@ async fn test_count_star_empty_table_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_with_partition_filter_pushes_down() {
-    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
+    let (_tmp, sql_context) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-01'), (3, 30, '2024-01-02')")
         .await
         .unwrap()
@@ -256,14 +256,14 @@ async fn test_count_star_with_partition_filter_pushes_down() {
         .unwrap();
 
     verify_count_pushdown(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt = '2024-01-01'",
     )
     .await
     .expect("COUNT(*) with partition filter should push down");
 
     let count = run_count_query(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt = '2024-01-01'",
     )
     .await;
@@ -276,9 +276,9 @@ async fn test_count_star_with_partition_filter_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
-    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
+    let (_tmp, sql_context) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-01'), (3, 30, '2024-01-02')")
         .await
         .unwrap()
@@ -287,7 +287,7 @@ async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
         .unwrap();
 
     let plan = verify_count_pushdown(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt = '2024-01-01' AND value > 15",
     )
     .await;
@@ -298,7 +298,7 @@ async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
     );
 
     let count = run_count_query(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt = '2024-01-01' AND value > 15",
     )
     .await;
@@ -311,9 +311,9 @@ async fn test_count_star_with_mixed_partition_data_filter_does_not_push_down() {
 
 #[tokio::test]
 async fn test_count_star_with_partition_in_filter_pushes_down() {
-    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
+    let (_tmp, sql_context) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-02'), (3, 30, '2024-01-03')")
         .await
         .unwrap()
@@ -322,14 +322,14 @@ async fn test_count_star_with_partition_in_filter_pushes_down() {
         .unwrap();
 
     verify_count_pushdown(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt IN ('2024-01-01', '2024-01-02')",
     )
     .await
     .expect("COUNT(*) with partition IN filter should push down");
 
     let count = run_count_query(
-        &handler,
+        &sql_context,
         "SELECT COUNT(*) FROM paimon.test_db.t WHERE dt IN ('2024-01-01', '2024-01-02')",
     )
     .await;
@@ -342,9 +342,9 @@ async fn test_count_star_with_partition_in_filter_pushes_down() {
 
 #[tokio::test]
 async fn test_count_star_partitioned_no_filter_pushes_down() {
-    let (_tmp, handler) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
+    let (_tmp, sql_context) = setup_partitioned_table("id INT, value INT, dt STRING", "dt").await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 10, '2024-01-01'), (2, 20, '2024-01-02')")
         .await
         .unwrap()
@@ -352,10 +352,10 @@ async fn test_count_star_partitioned_no_filter_pushes_down() {
         .await
         .unwrap();
 
-    verify_count_pushdown(&handler, "SELECT COUNT(*) FROM paimon.test_db.t")
+    verify_count_pushdown(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t")
         .await
         .expect("COUNT(*) without filter should push down");
 
-    let count = run_count_query(&handler, "SELECT COUNT(*) FROM paimon.test_db.t").await;
+    let count = run_count_query(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 2, "COUNT(*) should return 2");
 }

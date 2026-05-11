@@ -95,7 +95,9 @@ impl TableProvider for SnapshotsTable {
             self.table.file_io().clone(),
             self.table.location().to_string(),
         );
-        let snapshots = sm.list_all().await.map_err(to_datafusion_error)?;
+        let snapshots = crate::runtime::await_with_runtime(async move { sm.list_all().await })
+            .await
+            .map_err(to_datafusion_error)?;
 
         let n = snapshots.len();
         let mut snapshot_ids = Vec::with_capacity(n);

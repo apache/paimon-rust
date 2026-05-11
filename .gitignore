@@ -21,3 +21,4 @@
 .vscode
 **/.DS_Store
 dist/*
+.qoder

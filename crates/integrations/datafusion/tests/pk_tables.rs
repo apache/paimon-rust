@@ -28,7 +28,8 @@
 mod common;
 
 use common::{
-    collect_id_name, collect_id_value, create_handler, create_test_env, row_count, setup_handler,
+    collect_id_name, collect_id_value, create_sql_context, create_test_env, row_count,
+    setup_sql_context,
 };
 use datafusion::arrow::array::{Int32Array, StringArray};
 use paimon::catalog::Identifier;
@@ -39,9 +40,9 @@ use paimon::Catalog;
 /// Basic: CREATE TABLE with PK, INSERT, SELECT — verifies round-trip.
 #[tokio::test]
 async fn test_pk_basic_write_read() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t1 (
                 id INT NOT NULL, name STRING,
@@ -51,7 +52,7 @@ async fn test_pk_basic_write_read() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t1 VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
         .unwrap()
@@ -60,7 +61,7 @@ async fn test_pk_basic_write_read() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t1 ORDER BY id",
     )
     .await;
@@ -80,9 +81,9 @@ async fn test_pk_basic_write_read() {
 /// Duplicate keys in a single INSERT — last value wins (Deduplicate engine).
 #[tokio::test]
 async fn test_pk_dedup_within_single_commit() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dedup (
                 id INT NOT NULL, value INT,
@@ -92,7 +93,7 @@ async fn test_pk_dedup_within_single_commit() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dedup VALUES (1, 10), (2, 20), (1, 100), (2, 200)")
         .await
         .unwrap()
@@ -101,7 +102,7 @@ async fn test_pk_dedup_within_single_commit() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_dedup ORDER BY id",
     )
     .await;
@@ -115,9 +116,9 @@ async fn test_pk_dedup_within_single_commit() {
 /// Two commits with overlapping keys — second commit's values win.
 #[tokio::test]
 async fn test_pk_dedup_across_commits() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_cross (
                 id INT NOT NULL, name STRING,
@@ -128,7 +129,7 @@ async fn test_pk_dedup_across_commits() {
         .unwrap();
 
     // First commit
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
         .await
         .unwrap()
@@ -137,7 +138,7 @@ async fn test_pk_dedup_across_commits() {
         .unwrap();
 
     // Second commit: update id=1,3, add id=4
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross VALUES (1, 'alice-v2'), (3, 'carol-v2'), (4, 'dave')")
         .await
         .unwrap()
@@ -146,7 +147,7 @@ async fn test_pk_dedup_across_commits() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_cross ORDER BY id",
     )
     .await;
@@ -167,9 +168,9 @@ async fn test_pk_dedup_across_commits() {
 /// Three successive commits — verifies sequence number tracking across commits.
 #[tokio::test]
 async fn test_pk_three_commits() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_three (
                 id INT NOT NULL, value INT,
@@ -179,7 +180,7 @@ async fn test_pk_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_three VALUES (1, 10), (2, 20)")
         .await
         .unwrap()
@@ -187,7 +188,7 @@ async fn test_pk_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_three VALUES (2, 200), (3, 30)")
         .await
         .unwrap()
@@ -195,7 +196,7 @@ async fn test_pk_three_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_three VALUES (1, 100), (3, 300), (4, 40)")
         .await
         .unwrap()
@@ -204,7 +205,7 @@ async fn test_pk_three_commits() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_three ORDER BY id",
     )
     .await;
@@ -217,9 +218,9 @@ async fn test_pk_three_commits() {
 /// Partitioned PK table: dedup happens per-partition independently.
 #[tokio::test]
 async fn test_pk_partitioned_write_read() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_part (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -230,7 +231,7 @@ async fn test_pk_partitioned_write_read() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -243,7 +244,7 @@ async fn test_pk_partitioned_write_read() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_part ORDER BY id, name",
     )
     .await;
@@ -262,9 +263,9 @@ async fn test_pk_partitioned_write_read() {
 /// Partitioned PK table: dedup across commits within same partition.
 #[tokio::test]
 async fn test_pk_partitioned_dedup_across_commits() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_part_dedup (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -275,7 +276,7 @@ async fn test_pk_partitioned_dedup_across_commits() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part_dedup VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -288,7 +289,7 @@ async fn test_pk_partitioned_dedup_across_commits() {
         .unwrap();
 
     // Update within partition 2024-01-01
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part_dedup VALUES \
              ('2024-01-01', 1, 'alice-v2'), ('2024-01-02', 2, 'dave')",
@@ -299,7 +300,7 @@ async fn test_pk_partitioned_dedup_across_commits() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_part_dedup ORDER BY dt, id")
         .await
         .unwrap()
@@ -344,9 +345,9 @@ async fn test_pk_partitioned_dedup_across_commits() {
 /// Partition filter on PK table — only matching partition returned.
 #[tokio::test]
 async fn test_pk_partitioned_filter() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_part_filter (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -357,7 +358,7 @@ async fn test_pk_partitioned_filter() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part_filter VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -370,7 +371,7 @@ async fn test_pk_partitioned_filter() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_part_filter WHERE dt = '2024-01-01' ORDER BY id",
     )
     .await;
@@ -383,9 +384,9 @@ async fn test_pk_partitioned_filter() {
 /// Multiple buckets: rows are distributed by PK hash, dedup still works.
 #[tokio::test]
 async fn test_pk_multi_bucket() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_mbucket (
                 id INT NOT NULL, value INT,
@@ -395,7 +396,7 @@ async fn test_pk_multi_bucket() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_mbucket VALUES \
              (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80)",
@@ -407,7 +408,7 @@ async fn test_pk_multi_bucket() {
         .unwrap();
 
     // Update some keys
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_mbucket VALUES (2, 200), (5, 500), (8, 800)")
         .await
         .unwrap()
@@ -416,7 +417,7 @@ async fn test_pk_multi_bucket() {
         .unwrap();
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_mbucket ORDER BY id",
     )
     .await;
@@ -441,9 +442,9 @@ async fn test_pk_multi_bucket() {
 /// SELECT only a subset of columns from a PK table.
 #[tokio::test]
 async fn test_pk_column_projection() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_proj (
                 id INT NOT NULL, name STRING, value INT,
@@ -453,7 +454,7 @@ async fn test_pk_column_projection() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_proj VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await
         .unwrap()
@@ -462,7 +463,7 @@ async fn test_pk_column_projection() {
         .unwrap();
 
     // Update id=1
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_proj VALUES (1, 'alice-v2', 100)")
         .await
         .unwrap()
@@ -471,7 +472,7 @@ async fn test_pk_column_projection() {
         .unwrap();
 
     // Project only name
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT name FROM paimon.test_db.t_proj ORDER BY name")
         .await
         .unwrap()
@@ -495,7 +496,7 @@ async fn test_pk_column_projection() {
 
     // Project only value
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_proj ORDER BY id",
     )
     .await;
@@ -507,9 +508,9 @@ async fn test_pk_column_projection() {
 /// sequence.field: dedup uses the specified field instead of system sequence number.
 #[tokio::test]
 async fn test_pk_sequence_field() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_seqf (
                 id INT NOT NULL, version INT, name STRING,
@@ -520,7 +521,7 @@ async fn test_pk_sequence_field() {
         .unwrap();
 
     // First commit: version=2 for id=1
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_seqf VALUES (1, 2, 'alice-v2'), (2, 1, 'bob-v1')")
         .await
         .unwrap()
@@ -529,7 +530,7 @@ async fn test_pk_sequence_field() {
         .unwrap();
 
     // Second commit: version=1 for id=1 (older), version=2 for id=2 (newer)
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_seqf VALUES (1, 1, 'alice-v1'), (2, 2, 'bob-v2')")
         .await
         .unwrap()
@@ -538,7 +539,7 @@ async fn test_pk_sequence_field() {
         .unwrap();
 
     let rows = collect_id_name(
-        &handler,
+        &sql_context,
         "SELECT id, name FROM paimon.test_db.t_seqf ORDER BY id",
     )
     .await;
@@ -557,9 +558,9 @@ async fn test_pk_sequence_field() {
 /// INSERT OVERWRITE on a partitioned PK table replaces the partition.
 #[tokio::test]
 async fn test_pk_insert_overwrite_partitioned() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_overwrite (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -570,7 +571,7 @@ async fn test_pk_insert_overwrite_partitioned() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_overwrite VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -583,7 +584,7 @@ async fn test_pk_insert_overwrite_partitioned() {
         .unwrap();
 
     // Overwrite partition 2024-01-01
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_overwrite VALUES ('2024-01-01', 10, 'new_alice')")
         .await
         .unwrap()
@@ -591,7 +592,7 @@ async fn test_pk_insert_overwrite_partitioned() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_overwrite ORDER BY dt, id")
         .await
         .unwrap()
@@ -634,9 +635,9 @@ async fn test_pk_insert_overwrite_partitioned() {
 /// INSERT OVERWRITE with explicit PARTITION clause (Hive-style static partition).
 #[tokio::test]
 async fn test_pk_insert_overwrite_with_partition_clause() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_ow_part (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -648,7 +649,7 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
         .unwrap();
 
     // Insert data into two partitions
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_ow_part VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -662,7 +663,7 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
 
     // Overwrite partition dt='2024-01-01' using Hive-style PARTITION clause.
     // The SELECT only provides non-partition columns (id, name).
-    handler
+    sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_ow_part PARTITION (dt = '2024-01-01') \
              VALUES (10, 'new_alice'), (20, 'new_bob')",
@@ -673,7 +674,7 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_ow_part ORDER BY dt, id")
         .await
         .unwrap()
@@ -719,9 +720,9 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
 /// Only specifies dt, region comes from the source query (dynamic partition).
 #[tokio::test]
 async fn test_pk_insert_overwrite_partial_partition_clause() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_multi_part (
                 dt STRING, region STRING, id INT NOT NULL, name STRING,
@@ -733,7 +734,7 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
         .unwrap();
 
     // Insert data into multiple partitions
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_multi_part VALUES \
              ('2024-01-01', 'us', 1, 'alice'), \
@@ -748,7 +749,7 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
 
     // Overwrite only dt='2024-01-01', region comes from VALUES (dynamic).
     // This should overwrite all sub-partitions under dt='2024-01-01' that appear in the data.
-    handler
+    sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_multi_part PARTITION (dt = '2024-01-01') \
              VALUES ('us', 10, 'new_alice')",
@@ -759,7 +760,7 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, region, id, name FROM paimon.test_db.t_multi_part ORDER BY dt, region, id")
         .await
         .unwrap()
@@ -820,9 +821,9 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
 /// INSERT OVERWRITE with PARTITION clause and empty source truncates the partition.
 #[tokio::test]
 async fn test_pk_insert_overwrite_partition_truncate() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_trunc (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -833,7 +834,7 @@ async fn test_pk_insert_overwrite_partition_truncate() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_trunc VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -846,7 +847,7 @@ async fn test_pk_insert_overwrite_partition_truncate() {
         .unwrap();
 
     // Overwrite dt='2024-01-01' with empty source — should truncate that partition
-    handler
+    sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_trunc PARTITION (dt = '2024-01-01') \
              SELECT id, name FROM paimon.test_db.t_trunc WHERE false",
@@ -857,7 +858,7 @@ async fn test_pk_insert_overwrite_partition_truncate() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_trunc ORDER BY dt, id")
         .await
         .unwrap()
@@ -898,9 +899,9 @@ async fn test_pk_insert_overwrite_partition_truncate() {
 /// PARTITION clause with a non-partition column should fail.
 #[tokio::test]
 async fn test_pk_insert_overwrite_partition_non_partition_column_error() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_err (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -911,7 +912,7 @@ async fn test_pk_insert_overwrite_partition_non_partition_column_error() {
         .await
         .unwrap();
 
-    let result = handler
+    let result = sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_err PARTITION (name = 'alice') \
              VALUES (1)",
@@ -930,9 +931,9 @@ async fn test_pk_insert_overwrite_partition_non_partition_column_error() {
 /// not drop all partitions.
 #[tokio::test]
 async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -943,7 +944,7 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_dyn VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-02', 2, 'bob')",
@@ -956,7 +957,7 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
 
     // Dynamic partition overwrite: PARTITION (dt) with no static value.
     // Should only overwrite partitions present in the source data.
-    handler
+    sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_dyn PARTITION (dt) \
              VALUES ('2024-01-01', 10, 'new_alice')",
@@ -967,7 +968,7 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_dyn ORDER BY dt, id")
         .await
         .unwrap()
@@ -1011,9 +1012,9 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
 /// Source query with wrong column count should fail even when the result is empty.
 #[tokio::test]
 async fn test_pk_insert_overwrite_empty_source_wrong_columns_error() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_empty_err (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -1024,7 +1025,7 @@ async fn test_pk_insert_overwrite_empty_source_wrong_columns_error() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_empty_err VALUES \
              ('2024-01-01', 1, 'alice')",
@@ -1036,7 +1037,7 @@ async fn test_pk_insert_overwrite_empty_source_wrong_columns_error() {
         .unwrap();
 
     // Source only produces `id` but target expects `id, name` — should fail
-    let result = handler
+    let result = sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_empty_err PARTITION (dt = '2024-01-01') \
              SELECT id FROM paimon.test_db.t_empty_err WHERE false",
@@ -1054,9 +1055,9 @@ async fn test_pk_insert_overwrite_empty_source_wrong_columns_error() {
 /// Explicit target column list after PARTITION should reorder source columns to match schema.
 #[tokio::test]
 async fn test_pk_insert_overwrite_with_after_columns_reorder() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_reorder (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -1068,7 +1069,7 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
         .unwrap();
 
     // Insert with columns in reversed order: (name, id) instead of schema order (id, name)
-    handler
+    sql_context
         .sql(
             "INSERT OVERWRITE paimon.test_db.t_reorder (name, id) PARTITION (dt = '2024-01-01') \
              VALUES ('alice', 1), ('bob', 2)",
@@ -1079,7 +1080,7 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.t_reorder ORDER BY id")
         .await
         .unwrap()
@@ -1125,9 +1126,9 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
 /// Composite PK with multiple columns.
 #[tokio::test]
 async fn test_pk_composite_key() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_composite (
                 region STRING NOT NULL, id INT NOT NULL, value INT,
@@ -1137,7 +1138,7 @@ async fn test_pk_composite_key() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_composite VALUES \
              ('us', 1, 10), ('eu', 1, 20), ('us', 2, 30)",
@@ -1149,7 +1150,7 @@ async fn test_pk_composite_key() {
         .unwrap();
 
     // Update (us, 1) — (eu, 1) should be untouched
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_composite VALUES ('us', 1, 100)")
         .await
         .unwrap()
@@ -1157,7 +1158,7 @@ async fn test_pk_composite_key() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT region, id, value FROM paimon.test_db.t_composite ORDER BY region, id")
         .await
         .unwrap()
@@ -1199,9 +1200,9 @@ async fn test_pk_composite_key() {
 /// Reading an empty PK table returns zero rows.
 #[tokio::test]
 async fn test_pk_empty_table_read() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_empty (
                 id INT NOT NULL, name STRING,
@@ -1211,7 +1212,7 @@ async fn test_pk_empty_table_read() {
         .await
         .unwrap();
 
-    let count = row_count(&handler, "SELECT id, name FROM paimon.test_db.t_empty").await;
+    let count = row_count(&sql_context, "SELECT id, name FROM paimon.test_db.t_empty").await;
     assert_eq!(count, 0);
 }
 
@@ -1220,9 +1221,9 @@ async fn test_pk_empty_table_read() {
 /// Many rows with overlapping keys in a single commit.
 #[tokio::test]
 async fn test_pk_large_batch_dedup() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_large (
                 id INT NOT NULL, value INT,
@@ -1240,7 +1241,7 @@ async fn test_pk_large_batch_dedup() {
         values2.push(format!("({i}, {})", i * 10)); // id=i, value=i*10
     }
 
-    handler
+    sql_context
         .sql(&format!(
             "INSERT INTO paimon.test_db.t_large VALUES {}",
             values1.join(", ")
@@ -1251,7 +1252,7 @@ async fn test_pk_large_batch_dedup() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(&format!(
             "INSERT INTO paimon.test_db.t_large VALUES {}",
             values2.join(", ")
@@ -1262,12 +1263,12 @@ async fn test_pk_large_batch_dedup() {
         .await
         .unwrap();
 
-    let count = row_count(&handler, "SELECT * FROM paimon.test_db.t_large").await;
+    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t_large").await;
     assert_eq!(count, 100, "Dedup should keep exactly 100 unique keys");
 
     // Spot-check a few values
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_large WHERE id IN (1, 50, 100) ORDER BY id",
     )
     .await;
@@ -1279,9 +1280,9 @@ async fn test_pk_large_batch_dedup() {
 /// Partitioned PK table with multiple buckets.
 #[tokio::test]
 async fn test_pk_partitioned_multi_bucket() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_part_mb (
                 dt STRING, id INT NOT NULL, value INT,
@@ -1292,7 +1293,7 @@ async fn test_pk_partitioned_multi_bucket() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part_mb VALUES \
              ('2024-01-01', 1, 10), ('2024-01-01', 2, 20), \
@@ -1306,7 +1307,7 @@ async fn test_pk_partitioned_multi_bucket() {
         .unwrap();
 
     // Update across partitions
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_part_mb VALUES \
              ('2024-01-01', 2, 222), ('2024-01-02', 1, 111)",
@@ -1317,7 +1318,7 @@ async fn test_pk_partitioned_multi_bucket() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, value FROM paimon.test_db.t_part_mb ORDER BY dt, id")
         .await
         .unwrap()
@@ -1362,9 +1363,9 @@ async fn test_pk_partitioned_multi_bucket() {
 /// PK table with changelog-producer=input should be rejected.
 #[tokio::test]
 async fn test_pk_reject_changelog_producer_input() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_changelog (
                 id INT NOT NULL, name STRING,
@@ -1374,7 +1375,7 @@ async fn test_pk_reject_changelog_producer_input() {
         .await
         .unwrap();
 
-    let result = handler
+    let result = sql_context
         .sql("INSERT INTO paimon.test_db.t_changelog VALUES (1, 'alice')")
         .await;
 
@@ -1393,9 +1394,9 @@ async fn test_pk_reject_changelog_producer_input() {
 /// PK table with STRING primary key.
 #[tokio::test]
 async fn test_pk_string_key() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_strpk (
                 code STRING NOT NULL, name STRING,
@@ -1405,7 +1406,7 @@ async fn test_pk_string_key() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_strpk VALUES \
              ('A001', 'alice'), ('B002', 'bob'), ('C003', 'carol')",
@@ -1417,7 +1418,7 @@ async fn test_pk_string_key() {
         .unwrap();
 
     // Update A001
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_strpk VALUES ('A001', 'alice-v2')")
         .await
         .unwrap()
@@ -1425,7 +1426,7 @@ async fn test_pk_string_key() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT code, name FROM paimon.test_db.t_strpk ORDER BY code")
         .await
         .unwrap()
@@ -1463,9 +1464,9 @@ async fn test_pk_string_key() {
 /// PK table with many value columns — verifies all columns survive dedup.
 #[tokio::test]
 async fn test_pk_multiple_value_columns() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_multi_val (
                 id INT NOT NULL, col_a INT, col_b STRING, col_c INT,
@@ -1475,7 +1476,7 @@ async fn test_pk_multiple_value_columns() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_multi_val VALUES (1, 10, 'x', 100), (2, 20, 'y', 200)")
         .await
         .unwrap()
@@ -1483,7 +1484,7 @@ async fn test_pk_multiple_value_columns() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_multi_val VALUES (1, 11, 'xx', 111)")
         .await
         .unwrap()
@@ -1491,7 +1492,7 @@ async fn test_pk_multiple_value_columns() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT id, col_a, col_b, col_c FROM paimon.test_db.t_multi_val ORDER BY id")
         .await
         .unwrap()
@@ -1547,13 +1548,13 @@ async fn test_pk_multiple_value_columns() {
 #[tokio::test]
 async fn test_pk_first_row_insert_overwrite() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_fr_ow (
                 dt STRING, id INT NOT NULL, name STRING,
@@ -1565,7 +1566,7 @@ async fn test_pk_first_row_insert_overwrite() {
         .unwrap();
 
     // First commit: two partitions, creates level-0 files
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_fr_ow VALUES \
              ('2024-01-01', 1, 'alice'), ('2024-01-01', 2, 'bob'), \
@@ -1596,7 +1597,7 @@ async fn test_pk_first_row_insert_overwrite() {
     );
 
     // INSERT OVERWRITE partition 2024-01-01 — must delete old level-0 file
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_fr_ow VALUES ('2024-01-01', 10, 'new_alice')")
         .await
         .unwrap()
@@ -1622,7 +1623,7 @@ async fn test_pk_first_row_insert_overwrite() {
     );
 
     // Second overwrite on the same partition — no stale files should accumulate
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_fr_ow VALUES ('2024-01-01', 20, 'newer_alice')")
         .await
         .unwrap()
@@ -1654,13 +1655,13 @@ async fn test_pk_first_row_insert_overwrite() {
 #[tokio::test]
 async fn test_postpone_write_invisible_to_select() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_postpone (
                 id INT NOT NULL, value INT,
@@ -1671,7 +1672,7 @@ async fn test_postpone_write_invisible_to_select() {
         .unwrap();
 
     // Write data
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_postpone VALUES (1, 10), (2, 20), (3, 30)")
         .await
         .unwrap()
@@ -1695,7 +1696,7 @@ async fn test_postpone_write_invisible_to_select() {
     assert_eq!(file_count, 1, "scan_all_files should find 1 postpone file");
 
     // Normal SELECT should return 0 rows (postpone files are invisible)
-    let count = row_count(&handler, "SELECT * FROM paimon.test_db.t_postpone").await;
+    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t_postpone").await;
     assert_eq!(count, 0, "SELECT should return 0 rows for postpone table");
 }
 
@@ -1703,13 +1704,13 @@ async fn test_postpone_write_invisible_to_select() {
 #[tokio::test]
 async fn test_postpone_insert_overwrite() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    handler
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_postpone_ow (
                 id INT NOT NULL, value INT,
@@ -1720,7 +1721,7 @@ async fn test_postpone_insert_overwrite() {
         .unwrap();
 
     // First commit
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_postpone_ow VALUES (1, 10), (2, 20)")
         .await
         .unwrap()
@@ -1743,7 +1744,7 @@ async fn test_postpone_insert_overwrite() {
     assert_eq!(file_count, 1, "After INSERT: 1 postpone file");
 
     // INSERT OVERWRITE should replace old file
-    handler
+    sql_context
         .sql("INSERT OVERWRITE paimon.test_db.t_postpone_ow VALUES (3, 30)")
         .await
         .unwrap()
@@ -1777,9 +1778,9 @@ async fn test_postpone_insert_overwrite() {
 /// `trimmed_primary_keys()`, causing bucket pruning to target the wrong bucket.
 #[tokio::test]
 async fn test_pk_partitioned_fixed_bucket_predicate_query() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_bk_pred (
                 pt STRING, id INT NOT NULL, value INT,
@@ -1790,7 +1791,7 @@ async fn test_pk_partitioned_fixed_bucket_predicate_query() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_bk_pred VALUES \
              ('a', 1, 10), ('a', 2, 20), ('b', 3, 30), ('b', 4, 40)",
@@ -1803,14 +1804,14 @@ async fn test_pk_partitioned_fixed_bucket_predicate_query() {
 
     // Query with both partition and PK columns in predicate
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_bk_pred WHERE pt = 'a' AND id = 1",
     )
     .await;
     assert_eq!(rows, vec![(1, 10)], "Predicate query must find the row");
 
     let rows = collect_id_value(
-        &handler,
+        &sql_context,
         "SELECT id, value FROM paimon.test_db.t_bk_pred WHERE pt = 'b' AND id = 4",
     )
     .await;
@@ -1826,9 +1827,9 @@ async fn test_pk_partitioned_fixed_bucket_predicate_query() {
 /// on compaction to produce higher-level files).
 #[tokio::test]
 async fn test_pk_dv_deduplicate_read_no_error() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dv_dedup (
                 id INT NOT NULL, value INT,
@@ -1838,7 +1839,7 @@ async fn test_pk_dv_deduplicate_read_no_error() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dv_dedup VALUES (1, 10), (2, 20)")
         .await
         .unwrap()
@@ -1847,7 +1848,7 @@ async fn test_pk_dv_deduplicate_read_no_error() {
         .unwrap();
 
     // Second commit with overlapping key — creates level-0 files
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_dv_dedup VALUES (2, 200), (3, 30)")
         .await
         .unwrap()
@@ -1860,7 +1861,7 @@ async fn test_pk_dv_deduplicate_read_no_error() {
     // and get skipped — count may be 0, but the read must succeed without error.
     // Before the fix, this would hard-fail with "KeyValueFileReader does not
     // support deletion vectors".
-    let result = handler
+    let result = sql_context
         .sql("SELECT * FROM paimon.test_db.t_dv_dedup")
         .await
         .unwrap()

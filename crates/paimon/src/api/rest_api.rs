@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use crate::api::rest_client::HttpClient;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
-use crate::spec::{PartitionStatistics, Schema, Snapshot};
+use crate::spec::{Partition, PartitionStatistics, Schema, Snapshot};
 use crate::Result;
 
 use super::api_request::{
@@ -33,7 +33,7 @@ use super::api_request::{
 };
 use super::api_response::{
     ConfigResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListTablesResponse, PagedList,
+    ListPartitionsResponse, ListTablesResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::resource_paths::ResourcePaths;
@@ -374,6 +374,64 @@ impl RESTApi {
         let path = self.resource_paths.table(database, table);
         let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== Partition Operations ====================
+
+    /// List all partitions of a table, paging internally.
+    pub async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+
+        let mut results = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let paged = self
+                .list_partitions_paged(identifier, None, page_token.as_deref())
+                .await?;
+            let is_empty = paged.elements.is_empty();
+            results.extend(paged.elements);
+            page_token = paged.next_page_token;
+            if page_token.is_none() || is_empty {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// List partitions with pagination.
+    pub async fn list_partitions_paged(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+    ) -> Result<PagedList<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.partitions(database, table);
+        let mut params: Vec<(&str, String)> = Vec::new();
+
+        if let Some(max) = max_results {
+            params.push((Self::MAX_RESULTS, max.to_string()));
+        }
+        if let Some(token) = page_token {
+            params.push((Self::PAGE_TOKEN, token.to_string()));
+        }
+
+        let response: ListPartitionsResponse = if params.is_empty() {
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
+        } else {
+            self.client.get(&path, Some(&params)).await?
+        };
+
+        Ok(PagedList::new(
+            response.partitions.unwrap_or_default(),
+            response.next_page_token,
+        ))
     }
 
     // ==================== Token Operations ====================

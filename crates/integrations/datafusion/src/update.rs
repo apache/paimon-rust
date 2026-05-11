@@ -37,16 +37,13 @@ use crate::error::to_datafusion_error;
 use crate::merge_into::{
     build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
     is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
-    register_cow_target_table, retry_on_conflict,
+    register_cow_target_table, retry_on_conflict, TempTableTracker,
 };
+use crate::sql_context::SQLContext;
 
 /// Execute an UPDATE statement on a Paimon table.
-///
-/// Dispatches to the appropriate execution path based on table type:
-/// - Data evolution tables → partial-column writes via `DataEvolutionWriter`
-/// - Append-only tables (no PK) → copy-on-write file rewriting via `CopyOnWriteMergeWriter`
 pub(crate) async fn execute_update(
-    ctx: &SessionContext,
+    ctx: &SQLContext,
     update: &Update,
     table: Table,
 ) -> DFResult<DataFrame> {
@@ -77,7 +74,7 @@ pub(crate) async fn execute_update(
 
 /// Execute UPDATE on a data evolution table with retry on row ID conflict.
 async fn execute_data_evolution_update(
-    ctx: &SessionContext,
+    ctx: &SQLContext,
     update: &Update,
     table: Table,
 ) -> DFResult<DataFrame> {
@@ -89,7 +86,7 @@ async fn execute_data_evolution_update(
 
 /// Single attempt of UPDATE execution.
 async fn execute_update_once(
-    ctx: &SessionContext,
+    ctx: &SQLContext,
     update: &Update,
     table: &Table,
 ) -> DFResult<DataFrame> {
@@ -137,12 +134,12 @@ async fn execute_update_once(
     };
 
     let query_sql = format!("SELECT {select_clause} FROM {table_ref}{where_clause}");
-    let batches = ctx.sql(&query_sql).await?.collect().await?;
+    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     // 4. Project update columns (rename __upd_X → X)
     let total_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
     if total_count == 0 {
-        return ok_result(ctx, 0);
+        return ok_result(ctx.ctx(), 0);
     }
 
     let update_batches = project_update_columns(&batches, &columns)?;
@@ -159,7 +156,7 @@ async fn execute_update_once(
         commit.commit(messages).await.map_err(to_datafusion_error)?;
     }
 
-    ok_result(ctx, total_count)
+    ok_result(ctx.ctx(), total_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +165,7 @@ async fn execute_update_once(
 
 /// Execute UPDATE on an append-only table with retry on delete conflict.
 async fn execute_cow_update(
-    ctx: &SessionContext,
+    ctx: &SQLContext,
     update: &Update,
     table: &Table,
 ) -> DFResult<DataFrame> {
@@ -180,7 +177,7 @@ async fn execute_cow_update(
 
 /// Single attempt of CoW UPDATE execution.
 async fn execute_cow_update_once(
-    ctx: &SessionContext,
+    ctx: &SQLContext,
     update: &Update,
     table: &Table,
 ) -> DFResult<DataFrame> {
@@ -195,21 +192,23 @@ async fn execute_cow_update_once(
         .await
         .map_err(to_datafusion_error)?;
 
-    let (has_data, cow_table_guard) = register_cow_target_table(ctx, table, &writer).await?;
+    let mut temp_tracker = TempTableTracker::new(ctx);
+    let (has_data, cow_table_name) =
+        register_cow_target_table(ctx, table, &writer, &mut temp_tracker).await?;
     if !has_data {
-        return ok_result(ctx, 0);
+        return ok_result(ctx.ctx(), 0);
     }
 
+    let cow_target_name = cow_table_name;
     let result = execute_cow_update_inner(
-        ctx,
+        ctx.ctx(),
         &columns,
         &exprs,
-        cow_table_guard.name(),
+        &cow_target_name,
         update,
         &mut writer,
     )
     .await;
-    drop(cow_table_guard);
     let total_count = result?;
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
@@ -218,7 +217,7 @@ async fn execute_cow_update_once(
         commit.commit(messages).await.map_err(to_datafusion_error)?;
     }
 
-    ok_result(ctx, total_count)
+    ok_result(ctx.ctx(), total_count)
 }
 
 async fn execute_cow_update_inner(
@@ -326,7 +325,6 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{Int32Array, StringArray, UInt64Array};
-    use datafusion::prelude::SessionContext;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use paimon::catalog::{Catalog, Identifier};
@@ -335,33 +333,37 @@ mod tests {
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
-    use crate::{PaimonSqlHandler, PaimonTableProvider};
-
-    async fn setup_handler() -> (TempDir, PaimonSqlHandler, Arc<FileSystemCatalog>) {
+    async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse = format!("file://{}", temp_dir.path().display());
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler =
-            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
-        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+        let mut sql_context = SQLContext::new();
+        sql_context
+            .register_catalog("paimon", catalog.clone())
+            .await
+            .unwrap();
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
 
-        (temp_dir, handler, catalog)
+        (temp_dir, sql_context, catalog)
     }
 
-    async fn setup_data_evolution_table(name: &str) -> (TempDir, SessionContext, Table) {
-        let (tmp, handler, catalog) = setup_handler().await;
+    async fn setup_data_evolution_table(name: &str) -> (TempDir, SQLContext, Table) {
+        let (tmp, sql_context, catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
-                "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true')"
+                "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT) WITH ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -375,17 +377,8 @@ mod tests {
             .get_table(&Identifier::new("test_db", name))
             .await
             .unwrap();
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("data-evolution.enabled".to_string(), "true".to_string());
-        extra.insert("row-tracking.enabled".to_string(), "true".to_string());
-        let de_table = table.copy_with_options(extra);
 
-        // Register the data-evolution table under a simple name so _ROW_ID is visible
-        let ctx = handler.ctx().clone();
-        let provider = PaimonTableProvider::try_new(de_table.clone()).unwrap();
-        ctx.register_table("target", Arc::new(provider)).unwrap();
-
-        (tmp, ctx, de_table)
+        (tmp, sql_context, table)
     }
 
     fn parse_update(sql: &str) -> Update {
@@ -424,13 +417,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_with_where() {
-        let (_tmp, ctx, table) = setup_data_evolution_table("t_with_where").await;
+        let (_tmp, sql_context, table) = setup_data_evolution_table("t_with_where").await;
 
-        let update = parse_update("UPDATE target SET name = 'ALICE' WHERE id = 1");
-        execute_update(&ctx, &update, table).await.unwrap();
+        let update =
+            parse_update("UPDATE paimon.test_db.t_with_where SET name = 'ALICE' WHERE id = 1");
+        execute_update(&sql_context, &update, table).await.unwrap();
 
-        let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+        let batches = sql_context
+            .sql("SELECT id, name, value FROM paimon.test_db.t_with_where ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -450,13 +444,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_without_where() {
-        let (_tmp, ctx, table) = setup_data_evolution_table("t_without_where").await;
+        let (_tmp, sql_context, table) = setup_data_evolution_table("t_without_where").await;
 
-        let update = parse_update("UPDATE target SET value = 99");
-        execute_update(&ctx, &update, table).await.unwrap();
+        let update = parse_update("UPDATE paimon.test_db.t_without_where SET value = 99");
+        execute_update(&sql_context, &update, table).await.unwrap();
 
-        let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+        let batches = sql_context
+            .sql("SELECT id, name, value FROM paimon.test_db.t_without_where ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -476,13 +470,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_multiple_columns() {
-        let (_tmp, ctx, table) = setup_data_evolution_table("t_multi_col").await;
+        let (_tmp, sql_context, table) = setup_data_evolution_table("t_multi_col").await;
 
-        let update = parse_update("UPDATE target SET name = 'updated', value = 0 WHERE id = 2");
-        execute_update(&ctx, &update, table).await.unwrap();
+        let update = parse_update(
+            "UPDATE paimon.test_db.t_multi_col SET name = 'updated', value = 0 WHERE id = 2",
+        );
+        execute_update(&sql_context, &update, table).await.unwrap();
 
-        let batches = ctx
-            .sql("SELECT id, name, value FROM target ORDER BY id")
+        let batches = sql_context
+            .sql("SELECT id, name, value FROM paimon.test_db.t_multi_col ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -502,10 +498,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_no_matching_rows() {
-        let (_tmp, ctx, table) = setup_data_evolution_table("t_no_match").await;
+        let (_tmp, sql_context, table) = setup_data_evolution_table("t_no_match").await;
 
-        let update = parse_update("UPDATE target SET name = 'nobody' WHERE id = 99");
-        let result = execute_update(&ctx, &update, table).await.unwrap();
+        let update =
+            parse_update("UPDATE paimon.test_db.t_no_match SET name = 'nobody' WHERE id = 99");
+        let result = execute_update(&sql_context, &update, table).await.unwrap();
         let batches = result.collect().await.unwrap();
         let count = batches[0]
             .column(0)
@@ -518,23 +515,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_row_id_stability() {
-        let (_tmp, ctx, table) = setup_data_evolution_table("t_row_id").await;
+        let (_tmp, sql_context, table) = setup_data_evolution_table("t_row_id").await;
 
         // Get row IDs before update
-        let before = ctx
-            .sql("SELECT id, \"_ROW_ID\" FROM target ORDER BY id")
+        let before = sql_context
+            .sql("SELECT id, \"_ROW_ID\" FROM paimon.test_db.t_row_id ORDER BY id")
             .await
             .unwrap()
             .collect()
             .await
             .unwrap();
 
-        let update = parse_update("UPDATE target SET name = 'ALICE' WHERE id = 1");
-        execute_update(&ctx, &update, table).await.unwrap();
+        let update = parse_update("UPDATE paimon.test_db.t_row_id SET name = 'ALICE' WHERE id = 1");
+        execute_update(&sql_context, &update, table).await.unwrap();
 
         // Get row IDs after update
-        let after = ctx
-            .sql("SELECT id, \"_ROW_ID\" FROM target ORDER BY id")
+        let after = sql_context
+            .sql("SELECT id, \"_ROW_ID\" FROM paimon.test_db.t_row_id ORDER BY id")
             .await
             .unwrap()
             .collect()
@@ -573,9 +570,9 @@ mod tests {
             None,
         );
 
-        let ctx = SessionContext::new();
+        let sql_context = SQLContext::new();
         let update = parse_update("UPDATE t SET id = 1");
-        let result = execute_update(&ctx, &update, table).await;
+        let result = execute_update(&sql_context, &update, table).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -587,17 +584,17 @@ mod tests {
     // CoW UPDATE tests (append-only tables)
     // -----------------------------------------------------------------------
 
-    async fn setup_append_only_table(name: &str) -> (TempDir, PaimonSqlHandler) {
-        let (tmp, handler, _catalog) = setup_handler().await;
+    async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext) {
+        let (tmp, sql_context, _catalog) = setup_sql_context().await;
 
-        handler
+        sql_context
             .sql(&format!(
                 "CREATE TABLE paimon.test_db.{name} (id INT, name VARCHAR, value INT)"
             ))
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql(&format!(
                 "INSERT INTO paimon.test_db.{name} (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)"
             ))
@@ -607,11 +604,11 @@ mod tests {
             .await
             .unwrap();
 
-        (tmp, handler)
+        (tmp, sql_context)
     }
 
-    async fn query_rows(handler: &PaimonSqlHandler, table: &str) -> Vec<(i32, String, i32)> {
-        let batches = handler
+    async fn query_rows(sql_context: &SQLContext, table: &str) -> Vec<(i32, String, i32)> {
+        let batches = sql_context
             .sql(&format!("SELECT id, name, value FROM {table} ORDER BY id"))
             .await
             .unwrap()
@@ -623,14 +620,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_with_where() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_where").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_where").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_where SET name = 'ALICE' WHERE id = 1")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_where").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_where").await;
         assert_eq!(
             rows,
             vec![
@@ -643,14 +640,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_without_where() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_no_where").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_no_where").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_no_where SET value = 99")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_no_where").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_no_where").await;
         assert_eq!(
             rows,
             vec![
@@ -663,14 +660,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_multiple_columns() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_multi").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_multi").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_multi SET name = 'updated', value = 0 WHERE id = 2")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_multi").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_multi").await;
         assert_eq!(
             rows,
             vec![
@@ -683,9 +680,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_no_matching_rows() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_nomatch").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_nomatch").await;
 
-        let result = handler
+        let result = sql_context
             .sql("UPDATE paimon.test_db.t_cow_nomatch SET name = 'nobody' WHERE id = 99")
             .await
             .unwrap()
@@ -703,14 +700,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cow_update_expression() {
-        let (_tmp, handler) = setup_append_only_table("t_cow_expr").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_cow_expr").await;
 
-        handler
+        sql_context
             .sql("UPDATE paimon.test_db.t_cow_expr SET value = value + 100 WHERE id >= 2")
             .await
             .unwrap();
 
-        let rows = query_rows(&handler, "paimon.test_db.t_cow_expr").await;
+        let rows = query_rows(&sql_context, "paimon.test_db.t_cow_expr").await;
         assert_eq!(
             rows,
             vec![

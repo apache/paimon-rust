@@ -31,8 +31,49 @@ If you want to use the native Python DataFusion `SessionContext`, install `dataf
 
 ## Query Paimon Tables with DataFusion
 
-`pypaimon-rust` provides a `PaimonCatalog` that can be registered into the native DataFusion `SessionContext`.
-This keeps the standard DataFusion Python API available for regular queries.
+The recommended way to query Paimon tables is through `SQLContext`, which supports
+multi-catalog registration, DDL, DML, and all Paimon-specific SQL extensions:
+
+```python
+from pypaimon_rust.datafusion import SQLContext
+
+ctx = SQLContext()
+ctx.register_catalog("paimon", {
+    "warehouse": "/path/to/warehouse",
+})
+
+# DDL
+ctx.sql("CREATE SCHEMA paimon.my_db")
+ctx.sql("CREATE TABLE paimon.my_db.users (id INT, name STRING, PRIMARY KEY (id))")
+
+# DML
+ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
+
+# Query tables via SQL (catalog.database.table)
+batches = ctx.sql("SELECT * FROM paimon.my_db.users")
+```
+
+### Temporary Tables
+
+You can register temporary in-memory tables programmatically. Names support the same resolution rules as SQL: bare names use the current catalog and database, partially qualified names use the current catalog, and fully qualified names specify catalog.database.table.
+
+Register a single PyArrow RecordBatch as a temporary table:
+
+```python
+import pyarrow as pa
+
+batch = pa.record_batch([[1, 2], ["alice", "bob"]], names=["id", "name"])
+
+ctx.register_batch("paimon.default.my_temp", batch)
+
+batches = ctx.sql("SELECT * FROM paimon.default.my_temp")
+
+# Drop it via SQL when no longer needed
+ctx.sql("DROP TEMPORARY TABLE paimon.default.my_temp")
+```
+
+Alternatively, if you want to use the native Python DataFusion `SessionContext`,
+install `datafusion` and register a `PaimonCatalog`:
 
 ```python
 from datafusion import SessionContext

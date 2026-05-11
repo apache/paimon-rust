@@ -94,7 +94,9 @@ impl TableProvider for TagsTable {
             self.table.file_io().clone(),
             self.table.location().to_string(),
         );
-        let tags = tm.list_all().await.map_err(to_datafusion_error)?;
+        let tags = crate::runtime::await_with_runtime(async move { tm.list_all().await })
+            .await
+            .map_err(to_datafusion_error)?;
 
         let n = tags.len();
         let mut tag_names: Vec<String> = Vec::with_capacity(n);

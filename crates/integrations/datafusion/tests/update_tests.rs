@@ -21,55 +21,61 @@
 
 mod common;
 
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
-use common::{create_handler, create_test_env, dml_count, exec, query_int_str_int};
+use common::{create_sql_context, create_test_env, dml_count, exec, query_int_str_int};
 
 // ======================= Helpers =======================
 
-async fn setup() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40)",
     )
     .await;
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
-async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_partitioned() -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) PARTITIONED BY (pt)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.t VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', 2)",
     )
     .await;
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
-async fn query(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
+async fn query(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
-        handler,
+        sql_context,
         "SELECT id, name, age FROM paimon.test_db.t ORDER BY id",
     )
     .await
 }
 
-async fn query_pt(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
+async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
     query_int_str_int(
-        handler,
+        sql_context,
         "SELECT id, name, pt FROM paimon.test_db.t ORDER BY id",
     )
     .await
@@ -79,16 +85,16 @@ async fn query_pt(handler: &PaimonSqlHandler) -> Vec<(i32, String, i32)> {
 
 #[tokio::test]
 async fn test_update_with_where() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'a_new' WHERE id = 1",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a_new".into(), 10),
             (2, "b".into(), 20),
@@ -100,16 +106,16 @@ async fn test_update_with_where() {
 
 #[tokio::test]
 async fn test_update_with_expression() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET age = age + 1 WHERE id = 1",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 11),
             (2, "b".into(), 20),
@@ -121,17 +127,17 @@ async fn test_update_with_expression() {
 
 #[tokio::test]
 async fn test_update_no_match_empty_commit() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     let cnt = dml_count(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE id = 99",
     )
     .await;
     assert_eq!(cnt, 0);
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (2, "b".into(), 20),
@@ -143,12 +149,12 @@ async fn test_update_no_match_empty_commit() {
 
 #[tokio::test]
 async fn test_update_without_where() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "UPDATE paimon.test_db.t SET age = 0").await;
+    exec(&sql_context, "UPDATE paimon.test_db.t SET age = 0").await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 0),
             (2, "b".into(), 0),
@@ -162,16 +168,16 @@ async fn test_update_without_where() {
 
 #[tokio::test]
 async fn test_update_partitioned_by_non_partition_column() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE id = 1",
     )
     .await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![
             (1, "x".into(), 1),
             (2, "b".into(), 1),
@@ -183,16 +189,16 @@ async fn test_update_partitioned_by_non_partition_column() {
 
 #[tokio::test]
 async fn test_update_partitioned_by_partition_column() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE pt = 1",
     )
     .await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![
             (1, "x".into(), 1),
             (2, "x".into(), 1),
@@ -204,16 +210,16 @@ async fn test_update_partitioned_by_partition_column() {
 
 #[tokio::test]
 async fn test_update_partitioned_by_both_columns() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE pt = 2 AND id = 3",
     )
     .await;
 
     assert_eq!(
-        query_pt(&handler).await,
+        query_pt(&sql_context).await,
         vec![
             (1, "a".into(), 1),
             (2, "b".into(), 1),
@@ -227,16 +233,16 @@ async fn test_update_partitioned_by_both_columns() {
 
 #[tokio::test]
 async fn test_update_in_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE id IN (1, 3)",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "x".into(), 10),
             (2, "b".into(), 20),
@@ -248,16 +254,16 @@ async fn test_update_in_condition() {
 
 #[tokio::test]
 async fn test_update_not_in_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE id NOT IN (1, 3)",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (2, "x".into(), 20),
@@ -271,16 +277,16 @@ async fn test_update_not_in_condition() {
 
 #[tokio::test]
 async fn test_update_cross_column_reference() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET age = id * 100 WHERE id <= 2",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 100),
             (2, "b".into(), 200),
@@ -292,16 +298,16 @@ async fn test_update_cross_column_reference() {
 
 #[tokio::test]
 async fn test_update_multiple_columns_with_expressions() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'updated', age = age + id WHERE id >= 3",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (2, "b".into(), 20),
@@ -315,17 +321,21 @@ async fn test_update_multiple_columns_with_expressions() {
 
 #[tokio::test]
 async fn test_successive_updates() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
-    exec(&handler, "UPDATE paimon.test_db.t SET age = 0 WHERE id = 1").await;
     exec(
-        &handler,
+        &sql_context,
+        "UPDATE paimon.test_db.t SET age = 0 WHERE id = 1",
+    )
+    .await;
+    exec(
+        &sql_context,
         "UPDATE paimon.test_db.t SET age = 99 WHERE id = 1",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 99),
             (2, "b".into(), 20),
@@ -339,16 +349,16 @@ async fn test_successive_updates() {
 
 #[tokio::test]
 async fn test_update_or_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET name = 'x' WHERE id = 1 OR id = 4",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "x".into(), 10),
             (2, "b".into(), 20),
@@ -362,16 +372,16 @@ async fn test_update_or_condition() {
 
 #[tokio::test]
 async fn test_update_range_condition() {
-    let (_tmp, handler) = setup().await;
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET age = 0 WHERE id >= 2 AND id <= 3",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "a".into(), 10),
             (2, "b".into(), 0),
@@ -385,25 +395,22 @@ async fn test_update_range_condition() {
 
 #[tokio::test]
 async fn test_update_in_subquery() {
-    let (_tmp, handler) = setup().await;
-
-    handler
-        .ctx()
-        .sql("CREATE TABLE src (id INT) AS VALUES (1), (3)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let (_tmp, sql_context) = setup().await;
 
     exec(
-        &handler,
-        "UPDATE paimon.test_db.t SET name = 'sub' WHERE id IN (SELECT id FROM src)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1), (3)) AS t(id)",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "UPDATE paimon.test_db.t SET name = 'sub' WHERE id IN (SELECT id FROM paimon.test_db.src)",
     )
     .await;
 
     assert_eq!(
-        query(&handler).await,
+        query(&sql_context).await,
         vec![
             (1, "sub".into(), 10),
             (2, "b".into(), 20),
@@ -418,13 +425,16 @@ async fn test_update_in_subquery() {
 #[tokio::test]
 async fn test_update_with_null_values() {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.t VALUES (1, 'a', 10), (2, NULL, 20), (3, 'c', NULL)")
         .await
         .unwrap()
@@ -433,12 +443,12 @@ async fn test_update_with_null_values() {
         .unwrap();
 
     exec(
-        &handler,
+        &sql_context,
         "UPDATE paimon.test_db.t SET age = 0 WHERE name = 'a'",
     )
     .await;
 
-    let rows = query(&handler).await;
+    let rows = query(&sql_context).await;
     assert_eq!(rows[0], (1, "a".into(), 0));
     assert_eq!(rows[1].0, 2);
     assert_eq!(rows[1].2, 20);
@@ -451,14 +461,17 @@ async fn test_update_with_null_values() {
 #[tokio::test]
 async fn test_update_empty_table() {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT)")
         .await
         .unwrap();
 
-    let cnt = dml_count(&handler, "UPDATE paimon.test_db.t SET name = 'x'").await;
+    let cnt = dml_count(&sql_context, "UPDATE paimon.test_db.t SET name = 'x'").await;
     assert_eq!(cnt, 0);
     drop(tmp);
 }

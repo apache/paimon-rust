@@ -17,7 +17,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# DataFusion Integration
+# SQL Integration
 
 [Apache DataFusion](https://datafusion.apache.org/) is a fast, extensible query engine for building data-centric systems in Rust. The `paimon-datafusion` crate provides a full SQL integration that lets you create, query, and modify Paimon tables.
 
@@ -37,24 +37,23 @@ Register an entire Paimon catalog so all databases and tables are accessible via
 
 ```rust
 use std::sync::Arc;
-use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
-    let ctx = SessionContext::new();
-    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
-    let df = handler.sql("SELECT * FROM paimon.default.my_table").await?;
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)?;
+    let df = ctx.sql("SELECT * FROM paimon.default.my_table").await?;
     df.show().await?;
     Ok(())
 }
 ```
 
-`PaimonSqlHandler::new` automatically registers the Paimon catalog provider and relation planner on the session context. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -153,6 +152,52 @@ CREATE TABLE paimon.my_db.complex_types (
 
 ```sql
 DROP TABLE paimon.my_db.users;
+DROP TABLE IF EXISTS paimon.my_db.users;
+```
+
+### CREATE TEMPORARY TABLE
+
+Create an in-memory temporary table from a query result. Temporary tables exist only for the lifetime of the `SQLContext` instance and are automatically cleaned up when the context is dropped.
+
+```sql
+-- Without column types (types inferred from the query)
+CREATE TEMPORARY TABLE paimon.my_db.source AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+
+-- With explicit column types (recommended when integer precision matters)
+CREATE TEMPORARY TABLE paimon.my_db.source (id INT, name STRING) AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+```
+
+`IF NOT EXISTS` is supported — if the table already exists, the statement is silently ignored:
+
+```sql
+CREATE TEMPORARY TABLE IF NOT EXISTS paimon.my_db.source AS SELECT 1;
+```
+
+> **Note:** When using `VALUES` without explicit column types, DataFusion infers integer literals as `Int64`. If the temporary table will be used as a source in `MERGE INTO` against a Paimon table with `Int32` columns, specify the column types explicitly to avoid type mismatch errors.
+
+### CREATE TEMPORARY VIEW
+
+Create a temporary view from a query:
+
+```sql
+CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+`IF NOT EXISTS` is supported:
+
+```sql
+CREATE TEMPORARY VIEW IF NOT EXISTS paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+### DROP TEMPORARY TABLE / DROP TEMPORARY VIEW
+
+Remove a temporary table or view:
+
+```sql
+DROP TEMPORARY TABLE paimon.my_db.source;
+DROP TEMPORARY TABLE IF EXISTS paimon.my_db.source;
+DROP TEMPORARY VIEW paimon.my_db.active_users;
+DROP TEMPORARY VIEW IF EXISTS paimon.my_db.active_users;
 ```
 
 ### ALTER TABLE
@@ -504,12 +549,10 @@ SELECT * FROM paimon.default.my_table VERSION AS OF 1;
 
 ### By Tag Name
 
-`VERSION AS OF` in SQL only accepts numeric values. Tag-based time travel is done via the `scan.version` table option:
+Use a quoted tag name with `VERSION AS OF`:
 
-```rust
-let table = table.copy_with_options(HashMap::from([
-    ("scan.version".to_string(), "my_tag".to_string()),
-]));
+```sql
+SELECT * FROM paimon.default.my_table VERSION AS OF 'my_tag';
 ```
 
 Resolution order: first checks if a tag with that name exists, then tries to parse it as a snapshot ID.
@@ -523,21 +566,6 @@ SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00';
 ```
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
-
-### Enabling Time Travel Syntax
-
-DataFusion requires the Databricks SQL dialect to parse `VERSION AS OF` and `TIMESTAMP AS OF`:
-
-```rust
-use datafusion::prelude::{SessionConfig, SessionContext};
-
-let config = SessionConfig::new()
-    .set_str("datafusion.sql_parser.dialect", "Databricks");
-let ctx = SessionContext::new_with_config(config);
-
-ctx.register_catalog("paimon", Arc::new(PaimonCatalogProvider::new(catalog)));
-ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))?;
-```
 
 ## Dynamic Options (SET / RESET)
 
@@ -559,6 +587,85 @@ Example — enable BLOB descriptor mode:
 SET 'paimon.blob-as-descriptor' = 'true';
 SELECT * FROM paimon.my_db.assets;
 RESET 'paimon.blob-as-descriptor';
+```
+
+## Temporary Tables
+
+You can register in-memory temporary tables under any catalog. Temporary tables exist only for the lifetime of the `SQLContext` instance and are automatically cleaned up when the context is dropped.
+
+The table name accepts flexible references, similar to DataFusion:
+- `"my_table"` — uses the current catalog and current database
+- `"database.my_table"` — uses the current catalog with the specified database
+- `"catalog.database.my_table"` — fully qualified
+
+### register_temp_table
+
+Register any `Arc<dyn TableProvider>` as a temporary table (including `MemTable`, `ViewTable`, custom providers, etc.):
+
+```rust
+use datafusion::arrow::array::Int32Array;
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+
+let schema = Arc::new(Schema::new(vec![
+    Field::new("id", ArrowDataType::Int32, false),
+    Field::new("name", ArrowDataType::Utf8, true),
+]));
+let batch = RecordBatch::try_new(
+    schema.clone(),
+    vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3])),
+        Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+    ],
+)?;
+
+// Register a MemTable as a temp table
+let mem_table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]])?);
+ctx.register_temp_table("paimon.my_db.users", mem_table)?;
+let df = ctx.sql("SELECT * FROM paimon.my_db.users WHERE id > 1").await?;
+df.show().await?;
+
+// Register a ViewTable as a temp table
+use datafusion::datasource::ViewTable;
+let view_table = Arc::new(ViewTable::new(logical_plan, Some(query_sql)));
+ctx.register_temp_table("paimon.my_db.my_view", view_table)?;
+```
+
+### CREATE TEMPORARY TABLE
+
+You can also create temporary tables directly from SQL. See the [DDL section](#create-temporary-table) for details.
+
+```sql
+CREATE TEMPORARY TABLE paimon.my_db.source (id INT, name STRING) AS SELECT * FROM (VALUES (1, 'alice'), (2, 'bob')) AS t(id, name);
+```
+
+### CREATE TEMPORARY VIEW
+
+Create a temporary view directly from SQL. See the [DDL section](#create-temporary-view) for details.
+
+```sql
+CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.users WHERE id > 0;
+```
+
+### Deregister
+
+Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table--drop-temporary-view)):
+
+```rust
+ctx.deregister_temp_table("paimon.my_db.users")?;
+```
+
+Multiple temporary tables can share the same database — the database is created automatically on first use:
+
+```rust
+let mem_a = Arc::new(MemTable::try_new(schema_a, vec![vec![batch_a]])?);
+let mem_b = Arc::new(MemTable::try_new(schema_b, vec![vec![batch_b]])?);
+ctx.register_temp_table("my_db.table_a", mem_a)?;
+ctx.register_temp_table("my_db.table_b", mem_b)?;
+
+// Join two temp tables
+let df = ctx.sql("SELECT * FROM paimon.my_db.table_a JOIN paimon.my_db.table_b ON a.id = b.id").await?;
 ```
 
 ## System Tables
@@ -659,8 +766,8 @@ Columns:
 | `num_added_files` | BIGINT | Number of added data files |
 | `num_deleted_files` | BIGINT | Number of deleted data files |
 | `schema_id` | BIGINT | Schema ID |
-| `min_partition_stats` | STRING | Min partition values |
-| `max_partition_stats` | STRING | Max partition values |
+| `min_partition_stats` | STRING | Minimum partition stats, formatted as a Java row cast string |
+| `max_partition_stats` | STRING | Maximum partition stats, formatted as a Java row cast string |
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
 
@@ -706,9 +813,8 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 
 ```rust
 use std::sync::Arc;
-use datafusion::prelude::SessionContext;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -717,13 +823,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     options.set(CatalogOptions::WAREHOUSE, "file:///tmp/paimon-warehouse");
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
-    // Create handler (registers catalog provider and relation planner automatically)
-    let ctx = SessionContext::new();
-    let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
+    // Create SQL context and register catalog
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)?;
 
     // Create database and table
-    handler.sql("CREATE SCHEMA paimon.my_db").await?;
-    handler.sql(
+    ctx.sql("CREATE SCHEMA paimon.my_db").await?;
+    ctx.sql(
         "CREATE TABLE paimon.my_db.users (
             id INT NOT NULL,
             name STRING,
@@ -732,11 +838,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
 
     // Insert data
-    handler.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
+    ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
         .await?.collect().await?;
 
     // Query
-    let df = handler.sql("SELECT * FROM paimon.my_db.users ORDER BY id").await?;
+    let df = ctx.sql("SELECT * FROM paimon.my_db.users ORDER BY id").await?;
     df.show().await?;
 
     Ok(())

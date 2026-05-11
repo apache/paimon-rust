@@ -23,10 +23,10 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::{displayable, ExecutionPlan};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionConfig;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonRelationPlanner, PaimonTableProvider};
+use paimon_datafusion::{PaimonCatalogProvider, PaimonTableProvider, SQLContext};
 
 fn get_test_warehouse() -> String {
     std::env::var("PAIMON_TEST_WAREHOUSE").unwrap_or_else(|_| "/tmp/paimon-warehouse".to_string())
@@ -39,12 +39,13 @@ fn create_catalog() -> FileSystemCatalog {
     FileSystemCatalog::new(options).expect("Failed to create catalog")
 }
 
-async fn create_context(table_name: &str) -> SessionContext {
-    let provider = create_provider(table_name).await;
-    let ctx = SessionContext::new();
-    ctx.register_table(table_name, Arc::new(provider))
-        .expect("Failed to register table");
-
+async fn create_context() -> SQLContext {
+    let catalog = create_catalog();
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)
+        .await
+        .expect("Failed to register catalog");
     ctx
 }
 
@@ -75,7 +76,8 @@ async fn create_provider_with_options(
 }
 
 async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
-    let batches = collect_query(table_name, &format!("SELECT id, name FROM {table_name}"))
+    let sql = format!("SELECT id, name FROM paimon.default.{table_name}");
+    let batches = collect_query(&sql)
         .await
         .expect("Failed to collect query result");
 
@@ -90,19 +92,14 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
 }
 
 async fn collect_query(
-    table_name: &str,
     sql: &str,
 ) -> datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-    let ctx = create_context(table_name).await;
-
+    let ctx = create_context().await;
     ctx.sql(sql).await?.collect().await
 }
 
-async fn create_physical_plan(
-    table_name: &str,
-    sql: &str,
-) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-    let ctx = create_context(table_name).await;
+async fn create_physical_plan(sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let ctx = create_context().await;
     ctx.sql(sql).await?.create_physical_plan().await
 }
 
@@ -176,7 +173,7 @@ async fn test_read_primary_key_table_via_datafusion() {
 
 #[tokio::test]
 async fn test_projection_via_datafusion() {
-    let batches = collect_query("simple_log_table", "SELECT id FROM simple_log_table")
+    let batches = collect_query("SELECT id FROM paimon.default.simple_log_table")
         .await
         .expect("Subset projection should succeed");
 
@@ -242,7 +239,7 @@ async fn test_scan_partition_count_respects_session_config() {
 
     // With generous target_partitions, the plan should expose more than one partition.
     let config = SessionConfig::new().with_target_partitions(8);
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = datafusion::prelude::SessionContext::new_with_config(config);
     let state = ctx.state();
     let plan = provider
         .scan(&state, None, &[], None)
@@ -257,7 +254,7 @@ async fn test_scan_partition_count_respects_session_config() {
 
     // With target_partitions=1, all splits must be coalesced into a single partition
     let config_single = SessionConfig::new().with_target_partitions(1);
-    let ctx_single = SessionContext::new_with_config(config_single);
+    let ctx_single = datafusion::prelude::SessionContext::new_with_config(config_single);
     let state_single = ctx_single.state();
     let plan_single = provider
         .scan(&state_single, None, &[], None)
@@ -277,8 +274,7 @@ async fn test_scan_partition_count_respects_session_config() {
 #[tokio::test]
 async fn test_partition_filter_query_via_datafusion() {
     let batches = collect_query(
-        "partitioned_log_table",
-        "SELECT id, name FROM partitioned_log_table WHERE dt = '2024-01-01'",
+        "SELECT id, name FROM paimon.default.partitioned_log_table WHERE dt = '2024-01-01'",
     )
     .await
     .expect("Partition filter query should succeed");
@@ -294,8 +290,7 @@ async fn test_partition_filter_query_via_datafusion() {
 #[tokio::test]
 async fn test_multi_partition_filter_query_via_datafusion() {
     let batches = collect_query(
-        "multi_partitioned_log_table",
-        "SELECT id, name FROM multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr = 10",
+        "SELECT id, name FROM paimon.default.multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr = 10",
     )
     .await
     .expect("Multi-partition filter query should succeed");
@@ -311,8 +306,7 @@ async fn test_multi_partition_filter_query_via_datafusion() {
 #[tokio::test]
 async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
     let batches = collect_query(
-        "partitioned_log_table",
-        "SELECT id, name FROM partitioned_log_table WHERE dt = '2024-01-01' AND id > 1",
+        "SELECT id, name FROM paimon.default.partitioned_log_table WHERE dt = '2024-01-01' AND id > 1",
     )
     .await
     .expect("Mixed filter query should succeed");
@@ -324,8 +318,8 @@ async fn test_mixed_and_filter_keeps_residual_datafusion_filter() {
 
 #[tokio::test]
 async fn test_partially_translated_filter_keeps_partition_pruning_and_correctness() {
-    let sql = "SELECT id, name FROM multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr + 1 > 20 LIMIT 1";
-    let plan = create_physical_plan("multi_partitioned_log_table", sql)
+    let sql = "SELECT id, name FROM paimon.default.multi_partitioned_log_table WHERE dt = '2024-01-01' AND hr + 1 > 20 LIMIT 1";
+    let plan = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -346,7 +340,7 @@ async fn test_partially_translated_filter_keeps_partition_pruning_and_correctnes
         "Partially translated filters should not revive the removed fetch contract, plan:\n{plan_text}"
     );
 
-    let batches = collect_query("multi_partitioned_log_table", sql)
+    let batches = collect_query(sql)
         .await
         .expect("Partially translated filter + LIMIT query should succeed");
     let rows = extract_id_name_rows(&batches);
@@ -360,12 +354,9 @@ async fn test_partially_translated_filter_keeps_partition_pruning_and_correctnes
 
 #[tokio::test]
 async fn test_limit_pushdown_on_data_evolution_table_returns_merged_rows() {
-    let batches = collect_query(
-        "data_evolution_table",
-        "SELECT id, name FROM data_evolution_table LIMIT 3",
-    )
-    .await
-    .expect("Limit query on data evolution table should succeed");
+    let batches = collect_query("SELECT id, name FROM paimon.default.data_evolution_table LIMIT 3")
+        .await
+        .expect("Limit query on data evolution table should succeed");
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
@@ -389,8 +380,8 @@ async fn test_limit_pushdown_on_data_evolution_table_returns_merged_rows() {
 
 #[tokio::test]
 async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() {
-    let sql = "SELECT id, name FROM simple_log_table LIMIT 2";
-    let plan = create_physical_plan("simple_log_table", sql)
+    let sql = "SELECT id, name FROM paimon.default.simple_log_table LIMIT 2";
+    let plan = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -403,7 +394,7 @@ async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() 
         "Safe LIMIT query should push a scan limit hint into PaimonTableScan, plan:\n{plan_text}"
     );
 
-    let batches = collect_query("simple_log_table", sql)
+    let batches = collect_query(sql)
         .await
         .expect("LIMIT query should succeed");
     let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
@@ -412,8 +403,8 @@ async fn test_limit_pushdown_marks_safe_scan_limit_hint_and_keeps_correctness() 
 
 #[tokio::test]
 async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
-    let sql = "SELECT id, name FROM partitioned_log_table OFFSET 1 LIMIT 1";
-    let plan = create_physical_plan("partitioned_log_table", sql)
+    let sql = "SELECT id, name FROM paimon.default.partitioned_log_table OFFSET 1 LIMIT 1";
+    let plan = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -428,7 +419,7 @@ async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
         "OFFSET + LIMIT should not rely on the removed DataFusion fetch contract in PaimonTableScan, plan:\n{plan_text}"
     );
 
-    let batches = collect_query("partitioned_log_table", sql)
+    let batches = collect_query(sql)
         .await
         .expect("OFFSET + LIMIT query should succeed");
 
@@ -441,8 +432,8 @@ async fn test_offset_limit_pushdown_keeps_correctness_without_fetch_contract() {
 
 #[tokio::test]
 async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
-    let sql = "SELECT id, name FROM partitioned_log_table WHERE id > 1 LIMIT 1";
-    let plan = create_physical_plan("partitioned_log_table", sql)
+    let sql = "SELECT id, name FROM paimon.default.partitioned_log_table WHERE id > 1 LIMIT 1";
+    let plan = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -457,7 +448,7 @@ async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
         "Inexact filter queries should not revive the removed fetch contract, plan:\n{plan_text}"
     );
 
-    let batches = collect_query("partitioned_log_table", sql)
+    let batches = collect_query(sql)
         .await
         .expect("Inexact filter + LIMIT query should succeed");
     let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
@@ -469,8 +460,8 @@ async fn test_inexact_filter_limit_keeps_correctness_without_fetch_contract() {
 
 #[tokio::test]
 async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
-    let sql = "SELECT id, name FROM simple_log_table WHERE id + 1 > 3 LIMIT 1";
-    let plan = create_physical_plan("simple_log_table", sql)
+    let sql = "SELECT id, name FROM paimon.default.simple_log_table WHERE id + 1 > 3 LIMIT 1";
+    let plan = create_physical_plan(sql)
         .await
         .expect("Physical plan creation should succeed");
     let plan_text = format_physical_plan(&plan);
@@ -491,7 +482,7 @@ async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
         "Residual filter queries should not push a scan limit hint when residual filters stay above the scan, plan:\n{plan_text}"
     );
 
-    let batches = collect_query("simple_log_table", sql)
+    let batches = collect_query(sql)
         .await
         .expect("Residual filter + LIMIT query should succeed");
     let rows = extract_id_name_rows(&batches);
@@ -507,10 +498,11 @@ async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
 #[tokio::test]
 async fn test_query_via_catalog_provider() {
     let catalog = create_catalog();
-    let provider = PaimonCatalogProvider::new(Arc::new(catalog));
-
-    let ctx = SessionContext::new();
-    ctx.register_catalog("paimon", Arc::new(provider));
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)
+        .await
+        .expect("Failed to register catalog");
 
     let df = ctx
         .sql("SELECT id, name FROM paimon.default.simple_log_table")
@@ -535,18 +527,14 @@ async fn test_missing_database_returns_no_schema() {
 
 // ======================= Time Travel Tests =======================
 
-/// Helper: create a SessionContext with catalog + relation planner for time travel.
-/// Uses Databricks dialect to enable `VERSION AS OF` and `TIMESTAMP AS OF` syntax.
-async fn create_time_travel_context() -> SessionContext {
+/// Helper: create a SQLContext with catalog + relation planner for time travel.
+async fn create_time_travel_context() -> SQLContext {
     let catalog = create_catalog();
-    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Databricks");
-    let ctx = SessionContext::new_with_config(config);
-    ctx.register_catalog(
-        "paimon",
-        Arc::new(PaimonCatalogProvider::new(Arc::new(catalog))),
-    );
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog)
+        .await
+        .expect("Failed to register catalog");
     ctx
 }
 
@@ -596,21 +584,11 @@ async fn test_time_travel_by_snapshot_id() {
 
 #[tokio::test]
 async fn test_time_travel_by_tag_name() {
-    // Tag-based time travel uses `scan.version` option directly since
-    // `VERSION AS OF` in SQL only accepts numeric values.
-    let provider = create_provider_with_options(
-        "time_travel_table",
-        HashMap::from([("scan.version".to_string(), "snapshot1".to_string())]),
-    )
-    .await;
-
-    let ctx = SessionContext::new();
-    ctx.register_table("time_travel_table", Arc::new(provider))
-        .expect("Failed to register table");
+    let ctx = create_time_travel_context().await;
 
     // Tag 'snapshot1' points to snapshot 1: should contain only (alice, bob)
     let batches = ctx
-        .sql("SELECT id, name FROM time_travel_table")
+        .sql("SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 'snapshot1'")
         .await
         .expect("tag time travel query should parse")
         .collect()
@@ -626,18 +604,8 @@ async fn test_time_travel_by_tag_name() {
     );
 
     // Tag 'snapshot2' points to snapshot 2: should contain all rows
-    let provider2 = create_provider_with_options(
-        "time_travel_table",
-        HashMap::from([("scan.version".to_string(), "snapshot2".to_string())]),
-    )
-    .await;
-
-    let ctx2 = SessionContext::new();
-    ctx2.register_table("time_travel_table", Arc::new(provider2))
-        .expect("Failed to register table");
-
-    let batches = ctx2
-        .sql("SELECT id, name FROM time_travel_table")
+    let batches = ctx
+        .sql("SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 'snapshot2'")
         .await
         .expect("tag time travel query should parse")
         .collect()
@@ -660,23 +628,25 @@ async fn test_time_travel_by_tag_name() {
 
 #[tokio::test]
 async fn test_time_travel_conflicting_selectors_fail() {
+    // When both scan.version and scan.timestamp-millis are set on the same
+    // provider, Paimon rejects the combination at scan time.
     let provider = create_provider_with_options(
         "time_travel_table",
-        HashMap::from([("scan.timestamp-millis".to_string(), "1234".to_string())]),
+        HashMap::from([
+            ("scan.version".to_string(), "1".to_string()),
+            ("scan.timestamp-millis".to_string(), "1234".to_string()),
+        ]),
     )
     .await;
 
-    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "Databricks");
-    let ctx = SessionContext::new_with_config(config);
-    ctx.register_table("time_travel_table", Arc::new(provider))
-        .expect("Failed to register table");
-    ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))
-        .expect("Failed to register relation planner");
+    let ctx = create_context().await;
+    ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
+        .expect("Failed to register temp table");
 
     let err = ctx
-        .sql("SELECT id, name FROM time_travel_table VERSION AS OF 2")
+        .sql("SELECT id, name FROM paimon.default.time_travel_table")
         .await
-        .expect("time travel query should parse")
+        .expect("query should parse")
         .collect()
         .await
         .expect_err("conflicting time-travel selectors should fail");
@@ -700,12 +670,12 @@ async fn test_time_travel_invalid_version_fails() {
     )
     .await;
 
-    let ctx = SessionContext::new();
-    ctx.register_table("time_travel_table", Arc::new(provider))
-        .expect("Failed to register table");
+    let ctx = create_context().await;
+    ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
+        .expect("Failed to register temp table");
 
     let err = ctx
-        .sql("SELECT id, name FROM time_travel_table")
+        .sql("SELECT id, name FROM paimon.default.time_travel_table")
         .await
         .expect("query should parse")
         .collect()
@@ -724,12 +694,10 @@ async fn test_time_travel_invalid_version_fails() {
 /// Without the fix, `active_file_indices` would be empty and rows would be silently lost.
 #[tokio::test]
 async fn test_data_evolution_drop_column_null_fill() {
-    let batches = collect_query(
-        "data_evolution_drop_column",
-        "SELECT id, name, extra FROM data_evolution_drop_column",
-    )
-    .await
-    .expect("data_evolution_drop_column query should succeed");
+    let batches =
+        collect_query("SELECT id, name, extra FROM paimon.default.data_evolution_drop_column")
+            .await
+            .expect("data_evolution_drop_column query should succeed");
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
@@ -779,8 +747,7 @@ async fn test_data_evolution_drop_column_null_fill() {
 #[tokio::test]
 async fn test_read_complex_type_table_via_datafusion() {
     let batches = collect_query(
-        "complex_type_table",
-        "SELECT id, int_array, string_map, row_field FROM complex_type_table ORDER BY id",
+        "SELECT id, int_array, string_map, row_field FROM paimon.default.complex_type_table ORDER BY id",
     )
     .await
     .expect("Complex type query should succeed");
@@ -854,10 +821,10 @@ async fn test_read_complex_type_table_via_datafusion() {
 async fn test_select_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 
-    let ctx = create_context("data_evolution_table").await;
+    let ctx = create_context().await;
 
     let batches = ctx
-        .sql(r#"SELECT "_ROW_ID", id, name FROM data_evolution_table"#)
+        .sql(r#"SELECT "_ROW_ID", id, name FROM paimon.default.data_evolution_table"#)
         .await
         .expect("SQL should parse")
         .collect()
@@ -890,10 +857,10 @@ async fn test_select_row_id_from_data_evolution_table() {
 async fn test_filter_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 
-    let ctx = create_context("data_evolution_table").await;
+    let ctx = create_context().await;
 
     let all_batches = ctx
-        .sql(r#"SELECT "_ROW_ID" FROM data_evolution_table"#)
+        .sql(r#"SELECT "_ROW_ID" FROM paimon.default.data_evolution_table"#)
         .await
         .expect("SQL")
         .collect()
@@ -902,7 +869,7 @@ async fn test_filter_row_id_from_data_evolution_table() {
     let all_count: usize = all_batches.iter().map(|b| b.num_rows()).sum();
 
     let filtered_batches = ctx
-        .sql(r#"SELECT "_ROW_ID", id FROM data_evolution_table WHERE "_ROW_ID" = 0"#)
+        .sql(r#"SELECT "_ROW_ID", id FROM paimon.default.data_evolution_table WHERE "_ROW_ID" = 0"#)
         .await
         .expect("SQL")
         .collect()
@@ -931,9 +898,8 @@ mod fulltext_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{Int32Array, StringArray};
-    use datafusion::prelude::SessionContext;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-    use paimon_datafusion::{register_full_text_search, PaimonCatalogProvider};
+    use paimon_datafusion::{register_full_text_search, SQLContext};
 
     /// Extract the bundled tar.gz into a temp dir and return (tempdir, warehouse_path).
     fn extract_test_warehouse() -> (tempfile::TempDir, String) {
@@ -953,19 +919,18 @@ mod fulltext_tests {
         (tmp, warehouse)
     }
 
-    async fn create_fulltext_context() -> (SessionContext, tempfile::TempDir) {
+    async fn create_fulltext_context() -> (SQLContext, tempfile::TempDir) {
         let (tmp, warehouse) = extract_test_warehouse();
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
 
-        let ctx = SessionContext::new();
-        ctx.register_catalog(
-            "paimon",
-            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
-        );
-        register_full_text_search(&ctx, catalog, "default");
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog.clone())
+            .await
+            .expect("Failed to register catalog");
+        register_full_text_search(ctx.ctx(), catalog, "default");
         (ctx, tmp)
     }
 
@@ -1053,9 +1018,8 @@ mod vector_search_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::Int32Array;
-    use datafusion::prelude::SessionContext;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-    use paimon_datafusion::{register_vector_search, PaimonCatalogProvider};
+    use paimon_datafusion::{register_vector_search, SQLContext};
 
     fn extract_test_warehouse() -> (tempfile::TempDir, String) {
         let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1074,19 +1038,18 @@ mod vector_search_tests {
         (tmp, warehouse)
     }
 
-    async fn create_vector_search_context() -> (SessionContext, tempfile::TempDir) {
+    async fn create_vector_search_context() -> (SQLContext, tempfile::TempDir) {
         let (tmp, warehouse) = extract_test_warehouse();
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
 
-        let ctx = SessionContext::new();
-        ctx.register_catalog(
-            "paimon",
-            Arc::new(PaimonCatalogProvider::new(Arc::clone(&catalog))),
-        );
-        register_vector_search(&ctx, catalog, "default");
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog.clone())
+            .await
+            .expect("Failed to register catalog");
+        register_vector_search(ctx.ctx(), catalog, "default");
         (ctx, tmp)
     }
 

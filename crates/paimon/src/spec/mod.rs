@@ -65,6 +65,8 @@ pub(crate) mod avro;
 pub(crate) mod stats;
 mod types;
 pub use types::*;
+mod partition;
+pub use partition::Partition;
 mod partition_utils;
 pub(crate) use partition_utils::PartitionComputer;
 mod predicate;

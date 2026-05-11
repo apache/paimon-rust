@@ -24,11 +24,10 @@
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, StringArray};
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::table::SnapshotManager;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 use tempfile::TempDir;
 
 // ======================= Helpers =======================
@@ -42,17 +41,18 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
+async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).await.unwrap();
+    ctx
 }
 
-async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {
-    handler
+async fn setup_data_evolution_table(sql_context: &SQLContext) {
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA failed");
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.target (\
                 id INT NOT NULL, name STRING, value INT\
@@ -64,15 +64,15 @@ async fn setup_data_evolution_table(handler: &PaimonSqlHandler) {
         .expect("CREATE TABLE failed");
 }
 
-async fn enable_data_evolution(handler: &PaimonSqlHandler) {
-    handler
+async fn enable_data_evolution(sql_context: &SQLContext) {
+    sql_context
         .sql("ALTER TABLE paimon.test_db.target SET TBLPROPERTIES('data-evolution.enabled' = 'true')")
         .await
         .expect("ALTER TABLE failed");
 }
 
-async fn collect_rows_3col(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, String, i32)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+async fn collect_rows_3col(sql_context: &SQLContext, sql: &str) -> Vec<(i32, String, i32)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
         let ids = batch
@@ -97,8 +97,8 @@ async fn collect_rows_3col(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i32, S
     rows
 }
 
-async fn collect_row_ids(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i64, i32)> {
-    let batches = handler.sql(sql).await.unwrap().collect().await.unwrap();
+async fn collect_row_ids(sql_context: &SQLContext, sql: &str) -> Vec<(i64, i32)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
     let mut rows = Vec::new();
     for batch in &batches {
         let row_ids = batch
@@ -118,8 +118,8 @@ async fn collect_row_ids(handler: &PaimonSqlHandler, sql: &str) -> Vec<(i64, i32
     rows
 }
 
-async fn assert_merge_error(handler: &PaimonSqlHandler, sql: &str, expected_substring: &str) {
-    let result = handler.sql(sql).await;
+async fn assert_merge_error(sql_context: &SQLContext, sql: &str, expected_substring: &str) {
+    let result = sql_context.sql(sql).await;
     assert!(
         result.is_err(),
         "Expected error containing '{expected_substring}', but got Ok"
@@ -131,15 +131,8 @@ async fn assert_merge_error(handler: &PaimonSqlHandler, sql: &str, expected_subs
     );
 }
 
-async fn register_source(handler: &PaimonSqlHandler, sql: &str) {
-    handler
-        .ctx()
-        .sql(sql)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+async fn register_source(sql_context: &SQLContext, sql: &str) {
+    sql_context.sql(sql).await.unwrap().collect().await.unwrap();
 }
 
 // ======================= Functional Tests =======================
@@ -147,16 +140,16 @@ async fn register_source(handler: &PaimonSqlHandler, sql: &str) {
 #[tokio::test]
 async fn test_row_id_values_after_insert() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT \"_ROW_ID\" FROM paimon.test_db.target ORDER BY \"_ROW_ID\"")
         .await
         .unwrap()
@@ -195,32 +188,32 @@ async fn test_row_id_values_after_insert() {
 #[tokio::test]
 async fn test_row_id_stability_after_merge_into() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Capture _ROW_ID -> id mapping before merge
     let before = collect_row_ids(
-        &handler,
+        &sql_context,
         "SELECT \"_ROW_ID\", id FROM paimon.test_db.target ORDER BY id",
     )
     .await;
 
     // Register source and execute MERGE INTO
     register_source(
-        &handler,
-        "CREATE TABLE source1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (3, 'CHARLIE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source1 AS SELECT * FROM (VALUES (1, 'ALICE'), (3, 'CHARLIE')) AS t(id, name)",
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING source1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.source1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -231,7 +224,7 @@ async fn test_row_id_stability_after_merge_into() {
 
     // Capture _ROW_ID -> id mapping after merge
     let after = collect_row_ids(
-        &handler,
+        &sql_context,
         "SELECT \"_ROW_ID\", id FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -244,7 +237,7 @@ async fn test_row_id_stability_after_merge_into() {
 
     // Verify data correctness
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -261,24 +254,24 @@ async fn test_row_id_stability_after_merge_into() {
 #[tokio::test]
 async fn test_multiple_merge_into_different_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // First MERGE: update name for id=1
     register_source(
-        &handler,
-        "CREATE TABLE src_name (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_name AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_name s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_name s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -289,13 +282,13 @@ async fn test_multiple_merge_into_different_columns() {
 
     // Second MERGE: update value for id=2
     register_source(
-        &handler,
-        "CREATE TABLE src_value (id INT, value INT) AS VALUES (2, 200)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_value AS SELECT * FROM (VALUES (2, 200)) AS t(id, value)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_value s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_value s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET value = s.value",
         )
         .await
@@ -305,7 +298,7 @@ async fn test_multiple_merge_into_different_columns() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -318,25 +311,25 @@ async fn test_multiple_merge_into_different_columns() {
 #[tokio::test]
 async fn test_merge_into_with_non_paimon_source() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Source is a plain DataFusion in-memory table, not Paimon
     register_source(
-        &handler,
-        "CREATE TABLE df_source (id INT, name VARCHAR) AS VALUES (2, 'BOB_UPDATED')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.df_source AS SELECT * FROM (VALUES (2, 'BOB_UPDATED')) AS t(id, name)",
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING df_source s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.df_source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -346,7 +339,7 @@ async fn test_merge_into_with_non_paimon_source() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -362,18 +355,18 @@ async fn test_merge_into_with_non_paimon_source() {
 #[tokio::test]
 async fn test_merge_into_join_on_row_id() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Get _ROW_ID for id=2
     let row_id_map = collect_row_ids(
-        &handler,
+        &sql_context,
         "SELECT \"_ROW_ID\", id FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -381,16 +374,16 @@ async fn test_merge_into_join_on_row_id() {
 
     // Create source with that row_id
     register_source(
-        &handler,
+        &sql_context,
         &format!(
-            "CREATE TABLE rid_source (row_id BIGINT, name VARCHAR) AS VALUES ({row_id_of_2}, 'BOB')"
+            "CREATE TEMPORARY TABLE paimon.test_db.rid_source AS SELECT * FROM (VALUES ({row_id_of_2}, 'BOB')) AS t(row_id, name)"
         ),
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING rid_source s ON t.\"_ROW_ID\" = s.row_id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.rid_source s ON t.\"_ROW_ID\" = s.row_id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -400,7 +393,7 @@ async fn test_merge_into_join_on_row_id() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -417,17 +410,17 @@ async fn test_merge_into_join_on_row_id() {
 #[tokio::test]
 async fn test_self_merge() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Self-merge: target used as both target and source
-    handler
+    sql_context
         .sql(
             "MERGE INTO paimon.test_db.target t USING paimon.test_db.target s \
              ON t.\"_ROW_ID\" = s.\"_ROW_ID\" \
@@ -440,7 +433,7 @@ async fn test_self_merge() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -453,14 +446,14 @@ async fn test_self_merge() {
 #[tokio::test]
 async fn test_row_count_after_merge() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Snapshot 1: 3 rows inserted
     let table = catalog
@@ -473,13 +466,13 @@ async fn test_row_count_after_merge() {
 
     // MERGE INTO: update 1 row
     register_source(
-        &handler,
-        "CREATE TABLE src_count (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_count AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_count s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_count s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -504,24 +497,24 @@ async fn test_row_count_after_merge() {
 #[tokio::test]
 async fn test_merge_into_update_and_insert() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     register_source(
-        &handler,
-        "CREATE TABLE src_ui (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_ui AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_ui s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_ui s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -532,7 +525,7 @@ async fn test_merge_into_update_and_insert() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -549,25 +542,25 @@ async fn test_merge_into_update_and_insert() {
 #[tokio::test]
 async fn test_merge_into_insert_only() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     register_source(
-        &handler,
-        "CREATE TABLE src_io (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_io AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
     // Only INSERT, no MATCHED clause — matched row id=2 should be untouched
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_io s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_io s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
         .await
@@ -577,7 +570,7 @@ async fn test_merge_into_insert_only() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -594,10 +587,10 @@ async fn test_merge_into_insert_only() {
 #[tokio::test]
 async fn test_merge_into_insert_all_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20)")
         .await
         .unwrap()
@@ -605,18 +598,18 @@ async fn test_merge_into_insert_all_columns() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Source schema matches target: (id, name, value)
     register_source(
-        &handler,
-        "CREATE TABLE src_star (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 10), (2, 'BOB', 22)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_star AS SELECT * FROM (VALUES (1, 'alice', 10), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_star s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_star s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -627,7 +620,7 @@ async fn test_merge_into_insert_all_columns() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -643,10 +636,10 @@ async fn test_merge_into_insert_all_columns() {
 #[tokio::test]
 async fn test_merge_into_insert_partial_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20)")
         .await
         .unwrap()
@@ -654,18 +647,18 @@ async fn test_merge_into_insert_partial_columns() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     register_source(
-        &handler,
-        "CREATE TABLE src_partial (id INT, name VARCHAR) AS VALUES (1, 'alice'), (2, 'BOB')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_partial AS SELECT * FROM (VALUES (1, 'alice'), (2, 'BOB')) AS t(id, name)",
     )
     .await;
 
     // INSERT only id and name, value should be NULL (but our schema has INT, so this tests partial insert)
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_partial s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_partial s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, 0)",
         )
         .await
@@ -675,7 +668,7 @@ async fn test_merge_into_insert_partial_columns() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -691,10 +684,10 @@ async fn test_merge_into_insert_partial_columns() {
 #[tokio::test]
 async fn test_merge_into_insert_with_predicate() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
         .await
         .unwrap()
@@ -702,19 +695,19 @@ async fn test_merge_into_insert_with_predicate() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Source has 3 rows, only id=1 matches target
     register_source(
-        &handler,
-        "CREATE TABLE src_pred (id INT, name VARCHAR, value INT) AS VALUES (1, 'ALICE', 11), (2, 'bob', 20), (3, 'charlie', 30)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pred AS SELECT * FROM (VALUES (1, 'ALICE', 11), (2, 'bob', 20), (3, 'charlie', 30)) AS t(id, name, value)",
     )
     .await;
 
     // Only insert when value > 25
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_pred s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_pred s ON t.id = s.id \
              WHEN NOT MATCHED AND s.value > 25 THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
         .await
@@ -724,7 +717,7 @@ async fn test_merge_into_insert_with_predicate() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -741,32 +734,32 @@ async fn test_merge_into_insert_with_predicate() {
 #[tokio::test]
 async fn test_merge_into_row_id_for_inserted_rows() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (2, 'bob', 20), (3, 'charlie', 30)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // Before merge: _ROW_ID should be 0, 1
     let before = collect_row_ids(
-        &handler,
+        &sql_context,
         "SELECT \"_ROW_ID\", id FROM paimon.test_db.target ORDER BY id",
     )
     .await;
     assert_eq!(before, vec![(0, 2), (1, 3)]);
 
     register_source(
-        &handler,
-        "CREATE TABLE src_rid (id INT, name VARCHAR, value INT) AS VALUES (1, 'alice', 11), (2, 'BOB', 22)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_rid AS SELECT * FROM (VALUES (1, 'alice', 11), (2, 'BOB', 22)) AS t(id, name, value)",
     )
     .await;
 
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_rid s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_rid s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         )
@@ -778,7 +771,7 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 
     // After merge: existing rows keep their _ROW_ID, new row gets next available
     let after = collect_row_ids(
-        &handler,
+        &sql_context,
         "SELECT \"_ROW_ID\", id FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -805,10 +798,10 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 #[tokio::test]
 async fn test_rejects_when_matched_delete() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
         .await
         .unwrap()
@@ -816,13 +809,17 @@ async fn test_rejects_when_matched_delete() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
-    register_source(&handler, "CREATE TABLE src_del (id INT) AS VALUES (1)").await;
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_del AS SELECT * FROM (VALUES (1)) AS t(id)",
+    )
+    .await;
 
     assert_merge_error(
-        &handler,
-        "MERGE INTO paimon.test_db.target t USING src_del s ON t.id = s.id \
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_del s ON t.id = s.id \
          WHEN MATCHED THEN DELETE",
         "WHEN MATCHED THEN DELETE is not supported",
     )
@@ -832,10 +829,10 @@ async fn test_rejects_when_matched_delete() {
 #[tokio::test]
 async fn test_rejects_multiple_when_matched() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
         .await
         .unwrap()
@@ -843,17 +840,17 @@ async fn test_rejects_multiple_when_matched() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     register_source(
-        &handler,
-        "CREATE TABLE src_multi (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_multi AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
     assert_merge_error(
-        &handler,
-        "MERGE INTO paimon.test_db.target t USING src_multi s ON t.id = s.id \
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_multi s ON t.id = s.id \
          WHEN MATCHED AND t.id = 1 THEN UPDATE SET name = s.name \
          WHEN MATCHED THEN UPDATE SET name = 'default'",
         "WHEN MATCHED AND <predicate> is not yet supported",
@@ -864,10 +861,13 @@ async fn test_rejects_multiple_when_matched() {
 #[tokio::test]
 async fn test_rejects_partition_column_in_set() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.part_target (\
                 pt STRING, id INT NOT NULL, name STRING\
@@ -878,7 +878,7 @@ async fn test_rejects_partition_column_in_set() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.part_target (pt, id, name) VALUES ('a', 1, 'alice')")
         .await
         .unwrap()
@@ -886,17 +886,17 @@ async fn test_rejects_partition_column_in_set() {
         .await
         .unwrap();
 
-    handler.sql("ALTER TABLE paimon.test_db.part_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
+    sql_context.sql("ALTER TABLE paimon.test_db.part_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
-        &handler,
-        "CREATE TABLE src_pt (id INT, pt VARCHAR) AS VALUES (1, 'b')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pt AS SELECT * FROM (VALUES (1, 'b')) AS t(id, pt)",
     )
     .await;
 
     assert_merge_error(
-        &handler,
-        "MERGE INTO paimon.test_db.part_target t USING src_pt s ON t.id = s.id \
+        &sql_context,
+        "MERGE INTO paimon.test_db.part_target t USING paimon.test_db.src_pt s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET pt = s.pt",
         "Cannot update partition column",
     )
@@ -906,10 +906,13 @@ async fn test_rejects_partition_column_in_set() {
 #[tokio::test]
 async fn test_rejects_table_without_row_tracking() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.no_tracking (\
                 id INT NOT NULL, name STRING\
@@ -918,7 +921,7 @@ async fn test_rejects_table_without_row_tracking() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.no_tracking (id, name) VALUES (1, 'alice')")
         .await
         .unwrap()
@@ -926,17 +929,17 @@ async fn test_rejects_table_without_row_tracking() {
         .await
         .unwrap();
 
-    handler.sql("ALTER TABLE paimon.test_db.no_tracking SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
+    sql_context.sql("ALTER TABLE paimon.test_db.no_tracking SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
-        &handler,
-        "CREATE TABLE src_nrt (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_nrt AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
     assert_merge_error(
-        &handler,
-        "MERGE INTO paimon.test_db.no_tracking t USING src_nrt s ON t.id = s.id \
+        &sql_context,
+        "MERGE INTO paimon.test_db.no_tracking t USING paimon.test_db.src_nrt s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
         "row-tracking.enabled",
     )
@@ -948,24 +951,24 @@ async fn test_successive_merges_read_file_group() {
     // Verifies that a second MERGE INTO correctly reads columns from the file group
     // (base file + partial-column files created by the first merge), not just a single file.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // First MERGE: update 'name' column → creates a partial-column file for 'name'
     register_source(
-        &handler,
-        "CREATE TABLE src_m1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE'), (2, 'BOB')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_m1 AS SELECT * FROM (VALUES (1, 'ALICE'), (2, 'BOB')) AS t(id, name)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_m1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_m1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -976,7 +979,7 @@ async fn test_successive_merges_read_file_group() {
 
     // Verify first merge result
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -988,13 +991,13 @@ async fn test_successive_merges_read_file_group() {
     // Second MERGE: update 'name' again → must read the merged 'name' from file group
     // (base file has original 'name', partial file has updated 'name' from first merge)
     register_source(
-        &handler,
-        "CREATE TABLE src_m2 (id INT, name VARCHAR) AS VALUES (1, 'Alice_v2')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_m2 AS SELECT * FROM (VALUES (1, 'Alice_v2')) AS t(id, name)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_m2 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_m2 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -1004,7 +1007,7 @@ async fn test_successive_merges_read_file_group() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -1020,24 +1023,24 @@ async fn test_successive_merges_different_columns_read_file_group() {
     // The second merge must correctly read 'value' from the file group
     // even though a partial-column file for 'name' now exists.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await.unwrap().collect().await.unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     // First MERGE: update 'name'
     register_source(
-        &handler,
-        "CREATE TABLE src_dc1 (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_dc1 AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_dc1 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_dc1 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         )
         .await
@@ -1048,13 +1051,13 @@ async fn test_successive_merges_different_columns_read_file_group() {
 
     // Second MERGE: update 'value' — reads from file group (base + name-partial)
     register_source(
-        &handler,
-        "CREATE TABLE src_dc2 (id INT, value INT) AS VALUES (1, 100), (2, 200)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_dc2 AS SELECT * FROM (VALUES (1, 100), (2, 200)) AS t(id, value)",
     )
     .await;
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_dc2 s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_dc2 s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET value = s.value",
         )
         .await
@@ -1064,7 +1067,7 @@ async fn test_successive_merges_different_columns_read_file_group() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -1081,10 +1084,10 @@ async fn test_merge_insert_reordered_columns() {
     // Table schema: (id INT, name STRING, value INT)
     // INSERT specifies: (value, name, id) — reversed order
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
-    setup_data_evolution_table(&handler).await;
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
         .await
         .unwrap()
@@ -1092,18 +1095,18 @@ async fn test_merge_insert_reordered_columns() {
         .await
         .unwrap();
 
-    enable_data_evolution(&handler).await;
+    enable_data_evolution(&sql_context).await;
 
     register_source(
-        &handler,
-        "CREATE TABLE src_reorder (id INT, name VARCHAR, value INT) AS VALUES (2, 'bob', 20), (1, 'ALICE', 11)",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_reorder AS SELECT * FROM (VALUES (2, 'bob', 20), (1, 'ALICE', 11)) AS t(id, name, value)",
     )
     .await;
 
     // INSERT columns in reversed order: (value, name, id)
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.target t USING src_reorder s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_reorder s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (value, name, id) VALUES (s.value, s.name, s.id)",
         )
         .await
@@ -1113,7 +1116,7 @@ async fn test_merge_insert_reordered_columns() {
         .unwrap();
 
     let rows = collect_rows_3col(
-        &handler,
+        &sql_context,
         "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
@@ -1131,10 +1134,13 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
     // Verifies column reordering on a partitioned table where mis-mapping
     // would cause data to land in the wrong partition.
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.part_tbl (\
                 dt STRING, id INT NOT NULL, name STRING\
@@ -1145,7 +1151,7 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("INSERT INTO paimon.test_db.part_tbl (dt, id, name) VALUES ('2024-01-01', 1, 'alice')")
         .await
         .unwrap()
@@ -1153,18 +1159,18 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
         .await
         .unwrap();
 
-    handler.sql("ALTER TABLE paimon.test_db.part_tbl SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
+    sql_context.sql("ALTER TABLE paimon.test_db.part_tbl SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     register_source(
-        &handler,
-        "CREATE TABLE src_pt_reorder (id INT, name VARCHAR, dt VARCHAR) AS VALUES (2, 'bob', '2024-02-01'), (1, 'ALICE', '2024-01-01')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pt_reorder AS SELECT * FROM (VALUES (2, 'bob', '2024-02-01'), (1, 'ALICE', '2024-01-01')) AS t(id, name, dt)",
     )
     .await;
 
     // INSERT with columns in different order than table schema: (name, id, dt) vs table (dt, id, name)
-    handler
+    sql_context
         .sql(
-            "MERGE INTO paimon.test_db.part_tbl t USING src_pt_reorder s ON t.id = s.id \
+            "MERGE INTO paimon.test_db.part_tbl t USING paimon.test_db.src_pt_reorder s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (name, id, dt) VALUES (s.name, s.id, s.dt)",
         )
         .await
@@ -1173,7 +1179,7 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT dt, id, name FROM paimon.test_db.part_tbl ORDER BY id")
         .await
         .unwrap()
@@ -1219,10 +1225,13 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
 #[tokio::test]
 async fn test_rejects_table_with_primary_keys() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.pk_target (\
                 id INT NOT NULL, name STRING, PRIMARY KEY (id)\
@@ -1234,16 +1243,16 @@ async fn test_rejects_table_with_primary_keys() {
         .unwrap();
 
     register_source(
-        &handler,
-        "CREATE TABLE src_pk (id INT, name VARCHAR) AS VALUES (1, 'ALICE')",
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pk AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
     )
     .await;
 
-    handler.sql("ALTER TABLE paimon.test_db.pk_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
+    sql_context.sql("ALTER TABLE paimon.test_db.pk_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
 
     assert_merge_error(
-        &handler,
-        "MERGE INTO paimon.test_db.pk_target t USING src_pk s ON t.id = s.id \
+        &sql_context,
+        "MERGE INTO paimon.test_db.pk_target t USING paimon.test_db.src_pk s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
         "does not support primary keys",
     )

@@ -23,6 +23,7 @@
 mod database;
 mod factory;
 mod filesystem;
+mod partition_listing;
 mod rest;
 
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ use std::fmt;
 pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
+pub use partition_listing::list_partitions_from_file_system;
 pub use rest::*;
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +116,8 @@ impl fmt::Debug for Identifier {
 
 use async_trait::async_trait;
 
-use crate::spec::{Schema, SchemaChange};
+use crate::api::PagedList;
+use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::Table;
 use crate::Result;
 
@@ -227,4 +230,30 @@ pub trait Catalog: Send + Sync {
         changes: Vec<SchemaChange>,
         ignore_if_not_exists: bool,
     ) -> Result<()>;
+
+    /// List partitions for a table.
+    ///
+    /// Default impl scans the table's manifest entries via
+    /// [`list_partitions_from_file_system`], matching Java
+    /// `AbstractCatalog.listPartitions`. Catalogs with metastore-tracked
+    /// partitions (e.g. `RESTCatalog`) override to return audit fields too.
+    async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
+        let table = self.get_table(identifier).await?;
+        list_partitions_from_file_system(&table).await
+    }
+
+    /// Like [`Self::list_partitions`] but paged. Default impl ignores
+    /// `max_results` and `page_token`, returning all partitions in a single page.
+    /// Catalogs that need true pagination (e.g. `RESTCatalog`) override this.
+    async fn list_partitions_paged(
+        &self,
+        identifier: &Identifier,
+        _max_results: Option<u32>,
+        _page_token: Option<&str>,
+    ) -> Result<PagedList<Partition>> {
+        Ok(PagedList::new(
+            self.list_partitions(identifier).await?,
+            None,
+        ))
+    }
 }

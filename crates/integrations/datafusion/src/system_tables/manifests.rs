@@ -87,9 +87,11 @@ impl TableProvider for ManifestsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let metas = collect_manifests(&self.table)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = self.table.clone();
+        let metas =
+            crate::runtime::await_with_runtime(async move { collect_manifests(&table).await })
+                .await
+                .map_err(to_datafusion_error)?;
 
         let n = metas.len();
         let mut file_names: Vec<String> = Vec::with_capacity(n);

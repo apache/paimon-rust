@@ -258,6 +258,29 @@ impl ListTablesResponse {
     }
 }
 
+/// Response for listing partitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPartitionsResponse {
+    /// List of partitions.
+    pub partitions: Option<Vec<crate::spec::Partition>>,
+    /// Token for the next page.
+    pub next_page_token: Option<String>,
+}
+
+impl ListPartitionsResponse {
+    /// Create a new ListPartitionsResponse.
+    pub fn new(
+        partitions: Option<Vec<crate::spec::Partition>>,
+        next_page_token: Option<String>,
+    ) -> Self {
+        Self {
+            partitions,
+            next_page_token,
+        }
+    }
+}
+
 /// A paginated list of elements with an optional next page token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

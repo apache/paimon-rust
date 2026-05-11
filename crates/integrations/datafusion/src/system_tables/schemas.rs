@@ -85,10 +85,11 @@ impl TableProvider for SchemasTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let schemas = self
-            .table
-            .schema_manager()
-            .list_all()
+        let table = self.table.clone();
+        let schemas =
+            crate::runtime::await_with_runtime(
+                async move { table.schema_manager().list_all().await },
+            )
             .await
             .map_err(to_datafusion_error)?;
 

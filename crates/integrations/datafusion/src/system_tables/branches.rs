@@ -79,31 +79,11 @@ impl TableProvider for BranchesTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let bm = BranchManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let branch_names = bm.list_all().await.map_err(to_datafusion_error)?;
-
-        let n = branch_names.len();
-        let mut names: Vec<String> = Vec::with_capacity(n);
-        let mut create_times = Vec::with_capacity(n);
-
-        for name in branch_names {
-            let branch_path = bm.branch_path(&name);
-            let status = self
-                .table
-                .file_io()
-                .get_status(&branch_path)
+        let table = self.table.clone();
+        let (names, create_times) =
+            crate::runtime::await_with_runtime(async move { collect_branches(&table).await })
                 .await
                 .map_err(to_datafusion_error)?;
-            let ts_millis = status
-                .last_modified
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or(0);
-            names.push(name);
-            create_times.push(ts_millis);
-        }
 
         let schema = branches_schema();
         let batch = RecordBatch::try_new(
@@ -120,4 +100,21 @@ impl TableProvider for BranchesTable {
             projection.cloned(),
         )?)
     }
+}
+
+async fn collect_branches(table: &Table) -> paimon::Result<(Vec<String>, Vec<i64>)> {
+    let file_io = table.file_io();
+    let bm = BranchManager::new(file_io.clone(), table.location().to_string());
+    let names = bm.list_all().await?;
+    let mut create_times = Vec::with_capacity(names.len());
+    for name in &names {
+        let status = file_io.get_status(&bm.branch_path(name)).await?;
+        create_times.push(
+            status
+                .last_modified
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0),
+        );
+    }
+    Ok((names, create_times))
 }

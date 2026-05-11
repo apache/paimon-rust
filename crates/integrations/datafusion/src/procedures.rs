@@ -126,11 +126,15 @@ async fn earlier_or_equal_from_all(
 
 pub async fn execute_call(
     ctx: &SessionContext,
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
+    catalogs: &HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: &str,
     func: &Function,
 ) -> DFResult<DataFrame> {
-    let proc_name = extract_procedure_name(&func.name)?;
+    let (explicit_catalog, proc_name) = extract_procedure_name(&func.name)?;
+    let catalog_name = explicit_catalog.as_deref().unwrap_or(current_catalog);
+    let catalog = catalogs
+        .get(catalog_name)
+        .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
     let args = extract_named_args(&func.args)?;
 
     match proc_name.as_str() {
@@ -149,17 +153,19 @@ pub async fn execute_call(
     }
 }
 
-fn extract_procedure_name(name: &ObjectName) -> DFResult<String> {
+/// Returns (optional_catalog_name, procedure_name).
+fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String)> {
     let parts: Vec<String> = name
         .0
         .iter()
         .filter_map(|p| p.as_ident().map(|id| id.value.clone()))
         .collect();
     match parts.len() {
-        1 => Ok(parts[0].clone()),
-        2 => Ok(parts[1].clone()),
+        1 => Ok((None, parts[0].clone())),
+        2 => Ok((None, parts[1].clone())),
+        3 => Ok((Some(parts[0].clone()), parts[2].clone())),
         _ => Err(DataFusionError::Plan(format!(
-            "Invalid procedure name: {name}. Expected sys.procedure_name or procedure_name"
+            "Invalid procedure name: {name}. Expected procedure_name, sys.procedure_name, or catalog.sys.procedure_name"
         ))),
     }
 }

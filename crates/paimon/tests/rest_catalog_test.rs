@@ -263,6 +263,56 @@ async fn test_catalog_get_table_not_found() {
     assert!(result.is_err(), "getting non-existent table should fail");
 }
 
+/// When no data token is vended (`data_token_enabled=false` or external
+/// table), `get_table` must propagate catalog options to FileIO so an
+/// OSS-pathed table picks up `fs.oss.*` keys. Java parity:
+/// `RESTCatalog.fileIOFromOptions`.
+#[tokio::test]
+async fn test_catalog_get_table_propagates_oss_options_in_else_branch() {
+    let prefix = "mock-test";
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), prefix.to_string());
+    let config = ConfigResponse::new(defaults);
+
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        "/tmp/test_warehouse".to_string(),
+        config,
+        vec!["default".to_string()],
+    )
+    .await;
+
+    let url = server.url().expect("Failed to get server URL");
+    let mut options = Options::new();
+    options.set("uri", &url);
+    options.set("warehouse", "test_warehouse");
+    options.set("token.provider", "bear");
+    options.set("token", "test_token");
+    options.set("fs.oss.endpoint", "https://oss-cn-shanghai.aliyuncs.com");
+    options.set("fs.oss.accessKeyId", "test-ak");
+    options.set("fs.oss.accessKeySecret", "test-sk");
+
+    let catalog = RESTCatalog::new(options, true)
+        .await
+        .expect("create catalog");
+
+    let schema = test_schema();
+    server.add_table_with_schema(
+        "default",
+        "oss_table",
+        schema,
+        "oss://test-bucket/warehouse/default.db/oss_table",
+    );
+
+    let identifier = Identifier::new("default", "oss_table");
+    let result = catalog.get_table(&identifier).await;
+    assert!(
+        result.is_ok(),
+        "expected get_table to succeed when fs.oss.* keys are present in catalog options; \
+         got {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_catalog_create_table() {
     let ctx = setup_catalog(vec!["default"]).await;

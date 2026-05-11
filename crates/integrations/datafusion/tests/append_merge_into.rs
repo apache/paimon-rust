@@ -23,25 +23,28 @@
 mod common;
 
 use arrow_array::{Array, Int32Array, StringArray};
-use paimon_datafusion::PaimonSqlHandler;
+use paimon_datafusion::SQLContext;
 
 use common::{
-    collect_int_int_str, collect_int_str, collect_three_ints, create_handler, create_test_env,
-    ctx_exec, exec,
+    collect_int_int_str, collect_int_str, collect_three_ints, create_sql_context, create_test_env,
+    exec,
 };
 
 // ======================= Helpers =======================
 
-async fn setup(table_ddl: &str) -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup(table_ddl: &str) -> (tempfile::TempDir, SQLContext) {
     let (tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog);
-    handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
-    handler.sql(table_ddl).await.unwrap();
-    (tmp, handler)
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context.sql(table_ddl).await.unwrap();
+    (tmp, sql_context)
 }
 
-async fn query_abc(handler: &PaimonSqlHandler) -> Vec<(i32, i32, String)> {
-    let batches = handler
+async fn query_abc(sql_context: &SQLContext) -> Vec<(i32, i32, String)> {
+    let batches = sql_context
         .sql("SELECT a, b, c FROM paimon.test_db.target ORDER BY a, b")
         .await
         .unwrap()
@@ -51,24 +54,24 @@ async fn query_abc(handler: &PaimonSqlHandler) -> Vec<(i32, i32, String)> {
     collect_int_int_str(&batches)
 }
 
-async fn setup_abc() -> (tempfile::TempDir, PaimonSqlHandler) {
+async fn setup_abc() -> (tempfile::TempDir, SQLContext) {
     setup("CREATE TABLE paimon.test_db.target (a INT, b INT, c VARCHAR)").await
 }
 
-async fn setup_partitioned() -> (tempfile::TempDir, PaimonSqlHandler) {
-    let (tmp, handler) =
+async fn setup_partitioned() -> (tempfile::TempDir, SQLContext) {
+    let (tmp, sql_context) =
         setup("CREATE TABLE paimon.test_db.target (a INT, b INT, pt INT) PARTITIONED BY (pt)")
             .await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 1), (2, 20, 1), (3, 30, 2), (4, 40, 2)",
     )
     .await;
-    (tmp, handler)
+    (tmp, sql_context)
 }
 
-async fn query_a_b_pt(handler: &PaimonSqlHandler) -> Vec<(i32, i32, i32)> {
-    let batches = handler
+async fn query_a_b_pt(sql_context: &SQLContext) -> Vec<(i32, i32, i32)> {
+    let batches = sql_context
         .sql("SELECT a, b, pt FROM paimon.test_db.target ORDER BY pt, a")
         .await
         .unwrap()
@@ -83,28 +86,28 @@ async fn query_a_b_pt(handler: &PaimonSqlHandler) -> Vec<(i32, i32, i32)> {
 /// Paimon MergeInto: only update
 #[tokio::test]
 async fn test_only_update() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
-         WHEN MATCHED THEN UPDATE SET a = source.a, b = source.b, c = source.c",
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c11".into()), (2, 20, "c2".into()),]
     );
 }
@@ -112,54 +115,54 @@ async fn test_only_update() {
 /// Paimon MergeInto: only delete
 #[tokio::test]
 async fn test_only_delete() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE",
     )
     .await;
 
-    assert_eq!(query_abc(&handler).await, vec![(2, 20, "c2".into()),]);
+    assert_eq!(query_abc(&sql_context).await, vec![(2, 20, "c2".into()),]);
 }
 
 /// Paimon MergeInto: only insert
 #[tokio::test]
 async fn test_only_insert() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
-         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (a, b, c)",
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 10, "c1".into()),
             (2, 20, "c2".into()),
@@ -171,29 +174,29 @@ async fn test_only_insert() {
 /// Paimon MergeInto: update + insert
 #[tokio::test]
 async fn test_update_and_insert() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
-         WHEN MATCHED THEN UPDATE SET a = source.a, b = source.b, c = source.c \
-         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (a, b, c)",
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c \
+         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 100, "c11".into()),
             (2, 20, "c2".into()),
@@ -205,29 +208,29 @@ async fn test_update_and_insert() {
 /// Paimon MergeInto: delete + insert
 #[tokio::test]
 async fn test_delete_and_insert() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE \
-         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (a, b, c)",
+         WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(2, 20, "c2".into()), (3, 300, "c33".into()),]
     );
 }
@@ -235,27 +238,27 @@ async fn test_delete_and_insert() {
 /// Paimon MergeInto: partial insert with null
 #[tokio::test]
 async fn test_partial_insert_with_null() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
-        "MERGE INTO paimon.test_db.target \
-         USING source ON paimon.test_db.target.a = source.a \
-         WHEN NOT MATCHED THEN INSERT (a) VALUES (a)",
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN NOT MATCHED THEN INSERT (a) VALUES (s.a)",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT a, b, c FROM paimon.test_db.target ORDER BY a, b")
         .await
         .unwrap()
@@ -307,29 +310,29 @@ async fn test_partial_insert_with_null() {
 /// Paimon MergeInto: update value from both source and target table
 #[tokio::test]
 async fn test_update_from_both_source_and_target() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = t.b * 11, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b * 2, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 110, "c11".into()),
             (2, 20, "c2".into()),
@@ -341,29 +344,29 @@ async fn test_update_from_both_source_and_target() {
 /// Paimon MergeInto: insert/update columns in wrong order
 #[tokio::test]
 async fn test_columns_in_wrong_order() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c, b = s.b \
          WHEN NOT MATCHED THEN INSERT (b, c, a) VALUES (b, c, a)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 100, "c11".into()),
             (2, 20, "c2".into()),
@@ -375,29 +378,29 @@ async fn test_columns_in_wrong_order() {
 /// Paimon MergeInto: miss some columns in update
 #[tokio::test]
 async fn test_partial_update() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 10, "c11".into()),
             (2, 20, "c2".into()),
@@ -409,18 +412,18 @@ async fn test_partial_update() {
 /// Paimon MergeInto: source is a query (subquery)
 #[tokio::test]
 async fn test_source_is_subquery() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(&handler, "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33'), (4, 400, 'c44')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33'), (4, 400, 'c44')) AS t(a, b, c)").await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING (SELECT a, b, c FROM source WHERE a % 2 = 1) AS src \
+         USING (SELECT a, b, c FROM paimon.test_db.source WHERE a % 2 = 1) AS src \
          ON t.a = src.a \
          WHEN MATCHED THEN UPDATE SET b = src.b, c = src.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (src.a, src.b, src.c)",
@@ -428,7 +431,7 @@ async fn test_source_is_subquery() {
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 100, "c11".into()),
             (2, 20, "c2".into()),
@@ -440,48 +443,51 @@ async fn test_source_is_subquery() {
 /// Paimon MergeInto: source and target are empty
 #[tokio::test]
 async fn test_source_and_target_empty() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     // target is empty, source is empty
-    ctx_exec(&handler, "CREATE TABLE source (a INT, b INT, c VARCHAR) AS SELECT * FROM (VALUES (1, 1, 'x')) AS t(a, b, c) WHERE 1=0").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 1, 'x')) AS t(a, b, c) WHERE 1=0").await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
-    assert_eq!(query_abc(&handler).await, Vec::<(i32, i32, String)>::new());
+    assert_eq!(
+        query_abc(&sql_context).await,
+        Vec::<(i32, i32, String)>::new()
+    );
 }
 
 /// Paimon MergeInto: merge into with alias
 #[tokio::test]
 async fn test_with_alias() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 100, "c11".into()),
             (2, 20, "c2".into()),
@@ -493,28 +499,28 @@ async fn test_with_alias() {
 /// Paimon MergeInto: update on source eq target condition (reversed ON clause)
 #[tokio::test]
 async fn test_reversed_on_condition() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON s.a = t.a \
+         USING paimon.test_db.source s ON s.a = t.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c11".into()), (2, 20, "c2".into()),]
     );
 }
@@ -522,24 +528,24 @@ async fn test_reversed_on_condition() {
 /// Paimon MergeInto: two paimon tables
 #[tokio::test]
 async fn test_two_paimon_tables() {
-    let (_tmp, handler) = setup_abc().await;
-    handler
+    let (_tmp, sql_context) = setup_abc().await;
+    sql_context
         .sql("CREATE TABLE paimon.test_db.source (a INT, b INT, c VARCHAR)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.source VALUES (1, 100, 'c11'), (3, 300, 'c33')",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
          USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b, c = s.c",
@@ -547,7 +553,7 @@ async fn test_two_paimon_tables() {
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c11".into()), (2, 20, "c2".into()),]
     );
 }
@@ -555,20 +561,20 @@ async fn test_two_paimon_tables() {
 /// Paimon MergeInto: on clause has filter expression
 #[tokio::test]
 async fn test_on_clause_with_filter() {
-    let (_tmp, handler) = setup_abc().await;
-    handler
+    let (_tmp, sql_context) = setup_abc().await;
+    sql_context
         .sql("CREATE TABLE paimon.test_db.source (a INT, b INT, c VARCHAR)")
         .await
         .unwrap();
-    exec(&handler, "INSERT INTO paimon.test_db.source VALUES (1, 100, 'c11'), (3, 300, 'c11'), (5, 500, 'c55')").await;
+    exec(&sql_context, "INSERT INTO paimon.test_db.source VALUES (1, 100, 'c11'), (3, 300, 'c11'), (5, 500, 'c55')").await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 100, 'cc'), (2, 20, 'cc')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target tgt \
          USING (SELECT a, b FROM paimon.test_db.source WHERE c = 'c11') AS src \
          ON tgt.a = src.a AND tgt.b = src.b AND tgt.c = 'cc' \
@@ -576,37 +582,37 @@ async fn test_on_clause_with_filter() {
     )
     .await;
 
-    assert_eq!(query_abc(&handler).await, vec![(2, 20, "cc".into()),]);
+    assert_eq!(query_abc(&sql_context).await, vec![(2, 20, "cc".into()),]);
 }
 
 /// Paimon MergeInto: merge into with varchar type
 #[tokio::test]
 async fn test_with_varchar() {
-    let (_tmp, handler) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
-    handler
+    let (_tmp, sql_context) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
+    sql_context
         .sql("CREATE TABLE paimon.test_db.source (a INT, b VARCHAR)")
         .await
         .unwrap();
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 'Alice'), (2, 'Bob')",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.source VALUES (1, 'Eve'), (3, 'Cat')",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
          USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET a = s.a, b = s.b",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT a, b FROM paimon.test_db.target ORDER BY a")
         .await
         .unwrap()
@@ -622,29 +628,29 @@ async fn test_with_varchar() {
 /// Paimon MergeInto: update with coalesce referencing both source and target columns
 #[tokio::test]
 async fn test_coalesce_source_and_target() {
-    let (_tmp, handler) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
+    let (_tmp, sql_context) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 'guid_tgt_1'), (2, 'guid_tgt_2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b VARCHAR) AS VALUES (1, 'guid_src_1'), (3, 'guid_src_3')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 'guid_src_1'), (3, 'guid_src_3')) AS t(a, b)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target AS dest \
-         USING source AS src ON dest.a = src.a \
+         USING paimon.test_db.source AS src ON dest.a = src.a \
          WHEN MATCHED AND (nullif(cast(src.b as STRING), '') IS NOT NULL) THEN \
          UPDATE SET b = COALESCE(nullif(cast(src.b as STRING), ''), dest.b) \
          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b)",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT a, b FROM paimon.test_db.target ORDER BY a")
         .await
         .unwrap()
@@ -664,29 +670,29 @@ async fn test_coalesce_source_and_target() {
 /// Paimon MergeInto: subquery source with coalesce referencing both source and target
 #[tokio::test]
 async fn test_subquery_source_with_coalesce() {
-    let (_tmp, handler) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
+    let (_tmp, sql_context) = setup("CREATE TABLE paimon.test_db.target (a INT, b VARCHAR)").await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 'guid_tgt_1'), (2, 'guid_tgt_2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b VARCHAR) AS VALUES (1, 'guid_src_1'), (3, 'guid_src_3')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 'guid_src_1'), (3, 'guid_src_3')) AS t(a, b)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target AS dest \
-         USING (SELECT * FROM source) AS src ON dest.a = src.a \
+         USING (SELECT * FROM paimon.test_db.source) AS src ON dest.a = src.a \
          WHEN MATCHED AND (nullif(cast(src.b as STRING), '') IS NOT NULL) THEN \
          UPDATE SET b = COALESCE(nullif(cast(src.b as STRING), ''), dest.b) \
          WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b)",
     )
     .await;
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT a, b FROM paimon.test_db.target ORDER BY a")
         .await
         .unwrap()
@@ -706,28 +712,28 @@ async fn test_subquery_source_with_coalesce() {
 /// Paimon MergeInto: non pk table insert-only commit kind is APPEND
 #[tokio::test]
 async fn test_insert_only_is_append_commit() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (2, 2, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 1, 'c1')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 1, 'c1')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 1, "c1".into()), (2, 2, "c2".into()),]
     );
 }
@@ -735,48 +741,48 @@ async fn test_insert_only_is_append_commit() {
 /// Paimon MergeInto: successive merges on append-only table
 #[tokio::test]
 async fn test_successive_merges() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
 
     // First merge: update b for a=1
-    ctx_exec(
-        &handler,
-        "CREATE TABLE src1 (a INT, b INT) AS VALUES (1, 100)",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src1 AS SELECT * FROM (VALUES (1, 100)) AS t(a, b)",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING src1 s ON t.a = s.a \
+         USING paimon.test_db.src1 s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c1".into()), (2, 20, "c2".into()),]
     );
 
     // Second merge: update c for a=2
-    ctx_exec(
-        &handler,
-        "CREATE TABLE src2 (a INT, c VARCHAR) AS VALUES (2, 'C2_UPDATED')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src2 AS SELECT * FROM (VALUES (2, 'C2_UPDATED')) AS t(a, c)",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING src2 s ON t.a = s.a \
+         USING paimon.test_db.src2 s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET c = s.c",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c1".into()), (2, 20, "C2_UPDATED".into()),]
     );
 }
@@ -784,28 +790,28 @@ async fn test_successive_merges() {
 /// Paimon MergeInto: no match produces no changes
 #[tokio::test]
 async fn test_no_match_no_change() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (99, 990, 'c99')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (99, 990, 'c99')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 10, "c1".into()), (2, 20, "c2".into()),]
     );
 }
@@ -813,46 +819,53 @@ async fn test_no_match_no_change() {
 /// Paimon MergeInto: delete all matched rows
 #[tokio::test]
 async fn test_delete_all_rows() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(&handler, "CREATE TABLE source (a INT) AS VALUES (1), (2)").await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1), (2)) AS t(a)",
+    )
+    .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN DELETE",
     )
     .await;
 
-    assert_eq!(query_abc(&handler).await, Vec::<(i32, i32, String)>::new());
+    assert_eq!(
+        query_abc(&sql_context).await,
+        Vec::<(i32, i32, String)>::new()
+    );
 }
 
 /// Paimon MergeInto: multiple inserts from different batches
 #[tokio::test]
 async fn test_insert_many_rows() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1')",
     )
     .await;
-    ctx_exec(&handler, "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')) AS t(a, b, c)").await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 10, "c1".into()),
             (2, 20, "c2".into()),
@@ -866,22 +879,22 @@ async fn test_insert_many_rows() {
 /// Paimon MergeInto: conditional update — rows matching predicate get updated, others get deleted
 #[tokio::test]
 async fn test_conditional_update() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2'), (3, 30, 'c3')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND s.b > 200 THEN UPDATE SET b = s.b, c = s.c \
          WHEN MATCHED THEN DELETE \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
@@ -889,7 +902,7 @@ async fn test_conditional_update() {
     .await;
 
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(2, 20, "c2".into()), (3, 300, "c33".into()),]
     );
 }
@@ -897,22 +910,22 @@ async fn test_conditional_update() {
 /// Paimon MergeInto: conditional insert — only insert rows matching predicate
 #[tokio::test]
 async fn test_conditional_insert() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED THEN UPDATE SET b = s.b, c = s.c \
          WHEN NOT MATCHED AND s.b < 300 THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -920,7 +933,7 @@ async fn test_conditional_insert() {
 
     // a=1 updated, a=3 NOT inserted (b=300 not < 300)
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![(1, 100, "c11".into()), (2, 20, "c2".into()),]
     );
 }
@@ -928,22 +941,22 @@ async fn test_conditional_insert() {
 /// Paimon MergeInto: conditional delete — only delete rows matching predicate
 #[tokio::test]
 async fn test_conditional_delete() {
-    let (_tmp, handler) = setup_abc().await;
+    let (_tmp, sql_context) = setup_abc().await;
     exec(
-        &handler,
+        &sql_context,
         "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2')",
     )
     .await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33')",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33')) AS t(a, b, c)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND t.c < 'c1' THEN DELETE \
          WHEN NOT MATCHED THEN INSERT (a, b, c) VALUES (s.a, s.b, s.c)",
     )
@@ -951,7 +964,7 @@ async fn test_conditional_delete() {
 
     // a=1 matched but c='c1' is NOT < 'c1', so not deleted
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (1, 10, "c1".into()),
             (2, 20, "c2".into()),
@@ -963,13 +976,13 @@ async fn test_conditional_delete() {
 /// Paimon MergeInto: multiple matched clauses with predicates
 #[tokio::test]
 async fn test_multiple_matched_clauses() {
-    let (_tmp, handler) = setup_abc().await;
-    exec(&handler, "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')").await;
-    ctx_exec(&handler, "CREATE TABLE source (a INT, b INT, c VARCHAR) AS VALUES (1, 100, 'c11'), (3, 300, 'c33'), (5, 500, 'c55'), (7, 700, 'c77'), (9, 900, 'c99')").await;
+    let (_tmp, sql_context) = setup_abc().await;
+    exec(&sql_context, "INSERT INTO paimon.test_db.target VALUES (1, 10, 'c1'), (2, 20, 'c2'), (3, 30, 'c3'), (4, 40, 'c4'), (5, 50, 'c5')").await;
+    exec(&sql_context, "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, c VARCHAR) AS SELECT * FROM (VALUES (1, 100, 'c11'), (3, 300, 'c33'), (5, 500, 'c55'), (7, 700, 'c77'), (9, 900, 'c99')) AS t(a, b, c)").await;
 
-    exec(&handler,
+    exec(&sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a \
+         USING paimon.test_db.source s ON t.a = s.a \
          WHEN MATCHED AND t.a = 5 THEN UPDATE SET b = s.b + t.b \
          WHEN MATCHED AND s.c > 'c2' THEN UPDATE SET a = s.a, b = s.b, c = s.c \
          WHEN MATCHED THEN DELETE \
@@ -982,7 +995,7 @@ async fn test_multiple_matched_clauses() {
     // a=7: not matched, c='c77' not > 'c9' → INSERT *
     // a=9: not matched, c='c99' > 'c9' → INSERT with b=990
     assert_eq!(
-        query_abc(&handler).await,
+        query_abc(&sql_context).await,
         vec![
             (2, 20, "c2".into()),
             (3, 300, "c33".into()),
@@ -998,89 +1011,92 @@ async fn test_multiple_matched_clauses() {
 
 #[tokio::test]
 async fn test_partitioned_update_single_partition() {
-    let (_tmp, handler) = setup_partitioned().await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, pt INT) AS VALUES (1, 100, 1)",
+    let (_tmp, sql_context) = setup_partitioned().await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
     assert_eq!(
-        query_a_b_pt(&handler).await,
+        query_a_b_pt(&sql_context).await,
         vec![(1, 100, 1), (2, 20, 1), (3, 30, 2), (4, 40, 2),]
     );
 }
 
 #[tokio::test]
 async fn test_partitioned_update_multiple_partitions() {
-    let (_tmp, handler) = setup_partitioned().await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, pt INT) AS VALUES (1, 100, 1), (3, 300, 2)",
+    let (_tmp, sql_context) = setup_partitioned().await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1), (3, 300, 2)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
     assert_eq!(
-        query_a_b_pt(&handler).await,
+        query_a_b_pt(&sql_context).await,
         vec![(1, 100, 1), (2, 20, 1), (3, 300, 2), (4, 40, 2),]
     );
 }
 
 #[tokio::test]
 async fn test_partitioned_delete() {
-    let (_tmp, handler) = setup_partitioned().await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, pt INT) AS VALUES (1, 1), (3, 2)",
+    let (_tmp, sql_context) = setup_partitioned().await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, pt INT) AS SELECT * FROM (VALUES (1, 1), (3, 2)) AS t(a, pt)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN DELETE",
     )
     .await;
 
-    assert_eq!(query_a_b_pt(&handler).await, vec![(2, 20, 1), (4, 40, 2),]);
+    assert_eq!(
+        query_a_b_pt(&sql_context).await,
+        vec![(2, 20, 1), (4, 40, 2),]
+    );
 }
 
 #[tokio::test]
 async fn test_partitioned_insert_new_partition() {
-    let (_tmp, handler) = setup_partitioned().await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, pt INT) AS VALUES (5, 50, 3), (6, 60, 3)",
+    let (_tmp, sql_context) = setup_partitioned().await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (5, 50, 3), (6, 60, 3)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN NOT MATCHED THEN INSERT (a, b, pt) VALUES (s.a, s.b, s.pt)",
     )
     .await;
 
     assert_eq!(
-        query_a_b_pt(&handler).await,
+        query_a_b_pt(&sql_context).await,
         vec![
             (1, 10, 1),
             (2, 20, 1),
@@ -1094,60 +1110,60 @@ async fn test_partitioned_insert_new_partition() {
 
 #[tokio::test]
 async fn test_partitioned_update_and_insert() {
-    let (_tmp, handler) = setup_partitioned().await;
-    ctx_exec(
-        &handler,
-        "CREATE TABLE source (a INT, b INT, pt INT) AS VALUES (1, 100, 1), (5, 50, 2)",
+    let (_tmp, sql_context) = setup_partitioned().await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1), (5, 50, 2)) AS t(a, b, pt)",
     )
     .await;
 
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING source s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.source s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b \
          WHEN NOT MATCHED THEN INSERT (a, b, pt) VALUES (s.a, s.b, s.pt)",
     )
     .await;
 
     assert_eq!(
-        query_a_b_pt(&handler).await,
+        query_a_b_pt(&sql_context).await,
         vec![(1, 100, 1), (2, 20, 1), (3, 30, 2), (4, 40, 2), (5, 50, 2),]
     );
 }
 
 #[tokio::test]
 async fn test_partitioned_successive_merges() {
-    let (_tmp, handler) = setup_partitioned().await;
+    let (_tmp, sql_context) = setup_partitioned().await;
 
-    ctx_exec(
-        &handler,
-        "CREATE TABLE src1 (a INT, b INT, pt INT) AS VALUES (1, 100, 1)",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src1 (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1)) AS t(a, b, pt)",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING src1 s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.src1 s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
-    ctx_exec(
-        &handler,
-        "CREATE TABLE src2 (a INT, b INT, pt INT) AS VALUES (3, 300, 2)",
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src2 (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (3, 300, 2)) AS t(a, b, pt)",
     )
     .await;
     exec(
-        &handler,
+        &sql_context,
         "MERGE INTO paimon.test_db.target t \
-         USING src2 s ON t.a = s.a AND t.pt = s.pt \
+         USING paimon.test_db.src2 s ON t.a = s.a AND t.pt = s.pt \
          WHEN MATCHED THEN UPDATE SET b = s.b",
     )
     .await;
 
     assert_eq!(
-        query_a_b_pt(&handler).await,
+        query_a_b_pt(&sql_context).await,
         vec![(1, 100, 1), (2, 20, 1), (3, 300, 2), (4, 40, 2),]
     );
 }

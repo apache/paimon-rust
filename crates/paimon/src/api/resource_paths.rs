@@ -32,6 +32,7 @@ impl ResourcePaths {
     const DATABASES: &'static str = "databases";
     const TABLES: &'static str = "tables";
     const TABLE_DETAILS: &'static str = "table-details";
+    const PARTITIONS: &'static str = "partitions";
 
     /// Create a new ResourcePaths with the given prefix.
     pub fn new(prefix: &str) -> Self {
@@ -153,6 +154,19 @@ impl ResourcePaths {
             RESTUtil::encode_string(database_name),
             Self::TABLES,
             RESTUtil::encode_string(table_name)
+        )
+    }
+
+    /// Get the partitions endpoint path for a table.
+    pub fn partitions(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/{}/{}/{}/{}/{}",
+            self.base_path,
+            Self::DATABASES,
+            RESTUtil::encode_string(database_name),
+            Self::TABLES,
+            RESTUtil::encode_string(table_name),
+            Self::PARTITIONS
         )
     }
 }
