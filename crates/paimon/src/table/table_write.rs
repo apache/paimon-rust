@@ -926,7 +926,7 @@ mod tests {
             None,
         );
 
-        TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        TableWrite::new(&table, "test-user".to_string()).unwrap();
     }
 
     #[tokio::test]
@@ -952,7 +952,7 @@ mod tests {
             None,
         );
 
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
         let err = table_write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
@@ -987,7 +987,7 @@ mod tests {
             None,
         );
 
-        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
         let err = table_write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await

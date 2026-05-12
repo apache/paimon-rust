@@ -79,9 +79,9 @@ async fn test_pk_basic_write_read() {
 /// Partial-update merge engine: keep latest non-null value for each field.
 #[tokio::test]
 async fn test_pk_partial_update_fixed_bucket_e2e() {
-    let (_tmp, handler) = setup_handler().await;
+    let (_tmp, sql_context) = setup_sql_context().await;
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_partial_update (
                 id INT NOT NULL, v_int INT, v_str STRING,
@@ -91,7 +91,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_partial_update VALUES
              (1, 10, 'old-1'),
@@ -103,7 +103,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_partial_update VALUES
              (1, CAST(NULL AS INT), 'new-1'),
@@ -116,7 +116,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_partial_update VALUES
              (1, 111, CAST(NULL AS STRING))",
@@ -127,7 +127,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
         .await
         .unwrap();
 
-    let batches = handler
+    let batches = sql_context
         .sql("SELECT id, v_int, v_str FROM paimon.test_db.t_partial_update ORDER BY id")
         .await
         .unwrap()
