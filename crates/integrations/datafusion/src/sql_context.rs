@@ -46,7 +46,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, CreateView, Delete,
     Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
@@ -92,7 +92,8 @@ impl Default for SQLContext {
 impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
-        let ctx = SessionContext::new();
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
         ctx.register_relation_planner(Arc::new(
             crate::relation_planner::PaimonRelationPlanner::new(),
         ))
