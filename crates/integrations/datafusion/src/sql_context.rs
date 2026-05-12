@@ -117,12 +117,17 @@ impl SQLContext {
     ) -> DFResult<()> {
         let catalog_name = catalog_name.into();
         let is_first = self.catalogs.is_empty();
-
-        catalog
-            .create_database("default", true, Default::default())
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
+        let default_db = "default";
+        match catalog.get_database(default_db).await {
+            Ok(_) => {}
+            Err(paimon::Error::DatabaseNotExist { .. }) => {
+                catalog
+                    .create_database(default_db, true, Default::default())
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            }
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        }
         self.ctx.register_catalog(
             &catalog_name,
             Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
@@ -133,7 +138,7 @@ impl SQLContext {
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;
-            self.set_current_database("default").await?;
+            self.set_current_database(default_db).await?;
         }
         Ok(())
     }
