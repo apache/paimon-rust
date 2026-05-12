@@ -284,6 +284,22 @@ pub(super) fn can_push_down_limit_hint_for_scan(
     data_predicates.is_empty() && row_ranges.is_none()
 }
 
+fn should_skip_level_zero_for_scan(
+    scan_all_files: bool,
+    has_primary_keys: bool,
+    deletion_vectors_enabled: bool,
+    merge_engine: crate::Result<crate::spec::MergeEngine>,
+) -> bool {
+    if scan_all_files {
+        return false;
+    }
+    if !has_primary_keys {
+        return false;
+    }
+
+    deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -474,16 +490,12 @@ impl<'a> TableScan<'a> {
         //
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
-        let skip_level_zero = if self.scan_all_files {
-            false
-        } else if has_primary_keys {
-            deletion_vectors_enabled
-                || core_options
-                    .merge_engine()
-                    .is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
-        } else {
-            false
-        };
+        let skip_level_zero = should_skip_level_zero_for_scan(
+            self.scan_all_files,
+            has_primary_keys,
+            deletion_vectors_enabled,
+            core_options.merge_engine(),
+        );
 
         let partition_fields = self.table.schema().partition_fields();
 
@@ -768,7 +780,7 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::TableScan;
+    use super::{should_skip_level_zero_for_scan, TableScan};
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
@@ -984,6 +996,26 @@ mod tests {
             split_file_names(&pruned),
             vec!["a.parquet", "b.parquet", "c.parquet"]
         );
+    }
+
+    #[test]
+    fn test_first_row_skips_level_zero_by_default() {
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::FirstRow),
+        ));
+    }
+
+    #[test]
+    fn test_scan_all_files_disables_first_row_level_zero_skip() {
+        assert!(!should_skip_level_zero_for_scan(
+            true,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::FirstRow),
+        ));
     }
 
     #[test]

@@ -662,6 +662,8 @@ impl TableWrite {
         Ok(FileWriter::KeyValue(KeyValueFileWriter::new(
             self.table.file_io().clone(),
             KeyValueWriteConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
                 table_location: self.table.location().to_string(),
                 partition_path,
                 bucket,
@@ -674,9 +676,15 @@ impl TableWrite {
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),
                 merge_engine: self.merge_engine,
+                dynamic_bucket_enabled: matches!(
+                    self.bucket_assigner,
+                    BucketAssignerEnum::Dynamic(_) | BucketAssignerEnum::CrossPartition(_)
+                ),
+                deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
+                    .deletion_vectors_enabled(),
             },
             next_seq,
-        )))
+        )?))
     }
 }
 
@@ -896,6 +904,97 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
+    }
+
+    #[test]
+    fn test_allows_partial_update_fixed_bucket_table() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_partial_update_table"),
+            "memory:/test_partial_update_table".to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option("merge-engine", "partial-update")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rejects_partial_update_dynamic_bucket_table_when_creating_writer() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partial_update_dynamic_bucket_table";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_partial_update_dynamic_bucket_table"),
+            table_path.to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("merge-engine", "partial-update")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let err = table_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("bucket=-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejects_partial_update_with_deletion_vectors_when_creating_writer() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partial_update_dv_table";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_partial_update_dv_table"),
+            table_path.to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .option("merge-engine", "partial-update")
+                    .option("deletion-vectors.enabled", "true")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string(), false).unwrap();
+        let err = table_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("deletion-vectors.enabled=true"))
+        );
     }
 
     #[tokio::test]

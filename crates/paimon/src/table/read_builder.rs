@@ -342,6 +342,28 @@ mod tests {
         )
     }
 
+    fn partial_update_dv_pk_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .option("deletion-vectors.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "partial_update_dv_t"),
+            "/tmp/test-partial-update-dv-read-builder".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
     #[test]
     fn test_exact_filter_pushdown_is_true_for_partition_only_filter() {
         let table = simple_table();
@@ -698,5 +720,36 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].from(), 0);
         assert_eq!(ranges[0].to(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
+        let table = partial_update_dv_pk_table();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("/tmp/test-partial-update-dv-read-builder/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 1, 0)])
+            .with_data_deletion_files(vec![Some(crate::table::source::DeletionFile::new(
+                "/tmp/test-partial-update-dv-read-builder/index/dv".to_string(),
+                0,
+                0,
+                None,
+            ))])
+            .build()
+            .unwrap();
+        let err = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion vectors")),
+            "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
+        );
     }
 }

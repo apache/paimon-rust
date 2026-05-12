@@ -223,6 +223,7 @@ impl CopyOnWriteMergeWriter {
         let target_file_size = core_options.target_file_size();
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
+        let file_format = core_options.file_format().to_string();
         let write_buffer_size = core_options.write_parquet_buffer_size();
         let file_format = core_options.file_format().to_string();
         let schema_id = schema.id();

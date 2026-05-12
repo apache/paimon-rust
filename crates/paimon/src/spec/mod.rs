@@ -32,6 +32,9 @@ mod core_options;
 pub(crate) use core_options::TimeTravelSelector;
 pub use core_options::*;
 
+mod partial_update;
+pub(crate) use partial_update::PartialUpdateConfig;
+
 mod schema;
 pub use schema::*;
 

@@ -116,10 +116,20 @@ jobs:
           ref: ${{ needs.validate.outputs.source_sha }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup update stable
+          rustup default stable
 
       - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install zstd on Linux
         if: runner.os == 'Linux'
@@ -197,12 +207,16 @@ jobs:
           git push origin "refs/tags/$TAG"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            bindings/go/libpaimon_c.linux.amd64.so.zst
-            bindings/go/libpaimon_c.linux.arm64.so.zst
-            bindings/go/libpaimon_c.darwin.amd64.dylib.zst
-            bindings/go/libpaimon_c.darwin.arm64.dylib.zst
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        working-directory: bindings/go
+        run: |
+          gh release create "$TAG" \
+            --title "Release Go binding $VERSION" \
+            --generate-notes \
+            libpaimon_c.linux.amd64.so.zst \
+            libpaimon_c.linux.arm64.so.zst \
+            libpaimon_c.darwin.amd64.dylib.zst \
+            libpaimon_c.darwin.arm64.dylib.zst

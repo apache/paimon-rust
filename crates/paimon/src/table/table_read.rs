@@ -21,7 +21,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
-use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::spec::{CoreOptions, DataField, MergeEngine, Predicate};
 use crate::DataSplit;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -74,17 +74,18 @@ impl<'a> TableRead<'a> {
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
+        let merge_engine = core_options.merge_engine()?;
 
         // PK table with Deduplicate engine: splits containing level-0 files
         // need KeyValueFileReader for sort-merge dedup; splits with only
         // compacted files (level > 0) can use the faster DataFileReader.
-        // FirstRow engine falls through — scan already skips level-0.
         if has_primary_keys
-            && core_options
-                .merge_engine()
-                .is_ok_and(|e| e == crate::spec::MergeEngine::Deduplicate)
+            && matches!(
+                merge_engine,
+                MergeEngine::Deduplicate | MergeEngine::PartialUpdate
+            )
         {
-            return self.read_pk_deduplicate(data_splits, &core_options);
+            return self.read_pk(data_splits, &core_options);
         }
 
         if core_options.data_evolution_enabled() {
@@ -96,11 +97,15 @@ impl<'a> TableRead<'a> {
 
     /// Read PK table with Deduplicate engine: level-0 splits go through
     /// KeyValueFileReader for sort-merge dedup, compacted splits use DataFileReader.
-    fn read_pk_deduplicate(
+    fn read_pk(
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if core_options.merge_engine()? == MergeEngine::PartialUpdate {
+            return self.read_kv(data_splits, core_options);
+        }
+
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
@@ -134,12 +139,15 @@ impl<'a> TableRead<'a> {
         let reader = KeyValueFileReader::new(
             self.table.file_io.clone(),
             KeyValueReadConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
                 schema_manager: self.table.schema_manager().clone(),
                 table_schema_id: self.table.schema().id(),
                 table_fields: self.table.schema.fields().to_vec(),
                 read_type: self.read_type().to_vec(),
                 predicates: self.data_predicates.clone(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
                     .sequence_fields()
                     .iter()

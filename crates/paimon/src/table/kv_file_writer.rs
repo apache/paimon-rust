@@ -31,7 +31,7 @@ use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     extract_datum_from_arrow, BinaryRowBuilder, DataFileMeta, DataType, MergeEngine,
-    EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    PartialUpdateConfig, EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::Result;
 use arrow_array::{Int64Array, Int8Array, RecordBatch};
@@ -39,6 +39,7 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn, SortOptions};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Internal writer for primary-key tables that buffers data in memory,
@@ -59,6 +60,8 @@ pub(crate) struct KeyValueFileWriter {
 /// Configuration for [`KeyValueFileWriter`], grouping file-location, schema,
 /// and key/merge parameters.
 pub(crate) struct KeyValueWriteConfig {
+    pub table_name: String,
+    pub table_options: HashMap<String, String>,
     pub table_location: String,
     pub partition_path: String,
     pub bucket: i32,
@@ -75,6 +78,8 @@ pub(crate) struct KeyValueWriteConfig {
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
+    pub dynamic_bucket_enabled: bool,
+    pub deletion_vectors_enabled: bool,
 }
 
 impl KeyValueFileWriter {
@@ -82,15 +87,38 @@ impl KeyValueFileWriter {
         file_io: FileIO,
         config: KeyValueWriteConfig,
         next_sequence_number: i64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if config.merge_engine == MergeEngine::PartialUpdate {
+            PartialUpdateConfig::new(&config.table_options)
+                .validate_runtime_mode(true, &config.table_name)?;
+
+            if config.deletion_vectors_enabled {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Table '{}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet",
+                        config.table_name
+                    ),
+                });
+            }
+
+            if config.dynamic_bucket_enabled {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Table '{}' uses merge-engine=partial-update with bucket=-1, which is not supported yet; currently only fixed-bucket partial-update is supported",
+                        config.table_name
+                    ),
+                });
+            }
+        }
+
+        Ok(Self {
             file_io,
             config,
             next_sequence_number,
             buffer: Vec::new(),
             buffer_bytes: 0,
             written_files: Vec::new(),
-        }
+        })
     }
 
     /// Buffer a RecordBatch. Flushes when buffer exceeds write_buffer_size.
@@ -185,16 +213,16 @@ impl KeyValueFileWriter {
                 source: None,
             })?;
 
-        // Deduplicate: for consecutive rows with the same PK, pick the winner.
         // After sorting by PK + seq fields + auto-seq (all ascending):
-        //   Deduplicate → keep last row per key group (highest seq)
-        //   FirstRow    → keep first row per key group (lowest seq)
-        let deduped_indices = self.dedup_sorted_indices(&combined, &sorted_indices)?;
-        let deduped_num_rows = deduped_indices.len();
+        //   Deduplicate   → keep last row per key group (highest seq)
+        //   FirstRow      → keep first row per key group (lowest seq)
+        //   PartialUpdate → keep all rows for read-side field-wise merge
+        let selected_indices = self.select_flush_indices(&combined, &sorted_indices)?;
+        let selected_num_rows = selected_indices.len();
 
-        // Extract min_key / max_key from deduped endpoints.
-        let first_row = deduped_indices[0] as usize;
-        let last_row = deduped_indices[deduped_num_rows - 1] as usize;
+        // Extract min_key / max_key from selected endpoints.
+        let first_row = selected_indices[0] as usize;
+        let last_row = selected_indices[selected_num_rows - 1] as usize;
         let min_key = self.extract_key_binary_row(&combined, first_row)?;
         let max_key = self.extract_key_binary_row(&combined, last_row)?;
 
@@ -231,11 +259,11 @@ impl KeyValueFileWriter {
         )
         .await?;
 
-        // Chunked write using deduped indices.
-        let deduped_u32 = arrow_array::UInt32Array::from(deduped_indices);
-        for chunk_start in (0..deduped_num_rows).step_by(Self::FLUSH_CHUNK_ROWS) {
-            let chunk_len = Self::FLUSH_CHUNK_ROWS.min(deduped_num_rows - chunk_start);
-            let chunk_indices = deduped_u32.slice(chunk_start, chunk_len);
+        // Chunked write using selected indices.
+        let selected_u32 = arrow_array::UInt32Array::from(selected_indices);
+        for chunk_start in (0..selected_num_rows).step_by(Self::FLUSH_CHUNK_ROWS) {
+            let chunk_len = Self::FLUSH_CHUNK_ROWS.min(selected_num_rows - chunk_start);
+            let chunk_indices = selected_u32.slice(chunk_start, chunk_len);
 
             let mut physical_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
             // Sequence numbers for this chunk.
@@ -296,20 +324,20 @@ impl KeyValueFileWriter {
 
         let file_size = writer.close().await? as i64;
 
-        // Compute key_stats on deduped data (not the raw combined batch).
-        let deduped_key_columns: Vec<Arc<dyn arrow_array::Array>> =
-            self.config
-                .primary_key_indices
-                .iter()
-                .map(|&idx| {
-                    arrow_select::take::take(combined.column(idx).as_ref(), &deduped_u32, None)
-                        .map_err(|e| crate::Error::DataInvalid {
-                            message: format!("Failed to take key column for stats: {e}"),
-                            source: None,
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
-        let deduped_key_batch = RecordBatch::try_new(
+        // Compute key_stats on selected output rows (not the raw combined batch).
+        let selected_key_columns: Vec<Arc<dyn arrow_array::Array>> = self
+            .config
+            .primary_key_indices
+            .iter()
+            .map(|&idx| {
+                arrow_select::take::take(combined.column(idx).as_ref(), &selected_u32, None)
+                    .map_err(|e| crate::Error::DataInvalid {
+                        message: format!("Failed to take key column for stats: {e}"),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected_key_batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(
                 self.config
                     .primary_key_indices
@@ -317,15 +345,15 @@ impl KeyValueFileWriter {
                     .map(|&idx| user_schema.field(idx).clone())
                     .collect::<Vec<_>>(),
             )),
-            deduped_key_columns,
+            selected_key_columns,
         )
         .map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to build deduped key batch for stats: {e}"),
+            message: format!("Failed to build selected key batch for stats: {e}"),
             source: None,
         })?;
         let stats_col_indices: Vec<usize> = (0..self.config.primary_key_indices.len()).collect();
         let key_stats = compute_column_stats(
-            &deduped_key_batch,
+            &selected_key_batch,
             &stats_col_indices,
             &self.config.primary_key_types,
         )?;
@@ -334,7 +362,7 @@ impl KeyValueFileWriter {
         let meta = DataFileMeta {
             file_name,
             file_size,
-            row_count: deduped_num_rows as i64,
+            row_count: selected_num_rows as i64,
             min_key,
             max_key,
             key_stats,
@@ -361,7 +389,26 @@ impl KeyValueFileWriter {
         Ok(())
     }
 
-    /// Deduplicate sorted indices by primary key using the configured merge engine.
+    /// Select output row indices from sorted inputs according to merge engine.
+    ///
+    /// Input: `sorted_indices` ordered by PK + seq fields + auto-seq (all ascending).
+    /// Output: row indices to write in sorted PK order.
+    fn select_flush_indices(
+        &self,
+        batch: &RecordBatch,
+        sorted_indices: &arrow_array::UInt32Array,
+    ) -> Result<Vec<u32>> {
+        match self.config.merge_engine {
+            MergeEngine::Deduplicate | MergeEngine::FirstRow => {
+                self.dedup_sorted_indices(batch, sorted_indices)
+            }
+            MergeEngine::PartialUpdate => Ok((0..sorted_indices.len())
+                .map(|idx| sorted_indices.value(idx))
+                .collect()),
+        }
+    }
+
+    /// Deduplicate sorted indices by primary key for Deduplicate / FirstRow engines.
     ///
     /// Input: `sorted_indices` ordered by PK + seq fields + auto-seq (all ascending).
     /// Output: a Vec<u32> of original row indices to keep, in sorted PK order.
@@ -415,6 +462,9 @@ impl KeyValueFileWriter {
                     MergeEngine::Deduplicate => group_winner = cur,
                     // FirstRow: keep first (lowest seq), so don't update.
                     MergeEngine::FirstRow => {}
+                    MergeEngine::PartialUpdate => unreachable!(
+                        "partial-update should use select_flush_indices and skip dedup"
+                    ),
                 }
             } else {
                 // New key group — emit the winner of the previous group.
@@ -472,4 +522,155 @@ pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchem
         }
     }
     Arc::new(ArrowSchema::new(physical_fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::IntType;
+    use arrow_array::{Int32Array, UInt32Array};
+    use std::collections::HashMap;
+
+    fn test_write_config(merge_engine: MergeEngine) -> KeyValueWriteConfig {
+        let mut table_options = HashMap::new();
+        if merge_engine == MergeEngine::PartialUpdate {
+            table_options.insert("merge-engine".to_string(), "partial-update".to_string());
+        }
+
+        KeyValueWriteConfig {
+            table_name: "default.test_table".to_string(),
+            table_options,
+            table_location: "memory:/kv-test".to_string(),
+            partition_path: String::new(),
+            bucket: 0,
+            schema_id: 0,
+            file_compression: "none".to_string(),
+            file_compression_zstd_level: 0,
+            write_buffer_size: 1024,
+            file_format: "parquet".to_string(),
+            primary_key_indices: vec![0],
+            primary_key_types: vec![DataType::Int(IntType::new())],
+            sequence_field_indices: vec![1],
+            merge_engine,
+            dynamic_bucket_enabled: false,
+            deletion_vectors_enabled: false,
+        }
+    }
+
+    fn first_row_writer() -> KeyValueFileWriter {
+        KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            test_write_config(MergeEngine::FirstRow),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_dedup_sorted_indices_keeps_first_row_for_first_row_engine() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new("value", ArrowDataType::Int32, false)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20, 5, 6])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int32Array::from(vec![100, 200, 300, 400])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let sorted_indices = UInt32Array::from(vec![0, 1, 2, 3]);
+
+        let deduped = first_row_writer()
+            .dedup_sorted_indices(&batch, &sorted_indices)
+            .unwrap();
+
+        assert_eq!(deduped, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_select_flush_indices_keeps_all_rows_for_partial_update_engine() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let sorted_indices = UInt32Array::from(vec![0, 1]);
+        let writer = KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            test_write_config(MergeEngine::PartialUpdate),
+            0,
+        )
+        .unwrap();
+
+        let selected = writer
+            .select_flush_indices(&batch, &sorted_indices)
+            .unwrap();
+
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_new_rejects_partial_update_dynamic_bucket() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.dynamic_bucket_enabled = true;
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message } if message.contains("bucket=-1")
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_partial_update_with_deletion_vectors() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.deletion_vectors_enabled = true;
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("deletion-vectors.enabled=true")
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_unsupported_partial_update_options() {
+        let mut config = test_write_config(MergeEngine::PartialUpdate);
+        config.table_options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.price.aggregate-function".to_string(),
+                "last_non_null".to_string(),
+            ),
+        ]);
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("fields.price.aggregate-function")
+        ));
+    }
 }

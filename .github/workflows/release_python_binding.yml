@@ -48,6 +48,8 @@ jobs:
           working-directory: bindings/python
           command: sdist
           args: -o dist
+          before-script-linux: |
+            sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Upload sdist
         uses: actions/upload-artifact@v7
@@ -75,6 +77,59 @@ jobs:
           command: build
           args: --release -o dist
           manylinux: ${{ matrix.manylinux || 'auto' }}
+          before-script-linux: |
+            # Install OpenSSL for x86_64 (manylinux2014 with OpenSSL 1.1)
+            if [ "${{ matrix.target }}" = "x86_64" ]; then
+              yum install -y openssl11-devel
+              # Create symlinks so pkg-config finds openssl11 as openssl
+              ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
+              ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
+              ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
+            fi
+
+            # Install precompiled OpenSSL from Debian packages for aarch64
+            if [ "${{ matrix.target }}" = "aarch64" ]; then
+              set -e
+              echo "Installing OpenSSL for aarch64 from Debian packages..."
+
+              (cd /tmp
+              # Debian Bullseye arm64 packages (OpenSSL 1.1.1)
+              DEBIAN_MIRROR="http://ftp.debian.org/debian/pool/main/o/openssl"
+              curl -sLO "${DEBIAN_MIRROR}/libssl1.1_1.1.1w-0+deb11u1_arm64.deb"
+              curl -sLO "${DEBIAN_MIRROR}/libssl-dev_1.1.1w-0+deb11u1_arm64.deb"
+
+              # Extract .deb packages (ar format)
+              for deb in *.deb; do
+                ar x "$deb"
+                tar xf data.tar.*
+                rm -f debian-binary control.tar.* data.tar.*
+              done
+
+              # Install to maturin's expected location
+              TARGET_DIR="/usr/aarch64-unknown-linux-gnu"
+              mkdir -p "${TARGET_DIR}/include/openssl" "${TARGET_DIR}/lib"
+
+              # Copy main OpenSSL headers (architecture-independent)
+              cp -r usr/include/openssl/* "${TARGET_DIR}/include/openssl/"
+
+              # Overwrite with architecture-specific headers
+              cp -f usr/include/aarch64-linux-gnu/openssl/configuration.h "${TARGET_DIR}/include/openssl/" || true
+              cp -f usr/include/aarch64-linux-gnu/openssl/opensslconf.h "${TARGET_DIR}/include/openssl/" || true
+
+              # Copy libraries
+              cp -a usr/lib/aarch64-linux-gnu/libssl* "${TARGET_DIR}/lib/"
+              cp -a usr/lib/aarch64-linux-gnu/libcrypto* "${TARGET_DIR}/lib/"
+
+              # Verify
+              echo "✓ OpenSSL installed"
+              ls "${TARGET_DIR}/lib/libssl.a" && echo "✓ libssl.a found"
+              ls "${TARGET_DIR}/include/openssl/opensslv.h" && echo "✓ opensslv.h found"
+              ls "${TARGET_DIR}/include/openssl/opensslconf.h" && echo "✓ opensslconf.h found"
+              ) # End subshell
+
+              # Fix ring crate build: define ARM architecture version for aarch64
+              export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+            fi
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7

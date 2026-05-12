@@ -24,11 +24,13 @@
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
 use super::data_file_reader::DataFileReader;
-use super::sort_merge::{DeduplicateMergeFunction, SortMergeReaderBuilder};
+use super::sort_merge::{
+    DeduplicateMergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
+};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataType as PaimonDataType, Predicate, TinyIntType,
+    BigIntType, DataField, DataType as PaimonDataType, MergeEngine, Predicate, TinyIntType,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
@@ -39,6 +41,7 @@ use arrow_array::RecordBatch;
 
 use async_stream::try_stream;
 use futures::StreamExt;
+use std::collections::HashMap;
 
 /// Reads primary-key table data files using sort-merge deduplication.
 pub(crate) struct KeyValueFileReader {
@@ -49,12 +52,15 @@ pub(crate) struct KeyValueFileReader {
 /// Configuration for [`KeyValueFileReader`], grouping table schema and
 /// key/predicate parameters.
 pub(crate) struct KeyValueReadConfig {
+    pub table_name: String,
+    pub table_options: HashMap<String, String>,
     pub schema_manager: SchemaManager,
     pub table_schema_id: i64,
     pub table_fields: Vec<DataField>,
     pub read_type: Vec<DataField>,
     pub predicates: Vec<Predicate>,
     pub primary_keys: Vec<String>,
+    pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
 }
 
@@ -89,6 +95,23 @@ impl KeyValueFileReader {
                 predicates: pk_predicates,
                 ..config
             },
+        }
+    }
+
+    fn new_merge_function(
+        merge_engine: MergeEngine,
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+    ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
+        match merge_engine {
+            MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
+            MergeEngine::PartialUpdate => Ok(Box::new(PartialUpdateMergeFunction::new(
+                table_options,
+                table_name,
+            )?)),
+            MergeEngine::FirstRow => Err(Error::Unsupported {
+                message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
+            }),
         }
     }
 
@@ -234,9 +257,12 @@ impl KeyValueFileReader {
 
         let splits: Vec<DataSplit> = data_splits.to_vec();
         let file_io = self.file_io;
+        let merge_engine = self.config.merge_engine;
         let schema_manager = self.config.schema_manager;
         let table_schema_id = self.config.table_schema_id;
         let table_fields = self.config.table_fields;
+        let table_name = self.config.table_name;
+        let table_options = self.config.table_options;
         let predicates = self.config.predicates;
 
         // Build the merge output schema (keys + values, no system columns).
@@ -252,9 +278,8 @@ impl KeyValueFileReader {
                     .data_deletion_files()
                     .is_some_and(|files| files.iter().any(Option::is_some))
                 {
-                    Err(Error::UnexpectedError {
+                    Err(Error::Unsupported {
                         message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                        source: None,
                     })?;
                 }
 
@@ -303,7 +328,7 @@ impl KeyValueFileReader {
                     user_sequence_indices.clone(),
                     value_indices.clone(),
                     merge_output_schema.clone(),
-                    Box::new(DeduplicateMergeFunction),
+                    Self::new_merge_function(merge_engine, &table_options, &table_name)?,
                 )
                 .build()?;
 

@@ -766,8 +766,8 @@ Columns:
 | `num_added_files` | BIGINT | Number of added data files |
 | `num_deleted_files` | BIGINT | Number of deleted data files |
 | `schema_id` | BIGINT | Schema ID |
-| `min_partition_stats` | STRING | Min partition values |
-| `max_partition_stats` | STRING | Max partition values |
+| `min_partition_stats` | STRING | Minimum partition stats, formatted as a Java row cast string |
+| `max_partition_stats` | STRING | Maximum partition stats, formatted as a Java row cast string |
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
 

@@ -17,6 +17,7 @@
 
 use crate::spec::core_options::CoreOptions;
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
+use crate::spec::PartialUpdateConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -289,6 +290,7 @@ impl Schema {
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
+        PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
 
         Ok(Self {
             fields,
@@ -915,6 +917,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_partial_update_schema_validation_rejects_unsupported_options() {
+        for (key, value) in [
+            ("ignore-delete", "true"),
+            ("fields.value.sequence-group", "g1"),
+            ("fields.default-aggregate-function", "last_non_null"),
+        ] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .option(key, value)
+                .build()
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
+                "partial-update create-time validation should reject '{key}', got {err:?}"
+            );
+        }
     }
 
     #[test]

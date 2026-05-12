@@ -31,7 +31,7 @@ use common::{
     collect_id_name, collect_id_value, create_sql_context, create_test_env, row_count,
     setup_sql_context,
 };
-use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::Catalog;
 
@@ -72,6 +72,106 @@ async fn test_pk_basic_write_read() {
             (1, "alice".to_string()),
             (2, "bob".to_string()),
             (3, "carol".to_string()),
+        ]
+    );
+}
+
+/// Partial-update merge engine: keep latest non-null value for each field.
+#[tokio::test]
+async fn test_pk_partial_update_fixed_bucket_e2e() {
+    let (_tmp, handler) = setup_handler().await;
+
+    handler
+        .sql(
+            "CREATE TABLE paimon.test_db.t_partial_update (
+                id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '1', 'merge-engine' = 'partial-update')",
+        )
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_partial_update VALUES
+             (1, 10, 'old-1'),
+             (2, 20, 'old-2')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_partial_update VALUES
+             (1, CAST(NULL AS INT), 'new-1'),
+             (2, 200, CAST(NULL AS STRING)),
+             (3, 30, CAST(NULL AS STRING))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    handler
+        .sql(
+            "INSERT INTO paimon.test_db.t_partial_update VALUES
+             (1, 111, CAST(NULL AS STRING))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = handler
+        .sql("SELECT id, v_int, v_str FROM paimon.test_db.t_partial_update ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let ints = batch
+            .column_by_name("v_int")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let strs = batch
+            .column_by_name("v_str")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                ids.value(i),
+                if ints.is_null(i) {
+                    None
+                } else {
+                    Some(ints.value(i))
+                },
+                if strs.is_null(i) {
+                    None
+                } else {
+                    Some(strs.value(i).to_string())
+                },
+            ));
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(111), Some("new-1".to_string())),
+            (2, Some(200), Some("old-2".to_string())),
+            (3, Some(30), None),
         ]
     );
 }
