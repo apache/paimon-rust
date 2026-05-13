@@ -17,6 +17,8 @@
 
 //! Paimon system tables end-to-end via DataFusion SQL.
 
+mod common;
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
@@ -544,4 +546,79 @@ async fn test_manifests_system_table() {
         total_rows, expected,
         "$manifests rows should match base + delta + changelog manifest entries of the latest snapshot"
     );
+}
+
+#[tokio::test]
+async fn test_manifests_system_table_partition_stats() {
+    let (_tmp, sql_context) = common::setup_sql_context().await;
+    common::exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.manifest_stats (id INT, pt INT) PARTITIONED BY (pt)",
+    )
+    .await;
+    common::exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.manifest_stats VALUES (1, 1), (2, 2)",
+    )
+    .await;
+
+    let batches = sql_context
+        .sql(
+            "SELECT min_partition_stats, max_partition_stats \
+             FROM paimon.test_db.manifest_stats$manifests",
+        )
+        .await
+        .expect("$manifests query should plan")
+        .collect()
+        .await
+        .expect("$manifests query should execute");
+
+    let mut stats = Vec::new();
+    for batch in &batches {
+        let mins = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("min_partition_stats is Utf8");
+        let maxs = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("max_partition_stats is Utf8");
+        for row in 0..batch.num_rows() {
+            stats.push((
+                (!mins.is_null(row)).then(|| mins.value(row).to_string()),
+                (!maxs.is_null(row)).then(|| maxs.value(row).to_string()),
+            ));
+        }
+    }
+    stats.sort();
+
+    assert!(
+        !stats.is_empty(),
+        "$manifests should return partition stats"
+    );
+
+    let min_partition = stats
+        .iter()
+        .filter_map(|(min, _)| min.as_deref())
+        .map(single_int_partition_stat)
+        .min();
+    let max_partition = stats
+        .iter()
+        .filter_map(|(_, max)| max.as_deref())
+        .map(single_int_partition_stat)
+        .max();
+
+    assert_eq!(min_partition, Some(1));
+    assert_eq!(max_partition, Some(2));
+}
+
+fn single_int_partition_stat(value: &str) -> i32 {
+    value
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .expect("partition stats should use row cast braces")
+        .parse()
+        .expect("partition stats should contain one int partition value")
 }

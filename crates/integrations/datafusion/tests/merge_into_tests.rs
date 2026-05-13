@@ -796,6 +796,37 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 }
 
 #[tokio::test]
+async fn test_merge_into_rejects_duplicate_matched_updates() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    setup_data_evolution_table(&sql_context).await;
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    enable_data_evolution(&sql_context).await;
+
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_dup AS SELECT * FROM (VALUES (1, 'ALICE'), (1, 'ALICIA')) AS t(id, name)",
+    )
+    .await;
+
+    assert_merge_error(
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_dup s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET name = s.name",
+        "duplicate UPDATE",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_rejects_when_matched_delete() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

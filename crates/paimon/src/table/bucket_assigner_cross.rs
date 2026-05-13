@@ -147,19 +147,19 @@ impl GlobalPartitionIndex {
     }
 
     /// Assign a bucket for the given primary key targeting `new_partition`.
-    fn assign(&mut self, pk_bytes: &[u8], new_partition: &[u8]) -> AssignResult {
+    fn assign(&mut self, pk_bytes: &[u8], new_partition: &[u8]) -> Result<AssignResult> {
         if let Some((existing_partition, existing_bucket)) = self.key_to_location.get(pk_bytes) {
             if existing_partition == new_partition {
-                return AssignResult::SamePartition {
+                return Ok(AssignResult::SamePartition {
                     bucket: *existing_bucket,
-                };
+                });
             }
 
             // Key exists in a different partition
             match self.merge_engine {
                 MergeEngine::FirstRow => {
                     // FIRST_ROW: keep old data, discard new row
-                    return AssignResult::Skip;
+                    return Ok(AssignResult::Skip);
                 }
                 MergeEngine::Deduplicate => {
                     let old_partition = existing_partition.clone();
@@ -181,11 +181,16 @@ impl GlobalPartitionIndex {
                     self.key_to_location
                         .insert(pk_bytes.to_vec(), (new_partition.to_vec(), new_bucket));
 
-                    return AssignResult::CrossPartition {
+                    return Ok(AssignResult::CrossPartition {
                         old_partition,
                         old_bucket,
                         new_bucket,
-                    };
+                    });
+                }
+                MergeEngine::PartialUpdate => {
+                    return Err(crate::Error::Unsupported {
+                        message: "CrossPartitionAssigner does not support merge-engine=partial-update yet".to_string(),
+                    });
                 }
             }
         }
@@ -193,7 +198,7 @@ impl GlobalPartitionIndex {
         let bucket = self.assign_bucket_in_partition(new_partition);
         self.key_to_location
             .insert(pk_bytes.to_vec(), (new_partition.to_vec(), bucket));
-        AssignResult::SamePartition { bucket }
+        Ok(AssignResult::SamePartition { bucket })
     }
 
     fn assign_bucket_in_partition(&mut self, partition: &[u8]) -> i32 {
@@ -309,7 +314,7 @@ impl BucketAssigner for CrossPartitionAssigner {
         let mut skips = Vec::new();
 
         for row_idx in 0..num_rows {
-            match global_index.assign(&pk_bytes_vec[row_idx], &partition_bytes_vec[row_idx]) {
+            match global_index.assign(&pk_bytes_vec[row_idx], &partition_bytes_vec[row_idx])? {
                 AssignResult::SamePartition { bucket } => {
                     buckets.push(bucket);
                 }

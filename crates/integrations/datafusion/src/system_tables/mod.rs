@@ -32,6 +32,7 @@ use crate::error::to_datafusion_error;
 mod branches;
 mod manifests;
 mod options;
+mod row_string_cast;
 mod schemas;
 mod snapshots;
 mod tags;
