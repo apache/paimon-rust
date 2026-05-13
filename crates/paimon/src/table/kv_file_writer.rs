@@ -78,7 +78,6 @@ pub(crate) struct KeyValueWriteConfig {
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
-    pub dynamic_bucket_enabled: bool,
     pub deletion_vectors_enabled: bool,
 }
 
@@ -96,15 +95,6 @@ impl KeyValueFileWriter {
                 return Err(crate::Error::Unsupported {
                     message: format!(
                         "Table '{}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet",
-                        config.table_name
-                    ),
-                });
-            }
-
-            if config.dynamic_bucket_enabled {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Table '{}' uses merge-engine=partial-update with bucket=-1, which is not supported yet; currently only fixed-bucket partial-update is supported",
                         config.table_name
                     ),
                 });
@@ -553,7 +543,6 @@ mod tests {
             primary_key_types: vec![DataType::Int(IntType::new())],
             sequence_field_indices: vec![1],
             merge_engine,
-            dynamic_bucket_enabled: false,
             deletion_vectors_enabled: false,
         }
     }
@@ -619,21 +608,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(selected, vec![0, 1]);
-    }
-
-    #[test]
-    fn test_new_rejects_partial_update_dynamic_bucket() {
-        let mut config = test_write_config(MergeEngine::PartialUpdate);
-        config.dynamic_bucket_enabled = true;
-
-        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
-            .err()
-            .unwrap();
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message } if message.contains("bucket=-1")
-        ));
     }
 
     #[test]

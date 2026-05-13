@@ -41,7 +41,7 @@ const HASH_INDEX: &str = "HASH";
 
 /// Read/write hash index files.
 ///
-/// A hash index file is a flat binary file containing `i32` values in little-endian byte order.
+/// A hash index file is a flat binary file containing `i32` values in big-endian byte order.
 /// Each value is the hash code of a primary key that belongs to the associated bucket.
 struct HashIndexFile;
 
