@@ -27,8 +27,6 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ### 0.2.0 (In Development)
 
-Track progress at the [0.2.0 milestone](https://github.com/apache/paimon-rust/milestone/2).
-
 Planned features:
 
 - Primary-key table read/write support with sort-merge deduplication
