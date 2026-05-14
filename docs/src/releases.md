@@ -38,7 +38,7 @@ Planned features:
 
 ## Past Releases
 
-### 0.1.0
+### [0.1.0](https://github.com/apache/paimon-rust/releases/tag/v0.1.0)
 
 The first release of Apache Paimon Rust.
 
