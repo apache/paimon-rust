@@ -98,9 +98,11 @@ impl TableCommit {
         }
 
         let entries = self.messages_to_entries(&commit_messages);
+        let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         self.try_commit(CommitEntriesPlan::Direct {
             entries,
+            changelog_entries,
             new_index_entries,
         })
         .await
@@ -125,6 +127,14 @@ impl TableCommit {
     ) -> Result<()> {
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
+        }
+        if commit_messages
+            .iter()
+            .any(|msg| !msg.new_changelog_files.is_empty())
+        {
+            return Err(crate::Error::Unsupported {
+                message: "overwrite with changelog files is not supported".to_string(),
+            });
         }
 
         let new_entries = self.messages_to_entries(&commit_messages);
@@ -298,7 +308,7 @@ impl TableCommit {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
             let resolved = self.resolve_commit(&plan, &latest_snapshot).await?;
 
-            if resolved.entries.is_empty() {
+            if resolved.entries.is_empty() && resolved.changelog_entries.is_empty() {
                 break;
             }
 
@@ -376,11 +386,15 @@ impl TableCommit {
         let unique_id = uuid::Uuid::new_v4();
         let base_manifest_list_name = format!("manifest-list-{unique_id}-0");
         let delta_manifest_list_name = format!("manifest-list-{unique_id}-1");
+        let changelog_manifest_list_name = format!("manifest-list-{unique_id}-2");
         let new_manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
+        let changelog_manifest_name = format!("manifest-{}-1", uuid::Uuid::new_v4());
 
         let base_manifest_list_path = format!("{manifest_dir}/{base_manifest_list_name}");
         let delta_manifest_list_path = format!("{manifest_dir}/{delta_manifest_list_name}");
+        let changelog_manifest_list_path = format!("{manifest_dir}/{changelog_manifest_list_name}");
         let new_manifest_path = format!("{manifest_dir}/{new_manifest_name}");
+        let changelog_manifest_path = format!("{manifest_dir}/{changelog_manifest_name}");
 
         // Write manifest file
         let new_manifest_file_meta = self
@@ -399,6 +413,32 @@ impl TableCommit {
             &[new_manifest_file_meta],
         )
         .await?;
+
+        let changelog_record_count = if resolved.changelog_entries.is_empty() {
+            None
+        } else {
+            let changelog_manifest_file_meta = self
+                .write_manifest_file(
+                    file_io,
+                    &changelog_manifest_path,
+                    &changelog_manifest_name,
+                    &resolved.changelog_entries,
+                )
+                .await?;
+            ManifestList::write(
+                file_io,
+                &changelog_manifest_list_path,
+                &[changelog_manifest_file_meta],
+            )
+            .await?;
+            Some(
+                resolved
+                    .changelog_entries
+                    .iter()
+                    .map(|entry| entry.file().row_count)
+                    .sum(),
+            )
+        };
 
         // Read existing manifests (base + delta from previous snapshot) and write base manifest list
         let mut total_record_count: i64 = 0;
@@ -441,6 +481,8 @@ impl TableCommit {
             .time_millis(current_time_millis())
             .total_record_count(Some(total_record_count))
             .delta_record_count(Some(delta_record_count))
+            .changelog_manifest_list(changelog_record_count.map(|_| changelog_manifest_list_name))
+            .changelog_record_count(changelog_record_count)
             .next_row_id(next_row_id)
             .index_manifest(resolved.index_manifest_name)
             .build();
@@ -533,6 +575,7 @@ impl TableCommit {
         match plan {
             CommitEntriesPlan::Direct {
                 entries,
+                changelog_entries,
                 new_index_entries,
             } => {
                 if self.row_tracking_enabled {
@@ -576,6 +619,7 @@ impl TableCommit {
 
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
+                    changelog_entries: changelog_entries.clone(),
                     kind,
                     index_manifest_name,
                 })
@@ -613,6 +657,7 @@ impl TableCommit {
 
                 Ok(ResolvedCommit {
                     entries,
+                    changelog_entries: vec![],
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
                 })
@@ -1031,6 +1076,25 @@ impl TableCommit {
             .collect()
     }
 
+    /// Convert commit messages to changelog manifest entries (ADD kind only).
+    fn messages_to_changelog_entries(&self, messages: &[CommitMessage]) -> Vec<ManifestEntry> {
+        messages
+            .iter()
+            .flat_map(|msg| {
+                msg.new_changelog_files.iter().map(|file| {
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        msg.partition.clone(),
+                        msg.bucket,
+                        self.total_buckets,
+                        file.clone(),
+                        2,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Convert commit messages to index manifest entries (ADD kind).
     fn messages_to_index_entries(&self, messages: &[CommitMessage]) -> Vec<IndexManifestEntry> {
         messages
@@ -1056,6 +1120,7 @@ enum CommitEntriesPlan {
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
     Direct {
         entries: Vec<ManifestEntry>,
+        changelog_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
     },
     /// Overwrite with optional partition filter.
@@ -1069,6 +1134,7 @@ enum CommitEntriesPlan {
 /// Fully resolved commit ready for writing.
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
+    changelog_entries: Vec<ManifestEntry>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
 }
@@ -1620,6 +1686,22 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 600 - 300 (delete null) + 50 (add null2) = 350
         assert_eq!(snapshot.total_record_count(), Some(350));
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_rejects_changelog_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_overwrite_changelog_files";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut message = CommitMessage::new(vec![], 0, vec![test_data_file("data.parquet", 1)]);
+        message.new_changelog_files = vec![test_data_file("changelog.parquet", 1)];
+
+        let err = commit.overwrite(vec![message], None).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("changelog files"))
+        );
     }
 
     #[tokio::test]

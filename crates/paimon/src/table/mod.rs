@@ -39,6 +39,7 @@ mod kv_file_reader;
 mod kv_file_writer;
 mod partition_filter;
 mod postpone_file_writer;
+mod prepared_files;
 mod read_builder;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
