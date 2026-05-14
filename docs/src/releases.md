@@ -38,7 +38,7 @@ Planned features:
 
 ## Past Releases
 
-### 0.1.0 (2026-04-24)
+### 0.1.0
 
 The first release of Apache Paimon Rust.
 
