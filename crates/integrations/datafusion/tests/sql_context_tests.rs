@@ -42,6 +42,20 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     ctx
 }
 
+#[tokio::test]
+async fn test_show_tables_is_enabled() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("SHOW TABLES")
+        .await
+        .expect("SHOW TABLES should be planned when information_schema is enabled")
+        .collect()
+        .await
+        .expect("SHOW TABLES should execute");
+}
+
 // ======================= CREATE / DROP SCHEMA =======================
 
 #[tokio::test]
