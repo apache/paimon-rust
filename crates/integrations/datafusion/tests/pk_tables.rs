@@ -1460,9 +1460,9 @@ async fn test_pk_partitioned_multi_bucket() {
 
 // ======================= Error Cases =======================
 
-/// PK table with changelog-producer=input should be rejected.
+/// PK table with changelog-producer=input should write through DataFusion SQL.
 #[tokio::test]
-async fn test_pk_reject_changelog_producer_input() {
+async fn test_pk_input_changelog_write_read() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
     sql_context
@@ -1475,18 +1475,24 @@ async fn test_pk_reject_changelog_producer_input() {
         .await
         .unwrap();
 
-    let result = sql_context
-        .sql("INSERT INTO paimon.test_db.t_changelog VALUES (1, 'alice')")
-        .await;
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_changelog VALUES
+                (1, 'alice'), (1, 'bob'), (2, 'carol')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
-    let is_err = match result {
-        Err(_) => true,
-        Ok(df) => df.collect().await.is_err(),
-    };
-    assert!(
-        is_err,
-        "PK table with changelog-producer=input should reject writes"
-    );
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.t_changelog ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(rows, vec![(1, "bob".to_string()), (2, "carol".to_string())]);
 }
 
 // ======================= String Primary Key =======================
