@@ -29,6 +29,7 @@ keywords = ["paimon", "datafusion", "integrations"]
 
 [features]
 fulltext = ["paimon/fulltext"]
+vortex = ["paimon/vortex"]
 
 [dependencies]
 async-trait = "0.1"

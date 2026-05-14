@@ -54,9 +54,24 @@ pub async fn setup_sql_context() -> (TempDir, SQLContext) {
 
 #[allow(dead_code)]
 pub async fn collect_id_name(sql_context: &SQLContext, sql: &str) -> Vec<(i32, String)> {
+    let mut rows = collect_id_name_in_batch_order(sql_context, sql).await;
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+#[allow(dead_code)]
+pub async fn collect_id_name_in_batch_order(
+    sql_context: &SQLContext,
+    sql: &str,
+) -> Vec<(i32, String)> {
     let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    collect_id_name_from_batches_in_order(&batches)
+}
+
+#[allow(dead_code)]
+pub fn collect_id_name_from_batches_in_order(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     let mut rows = Vec::new();
-    for batch in &batches {
+    for batch in batches {
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -69,7 +84,6 @@ pub async fn collect_id_name(sql_context: &SQLContext, sql: &str) -> Vec<(i32, S
             rows.push((ids.value(i), names.value(i).to_string()));
         }
     }
-    rows.sort_by_key(|(id, _)| *id);
     rows
 }
 

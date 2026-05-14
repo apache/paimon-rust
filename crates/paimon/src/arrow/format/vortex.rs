@@ -21,7 +21,7 @@ use crate::spec::{DataField, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::StreamExt;
@@ -472,7 +472,7 @@ fn vortex_array_to_record_batch(
     schema: &SchemaRef,
 ) -> crate::Result<RecordBatch> {
     let arrow_array = vortex_array
-        .into_arrow_preferred()
+        .into_arrow(&ArrowDataType::Struct(schema.fields().clone()))
         .map_err(|e| Error::DataInvalid {
             message: format!("Failed to convert Vortex array to Arrow: {e}"),
             source: None,
@@ -485,6 +485,17 @@ fn vortex_array_to_record_batch(
             message: "Vortex array did not convert to Arrow StructArray".to_string(),
             source: None,
         })?;
+
+    if struct_array.columns().len() != schema.fields().len() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Vortex column count {} does not match target schema column count {}",
+                struct_array.columns().len(),
+                schema.fields().len()
+            ),
+            source: None,
+        });
+    }
 
     RecordBatch::try_new(schema.clone(), struct_array.columns().to_vec()).map_err(|e| {
         Error::DataInvalid {
@@ -680,7 +691,8 @@ mod tests {
     use super::*;
     use crate::arrow::format::FormatFileWriter;
     use crate::io::FileIOBuilder;
-    use arrow_array::Int32Array;
+    use crate::spec::{DataField, DataType, VarCharType};
+    use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
     fn test_arrow_schema() -> Arc<ArrowSchema> {
@@ -756,6 +768,78 @@ mod tests {
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_vortex_reader_returns_utf8_for_string_schema() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_vortex_utf8_schema.vortex";
+        let output = file_io.new_output(path).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            VortexFormatWriter::new(&output, schema.clone())
+                .await
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let metadata = input.metadata().await.unwrap();
+        let read_fields = vec![
+            DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(crate::spec::IntType::new()),
+            ),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+
+        let reader = VortexFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                metadata.size,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut names = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            assert_eq!(batch.schema().field(1).data_type(), &ArrowDataType::Utf8);
+            assert_eq!(batch.column(1).data_type(), &ArrowDataType::Utf8);
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                names.push(name_col.value(i).to_string());
+            }
+        }
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
     }
 
     #[tokio::test]
