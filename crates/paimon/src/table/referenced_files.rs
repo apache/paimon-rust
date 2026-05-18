@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Collect per-snapshot file size summaries for all snapshots of a table.
+//! Collect deduplicated referenced file size summaries for all snapshots of a table.
 //!
 //! Reference: [LocalOrphanFilesClean](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/LocalOrphanFilesClean.java)
 
@@ -28,12 +28,17 @@ use crate::table::{BranchManager, SnapshotManager, TagManager};
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
-/// Per-scope aggregated summary of referenced files.
+/// Per-scope aggregated summary of referenced files (deduplicated).
 ///
-/// Each row represents the total referenced files for a scope:
+/// Each row represents the unique referenced files for a scope:
 /// - `"total"`: all snapshots across all branches and tags
-/// - `"main"`: main branch snapshots + tags
+/// - `"branch:main"`: main branch snapshots + tags
 /// - `"branch:<name>"`: a specific branch
+///
+/// Files are deduplicated by file name within each scope, so the sum
+/// represents actual disk usage that is still referenced (protected from cleanup).
+/// Both ADD and DELETE manifest entries are included since both reference
+/// physical files that cannot be removed until the snapshot expires.
 #[derive(Debug, Clone, Default)]
 pub struct ReferencedFilesSummary {
     pub source: String,
@@ -45,35 +50,62 @@ pub struct ReferencedFilesSummary {
     pub index_file_size: i64,
 }
 
-impl ReferencedFilesSummary {
-    fn accumulate(&mut self, other: &ReferencedFilesSummary) {
-        self.manifest_file_count += other.manifest_file_count;
-        self.manifest_file_size += other.manifest_file_size;
-        self.data_file_count += other.data_file_count;
-        self.data_file_size += other.data_file_size;
-        self.index_file_count += other.index_file_count;
-        self.index_file_size += other.index_file_size;
+/// Deduplicated file set for a scope, keyed by file name.
+#[derive(Default)]
+struct ScopeFileSet {
+    manifest_files: HashMap<String, i64>,
+    data_files: HashMap<String, i64>,
+    index_files: HashMap<String, i64>,
+}
+
+impl ScopeFileSet {
+    fn to_summary(&self, source: &str) -> ReferencedFilesSummary {
+        ReferencedFilesSummary {
+            source: source.to_string(),
+            manifest_file_count: self.manifest_files.len() as i64,
+            manifest_file_size: self.manifest_files.values().sum(),
+            data_file_count: self.data_files.len() as i64,
+            data_file_size: self.data_files.values().sum(),
+            index_file_count: self.index_files.len() as i64,
+            index_file_size: self.index_files.values().sum(),
+        }
+    }
+
+    fn merge(&mut self, other: &ScopeFileSet) {
+        for (k, v) in &other.manifest_files {
+            self.manifest_files.entry(k.clone()).or_insert(*v);
+        }
+        for (k, v) in &other.data_files {
+            self.data_files.entry(k.clone()).or_insert(*v);
+        }
+        for (k, v) in &other.index_files {
+            self.index_files.entry(k.clone()).or_insert(*v);
+        }
     }
 }
 
 const SNAPSHOT_CONCURRENCY: usize = 32;
 
-/// Cached (data_file_count, data_file_size) per manifest file full path.
-type ManifestCache = Mutex<HashMap<String, (i64, i64)>>;
+/// Cached data file entries (file_name, file_size) per manifest file full path.
+type ManifestCache = Mutex<HashMap<String, Vec<(String, i64)>>>;
 
-/// Collect per-scope referenced file size summaries for a table.
+/// Collect per-scope deduplicated referenced file size summaries for a table.
 ///
 /// Returns rows:
-/// 1. `"total"` — union of all snapshots from main branch, tags, and branches
-/// 2. `"main"` — main branch snapshots + tag snapshots
+/// 1. `"total"` — union of all referenced files from main branch, tags, and branches
+/// 2. `"branch:main"` — main branch snapshots + tag snapshots
 /// 3. `"branch:<name>"` — one row per branch
 ///
 /// Snapshots are processed concurrently (up to 32 at a time). Within each
 /// snapshot, manifest list and manifest file reads are also concurrent.
 /// A shared cache avoids re-reading the same manifest file across snapshots.
 ///
-/// Manifest files that have been deleted by concurrent cleanup are gracefully
-/// skipped (treated as contributing 0 files/bytes).
+/// Files are deduplicated by name within each scope to produce an accurate
+/// count of unique referenced files. Both ADD and DELETE entries are included
+/// since both reference physical files protected from cleanup.
+///
+/// Manifest list files and index manifest files are counted as manifest files,
+/// consistent with `physical_files_size` classification.
 pub async fn collect_referenced_files_summary(
     file_io: &FileIO,
     table_location: &str,
@@ -83,118 +115,109 @@ pub async fn collect_referenced_files_summary(
 
     // 1. Main branch snapshots + tags
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string());
-    let mut main_summary =
-        collect_scope_summary(file_io, &sm, "branch:main", manifest_cache_ref).await?;
+    let mut main_files = collect_scope_files(file_io, &sm, manifest_cache_ref).await?;
 
     let tm = TagManager::new(file_io.clone(), table_location.to_string());
-    let tag_summary = collect_tag_scope_summary(file_io, &sm, &tm, manifest_cache_ref).await?;
-    main_summary.accumulate(&tag_summary);
+    let tag_files = collect_tag_files(file_io, &sm, &tm, manifest_cache_ref).await?;
+    main_files.merge(&tag_files);
 
-    // 2. Branch summaries
+    // 2. Branch file sets
     let bm = BranchManager::new(file_io.clone(), table_location.to_string());
     let branch_names = bm.list_all().await?;
-    let mut branch_summaries = Vec::new();
+    let mut branch_file_sets = Vec::new();
     for branch_name in &branch_names {
         let branch_sm = sm.with_branch(branch_name);
-        let branch_summary = collect_scope_summary(
-            file_io,
-            &branch_sm,
-            &format!("branch:{branch_name}"),
-            manifest_cache_ref,
-        )
-        .await?;
-        branch_summaries.push(branch_summary);
+        let branch_files = collect_scope_files(file_io, &branch_sm, manifest_cache_ref).await?;
+        branch_file_sets.push((branch_name.clone(), branch_files));
     }
 
     // 3. Assemble output: total, main, branches
-    let mut total = ReferencedFilesSummary {
-        source: "total".to_string(),
-        ..Default::default()
-    };
-    total.accumulate(&main_summary);
-    for bs in &branch_summaries {
-        total.accumulate(bs);
+    let mut total_files = ScopeFileSet::default();
+    total_files.merge(&main_files);
+    for (_, bs) in &branch_file_sets {
+        total_files.merge(bs);
     }
 
-    let mut result = vec![total, main_summary];
-    result.extend(branch_summaries);
+    let mut result = vec![
+        total_files.to_summary("total"),
+        main_files.to_summary("branch:main"),
+    ];
+    for (name, files) in &branch_file_sets {
+        result.push(files.to_summary(&format!("branch:{name}")));
+    }
     Ok(result)
 }
 
-async fn collect_scope_summary(
+async fn collect_scope_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
-    source: &str,
     manifest_cache: &ManifestCache,
-) -> crate::Result<ReferencedFilesSummary> {
+) -> crate::Result<ScopeFileSet> {
     let snapshot_ids = sm.list_all_ids().await?;
 
-    let per_snapshot: Vec<Option<ReferencedFilesSummary>> = stream::iter(snapshot_ids)
+    let per_snapshot: Vec<Option<ScopeFileSet>> = stream::iter(snapshot_ids)
         .map(|snapshot_id| {
             let sm = sm.clone();
             async move {
-                collect_single_snapshot_summary(file_io, &sm, snapshot_id, manifest_cache).await
+                collect_single_snapshot_files(file_io, &sm, snapshot_id, manifest_cache).await
             }
         })
         .buffer_unordered(SNAPSHOT_CONCURRENCY)
         .try_collect()
         .await?;
 
-    let mut summary = ReferencedFilesSummary {
-        source: source.to_string(),
-        ..Default::default()
-    };
-    for s in per_snapshot.into_iter().flatten() {
-        summary.accumulate(&s);
+    let mut merged = ScopeFileSet::default();
+    for fs in per_snapshot.into_iter().flatten() {
+        merged.merge(&fs);
     }
-    Ok(summary)
+    Ok(merged)
 }
 
-async fn collect_tag_scope_summary(
+async fn collect_tag_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
     tm: &TagManager,
     manifest_cache: &ManifestCache,
-) -> crate::Result<ReferencedFilesSummary> {
+) -> crate::Result<ScopeFileSet> {
     let tag_names = tm.list_all_names().await?;
-    let mut summary = ReferencedFilesSummary::default();
+    let mut merged = ScopeFileSet::default();
 
     for tag_name in &tag_names {
         let snapshot = match tm.get(tag_name).await? {
             Some(s) => s,
             None => continue,
         };
-        if let Some(s) = collect_snapshot_summary(file_io, sm, &snapshot, manifest_cache).await? {
-            summary.accumulate(&s);
+        if let Some(fs) = collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await? {
+            merged.merge(&fs);
         }
     }
 
-    Ok(summary)
+    Ok(merged)
 }
 
-async fn collect_single_snapshot_summary(
+async fn collect_single_snapshot_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
     snapshot_id: i64,
     manifest_cache: &ManifestCache,
-) -> crate::Result<Option<ReferencedFilesSummary>> {
+) -> crate::Result<Option<ScopeFileSet>> {
     let snapshot = match try_get_snapshot(sm, snapshot_id).await? {
         Some(s) => s,
         None => return Ok(None),
     };
 
-    collect_snapshot_summary(file_io, sm, &snapshot, manifest_cache).await
+    collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await
 }
 
-async fn collect_snapshot_summary(
+async fn collect_snapshot_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
     snapshot: &crate::spec::Snapshot,
     manifest_cache: &ManifestCache,
-) -> crate::Result<Option<ReferencedFilesSummary>> {
-    let mut summary = ReferencedFilesSummary::default();
+) -> crate::Result<Option<ScopeFileSet>> {
+    let mut file_set = ScopeFileSet::default();
 
-    // Collect manifest list file names
+    // Collect manifest list file names (these are manifest-type files themselves)
     let mut manifest_list_names = vec![
         snapshot.base_manifest_list().to_string(),
         snapshot.delta_manifest_list().to_string(),
@@ -203,27 +226,41 @@ async fn collect_snapshot_summary(
         manifest_list_names.push(cl.to_string());
     }
 
-    // Pre-compute paths so futures can borrow them
+    // Pre-compute paths
     let manifest_list_paths: Vec<String> = manifest_list_names
         .iter()
         .map(|name| sm.manifest_path(name))
         .collect();
 
-    // Read all manifest lists concurrently
+    // Read all manifest lists concurrently and record their sizes
     let manifest_list_futures: Vec<_> = manifest_list_paths
         .iter()
-        .map(|path| try_read_manifest_list(file_io, path))
+        .map(|path| try_read_manifest_list_with_size(file_io, path))
         .collect();
-    let manifest_lists = try_join_all(manifest_list_futures).await?;
+    let manifest_list_results = try_join_all(manifest_list_futures).await?;
+
+    // Register manifest list files themselves as manifest files
+    for (name, (_, size)) in manifest_list_names.iter().zip(&manifest_list_results) {
+        if *size > 0 {
+            file_set.manifest_files.entry(name.clone()).or_insert(*size);
+        }
+    }
 
     // Flatten all manifest file metas from all manifest lists
-    let all_manifest_metas: Vec<&ManifestFileMeta> =
-        manifest_lists.iter().flat_map(|ml| ml.iter()).collect();
+    let all_manifest_metas: Vec<&ManifestFileMeta> = manifest_list_results
+        .iter()
+        .flat_map(|(metas, _)| metas.iter())
+        .collect();
 
-    summary.manifest_file_count = all_manifest_metas.len() as i64;
-    summary.manifest_file_size = all_manifest_metas.iter().map(|m| m.file_size()).sum();
+    // Register manifest files
+    for meta in &all_manifest_metas {
+        file_set
+            .manifest_files
+            .entry(meta.file_name().to_string())
+            .or_insert(meta.file_size());
+    }
 
-    // Read manifest files to get data file stats, using cache by full path
+    // Read manifest files to get data file entries, using cache by full path
     let manifest_paths: Vec<String> = all_manifest_metas
         .iter()
         .map(|meta| sm.manifest_path(meta.file_name()))
@@ -239,7 +276,6 @@ async fn collect_snapshot_summary(
         .map(|(i, _)| i)
         .collect();
 
-    // Only read manifests not yet in cache
     if !uncached_indices.is_empty() {
         let uncached_paths: Vec<&str> = uncached_indices
             .iter()
@@ -252,37 +288,51 @@ async fn collect_snapshot_summary(
             .collect();
         let results = try_join_all(manifest_futures).await?;
 
-        // Store results in cache
         let mut cache = manifest_cache.lock().unwrap();
         for (path, entries) in uncached_paths.into_iter().zip(results) {
-            let count = entries.len() as i64;
-            let size: i64 = entries.iter().map(|e| e.file().file_size).sum();
-            cache.insert(path.to_string(), (count, size));
+            let file_entries: Vec<(String, i64)> = entries
+                .iter()
+                .map(|e| (e.file().file_name.clone(), e.file().file_size))
+                .collect();
+            cache.insert(path.to_string(), file_entries);
         }
     }
 
-    // Aggregate from cache
+    // Collect data files from cache (deduplicated by HashMap key)
     {
         let cache = manifest_cache.lock().unwrap();
         for path in &manifest_paths {
-            if let Some(&(count, size)) = cache.get(path.as_str()) {
-                summary.data_file_count += count;
-                summary.data_file_size += size;
+            if let Some(entries) = cache.get(path.as_str()) {
+                for (name, size) in entries {
+                    file_set.data_files.entry(name.clone()).or_insert(*size);
+                }
             }
         }
     }
 
     // Read index manifest if present
     if let Some(index_manifest_name) = snapshot.index_manifest() {
-        let index_path = sm.manifest_path(index_manifest_name);
-        let index_entries = try_read_index_manifest(file_io, &index_path).await?;
-        for entry in &index_entries {
-            summary.index_file_count += 1;
-            summary.index_file_size += entry.index_file.file_size as i64;
+        // The index manifest file itself is a manifest-type file
+        let index_manifest_path = sm.manifest_path(index_manifest_name);
+        let index_entries =
+            try_read_index_manifest_with_size(file_io, &index_manifest_path).await?;
+
+        if index_entries.1 > 0 {
+            file_set
+                .manifest_files
+                .entry(index_manifest_name.to_string())
+                .or_insert(index_entries.1);
+        }
+
+        for entry in &index_entries.0 {
+            file_set
+                .index_files
+                .entry(entry.index_file.file_name.clone())
+                .or_insert(entry.index_file.file_size as i64);
         }
     }
 
-    Ok(Some(summary))
+    Ok(Some(file_set))
 }
 
 async fn try_get_snapshot(
@@ -305,17 +355,22 @@ async fn try_get_snapshot(
     }
 }
 
-async fn try_read_manifest_list(
+/// Read a manifest list file. Returns (entries, file_size_in_bytes).
+async fn try_read_manifest_list_with_size(
     file_io: &FileIO,
     path: &str,
-) -> crate::Result<Vec<ManifestFileMeta>> {
+) -> crate::Result<(Vec<ManifestFileMeta>, i64)> {
     let input = file_io.new_input(path)?;
     match input.read().await {
-        Ok(bytes) => crate::spec::avro::from_avro_bytes_fast(&bytes),
+        Ok(bytes) => {
+            let size = bytes.len() as i64;
+            let metas = crate::spec::avro::from_avro_bytes_fast(&bytes)?;
+            Ok((metas, size))
+        }
         Err(crate::Error::IoUnexpected { ref source, .. })
             if source.kind() == opendal::ErrorKind::NotFound =>
         {
-            Ok(Vec::new())
+            Ok((Vec::new(), 0))
         }
         Err(e) => Err(e),
     }
@@ -333,16 +388,17 @@ async fn try_read_manifest(file_io: &FileIO, path: &str) -> crate::Result<Vec<Ma
     }
 }
 
-async fn try_read_index_manifest(
+/// Read an index manifest file. Returns (entries, file_size_in_bytes).
+async fn try_read_index_manifest_with_size(
     file_io: &FileIO,
     path: &str,
-) -> crate::Result<Vec<crate::spec::IndexManifestEntry>> {
-    match IndexManifest::read(file_io, path).await {
-        Ok(entries) => Ok(entries),
+) -> crate::Result<(Vec<crate::spec::IndexManifestEntry>, i64)> {
+    match IndexManifest::read_with_size(file_io, path).await {
+        Ok(result) => Ok(result),
         Err(crate::Error::IoUnexpected { ref source, .. })
             if source.kind() == opendal::ErrorKind::NotFound =>
         {
-            Ok(Vec::new())
+            Ok((Vec::new(), 0))
         }
         Err(e) => Err(e),
     }
@@ -480,10 +536,11 @@ mod tests {
     #[tokio::test]
     async fn test_collect_empty_table() {
         let file_io = test_file_io();
-        let result = collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
-            .await
-            .unwrap();
-        // total + main
+        let result =
+            collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
+                .await
+                .unwrap();
+        // total + branch:main
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source, "total");
         assert_eq!(result[0].data_file_count, 0);
@@ -523,7 +580,7 @@ mod tests {
         let result = collect_referenced_files_summary(&file_io, table_path)
             .await
             .unwrap();
-        // total + main
+        // total + branch:main
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source, "total");
         assert_eq!(result[0].manifest_file_count, 0);
