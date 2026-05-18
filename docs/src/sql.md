@@ -539,7 +539,7 @@ The function searches across all Tantivy full-text index files for the target co
 
 ## Referenced Files Size
 
-The `referenced_files_size` table-valued function computes aggregated file size summaries for all snapshots referenced by a table, including snapshots from the main branch, tags, and other branches. This is useful for understanding storage usage and for orphan file cleanup.
+The `referenced_files_size` table-valued function computes aggregated manifest/data/index file size summaries for all snapshots referenced by a table, including snapshots from the main branch, tags, and other branches. This is useful for understanding storage usage and for orphan file analysis.
 
 Historical snapshots may be in the process of being cleaned up — if a manifest file has already been deleted, it is gracefully skipped (counted as 0 files/bytes).
 
@@ -597,9 +597,9 @@ WHERE source = 'total';
 The `physical_files_size` table-valued function scans the table directory recursively and computes the total size of all physical files on disk, categorized by file type. By comparing with `referenced_files_size`, you can identify orphan files that are no longer referenced by any snapshot.
 
 Files are classified by their file name prefix:
-- `manifest-*` / `manifest-list-*` / `index-manifest-*` → manifest
-- `data-*` → data
+- `manifest-*` / `index-manifest-*` → manifest
 - `index-*` (excluding `index-manifest-*`) → index
+- Everything else → data
 
 ### Registration
 

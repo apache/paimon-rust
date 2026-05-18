@@ -122,7 +122,12 @@ impl ExtraFileResolver {
         partition_bytes: &[u8],
         bucket: i32,
         extra_file_name: &str,
+        external_path: Option<&str>,
     ) -> Option<String> {
+        if let Some(ext_path) = external_path {
+            let dir = ext_path.trim_end_matches('/');
+            return Some(format!("{}/{}", dir, extra_file_name));
+        }
         let partition_path = if let Some(ref computer) = self.partition_computer {
             let row = BinaryRow::from_serialized_bytes(partition_bytes).ok()?;
             computer.generate_partition_path(&row).ok()?
@@ -425,8 +430,12 @@ async fn collect_snapshot_files(
                 file_entries.push((e.file().file_name.clone(), e.file().file_size));
                 for extra in &e.file().extra_files {
                     let entry_idx = file_entries.len();
-                    let full_path =
-                        extra_resolver.resolve_extra_file_path(e.partition(), e.bucket(), extra);
+                    let full_path = extra_resolver.resolve_extra_file_path(
+                        e.partition(),
+                        e.bucket(),
+                        extra,
+                        e.file().external_path.as_deref(),
+                    );
                     if let Some(path) = full_path {
                         extra_file_stat_tasks.push((manifest_idx, entry_idx, path));
                     }
@@ -490,6 +499,21 @@ async fn collect_snapshot_files(
                 .index_files
                 .entry(entry.index_file.file_name.clone())
                 .or_insert(entry.index_file.file_size as i64);
+        }
+    }
+
+    // Collect statistics file if present
+    if let Some(statistics_name) = snapshot.statistics() {
+        let statistics_path = format!(
+            "{}/statistics/{}",
+            extra_resolver.table_location, statistics_name
+        );
+        let size = try_stat_file_size(file_io, &statistics_path).await?;
+        if size > 0 {
+            file_set
+                .manifest_files
+                .entry(statistics_name.to_string())
+                .or_insert(size);
         }
     }
 
@@ -591,15 +615,17 @@ pub struct PhysicalFilesSummary {
 }
 
 /// Categorize a file name into a file type.
+/// Everything that is not a manifest/statistics or index file is classified as data.
 fn classify_file_name(file_name: &str) -> FileType {
-    if file_name.starts_with("manifest-") || file_name.starts_with("index-manifest-") {
+    if file_name.starts_with("manifest-")
+        || file_name.starts_with("index-manifest-")
+        || file_name.starts_with("statistics-")
+    {
         FileType::Manifest
-    } else if file_name.starts_with("data-") {
-        FileType::Data
     } else if file_name.starts_with("index-") {
         FileType::Index
     } else {
-        FileType::Other
+        FileType::Data
     }
 }
 
@@ -607,7 +633,6 @@ enum FileType {
     Manifest,
     Data,
     Index,
-    Other,
 }
 
 const DIR_LIST_CONCURRENCY: usize = 32;
@@ -619,10 +644,9 @@ const DIR_LIST_CONCURRENCY: usize = 32;
 /// on object stores with many partition directories.
 ///
 /// Files are classified by their file name prefix:
-/// - `manifest-*` / `manifest-list-*` / `index-manifest-*` → manifest
-/// - `data-*` → data
+/// - `manifest-*` / `index-manifest-*` → manifest
 /// - `index-*` (excluding `index-manifest-*`) → index
-/// - Other files (snapshots, schemas, etc.) are not counted.
+/// - Everything else → data
 pub async fn collect_physical_files_summary(
     file_io: &FileIO,
     table_location: &str,
@@ -693,7 +717,6 @@ fn accumulate_file(summary: &mut PhysicalFilesSummary, file_name: &str, size: u6
             summary.index_file_count += 1;
             summary.index_file_size += size as i64;
         }
-        FileType::Other => {}
     }
 }
 
