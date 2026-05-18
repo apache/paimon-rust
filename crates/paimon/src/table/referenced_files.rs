@@ -310,10 +310,13 @@ async fn collect_snapshot_files(
 
         let mut cache = manifest_cache.lock().unwrap();
         for (path, entries) in uncached_paths.into_iter().zip(results) {
-            let file_entries: Vec<(String, i64)> = entries
-                .iter()
-                .map(|e| (e.file().file_name.clone(), e.file().file_size))
-                .collect();
+            let mut file_entries: Vec<(String, i64)> = Vec::new();
+            for e in &entries {
+                file_entries.push((e.file().file_name.clone(), e.file().file_size));
+                for extra in &e.file().extra_files {
+                    file_entries.push((extra.clone(), 0));
+                }
+            }
             cache.insert(path.to_string(), file_entries);
         }
     }
