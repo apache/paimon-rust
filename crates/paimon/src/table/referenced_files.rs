@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::io::FileIO;
-use crate::spec::{IndexManifest, Manifest, ManifestEntry, ManifestFileMeta};
+use crate::spec::{
+    bucket_dir_name, BinaryRow, DataField, IndexManifest, Manifest, ManifestEntry,
+    ManifestFileMeta, PartitionComputer,
+};
 use crate::table::{BranchManager, SnapshotManager, TagManager};
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -89,6 +92,51 @@ const SNAPSHOT_CONCURRENCY: usize = 32;
 /// Cached data file entries (file_name, file_size) per manifest file full path.
 type ManifestCache = Mutex<HashMap<String, Vec<(String, i64)>>>;
 
+/// Resolves extra file paths for stat-ing their real sizes.
+struct ExtraFileResolver {
+    table_location: String,
+    partition_computer: Option<PartitionComputer>,
+}
+
+impl ExtraFileResolver {
+    fn new(table_location: &str, partition_keys: &[String], schema_fields: &[DataField]) -> Self {
+        let partition_computer = if partition_keys.is_empty() {
+            None
+        } else {
+            PartitionComputer::new(
+                partition_keys,
+                schema_fields,
+                "__DEFAULT_PARTITION__",
+                false,
+            )
+            .ok()
+        };
+        Self {
+            table_location: table_location.to_string(),
+            partition_computer,
+        }
+    }
+
+    fn resolve_extra_file_path(
+        &self,
+        partition_bytes: &[u8],
+        bucket: i32,
+        extra_file_name: &str,
+    ) -> Option<String> {
+        let partition_path = if let Some(ref computer) = self.partition_computer {
+            let row = BinaryRow::from_serialized_bytes(partition_bytes).ok()?;
+            computer.generate_partition_path(&row).ok()?
+        } else {
+            String::new()
+        };
+        let bucket_dir = bucket_dir_name(bucket);
+        Some(format!(
+            "{}/{}{}/{}",
+            self.table_location, partition_path, bucket_dir, extra_file_name
+        ))
+    }
+}
+
 /// Collect per-scope deduplicated referenced file size summaries for a table.
 ///
 /// Returns rows:
@@ -106,20 +154,35 @@ type ManifestCache = Mutex<HashMap<String, Vec<(String, i64)>>>;
 ///
 /// Manifest list files and index manifest files are counted as manifest files,
 /// consistent with `physical_files_size` classification.
+///
+/// Extra files referenced by data file entries are stat-ed to obtain their
+/// real sizes, using partition/bucket info to construct full paths.
 pub async fn collect_referenced_files_summary(
     file_io: &FileIO,
     table_location: &str,
+    partition_keys: &[String],
+    schema_fields: &[DataField],
 ) -> crate::Result<Vec<ReferencedFilesSummary>> {
     let manifest_cache: ManifestCache = Mutex::new(HashMap::new());
     let manifest_cache_ref = &manifest_cache;
+    let extra_resolver = ExtraFileResolver::new(table_location, partition_keys, schema_fields);
+    let extra_resolver_ref = &extra_resolver;
 
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string());
     let tm = TagManager::new(file_io.clone(), table_location.to_string());
 
     // 1. Main branch snapshots + tags (concurrently)
+    // For main branch, snapshot reading and manifest resolution both use root SM.
     let (main_files, tag_files) = tokio::try_join!(
-        collect_scope_files(file_io, &sm, manifest_cache_ref),
-        collect_tag_files(file_io, &sm, &tm, manifest_cache_ref),
+        collect_scope_files(file_io, &sm, &sm, manifest_cache_ref, extra_resolver_ref),
+        collect_tag_files(
+            file_io,
+            &sm,
+            &sm,
+            &tm,
+            manifest_cache_ref,
+            extra_resolver_ref
+        ),
     )?;
     let mut main_files = main_files;
     main_files.merge(&tag_files);
@@ -128,15 +191,31 @@ pub async fn collect_referenced_files_summary(
     let bm = BranchManager::new(file_io.clone(), table_location.to_string());
     let branch_names = bm.list_all().await?;
 
+    let sm_ref = &sm;
     let branch_futures: Vec<_> = branch_names
         .iter()
         .map(|branch_name| {
             let branch_sm = sm.with_branch(branch_name);
             let branch_tm = tm.with_branch(branch_name);
             async move {
+                // Branch SM reads snapshot/tag files from branch path,
+                // but manifest paths are always resolved from the table root.
                 let (mut branch_files, branch_tag_files) = tokio::try_join!(
-                    collect_scope_files(file_io, &branch_sm, manifest_cache_ref),
-                    collect_tag_files(file_io, &branch_sm, &branch_tm, manifest_cache_ref),
+                    collect_scope_files(
+                        file_io,
+                        &branch_sm,
+                        sm_ref,
+                        manifest_cache_ref,
+                        extra_resolver_ref
+                    ),
+                    collect_tag_files(
+                        file_io,
+                        &branch_sm,
+                        sm_ref,
+                        &branch_tm,
+                        manifest_cache_ref,
+                        extra_resolver_ref
+                    ),
                 )?;
                 branch_files.merge(&branch_tag_files);
                 Ok::<_, crate::Error>(branch_files)
@@ -165,21 +244,30 @@ pub async fn collect_referenced_files_summary(
 async fn collect_scope_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
+    manifest_sm: &SnapshotManager,
     manifest_cache: &ManifestCache,
+    extra_resolver: &ExtraFileResolver,
 ) -> crate::Result<ScopeFileSet> {
     let snapshot_ids = sm.list_all_ids().await?;
 
-    let per_snapshot: Vec<Option<ScopeFileSet>> =
-        stream::iter(snapshot_ids)
-            .map(|snapshot_id| {
-                let sm = sm.clone();
-                async move {
-                    collect_single_snapshot_files(file_io, &sm, snapshot_id, manifest_cache).await
-                }
-            })
-            .buffer_unordered(SNAPSHOT_CONCURRENCY)
-            .try_collect()
-            .await?;
+    let per_snapshot: Vec<Option<ScopeFileSet>> = stream::iter(snapshot_ids)
+        .map(|snapshot_id| {
+            let sm = sm.clone();
+            async move {
+                collect_single_snapshot_files(
+                    file_io,
+                    &sm,
+                    manifest_sm,
+                    snapshot_id,
+                    manifest_cache,
+                    extra_resolver,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(SNAPSHOT_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     let mut merged = ScopeFileSet::default();
     for fs in per_snapshot.into_iter().flatten() {
@@ -190,9 +278,11 @@ async fn collect_scope_files(
 
 async fn collect_tag_files(
     file_io: &FileIO,
-    sm: &SnapshotManager,
+    _sm: &SnapshotManager,
+    manifest_sm: &SnapshotManager,
     tm: &TagManager,
     manifest_cache: &ManifestCache,
+    extra_resolver: &ExtraFileResolver,
 ) -> crate::Result<ScopeFileSet> {
     let tag_names = tm.list_all_names().await?;
 
@@ -203,7 +293,14 @@ async fn collect_tag_files(
                 Some(s) => s,
                 None => return Ok(None),
             };
-            collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await
+            collect_snapshot_files(
+                file_io,
+                manifest_sm,
+                &snapshot,
+                manifest_cache,
+                extra_resolver,
+            )
+            .await
         })
         .collect();
     let tag_results = try_join_all(tag_futures).await?;
@@ -218,22 +315,32 @@ async fn collect_tag_files(
 async fn collect_single_snapshot_files(
     file_io: &FileIO,
     sm: &SnapshotManager,
+    manifest_sm: &SnapshotManager,
     snapshot_id: i64,
     manifest_cache: &ManifestCache,
+    extra_resolver: &ExtraFileResolver,
 ) -> crate::Result<Option<ScopeFileSet>> {
     let snapshot = match try_get_snapshot(sm, snapshot_id).await? {
         Some(s) => s,
         None => return Ok(None),
     };
 
-    collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await
+    collect_snapshot_files(
+        file_io,
+        manifest_sm,
+        &snapshot,
+        manifest_cache,
+        extra_resolver,
+    )
+    .await
 }
 
 async fn collect_snapshot_files(
     file_io: &FileIO,
-    sm: &SnapshotManager,
+    manifest_sm: &SnapshotManager,
     snapshot: &crate::spec::Snapshot,
     manifest_cache: &ManifestCache,
+    extra_resolver: &ExtraFileResolver,
 ) -> crate::Result<Option<ScopeFileSet>> {
     let mut file_set = ScopeFileSet::default();
 
@@ -246,10 +353,10 @@ async fn collect_snapshot_files(
         manifest_list_names.push(cl.to_string());
     }
 
-    // Pre-compute paths
+    // Pre-compute paths (always resolved from table root)
     let manifest_list_paths: Vec<String> = manifest_list_names
         .iter()
-        .map(|name| sm.manifest_path(name))
+        .map(|name| manifest_sm.manifest_path(name))
         .collect();
 
     // Read all manifest lists concurrently and record their sizes
@@ -283,7 +390,7 @@ async fn collect_snapshot_files(
     // Read manifest files to get data file entries, using cache by full path
     let manifest_paths: Vec<String> = all_manifest_metas
         .iter()
-        .map(|meta| sm.manifest_path(meta.file_name()))
+        .map(|meta| manifest_sm.manifest_path(meta.file_name()))
         .collect();
 
     let uncached_indices: Vec<usize> = manifest_paths
@@ -308,15 +415,46 @@ async fn collect_snapshot_files(
             .collect();
         let results = try_join_all(manifest_futures).await?;
 
-        let mut cache = manifest_cache.lock().unwrap();
-        for (path, entries) in uncached_paths.into_iter().zip(results) {
+        // Collect extra files that need stat-ing
+        let mut extra_file_stat_tasks: Vec<(usize, usize, String)> = Vec::new();
+        let mut all_file_entries: Vec<Vec<(String, i64)>> = Vec::with_capacity(results.len());
+
+        for (manifest_idx, entries) in results.iter().enumerate() {
             let mut file_entries: Vec<(String, i64)> = Vec::new();
-            for e in &entries {
+            for e in entries {
                 file_entries.push((e.file().file_name.clone(), e.file().file_size));
                 for extra in &e.file().extra_files {
+                    let entry_idx = file_entries.len();
+                    let full_path =
+                        extra_resolver.resolve_extra_file_path(e.partition(), e.bucket(), extra);
+                    if let Some(path) = full_path {
+                        extra_file_stat_tasks.push((manifest_idx, entry_idx, path));
+                    }
                     file_entries.push((extra.clone(), 0));
                 }
             }
+            all_file_entries.push(file_entries);
+        }
+
+        // Batch stat extra files concurrently
+        if !extra_file_stat_tasks.is_empty() {
+            let stat_futures: Vec<_> = extra_file_stat_tasks
+                .iter()
+                .map(|(_, _, path)| try_stat_file_size(file_io, path))
+                .collect();
+            let stat_results = try_join_all(stat_futures).await?;
+
+            for ((manifest_idx, entry_idx, _), size) in
+                extra_file_stat_tasks.iter().zip(stat_results)
+            {
+                if size > 0 {
+                    all_file_entries[*manifest_idx][*entry_idx].1 = size;
+                }
+            }
+        }
+
+        let mut cache = manifest_cache.lock().unwrap();
+        for (path, file_entries) in uncached_paths.into_iter().zip(all_file_entries) {
             cache.insert(path.to_string(), file_entries);
         }
     }
@@ -336,7 +474,7 @@ async fn collect_snapshot_files(
     // Read index manifest if present
     if let Some(index_manifest_name) = snapshot.index_manifest() {
         // The index manifest file itself is a manifest-type file
-        let index_manifest_path = sm.manifest_path(index_manifest_name);
+        let index_manifest_path = manifest_sm.manifest_path(index_manifest_name);
         let index_entries =
             try_read_index_manifest_with_size(file_io, &index_manifest_path).await?;
 
@@ -406,6 +544,20 @@ async fn try_read_manifest(file_io: &FileIO, path: &str) -> crate::Result<Vec<Ma
             if source.kind() == opendal::ErrorKind::NotFound =>
         {
             Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Stat a file to get its size. Returns 0 if the file is not found.
+async fn try_stat_file_size(file_io: &FileIO, path: &str) -> crate::Result<i64> {
+    let input = file_io.new_input(path)?;
+    match input.metadata().await {
+        Ok(status) => Ok(status.size as i64),
+        Err(crate::Error::IoUnexpected { ref source, .. })
+            if source.kind() == opendal::ErrorKind::NotFound =>
+        {
+            Ok(0)
         }
         Err(e) => Err(e),
     }
@@ -559,9 +711,10 @@ mod tests {
     #[tokio::test]
     async fn test_collect_empty_table() {
         let file_io = test_file_io();
-        let result = collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
-            .await
-            .unwrap();
+        let result =
+            collect_referenced_files_summary(&file_io, "memory:/test_empty_table", &[], &[])
+                .await
+                .unwrap();
         // total + branch:main
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source, "total");
@@ -599,7 +752,7 @@ mod tests {
             .build();
         sm.commit_snapshot(&snapshot).await.unwrap();
 
-        let result = collect_referenced_files_summary(&file_io, table_path)
+        let result = collect_referenced_files_summary(&file_io, table_path, &[], &[])
             .await
             .unwrap();
         // total + branch:main
@@ -614,11 +767,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_branch_tag_referenced_files() {
+        use crate::spec::stats::BinaryTableStats;
+        use crate::spec::{DataFileMeta, FileKind, Manifest, ManifestFileMeta, ManifestList};
+
         let table_path = "memory:/test_branch_tag";
         let file_io = test_file_io();
 
-        // Set up main branch with a snapshot
-        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
         file_io
             .mkdirs(&format!("{table_path}/snapshot/"))
             .await
@@ -628,54 +782,116 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = Snapshot::builder()
+        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let empty_stats = BinaryTableStats::new(vec![0u8; 8], vec![0u8; 8], vec![Some(0)]);
+
+        // Write a manifest file (referenced by branch tag only) at the TABLE ROOT
+        let manifest_name = "manifest-branch-only-1";
+        let manifest_path = format!("{table_path}/manifest/{manifest_name}");
+        let data_file = DataFileMeta {
+            file_name: "data-branch-tag-file-1.parquet".to_string(),
+            file_size: 4096,
+            row_count: 100,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+            value_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        };
+        let entry = ManifestEntry::new(FileKind::Add, vec![0u8; 12], 0, 1, data_file, 2);
+        Manifest::write(&file_io, &manifest_path, &[entry])
+            .await
+            .unwrap();
+
+        // Write a manifest list that references the above manifest (at the table root)
+        let manifest_list_name = "manifest-list-branch-tag-base";
+        let manifest_list_path = format!("{table_path}/manifest/{manifest_list_name}");
+        let manifest_meta =
+            ManifestFileMeta::new(manifest_name.to_string(), 512, 1, 0, empty_stats.clone(), 0);
+        ManifestList::write(&file_io, &manifest_list_path, &[manifest_meta])
+            .await
+            .unwrap();
+
+        // Write an empty delta manifest list at the table root
+        let delta_list_name = "manifest-list-branch-tag-delta";
+        let delta_list_path = format!("{table_path}/manifest/{delta_list_name}");
+        ManifestList::write(&file_io, &delta_list_path, &[])
+            .await
+            .unwrap();
+
+        // Create a main branch snapshot (with non-existent manifest lists)
+        let main_snapshot = Snapshot::builder()
             .version(3)
             .id(1)
             .schema_id(0)
-            .base_manifest_list("manifest-list-base-1".to_string())
-            .delta_manifest_list("manifest-list-delta-1".to_string())
+            .base_manifest_list("manifest-list-main-base".to_string())
+            .delta_manifest_list("manifest-list-main-delta".to_string())
             .commit_user("test".to_string())
             .commit_identifier(0)
             .commit_kind(CommitKind::APPEND)
             .time_millis(1000)
             .build();
-        sm.commit_snapshot(&snapshot).await.unwrap();
+        sm.commit_snapshot(&main_snapshot).await.unwrap();
 
-        // Create branch directory structure (no snapshot in branch)
+        // Create branch b1 with NO snapshots
         let bm = BranchManager::new(file_io.clone(), table_path.to_string());
         bm.create_branch("b1").await.unwrap();
 
-        // Create a tag under the branch that references a snapshot with manifest lists
+        // Create a tag under branch b1 that references the readable manifest lists
         let branch_tm = TagManager::new(file_io.clone(), table_path.to_string()).with_branch("b1");
-        let branch_snapshot = Snapshot::builder()
+        let branch_tag_snapshot = Snapshot::builder()
             .version(3)
             .id(100)
             .schema_id(0)
-            .base_manifest_list("manifest-list-branch-base".to_string())
-            .delta_manifest_list("manifest-list-branch-delta".to_string())
+            .base_manifest_list(manifest_list_name.to_string())
+            .delta_manifest_list(delta_list_name.to_string())
             .commit_user("test".to_string())
             .commit_identifier(0)
             .commit_kind(CommitKind::APPEND)
             .time_millis(2000)
             .build();
-        branch_tm.create("v1", &branch_snapshot).await.unwrap();
+        branch_tm.create("v1", &branch_tag_snapshot).await.unwrap();
 
-        let result = collect_referenced_files_summary(&file_io, table_path)
+        let result = collect_referenced_files_summary(&file_io, table_path, &[], &[])
             .await
             .unwrap();
 
         // Should have: total, branch:main, branch:b1
         assert_eq!(result.len(), 3);
-        assert_eq!(result[2].source, "branch:b1");
-        // The branch tag references manifest lists that don't exist (NotFound → skipped),
-        // but the manifest list file names themselves should be counted as manifest files
-        // if they were readable. Since they don't exist, size is 0 but no error occurs.
-        // The key assertion: the function completes without error and includes the branch.
-        // If branch tags were not collected, this branch would have been missed entirely
-        // or produced incorrect results.
-
-        // Verify that main branch's manifest list file names are counted
-        // (they also don't exist physically, so size = 0 from NotFound)
+        assert_eq!(result[0].source, "total");
         assert_eq!(result[1].source, "branch:main");
+        assert_eq!(result[2].source, "branch:b1");
+
+        // branch:b1 must have non-zero counts from the branch tag's readable manifests.
+        // The manifest list + manifest file + delta manifest list = 3 manifest files.
+        assert!(
+            result[2].manifest_file_count > 0,
+            "branch:b1 must have manifest files from branch tag, got {}",
+            result[2].manifest_file_count
+        );
+        assert!(
+            result[2].manifest_file_size > 0,
+            "branch:b1 must have non-zero manifest file size, got {}",
+            result[2].manifest_file_size
+        );
+        // The manifest references one data file
+        assert_eq!(result[2].data_file_count, 1);
+        assert_eq!(result[2].data_file_size, 4096);
+
+        // total should include branch:b1's files
+        assert!(result[0].data_file_count >= 1);
+        assert!(result[0].data_file_size >= 4096);
     }
 }

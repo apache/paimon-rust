@@ -145,7 +145,16 @@ impl TableProvider for ReferencedFilesSizeTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.table.clone();
         let summaries = await_with_runtime(async move {
-            collect_referenced_files_summary(table.file_io(), table.location()).await
+            let schema = table.schema();
+            let partition_keys = schema.partition_keys();
+            let partition_fields = schema.partition_fields();
+            collect_referenced_files_summary(
+                table.file_io(),
+                table.location(),
+                partition_keys,
+                &partition_fields,
+            )
+            .await
         })
         .await
         .map_err(to_datafusion_error)?;
