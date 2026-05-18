@@ -43,8 +43,10 @@ mod filter_pushdown;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
 mod merge_into;
+mod physical_files_size;
 mod physical_plan;
 mod procedures;
+mod referenced_files_size;
 mod relation_planner;
 pub mod runtime;
 mod sql_context;
@@ -67,7 +69,9 @@ pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]
 pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
+pub use physical_files_size::{register_physical_files_size, PhysicalFilesSizeFunction};
 pub use physical_plan::PaimonTableScan;
+pub use referenced_files_size::{register_referenced_files_size, ReferencedFilesSizeFunction};
 pub use relation_planner::PaimonRelationPlanner;
 pub use sql_context::SQLContext;
 pub use table::PaimonTableProvider;
