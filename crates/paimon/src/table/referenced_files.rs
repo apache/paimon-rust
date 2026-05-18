@@ -155,16 +155,17 @@ async fn collect_scope_files(
 ) -> crate::Result<ScopeFileSet> {
     let snapshot_ids = sm.list_all_ids().await?;
 
-    let per_snapshot: Vec<Option<ScopeFileSet>> = stream::iter(snapshot_ids)
-        .map(|snapshot_id| {
-            let sm = sm.clone();
-            async move {
-                collect_single_snapshot_files(file_io, &sm, snapshot_id, manifest_cache).await
-            }
-        })
-        .buffer_unordered(SNAPSHOT_CONCURRENCY)
-        .try_collect()
-        .await?;
+    let per_snapshot: Vec<Option<ScopeFileSet>> =
+        stream::iter(snapshot_ids)
+            .map(|snapshot_id| {
+                let sm = sm.clone();
+                async move {
+                    collect_single_snapshot_files(file_io, &sm, snapshot_id, manifest_cache).await
+                }
+            })
+            .buffer_unordered(SNAPSHOT_CONCURRENCY)
+            .try_collect()
+            .await?;
 
     let mut merged = ScopeFileSet::default();
     for fs in per_snapshot.into_iter().flatten() {
@@ -536,10 +537,9 @@ mod tests {
     #[tokio::test]
     async fn test_collect_empty_table() {
         let file_io = test_file_io();
-        let result =
-            collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
-                .await
-                .unwrap();
+        let result = collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
+            .await
+            .unwrap();
         // total + branch:main
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source, "total");
