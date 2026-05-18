@@ -164,13 +164,13 @@ impl FileIO {
         let base_path = &path[..path.len() - relative_path.len()];
         let list_path = normalize_root(relative_path);
 
-        let entries = op
-            .list_with(&list_path)
-            .recursive(true)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to list files recursively in '{path}'"),
-            })?;
+        let entries =
+            op.list_with(&list_path)
+                .recursive(true)
+                .await
+                .context(IoUnexpectedSnafu {
+                    message: format!("Failed to list files recursively in '{path}'"),
+                })?;
 
         let mut statuses = Vec::new();
         let list_path_normalized = list_path.trim_start_matches('/');

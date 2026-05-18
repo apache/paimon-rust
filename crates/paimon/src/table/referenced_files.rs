@@ -348,7 +348,6 @@ async fn try_read_index_manifest(
     }
 }
 
-
 /// Summary of all physical files in the table directory, categorized by file type.
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalFilesSummary {
@@ -481,10 +480,9 @@ mod tests {
     #[tokio::test]
     async fn test_collect_empty_table() {
         let file_io = test_file_io();
-        let result =
-            collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
-                .await
-                .unwrap();
+        let result = collect_referenced_files_summary(&file_io, "memory:/test_empty_table")
+            .await
+            .unwrap();
         // total + main
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].source, "total");
