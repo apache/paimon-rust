@@ -113,35 +113,42 @@ pub async fn collect_referenced_files_summary(
     let manifest_cache: ManifestCache = Mutex::new(HashMap::new());
     let manifest_cache_ref = &manifest_cache;
 
-    // 1. Main branch snapshots + tags
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string());
-    let mut main_files = collect_scope_files(file_io, &sm, manifest_cache_ref).await?;
-
     let tm = TagManager::new(file_io.clone(), table_location.to_string());
-    let tag_files = collect_tag_files(file_io, &sm, &tm, manifest_cache_ref).await?;
+
+    // 1. Main branch snapshots + tags (concurrently)
+    let (main_files, tag_files) = tokio::try_join!(
+        collect_scope_files(file_io, &sm, manifest_cache_ref),
+        collect_tag_files(file_io, &sm, &tm, manifest_cache_ref),
+    )?;
+    let mut main_files = main_files;
     main_files.merge(&tag_files);
 
-    // 2. Branch file sets (snapshots + branch-level tags)
+    // 2. Branch file sets (all branches concurrently)
     let bm = BranchManager::new(file_io.clone(), table_location.to_string());
     let branch_names = bm.list_all().await?;
-    let mut branch_file_sets = Vec::new();
-    for branch_name in &branch_names {
-        let branch_sm = sm.with_branch(branch_name);
-        let mut branch_files =
-            collect_scope_files(file_io, &branch_sm, manifest_cache_ref).await?;
 
-        let branch_tm = tm.with_branch(branch_name);
-        let branch_tag_files =
-            collect_tag_files(file_io, &branch_sm, &branch_tm, manifest_cache_ref).await?;
-        branch_files.merge(&branch_tag_files);
-
-        branch_file_sets.push((branch_name.clone(), branch_files));
-    }
+    let branch_futures: Vec<_> = branch_names
+        .iter()
+        .map(|branch_name| {
+            let branch_sm = sm.with_branch(branch_name);
+            let branch_tm = tm.with_branch(branch_name);
+            async move {
+                let (mut branch_files, branch_tag_files) = tokio::try_join!(
+                    collect_scope_files(file_io, &branch_sm, manifest_cache_ref),
+                    collect_tag_files(file_io, &branch_sm, &branch_tm, manifest_cache_ref),
+                )?;
+                branch_files.merge(&branch_tag_files);
+                Ok::<_, crate::Error>(branch_files)
+            }
+        })
+        .collect();
+    let branch_results = try_join_all(branch_futures).await?;
 
     // 3. Assemble output: total, main, branches
     let mut total_files = ScopeFileSet::default();
     total_files.merge(&main_files);
-    for (_, bs) in &branch_file_sets {
+    for bs in &branch_results {
         total_files.merge(bs);
     }
 
@@ -149,7 +156,7 @@ pub async fn collect_referenced_files_summary(
         total_files.to_summary("total"),
         main_files.to_summary("branch:main"),
     ];
-    for (name, files) in &branch_file_sets {
+    for (name, files) in branch_names.iter().zip(&branch_results) {
         result.push(files.to_summary(&format!("branch:{name}")));
     }
     Ok(result)
@@ -188,18 +195,23 @@ async fn collect_tag_files(
     manifest_cache: &ManifestCache,
 ) -> crate::Result<ScopeFileSet> {
     let tag_names = tm.list_all_names().await?;
+
+    let tag_futures: Vec<_> = tag_names
+        .iter()
+        .map(|tag_name| async move {
+            let snapshot = match tm.get(tag_name).await? {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await
+        })
+        .collect();
+    let tag_results = try_join_all(tag_futures).await?;
+
     let mut merged = ScopeFileSet::default();
-
-    for tag_name in &tag_names {
-        let snapshot = match tm.get(tag_name).await? {
-            Some(s) => s,
-            None => continue,
-        };
-        if let Some(fs) = collect_snapshot_files(file_io, sm, &snapshot, manifest_cache).await? {
-            merged.merge(&fs);
-        }
+    for fs in tag_results.into_iter().flatten() {
+        merged.merge(&fs);
     }
-
     Ok(merged)
 }
 
