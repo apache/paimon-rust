@@ -643,8 +643,7 @@ mod tests {
         bm.create_branch("b1").await.unwrap();
 
         // Create a tag under the branch that references a snapshot with manifest lists
-        let branch_tm = TagManager::new(file_io.clone(), table_path.to_string())
-            .with_branch("b1");
+        let branch_tm = TagManager::new(file_io.clone(), table_path.to_string()).with_branch("b1");
         let branch_snapshot = Snapshot::builder()
             .version(3)
             .id(100)
