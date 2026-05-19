@@ -43,6 +43,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Patch version for pre-release
+        if: contains(github.ref, '-rc')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i 's/dynamic = \["version"\]/version = "'"$PEP_VERSION"'"/' bindings/python/pyproject.toml
+          echo "Patched pyproject.toml version to $PEP_VERSION"
+
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: bindings/python
@@ -69,6 +77,16 @@ jobs:
           - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
     steps:
       - uses: actions/checkout@v6
+
+      - name: Patch version for pre-release
+        if: contains(github.ref, '-rc')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i.bak 's/dynamic = \["version"\]/version = "'"$PEP_VERSION"'"/' bindings/python/pyproject.toml
+          rm -f bindings/python/pyproject.toml.bak
+          echo "Patched pyproject.toml version to $PEP_VERSION"
 
       - uses: PyO3/maturin-action@v1
         with:
