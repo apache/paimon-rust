@@ -21,8 +21,10 @@ mod common;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::array::{
+    Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -113,6 +115,173 @@ async fn test_options_system_table() {
     expected.sort();
 
     assert_eq!(actual, expected, "$options rows should match table options");
+}
+
+#[tokio::test]
+async fn test_table_indexes_system_table() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$table_indexes");
+    let batches = run_sql(&ctx, &sql).await;
+
+    assert!(!batches.is_empty(), "$table_indexes should return ≥1 batch");
+
+    let dv_meta_fields = vec![
+        Arc::new(Field::new("f0", DataType::Utf8, false)),
+        Arc::new(Field::new("f1", DataType::Int32, false)),
+        Arc::new(Field::new("f2", DataType::Int32, false)),
+        Arc::new(Field::new("_CARDINALITY", DataType::Int64, true)),
+    ]
+    .into();
+    let expected_columns = [
+        ("partition", DataType::Utf8),
+        ("bucket", DataType::Int32),
+        ("index_type", DataType::Utf8),
+        ("file_name", DataType::Utf8),
+        ("file_size", DataType::Int64),
+        ("row_count", DataType::Int64),
+        (
+            "dv_ranges",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(dv_meta_fields),
+                true,
+            ))),
+        ),
+        ("row_range_start", DataType::Int64),
+        ("row_range_end", DataType::Int64),
+        ("index_field_id", DataType::Int32),
+        ("index_field_name", DataType::Utf8),
+    ];
+    let arrow_schema = batches[0].schema();
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog
+        .get_table(&identifier)
+        .await
+        .expect("fixture table should load");
+    let sm =
+        paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let latest = sm
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .expect("fixture has snapshots");
+    let index_manifest = latest
+        .index_manifest()
+        .expect("fixture should have an index manifest");
+    let expected_entries =
+        paimon::spec::IndexManifest::read(table.file_io(), &sm.manifest_path(index_manifest))
+            .await
+            .unwrap();
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows,
+        expected_entries.len(),
+        "$table_indexes rows should match the latest index manifest entries"
+    );
+
+    let batch = &batches[0];
+    let partitions = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("partition is Utf8");
+    let buckets = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("bucket is Int32");
+    let index_types = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("index_type is Utf8");
+    let file_names = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("file_name is Utf8");
+    let file_sizes = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("file_size is Int64");
+    let row_counts = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("row_count is Int64");
+    let dv_ranges = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("dv_ranges is ListArray");
+    let row_range_starts = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("row_range_start is Int64");
+    let row_range_ends = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("row_range_end is Int64");
+    let index_field_ids = batch
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("index_field_id is Int32");
+    let index_field_names = batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("index_field_name is Utf8");
+
+    for (row, expected) in expected_entries.iter().enumerate() {
+        assert!(!partitions.is_null(row), "partition should be non-null");
+        assert_eq!(buckets.value(row), expected.bucket);
+        assert_eq!(index_types.value(row), expected.index_file.index_type);
+        assert_eq!(file_names.value(row), expected.index_file.file_name);
+        assert_eq!(
+            file_sizes.value(row),
+            i64::from(expected.index_file.file_size)
+        );
+        assert_eq!(
+            row_counts.value(row),
+            i64::from(expected.index_file.row_count)
+        );
+        assert_eq!(
+            dv_ranges.is_null(row),
+            expected.index_file.deletion_vectors_ranges.is_none()
+        );
+
+        if let Some(global_meta) = &expected.index_file.global_index_meta {
+            assert_eq!(row_range_starts.value(row), global_meta.row_range_start);
+            assert_eq!(row_range_ends.value(row), global_meta.row_range_end);
+            assert_eq!(index_field_ids.value(row), global_meta.index_field_id);
+            let expected_field_name = table
+                .schema()
+                .fields()
+                .iter()
+                .find(|field| field.id() == global_meta.index_field_id)
+                .map(|field| field.name());
+            assert_eq!(
+                (!index_field_names.is_null(row)).then(|| index_field_names.value(row)),
+                expected_field_name
+            );
+        } else {
+            assert!(row_range_starts.is_null(row));
+            assert!(row_range_ends.is_null(row));
+            assert!(index_field_ids.is_null(row));
+            assert!(index_field_names.is_null(row));
+        }
+    }
 }
 
 #[tokio::test]
