@@ -33,6 +33,8 @@ mod branches;
 mod manifests;
 mod options;
 mod partitions;
+mod physical_files_size;
+mod referenced_files_size;
 mod row_string_cast;
 mod schemas;
 mod snapshots;
@@ -47,6 +49,8 @@ const TABLES: &[(&str, Builder)] = &[
     ("branches", branches::build),
     ("manifests", manifests::build),
     ("options", options::build),
+    ("physical_files_size", physical_files_size::build),
+    ("referenced_files_size", referenced_files_size::build),
     ("schemas", schemas::build),
     ("snapshots", snapshots::build),
     ("tags", tags::build),
@@ -57,6 +61,8 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "manifests",
     "options",
     "partitions",
+    "physical_files_size",
+    "referenced_files_size",
     "schemas",
     "snapshots",
     "tags",

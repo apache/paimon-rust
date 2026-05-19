@@ -15,89 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Table function that computes per-snapshot referenced file size summaries.
-//!
-//! Usage: `SELECT * FROM referenced_files_size('db.table_name')`
+//! Mirrors Java [ReferencedFilesSizeTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system).
 
 use std::any::Any;
-use std::fmt::Debug;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::catalog::TableFunctionImpl;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
-use paimon::catalog::Catalog;
 use paimon::table::referenced_files::{collect_referenced_files_summary, ReferencedFilesSummary};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
-use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::table_function_args::{extract_string_literal, parse_table_identifier};
 
-const FUNCTION_NAME: &str = "referenced_files_size";
-
-pub fn register_referenced_files_size(
-    ctx: &SessionContext,
-    catalog: Arc<dyn Catalog>,
-    default_database: &str,
-) {
-    ctx.register_udtf(
-        FUNCTION_NAME,
-        Arc::new(ReferencedFilesSizeFunction::new(catalog, default_database)),
-    );
-}
-
-pub struct ReferencedFilesSizeFunction {
-    catalog: Arc<dyn Catalog>,
-    default_database: String,
-}
-
-impl Debug for ReferencedFilesSizeFunction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReferencedFilesSizeFunction")
-            .field("default_database", &self.default_database)
-            .finish()
-    }
-}
-
-impl ReferencedFilesSizeFunction {
-    pub fn new(catalog: Arc<dyn Catalog>, default_database: &str) -> Self {
-        Self {
-            catalog,
-            default_database: default_database.to_string(),
-        }
-    }
-}
-
-impl TableFunctionImpl for ReferencedFilesSizeFunction {
-    fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        if args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "referenced_files_size requires 1 argument: (table_name)".to_string(),
-            ));
-        }
-
-        let table_name = extract_string_literal(FUNCTION_NAME, &args[0], "table_name")?;
-        let identifier =
-            parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
-
-        let catalog = Arc::clone(&self.catalog);
-        let table = block_on_with_runtime(
-            async move { catalog.get_table(&identifier).await },
-            "referenced_files_size: catalog access thread panicked",
-        )
-        .map_err(to_datafusion_error)?;
-
-        Ok(Arc::new(ReferencedFilesSizeTableProvider { table }))
-    }
+pub(super) fn build(table: Table) -> DFResult<Arc<dyn TableProvider>> {
+    Ok(Arc::new(ReferencedFilesSizeTable { table }))
 }
 
 fn output_schema() -> SchemaRef {
@@ -118,12 +56,12 @@ fn output_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct ReferencedFilesSizeTableProvider {
+struct ReferencedFilesSizeTable {
     table: Table,
 }
 
 #[async_trait]
-impl TableProvider for ReferencedFilesSizeTableProvider {
+impl TableProvider for ReferencedFilesSizeTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -144,7 +82,7 @@ impl TableProvider for ReferencedFilesSizeTableProvider {
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.table.clone();
-        let summaries = await_with_runtime(async move {
+        let summaries = crate::runtime::await_with_runtime(async move {
             let schema = table.schema();
             let partition_keys = schema.partition_keys();
             let partition_fields = schema.partition_fields();
