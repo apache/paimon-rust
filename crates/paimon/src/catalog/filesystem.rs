@@ -215,6 +215,8 @@ impl Catalog for FileSystemCatalog {
         ignore_if_exists: bool,
         properties: HashMap<String, String>,
     ) -> Result<()> {
+        Identifier::validate_database_name(name)?;
+
         if properties.contains_key(DB_LOCATION_PROP) {
             return Err(Error::ConfigInvalid {
                 message: "Cannot specify location for a database when using fileSystem catalog."
@@ -239,6 +241,8 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn get_database(&self, name: &str) -> Result<Database> {
+        Identifier::validate_database_name(name)?;
+
         if !self.database_exists(name).await? {
             return Err(Error::DatabaseNotExist {
                 database: name.to_string(),
@@ -254,6 +258,8 @@ impl Catalog for FileSystemCatalog {
         ignore_if_not_exists: bool,
         cascade: bool,
     ) -> Result<()> {
+        Identifier::validate_database_name(name)?;
+
         let path = self.database_path(name);
 
         let database_exists = self.database_exists(name).await?;
@@ -279,6 +285,8 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
+        identifier.validate()?;
+
         let table_path = self.table_path(identifier);
 
         if !self.table_exists(identifier).await? {
@@ -304,6 +312,8 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
+        Identifier::validate_database_name(database_name)?;
+
         let path = self.database_path(database_name);
 
         if !self.database_exists(database_name).await? {
@@ -321,6 +331,8 @@ impl Catalog for FileSystemCatalog {
         creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        identifier.validate()?;
+
         let table_path = self.table_path(identifier);
 
         let table_exists = self.table_exists(identifier).await?;
@@ -348,6 +360,8 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
+        identifier.validate()?;
+
         let table_path = self.table_path(identifier);
 
         let table_exists = self.table_exists(identifier).await?;
@@ -372,6 +386,9 @@ impl Catalog for FileSystemCatalog {
         to: &Identifier,
         ignore_if_not_exists: bool,
     ) -> Result<()> {
+        from.validate()?;
+        to.validate()?;
+
         let from_path = self.table_path(from);
         let to_path = self.table_path(to);
 
@@ -403,6 +420,8 @@ impl Catalog for FileSystemCatalog {
         changes: Vec<crate::spec::SchemaChange>,
         ignore_if_not_exists: bool,
     ) -> Result<()> {
+        identifier.validate()?;
+
         let table_path = self.table_path(identifier);
         if !self.table_exists(identifier).await? {
             if ignore_if_not_exists {
@@ -512,6 +531,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_database_should_reject_path_traversal_name() {
+        let (temp_dir, catalog) = create_test_catalog();
+        let escaped_path = temp_dir.path().join("escaped.db");
+
+        let result = catalog
+            .create_database("../escaped", false, HashMap::new())
+            .await;
+
+        assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
+        assert!(!escaped_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_drop_database_should_reject_path_traversal_name() {
+        let (temp_dir, catalog) = create_test_catalog();
+        let escaped_path = temp_dir.path().join("escaped.db");
+        std::fs::create_dir(&escaped_path).unwrap();
+
+        let result = catalog.drop_database("../escaped", false, true).await;
+
+        assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
+        assert!(escaped_path.exists());
+    }
+
+    #[tokio::test]
     async fn test_table_operations() {
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -566,6 +610,54 @@ mod tests {
         let tables = catalog.list_tables("db1").await.unwrap();
         assert_eq!(tables.len(), 2);
         assert!(!tables.contains(&"table1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_should_reject_path_traversal_object_name() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let escaped_path = temp_dir.path().join("table_escape");
+
+        let result = catalog
+            .create_table(
+                &Identifier::new("db1", "../../table_escape"),
+                testing_schema(),
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
+        assert!(!escaped_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_should_reject_path_traversal_target_name() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let source = Identifier::new("db1", "source");
+        catalog
+            .create_table(&source, testing_schema(), false)
+            .await
+            .unwrap();
+        let escaped_path = temp_dir.path().join("renamed_escape");
+
+        let result = catalog
+            .rename_table(
+                &source,
+                &Identifier::new("db1", "../../renamed_escape"),
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
+        assert!(!escaped_path.exists());
+        assert!(catalog.get_table(&source).await.is_ok());
     }
 
     #[tokio::test]

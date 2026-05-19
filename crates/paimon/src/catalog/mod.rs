@@ -29,6 +29,7 @@ mod rest;
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::{Error, Result};
 pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
@@ -76,6 +77,29 @@ impl Identifier {
         }
     }
 
+    /// Create an identifier from database and object name, validating both names.
+    pub fn try_new(database: impl Into<String>, object: impl Into<String>) -> Result<Self> {
+        let identifier = Self::new(database, object);
+        identifier.validate()?;
+        Ok(identifier)
+    }
+
+    /// Validate this identifier's database and object names.
+    pub fn validate(&self) -> Result<()> {
+        Self::validate_database_name(&self.database)?;
+        Self::validate_object_name(&self.object)
+    }
+
+    /// Validate a database name for path-safe catalog use.
+    pub fn validate_database_name(name: &str) -> Result<()> {
+        validate_identifier_name("database", name)
+    }
+
+    /// Validate an object name for path-safe catalog use.
+    pub fn validate_object_name(name: &str) -> Result<()> {
+        validate_identifier_name("object", name)
+    }
+
     /// Database name.
     pub fn database(&self) -> &str {
         &self.database
@@ -97,6 +121,28 @@ impl Identifier {
     }
 }
 
+fn validate_identifier_name(kind: &str, name: &str) -> Result<()> {
+    let invalid = if name.trim().is_empty() {
+        Some("cannot be empty or whitespace")
+    } else if matches!(name, "." | "..") {
+        Some("cannot be '.' or '..'")
+    } else if name.contains('/') || name.contains('\\') {
+        Some("cannot contain path separators")
+    } else if name.chars().any(char::is_control) {
+        Some("cannot contain control characters")
+    } else {
+        None
+    };
+
+    if let Some(reason) = invalid {
+        return Err(Error::IdentifierInvalid {
+            message: format!("{kind} name {reason}: {name:?}"),
+        });
+    }
+
+    Ok(())
+}
+
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.full_name())
@@ -112,6 +158,49 @@ impl fmt::Debug for Identifier {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_identifier_try_new_should_reject_path_control_names() {
+        for (database, object) in [
+            ("", "table"),
+            ("   ", "table"),
+            (".", "table"),
+            ("..", "table"),
+            ("../escaped", "table"),
+            ("db\\escaped", "table"),
+            ("db\nescaped", "table"),
+            ("db", ""),
+            ("db", "   "),
+            ("db", "."),
+            ("db", ".."),
+            ("db", "../escaped"),
+            ("db", "nested/table"),
+            ("db", "nested\\table"),
+            ("db", "table\0name"),
+        ] {
+            let result = Identifier::try_new(database, object);
+            assert!(
+                matches!(result, Err(Error::IdentifierInvalid { .. })),
+                "expected invalid identifier for database={database:?}, object={object:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identifier_try_new_should_allow_system_suffix_and_unicode_names() {
+        let identifier = Identifier::try_new("analytics", "orders$snapshots").unwrap();
+        assert_eq!(identifier.database(), "analytics");
+        assert_eq!(identifier.object(), "orders$snapshots");
+
+        let identifier = Identifier::try_new("数据", "订单").unwrap();
+        assert_eq!(identifier.database(), "数据");
+        assert_eq!(identifier.object(), "订单");
+    }
+}
+
 // ======================= Catalog trait ===============================
 
 use async_trait::async_trait;
@@ -119,7 +208,6 @@ use async_trait::async_trait;
 use crate::api::PagedList;
 use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::Table;
-use crate::Result;
 
 /// Catalog API for reading and writing metadata (databases, tables) in Paimon.
 ///
