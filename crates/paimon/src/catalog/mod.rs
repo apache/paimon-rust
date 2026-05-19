@@ -158,49 +158,6 @@ impl fmt::Debug for Identifier {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_identifier_try_new_should_reject_path_control_names() {
-        for (database, object) in [
-            ("", "table"),
-            ("   ", "table"),
-            (".", "table"),
-            ("..", "table"),
-            ("../escaped", "table"),
-            ("db\\escaped", "table"),
-            ("db\nescaped", "table"),
-            ("db", ""),
-            ("db", "   "),
-            ("db", "."),
-            ("db", ".."),
-            ("db", "../escaped"),
-            ("db", "nested/table"),
-            ("db", "nested\\table"),
-            ("db", "table\0name"),
-        ] {
-            let result = Identifier::try_new(database, object);
-            assert!(
-                matches!(result, Err(Error::IdentifierInvalid { .. })),
-                "expected invalid identifier for database={database:?}, object={object:?}, got {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_identifier_try_new_should_allow_system_suffix_and_unicode_names() {
-        let identifier = Identifier::try_new("analytics", "orders$snapshots").unwrap();
-        assert_eq!(identifier.database(), "analytics");
-        assert_eq!(identifier.object(), "orders$snapshots");
-
-        let identifier = Identifier::try_new("数据", "订单").unwrap();
-        assert_eq!(identifier.database(), "数据");
-        assert_eq!(identifier.object(), "订单");
-    }
-}
-
 // ======================= Catalog trait ===============================
 
 use async_trait::async_trait;
@@ -343,5 +300,48 @@ pub trait Catalog: Send + Sync {
             self.list_partitions(identifier).await?,
             None,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_identifier_try_new_should_reject_path_control_names() {
+        for (database, object) in [
+            ("", "table"),
+            ("   ", "table"),
+            (".", "table"),
+            ("..", "table"),
+            ("../escaped", "table"),
+            ("db\\escaped", "table"),
+            ("db\nescaped", "table"),
+            ("db", ""),
+            ("db", "   "),
+            ("db", "."),
+            ("db", ".."),
+            ("db", "../escaped"),
+            ("db", "nested/table"),
+            ("db", "nested\\table"),
+            ("db", "table\0name"),
+        ] {
+            let result = Identifier::try_new(database, object);
+            assert!(
+                matches!(result, Err(Error::IdentifierInvalid { .. })),
+                "expected invalid identifier for database={database:?}, object={object:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identifier_try_new_should_allow_system_suffix_and_unicode_names() {
+        let identifier = Identifier::try_new("analytics", "orders$snapshots").unwrap();
+        assert_eq!(identifier.database(), "analytics");
+        assert_eq!(identifier.object(), "orders$snapshots");
+
+        let identifier = Identifier::try_new("数据", "订单").unwrap();
+        assert_eq!(identifier.database(), "数据");
+        assert_eq!(identifier.object(), "订单");
     }
 }
