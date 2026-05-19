@@ -167,14 +167,6 @@ impl TableWrite {
             });
         }
 
-        Self::validate_changelog_write_options(
-            &core_options,
-            changelog_producer,
-            has_primary_keys,
-            total_buckets,
-            is_dynamic_cross_partition,
-        )?;
-
         if !has_primary_keys && total_buckets != -1 && core_options.bucket_key().is_none() {
             return Err(crate::Error::Unsupported {
                 message: "Append tables with fixed bucket must configure 'bucket-key'".to_string(),
@@ -313,88 +305,6 @@ impl TableWrite {
             blob_descriptor_fields,
             has_blob_fields,
         })
-    }
-
-    fn validate_changelog_write_options(
-        core_options: &CoreOptions<'_>,
-        producer: ChangelogProducer,
-        has_primary_keys: bool,
-        total_buckets: i32,
-        is_cross_partition: bool,
-    ) -> Result<()> {
-        match producer {
-            ChangelogProducer::None => Ok(()),
-            _ if !has_primary_keys => Err(crate::Error::Unsupported {
-                message: format!(
-                    "changelog-producer={} is only supported for primary-key tables",
-                    producer.as_str()
-                ),
-            }),
-            ChangelogProducer::FullCompaction | ChangelogProducer::Lookup => {
-                Err(crate::Error::Unsupported {
-                    message: format!(
-                        "changelog-producer={} is not supported by the write path yet",
-                        producer.as_str()
-                    ),
-                })
-            }
-            ChangelogProducer::Input => {
-                let merge_engine = core_options.merge_engine()?;
-                if merge_engine != MergeEngine::Deduplicate {
-                    return Err(crate::Error::Unsupported {
-                        message: format!(
-                            "changelog-producer=input only supports merge-engine=deduplicate, found merge-engine={}",
-                            match merge_engine {
-                                MergeEngine::Deduplicate => "deduplicate",
-                                MergeEngine::PartialUpdate => "partial-update",
-                                MergeEngine::FirstRow => "first-row",
-                            }
-                        ),
-                    });
-                }
-                if is_cross_partition {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "changelog-producer=input does not support cross-partition dynamic bucket tables"
-                                .to_string(),
-                    });
-                }
-                if total_buckets == POSTPONE_BUCKET {
-                    return Err(crate::Error::Unsupported {
-                        message: "changelog-producer=input does not support bucket=-2".to_string(),
-                    });
-                }
-                if core_options.rowkind_field().is_some() {
-                    return Err(crate::Error::Unsupported {
-                        message: "changelog-producer=input does not support rowkind.field"
-                            .to_string(),
-                    });
-                }
-                if core_options.changelog_file_format_configured() {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "changelog-file.format is not supported for changelog-producer=input yet"
-                                .to_string(),
-                    });
-                }
-                if core_options.changelog_file_compression_configured() {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "changelog-file.compression is not supported for changelog-producer=input yet"
-                                .to_string(),
-                    });
-                }
-                if core_options.changelog_file_stats_mode_configured() {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "changelog-file.stats-mode is not supported for changelog-producer=input yet"
-                                .to_string(),
-                    });
-                }
-
-                Ok(())
-            }
-        }
     }
 
     /// Scan the latest snapshot for a specific partition and return a map of
@@ -611,12 +521,6 @@ impl TableWrite {
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        if self.is_overwrite && self.changelog_producer == ChangelogProducer::Input {
-            return Err(crate::Error::Unsupported {
-                message: "overwrite with changelog-producer=input is not supported".to_string(),
-            });
-        }
-
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
@@ -785,7 +689,8 @@ impl TableWrite {
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
                 file_format: self.file_format.clone(),
-                input_changelog: self.changelog_producer == ChangelogProducer::Input,
+                input_changelog: self.changelog_producer == ChangelogProducer::Input
+                    && !self.is_overwrite,
                 changelog_file_prefix: self.changelog_file_prefix.clone(),
                 changelog_file_compression: self.changelog_file_compression.clone(),
                 changelog_file_format: self.changelog_file_format.clone(),
@@ -1659,29 +1564,6 @@ mod tests {
         TableSchema::new(0, &builder.build().unwrap())
     }
 
-    fn non_pk_changelog_schema(options: &[(&str, &str)]) -> TableSchema {
-        let mut builder = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()));
-        for (key, value) in options {
-            builder = builder.option(*key, *value);
-        }
-        TableSchema::new(0, &builder.build().unwrap())
-    }
-
-    fn partitioned_dynamic_pk_changelog_schema() -> TableSchema {
-        let schema = Schema::builder()
-            .column("pt", DataType::VarChar(VarCharType::string_type()))
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .partition_keys(["pt"])
-            .primary_key(["id"])
-            .option("changelog-producer", "input")
-            .build()
-            .unwrap();
-        TableSchema::new(0, &schema)
-    }
-
     fn ordinary_dynamic_pk_changelog_schema() -> TableSchema {
         let schema = Schema::builder()
             .column("pt", DataType::VarChar(VarCharType::string_type()))
@@ -1693,120 +1575,6 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
-    }
-
-    fn table_write_new_unsupported(schema: TableSchema, expected_message: &str) {
-        let table = Table::new(
-            test_file_io(),
-            Identifier::new("default", "test_changelog_validation"),
-            "memory:/test_changelog_validation".to_string(),
-            schema,
-            None,
-        );
-
-        let err = match TableWrite::new(&table, "test-user".to_string()) {
-            Ok(_) => panic!("TableWrite::new should reject this schema"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains(expected_message)),
-            "expected unsupported error containing '{expected_message}', got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_rejects_unsupported_changelog_producer_configurations() {
-        let cases = vec![
-            (
-                non_pk_changelog_schema(&[("changelog-producer", "input")]),
-                "only supported for primary-key tables",
-            ),
-            (
-                non_pk_changelog_schema(&[("changelog-producer", "lookup")]),
-                "changelog-producer=lookup",
-            ),
-            (
-                pk_changelog_schema(&[("changelog-producer", "unknown")]),
-                "Unsupported changelog-producer",
-            ),
-            (
-                pk_changelog_schema(&[("changelog-producer", "full-compaction")]),
-                "changelog-producer=full-compaction",
-            ),
-            (
-                pk_changelog_schema(&[("changelog-producer", "lookup")]),
-                "changelog-producer=lookup",
-            ),
-        ];
-
-        for (schema, expected_message) in cases {
-            table_write_new_unsupported(schema, expected_message);
-        }
-    }
-
-    #[test]
-    fn test_rejects_unsupported_input_changelog_options() {
-        let rowkind_schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .column("op", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .option("changelog-producer", "input")
-            .option("rowkind.field", "op")
-            .build()
-            .unwrap();
-
-        let cases = vec![
-            (
-                pk_changelog_schema(&[
-                    ("changelog-producer", "input"),
-                    ("merge-engine", "partial-update"),
-                ]),
-                "merge-engine=partial-update",
-            ),
-            (
-                pk_changelog_schema(&[
-                    ("changelog-producer", "input"),
-                    ("merge-engine", "first-row"),
-                ]),
-                "merge-engine=first-row",
-            ),
-            (
-                pk_changelog_schema(&[("changelog-producer", "input"), ("bucket", "-2")]),
-                "bucket=-2",
-            ),
-            (
-                partitioned_dynamic_pk_changelog_schema(),
-                "cross-partition dynamic bucket",
-            ),
-            (TableSchema::new(0, &rowkind_schema), "rowkind.field"),
-            (
-                pk_changelog_schema(&[
-                    ("changelog-producer", "input"),
-                    ("changelog-file.format", "avro"),
-                ]),
-                "changelog-file.format",
-            ),
-            (
-                pk_changelog_schema(&[
-                    ("changelog-producer", "input"),
-                    ("changelog-file.compression", "snappy"),
-                ]),
-                "changelog-file.compression",
-            ),
-            (
-                pk_changelog_schema(&[
-                    ("changelog-producer", "input"),
-                    ("changelog-file.stats-mode", "counts"),
-                ]),
-                "changelog-file.stats-mode",
-            ),
-        ];
-
-        for (schema, expected_message) in cases {
-            table_write_new_unsupported(schema, expected_message);
-        }
     }
 
     #[tokio::test]
@@ -2071,7 +1839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_input_changelog_overwrite_prepare_commit_rejects_before_flush() {
+    async fn test_input_changelog_overwrite_does_not_write_changelog_files() {
         let file_io = test_file_io();
         let table_path = "memory:/test_input_changelog_overwrite";
         setup_dirs(&file_io, table_path).await;
@@ -2092,10 +1860,10 @@ mod tests {
             .await
             .unwrap();
 
-        let err = table_write.prepare_commit().await.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("overwrite"))
-        );
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert!(messages[0].new_changelog_files.is_empty());
     }
 
     #[tokio::test]

@@ -447,18 +447,6 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
     }
 
-    pub(crate) fn changelog_file_format_configured(&self) -> bool {
-        self.options.contains_key(CHANGELOG_FILE_FORMAT_OPTION)
-    }
-
-    pub(crate) fn changelog_file_compression_configured(&self) -> bool {
-        self.options.contains_key(CHANGELOG_FILE_COMPRESSION_OPTION)
-    }
-
-    pub(crate) fn changelog_file_stats_mode_configured(&self) -> bool {
-        self.options.contains_key(CHANGELOG_FILE_STATS_MODE_OPTION)
-    }
-
     /// Parquet writer in-progress buffer size limit. Default is 256MB.
     /// When the buffered data exceeds this, the writer flushes the current row group.
     pub fn write_parquet_buffer_size(&self) -> i64 {
@@ -720,9 +708,6 @@ mod tests {
         assert_eq!(custom_core.changelog_file_format(), "parquet");
         assert_eq!(custom_core.changelog_file_compression(), "zstd");
         assert_eq!(custom_core.changelog_file_stats_mode(), Some("counts"));
-        assert!(custom_core.changelog_file_format_configured());
-        assert!(custom_core.changelog_file_compression_configured());
-        assert!(custom_core.changelog_file_stats_mode_configured());
     }
 
     #[test]

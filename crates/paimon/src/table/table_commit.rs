@@ -128,17 +128,12 @@ impl TableCommit {
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
         }
-        if commit_messages
-            .iter()
-            .any(|msg| !msg.new_changelog_files.is_empty())
-        {
-            return Err(crate::Error::Unsupported {
-                message: "overwrite with changelog files is not supported".to_string(),
-            });
-        }
 
         let new_entries = self.messages_to_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        let has_new_data_entries = new_entries
+            .iter()
+            .any(|entry| *entry.kind() == FileKind::Add);
 
         let partition_filter = if let Some(sp) = static_partitions {
             let partition_keys = self.table.schema().partition_keys();
@@ -154,8 +149,10 @@ impl TableCommit {
             } else {
                 Some(self.build_static_partition_predicate(&sp, &partition_fields)?)
             }
+        } else if !self.table.schema().partition_fields().is_empty() && !has_new_data_entries {
+            return Ok(());
         } else {
-            self.build_dynamic_partition_filter(&commit_messages)?
+            self.build_dynamic_partition_filter(&new_entries)?
         };
 
         self.try_commit(CommitEntriesPlan::Overwrite {
@@ -192,13 +189,13 @@ impl TableCommit {
         Ok(PartitionFilter::from_predicate(combined, partition_fields))
     }
 
-    /// Build a dynamic partition filter from the partitions present in commit messages.
+    /// Build a dynamic partition filter from the partitions present in new data entries.
     ///
     /// Returns `None` for unpartitioned tables (full table overwrite).
     /// Uses `PartitionSet` for O(1) byte-level matching.
     fn build_dynamic_partition_filter(
         &self,
-        commit_messages: &[CommitMessage],
+        entries: &[ManifestEntry],
     ) -> Result<Option<PartitionFilter>> {
         let partition_fields = self.table.schema().partition_fields();
         if partition_fields.is_empty() {
@@ -206,8 +203,10 @@ impl TableCommit {
         }
 
         let mut partition_bytes_set: HashSet<Vec<u8>> = HashSet::new();
-        for msg in commit_messages {
-            partition_bytes_set.insert(msg.partition.clone());
+        for entry in entries {
+            if *entry.kind() == FileKind::Add {
+                partition_bytes_set.insert(entry.partition().to_vec());
+            }
         }
 
         Ok(Some(PartitionFilter::from_partition_set(
@@ -1088,7 +1087,7 @@ impl TableCommit {
                         msg.bucket,
                         self.total_buckets,
                         file.clone(),
-                        2,
+                        0,
                     )
                 })
             })
@@ -1438,6 +1437,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dynamic_overwrite_ignores_changelog_only_message() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_dynamic_overwrite_changelog_only";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_partitioned_commit(&file_io, table_path);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition_bytes("a"),
+                0,
+                vec![test_data_file("data-a.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(partition_bytes("a"), 0, vec![]);
+        message.new_changelog_files = vec![test_data_file("changelog-a.parquet", 1)];
+
+        commit.overwrite(vec![message], None).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io, table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+        assert_eq!(snapshot.total_record_count(), Some(100));
+        assert_eq!(snapshot.changelog_manifest_list(), None);
+    }
+
+    #[tokio::test]
     async fn test_drop_partitions() {
         let file_io = test_file_io();
         let table_path = "memory:/test_drop_partitions";
@@ -1689,7 +1717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_overwrite_rejects_changelog_files() {
+    async fn test_overwrite_ignores_changelog_files() {
         let file_io = test_file_io();
         let table_path = "memory:/test_overwrite_changelog_files";
         setup_dirs(&file_io, table_path).await;
@@ -1698,10 +1726,14 @@ mod tests {
         let mut message = CommitMessage::new(vec![], 0, vec![test_data_file("data.parquet", 1)]);
         message.new_changelog_files = vec![test_data_file("changelog.parquet", 1)];
 
-        let err = commit.overwrite(vec![message], None).await.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("changelog files"))
-        );
+        commit.overwrite(vec![message], None).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io, table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        assert_eq!(snapshot.total_record_count(), Some(1));
+        assert_eq!(snapshot.changelog_record_count(), None);
+        assert_eq!(snapshot.changelog_manifest_list(), None);
     }
 
     #[tokio::test]
