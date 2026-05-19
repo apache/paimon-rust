@@ -115,7 +115,7 @@ For any user-facing feature included in a release, we aim to ensure it is functi
 - **Python binding:** The RC is published to **TestPyPI**; install the client from TestPyPI and write your own test cases to verify:
 
     ```bash
-    pip install -i https://test.pypi.org/simple/ pypaimon==${RELEASE_VERSION}
+    pip install -i https://test.pypi.org/simple/ pypaimon-rust==${RELEASE_VERSION}
     ```
 
 - **Go binding:** The RC is published as a Go module tag `bindings/go/v${RELEASE_VERSION}-rc${RC_NUM}`; see [Go Binding](https://paimon.apache.org/docs/rust/go-binding/) for usage. Add it to your Go project and write test cases to verify:
