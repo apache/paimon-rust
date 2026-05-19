@@ -32,6 +32,9 @@ use crate::error::to_datafusion_error;
 mod branches;
 mod manifests;
 mod options;
+mod partitions;
+mod physical_files_size;
+mod referenced_files_size;
 mod row_string_cast;
 mod schemas;
 mod snapshots;
@@ -39,13 +42,30 @@ mod tags;
 
 type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 
+// Most system tables only need the base `Table`. `partitions` is special-cased
+// in `load` because it needs the catalog handle (for metastore-tracked audit
+// metadata via `Catalog::list_partitions`).
 const TABLES: &[(&str, Builder)] = &[
     ("branches", branches::build),
     ("manifests", manifests::build),
     ("options", options::build),
+    ("physical_files_size", physical_files_size::build),
+    ("referenced_files_size", referenced_files_size::build),
     ("schemas", schemas::build),
     ("snapshots", snapshots::build),
     ("tags", tags::build),
+];
+
+const SYSTEM_TABLE_NAMES: &[&str] = &[
+    "branches",
+    "manifests",
+    "options",
+    "partitions",
+    "physical_files_size",
+    "referenced_files_size",
+    "schemas",
+    "snapshots",
+    "tags",
 ];
 
 /// Parse a Paimon object name into `(base_table, optional system_table_name)`.
@@ -82,7 +102,9 @@ pub(crate) fn split_object_name(name: &str) -> (&str, Option<&str>) {
 
 /// Returns true if `name` is a recognised Paimon system table suffix.
 pub(crate) fn is_registered(name: &str) -> bool {
-    TABLES.iter().any(|(n, _)| name.eq_ignore_ascii_case(n))
+    SYSTEM_TABLE_NAMES
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
 }
 
 /// Wraps an already-loaded base table as the system table `name`.
@@ -110,9 +132,14 @@ pub(crate) async fn load(
     }
     let identifier = Identifier::new(database, base.clone());
     match catalog.get_table(&identifier).await {
-        Ok(table) => wrap_to_system_table(&system_name, table)
-            .expect("is_registered guarantees a builder")
-            .map(Some),
+        Ok(table) => {
+            if system_name.eq_ignore_ascii_case("partitions") {
+                return partitions::build(catalog, identifier, table).map(Some);
+            }
+            wrap_to_system_table(&system_name, table)
+                .expect("is_registered guarantees a builder")
+                .map(Some)
+        }
         Err(paimon::Error::TableNotExist { .. }) => Err(DataFusionError::Plan(format!(
             "Cannot read system table `${system_name}`: \
              base table `{base}` does not exist"
@@ -123,7 +150,28 @@ pub(crate) async fn load(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_registered, split_object_name};
+    use super::{is_registered, split_object_name, SYSTEM_TABLE_NAMES, TABLES};
+
+    /// Guards against the two registries drifting: anything in `TABLES` must
+    /// also be in `SYSTEM_TABLE_NAMES`, and the only name allowed to be in
+    /// `SYSTEM_TABLE_NAMES` but not `TABLES` is `partitions` (routed via the
+    /// special path in `load`).
+    #[test]
+    fn registries_stay_in_sync() {
+        for (name, _) in TABLES {
+            assert!(
+                SYSTEM_TABLE_NAMES.contains(name),
+                "`{name}` is in TABLES but missing from SYSTEM_TABLE_NAMES"
+            );
+        }
+        for name in SYSTEM_TABLE_NAMES {
+            let in_tables = TABLES.iter().any(|(n, _)| n == name);
+            assert!(
+                in_tables || *name == "partitions",
+                "`{name}` is in SYSTEM_TABLE_NAMES but has no builder and is not the special-cased `partitions`"
+            );
+        }
+    }
 
     #[test]
     fn is_registered_is_case_insensitive() {
@@ -142,6 +190,9 @@ mod tests {
         assert!(is_registered("manifests"));
         assert!(is_registered("Manifests"));
         assert!(is_registered("MANIFESTS"));
+        assert!(is_registered("partitions"));
+        assert!(is_registered("Partitions"));
+        assert!(is_registered("PARTITIONS"));
         assert!(!is_registered("nonsense"));
     }
 

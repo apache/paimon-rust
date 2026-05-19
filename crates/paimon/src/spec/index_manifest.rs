@@ -122,6 +122,18 @@ impl IndexManifest {
         Self::read_from_bytes(&content)
     }
 
+    /// Read index manifest entries and return their byte size.
+    pub async fn read_with_size(
+        file_io: &FileIO,
+        path: &str,
+    ) -> Result<(Vec<IndexManifestEntry>, i64)> {
+        let input_file = file_io.new_input(path)?;
+        let content = input_file.read().await?;
+        let size = content.len() as i64;
+        let entries = Self::read_from_bytes(&content)?;
+        Ok((entries, size))
+    }
+
     /// Read index manifest entries from Avro-encoded bytes.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Vec<IndexManifestEntry>> {
         crate::spec::avro::from_avro_bytes_fast(bytes)

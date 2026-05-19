@@ -40,6 +40,7 @@ mod kv_file_writer;
 mod partition_filter;
 mod postpone_file_writer;
 mod read_builder;
+pub mod referenced_files;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
 pub(crate) mod schema_manager;

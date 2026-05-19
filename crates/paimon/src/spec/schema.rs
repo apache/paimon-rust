@@ -356,6 +356,7 @@ impl Schema {
         Self::validate_no_duplicate_fields(&field_names)?;
         Self::validate_partition_keys(&field_names, partition_keys)?;
         Self::validate_primary_keys(&field_names, primary_keys)?;
+        Self::validate_primary_keys_not_partition_only(partition_keys, primary_keys)?;
 
         if primary_keys.is_empty() {
             return Ok(fields.to_vec());
@@ -442,6 +443,29 @@ impl Schema {
                 ),
             });
         }
+        Ok(())
+    }
+
+    fn validate_primary_keys_not_partition_only(
+        partition_keys: &[String],
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        if primary_keys.is_empty() || partition_keys.is_empty() {
+            return Ok(());
+        }
+
+        let partition_set: HashSet<&str> = partition_keys.iter().map(String::as_str).collect();
+        if primary_keys
+            .iter()
+            .all(|pk| partition_set.contains(pk.as_str()))
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Primary key constraint {primary_keys:?} should not be same with partition fields {partition_keys:?}, this will result in only one record in a partition"
+                ),
+            });
+        }
+
         Ok(())
     }
 
@@ -824,6 +848,18 @@ mod tests {
         assert!(
             res.is_err(),
             "primary key not in columns should be rejected"
+        );
+
+        // Primary key cannot be fully covered by partition keys.
+        let res = Schema::builder()
+            .column("a", DataType::Int(IntType::with_nullable(false)))
+            .column("b", DataType::Int(IntType::new()))
+            .partition_keys(["a", "b"])
+            .primary_key(["a"])
+            .build();
+        assert!(
+            matches!(res, Err(crate::Error::ConfigInvalid { message }) if message.contains("only one record in a partition")),
+            "primary key fully covered by partition keys should be rejected"
         );
 
         // primary-key in options and DDL at same time

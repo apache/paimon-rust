@@ -506,7 +506,7 @@ impl SQLContext {
 
         // Sort replacements by position (descending) so that replacements
         // from right to left don't shift indices of earlier ones
-        replacements.sort_by(|a, b| b.0 .0.cmp(&a.0 .0));
+        replacements.sort_by_key(|r| std::cmp::Reverse(r.0 .0));
 
         // Build the rewritten SQL by replacing each clause from right to left
         let mut rewritten_sql = sql.to_string();

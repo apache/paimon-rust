@@ -22,10 +22,10 @@ mod common;
 use common::{
     collect_id_name, collect_id_value, create_sql_context, create_test_env, setup_sql_context,
 };
-use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::spec::{IndexManifest, IndexManifestEntry};
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options, SnapshotManager};
+use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options, SnapshotManager};
 
 /// PK table with bucket=-1 (dynamic bucket) should write and read correctly.
 #[tokio::test]
@@ -78,6 +78,268 @@ async fn test_pk_dynamic_bucket() {
             (1, "alice".to_string()),
             (2, "bobby".to_string()),
             (3, "carol".to_string()),
+        ]
+    );
+}
+
+async fn collect_partial_update_rows(
+    sql_context: &paimon_datafusion::SQLContext,
+    sql: &str,
+) -> Vec<(i32, Option<i32>, Option<String>)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let ints = batch
+            .column_by_name("v_int")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let strs = batch
+            .column_by_name("v_str")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                ids.value(i),
+                if ints.is_null(i) {
+                    None
+                } else {
+                    Some(ints.value(i))
+                },
+                if strs.is_null(i) {
+                    None
+                } else {
+                    Some(strs.value(i).to_string())
+                },
+            ));
+        }
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
+#[tokio::test]
+async fn test_pk_dynamic_bucket_partial_update() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dyn_partial_update (
+                id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '-1', 'merge-engine' = 'partial-update')",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_partial_update VALUES
+             (1, 10, 'old-1'),
+             (2, 20, 'old-2')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_partial_update VALUES
+             (1, CAST(NULL AS INT), 'new-1'),
+             (2, 200, CAST(NULL AS STRING)),
+             (3, 30, CAST(NULL AS STRING))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_partial_update VALUES
+             (1, 111, CAST(NULL AS STRING))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_partial_update_rows(
+        &sql_context,
+        "SELECT id, v_int, v_str FROM paimon.test_db.t_dyn_partial_update",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(111), Some("new-1".to_string())),
+            (2, Some(200), Some("old-2".to_string())),
+            (3, Some(30), None),
+        ]
+    );
+}
+
+async fn latest_splits(table: &paimon::Table) -> Vec<DataSplit> {
+    table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .to_vec()
+}
+
+async fn bucket_containing_id(table: &paimon::Table, id: i32) -> i32 {
+    let read_builder = table.new_read_builder();
+    let read = read_builder.new_read().unwrap();
+    let splits = latest_splits(table).await;
+    let mut buckets = Vec::new();
+    for split in &splits {
+        let batches: Vec<_> =
+            futures::TryStreamExt::try_collect(read.to_arrow(std::slice::from_ref(split)).unwrap())
+                .await
+                .unwrap();
+        let contains_id = batches.iter().any(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .unwrap();
+            (0..batch.num_rows()).any(|i| ids.value(i) == id)
+        });
+        if contains_id {
+            buckets.push(split.bucket());
+        }
+    }
+
+    buckets.sort();
+    buckets.dedup();
+    assert_eq!(
+        buckets.len(),
+        1,
+        "id={id} should be readable from exactly one bucket"
+    );
+    buckets[0]
+}
+
+async fn index_bucket_count(table: &paimon::Table) -> usize {
+    let entries = read_hash_index_entries(table).await;
+    let mut buckets = entries.iter().map(|entry| entry.bucket).collect::<Vec<_>>();
+    buckets.sort();
+    buckets.dedup();
+    buckets.len()
+}
+
+#[tokio::test]
+async fn test_pk_dynamic_bucket_partial_update_restores_existing_bucket() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dyn_partial_route (
+                id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '-1',
+                'dynamic-bucket.target-row-num' = '1',
+                'merge-engine' = 'partial-update'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_partial_route VALUES
+             (2, 20, 'old-2'),
+             (1, 10, 'old-1')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_dyn_partial_route"))
+        .await
+        .unwrap();
+    assert_eq!(
+        index_bucket_count(&table).await,
+        2,
+        "target row number 1 should put two new keys into two HASH index buckets"
+    );
+    let id1_bucket = bucket_containing_id(&table, 1).await;
+    assert_ne!(
+        id1_bucket, 0,
+        "test setup writes id=1 second so missing index restore would allocate a different bucket"
+    );
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_partial_route VALUES
+             (1, CAST(NULL AS INT), 'new-1')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_dyn_partial_route"))
+        .await
+        .unwrap();
+    let id1_bucket_after = bucket_containing_id(&table, 1).await;
+    assert_eq!(
+        id1_bucket_after, id1_bucket,
+        "restored HASH index should route id=1 back to its original bucket"
+    );
+
+    let splits = latest_splits(&table).await;
+    let id1_data_files_in_bucket: usize = splits
+        .iter()
+        .filter(|split| split.bucket() == id1_bucket)
+        .map(|split| split.data_files().len())
+        .sum();
+    assert_eq!(
+        id1_data_files_in_bucket, 2,
+        "id=1 initial row and later partial update should be in the same bucket"
+    );
+    let other_bucket_file_count: usize = splits
+        .iter()
+        .filter(|split| split.bucket() != id1_bucket)
+        .map(|split| split.data_files().len())
+        .sum();
+    assert_eq!(
+        other_bucket_file_count, 1,
+        "id=2 should remain in a separate bucket when target row number is 1"
+    );
+
+    let rows = collect_partial_update_rows(
+        &sql_context,
+        "SELECT id, v_int, v_str FROM paimon.test_db.t_dyn_partial_route",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(10), Some("new-1".to_string())),
+            (2, Some(20), Some("old-2".to_string())),
         ]
     );
 }
@@ -160,6 +422,162 @@ async fn test_pk_dynamic_bucket_partitioned() {
     );
 }
 
+#[tokio::test]
+async fn test_pk_dynamic_bucket_partitioned_partial_update() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dyn_part_partial_update (
+                dt STRING, id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (dt, id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '-1', 'merge-engine' = 'partial-update')",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_part_partial_update VALUES
+             ('2024-01-01', 1, 10, 'old-a'),
+             ('2024-01-02', 1, 100, 'old-b')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_part_partial_update VALUES
+             ('2024-01-01', 1, CAST(NULL AS INT), 'new-a'),
+             ('2024-01-02', 1, 200, CAST(NULL AS STRING))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql(
+            "SELECT dt, id, v_int, v_str
+             FROM paimon.test_db.t_dyn_part_partial_update
+             ORDER BY dt, id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let dts = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let ints = batch
+            .column_by_name("v_int")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let strs = batch
+            .column_by_name("v_str")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dts.value(i).to_string(),
+                ids.value(i),
+                if ints.is_null(i) {
+                    None
+                } else {
+                    Some(ints.value(i))
+                },
+                if strs.is_null(i) {
+                    None
+                } else {
+                    Some(strs.value(i).to_string())
+                },
+            ));
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "2024-01-01".to_string(),
+                1,
+                Some(10),
+                Some("new-a".to_string())
+            ),
+            (
+                "2024-01-02".to_string(),
+                1,
+                Some(200),
+                Some("old-b".to_string())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_rejects_cross_partition_dynamic_bucket_partial_update() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_cross_partial_update (
+                dt STRING, id INT NOT NULL, v_int INT,
+                PRIMARY KEY (id)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '-1', 'merge-engine' = 'partial-update')",
+        )
+        .await
+        .unwrap();
+
+    let result = sql_context
+        .sql("INSERT INTO paimon.test_db.t_cross_partial_update VALUES ('2024-01-01', 1, 10)")
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cross-partition update"),
+        "expected cross-partition partial-update rejection, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_rejects_partition_only_primary_key_partial_update() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let result = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_partition_only_pk (
+                dt STRING NOT NULL, v_int INT,
+                PRIMARY KEY (dt)
+            ) PARTITIONED BY (dt)
+            WITH ('bucket' = '-1', 'merge-engine' = 'partial-update')",
+        )
+        .await;
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("only one record in a partition"),
+        "expected partition-only primary key rejection, got: {err}"
+    );
+}
+
 /// Dynamic bucket with three commits — verifies sequence number tracking.
 #[tokio::test]
 async fn test_pk_dynamic_bucket_three_commits() {
@@ -225,7 +643,7 @@ async fn read_hash_index_entries(table: &paimon::Table) -> Vec<IndexManifestEntr
         .collect()
 }
 
-/// Helper: read raw hash values from a hash index file (flat i32 little-endian).
+/// Helper: read raw hash values from a hash index file (flat i32 big-endian).
 async fn read_hash_file(table: &paimon::Table, file_name: &str) -> Vec<i32> {
     let path = format!("{}/index/{}", table.location(), file_name);
     let input = table.file_io().new_input(&path).unwrap();

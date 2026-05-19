@@ -68,6 +68,27 @@ impl Manifest {
     }
 }
 
+/// Merge ADD/DELETE entries by file identifier, returning only the active ADD set.
+/// Mirrors Java [FileEntry.mergeEntries](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java).
+/// Return order is unspecified.
+pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    use std::collections::HashMap;
+
+    use crate::spec::manifest_entry::Identifier;
+    let mut map: HashMap<Identifier, ManifestEntry> = HashMap::new();
+    for entry in entries {
+        match entry.kind() {
+            FileKind::Add => {
+                map.insert(entry.identifier(), entry);
+            }
+            FileKind::Delete => {
+                map.remove(&entry.identifier());
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
 #[cfg(test)]
 #[cfg(not(windows))] // Skip on Windows due to path compatibility issues
 mod tests {
@@ -95,5 +116,59 @@ mod tests {
         let t2 = &entries[1];
         assert_eq!(t2.kind(), &FileKind::Add);
         assert_eq!(t2.bucket(), 2);
+    }
+
+    #[test]
+    fn test_merge_active_entries_cancels_add_then_delete() {
+        use crate::spec::data_file::DataFileMeta;
+        use crate::spec::stats::BinaryTableStats;
+        use crate::spec::ManifestEntry;
+
+        fn entry(kind: FileKind, file_name: &str, level: i32) -> ManifestEntry {
+            let stats = BinaryTableStats::new(vec![], vec![], vec![]);
+            let file = DataFileMeta {
+                file_name: file_name.to_string(),
+                file_size: 100,
+                row_count: 10,
+                min_key: vec![],
+                max_key: vec![],
+                key_stats: stats.clone(),
+                value_stats: stats,
+                min_sequence_number: 0,
+                max_sequence_number: 0,
+                schema_id: 0,
+                level,
+                extra_files: vec![],
+                creation_time: None,
+                delete_row_count: None,
+                embedded_index: None,
+                file_source: None,
+                value_stats_cols: None,
+                external_path: None,
+                first_row_id: None,
+                write_cols: None,
+            };
+            ManifestEntry::new(kind, vec![], 0, 1, file, 2)
+        }
+
+        let cancelled = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Delete, "f.parquet", 0),
+        ]);
+        assert!(cancelled.is_empty());
+
+        let two_levels = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Add, "f.parquet", 1),
+        ]);
+        assert_eq!(two_levels.len(), 2);
+
+        let compacted = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Delete, "f.parquet", 0),
+            entry(FileKind::Add, "f.parquet", 1),
+        ]);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].file().level, 1);
     }
 }

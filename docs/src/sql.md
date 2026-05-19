@@ -537,6 +537,7 @@ SELECT * FROM full_text_search('paimon.my_db.docs', 'content', 'paimon search', 
 
 The function searches across all Tantivy full-text index files for the target column, merges results by relevance score, and returns the top-k matching rows. If no matching index is found, an empty result is returned.
 
+
 ## Time Travel
 
 Paimon supports time travel queries to read historical data.
@@ -770,6 +771,90 @@ Columns:
 | `max_partition_stats` | STRING | Maximum partition stats, formatted as a Java row cast string |
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
+
+### $partitions
+
+View all partitions of a table with aggregated record counts and file sizes:
+
+```sql
+SELECT * FROM paimon.default.my_table$partitions;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `partition` | STRING | Partition spec, formatted as `key1=val1/key2=val2` |
+| `record_count` | BIGINT | Total record count across all data files in the partition |
+| `file_size_in_bytes` | BIGINT | Total file size in bytes |
+| `file_count` | BIGINT | Number of data files |
+| `last_update_time` | TIMESTAMP | Latest data-file creation time |
+| `created_at` | TIMESTAMP | Partition creation time (only available with metastore-tracked catalogs) |
+| `created_by` | STRING | Snapshot id that created the partition (catalog-tracked only) |
+| `updated_by` | STRING | Snapshot id that last updated the partition (catalog-tracked only) |
+| `options` | STRING | Per-partition options as flat JSON (catalog-tracked only) |
+| `total_buckets` | INT | Total bucket count for the partition (0 unless catalog-tracked) |
+| `done` | BOOLEAN | Whether the partition is marked done (false unless catalog-tracked) |
+
+### $physical_files_size
+
+Scan the table directory recursively and compute the total size of all physical files on disk, categorized by file type. By comparing with `$referenced_files_size`, you can identify orphan files that are no longer referenced by any snapshot.
+
+Files are classified by their file name prefix:
+- `manifest-*` / `index-manifest-*` → manifest
+- `index-*` (excluding `index-manifest-*`) → index
+- Everything else → data
+
+```sql
+SELECT * FROM paimon.default.my_table$physical_files_size;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `manifest_file_count` | BIGINT | Number of manifest files on disk |
+| `manifest_file_size` | BIGINT | Total size of manifest files (bytes) |
+| `data_file_count` | BIGINT | Number of data files on disk |
+| `data_file_size` | BIGINT | Total size of data files (bytes) |
+| `index_file_count` | BIGINT | Number of index files on disk |
+| `index_file_size` | BIGINT | Total size of index files (bytes) |
+
+### $referenced_files_size
+
+Compute aggregated manifest/data/index file size summaries for all snapshots referenced by a table, including snapshots from the main branch, tags, and other branches. This is useful for understanding storage usage and for orphan file analysis.
+
+Historical snapshots may be in the process of being cleaned up — if a manifest file has already been deleted, it is gracefully skipped (counted as 0 files/bytes).
+
+```sql
+SELECT * FROM paimon.default.my_table$referenced_files_size;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `source` | STRING | Scope: `total` or `branch:<name>` |
+| `manifest_file_count` | BIGINT | Number of manifest files |
+| `manifest_file_size` | BIGINT | Total size of manifest files (bytes) |
+| `data_file_count` | BIGINT | Number of data files |
+| `data_file_size` | BIGINT | Total size of data files (bytes) |
+| `index_file_count` | BIGINT | Number of index files |
+| `index_file_size` | BIGINT | Total size of index files (bytes) |
+
+The output contains one row per scope:
+- `total` — sum across all branches and tags
+- `branch:main` — main branch snapshots + tag snapshots
+- `branch:<name>` — one row per other branch
+
+To identify orphan file size:
+
+```sql
+SELECT p.data_file_size - r.data_file_size AS orphan_data_size
+FROM paimon.default.my_table$physical_files_size p,
+     paimon.default.my_table$referenced_files_size r
+WHERE r.source = 'total';
+```
 
 ### Branch References
 

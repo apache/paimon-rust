@@ -53,6 +53,7 @@ pub use index_file_meta::*;
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
 mod manifest;
+pub(crate) use manifest::merge_active_entries;
 pub use manifest::Manifest;
 mod manifest_common;
 pub use manifest_common::FileKind;

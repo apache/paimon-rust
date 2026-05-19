@@ -158,6 +158,44 @@ impl FileIO {
         Ok(statuses)
     }
 
+    /// List all files recursively under the given directory path.
+    pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
+        let (op, relative_path) = self.storage.create(path)?;
+        let base_path = &path[..path.len() - relative_path.len()];
+        let list_path = normalize_root(relative_path);
+
+        let entries =
+            op.list_with(&list_path)
+                .recursive(true)
+                .await
+                .context(IoUnexpectedSnafu {
+                    message: format!("Failed to list files recursively in '{path}'"),
+                })?;
+
+        let mut statuses = Vec::new();
+        let list_path_normalized = list_path.trim_start_matches('/');
+        for entry in entries {
+            let entry_path = entry.path();
+            if entry_path.trim_start_matches('/') == list_path_normalized {
+                continue;
+            }
+            let meta = entry.metadata();
+            if meta.is_dir() {
+                continue;
+            }
+            statuses.push(FileStatus {
+                size: meta.content_length(),
+                is_dir: false,
+                path: format!("{base_path}{entry_path}"),
+                last_modified: meta
+                    .last_modified()
+                    .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
+            });
+        }
+
+        Ok(statuses)
+    }
+
     /// Check if exists.
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>

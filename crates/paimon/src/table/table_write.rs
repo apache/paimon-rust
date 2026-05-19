@@ -139,13 +139,15 @@ impl TableWrite {
         let has_primary_keys = !schema.primary_keys().is_empty();
         let is_dynamic_bucket = has_primary_keys && total_buckets == -1;
 
-        let is_cross_partition = is_dynamic_bucket && !schema.partition_keys().is_empty() && {
-            let pk_set: HashSet<&str> = schema.primary_keys().iter().map(String::as_str).collect();
-            schema
-                .partition_keys()
-                .iter()
-                .any(|p| !pk_set.contains(p.as_str()))
-        };
+        let is_dynamic_cross_partition =
+            is_dynamic_bucket && !schema.partition_keys().is_empty() && {
+                let pk_set: HashSet<&str> =
+                    schema.primary_keys().iter().map(String::as_str).collect();
+                schema
+                    .partition_keys()
+                    .iter()
+                    .any(|p| !pk_set.contains(p.as_str()))
+            };
 
         if has_primary_keys
             && !is_dynamic_bucket
@@ -223,6 +225,14 @@ impl TableWrite {
 
         let merge_engine = core_options.merge_engine()?;
 
+        if is_dynamic_cross_partition && merge_engine == MergeEngine::PartialUpdate {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "merge-engine=partial-update with cross-partition update is not supported yet"
+                        .to_string(),
+            });
+        }
+
         if has_primary_keys && core_options.rowkind_field().is_some() {
             return Err(crate::Error::Unsupported {
                 message: "KeyValueFileWriter does not support rowkind.field".to_string(),
@@ -231,7 +241,7 @@ impl TableWrite {
 
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
 
-        let bucket_assigner = if is_cross_partition {
+        let bucket_assigner = if is_dynamic_cross_partition {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
                 table.clone(),
                 partition_field_indices,
@@ -676,10 +686,6 @@ impl TableWrite {
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),
                 merge_engine: self.merge_engine,
-                dynamic_bucket_enabled: matches!(
-                    self.bucket_assigner,
-                    BucketAssignerEnum::Dynamic(_) | BucketAssignerEnum::CrossPartition(_)
-                ),
                 deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
                     .deletion_vectors_enabled(),
             },
@@ -930,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_partial_update_dynamic_bucket_table_when_creating_writer() {
+    async fn test_allows_partial_update_dynamic_bucket_table() {
         let file_io = test_file_io();
         let table_path = "memory:/test_partial_update_dynamic_bucket_table";
         setup_dirs(&file_io, table_path).await;
@@ -953,13 +959,10 @@ mod tests {
         );
 
         let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
-        let err = table_write
+        table_write
             .write_arrow_batch(&make_batch(vec![1], vec![10]))
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("bucket=-1"))
-        );
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1897,6 +1900,39 @@ mod tests {
         assert!(matches!(
             tw2.bucket_assigner,
             BucketAssignerEnum::Dynamic(_)
+        ));
+    }
+
+    #[test]
+    fn test_rejects_cross_partition_partial_update() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_cross_partial_update";
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .partition_keys(["pt"])
+            .option("merge-engine", "partial-update")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_cross_partial_update"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let err = match TableWrite::new(&table, "test-user".to_string()) {
+            Ok(_) => panic!("cross-partition partial-update should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("cross-partition update")
         ));
     }
 

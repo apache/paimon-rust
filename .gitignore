@@ -20,5 +20,6 @@
 .idea
 .vscode
 **/.DS_Store
-dist/*
+**/dist/
+docs/site/
 .qoder

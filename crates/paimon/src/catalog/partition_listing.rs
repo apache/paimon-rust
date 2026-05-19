@@ -22,7 +22,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::spec::{BinaryRow, CoreOptions, Manifest, ManifestList, Partition, PartitionComputer};
+use crate::spec::{
+    merge_active_entries, BinaryRow, CoreOptions, Manifest, ManifestList, Partition,
+    PartitionComputer,
+};
 use crate::table::{SnapshotManager, Table};
 use crate::Result;
 
@@ -49,6 +52,9 @@ pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Parti
         let entries = Manifest::read(file_io, &manifest_path).await?;
         all_entries.extend(entries);
     }
+    // Mirror Java AbstractFileStoreScan.readAndMergeFileEntries: drop entries
+    // shadowed by a later DELETE so file_count/record_count reflect live files.
+    let all_entries = merge_active_entries(all_entries);
 
     let schema = table.schema();
     let core = CoreOptions::new(schema.options());

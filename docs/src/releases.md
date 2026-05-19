@@ -25,20 +25,28 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.1.0 (In Development)
-
-The first release of Apache Paimon Rust. Track progress at the [0.1.0 milestone](https://github.com/apache/paimon-rust/issues/3).
+### 0.2.0 (In Development)
 
 Planned features:
 
-- Paimon table format reader
-- Local filesystem, S3, and OSS storage backends
-- REST Catalog client
-- Apache DataFusion integration
-- Partitioned table support
-- C FFI bindings
-- Go bindings
+- Primary-key table read/write support with sort-merge deduplication
+- DataFusion DML support (INSERT OVERWRITE, TRUNCATE TABLE, DROP PARTITION, CALL procedures)
+- System tables ($snapshots, $tags, $manifests, $schemas)
+- Multi-catalog support, session-scoped dynamic options (SET/RESET), and temporary tables
+- Lumina vector index read infrastructure and Vortex columnar file format support
+- Exact COUNT(*) pushdown via partition statistics
 
 ## Past Releases
 
-No releases yet. Stay tuned!
+### [0.1.0](https://github.com/apache/paimon-rust/releases/tag/v0.1.0)
+
+The first release of Apache Paimon Rust.
+
+Key features:
+
+- Paimon table format reader (Parquet, ORC, Avro) with schema evolution
+- Filesystem and REST Catalog support
+- Apache DataFusion integration (catalog, predicate/projection push-down, time travel, partition pruning, statistics)
+- Deletion vectors, data-level stats pruning, BTree global index, Tantivy full-text search index
+- Commit pipeline with SnapshotCommit abstraction
+- Go / Python bindings

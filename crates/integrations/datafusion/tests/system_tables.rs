@@ -21,7 +21,7 @@ mod common;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::catalog::Identifier;
@@ -621,4 +621,122 @@ fn single_int_partition_stat(value: &str) -> i32 {
         .expect("partition stats should use row cast braces")
         .parse()
         .expect("partition stats should contain one int partition value")
+}
+
+#[tokio::test]
+async fn test_partitions_system_table() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$partitions");
+    let batches = run_sql(&ctx, &sql).await;
+
+    assert!(!batches.is_empty(), "$partitions should return ≥1 batch");
+
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("partition", DataType::Utf8),
+        ("record_count", DataType::Int64),
+        ("file_size_in_bytes", DataType::Int64),
+        ("file_count", DataType::Int64),
+        (
+            "last_update_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        (
+            "created_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("created_by", DataType::Utf8),
+        ("updated_by", DataType::Utf8),
+        ("options", DataType::Utf8),
+        ("total_buckets", DataType::Int32),
+        ("done", DataType::Boolean),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    let mut partition_strings: Vec<Option<String>> = Vec::new();
+    let mut record_counts: Vec<i64> = Vec::new();
+    let mut file_counts: Vec<i64> = Vec::new();
+    let mut file_sizes: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let parts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("partition is Utf8");
+        let rc = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("record_count is Int64");
+        let sz = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("file_size_in_bytes is Int64");
+        let fc = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("file_count is Int64");
+        for i in 0..batch.num_rows() {
+            partition_strings.push(if parts.is_null(i) {
+                None
+            } else {
+                Some(parts.value(i).to_string())
+            });
+            record_counts.push(rc.value(i));
+            file_sizes.push(sz.value(i));
+            file_counts.push(fc.value(i));
+        }
+    }
+
+    for fc in &file_counts {
+        assert!(*fc >= 1, "file_count must be ≥ 1 per partition");
+    }
+    for sz in &file_sizes {
+        assert!(*sz >= 0, "file_size_in_bytes must be non-negative");
+    }
+    for rc in &record_counts {
+        assert!(*rc >= 0, "record_count must be non-negative");
+    }
+
+    let mut sorted = partition_strings.clone();
+    sorted.sort();
+    assert_eq!(
+        partition_strings, sorted,
+        "rows should be sorted by partition string"
+    );
+
+    // Cols 5-8 stay null with FileSystemCatalog (no metastore audit metadata).
+    for batch in &batches {
+        for col_idx in 5..=8 {
+            for i in 0..batch.num_rows() {
+                assert!(
+                    batch.column(col_idx).is_null(i),
+                    "column {col_idx} row {i} should be null"
+                );
+            }
+        }
+    }
+    // total_buckets defaults to 0 and done to false on FileSystemCatalog.
+    for batch in &batches {
+        let tb = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("total_buckets is Int32");
+        let done = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("done is Boolean");
+        for i in 0..batch.num_rows() {
+            assert_eq!(tb.value(i), 0, "total_buckets default for FS catalog");
+            assert!(!done.value(i), "done default for FS catalog");
+        }
+    }
 }
