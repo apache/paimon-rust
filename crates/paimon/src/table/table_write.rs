@@ -1585,7 +1585,7 @@ mod tests {
 
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_input_changelog"),
+            Identifier::new("default", "test_input_changelog").unwrap(),
             table_path.to_string(),
             pk_changelog_schema(&[
                 ("changelog-producer", "input"),
@@ -1643,7 +1643,7 @@ mod tests {
 
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_input_changelog"),
+            Identifier::new("default", "test_input_changelog").unwrap(),
             table_path.to_string(),
             pk_changelog_schema(&[("changelog-producer", "input")]),
             None,
@@ -1672,7 +1672,7 @@ mod tests {
 
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_input_changelog"),
+            Identifier::new("default", "test_input_changelog").unwrap(),
             table_path.to_string(),
             pk_changelog_schema(&[("changelog-producer", "input")]),
             None,
@@ -1698,7 +1698,7 @@ mod tests {
 
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_input_changelog"),
+            Identifier::new("default", "test_input_changelog").unwrap(),
             table_path.to_string(),
             pk_changelog_schema(&[("changelog-producer", "input")]),
             None,
@@ -1766,7 +1766,7 @@ mod tests {
 
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_input_changelog_dynamic_bucket"),
+            Identifier::new("default", "test_input_changelog_dynamic_bucket").unwrap(),
             table_path.to_string(),
             ordinary_dynamic_pk_changelog_schema(),
             None,
@@ -1846,7 +1846,7 @@ mod tests {
 
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_input_changelog"),
+            Identifier::new("default", "test_input_changelog").unwrap(),
             table_path.to_string(),
             pk_changelog_schema(&[("changelog-producer", "input")]),
             None,
