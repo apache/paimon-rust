@@ -98,9 +98,11 @@ impl TableCommit {
         }
 
         let entries = self.messages_to_entries(&commit_messages);
+        let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         self.try_commit(CommitEntriesPlan::Direct {
             entries,
+            changelog_entries,
             new_index_entries,
         })
         .await
@@ -129,6 +131,9 @@ impl TableCommit {
 
         let new_entries = self.messages_to_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        let has_new_data_entries = new_entries
+            .iter()
+            .any(|entry| *entry.kind() == FileKind::Add);
 
         let partition_filter = if let Some(sp) = static_partitions {
             let partition_keys = self.table.schema().partition_keys();
@@ -144,8 +149,10 @@ impl TableCommit {
             } else {
                 Some(self.build_static_partition_predicate(&sp, &partition_fields)?)
             }
+        } else if !self.table.schema().partition_fields().is_empty() && !has_new_data_entries {
+            return Ok(());
         } else {
-            self.build_dynamic_partition_filter(&commit_messages)?
+            self.build_dynamic_partition_filter(&new_entries)?
         };
 
         self.try_commit(CommitEntriesPlan::Overwrite {
@@ -182,13 +189,13 @@ impl TableCommit {
         Ok(PartitionFilter::from_predicate(combined, partition_fields))
     }
 
-    /// Build a dynamic partition filter from the partitions present in commit messages.
+    /// Build a dynamic partition filter from the partitions present in new data entries.
     ///
     /// Returns `None` for unpartitioned tables (full table overwrite).
     /// Uses `PartitionSet` for O(1) byte-level matching.
     fn build_dynamic_partition_filter(
         &self,
-        commit_messages: &[CommitMessage],
+        entries: &[ManifestEntry],
     ) -> Result<Option<PartitionFilter>> {
         let partition_fields = self.table.schema().partition_fields();
         if partition_fields.is_empty() {
@@ -196,8 +203,10 @@ impl TableCommit {
         }
 
         let mut partition_bytes_set: HashSet<Vec<u8>> = HashSet::new();
-        for msg in commit_messages {
-            partition_bytes_set.insert(msg.partition.clone());
+        for entry in entries {
+            if *entry.kind() == FileKind::Add {
+                partition_bytes_set.insert(entry.partition().to_vec());
+            }
         }
 
         Ok(Some(PartitionFilter::from_partition_set(
@@ -298,7 +307,7 @@ impl TableCommit {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
             let resolved = self.resolve_commit(&plan, &latest_snapshot).await?;
 
-            if resolved.entries.is_empty() {
+            if resolved.entries.is_empty() && resolved.changelog_entries.is_empty() {
                 break;
             }
 
@@ -376,11 +385,15 @@ impl TableCommit {
         let unique_id = uuid::Uuid::new_v4();
         let base_manifest_list_name = format!("manifest-list-{unique_id}-0");
         let delta_manifest_list_name = format!("manifest-list-{unique_id}-1");
+        let changelog_manifest_list_name = format!("manifest-list-{unique_id}-2");
         let new_manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
+        let changelog_manifest_name = format!("manifest-{}-1", uuid::Uuid::new_v4());
 
         let base_manifest_list_path = format!("{manifest_dir}/{base_manifest_list_name}");
         let delta_manifest_list_path = format!("{manifest_dir}/{delta_manifest_list_name}");
+        let changelog_manifest_list_path = format!("{manifest_dir}/{changelog_manifest_list_name}");
         let new_manifest_path = format!("{manifest_dir}/{new_manifest_name}");
+        let changelog_manifest_path = format!("{manifest_dir}/{changelog_manifest_name}");
 
         // Write manifest file
         let new_manifest_file_meta = self
@@ -399,6 +412,32 @@ impl TableCommit {
             &[new_manifest_file_meta],
         )
         .await?;
+
+        let changelog_record_count = if resolved.changelog_entries.is_empty() {
+            None
+        } else {
+            let changelog_manifest_file_meta = self
+                .write_manifest_file(
+                    file_io,
+                    &changelog_manifest_path,
+                    &changelog_manifest_name,
+                    &resolved.changelog_entries,
+                )
+                .await?;
+            ManifestList::write(
+                file_io,
+                &changelog_manifest_list_path,
+                &[changelog_manifest_file_meta],
+            )
+            .await?;
+            Some(
+                resolved
+                    .changelog_entries
+                    .iter()
+                    .map(|entry| entry.file().row_count)
+                    .sum(),
+            )
+        };
 
         // Read existing manifests (base + delta from previous snapshot) and write base manifest list
         let mut total_record_count: i64 = 0;
@@ -441,6 +480,8 @@ impl TableCommit {
             .time_millis(current_time_millis())
             .total_record_count(Some(total_record_count))
             .delta_record_count(Some(delta_record_count))
+            .changelog_manifest_list(changelog_record_count.map(|_| changelog_manifest_list_name))
+            .changelog_record_count(changelog_record_count)
             .next_row_id(next_row_id)
             .index_manifest(resolved.index_manifest_name)
             .build();
@@ -533,6 +574,7 @@ impl TableCommit {
         match plan {
             CommitEntriesPlan::Direct {
                 entries,
+                changelog_entries,
                 new_index_entries,
             } => {
                 if self.row_tracking_enabled {
@@ -576,6 +618,7 @@ impl TableCommit {
 
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
+                    changelog_entries: changelog_entries.clone(),
                     kind,
                     index_manifest_name,
                 })
@@ -613,6 +656,7 @@ impl TableCommit {
 
                 Ok(ResolvedCommit {
                     entries,
+                    changelog_entries: vec![],
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
                 })
@@ -1031,6 +1075,25 @@ impl TableCommit {
             .collect()
     }
 
+    /// Convert commit messages to changelog manifest entries (ADD kind only).
+    fn messages_to_changelog_entries(&self, messages: &[CommitMessage]) -> Vec<ManifestEntry> {
+        messages
+            .iter()
+            .flat_map(|msg| {
+                msg.new_changelog_files.iter().map(|file| {
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        msg.partition.clone(),
+                        msg.bucket,
+                        self.total_buckets,
+                        file.clone(),
+                        0,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Convert commit messages to index manifest entries (ADD kind).
     fn messages_to_index_entries(&self, messages: &[CommitMessage]) -> Vec<IndexManifestEntry> {
         messages
@@ -1056,6 +1119,7 @@ enum CommitEntriesPlan {
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
     Direct {
         entries: Vec<ManifestEntry>,
+        changelog_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
     },
     /// Overwrite with optional partition filter.
@@ -1069,6 +1133,7 @@ enum CommitEntriesPlan {
 /// Fully resolved commit ready for writing.
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
+    changelog_entries: Vec<ManifestEntry>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
 }
@@ -1372,6 +1437,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dynamic_overwrite_ignores_changelog_only_message() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_dynamic_overwrite_changelog_only";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_partitioned_commit(&file_io, table_path);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition_bytes("a"),
+                0,
+                vec![test_data_file("data-a.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(partition_bytes("a"), 0, vec![]);
+        message.new_changelog_files = vec![test_data_file("changelog-a.parquet", 1)];
+
+        commit.overwrite(vec![message], None).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io, table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+        assert_eq!(snapshot.total_record_count(), Some(100));
+        assert_eq!(snapshot.changelog_manifest_list(), None);
+    }
+
+    #[tokio::test]
     async fn test_drop_partitions() {
         let file_io = test_file_io();
         let table_path = "memory:/test_drop_partitions";
@@ -1620,6 +1714,26 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 600 - 300 (delete null) + 50 (add null2) = 350
         assert_eq!(snapshot.total_record_count(), Some(350));
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_ignores_changelog_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_overwrite_changelog_files";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut message = CommitMessage::new(vec![], 0, vec![test_data_file("data.parquet", 1)]);
+        message.new_changelog_files = vec![test_data_file("changelog.parquet", 1)];
+
+        commit.overwrite(vec![message], None).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io, table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        assert_eq!(snapshot.total_record_count(), Some(1));
+        assert_eq!(snapshot.changelog_record_count(), None);
+        assert_eq!(snapshot.changelog_manifest_list(), None);
     }
 
     #[tokio::test]

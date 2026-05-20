@@ -40,6 +40,10 @@ const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
+const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
+const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
+const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
+const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
@@ -55,6 +59,7 @@ pub const SCAN_VERSION_OPTION: &str = "scan.version";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
+const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
@@ -73,6 +78,32 @@ pub enum MergeEngine {
     PartialUpdate,
     /// Keep the first row for each key (ignore later updates).
     FirstRow,
+}
+
+/// Changelog producer for table writes.
+///
+/// Reference: Java `CoreOptions.ChangelogProducer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogProducer {
+    /// No changelog file.
+    None,
+    /// Double write input rows to changelog files.
+    Input,
+    /// Generate changelog files during full compaction.
+    FullCompaction,
+    /// Generate changelog files through lookup compaction.
+    Lookup,
+}
+
+impl ChangelogProducer {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Input => "input",
+            Self::FullCompaction => "full-compaction",
+            Self::Lookup => "lookup",
+        }
+    }
 }
 
 /// Format the bucket directory name for a given bucket number.
@@ -138,12 +169,28 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
-    /// Changelog producer setting. Default is "none".
+    /// Raw changelog producer setting. Default is `"none"`.
     pub fn changelog_producer(&self) -> &str {
         self.options
             .get(CHANGELOG_PRODUCER_OPTION)
             .map(String::as_str)
             .unwrap_or("none")
+    }
+
+    /// Typed changelog producer setting. Default is `None`.
+    pub fn try_changelog_producer(&self) -> crate::Result<ChangelogProducer> {
+        match self.options.get(CHANGELOG_PRODUCER_OPTION) {
+            None => Ok(ChangelogProducer::None),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "none" => Ok(ChangelogProducer::None),
+                "input" => Ok(ChangelogProducer::Input),
+                "full-compaction" => Ok(ChangelogProducer::FullCompaction),
+                "lookup" => Ok(ChangelogProducer::Lookup),
+                other => Err(crate::Error::Unsupported {
+                    message: format!("Unsupported changelog-producer: '{other}'"),
+                }),
+            },
+        }
     }
 
     /// The `rowkind.field` option: a user column whose value encodes the row kind.
@@ -363,6 +410,43 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(1)
     }
 
+    /// File name prefix for changelog files. Default is `"changelog-"`.
+    pub fn changelog_file_prefix(&self) -> &str {
+        self.options
+            .get(CHANGELOG_FILE_PREFIX_OPTION)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_CHANGELOG_FILE_PREFIX)
+    }
+
+    /// Effective file format for changelog files.
+    ///
+    /// When `changelog-file.format` is not configured, Java Paimon falls back
+    /// to the table `file.format`.
+    pub fn changelog_file_format(&self) -> &str {
+        self.options
+            .get(CHANGELOG_FILE_FORMAT_OPTION)
+            .map(String::as_str)
+            .unwrap_or_else(|| self.file_format())
+    }
+
+    /// Effective compression codec for changelog files.
+    ///
+    /// When `changelog-file.compression` is not configured, Java Paimon falls
+    /// back to the table `file.compression`.
+    pub fn changelog_file_compression(&self) -> &str {
+        self.options
+            .get(CHANGELOG_FILE_COMPRESSION_OPTION)
+            .map(String::as_str)
+            .unwrap_or_else(|| self.file_compression())
+    }
+
+    /// Metadata stats collection mode for changelog files, if configured.
+    pub fn changelog_file_stats_mode(&self) -> Option<&str> {
+        self.options
+            .get(CHANGELOG_FILE_STATS_MODE_OPTION)
+            .map(String::as_str)
+    }
+
     /// Parquet writer in-progress buffer size limit. Default is 256MB.
     /// When the buffered data exceeds this, the writer flushes the current row group.
     pub fn write_parquet_buffer_size(&self) -> i64 {
@@ -544,6 +628,86 @@ mod tests {
         let core = CoreOptions::new(&options);
 
         assert_eq!(core.merge_engine().unwrap(), MergeEngine::PartialUpdate);
+    }
+
+    #[test]
+    fn test_changelog_producer_defaults_to_none() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(core.changelog_producer(), "none");
+        assert_eq!(
+            core.try_changelog_producer().unwrap(),
+            ChangelogProducer::None
+        );
+    }
+
+    #[test]
+    fn test_changelog_producer_accepts_known_values() {
+        for (value, expected) in [
+            ("none", ChangelogProducer::None),
+            ("input", ChangelogProducer::Input),
+            ("full-compaction", ChangelogProducer::FullCompaction),
+            ("lookup", ChangelogProducer::Lookup),
+            ("INPUT", ChangelogProducer::Input),
+        ] {
+            let options = HashMap::from([(CHANGELOG_PRODUCER_OPTION.to_string(), value.into())]);
+            let core = CoreOptions::new(&options);
+
+            assert_eq!(core.try_changelog_producer().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_changelog_producer_rejects_unknown_values() {
+        let options = HashMap::from([(CHANGELOG_PRODUCER_OPTION.to_string(), "other".into())]);
+        let core = CoreOptions::new(&options);
+
+        let err = core
+            .try_changelog_producer()
+            .expect_err("unknown producer should fail");
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("Unsupported changelog-producer"))
+        );
+    }
+
+    #[test]
+    fn test_changelog_file_options_defaults_and_overrides() {
+        let default_options = HashMap::from([
+            (FILE_FORMAT_OPTION.to_string(), "avro".to_string()),
+            (FILE_COMPRESSION_OPTION.to_string(), "snappy".to_string()),
+        ]);
+        let default_core = CoreOptions::new(&default_options);
+
+        assert_eq!(default_core.changelog_file_prefix(), "changelog-");
+        assert_eq!(default_core.changelog_file_format(), "avro");
+        assert_eq!(default_core.changelog_file_compression(), "snappy");
+        assert_eq!(default_core.changelog_file_stats_mode(), None);
+
+        let custom_options = HashMap::from([
+            (
+                CHANGELOG_FILE_PREFIX_OPTION.to_string(),
+                "custom-".to_string(),
+            ),
+            (
+                CHANGELOG_FILE_FORMAT_OPTION.to_string(),
+                "parquet".to_string(),
+            ),
+            (
+                CHANGELOG_FILE_COMPRESSION_OPTION.to_string(),
+                "zstd".to_string(),
+            ),
+            (
+                CHANGELOG_FILE_STATS_MODE_OPTION.to_string(),
+                "counts".to_string(),
+            ),
+        ]);
+        let custom_core = CoreOptions::new(&custom_options);
+
+        assert_eq!(custom_core.changelog_file_prefix(), "custom-");
+        assert_eq!(custom_core.changelog_file_format(), "parquet");
+        assert_eq!(custom_core.changelog_file_compression(), "zstd");
+        assert_eq!(custom_core.changelog_file_stats_mode(), Some("counts"));
     }
 
     #[test]

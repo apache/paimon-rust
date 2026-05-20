@@ -21,10 +21,10 @@
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
 use crate::arrow::build_target_arrow_schema;
-use crate::spec::DataFileMeta;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    BinaryRow, ChangelogProducer, CoreOptions, DataType, MergeEngine, EMPTY_SERIALIZED_ROW,
+    POSTPONE_BUCKET,
 };
 use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -37,6 +37,7 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
+use crate::table::prepared_files::PreparedFiles;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -61,12 +62,12 @@ impl FileWriter {
         }
     }
 
-    async fn prepare_commit(mut self) -> Result<Vec<DataFileMeta>> {
+    async fn prepare_commit(mut self) -> Result<PreparedFiles> {
         match self {
-            FileWriter::Append(ref mut w) => w.prepare_commit().await,
-            FileWriter::AppendBlob(ref mut w) => w.prepare_commit().await,
+            FileWriter::Append(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::AppendBlob(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
             FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
-            FileWriter::Postpone(ref mut w) => w.prepare_commit().await,
+            FileWriter::Postpone(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
         }
     }
 }
@@ -96,6 +97,10 @@ pub struct TableWrite {
     primary_key_types: Vec<DataType>,
     sequence_field_indices: Vec<usize>,
     merge_engine: MergeEngine,
+    changelog_producer: ChangelogProducer,
+    changelog_file_prefix: String,
+    changelog_file_format: String,
+    changelog_file_compression: String,
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
     commit_user: String,
     /// Bucket assignment strategy (fixed, dynamic, or cross-partition).
@@ -138,6 +143,7 @@ impl TableWrite {
         let total_buckets = core_options.bucket();
         let has_primary_keys = !schema.primary_keys().is_empty();
         let is_dynamic_bucket = has_primary_keys && total_buckets == -1;
+        let changelog_producer = core_options.try_changelog_producer()?;
 
         let is_dynamic_cross_partition =
             is_dynamic_bucket && !schema.partition_keys().is_empty() && {
@@ -160,16 +166,6 @@ impl TableWrite {
                 ),
             });
         }
-        if has_primary_keys
-            && total_buckets != POSTPONE_BUCKET
-            && core_options
-                .changelog_producer()
-                .eq_ignore_ascii_case("input")
-        {
-            return Err(crate::Error::Unsupported {
-                message: "KeyValueFileWriter does not support changelog-producer=input".to_string(),
-            });
-        }
 
         if !has_primary_keys && total_buckets != -1 && core_options.bucket_key().is_none() {
             return Err(crate::Error::Unsupported {
@@ -181,6 +177,9 @@ impl TableWrite {
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
+        let changelog_file_prefix = core_options.changelog_file_prefix().to_string();
+        let changelog_file_format = core_options.changelog_file_format().to_string();
+        let changelog_file_compression = core_options.changelog_file_compression().to_string();
         let write_buffer_size = core_options.write_parquet_buffer_size();
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
@@ -295,6 +294,10 @@ impl TableWrite {
             primary_key_types,
             sequence_field_indices,
             merge_engine,
+            changelog_producer,
+            changelog_file_prefix,
+            changelog_file_format,
+            changelog_file_compression,
             partition_seq_cache: HashMap::new(),
             commit_user,
             bucket_assigner,
@@ -543,8 +546,12 @@ impl TableWrite {
         for (partition_bytes, bucket, files) in results {
             let key = (partition_bytes.clone(), bucket);
             let index_files = index_files_by_key.remove(&key).unwrap_or_default();
-            if !files.is_empty() || !index_files.is_empty() {
-                let mut msg = CommitMessage::new(partition_bytes, bucket, files);
+            if !files.data_files.is_empty()
+                || !files.changelog_files.is_empty()
+                || !index_files.is_empty()
+            {
+                let mut msg = CommitMessage::new(partition_bytes, bucket, files.data_files);
+                msg.new_changelog_files = files.changelog_files;
                 msg.new_index_files = index_files;
                 messages.push(msg);
             }
@@ -682,6 +689,11 @@ impl TableWrite {
                 file_compression_zstd_level: self.file_compression_zstd_level,
                 write_buffer_size: self.write_buffer_size,
                 file_format: self.file_format.clone(),
+                input_changelog: self.changelog_producer == ChangelogProducer::Input
+                    && !self.is_overwrite,
+                changelog_file_prefix: self.changelog_file_prefix.clone(),
+                changelog_file_compression: self.changelog_file_compression.clone(),
+                changelog_file_format: self.changelog_file_format.clone(),
                 primary_key_indices: self.primary_key_indices.clone(),
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),
@@ -697,15 +709,18 @@ impl TableWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::format::create_format_reader;
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
-        BinaryRowBuilder, BlobType, DataType, DecimalType, IntType, LocalZonedTimestampType,
-        Schema, TableSchema, TimestampType, VarCharType,
+        bucket_dir_name, BigIntType, BinaryRowBuilder, BlobType, DataField, DataType, DecimalType,
+        FileKind, IndexManifest, IntType, LocalZonedTimestampType, Manifest, ManifestList, Schema,
+        TableSchema, TimestampType, TinyIntType, VarCharType, SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
     };
     use crate::table::{SnapshotManager, TableCommit};
-    use arrow_array::Int32Array;
     use arrow_array::RecordBatchReader as _;
+    use arrow_array::{Int32Array, Int64Array, Int8Array};
     use arrow_schema::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
     };
@@ -788,6 +803,147 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn make_batch_with_value_kind(
+        ids: Vec<i32>,
+        values: Vec<i32>,
+        value_kinds: Vec<i8>,
+    ) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+            ArrowField::new(
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(Int8Array::from(value_kinds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_partitioned_batch_with_value_kind(
+        pts: Vec<&str>,
+        ids: Vec<i32>,
+        values: Vec<i32>,
+        value_kinds: Vec<i8>,
+    ) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("pt", ArrowDataType::Utf8, false),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+            ArrowField::new(
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(pts)),
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(Int8Array::from(value_kinds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn physical_key_value_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::new()),
+            ),
+            DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ),
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ]
+    }
+
+    async fn read_physical_key_value_batches(
+        file_io: &FileIO,
+        file_path: &str,
+        file_size: i64,
+    ) -> Vec<RecordBatch> {
+        let format_reader = create_format_reader(file_path, false).unwrap();
+        let input = file_io.new_input(file_path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let read_fields = physical_key_value_fields();
+        let stream = format_reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size as u64,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        futures::TryStreamExt::try_collect(stream).await.unwrap()
+    }
+
+    fn collect_i32(batches: &[RecordBatch], column: usize) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    fn collect_i64(batches: &[RecordBatch], column: usize) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    fn collect_i8(batches: &[RecordBatch], column: usize) -> Vec<i8> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
     }
 
     fn make_partitioned_batch(pts: Vec<&str>, ids: Vec<i32>) -> RecordBatch {
@@ -1394,6 +1550,320 @@ mod tests {
             test_pk_schema(),
             None,
         )
+    }
+
+    fn pk_changelog_schema(options: &[(&str, &str)]) -> TableSchema {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1");
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        TableSchema::new(0, &builder.build().unwrap())
+    }
+
+    fn ordinary_dynamic_pk_changelog_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["pt", "id"])
+            .option("changelog-producer", "input")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_writes_raw_rows_separately_from_data_rows() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_duplicate_pk";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[
+                ("changelog-producer", "input"),
+                ("changelog-file.prefix", "custom-changelog-"),
+            ]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 1], vec![10, 20]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].row_count, 1);
+        assert_eq!(messages[0].new_changelog_files.len(), 1);
+        assert_eq!(messages[0].new_changelog_files[0].row_count, 2);
+        assert!(messages[0].new_files[0].file_name.starts_with("data-"));
+        assert!(messages[0].new_changelog_files[0]
+            .file_name
+            .starts_with("custom-changelog-"));
+
+        let bucket_dir = bucket_dir_name(messages[0].bucket);
+        let data_file = &messages[0].new_files[0];
+        let data_file_path = format!("{table_path}/{bucket_dir}/{}", data_file.file_name);
+        let data_batches =
+            read_physical_key_value_batches(&file_io, &data_file_path, data_file.file_size).await;
+        assert_eq!(collect_i64(&data_batches, 0), vec![1]);
+        assert_eq!(collect_i8(&data_batches, 1), vec![0]);
+        assert_eq!(collect_i32(&data_batches, 2), vec![1]);
+        assert_eq!(collect_i32(&data_batches, 3), vec![20]);
+
+        let changelog_file = &messages[0].new_changelog_files[0];
+        let changelog_file_path = format!("{table_path}/{bucket_dir}/{}", changelog_file.file_name);
+        let changelog_batches = read_physical_key_value_batches(
+            &file_io,
+            &changelog_file_path,
+            changelog_file.file_size,
+        )
+        .await;
+        assert_eq!(collect_i64(&changelog_batches, 0), vec![0, 1]);
+        assert_eq!(collect_i8(&changelog_batches, 1), vec![0, 0]);
+        assert_eq!(collect_i32(&changelog_batches, 2), vec![1, 1]);
+        assert_eq!(collect_i32(&changelog_batches, 3), vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_metadata_counts_retract_rows() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_retract_rows";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch_with_value_kind(
+                vec![1, 2, 3],
+                vec![10, 20, 30],
+                vec![0, 1, 3],
+            ))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(2));
+        assert_eq!(messages[0].new_changelog_files[0].delete_row_count, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_rejects_invalid_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_invalid_value_kind";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch_with_value_kind(vec![1], vec![10], vec![4]))
+            .await
+            .unwrap();
+
+        let err = table_write.prepare_commit().await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Invalid RowKind value"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_commit_writes_changelog_manifest_metadata() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 1], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let data_file_name = messages[0].new_files[0].file_name.clone();
+        let changelog_file_name = messages[0].new_changelog_files[0].file_name.clone();
+
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.total_record_count(), Some(1));
+        assert_eq!(snapshot.delta_record_count(), Some(1));
+        assert_eq!(snapshot.changelog_record_count(), Some(2));
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let delta_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        let delta_entries = Manifest::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", delta_metas[0].file_name()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta_entries.len(), 1);
+        assert_eq!(*delta_entries[0].kind(), FileKind::Add);
+        assert_eq!(delta_entries[0].file().file_name, data_file_name);
+
+        let changelog_list = snapshot
+            .changelog_manifest_list()
+            .expect("changelog manifest list");
+        let changelog_metas =
+            ManifestList::read(&file_io, &format!("{manifest_dir}/{changelog_list}"))
+                .await
+                .unwrap();
+        let changelog_entries = Manifest::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", changelog_metas[0].file_name()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changelog_entries.len(), 1);
+        assert_eq!(*changelog_entries[0].kind(), FileKind::Add);
+        assert_eq!(changelog_entries[0].file().file_name, changelog_file_name);
+        assert_eq!(changelog_entries[0].file().row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_dynamic_bucket_commits_data_changelog_and_index() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_dynamic_bucket_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_input_changelog_dynamic_bucket"),
+            table_path.to_string(),
+            ordinary_dynamic_pk_changelog_schema(),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        assert!(matches!(
+            table_write.bucket_assigner,
+            BucketAssignerEnum::Dynamic(_)
+        ));
+        table_write
+            .write_arrow_batch(&make_partitioned_batch_with_value_kind(
+                vec!["a", "a"],
+                vec![1, 2],
+                vec![10, 20],
+                vec![0, 3],
+            ))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].row_count, 2);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        assert_eq!(messages[0].new_changelog_files.len(), 1);
+        assert_eq!(messages[0].new_changelog_files[0].row_count, 2);
+        assert_eq!(messages[0].new_changelog_files[0].delete_row_count, Some(1));
+        assert_eq!(messages[0].new_index_files.len(), 1);
+        assert_eq!(messages[0].new_index_files[0].index_type, "HASH");
+        assert_eq!(messages[0].new_index_files[0].row_count, 2);
+
+        let index_file_name = messages[0].new_index_files[0].file_name.clone();
+
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.total_record_count(), Some(2));
+        assert_eq!(snapshot.delta_record_count(), Some(2));
+        assert_eq!(snapshot.changelog_record_count(), Some(2));
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let changelog_list = snapshot
+            .changelog_manifest_list()
+            .expect("changelog manifest list");
+        let changelog_metas =
+            ManifestList::read(&file_io, &format!("{manifest_dir}/{changelog_list}"))
+                .await
+                .unwrap();
+        let changelog_partition_stats = changelog_metas[0].partition_stats();
+        assert!(!changelog_partition_stats.min_values().is_empty());
+        assert!(!changelog_partition_stats.max_values().is_empty());
+        assert_eq!(
+            changelog_partition_stats.null_counts().as_slice(),
+            &[Some(0)]
+        );
+
+        let index_manifest = snapshot.index_manifest().expect("index manifest");
+        let index_entries =
+            IndexManifest::read(&file_io, &format!("{manifest_dir}/{index_manifest}"))
+                .await
+                .unwrap();
+        assert_eq!(index_entries.len(), 1);
+        assert_eq!(index_entries[0].kind, FileKind::Add);
+        assert_eq!(index_entries[0].index_file.file_name, index_file_name);
+        assert_eq!(index_entries[0].index_file.index_type, "HASH");
+        assert_eq!(index_entries[0].index_file.row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_overwrite_does_not_write_changelog_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_input_changelog_overwrite";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string())
+            .unwrap()
+            .with_overwrite();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert!(messages[0].new_changelog_files.is_empty());
     }
 
     #[tokio::test]

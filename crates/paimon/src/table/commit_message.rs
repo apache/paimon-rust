@@ -29,6 +29,8 @@ pub struct CommitMessage {
     pub bucket: i32,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
+    /// New changelog files to be added.
+    pub new_changelog_files: Vec<DataFileMeta>,
     /// New index files to be added (used by dynamic bucket mode).
     pub new_index_files: Vec<IndexFileMeta>,
     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
@@ -41,6 +43,7 @@ impl CommitMessage {
             partition,
             bucket,
             new_files,
+            new_changelog_files: Vec::new(),
             new_index_files: Vec::new(),
             deleted_files: Vec::new(),
         }
