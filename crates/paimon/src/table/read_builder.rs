@@ -364,6 +364,28 @@ mod tests {
         )
     }
 
+    fn aggregation_pk_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "aggregation_t"),
+            "/tmp/test-aggregation-read-builder".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
     #[test]
     fn test_exact_filter_pushdown_is_true_for_partition_only_filter() {
         let table = simple_table();
@@ -750,6 +772,33 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion vectors")),
             "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
+        );
+    }
+
+    /// Until `AggregateMergeFunction` lands, `merge-engine=aggregation` reads
+    /// must surface `Unsupported` rather than silently returning unmerged rows.
+    #[tokio::test]
+    async fn test_direct_table_read_aggregation_returns_unsupported() {
+        let table = aggregation_pk_table();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("/tmp/test-aggregation-read-builder/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 1, 0)])
+            .build()
+            .unwrap();
+        let err = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("merge-engine=aggregation")),
+            "expected aggregation read to fail fast with Unsupported, got {err:?}"
         );
     }
 }

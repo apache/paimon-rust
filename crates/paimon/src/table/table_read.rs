@@ -81,10 +81,12 @@ impl<'a> TableRead<'a> {
         // splits marked raw convertible by scan planning — and all compacted
         // files of deletion-vector tables, where DVs mask stale versions —
         // use the faster DataFileReader.
+        // PartialUpdate / Aggregation always go through KeyValueFileReader so
+        // that per-key materialization can run on the read side.
         if has_primary_keys
             && matches!(
                 merge_engine,
-                MergeEngine::Deduplicate | MergeEngine::PartialUpdate
+                MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::Aggregation
             )
         {
             return self.read_pk(data_splits, &core_options);
@@ -97,18 +99,23 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Read PK table with Deduplicate engine: splits marked raw convertible
-    /// by scan planning (mirrors Java `DataSplit#convertToRawFiles`) use the
-    /// faster DataFileReader; the rest go through KeyValueFileReader for
-    /// sort-merge dedup. Deletion-vector tables are exempt: their stale
-    /// versions are masked by DVs, and KeyValueFileReader does not support
-    /// DVs, so they keep the plain level-0 dispatch.
+    /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan
+    /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
+    /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
+    /// dedup. Deletion-vector tables are exempt: their stale versions are
+    /// masked by DVs, and KeyValueFileReader does not support DVs, so they keep
+    /// the plain level-0 dispatch. `PartialUpdate` and `Aggregation` always go
+    /// through KeyValueFileReader because their merge semantics require per-key
+    /// materialization even for compacted runs.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        if core_options.merge_engine()? == MergeEngine::PartialUpdate {
+        if matches!(
+            core_options.merge_engine()?,
+            MergeEngine::PartialUpdate | MergeEngine::Aggregation
+        ) {
             return self.read_kv(data_splits, core_options);
         }
 

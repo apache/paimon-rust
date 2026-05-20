@@ -244,6 +244,14 @@ impl TableWrite {
             });
         }
 
+        if is_dynamic_cross_partition && merge_engine == MergeEngine::Aggregation {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "merge-engine=aggregation with cross-partition update is not supported yet"
+                        .to_string(),
+            });
+        }
+
         if has_primary_keys && core_options.rowkind_field().is_some() {
             return Err(crate::Error::Unsupported {
                 message: "KeyValueFileWriter does not support rowkind.field".to_string(),
@@ -2460,6 +2468,40 @@ mod tests {
             err,
             crate::Error::Unsupported { message }
             if message.contains("cross-partition update")
+        ));
+    }
+
+    #[test]
+    fn test_rejects_cross_partition_aggregation() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_cross_aggregation";
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .partition_keys(["pt"])
+            .option("merge-engine", "aggregation")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_cross_aggregation"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let err = match TableWrite::new(&table, "test-user".to_string()) {
+            Ok(_) => panic!("cross-partition aggregation should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("merge-engine=aggregation")
+                && message.contains("cross-partition update")
         ));
     }
 
