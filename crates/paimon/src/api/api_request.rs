@@ -123,8 +123,8 @@ mod tests {
 
     #[test]
     fn test_rename_table_request_serialization() {
-        let source = Identifier::new("db1".to_string(), "table1".to_string()).unwrap();
-        let destination = Identifier::new("db2".to_string(), "table2".to_string()).unwrap();
+        let source = Identifier::new("db1".to_string(), "table1".to_string());
+        let destination = Identifier::new("db2".to_string(), "table2".to_string());
         let req = RenameTableRequest::new(source, destination);
 
         let json = serde_json::to_string(&req).unwrap();

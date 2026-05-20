@@ -913,7 +913,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         Table::new(
             file_io,
-            Identifier::new("test_db", "test_table").unwrap(),
+            Identifier::new("test_db", "test_table"),
             "/tmp/test-table".to_string(),
             table_schema,
             None,

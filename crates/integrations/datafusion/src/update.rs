@@ -374,7 +374,7 @@ mod tests {
             .unwrap();
 
         let table = catalog
-            .get_table(&Identifier::new("test_db", name).unwrap())
+            .get_table(&Identifier::new("test_db", name))
             .await
             .unwrap();
 
@@ -564,7 +564,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             table_path.to_string(),
             table_schema,
             None,

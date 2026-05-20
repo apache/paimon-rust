@@ -51,7 +51,7 @@ async fn create_context() -> SQLContext {
 
 async fn create_provider(table_name: &str) -> PaimonTableProvider {
     let catalog = create_catalog();
-    let identifier = Identifier::new("default", table_name).unwrap();
+    let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)
         .await
@@ -65,7 +65,7 @@ async fn create_provider_with_options(
     extra_options: HashMap<String, String>,
 ) -> PaimonTableProvider {
     let catalog = create_catalog();
-    let identifier = Identifier::new("default", table_name).unwrap();
+    let identifier = Identifier::new("default", table_name);
     let table = catalog
         .get_table(&identifier)
         .await

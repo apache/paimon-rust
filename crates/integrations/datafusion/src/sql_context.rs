@@ -554,16 +554,20 @@ impl SQLContext {
                     .catalogs
                     .get(catalog.as_ref())
                     .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
-                let identifier = Identifier::new(schema.as_ref(), table.as_ref())
-                    .map_err(to_datafusion_error)?;
-                Ok((catalog_arc.clone(), catalog.to_string(), identifier))
+                Ok((
+                    catalog_arc.clone(),
+                    catalog.to_string(),
+                    Identifier::new(schema.as_ref(), table.as_ref()),
+                ))
             }
             datafusion::common::TableReference::Partial { schema, table } => {
                 let catalog = self.current_catalog()?;
                 let catalog_name = self.current_catalog_name();
-                let identifier = Identifier::new(schema.as_ref(), table.as_ref())
-                    .map_err(to_datafusion_error)?;
-                Ok((catalog, catalog_name, identifier))
+                Ok((
+                    catalog,
+                    catalog_name,
+                    Identifier::new(schema.as_ref(), table.as_ref()),
+                ))
             }
             datafusion::common::TableReference::Bare { table } => {
                 let catalog = self.current_catalog()?;
@@ -575,9 +579,11 @@ impl SQLContext {
                     .catalog
                     .default_schema
                     .clone();
-                let identifier =
-                    Identifier::new(default_schema, table.as_ref()).map_err(to_datafusion_error)?;
-                Ok((catalog, catalog_name, identifier))
+                Ok((
+                    catalog,
+                    catalog_name,
+                    Identifier::new(default_schema, table.as_ref()),
+                ))
             }
         }
     }
@@ -840,10 +846,7 @@ impl SQLContext {
                             object_name_to_string(name)
                         }
                     };
-                    rename_to = Some(
-                        Identifier::new(identifier.database().to_string(), new_name)
-                            .map_err(to_datafusion_error)?,
-                    );
+                    rename_to = Some(Identifier::new(identifier.database().to_string(), new_name));
                 }
                 AlterTableOperation::SetTblProperties { table_properties } => {
                     for opt in table_properties {
@@ -1253,15 +1256,19 @@ impl SQLContext {
                 let catalog = self.catalogs.get(&parts[0]).ok_or_else(|| {
                     DataFusionError::Plan(format!("Unknown catalog '{}'", parts[0]))
                 })?;
-                let identifier = Identifier::new(parts[1].clone(), parts[2].clone())
-                    .map_err(to_datafusion_error)?;
-                Ok((catalog.clone(), parts[0].clone(), identifier))
+                Ok((
+                    catalog.clone(),
+                    parts[0].clone(),
+                    Identifier::new(parts[1].clone(), parts[2].clone()),
+                ))
             }
             2 => {
                 let catalog = self.current_catalog()?;
-                let identifier = Identifier::new(parts[0].clone(), parts[1].clone())
-                    .map_err(to_datafusion_error)?;
-                Ok((catalog, self.current_catalog_name(), identifier))
+                Ok((
+                    catalog,
+                    self.current_catalog_name(),
+                    Identifier::new(parts[0].clone(), parts[1].clone()),
+                ))
             }
             1 => {
                 let catalog = self.current_catalog()?;
@@ -1272,9 +1279,11 @@ impl SQLContext {
                     .catalog
                     .default_schema
                     .clone();
-                let identifier = Identifier::new(default_schema, parts[0].clone())
-                    .map_err(to_datafusion_error)?;
-                Ok((catalog, self.current_catalog_name(), identifier))
+                Ok((
+                    catalog,
+                    self.current_catalog_name(),
+                    Identifier::new(default_schema, parts[0].clone()),
+                ))
             }
             _ => Err(DataFusionError::Plan(format!(
                 "Invalid table reference: {name}"

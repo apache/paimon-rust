@@ -470,14 +470,6 @@ mod tests {
             .unwrap()
     }
 
-    fn deserialize_identifier(database: &str, object: &str) -> Identifier {
-        serde_json::from_value(serde_json::json!({
-            "database": database,
-            "object": object,
-        }))
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn test_database_operations() {
         let (_temp_dir, catalog) = create_test_catalog();
@@ -526,11 +518,7 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .create_table(
-                &Identifier::new("db1", "table1").unwrap(),
-                testing_schema(),
-                false,
-            )
+            .create_table(&Identifier::new("db1", "table1"), testing_schema(), false)
             .await
             .unwrap();
         let result = catalog.drop_database("db1", false, false).await;
@@ -578,15 +566,11 @@ mod tests {
         // create and list tables
         let schema = testing_schema();
         catalog
-            .create_table(
-                &Identifier::new("db1", "table1").unwrap(),
-                schema.clone(),
-                false,
-            )
+            .create_table(&Identifier::new("db1", "table1"), schema.clone(), false)
             .await
             .unwrap();
         catalog
-            .create_table(&Identifier::new("db1", "table2").unwrap(), schema, false)
+            .create_table(&Identifier::new("db1", "table2"), schema, false)
             .await
             .unwrap();
         let tables = catalog.list_tables("db1").await.unwrap();
@@ -607,15 +591,11 @@ mod tests {
             .build()
             .unwrap();
         catalog
-            .create_table(
-                &Identifier::new("db1", "table3").unwrap(),
-                schema_with_name,
-                false,
-            )
+            .create_table(&Identifier::new("db1", "table3"), schema_with_name, false)
             .await
             .unwrap();
         let table = catalog
-            .get_table(&Identifier::new("db1", "table3").unwrap())
+            .get_table(&Identifier::new("db1", "table3"))
             .await
             .unwrap();
         let table_schema = table.schema();
@@ -624,7 +604,7 @@ mod tests {
 
         // drop table
         catalog
-            .drop_table(&Identifier::new("db1", "table1").unwrap(), false)
+            .drop_table(&Identifier::new("db1", "table1"), false)
             .await
             .unwrap();
         let tables = catalog.list_tables("db1").await.unwrap();
@@ -641,9 +621,12 @@ mod tests {
             .unwrap();
         let escaped_path = temp_dir.path().join("table_escape");
 
-        let identifier = deserialize_identifier("db1", "../../table_escape");
         let result = catalog
-            .create_table(&identifier, testing_schema(), false)
+            .create_table(
+                &Identifier::new("db1", "../../table_escape"),
+                testing_schema(),
+                false,
+            )
             .await;
 
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
@@ -657,15 +640,20 @@ mod tests {
             .create_database("db1", false, HashMap::new())
             .await
             .unwrap();
-        let source = Identifier::new("db1", "source").unwrap();
+        let source = Identifier::new("db1", "source");
         catalog
             .create_table(&source, testing_schema(), false)
             .await
             .unwrap();
         let escaped_path = temp_dir.path().join("renamed_escape");
 
-        let target = deserialize_identifier("db1", "../../renamed_escape");
-        let result = catalog.rename_table(&source, &target, false).await;
+        let result = catalog
+            .rename_table(
+                &source,
+                &Identifier::new("db1", "../../renamed_escape"),
+                false,
+            )
+            .await;
 
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
         assert!(!escaped_path.exists());
@@ -675,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_partitions_default_table_not_found_errors() {
         let (_temp_dir, catalog) = create_test_catalog();
-        let id = Identifier::new("nope_db", "nope_table").unwrap();
+        let id = Identifier::new("nope_db", "nope_table");
         let result = catalog.list_partitions(&id).await;
         assert!(
             matches!(
@@ -693,7 +681,7 @@ mod tests {
             .create_database("db1", false, HashMap::new())
             .await
             .unwrap();
-        let id = Identifier::new("db1", "t1").unwrap();
+        let id = Identifier::new("db1", "t1");
         catalog
             .create_table(&id, testing_schema(), false)
             .await
@@ -714,7 +702,7 @@ mod tests {
             .create_database("db1", false, HashMap::new())
             .await
             .unwrap();
-        let id = Identifier::new("db1", "t1").unwrap();
+        let id = Identifier::new("db1", "t1");
         catalog
             .create_table(&id, testing_schema(), false)
             .await

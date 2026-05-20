@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_void};
 
 use paimon::catalog::Identifier;
 
-use crate::error::{paimon_error, validate_cstr};
+use crate::error::validate_cstr;
 use crate::result::paimon_result_identifier_new;
 use crate::types::paimon_identifier;
 
@@ -50,17 +50,8 @@ pub unsafe extern "C" fn paimon_identifier_new(
             }
         }
     };
-    let identifier = match Identifier::new(db, obj) {
-        Ok(identifier) => identifier,
-        Err(e) => {
-            return paimon_result_identifier_new {
-                identifier: std::ptr::null_mut(),
-                error: paimon_error::from_paimon(e),
-            }
-        }
-    };
     let wrapper = Box::new(paimon_identifier {
-        inner: Box::into_raw(Box::new(identifier)) as *mut c_void,
+        inner: Box::into_raw(Box::new(Identifier::new(db, obj))) as *mut c_void,
     });
     paimon_result_identifier_new {
         identifier: Box::into_raw(wrapper),
@@ -78,42 +69,6 @@ pub unsafe extern "C" fn paimon_identifier_free(id: *mut paimon_identifier) {
         let i = Box::from_raw(id);
         if !i.inner.is_null() {
             drop(Box::from_raw(i.inner as *mut Identifier));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::CString;
-
-    use super::*;
-    use crate::error::paimon_error_free;
-
-    #[test]
-    fn test_paimon_identifier_new_should_reject_path_control_names() {
-        let database = CString::new("db").unwrap();
-        let object = CString::new("../escaped").unwrap();
-
-        let result = unsafe { paimon_identifier_new(database.as_ptr(), object.as_ptr()) };
-
-        assert!(result.identifier.is_null());
-        assert!(!result.error.is_null());
-        unsafe {
-            paimon_error_free(result.error);
-        }
-    }
-
-    #[test]
-    fn test_paimon_identifier_new_should_allow_safe_names() {
-        let database = CString::new("db").unwrap();
-        let object = CString::new("table$snapshots").unwrap();
-
-        let result = unsafe { paimon_identifier_new(database.as_ptr(), object.as_ptr()) };
-
-        assert!(result.error.is_null());
-        assert!(!result.identifier.is_null());
-        unsafe {
-            paimon_identifier_free(result.identifier);
         }
     }
 }

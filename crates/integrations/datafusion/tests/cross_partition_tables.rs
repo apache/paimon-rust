@@ -290,7 +290,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
 
     // Verify initial state: 2 data files (one per partition)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_cross_dv").unwrap())
+        .get_table(&Identifier::new("test_db", "t_cross_dv"))
         .await
         .unwrap();
     let plan = table
@@ -318,7 +318,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
     // Verify via scan_all_files: old partition "a" should have a new file
     // containing the DELETE record for id=1 (written with _VALUE_KIND=1)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_cross_dv").unwrap())
+        .get_table(&Identifier::new("test_db", "t_cross_dv"))
         .await
         .unwrap();
     let plan = table
@@ -396,7 +396,7 @@ async fn test_cross_partition_delete_file_in_old_partition() {
 
     // Verify partition "a" now has another DELETE file for id=2
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_cross_dv").unwrap())
+        .get_table(&Identifier::new("test_db", "t_cross_dv"))
         .await
         .unwrap();
     let plan = table
@@ -486,7 +486,7 @@ async fn test_cross_partition_first_row_skip() {
 
     // Use scan_all_files to verify (FIRST_ROW skips level-0 in normal reads)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_cross_fr").unwrap())
+        .get_table(&Identifier::new("test_db", "t_cross_fr"))
         .await
         .unwrap();
     let rb = table.new_read_builder();

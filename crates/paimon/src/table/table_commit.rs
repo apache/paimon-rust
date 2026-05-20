@@ -1196,7 +1196,7 @@ mod tests {
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table").unwrap(),
+            Identifier::new("default", "test_table"),
             table_path.to_string(),
             test_schema(),
             None,
@@ -1206,7 +1206,7 @@ mod tests {
     fn test_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table").unwrap(),
+            Identifier::new("default", "test_table"),
             table_path.to_string(),
             test_partitioned_schema(),
             None,
@@ -1530,7 +1530,7 @@ mod tests {
     fn test_row_tracking_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table").unwrap(),
+            Identifier::new("default", "test_table"),
             table_path.to_string(),
             test_row_tracking_schema(),
             None,

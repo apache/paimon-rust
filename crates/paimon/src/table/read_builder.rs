@@ -335,7 +335,7 @@ mod tests {
         );
         Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             "/tmp/test-read-builder".to_string(),
             table_schema,
             None,
@@ -357,7 +357,7 @@ mod tests {
         );
         Table::new(
             file_io,
-            Identifier::new("default", "partial_update_dv_t").unwrap(),
+            Identifier::new("default", "partial_update_dv_t"),
             "/tmp/test-partial-update-dv-read-builder".to_string(),
             table_schema,
             None,
@@ -414,7 +414,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             table_path,
             table_schema,
             None,
@@ -473,7 +473,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             table_path,
             table_schema,
             None,
@@ -530,7 +530,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             table_path,
             table_schema,
             None,
@@ -590,7 +590,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             table_path,
             table_schema,
             None,
@@ -641,7 +641,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             "/tmp/test".to_string(),
             table_schema,
             None,
@@ -697,7 +697,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t").unwrap(),
+            Identifier::new("default", "t"),
             "/tmp/test".to_string(),
             table_schema,
             None,

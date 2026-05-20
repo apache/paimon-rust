@@ -69,29 +69,27 @@ pub struct Identifier {
 }
 
 impl Identifier {
-    /// Create an identifier from database and object name, validating both names.
-    pub fn new(database: impl Into<String>, object: impl Into<String>) -> Result<Self> {
-        let identifier = Self {
+    /// Create an identifier from database and object name.
+    pub fn new(database: impl Into<String>, object: impl Into<String>) -> Self {
+        Self {
             database: database.into(),
             object: object.into(),
-        };
-        identifier.validate()?;
-        Ok(identifier)
+        }
     }
 
     /// Validate this identifier's database and object names.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         Self::validate_database_name(&self.database)?;
         Self::validate_object_name(&self.object)
     }
 
     /// Validate a database name for path-safe catalog use.
-    pub fn validate_database_name(name: &str) -> Result<()> {
+    pub(crate) fn validate_database_name(name: &str) -> Result<()> {
         validate_identifier_name("database", name)
     }
 
     /// Validate an object name for path-safe catalog use.
-    pub fn validate_object_name(name: &str) -> Result<()> {
+    pub(crate) fn validate_object_name(name: &str) -> Result<()> {
         validate_identifier_name("object", name)
     }
 
@@ -303,7 +301,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_identifier_new_should_reject_path_control_names() {
+    fn test_identifier_validate_should_reject_path_control_names() {
         for (database, object) in [
             ("", "table"),
             ("   ", "table"),
@@ -321,7 +319,7 @@ mod tests {
             ("db", "nested\\table"),
             ("db", "table\0name"),
         ] {
-            let result = Identifier::new(database, object);
+            let result = Identifier::new(database, object).validate();
             assert!(
                 matches!(result, Err(Error::IdentifierInvalid { .. })),
                 "expected invalid identifier for database={database:?}, object={object:?}, got {result:?}"
@@ -330,12 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn test_identifier_new_should_allow_system_suffix_and_unicode_names() {
-        let identifier = Identifier::new("analytics", "orders$snapshots").unwrap();
+    fn test_identifier_validate_should_allow_system_suffix_and_unicode_names() {
+        let identifier = Identifier::new("analytics", "orders$snapshots");
+        identifier.validate().unwrap();
         assert_eq!(identifier.database(), "analytics");
         assert_eq!(identifier.object(), "orders$snapshots");
 
-        let identifier = Identifier::new("数据", "订单").unwrap();
+        let identifier = Identifier::new("数据", "订单");
+        identifier.validate().unwrap();
         assert_eq!(identifier.database(), "数据");
         assert_eq!(identifier.object(), "订单");
     }

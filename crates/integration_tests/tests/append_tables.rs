@@ -51,7 +51,7 @@ async fn setup_dirs(file_io: &paimon::io::FileIO, table_path: &str) {
 fn make_table(file_io: &paimon::io::FileIO, table_path: &str, schema: TableSchema) -> Table {
     Table::new(
         file_io.clone(),
-        Identifier::new("default", "test").unwrap(),
+        Identifier::new("default", "test"),
         table_path.to_string(),
         schema,
         None,

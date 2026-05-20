@@ -1686,7 +1686,7 @@ async fn test_pk_first_row_insert_overwrite() {
 
     // Verify via scan_all_files: 2 level-0 files (one per partition)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_fr_ow").unwrap())
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
         .await
         .unwrap();
     let plan = table
@@ -1712,7 +1712,7 @@ async fn test_pk_first_row_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_fr_ow").unwrap())
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
         .await
         .unwrap();
     let plan = table
@@ -1738,7 +1738,7 @@ async fn test_pk_first_row_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_fr_ow").unwrap())
+        .get_table(&Identifier::new("test_db", "t_fr_ow"))
         .await
         .unwrap();
     let plan = table
@@ -1788,7 +1788,7 @@ async fn test_postpone_write_invisible_to_select() {
 
     // scan_all_files should find the postpone file
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_postpone").unwrap())
+        .get_table(&Identifier::new("test_db", "t_postpone"))
         .await
         .unwrap();
     let plan = table
@@ -1836,7 +1836,7 @@ async fn test_postpone_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_postpone_ow").unwrap())
+        .get_table(&Identifier::new("test_db", "t_postpone_ow"))
         .await
         .unwrap();
     let plan = table
@@ -1859,7 +1859,7 @@ async fn test_postpone_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_postpone_ow").unwrap())
+        .get_table(&Identifier::new("test_db", "t_postpone_ow"))
         .await
         .unwrap();
     let plan = table

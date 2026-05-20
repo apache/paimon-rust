@@ -710,7 +710,7 @@ mod tests {
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_de_table").unwrap(),
+            Identifier::new("default", "test_de_table"),
             table_path.to_string(),
             test_data_evolution_schema(),
             None,
@@ -1055,7 +1055,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test").unwrap(),
+            Identifier::new("default", "test"),
             "memory:/test".to_string(),
             table_schema,
             None,

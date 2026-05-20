@@ -531,7 +531,7 @@ mod tests {
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_cow").unwrap(),
+            Identifier::new("default", "test_cow"),
             table_path.to_string(),
             test_append_schema(),
             None,
@@ -549,7 +549,7 @@ mod tests {
             .unwrap();
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test").unwrap(),
+            Identifier::new("default", "test"),
             "memory:/test".to_string(),
             TableSchema::new(0, &schema),
             None,
@@ -573,7 +573,7 @@ mod tests {
             .unwrap();
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test").unwrap(),
+            Identifier::new("default", "test"),
             "memory:/test".to_string(),
             TableSchema::new(0, &schema),
             None,
@@ -598,7 +598,7 @@ mod tests {
             .unwrap();
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test").unwrap(),
+            Identifier::new("default", "test"),
             "memory:/test".to_string(),
             TableSchema::new(0, &schema),
             None,

@@ -71,7 +71,7 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
     catalog: &C,
     table_name: &str,
 ) -> paimon::Table {
-    let identifier = Identifier::new("default", table_name).unwrap();
+    let identifier = Identifier::new("default", table_name);
     catalog
         .get_table(&identifier)
         .await
