@@ -48,10 +48,11 @@ enum PickPolicy {
     FirstNonNull,
 }
 
-/// Internal implementation shared by all four pick-style aggregators.
+/// Internal accumulator shared by all four pick-style aggregators.  Only the
+/// outer typed wrappers (e.g. [`LastValueAgg`]) implement [`FieldAggregator`];
+/// this struct exposes inherent methods that the wrappers delegate to.
 #[derive(Debug)]
 struct PickValueAgg {
-    name: &'static str,
     policy: PickPolicy,
     arrow_type: ArrowDataType,
     /// 1-row Arrow array holding the currently-winning value; `None` means
@@ -60,9 +61,8 @@ struct PickValueAgg {
 }
 
 impl PickValueAgg {
-    fn new(name: &'static str, policy: PickPolicy, data_type: &DataType) -> crate::Result<Self> {
+    fn new(policy: PickPolicy, data_type: &DataType) -> crate::Result<Self> {
         Ok(Self {
-            name,
             policy,
             arrow_type: paimon_type_to_arrow(data_type)?,
             winner: None,
@@ -77,135 +77,66 @@ impl PickValueAgg {
             PickPolicy::FirstNonNull => self.winner.is_none() && !is_null,
         }
     }
-}
-
-impl FieldAggregator for PickValueAgg {
-    fn name(&self) -> &'static str {
-        self.name
-    }
 
     fn reset(&mut self) {
         self.winner = None;
     }
 
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+    fn agg(&mut self, array: &dyn Array, row_idx: usize) {
         if self.should_replace(array.is_null(row_idx)) {
             self.winner = Some(array.slice(row_idx, 1));
         }
-        Ok(())
     }
 
-    fn result(&self) -> crate::Result<ArrayRef> {
-        Ok(match &self.winner {
+    fn result(&self) -> ArrayRef {
+        match &self.winner {
             Some(arr) => arr.clone(),
             None => new_null_array(&self.arrow_type, 1),
-        })
+        }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct LastValueAgg(PickValueAgg);
-impl LastValueAgg {
-    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
-        Ok(Self(PickValueAgg::new(
-            "last_value",
-            PickPolicy::Last,
-            data_type,
-        )?))
-    }
-}
-impl FieldAggregator for LastValueAgg {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn reset(&mut self) {
-        self.0.reset()
-    }
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.0.agg(array, row_idx)
-    }
-    fn result(&self) -> crate::Result<ArrayRef> {
-        self.0.result()
-    }
+macro_rules! pick_agg {
+    ($struct_name:ident, $factory_name:literal, $policy:expr) => {
+        #[derive(Debug)]
+        pub(crate) struct $struct_name(PickValueAgg);
+
+        impl $struct_name {
+            pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
+                Ok(Self(PickValueAgg::new($policy, data_type)?))
+            }
+        }
+
+        impl FieldAggregator for $struct_name {
+            fn name(&self) -> &'static str {
+                $factory_name
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+            fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+                self.0.agg(array, row_idx);
+                Ok(())
+            }
+            fn result(&self) -> crate::Result<ArrayRef> {
+                Ok(self.0.result())
+            }
+        }
+    };
 }
 
-#[derive(Debug)]
-pub(crate) struct FirstValueAgg(PickValueAgg);
-impl FirstValueAgg {
-    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
-        Ok(Self(PickValueAgg::new(
-            "first_value",
-            PickPolicy::First,
-            data_type,
-        )?))
-    }
-}
-impl FieldAggregator for FirstValueAgg {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn reset(&mut self) {
-        self.0.reset()
-    }
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.0.agg(array, row_idx)
-    }
-    fn result(&self) -> crate::Result<ArrayRef> {
-        self.0.result()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct LastNonNullValueAgg(PickValueAgg);
-impl LastNonNullValueAgg {
-    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
-        Ok(Self(PickValueAgg::new(
-            "last_non_null_value",
-            PickPolicy::LastNonNull,
-            data_type,
-        )?))
-    }
-}
-impl FieldAggregator for LastNonNullValueAgg {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn reset(&mut self) {
-        self.0.reset()
-    }
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.0.agg(array, row_idx)
-    }
-    fn result(&self) -> crate::Result<ArrayRef> {
-        self.0.result()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct FirstNonNullValueAgg(PickValueAgg);
-impl FirstNonNullValueAgg {
-    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
-        Ok(Self(PickValueAgg::new(
-            "first_non_null_value",
-            PickPolicy::FirstNonNull,
-            data_type,
-        )?))
-    }
-}
-impl FieldAggregator for FirstNonNullValueAgg {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn reset(&mut self) {
-        self.0.reset()
-    }
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.0.agg(array, row_idx)
-    }
-    fn result(&self) -> crate::Result<ArrayRef> {
-        self.0.result()
-    }
-}
+pick_agg!(LastValueAgg, "last_value", PickPolicy::Last);
+pick_agg!(FirstValueAgg, "first_value", PickPolicy::First);
+pick_agg!(
+    LastNonNullValueAgg,
+    "last_non_null_value",
+    PickPolicy::LastNonNull
+);
+pick_agg!(
+    FirstNonNullValueAgg,
+    "first_non_null_value",
+    PickPolicy::FirstNonNull
+);
 
 #[cfg(test)]
 mod tests {

@@ -28,12 +28,6 @@
 //!
 //! [`reset`]: FieldAggregator::reset
 
-// The aggregators are wired into the read-side merge function in a follow-up
-// commit; until then the module is reachable only from its own tests, which
-// would otherwise produce dead_code warnings under the CI `-D warnings`
-// configuration.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use arrow_array::{Array, ArrayRef};
@@ -62,7 +56,7 @@ pub(crate) use value::{FirstNonNullValueAgg, FirstValueAgg, LastNonNullValueAgg,
 /// [`reset`]: FieldAggregator::reset
 /// [`agg`]: FieldAggregator::agg
 /// [`result`]: FieldAggregator::result
-pub(crate) trait FieldAggregator: Send + Sync {
+pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// Aggregator identifier, e.g. `"sum"`. Matches the
     /// `fields.<col>.aggregate-function` option value.
     fn name(&self) -> &'static str;

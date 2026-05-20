@@ -22,7 +22,9 @@ const AGGREGATION_ENGINE: &str = "aggregation";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_DELETE_SUFFIX: &str = ".ignore-delete";
 const AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION: &str = "aggregation.remove-record-on-delete";
+const FIELDS_DEFAULT_AGG_FUNCTION_OPTION: &str = "fields.default-aggregate-function";
 const FIELDS_PREFIX: &str = "fields.";
+const AGG_FUNCTION_SUFFIX: &str = ".aggregate-function";
 const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
 const DISTINCT_SUFFIX: &str = ".distinct";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
@@ -121,6 +123,19 @@ impl<'a> AggregationConfig<'a> {
             .collect();
         keys.sort();
         keys
+    }
+
+    /// Per-field aggregate function configured via `fields.<col>.aggregate-function`.
+    pub(crate) fn agg_function_for_field(&self, field_name: &str) -> Option<&str> {
+        let key = format!("{FIELDS_PREFIX}{field_name}{AGG_FUNCTION_SUFFIX}");
+        self.options.get(&key).map(String::as_str)
+    }
+
+    /// Default aggregate function from `fields.default-aggregate-function`.
+    pub(crate) fn default_agg_function(&self) -> Option<&str> {
+        self.options
+            .get(FIELDS_DEFAULT_AGG_FUNCTION_OPTION)
+            .map(String::as_str)
     }
 }
 

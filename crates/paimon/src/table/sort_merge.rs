@@ -26,7 +26,8 @@
 //! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
 //! - Arrow-row: `RowConverter` for efficient key comparison
 
-use crate::spec::{PartialUpdateConfig, RowKind};
+use crate::spec::{AggregationConfig, DataField, PartialUpdateConfig, RowKind};
+use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
@@ -37,6 +38,8 @@ use async_stream::try_stream;
 use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -264,6 +267,217 @@ impl MergeFunction for PartialUpdateMergeFunction {
         let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
             Error::UnexpectedError {
                 message: format!("Failed to build partial-update materialized row: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?;
+
+        Ok(MergeResult::MaterializedRow(batch))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AggregateMergeFunction
+// ---------------------------------------------------------------------------
+
+/// Basic aggregation merge: for each non-key, non-sequence column, apply a
+/// per-field aggregator across all rows sharing the same primary key.
+///
+/// The merge function honors the following contract:
+///
+/// - Primary-key columns are copied from any row of the group (Paimon
+///   guarantees they all share the same value); no aggregator is constructed
+///   for them.
+/// - Sequence fields named in `sequence.field` are forced to `last_value`
+///   regardless of any per-field configuration, matching Java
+///   `AggregateMergeFunction`.
+/// - Every other output column requires either
+///   `fields.<col>.aggregate-function` or a fall-back
+///   `fields.default-aggregate-function`; otherwise construction fails with
+///   [`Error::ConfigInvalid`].
+/// - DELETE / UPDATE_BEFORE rows are rejected at runtime; retract handling
+///   is left to a follow-up commit.
+///
+/// `aggregators` is held behind a `Mutex` so the implementation can mutate
+/// per-key accumulators inside `MergeFunction::merge(&self, ...)` without
+/// changing the trait signature shared with the other merge functions.  The
+/// merge function is invoked sequentially by `sort_merge_stream`, so the
+/// lock is effectively uncontended.
+///
+/// Reference: Java `org.apache.paimon.mergetree.compact.aggregate.AggregateMergeFunction`.
+///
+/// [`Error::ConfigInvalid`]: crate::Error::ConfigInvalid
+#[derive(Debug)]
+pub(crate) struct AggregateMergeFunction {
+    /// One slot per output column.  `None` marks primary-key columns that are
+    /// copied through; `Some` holds the aggregator that owns the column.
+    aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
+}
+
+impl AggregateMergeFunction {
+    pub(crate) fn new(
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+        output_fields: &[DataField],
+        primary_keys: &[String],
+        sequence_fields: &[String],
+    ) -> crate::Result<Self> {
+        AggregationConfig::new(table_options).validate_runtime_mode(true, table_name)?;
+        let config = AggregationConfig::new(table_options);
+
+        let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        let seq_set: HashSet<&str> = sequence_fields.iter().map(String::as_str).collect();
+
+        let aggregators: Vec<Option<Box<dyn FieldAggregator>>> = output_fields
+            .iter()
+            .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
+                let name = field.name();
+                if pk_set.contains(name) {
+                    return Ok(None);
+                }
+                // Sequence fields are forced to last_value, mirroring Java
+                // AggregateMergeFunction#createFieldAggregators.
+                let agg_name: String = if seq_set.contains(name) {
+                    "last_value".to_string()
+                } else if let Some(per_field) = config.agg_function_for_field(name) {
+                    per_field.to_string()
+                } else if let Some(default) = config.default_agg_function() {
+                    default.to_string()
+                } else {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{name}' has no aggregate-function configured for \
+                             merge-engine=aggregation on table '{table_name}'; set \
+                             fields.{name}.aggregate-function or fields.default-aggregate-function"
+                        ),
+                    });
+                };
+                Ok(Some(new_aggregator(
+                    agg_name.as_str(),
+                    name,
+                    field.data_type(),
+                    table_options,
+                )?))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        Ok(Self {
+            aggregators: Mutex::new(aggregators),
+        })
+    }
+}
+
+impl MergeFunction for AggregateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if rows.is_empty() {
+            return Err(Error::UnexpectedError {
+                message: "merge called with empty rows".to_string(),
+                source: None,
+            });
+        }
+
+        // Reject retract rows up-front so partial accumulation cannot leak
+        // into the output if a DELETE shows up mid-group.
+        for row in rows {
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                return Err(crate::Error::Unsupported {
+                    message: "merge-engine=aggregation basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
+                });
+            }
+        }
+
+        // Sort row indices by user sequence (if configured), then system
+        // sequence, so per-field aggregators see the canonical "ascending
+        // sequence" order documented in their contracts.
+        let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
+        ordered_row_indices.sort_by(|&lhs_idx, &rhs_idx| {
+            compare_sequence_order(&rows[lhs_idx], &rows[rhs_idx])
+                .then_with(|| lhs_idx.cmp(&rhs_idx))
+        });
+
+        let mut aggregators = self
+            .aggregators
+            .lock()
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("AggregateMergeFunction aggregator mutex poisoned: {e}"),
+                source: None,
+            })?;
+        if aggregators.len() != output_schema.fields().len() {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "AggregateMergeFunction aggregator slot count {} does not match output \
+                     schema field count {}",
+                    aggregators.len(),
+                    output_schema.fields().len()
+                ),
+                source: None,
+            });
+        }
+        for slot in aggregators.iter_mut() {
+            if let Some(agg) = slot.as_mut() {
+                agg.reset();
+            }
+        }
+
+        for &row_idx in &ordered_row_indices {
+            let row = &rows[row_idx];
+            for (col_idx, slot) in aggregators.iter_mut().enumerate() {
+                if let Some(agg) = slot.as_mut() {
+                    let source_array = batch_buffer[row.batch_idx]
+                        .column_for_output(col_idx, source_output_col_indices);
+                    agg.agg(source_array, row.row_idx)?;
+                }
+            }
+        }
+
+        // Use the last sorted row to source primary-key column values: every
+        // row in the group shares the same PK by construction, so any row
+        // works; picking the last one keeps the slice cheap to compute.
+        let pk_source = &rows[*ordered_row_indices.last().unwrap()];
+
+        let output_columns: Vec<ArrayRef> = aggregators
+            .iter()
+            .enumerate()
+            .map(|(col_idx, slot)| -> crate::Result<ArrayRef> {
+                match slot {
+                    Some(agg) => agg.result(),
+                    None => Ok(batch_buffer[pk_source.batch_idx]
+                        .column_for_output(col_idx, source_output_col_indices)
+                        .slice(pk_source.row_idx, 1)),
+                }
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Defensive check: non-nullable fields must not receive NULL output
+        // from an aggregator (e.g. `min` on an all-NULL group).  Mirror the
+        // partial-update guard but also surface which aggregator produced
+        // the NULL so a misconfigured `fields.<col>.aggregate-function`
+        // shows up clearly in the error.
+        for (col_idx, field) in output_schema.fields().iter().enumerate() {
+            if !field.is_nullable() && output_columns[col_idx].is_null(0) {
+                let agg_name = aggregators[col_idx]
+                    .as_ref()
+                    .map(|a| a.name())
+                    .unwrap_or("<primary-key>");
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "merge-engine=aggregation: aggregator '{agg_name}' produced NULL for \
+                         non-nullable field '{}'",
+                        field.name()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build aggregation materialized row: {e}"),
                 source: Some(Box::new(e)),
             }
         })?;
@@ -1718,5 +1932,328 @@ mod tests {
             Error::Unsupported { message }
             if message.contains("fields.price.aggregate-function")
         ));
+    }
+
+    // ---------- AggregateMergeFunction ----------
+
+    use crate::spec::{DataType as PaimonDataType, IntType, VarCharType};
+
+    fn aggregation_output_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "pk".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(1, "amount".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "tag".into(),
+                PaimonDataType::VarChar(VarCharType::new(255).unwrap()),
+            ),
+        ]
+    }
+
+    fn aggregation_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("amount", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]))
+    }
+
+    fn aggregation_output_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]))
+    }
+
+    fn agg_options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut opts = HashMap::from([("merge-engine".to_string(), "aggregation".to_string())]);
+        for (k, v) in pairs {
+            opts.insert((*k).to_string(), (*v).to_string());
+        }
+        opts
+    }
+
+    fn build_agg_function(options: HashMap<String, String>) -> Box<dyn MergeFunction> {
+        Box::new(
+            AggregateMergeFunction::new(
+                &options,
+                "test_table",
+                &aggregation_output_fields(),
+                &["pk".to_string()],
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_merge_sum_and_listagg() {
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("x")])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![2, 2, 1])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(5), Some(7), Some(99)])),
+                Arc::new(StringArray::from(vec![Some("b"), None, Some("solo")])),
+            ],
+        )
+        .unwrap()]);
+
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "listagg"),
+            ("fields.tag.list-agg-delimiter", "|"),
+        ]);
+
+        let batches = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            build_agg_function(options),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let mut rows: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+        for batch in &batches {
+            let pks = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let tags = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    pks.value(i),
+                    if amounts.is_null(i) {
+                        None
+                    } else {
+                        Some(amounts.value(i))
+                    },
+                    if tags.is_null(i) {
+                        None
+                    } else {
+                        Some(tags.value(i).to_string())
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some(15), Some("a|b".to_string())),
+                (2, Some(27), Some("x".to_string())),
+                (3, Some(99), Some("solo".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_merge_rejects_delete_rows() {
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![Some(10)])),
+                Arc::new(StringArray::from(vec![Some("a")])),
+            ],
+        )
+        .unwrap()]);
+        // Row kind 3 = DELETE
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int8Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![Some(99)])),
+                Arc::new(StringArray::from(vec![Some("b")])),
+            ],
+        )
+        .unwrap()]);
+
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "last_value"),
+        ]);
+
+        let err = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            build_agg_function(options),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { ref message }
+            if message.contains("aggregation basic mode does not support DELETE")
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_requires_agg_function_per_field() {
+        // amount has no per-field nor default aggregate-function configured.
+        let options = HashMap::from([("merge-engine".to_string(), "aggregation".to_string())]);
+        let err = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ConfigInvalid { message } if message.contains("aggregate-function"))
+        );
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_sequence_field_forced_last_value() {
+        // 'tag' is the sequence field; even though user configured listagg,
+        // it should be forced to last_value (so the latest tag survives).
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "listagg"),
+            ("sequence.field", "tag"),
+        ]);
+        let mf = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &["tag".to_string()],
+        )
+        .unwrap();
+
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![Some(3), Some(4)])),
+                Arc::new(StringArray::from(vec![Some("first"), Some("second")])),
+            ],
+        )
+        .unwrap()]);
+
+        // Use the merge function via builder.
+        let batches = futures::executor::block_on(async {
+            SortMergeReaderBuilder::new(
+                vec![s0],
+                schema,
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![3, 4],
+                output_schema,
+                Box::new(mf),
+            )
+            .build()
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap()
+        });
+
+        let batch = &batches[0];
+        let tags = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let amounts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(tags.value(0), "second"); // last_value, not listagg.
+        assert_eq!(amounts.value(0), 7); // sum of 3 + 4.
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_default_function_applies_when_per_field_absent() {
+        let options = agg_options(&[("fields.default-aggregate-function", "last_non_null_value")]);
+        let mf = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .unwrap();
+        // Construction must succeed: amount and tag fall back to the default.
+        // Tag is VarChar — last_non_null_value supports any type.
+        let _ = mf;
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_rejects_unsupported_options() {
+        let options = agg_options(&[("fields.amount.ignore-retract", "true")]);
+        let err = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { message } if message.contains("ignore-retract"))
+        );
     }
 }
