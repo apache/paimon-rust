@@ -17,6 +17,7 @@
 
 //! Table API for Apache Paimon
 
+pub(crate) mod aggregator;
 pub(crate) mod bin_pack;
 mod blob_file_writer;
 mod branch_manager;
