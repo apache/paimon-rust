@@ -2534,18 +2534,34 @@ async fn test_pk_aggregation_rejects_delete() {
         .await
         .unwrap();
 
-    let err = sql_context
+    // DELETE may either fail at planning or surface Unsupported at execution.
+    // Either way the error must mention the aggregation engine refusing the
+    // retract row; we explicitly assert both branches so a future parser
+    // change cannot silently turn this into a no-op pass.
+    let plan_result = sql_context
         .sql("DELETE FROM paimon.test_db.t_agg_del WHERE id = 1")
         .await;
-    // DELETE may either fail at planning or surface Unsupported at read.
-    if let Ok(df) = err {
-        let exec = df.collect().await;
-        assert!(exec.is_err(), "DELETE on aggregation table should fail");
-        let msg = format!("{:?}", exec.err().unwrap());
-        assert!(
-            msg.contains("aggregation") || msg.contains("DELETE") || msg.contains("UPDATE_BEFORE"),
-            "expected aggregation engine to reject DELETE, got {msg}"
-        );
+    match plan_result {
+        Ok(df) => {
+            let exec = df.collect().await;
+            assert!(exec.is_err(), "DELETE on aggregation table should fail");
+            let msg = format!("{:?}", exec.err().unwrap());
+            assert!(
+                msg.contains("aggregation")
+                    || msg.contains("DELETE")
+                    || msg.contains("UPDATE_BEFORE"),
+                "expected aggregation engine to reject DELETE at execution, got {msg}"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("aggregation")
+                    || msg.contains("DELETE")
+                    || msg.contains("Unsupported"),
+                "expected aggregation engine to reject DELETE at planning, got {msg}"
+            );
+        }
     }
 }
 
@@ -2619,10 +2635,9 @@ async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
     );
 }
 
-/// All-NULL aggregation group on a non-nullable column surfaces a clear
-/// DataInvalid error.  Uses `count` whose output is NOT NULL and forms an
-/// empty group when the group is empty — instead we verify that the
-/// aggregator-NULL path produces a descriptive error.
+/// All-NULL aggregation group on a nullable `sum` column should emit NULL
+/// rather than 0 or an error: nothing was observed, so there is no
+/// arithmetic result to surface.
 #[tokio::test]
 async fn test_pk_aggregation_sum_all_null_emits_null_for_nullable_column() {
     let (_tmp, sql_context) = setup_sql_context().await;
