@@ -1354,7 +1354,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "blob_t"),
+            Identifier::new("default", "blob_t").unwrap(),
             table_path,
             table_schema,
             None,
@@ -1447,7 +1447,7 @@ mod tests {
         );
         let table = Table::new(
             file_io,
-            Identifier::new("default", "blob_multi_t"),
+            Identifier::new("default", "blob_multi_t").unwrap(),
             table_path,
             table_schema,
             None,

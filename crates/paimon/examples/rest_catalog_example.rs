@@ -146,7 +146,7 @@ async fn main() {
     println!("\n=== Part 2: Table Operations ===\n");
 
     // Create table
-    let table_identifier = Identifier::new("example_db", "users");
+    let table_identifier = Identifier::new("example_db", "users").unwrap();
     println!("Creating table '{table_identifier}'...");
     let schema = create_test_schema();
     match catalog.create_table(&table_identifier, schema, false).await {
@@ -176,7 +176,7 @@ async fn main() {
     }
 
     // Rename table
-    let renamed_identifier = Identifier::new("example_db", "users_renamed");
+    let renamed_identifier = Identifier::new("example_db", "users_renamed").unwrap();
     println!("\nRenaming table '{table_identifier}' to '{renamed_identifier}'...");
     match catalog
         .rename_table(&table_identifier, &renamed_identifier, false)
@@ -191,7 +191,7 @@ async fn main() {
 
     // Try to read from an existing table (example_db.users_renamed)
     // This table must already exist on the REST catalog server
-    let read_table_identifier = Identifier::new("example_db", "users_renamed");
+    let read_table_identifier = Identifier::new("example_db", "users_renamed").unwrap();
     println!("Attempting to read from table '{read_table_identifier}'...");
 
     match catalog.get_table(&read_table_identifier).await {

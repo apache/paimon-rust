@@ -1496,7 +1496,7 @@ mod tests {
             .unwrap();
 
         let table = catalog
-            .get_table(&Identifier::new("test_db", name))
+            .get_table(&Identifier::new("test_db", name).unwrap())
             .await
             .unwrap();
         let mut extra = std::collections::HashMap::new();
@@ -1645,7 +1645,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = Table::new(
             file_io,
-            Identifier::new("default", "t"),
+            Identifier::new("default", "t").unwrap(),
             table_path.to_string(),
             table_schema,
             None,
@@ -1689,7 +1689,7 @@ mod tests {
             .unwrap();
 
         let table = catalog
-            .get_table(&Identifier::new("test_db", name))
+            .get_table(&Identifier::new("test_db", name).unwrap())
             .await
             .unwrap();
 

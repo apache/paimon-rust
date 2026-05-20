@@ -101,7 +101,7 @@ async fn test_options_system_table() {
     }
     actual.sort();
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog
         .get_table(&identifier)
         .await
@@ -159,7 +159,7 @@ async fn test_table_indexes_system_table() {
         assert_eq!(field.data_type(), dtype, "column {i} type");
     }
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog
         .get_table(&identifier)
         .await
@@ -329,7 +329,7 @@ async fn test_schemas_system_table() {
         assert_eq!(field.data_type(), dtype, "column {i} type");
     }
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog
         .get_table(&identifier)
         .await
@@ -456,7 +456,7 @@ async fn test_snapshots_system_table() {
     }
 
     // Row count must match the snapshot directory listing.
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog
         .get_table(&identifier)
         .await
@@ -595,7 +595,7 @@ async fn test_tags_system_table_empty_when_no_tag_dir() {
 async fn test_tags_system_table_with_seeded_tags() {
     let (ctx, catalog, tmp) = create_context().await;
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog.get_table(&identifier).await.unwrap();
     let sm =
         paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
@@ -685,7 +685,7 @@ async fn test_manifests_system_table() {
         }
     }
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog.get_table(&identifier).await.unwrap();
     let sm =
         paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
@@ -831,7 +831,7 @@ async fn test_files_system_table() {
         assert_eq!(field.data_type(), dtype, "column {i} type");
     }
 
-    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string()).unwrap();
     let table = catalog.get_table(&identifier).await.unwrap();
     let plan = table
         .new_read_builder()

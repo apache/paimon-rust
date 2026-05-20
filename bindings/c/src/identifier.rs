@@ -50,7 +50,7 @@ pub unsafe extern "C" fn paimon_identifier_new(
             }
         }
     };
-    let identifier = match Identifier::try_new(db, obj) {
+    let identifier = match Identifier::new(db, obj) {
         Ok(identifier) => identifier,
         Err(e) => {
             return paimon_result_identifier_new {

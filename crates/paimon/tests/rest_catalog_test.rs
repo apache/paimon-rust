@@ -249,7 +249,7 @@ async fn test_catalog_get_table() {
         "file:///tmp/test_warehouse/default.db/my_table",
     );
 
-    let identifier = Identifier::new("default", "my_table");
+    let identifier = Identifier::new("default", "my_table").unwrap();
     let table = ctx.catalog.get_table(&identifier).await;
     assert!(table.is_ok(), "failed to get table: {table:?}");
 }
@@ -258,7 +258,7 @@ async fn test_catalog_get_table() {
 async fn test_catalog_get_table_not_found() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let identifier = Identifier::new("default", "non_existent");
+    let identifier = Identifier::new("default", "non_existent").unwrap();
     let result = ctx.catalog.get_table(&identifier).await;
     assert!(result.is_err(), "getting non-existent table should fail");
 }
@@ -304,7 +304,7 @@ async fn test_catalog_get_table_propagates_oss_options_in_else_branch() {
         "oss://test-bucket/warehouse/default.db/oss_table",
     );
 
-    let identifier = Identifier::new("default", "oss_table");
+    let identifier = Identifier::new("default", "oss_table").unwrap();
     let result = catalog.get_table(&identifier).await;
     assert!(
         result.is_ok(),
@@ -318,7 +318,7 @@ async fn test_catalog_create_table() {
     let ctx = setup_catalog(vec!["default"]).await;
 
     let schema = test_schema();
-    let identifier = Identifier::new("default", "new_table");
+    let identifier = Identifier::new("default", "new_table").unwrap();
 
     let result = ctx.catalog.create_table(&identifier, schema, false).await;
     assert!(result.is_ok(), "failed to create table: {result:?}");
@@ -336,7 +336,7 @@ async fn test_catalog_create_table_already_exists() {
     ctx.server.add_table("default", "existing_table");
 
     let schema = test_schema();
-    let identifier = Identifier::new("default", "existing_table");
+    let identifier = Identifier::new("default", "existing_table").unwrap();
 
     // Create with ignore_if_exists=false should fail
     let result = ctx.catalog.create_table(&identifier, schema, false).await;
@@ -354,7 +354,7 @@ async fn test_catalog_create_table_ignore_if_exists() {
     ctx.server.add_table("default", "existing_table");
 
     let schema = test_schema();
-    let identifier = Identifier::new("default", "existing_table");
+    let identifier = Identifier::new("default", "existing_table").unwrap();
 
     // Create with ignore_if_exists=true should succeed
     let result = ctx.catalog.create_table(&identifier, schema, true).await;
@@ -371,7 +371,7 @@ async fn test_catalog_drop_table() {
     // Add a table
     ctx.server.add_table("default", "table_to_drop");
 
-    let identifier = Identifier::new("default", "table_to_drop");
+    let identifier = Identifier::new("default", "table_to_drop").unwrap();
 
     // Drop table
     let result = ctx.catalog.drop_table(&identifier, false).await;
@@ -386,7 +386,7 @@ async fn test_catalog_drop_table() {
 async fn test_catalog_drop_table_not_found() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let identifier = Identifier::new("default", "non_existent");
+    let identifier = Identifier::new("default", "non_existent").unwrap();
 
     // Drop with ignore_if_not_exists=false should fail
     let result = ctx.catalog.drop_table(&identifier, false).await;
@@ -400,7 +400,7 @@ async fn test_catalog_drop_table_not_found() {
 async fn test_catalog_drop_table_ignore_if_not_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let identifier = Identifier::new("default", "non_existent");
+    let identifier = Identifier::new("default", "non_existent").unwrap();
 
     // Drop with ignore_if_not_exists=true should succeed
     let result = ctx.catalog.drop_table(&identifier, true).await;
@@ -419,8 +419,8 @@ async fn test_catalog_rename_table() {
     // Add a table
     ctx.server.add_table("default", "old_table");
 
-    let from = Identifier::new("default", "old_table");
-    let to = Identifier::new("default", "new_table");
+    let from = Identifier::new("default", "old_table").unwrap();
+    let to = Identifier::new("default", "new_table").unwrap();
 
     // Rename table
     let result = ctx.catalog.rename_table(&from, &to, false).await;
@@ -436,8 +436,8 @@ async fn test_catalog_rename_table() {
 async fn test_catalog_rename_table_not_found() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let from = Identifier::new("default", "non_existent");
-    let to = Identifier::new("default", "new_name");
+    let from = Identifier::new("default", "non_existent").unwrap();
+    let to = Identifier::new("default", "new_name").unwrap();
 
     // Rename with ignore_if_not_exists=false should fail
     let result = ctx.catalog.rename_table(&from, &to, false).await;
@@ -451,8 +451,8 @@ async fn test_catalog_rename_table_not_found() {
 async fn test_catalog_rename_table_ignore_if_not_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let from = Identifier::new("default", "non_existent");
-    let to = Identifier::new("default", "new_name");
+    let from = Identifier::new("default", "non_existent").unwrap();
+    let to = Identifier::new("default", "new_name").unwrap();
 
     // Rename with ignore_if_not_exists=true should succeed
     let result = ctx.catalog.rename_table(&from, &to, true).await;
@@ -468,7 +468,7 @@ async fn test_catalog_rename_table_ignore_if_not_exists() {
 async fn test_catalog_alter_table_unsupported() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    let identifier = Identifier::new("default", "some_table");
+    let identifier = Identifier::new("default", "some_table").unwrap();
 
     // alter_table should return Unsupported error
     let result = ctx.catalog.alter_table(&identifier, vec![], false).await;

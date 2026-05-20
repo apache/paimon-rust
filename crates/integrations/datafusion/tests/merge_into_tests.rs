@@ -457,7 +457,7 @@ async fn test_row_count_after_merge() {
 
     // Snapshot 1: 3 rows inserted
     let table = catalog
-        .get_table(&Identifier::new("test_db", "target"))
+        .get_table(&Identifier::new("test_db", "target").unwrap())
         .await
         .unwrap();
     let snap_mgr = SnapshotManager::new(table.file_io().clone(), table.location().to_string());
@@ -783,7 +783,7 @@ async fn test_merge_into_row_id_for_inserted_rows() {
 
     // Verify next_row_id in snapshot
     let table = catalog
-        .get_table(&Identifier::new("test_db", "target"))
+        .get_table(&Identifier::new("test_db", "target").unwrap())
         .await
         .unwrap();
     let snap_mgr = SnapshotManager::new(table.file_io().clone(), table.location().to_string());

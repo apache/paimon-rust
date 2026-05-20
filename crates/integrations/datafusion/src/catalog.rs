@@ -214,7 +214,7 @@ impl PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         let db = database.to_string();
         let tbl = table_name.to_string();
-        let identifier = Identifier::new(db, tbl);
+        let identifier = Identifier::new(db, tbl).map_err(to_datafusion_error)?;
         if let Ok(true) = block_on_with_runtime(
             async move {
                 match catalog.get_table(&identifier).await {
@@ -372,7 +372,8 @@ impl SchemaProvider for PaimonSchemaProvider {
 
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
-        let identifier = Identifier::new(self.database.clone(), base);
+        let identifier =
+            Identifier::new(self.database.clone(), base).map_err(to_datafusion_error)?;
         await_with_runtime(async move {
             match catalog.get_table(&identifier).await {
                 Ok(table) => {
@@ -407,7 +408,13 @@ impl SchemaProvider for PaimonSchemaProvider {
         }
 
         let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), base.to_string());
+        let identifier = match Identifier::new(self.database.clone(), base.to_string()) {
+            Ok(identifier) => identifier,
+            Err(e) => {
+                log::error!("invalid table identifier '{}.{}': {e}", self.database, base);
+                return false;
+            }
+        };
         block_on_with_runtime(
             async move {
                 match catalog.get_table(&identifier).await {
@@ -435,7 +442,8 @@ impl SchemaProvider for PaimonSchemaProvider {
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), name);
+        let identifier =
+            Identifier::new(self.database.clone(), name).map_err(to_datafusion_error)?;
         block_on_with_runtime(
             async move {
                 // Try to get the table first so we can return it.

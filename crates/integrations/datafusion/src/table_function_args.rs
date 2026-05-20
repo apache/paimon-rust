@@ -20,6 +20,8 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use paimon::catalog::Identifier;
 
+use crate::error::to_datafusion_error;
+
 pub(crate) fn extract_string_literal(
     function_name: &str,
     expr: &Expr,
@@ -72,9 +74,9 @@ pub(crate) fn parse_table_identifier(
 ) -> DFResult<Identifier> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
-        1 => Ok(Identifier::new(default_database, parts[0])),
-        2 => Ok(Identifier::new(parts[0], parts[1])),
-        3 => Ok(Identifier::new(parts[1], parts[2])),
+        1 => Identifier::new(default_database, parts[0]).map_err(to_datafusion_error),
+        2 => Identifier::new(parts[0], parts[1]).map_err(to_datafusion_error),
+        3 => Identifier::new(parts[1], parts[2]).map_err(to_datafusion_error),
         _ => Err(DataFusionError::Plan(format!(
             "{function_name}: invalid table name '{name}', expected 'table', 'database.table', or 'catalog.database.table'"
         ))),

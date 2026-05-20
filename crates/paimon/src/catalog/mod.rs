@@ -69,17 +69,12 @@ pub struct Identifier {
 }
 
 impl Identifier {
-    /// Create an identifier from database and object name.
-    pub fn new(database: impl Into<String>, object: impl Into<String>) -> Self {
-        Self {
+    /// Create an identifier from database and object name, validating both names.
+    pub fn new(database: impl Into<String>, object: impl Into<String>) -> Result<Self> {
+        let identifier = Self {
             database: database.into(),
             object: object.into(),
-        }
-    }
-
-    /// Create an identifier from database and object name, validating both names.
-    pub fn try_new(database: impl Into<String>, object: impl Into<String>) -> Result<Self> {
-        let identifier = Self::new(database, object);
+        };
         identifier.validate()?;
         Ok(identifier)
     }
@@ -308,7 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_identifier_try_new_should_reject_path_control_names() {
+    fn test_identifier_new_should_reject_path_control_names() {
         for (database, object) in [
             ("", "table"),
             ("   ", "table"),
@@ -326,7 +321,7 @@ mod tests {
             ("db", "nested\\table"),
             ("db", "table\0name"),
         ] {
-            let result = Identifier::try_new(database, object);
+            let result = Identifier::new(database, object);
             assert!(
                 matches!(result, Err(Error::IdentifierInvalid { .. })),
                 "expected invalid identifier for database={database:?}, object={object:?}, got {result:?}"
@@ -335,12 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn test_identifier_try_new_should_allow_system_suffix_and_unicode_names() {
-        let identifier = Identifier::try_new("analytics", "orders$snapshots").unwrap();
+    fn test_identifier_new_should_allow_system_suffix_and_unicode_names() {
+        let identifier = Identifier::new("analytics", "orders$snapshots").unwrap();
         assert_eq!(identifier.database(), "analytics");
         assert_eq!(identifier.object(), "orders$snapshots");
 
-        let identifier = Identifier::try_new("数据", "订单").unwrap();
+        let identifier = Identifier::new("数据", "订单").unwrap();
         assert_eq!(identifier.database(), "数据");
         assert_eq!(identifier.object(), "订单");
     }

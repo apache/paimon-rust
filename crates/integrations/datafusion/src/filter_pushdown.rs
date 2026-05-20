@@ -397,7 +397,7 @@ mod tests {
         );
         Table::new(
             file_io,
-            Identifier::new("default", "t"),
+            Identifier::new("default", "t").unwrap(),
             "/tmp/test-filter-pushdown".to_string(),
             table_schema,
             None,

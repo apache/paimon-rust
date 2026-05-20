@@ -737,7 +737,7 @@ mod tests {
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table"),
+            Identifier::new("default", "test_table").unwrap(),
             table_path.to_string(),
             test_schema(),
             None,
@@ -747,7 +747,7 @@ mod tests {
     fn test_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table"),
+            Identifier::new("default", "test_table").unwrap(),
             table_path.to_string(),
             test_partitioned_schema(),
             None,
@@ -837,7 +837,7 @@ mod tests {
     fn test_allows_append_blob_table() {
         let table = Table::new(
             test_file_io(),
-            Identifier::new("default", "test_blob_table"),
+            Identifier::new("default", "test_blob_table").unwrap(),
             "memory:/test_blob_table".to_string(),
             test_blob_table_schema(),
             None,
@@ -854,7 +854,7 @@ mod tests {
 
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_blob_table"),
+            Identifier::new("default", "test_blob_table").unwrap(),
             table_path.to_string(),
             test_blob_table_schema(),
             None,
@@ -916,7 +916,7 @@ mod tests {
     fn test_allows_partial_update_fixed_bucket_table() {
         let table = Table::new(
             test_file_io(),
-            Identifier::new("default", "test_partial_update_table"),
+            Identifier::new("default", "test_partial_update_table").unwrap(),
             "memory:/test_partial_update_table".to_string(),
             TableSchema::new(
                 0,
@@ -943,7 +943,7 @@ mod tests {
 
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_partial_update_dynamic_bucket_table"),
+            Identifier::new("default", "test_partial_update_dynamic_bucket_table").unwrap(),
             table_path.to_string(),
             TableSchema::new(
                 0,
@@ -973,7 +973,7 @@ mod tests {
 
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_partial_update_dv_table"),
+            Identifier::new("default", "test_partial_update_dv_table").unwrap(),
             table_path.to_string(),
             TableSchema::new(
                 0,
@@ -1120,7 +1120,7 @@ mod tests {
     fn test_bucketed_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table"),
+            Identifier::new("default", "test_table").unwrap(),
             table_path.to_string(),
             test_bucketed_schema(),
             None,
@@ -1265,7 +1265,7 @@ mod tests {
             let table_schema = TableSchema::new(0, &schema);
             let table = Table::new(
                 file_io.clone(),
-                Identifier::new("default", "test_table"),
+                Identifier::new("default", "test_table").unwrap(),
                 table_path.to_string(),
                 table_schema,
                 None,
@@ -1344,7 +1344,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_table"),
+            Identifier::new("default", "test_table").unwrap(),
             table_path.to_string(),
             table_schema,
             None,
@@ -1389,7 +1389,7 @@ mod tests {
     fn test_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_pk_table"),
+            Identifier::new("default", "test_pk_table").unwrap(),
             table_path.to_string(),
             test_pk_schema(),
             None,
@@ -1588,7 +1588,7 @@ mod tests {
     fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_postpone_table"),
+            Identifier::new("default", "test_postpone_table").unwrap(),
             table_path.to_string(),
             test_postpone_pk_schema(),
             None,
@@ -1611,7 +1611,7 @@ mod tests {
     fn test_postpone_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_postpone_table"),
+            Identifier::new("default", "test_postpone_table").unwrap(),
             table_path.to_string(),
             test_postpone_partitioned_schema(),
             None,
@@ -1860,7 +1860,7 @@ mod tests {
     fn test_cross_partition_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
-            Identifier::new("default", "test_cross_partition"),
+            Identifier::new("default", "test_cross_partition").unwrap(),
             table_path.to_string(),
             test_cross_partition_schema(),
             None,
@@ -1891,7 +1891,7 @@ mod tests {
             .unwrap();
         let table2 = Table::new(
             file_io.clone(),
-            Identifier::new("default", "test"),
+            Identifier::new("default", "test").unwrap(),
             table_path.to_string(),
             TableSchema::new(0, &schema),
             None,
@@ -1918,7 +1918,7 @@ mod tests {
             .unwrap();
         let table = Table::new(
             file_io,
-            Identifier::new("default", "test_cross_partial_update"),
+            Identifier::new("default", "test_cross_partial_update").unwrap(),
             table_path.to_string(),
             TableSchema::new(0, &schema),
             None,

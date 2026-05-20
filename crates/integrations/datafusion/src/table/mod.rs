@@ -285,7 +285,7 @@ mod tests {
 
     async fn create_provider(table_name: &str) -> PaimonTableProvider {
         let catalog = create_catalog();
-        let identifier = Identifier::new("default", table_name);
+        let identifier = Identifier::new("default", table_name).unwrap();
         let table = catalog
             .get_table(&identifier)
             .await
@@ -536,7 +536,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = paimon::table::Table::new(
             file_io,
-            Identifier::new("default", "test_insert"),
+            Identifier::new("default", "test_insert").unwrap(),
             table_path.to_string(),
             table_schema,
             None,
@@ -616,7 +616,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = paimon::table::Table::new(
             file_io,
-            Identifier::new("default", "test_overwrite"),
+            Identifier::new("default", "test_overwrite").unwrap(),
             table_path.to_string(),
             table_schema,
             None,
@@ -704,7 +704,7 @@ mod tests {
         let table_schema = TableSchema::new(0, &schema);
         let table = paimon::table::Table::new(
             file_io,
-            Identifier::new("default", "test_overwrite_unpart"),
+            Identifier::new("default", "test_overwrite_unpart").unwrap(),
             table_path.to_string(),
             table_schema,
             None,

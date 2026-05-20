@@ -148,7 +148,7 @@ async fn test_create_table() {
 
     // Verify schema
     let table = catalog
-        .get_table(&Identifier::new("mydb", "users"))
+        .get_table(&Identifier::new("mydb", "users").unwrap())
         .await
         .unwrap();
     let schema = table.schema();
@@ -178,7 +178,7 @@ async fn test_create_table_with_blob_type() {
         .expect("CREATE TABLE with BLOB should succeed");
 
     let table = catalog
-        .get_table(&Identifier::new("mydb", "assets"))
+        .get_table(&Identifier::new("mydb", "assets").unwrap())
         .await
         .unwrap();
     let schema = table.schema();
@@ -214,7 +214,7 @@ async fn test_create_table_with_partition() {
         .expect("CREATE TABLE with partition should succeed");
 
     let table = catalog
-        .get_table(&Identifier::new("mydb", "events"))
+        .get_table(&Identifier::new("mydb", "events").unwrap())
         .await
         .unwrap();
     let schema = table.schema();
@@ -333,7 +333,7 @@ async fn test_create_table_with_array_and_map() {
         .expect("CREATE TABLE with ARRAY and MAP should succeed");
 
     let table = catalog
-        .get_table(&Identifier::new("mydb", "complex_types"))
+        .get_table(&Identifier::new("mydb", "complex_types").unwrap())
         .await
         .unwrap();
     let schema = table.schema();
@@ -386,7 +386,7 @@ async fn test_create_table_with_row_type() {
         .expect("CREATE TABLE with STRUCT should succeed");
 
     let table = catalog
-        .get_table(&Identifier::new("mydb", "row_table"))
+        .get_table(&Identifier::new("mydb", "row_table").unwrap())
         .await
         .unwrap();
     let schema = table.schema();
@@ -427,7 +427,7 @@ async fn test_drop_table() {
         .build()
         .unwrap();
     catalog
-        .create_table(&Identifier::new("mydb", "to_drop"), schema, false)
+        .create_table(&Identifier::new("mydb", "to_drop").unwrap(), schema, false)
         .await
         .unwrap();
 
@@ -476,7 +476,11 @@ async fn test_alter_table_add_column() {
         .build()
         .unwrap();
     catalog
-        .create_table(&Identifier::new("mydb", "alter_test"), schema, false)
+        .create_table(
+            &Identifier::new("mydb", "alter_test").unwrap(),
+            schema,
+            false,
+        )
         .await
         .unwrap();
 
@@ -517,7 +521,7 @@ async fn test_alter_table_rename() {
         .build()
         .unwrap();
     catalog
-        .create_table(&Identifier::new("mydb", "old_name"), schema, false)
+        .create_table(&Identifier::new("mydb", "old_name").unwrap(), schema, false)
         .await
         .unwrap();
 
@@ -555,7 +559,7 @@ async fn test_ddl_context_delegates_select() {
         .build()
         .unwrap();
     catalog
-        .create_table(&Identifier::new("mydb", "t1"), schema, false)
+        .create_table(&Identifier::new("mydb", "t1").unwrap(), schema, false)
         .await
         .unwrap();
 

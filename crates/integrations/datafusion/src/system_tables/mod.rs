@@ -136,7 +136,7 @@ pub(crate) async fn load(
     if !is_registered(&system_name) {
         return Ok(None);
     }
-    let identifier = Identifier::new(database, base.clone());
+    let identifier = Identifier::new(database, base.clone()).map_err(to_datafusion_error)?;
     match catalog.get_table(&identifier).await {
         Ok(table) => {
             if system_name.eq_ignore_ascii_case("partitions") {

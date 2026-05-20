@@ -233,7 +233,7 @@ fn require_arg<'a>(args: &'a HashMap<String, String>, name: &str) -> DFResult<&'
 fn resolve_table_identifier(table_str: &str, catalog_name: &str) -> DFResult<Identifier> {
     let parts: Vec<&str> = table_str.split('.').collect();
     match parts.len() {
-        2 => Ok(Identifier::new(parts[0], parts[1])),
+        2 => Identifier::new(parts[0], parts[1]).map_err(to_datafusion_error),
         3 => {
             if parts[0] != catalog_name {
                 return Err(DataFusionError::Plan(format!(
@@ -241,7 +241,7 @@ fn resolve_table_identifier(table_str: &str, catalog_name: &str) -> DFResult<Ide
                     parts[0]
                 )));
             }
-            Ok(Identifier::new(parts[1], parts[2]))
+            Identifier::new(parts[1], parts[2]).map_err(to_datafusion_error)
         }
         _ => Err(DataFusionError::Plan(format!(
             "Invalid table identifier: '{table_str}'. Expected 'database.table' or 'catalog.database.table'"

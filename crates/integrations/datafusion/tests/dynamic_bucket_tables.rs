@@ -275,7 +275,7 @@ async fn test_pk_dynamic_bucket_partial_update_restores_existing_bucket() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_partial_route"))
+        .get_table(&Identifier::new("test_db", "t_dyn_partial_route").unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -301,7 +301,7 @@ async fn test_pk_dynamic_bucket_partial_update_restores_existing_bucket() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_partial_route"))
+        .get_table(&Identifier::new("test_db", "t_dyn_partial_route").unwrap())
         .await
         .unwrap();
     let id1_bucket_after = bucket_containing_id(&table, 1).await;
@@ -705,7 +705,7 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_ow"))
+        .get_table(&Identifier::new("test_db", "t_dyn_ow").unwrap())
         .await
         .unwrap();
     let hashes_before = collect_all_hashes(&table).await;
@@ -733,7 +733,7 @@ async fn test_pk_dynamic_bucket_insert_overwrite() {
 
     // Verify HASH index: should have exactly 2 entries (not 3+2=5)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_ow"))
+        .get_table(&Identifier::new("test_db", "t_dyn_ow").unwrap())
         .await
         .unwrap();
     let hashes_after = collect_all_hashes(&table).await;
@@ -788,7 +788,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
         .unwrap();
 
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_part_ow"))
+        .get_table(&Identifier::new("test_db", "t_dyn_part_ow").unwrap())
         .await
         .unwrap();
     let entries_before = read_hash_index_entries(&table).await;
@@ -818,7 +818,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
     // Verify HASH index: partition 'b' entries should survive,
     // partition 'a' should have exactly 1 entry (not 2+1=3)
     let table = catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_part_ow"))
+        .get_table(&Identifier::new("test_db", "t_dyn_part_ow").unwrap())
         .await
         .unwrap();
     let entries_after = read_hash_index_entries(&table).await;
@@ -860,7 +860,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
     opts.set(CatalogOptions::WAREHOUSE, &warehouse);
     let spark_catalog = FileSystemCatalog::new(opts).unwrap();
     let spark_table = spark_catalog
-        .get_table(&Identifier::new("default", "dynamic_bucket_pk_table"))
+        .get_table(&Identifier::new("default", "dynamic_bucket_pk_table").unwrap())
         .await
         .unwrap();
 
@@ -958,7 +958,7 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
         FileSystemCatalog::new(opts).unwrap()
     };
     let rust_table = rust_catalog
-        .get_table(&Identifier::new("test_db", "t_dyn_cmp"))
+        .get_table(&Identifier::new("test_db", "t_dyn_cmp").unwrap())
         .await
         .unwrap();
 
