@@ -2626,8 +2626,7 @@ async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
             )",
         )
         .await
-        .err()
-        .expect("CREATE TABLE with ignore-retract should fail in basic mode");
+        .expect_err("CREATE TABLE with ignore-retract should fail in basic mode");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("ignore-retract"),
