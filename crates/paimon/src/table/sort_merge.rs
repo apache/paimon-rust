@@ -287,9 +287,10 @@ impl MergeFunction for PartialUpdateMergeFunction {
 /// - Primary-key columns are copied from any row of the group (Paimon
 ///   guarantees they all share the same value); no aggregator is constructed
 ///   for them.
-/// - Sequence fields named in `sequence.field` are forced to `last_value`
-///   regardless of any per-field configuration, matching Java
-///   `AggregateMergeFunction`.
+/// - Columns listed in the `sequence_fields` constructor argument (which the
+///   reader populates from the `sequence.field` table option) are forced to
+///   `last_value` regardless of any per-field configuration, matching Java
+///   `AggregateMergeFunction#createFieldAggregators`.
 /// - Every other output column requires either
 ///   `fields.<col>.aggregate-function` or a fall-back
 ///   `fields.default-aggregate-function`; otherwise construction fails with
@@ -321,8 +322,8 @@ impl AggregateMergeFunction {
         primary_keys: &[String],
         sequence_fields: &[String],
     ) -> crate::Result<Self> {
-        AggregationConfig::new(table_options).validate_runtime_mode(true, table_name)?;
         let config = AggregationConfig::new(table_options);
+        config.validate_runtime_mode(true, table_name)?;
 
         let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let seq_set: HashSet<&str> = sequence_fields.iter().map(String::as_str).collect();
@@ -407,17 +408,6 @@ impl MergeFunction for AggregateMergeFunction {
                 message: format!("AggregateMergeFunction aggregator mutex poisoned: {e}"),
                 source: None,
             })?;
-        if aggregators.len() != output_schema.fields().len() {
-            return Err(Error::UnexpectedError {
-                message: format!(
-                    "AggregateMergeFunction aggregator slot count {} does not match output \
-                     schema field count {}",
-                    aggregators.len(),
-                    output_schema.fields().len()
-                ),
-                source: None,
-            });
-        }
         for slot in aggregators.iter_mut() {
             if let Some(agg) = slot.as_mut() {
                 agg.reset();
@@ -453,23 +443,28 @@ impl MergeFunction for AggregateMergeFunction {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        // Defensive check: non-nullable fields must not receive NULL output
-        // from an aggregator (e.g. `min` on an all-NULL group).  Mirror the
-        // partial-update guard but also surface which aggregator produced
-        // the NULL so a misconfigured `fields.<col>.aggregate-function`
-        // shows up clearly in the error.
+        // Defensive check: non-nullable fields must not contain NULL on the
+        // merged output (e.g. `min` on an all-NULL value group, or a NULL
+        // primary-key cell on the source row).  Split the message so the
+        // operator knows whether to look at the aggregator config or at the
+        // upstream data.
         for (col_idx, field) in output_schema.fields().iter().enumerate() {
             if !field.is_nullable() && output_columns[col_idx].is_null(0) {
-                let agg_name = aggregators[col_idx]
-                    .as_ref()
-                    .map(|a| a.name())
-                    .unwrap_or("<primary-key>");
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "merge-engine=aggregation: aggregator '{agg_name}' produced NULL for \
+                let message = match aggregators[col_idx].as_ref() {
+                    Some(agg) => format!(
+                        "merge-engine=aggregation: aggregator '{}' produced NULL for \
                          non-nullable field '{}'",
+                        agg.name(),
                         field.name()
                     ),
+                    None => format!(
+                        "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
+                         source row; declare the column nullable or fix the upstream data",
+                        field.name()
+                    ),
+                };
+                return Err(Error::DataInvalid {
+                    message,
                     source: None,
                 });
             }
