@@ -17,6 +17,7 @@
 
 use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
+use crate::spec::AggregationConfig;
 use crate::spec::PartialUpdateConfig;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -305,6 +306,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
+        AggregationConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
         Self::validate_first_row_changelog_producer(&options)?;
 
         Ok(Self {
@@ -763,7 +765,7 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, IntType};
+    use crate::spec::{BlobType, IntType, VarCharType};
 
     use super::*;
 
@@ -1052,6 +1054,51 @@ mod tests {
             assert!(
                 matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
                 "partial-update create-time validation should reject '{key}', got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_accepts_basic_options() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("tags", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            .option("fields.value.aggregate-function", "sum")
+            .option("fields.tags.aggregate-function", "listagg")
+            .option("fields.tags.list-agg-delimiter", ";")
+            .option("fields.default-aggregate-function", "last_non_null_value")
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.fields().len(), 3);
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unsupported_options() {
+        for (key, value) in [
+            ("ignore-delete", "true"),
+            ("aggregation.remove-record-on-delete", "true"),
+            ("fields.value.ignore-retract", "true"),
+            ("fields.value.distinct", "true"),
+            ("fields.value.sequence-group", "g1"),
+            ("fields.value.nested-key", "id"),
+            ("fields.value.count-limit", "10"),
+        ] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option(key, value)
+                .build()
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
+                "aggregation create-time validation should reject '{key}', got {err:?}"
             );
         }
     }

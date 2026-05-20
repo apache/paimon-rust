@@ -35,6 +35,9 @@ pub use core_options::*;
 mod partial_update;
 pub(crate) use partial_update::PartialUpdateConfig;
 
+mod aggregation;
+pub(crate) use aggregation::AggregationConfig;
+
 mod schema;
 pub use schema::*;
 

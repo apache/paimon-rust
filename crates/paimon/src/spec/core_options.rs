@@ -78,6 +78,8 @@ pub enum MergeEngine {
     PartialUpdate,
     /// Keep the first row for each key (ignore later updates).
     FirstRow,
+    /// Apply per-field aggregate functions across rows sharing the same key.
+    Aggregation,
 }
 
 /// Changelog producer for table writes.
@@ -169,6 +171,7 @@ impl<'a> CoreOptions<'a> {
                 "deduplicate" => Ok(MergeEngine::Deduplicate),
                 "partial-update" => Ok(MergeEngine::PartialUpdate),
                 "first-row" => Ok(MergeEngine::FirstRow),
+                "aggregation" => Ok(MergeEngine::Aggregation),
                 other => Err(crate::Error::Unsupported {
                     message: format!("Unsupported merge-engine: '{other}'"),
                 }),
@@ -635,6 +638,14 @@ mod tests {
         let core = CoreOptions::new(&options);
 
         assert_eq!(core.merge_engine().unwrap(), MergeEngine::PartialUpdate);
+    }
+
+    #[test]
+    fn test_merge_engine_accepts_aggregation() {
+        let options = HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "aggregation".into())]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(core.merge_engine().unwrap(), MergeEngine::Aggregation);
     }
 
     #[test]

@@ -192,6 +192,13 @@ impl GlobalPartitionIndex {
                         message: "CrossPartitionAssigner does not support merge-engine=partial-update yet".to_string(),
                     });
                 }
+                MergeEngine::Aggregation => {
+                    return Err(crate::Error::Unsupported {
+                        message:
+                            "CrossPartitionAssigner does not support merge-engine=aggregation yet"
+                                .to_string(),
+                    });
+                }
             }
         }
 

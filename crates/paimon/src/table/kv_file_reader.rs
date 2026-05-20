@@ -112,6 +112,12 @@ impl KeyValueFileReader {
             MergeEngine::FirstRow => Err(Error::Unsupported {
                 message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
             }),
+            // Wired up by a follow-up commit that adds AggregateMergeFunction.
+            MergeEngine::Aggregation => Err(Error::Unsupported {
+                message: format!(
+                    "Table '{table_name}' uses merge-engine=aggregation, which is not yet wired into the read path"
+                ),
+            }),
         }
     }
 
