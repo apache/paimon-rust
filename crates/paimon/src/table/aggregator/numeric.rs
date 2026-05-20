@@ -17,15 +17,20 @@
 
 //! Numeric aggregators: sum, product, min, max, count.
 //!
-//! `sum` and `product` operate on the integer / floating / decimal numeric
-//! family.  Integer overflow is reported as [`Error::DataInvalid`] so silent
-//! wrap cannot produce misleading aggregated values.
+//! `sum` operates on every integer / floating / Decimal numeric type.
+//! `product` accepts the same numeric family except DECIMAL — basic mode does
+//! not yet implement BigDecimal-style scale rebasing for Decimal product, so
+//! Decimal columns are rejected at construction.  Integer overflow on either
+//! aggregator is reported as [`Error::DataInvalid`] so silent wrap cannot
+//! produce misleading aggregated values.
 //!
-//! `min` / `max` extend to lexicographically comparable types: numerics,
-//! Decimal, Date, Time, Timestamp, and Char/VarChar.
+//! `min` / `max` extend to every ordered Paimon type: numerics, Decimal,
+//! Date, Time, Timestamp, and Char/VarChar.  Comparison is by native value
+//! order (numeric for numbers, lexicographic for strings).
 //!
-//! `count` accepts any input type and produces a `BIGINT` column whose value
-//! is the number of non-NULL inputs accumulated for the key.
+//! `count` requires the column to be declared as BIGINT and accumulates the
+//! number of non-NULL inputs encountered for the key.  Non-BIGINT columns are
+//! rejected at construction.
 //!
 //! Reference: Java `FieldSumAgg`, `FieldProductAgg`, `FieldMinAgg`,
 //! `FieldMaxAgg`, `FieldCountAgg` under
@@ -203,11 +208,9 @@ enum ProductState {
     I64(Option<i64>),
     F32(Option<f32>),
     F64(Option<f64>),
-    Decimal128 {
-        precision: u8,
-        scale: i8,
-        acc: Option<i128>,
-    },
+    // DECIMAL `product` is intentionally rejected at construction (see
+    // `ProductAgg::new`); add a variant here when the BigDecimal-style
+    // scale handling lands.
 }
 
 #[derive(Debug)]
@@ -225,11 +228,21 @@ impl ProductAgg {
             DataType::BigInt(_) => ProductState::I64(None),
             DataType::Float(_) => ProductState::F32(None),
             DataType::Double(_) => ProductState::F64(None),
-            DataType::Decimal(d) => ProductState::Decimal128 {
-                precision: decimal_precision(d.precision(), field_name)?,
-                scale: decimal_scale(d.scale(), field_name)?,
-                acc: None,
-            },
+            // Decimal `product` would need BigDecimal-style scale rebasing
+            // (multiply raw i128, then divide by 10^scale, with precision
+            // checks).  The basic mode does not implement that yet, so we
+            // reject DECIMAL columns explicitly rather than silently produce
+            // a scale-shifted result.
+            DataType::Decimal(_) => {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Aggregate function 'product' on DECIMAL field '{field_name}' is not \
+                         supported in the basic mode; use a BIGINT/DOUBLE column or wait for a \
+                         follow-up commit that adds Decimal product semantics aligned with Java \
+                         BigDecimal"
+                    ),
+                });
+            }
             other => return Err(unsupported_type_error("product", field_name, other)),
         };
         Ok(Self {
@@ -252,7 +265,6 @@ impl FieldAggregator for ProductAgg {
             ProductState::I64(acc) => *acc = None,
             ProductState::F32(acc) => *acc = None,
             ProductState::F64(acc) => *acc = None,
-            ProductState::Decimal128 { acc, .. } => *acc = None,
         }
     }
 
@@ -305,15 +317,6 @@ impl FieldAggregator for ProductAgg {
                 let v = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(acc.map_or(v, |prev| prev * v));
             }
-            ProductState::Decimal128 { acc, .. } => {
-                let v = downcast::<Decimal128Array>(array, &self.field_name)?.value(row_idx);
-                *acc = Some(match *acc {
-                    None => v,
-                    Some(prev) => prev
-                        .checked_mul(v)
-                        .ok_or_else(|| overflow_error("product", &self.field_name))?,
-                });
-            }
         }
         Ok(())
     }
@@ -326,11 +329,6 @@ impl FieldAggregator for ProductAgg {
             ProductState::I64(acc) => Arc::new(Int64Array::from(vec![*acc])),
             ProductState::F32(acc) => Arc::new(Float32Array::from(vec![*acc])),
             ProductState::F64(acc) => Arc::new(Float64Array::from(vec![*acc])),
-            ProductState::Decimal128 {
-                precision,
-                scale,
-                acc,
-            } => decimal_array(*precision, *scale, *acc, "product", &self.field_name)?,
         })
     }
 }
@@ -611,8 +609,12 @@ impl FieldAggregator for MaxAgg {
 // Count
 // ---------------------------------------------------------------------------
 
-/// `count` accumulates the number of non-NULL inputs and outputs a `BIGINT`
-/// scalar regardless of the input type.  Aligns with Java `FieldCountAgg`.
+/// `count` accumulates the number of non-NULL inputs.  The output is a
+/// `BIGINT` scalar; the input column must also be declared as BIGINT so the
+/// existing data-file layout can hold the i64 counter without an extra cast
+/// layer.  Non-BIGINT columns are rejected at construction.
+///
+/// Aligns with Java `FieldCountAgg`, which likewise produces a BIGINT output.
 #[derive(Debug)]
 pub(crate) struct CountAgg {
     field_name: String,
@@ -888,6 +890,18 @@ mod tests {
             agg.agg(&arr, i).unwrap();
         }
         assert_eq!(collect_i32(agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn test_product_rejects_decimal_until_scale_handling_lands() {
+        // DECIMAL multiplication needs BigDecimal-style scale rebasing; the
+        // basic mode rejects it explicitly instead of silently shifting the
+        // implied scale.
+        let err =
+            ProductAgg::new("v", &DataType::Decimal(DecimalType::new(10, 2).unwrap())).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("DECIMAL"))
+        );
     }
 
     #[test]
