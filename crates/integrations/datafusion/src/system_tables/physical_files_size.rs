@@ -82,7 +82,8 @@ impl TableProvider for PhysicalFilesSizeTable {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.table.clone();
         let summary = crate::runtime::await_with_runtime(async move {
-            collect_physical_files_summary(table.file_io(), table.location()).await
+            let partition_depth = table.schema().partition_keys().len();
+            collect_physical_files_summary(table.file_io(), table.location(), partition_depth).await
         })
         .await
         .map_err(to_datafusion_error)?;

@@ -806,12 +806,14 @@ Columns:
 
 ### $physical_files_size
 
-Scan the table directory recursively and compute the total size of all physical files on disk, categorized by file type. By comparing with `$referenced_files_size`, you can identify orphan files that are no longer referenced by any snapshot.
+Scan the table directory recursively and compute the total size of recognized physical files on disk, categorized by file type. This table is a diagnostic size summary; orphan cleanup needs file-level candidates and retention checks, not just aggregate size differences.
 
-Files are classified by their file name prefix:
-- `manifest-*` / `index-manifest-*` → manifest
-- `index-*` (excluding `index-manifest-*`) → index
-- Everything else → data
+Files are classified by their table-relative path:
+- `manifest/manifest-*`, `manifest/manifest-list-*`, and `manifest/index-manifest-*` → manifest
+- `statistics/*` → manifest file counters for the current compatible output schema
+- `index/*` → index
+- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth
+- unknown files are ignored by this summary
 
 ```sql
 SELECT * FROM paimon.default.my_table$physical_files_size;
@@ -823,8 +825,8 @@ Columns:
 |---|---|---|
 | `manifest_file_count` | BIGINT | Number of manifest files on disk |
 | `manifest_file_size` | BIGINT | Total size of manifest files (bytes) |
-| `data_file_count` | BIGINT | Number of data files on disk |
-| `data_file_size` | BIGINT | Total size of data files (bytes) |
+| `data_file_count` | BIGINT | Number of recognized data files on disk |
+| `data_file_size` | BIGINT | Total size of recognized data files (bytes) |
 | `index_file_count` | BIGINT | Number of index files on disk |
 | `index_file_size` | BIGINT | Total size of index files (bytes) |
 
@@ -855,7 +857,7 @@ The output contains one row per scope:
 - `branch:main` — main branch snapshots + tag snapshots
 - `branch:<name>` — one row per other branch
 
-To identify orphan file size:
+To estimate possible orphan file size for recognized data files:
 
 ```sql
 SELECT p.data_file_size - r.data_file_size AS orphan_data_size
