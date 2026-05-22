@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::core_options::CoreOptions;
+use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::PartialUpdateConfig;
 use serde::{Deserialize, Serialize};
@@ -148,6 +148,7 @@ impl TableSchema {
             }
         }
 
+        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
         Ok(new_schema)
     }
 
@@ -263,6 +264,7 @@ pub fn escape_single_quotes(text: &str) -> String {
 pub const PRIMARY_KEY_OPTION: &str = "primary-key";
 /// Option key for partition in table options (same as [CoreOptions.PARTITION](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java)).
 pub const PARTITION_OPTION: &str = "partition";
+const MERGE_ENGINE_OPTION: &str = "merge-engine";
 
 /// Schema of a table (logical DDL schema).
 ///
@@ -291,6 +293,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
+        Self::validate_first_row_changelog_producer(&options)?;
 
         Ok(Self {
             fields,
@@ -504,6 +507,40 @@ impl Schema {
         }
 
         Ok(())
+    }
+
+    fn validate_first_row_changelog_producer(
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        if !options
+            .get(MERGE_ENGINE_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("first-row"))
+        {
+            return Ok(());
+        }
+
+        let changelog_producer = CoreOptions::new(options)
+            .try_changelog_producer()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if first_row_supports_changelog_producer(changelog_producer) {
+            return Ok(());
+        }
+
+        Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "merge-engine=first-row only supports changelog-producer=none or lookup, but found changelog-producer={}",
+                changelog_producer.as_str()
+            ),
+        })
+    }
+
+    fn options_error_to_config_invalid(error: crate::Error) -> crate::Error {
+        match error {
+            crate::Error::Unsupported { message } => crate::Error::ConfigInvalid { message },
+            other => crate::Error::ConfigInvalid {
+                message: other.to_string(),
+            },
+        }
     }
 
     /// Returns top-level Blob field names for create-time Blob contract checks.
@@ -976,6 +1013,128 @@ mod tests {
                 "partial-update create-time validation should reject '{key}', got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_first_row_schema_validation_accepts_supported_changelog_producers() {
+        for producer in ["none", "lookup"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "first-row")
+                .option("changelog-producer", producer)
+                .build()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_first_row_schema_validation_rejects_incompatible_changelog_producers() {
+        for producer in ["input", "full-compaction"] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "first-row")
+                .option("changelog-producer", producer)
+                .build()
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains("merge-engine=first-row")
+                        && message.contains("changelog-producer")
+                        && message.contains(producer)),
+                "first-row should reject changelog-producer={producer}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_first_row_apply_changes_rejects_incompatible_changelog_producers() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "first-row")
+                .option("changelog-producer", "lookup")
+                .build()
+                .unwrap(),
+        );
+
+        for producer in ["input", "full-compaction"] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                    "changelog-producer".to_string(),
+                    producer.to_string(),
+                )])
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains("merge-engine=first-row")
+                        && message.contains("changelog-producer")
+                        && message.contains(producer)),
+                "first-row alter should reject changelog-producer={producer}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_first_row_apply_changes_validates_final_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("changelog-producer", "input")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "merge-engine".to_string(),
+                "first-row".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("merge-engine=first-row")
+                    && message.contains("changelog-producer")
+                    && message.contains("input")),
+            "first-row alter should reject incompatible final options, got {err:?}"
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "merge-engine".to_string(),
+                    "first-row".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "changelog-producer".to_string(),
+                    "lookup".to_string(),
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            new_schema.options().get("merge-engine").map(String::as_str),
+            Some("first-row")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("changelog-producer")
+                .map(String::as_str),
+            Some("lookup")
+        );
     }
 
     #[test]

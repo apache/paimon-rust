@@ -23,8 +23,8 @@
 use crate::arrow::build_target_arrow_schema;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    BinaryRow, ChangelogProducer, CoreOptions, DataType, MergeEngine, EMPTY_SERIALIZED_ROW,
-    POSTPONE_BUCKET,
+    first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataType,
+    MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -223,6 +223,18 @@ impl TableWrite {
             .collect();
 
         let merge_engine = core_options.merge_engine()?;
+
+        if merge_engine == MergeEngine::FirstRow
+            && !first_row_supports_changelog_producer(changelog_producer)
+        {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Table '{}' has incompatible table options: merge-engine=first-row only supports changelog-producer=none or lookup, but found changelog-producer={}",
+                    table.identifier().full_name(),
+                    changelog_producer.as_str()
+                ),
+            });
+        }
 
         if is_dynamic_cross_partition && merge_engine == MergeEngine::PartialUpdate {
             return Err(crate::Error::Unsupported {
@@ -1564,6 +1576,21 @@ mod tests {
         TableSchema::new(0, &builder.build().unwrap())
     }
 
+    fn loaded_first_row_schema_with_changelog_producer(producer: &str) -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "first-row")
+            .option("changelog-producer", "lookup")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let mut value = serde_json::to_value(&table_schema).unwrap();
+        value["options"]["changelog-producer"] = serde_json::Value::String(producer.to_string());
+        serde_json::from_value(value).unwrap()
+    }
+
     fn ordinary_dynamic_pk_changelog_schema() -> TableSchema {
         let schema = Schema::builder()
             .column("pt", DataType::VarChar(VarCharType::string_type()))
@@ -1575,6 +1602,36 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[test]
+    fn test_table_write_rejects_loaded_first_row_with_incompatible_changelog_producer() {
+        let file_io = test_file_io();
+
+        for producer in ["input", "full-compaction"] {
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_first_row_changelog"),
+                "memory:/test_first_row_changelog".to_string(),
+                loaded_first_row_schema_with_changelog_producer(producer),
+                None,
+            );
+
+            let err = match TableWrite::new(&table, "test-user".to_string()) {
+                Ok(_) => panic!(
+                    "first-row should reject changelog-producer={producer} during write setup"
+                ),
+                Err(err) => err,
+            };
+
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("incompatible table options")
+                        && message.contains("merge-engine=first-row")
+                        && message.contains(producer)),
+                "first-row runtime guard should reject changelog-producer={producer}, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

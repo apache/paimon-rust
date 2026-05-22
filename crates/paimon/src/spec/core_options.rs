@@ -106,6 +106,13 @@ impl ChangelogProducer {
     }
 }
 
+pub(crate) fn first_row_supports_changelog_producer(producer: ChangelogProducer) -> bool {
+    matches!(
+        producer,
+        ChangelogProducer::None | ChangelogProducer::Lookup
+    )
+}
+
 /// Format the bucket directory name for a given bucket number.
 /// Returns `"bucket-postpone"` for `POSTPONE_BUCKET` (-2), otherwise `"bucket-{N}"`.
 pub fn bucket_dir_name(bucket: i32) -> String {
