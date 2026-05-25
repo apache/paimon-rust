@@ -54,6 +54,9 @@ struct Accum {
 impl Table {
     /// Compute per-partition statistics from the latest snapshot.
     ///
+    /// **Warning:** This method reads all manifest lists and entries from the latest snapshot.
+    /// For tables with a large number of manifests, this operation can be expensive.
+    ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
         let sm = SnapshotManager::new(self.file_io().clone(), self.location().to_string());
@@ -70,6 +73,9 @@ impl Table {
     }
 
     /// List all partition values present in the latest snapshot.
+    ///
+    /// **Warning:** This method computes partition statistics which reads all manifest lists
+    /// and entries. For large tables, this operation can be expensive.
     ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn list_partitions(&self) -> crate::Result<Vec<HashMap<String, String>>> {
@@ -196,6 +202,9 @@ fn partition_value_to_string(row: &BinaryRow, pos: usize, dt: Option<&DataType>)
         Some(DataType::Double(_)) => row.get_double(pos_i).map(|v| v.to_string()),
         Some(DataType::Char(_)) | Some(DataType::VarChar(_)) => {
             row.get_string(pos_i).map(|v| v.to_string())
+        }
+        Some(DataType::Binary(_)) | Some(DataType::VarBinary(_)) => {
+            row.get_binary(pos_i).map(hex::encode)
         }
         _ => row.get_string(pos_i).map(|v| v.to_string()),
     }
