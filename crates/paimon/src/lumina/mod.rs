@@ -20,7 +20,16 @@ pub mod reader;
 
 use std::collections::HashMap;
 
-pub const LUMINA_VECTOR_ANN_IDENTIFIER: &str = "lumina-vector-ann";
+pub const LUMINA_IDENTIFIER: &str = "lumina";
+pub const LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER: &str = "lumina-vector-ann";
+pub const LUMINA_VECTOR_ANN_IDENTIFIER: &str = LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER;
+
+pub fn is_lumina_index_type(index_type: &str) -> bool {
+    matches!(
+        index_type,
+        LUMINA_IDENTIFIER | LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuminaVectorMetric {
@@ -505,6 +514,17 @@ mod tests {
             );
         }
         assert!(LuminaVectorMetric::from_string("hamming").is_err());
+    }
+
+    #[test]
+    fn test_lumina_index_type_identifier_helper() {
+        assert!(is_lumina_index_type(LUMINA_IDENTIFIER));
+        assert!(is_lumina_index_type(LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER));
+        assert!(is_lumina_index_type(LUMINA_VECTOR_ANN_IDENTIFIER));
+        assert!(!is_lumina_index_type(""));
+        assert!(!is_lumina_index_type("btree"));
+        assert!(!is_lumina_index_type("lumina-vector"));
+        assert!(!is_lumina_index_type("LUMINA"));
     }
 
     #[test]

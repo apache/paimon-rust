@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::{GlobalIndexIOMeta, SearchResult, VectorSearch, LUMINA_VECTOR_ANN_IDENTIFIER};
+use crate::lumina::{is_lumina_index_type, GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::{find_field_id_by_name, RowRange, Table};
@@ -130,7 +130,7 @@ async fn evaluate_vector_search(
         .iter()
         .filter(|e| {
             e.kind == FileKind::Add
-                && e.index_file.index_type == LUMINA_VECTOR_ANN_IDENTIFIER
+                && is_lumina_index_type(&e.index_file.index_type)
                 && e.index_file
                     .global_index_meta
                     .as_ref()
@@ -190,6 +190,7 @@ async fn evaluate_vector_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
     use crate::spec::{DataType, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType};
 
     fn make_field(id: i32, name: &str) -> DataField {
@@ -238,31 +239,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_evaluate_ignores_non_lumina_index_type() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(2, "embedding")];
+        let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+
+        let entry = make_lumina_entry("test.idx", "btree", FileKind::Add, 2);
+
+        let result = evaluate_vector_search(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &[entry],
+            &vs,
+            &fields,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_evaluate_no_matching_field() {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(1, "id")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
 
-        let entry = IndexManifestEntry {
-            kind: FileKind::Add,
-            partition: vec![],
-            bucket: 0,
-            index_file: IndexFileMeta {
-                index_type: LUMINA_VECTOR_ANN_IDENTIFIER.to_string(),
-                file_name: "test.idx".to_string(),
-                file_size: 100,
-                row_count: 10,
-                deletion_vectors_ranges: None,
-                global_index_meta: Some(GlobalIndexMeta {
-                    row_range_start: 0,
-                    row_range_end: 9,
-                    index_field_id: 99,
-                    extra_field_ids: None,
-                    index_meta: None,
-                }),
-            },
-            version: 1,
-        };
+        let entry = make_lumina_entry(
+            "test.idx",
+            LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
+            FileKind::Add,
+            99,
+        );
 
         let result = evaluate_vector_search(
             &file_io,
@@ -283,26 +291,12 @@ mod tests {
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
 
-        let entry = IndexManifestEntry {
-            kind: FileKind::Delete,
-            partition: vec![],
-            bucket: 0,
-            index_file: IndexFileMeta {
-                index_type: LUMINA_VECTOR_ANN_IDENTIFIER.to_string(),
-                file_name: "test.idx".to_string(),
-                file_size: 100,
-                row_count: 10,
-                deletion_vectors_ranges: None,
-                global_index_meta: Some(GlobalIndexMeta {
-                    row_range_start: 0,
-                    row_range_end: 9,
-                    index_field_id: 2,
-                    extra_field_ids: None,
-                    index_meta: None,
-                }),
-            },
-            version: 1,
-        };
+        let entry = make_lumina_entry(
+            "test.idx",
+            LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
+            FileKind::Delete,
+            2,
+        );
 
         let result = evaluate_vector_search(
             &file_io,
@@ -315,5 +309,88 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_accepts_canonical_lumina_index_type() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(2, "embedding")];
+        let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+
+        let entry = make_lumina_entry("missing.idx", LUMINA_IDENTIFIER, FileKind::Add, 2);
+
+        let err = evaluate_vector_search(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &[entry],
+            &vs,
+            &fields,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to read Lumina index file 'missing.idx'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_accepts_legacy_lumina_index_type() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(2, "embedding")];
+        let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+
+        let entry = make_lumina_entry(
+            "missing.idx",
+            LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
+            FileKind::Add,
+            2,
+        );
+
+        let err = evaluate_vector_search(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &[entry],
+            &vs,
+            &fields,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to read Lumina index file 'missing.idx'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn make_lumina_entry(
+        file_name: &str,
+        index_type: &str,
+        kind: FileKind,
+        index_field_id: i32,
+    ) -> IndexManifestEntry {
+        IndexManifestEntry {
+            kind,
+            partition: vec![],
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: index_type.to_string(),
+                file_name: file_name.to_string(),
+                file_size: 100,
+                row_count: 10,
+                deletion_vectors_ranges: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 9,
+                    index_field_id,
+                    extra_field_ids: None,
+                    index_meta: None,
+                }),
+            },
+            version: 1,
+        }
     }
 }
