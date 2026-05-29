@@ -307,7 +307,10 @@ impl TableCommit {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
             let resolved = self.resolve_commit(&plan, &latest_snapshot).await?;
 
-            if resolved.entries.is_empty() && resolved.changelog_entries.is_empty() {
+            if resolved.entries.is_empty()
+                && resolved.changelog_entries.is_empty()
+                && !resolved.index_manifest_changed
+            {
                 break;
             }
 
@@ -370,13 +373,20 @@ impl TableCommit {
                 .as_ref()
                 .and_then(|s| s.next_row_id())
                 .unwrap_or(0);
-            let (assigned, nrid) = self.assign_row_tracking_meta(
-                new_snapshot_id,
-                first_row_id_start,
-                resolved.entries,
-            );
-            resolved.entries = assigned;
-            next_row_id = Some(nrid);
+            if resolved.entries.is_empty() {
+                next_row_id = latest_snapshot
+                    .as_ref()
+                    .and_then(|s| s.next_row_id())
+                    .or(Some(first_row_id_start));
+            } else {
+                let (assigned, nrid) = self.assign_row_tracking_meta(
+                    new_snapshot_id,
+                    first_row_id_start,
+                    resolved.entries,
+                );
+                resolved.entries = assigned;
+                next_row_id = Some(nrid);
+            }
         }
 
         let file_io = self.snapshot_manager.file_io();
@@ -611,22 +621,13 @@ impl TableCommit {
                         .as_ref()
                         .and_then(|s| s.index_manifest().map(|s| s.to_string()))
                 } else {
-                    let mut all =
-                        Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot)
-                            .await?;
-                    let new_keys: HashSet<(Vec<u8>, i32)> = new_index_entries
-                        .iter()
-                        .filter(|e| e.index_file.index_type == "HASH")
-                        .map(|e| (e.partition.clone(), e.bucket))
-                        .collect();
-                    all.retain(|e| {
-                        if e.index_file.index_type == "HASH" {
-                            !new_keys.contains(&(e.partition.clone(), e.bucket))
-                        } else {
-                            true
-                        }
-                    });
-                    all.extend_from_slice(new_index_entries);
+                    let all = Self::merge_index_entries(
+                        latest_snapshot,
+                        new_index_entries,
+                        file_io,
+                        &manifest_dir,
+                    )
+                    .await?;
                     Self::write_index_manifest(file_io, &manifest_dir, &all).await?
                 };
 
@@ -635,6 +636,7 @@ impl TableCommit {
                     changelog_entries: changelog_entries.clone(),
                     kind,
                     index_manifest_name,
+                    index_manifest_changed: !new_index_entries.is_empty(),
                 })
             }
             CommitEntriesPlan::Overwrite {
@@ -650,8 +652,9 @@ impl TableCommit {
                     )
                     .await?;
 
-                let mut all =
+                let previous =
                     Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                let mut all = previous.clone();
                 match partition_filter.as_ref() {
                     None => all.clear(),
                     Some(filter) => {
@@ -664,18 +667,122 @@ impl TableCommit {
                         all = retained;
                     }
                 }
+                Self::validate_global_index_overlap(&all, new_index_entries)?;
+                Self::validate_added_global_index_overlap(new_index_entries)?;
                 all.extend_from_slice(new_index_entries);
-                let index_manifest_name =
-                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?;
+                let index_manifest_changed = all != previous;
+                let index_manifest_name = if index_manifest_changed {
+                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
+                } else {
+                    latest_snapshot
+                        .as_ref()
+                        .and_then(|s| s.index_manifest().map(|s| s.to_string()))
+                };
 
                 Ok(ResolvedCommit {
                     entries,
                     changelog_entries: vec![],
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
+                    index_manifest_changed,
                 })
             }
         }
+    }
+
+    async fn merge_index_entries(
+        latest_snapshot: &Option<Snapshot>,
+        new_index_entries: &[IndexManifestEntry],
+        file_io: &FileIO,
+        manifest_dir: &str,
+    ) -> Result<Vec<IndexManifestEntry>> {
+        let mut all = Self::read_prev_index_entries(file_io, manifest_dir, latest_snapshot).await?;
+        let new_hash_keys: HashSet<(Vec<u8>, i32)> = new_index_entries
+            .iter()
+            .filter(|e| e.index_file.index_type == "HASH")
+            .map(|e| (e.partition.clone(), e.bucket))
+            .collect();
+        all.retain(|e| {
+            if e.index_file.index_type == "HASH" {
+                !new_hash_keys.contains(&(e.partition.clone(), e.bucket))
+            } else {
+                true
+            }
+        });
+        Self::validate_global_index_overlap(&all, new_index_entries)?;
+        Self::validate_added_global_index_overlap(new_index_entries)?;
+        all.extend_from_slice(new_index_entries);
+        Ok(all)
+    }
+
+    fn validate_global_index_overlap(
+        retained_entries: &[IndexManifestEntry],
+        added_entries: &[IndexManifestEntry],
+    ) -> Result<()> {
+        for retained in retained_entries {
+            if retained.kind == FileKind::Delete {
+                continue;
+            }
+            let Some(retained_meta) = retained.index_file.global_index_meta.as_ref() else {
+                continue;
+            };
+            for added in added_entries {
+                if added.kind == FileKind::Delete {
+                    continue;
+                }
+                let Some(added_meta) = added.index_file.global_index_meta.as_ref() else {
+                    continue;
+                };
+                if retained_meta.index_field_id == added_meta.index_field_id
+                    && ranges_overlap(
+                        retained_meta.row_range_start,
+                        retained_meta.row_range_end,
+                        added_meta.row_range_start,
+                        added_meta.row_range_end,
+                    )
+                {
+                    return Err(global_index_overlap_error(
+                        retained,
+                        retained_meta,
+                        added,
+                        added_meta,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_added_global_index_overlap(added_entries: &[IndexManifestEntry]) -> Result<()> {
+        for (left_index, left) in added_entries.iter().enumerate() {
+            if left.kind == FileKind::Delete {
+                continue;
+            }
+            let Some(left_meta) = left.index_file.global_index_meta.as_ref() else {
+                continue;
+            };
+            for right in added_entries.iter().skip(left_index + 1) {
+                if right.kind == FileKind::Delete {
+                    continue;
+                }
+                let Some(right_meta) = right.index_file.global_index_meta.as_ref() else {
+                    continue;
+                };
+                if left_meta.index_field_id == right_meta.index_field_id
+                    && ranges_overlap(
+                        left_meta.row_range_start,
+                        left_meta.row_range_end,
+                        right_meta.row_range_start,
+                        right_meta.row_range_end,
+                    )
+                {
+                    return Err(global_index_overlap_error(
+                        left, left_meta, right, right_meta,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read index entries from the previous snapshot's index manifest.
@@ -1161,6 +1268,35 @@ struct ResolvedCommit {
     changelog_entries: Vec<ManifestEntry>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
+    index_manifest_changed: bool,
+}
+
+fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> bool {
+    left_start <= right_end && right_start <= left_end
+}
+
+fn global_index_overlap_error(
+    retained: &IndexManifestEntry,
+    retained_meta: &crate::spec::GlobalIndexMeta,
+    added: &IndexManifestEntry,
+    added_meta: &crate::spec::GlobalIndexMeta,
+) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!(
+            "Trying to add global index file {} of type {} for index field {} with row range \
+             [{}, {}], but previous file {} still exists with overlapping row range [{}, {}]. \
+             Remove the previous file first.",
+            added.index_file.file_name,
+            added.index_file.index_type,
+            added_meta.index_field_id,
+            added_meta.row_range_start,
+            added_meta.row_range_end,
+            retained.index_file.file_name,
+            retained_meta.row_range_start,
+            retained_meta.row_range_end,
+        ),
+        source: None,
+    }
 }
 
 fn current_time_millis() -> u64 {
@@ -1190,7 +1326,9 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRowBuilder, DataFileMeta, ManifestList, TableSchema};
+    use crate::spec::{
+        BinaryRowBuilder, DataFileMeta, GlobalIndexMeta, IndexFileMeta, ManifestList, TableSchema,
+    };
     use chrono::{DateTime, Utc};
 
     fn test_file_io() -> FileIO {
@@ -1264,6 +1402,28 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+        }
+    }
+
+    fn test_global_index_file(
+        name: &str,
+        index_field_id: i32,
+        row_range_start: i64,
+        row_range_end: i64,
+    ) -> IndexFileMeta {
+        IndexFileMeta {
+            index_type: "lumina".to_string(),
+            file_name: name.to_string(),
+            file_size: 128,
+            row_count: (row_range_end - row_range_start + 1) as i32,
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start,
+                row_range_end,
+                index_field_id,
+                extra_field_ids: None,
+                index_meta: None,
+            }),
         }
     }
 
@@ -1384,6 +1544,111 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap();
         assert!(snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_index_only_commit_creates_snapshot() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_index_only_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_row_tracking_commit(&file_io, table_path);
+        let mut data_file = test_data_file("data-0.parquet", 10);
+        data_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        commit.commit(vec![message]).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 2);
+        assert_eq!(snapshot.total_record_count(), Some(10));
+        assert_eq!(snapshot.delta_record_count(), Some(0));
+        assert_eq!(snapshot.next_row_id(), Some(10));
+
+        let index_manifest = snapshot.index_manifest().expect("index manifest");
+        let manifest_dir = format!("{table_path}/manifest");
+        let index_entries =
+            IndexManifest::read(&file_io, &format!("{manifest_dir}/{index_manifest}"))
+                .await
+                .unwrap();
+        assert_eq!(index_entries.len(), 1);
+        assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+    }
+
+    #[tokio::test]
+    async fn test_global_index_overlap_rejected_on_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_global_index_overlap";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut first = CommitMessage::new(vec![], 0, vec![]);
+        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        commit.commit(vec![first]).await.unwrap();
+
+        let mut second = CommitMessage::new(vec![], 0, vec![]);
+        second.new_index_files = vec![test_global_index_file("lumina-1.index", 0, 5, 14)];
+
+        let result = commit.commit(vec![second]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("overlapping row range"),
+            "expected overlap error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_index_overlap_rejected_within_same_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_global_index_overlap_same_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![
+            test_global_index_file("lumina-0.index", 0, 0, 9),
+            test_global_index_file("lumina-1.index", 0, 5, 14),
+        ];
+
+        let result = commit.commit(vec![message]).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("overlapping row range"),
+            "expected overlap error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_index_non_overlap_allowed_on_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_global_index_non_overlap";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut first = CommitMessage::new(vec![], 0, vec![]);
+        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        commit.commit(vec![first]).await.unwrap();
+
+        let mut second = CommitMessage::new(vec![], 0, vec![]);
+        second.new_index_files = vec![test_global_index_file("lumina-1.index", 0, 10, 19)];
+        commit.commit(vec![second]).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        let index_manifest = snapshot.index_manifest().expect("index manifest");
+        let index_entries =
+            IndexManifest::read(&file_io, &format!("{table_path}/manifest/{index_manifest}"))
+                .await
+                .unwrap();
+        assert_eq!(index_entries.len(), 2);
     }
 
     #[tokio::test]

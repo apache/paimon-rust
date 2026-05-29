@@ -38,6 +38,7 @@ mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
 mod kv_file_reader;
 mod kv_file_writer;
+mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
 mod partition_filter;
 mod postpone_file_writer;
@@ -71,6 +72,7 @@ pub use data_evolution_writer::DataEvolutionWriter;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
+pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use schema_manager::SchemaManager;
@@ -180,6 +182,10 @@ impl Table {
 
     pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
         VectorSearchBuilder::new(self)
+    }
+
+    pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
+        LuminaIndexBuildBuilder::new(self)
     }
 
     /// Create a write builder for write/commit.
