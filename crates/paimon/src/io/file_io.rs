@@ -709,6 +709,123 @@ mod file_action_test {
 }
 
 #[cfg(test)]
+mod object_storage_path_test {
+    use super::*;
+
+    fn assert_relative_paths(file_io: &FileIO, path: &str, expected_relative_path: &str) {
+        let input = file_io.new_input(path).unwrap();
+        assert_eq!(input.location(), path);
+        assert_eq!(
+            &input.path[input.relative_path_pos..],
+            expected_relative_path
+        );
+
+        let output = file_io.new_output(path).unwrap();
+        assert_eq!(output.location(), path);
+        assert_eq!(
+            &output.path[output.relative_path_pos..],
+            expected_relative_path
+        );
+
+        let (_op, relative_path) = file_io.storage.create(path).unwrap();
+        assert_eq!(relative_path, expected_relative_path);
+
+        let base_path = &path[..path.len() - relative_path.len()];
+        assert_eq!(format!("{base_path}{relative_path}"), path);
+    }
+
+    #[cfg(feature = "storage-cos")]
+    #[test]
+    fn test_cos_file_io_relative_paths_and_scheme_aliases() {
+        for scheme in ["cosn", "cos"] {
+            let path = format!("{scheme}://bucket/warehouse/table/data.parquet");
+            let dir_path = format!("{scheme}://bucket/warehouse/table/");
+            let file_io = FileIO::from_path(&path)
+                .unwrap()
+                .with_props([
+                    ("fs.cosn.endpoint", "https://cos.ap-shanghai.myqcloud.com"),
+                    ("fs.cosn.userinfo.secretId", "secret-id"),
+                    ("fs.cosn.userinfo.secretKey", "secret-key"),
+                    ("fs.cosn.disable-config-load", "true"),
+                ])
+                .build()
+                .unwrap();
+
+            assert_relative_paths(&file_io, &path, "warehouse/table/data.parquet");
+            assert_relative_paths(&file_io, &dir_path, "warehouse/table/");
+        }
+    }
+
+    #[cfg(feature = "storage-obs")]
+    #[test]
+    fn test_obs_file_io_relative_paths() {
+        let file_io = FileIO::from_path("obs://bucket/warehouse")
+            .unwrap()
+            .with_props([
+                (
+                    "fs.obs.endpoint",
+                    "https://obs.cn-north-4.myhuaweicloud.com",
+                ),
+                ("fs.obs.access.key", "access-key"),
+                ("fs.obs.secret.key", "secret-key"),
+            ])
+            .build()
+            .unwrap();
+
+        assert_relative_paths(
+            &file_io,
+            "obs://bucket/warehouse/table/data.parquet",
+            "warehouse/table/data.parquet",
+        );
+        assert_relative_paths(
+            &file_io,
+            "obs://bucket/warehouse/table/",
+            "warehouse/table/",
+        );
+    }
+
+    #[cfg(feature = "storage-gcs")]
+    #[test]
+    fn test_gcs_file_io_relative_paths_and_scheme_aliases() {
+        for scheme in ["gs", "gcs"] {
+            let path = format!("{scheme}://bucket/warehouse/table/data.parquet");
+            let dir_path = format!("{scheme}://bucket/warehouse/table/");
+            let file_io = FileIO::from_path(&path)
+                .unwrap()
+                .with_props([
+                    ("gcs.allow-anonymous", "true"),
+                    ("gcs.disable-config-load", "true"),
+                    ("gcs.disable-vm-metadata", "true"),
+                ])
+                .build()
+                .unwrap();
+
+            assert_relative_paths(&file_io, &path, "warehouse/table/data.parquet");
+            assert_relative_paths(&file_io, &dir_path, "warehouse/table/");
+        }
+    }
+
+    #[cfg(feature = "storage-azdls")]
+    #[test]
+    fn test_azdls_file_io_relative_paths_and_scheme_aliases() {
+        for scheme in ["abfs", "abfss"] {
+            let path = format!(
+                "{scheme}://filesystem@account.dfs.core.windows.net/warehouse/data.parquet"
+            );
+            let dir_path = format!("{scheme}://filesystem@account.dfs.core.windows.net/warehouse/");
+            let file_io = FileIO::from_path(&path)
+                .unwrap()
+                .with_prop("azure.account-key", "account-key")
+                .build()
+                .unwrap();
+
+            assert_relative_paths(&file_io, &path, "warehouse/data.parquet");
+            assert_relative_paths(&file_io, &dir_path, "warehouse/");
+        }
+    }
+}
+
+#[cfg(test)]
 mod input_output_test {
     use super::*;
     use bytes::Bytes;

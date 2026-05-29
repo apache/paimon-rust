@@ -41,6 +41,26 @@ mod storage_s3;
 #[cfg(feature = "storage-s3")]
 use storage_s3::*;
 
+#[cfg(feature = "storage-cos")]
+mod storage_cos;
+#[cfg(feature = "storage-cos")]
+use storage_cos::*;
+
+#[cfg(feature = "storage-azdls")]
+mod storage_azdls;
+#[cfg(feature = "storage-azdls")]
+use storage_azdls::*;
+
+#[cfg(feature = "storage-obs")]
+mod storage_obs;
+#[cfg(feature = "storage-obs")]
+use storage_obs::*;
+
+#[cfg(feature = "storage-gcs")]
+mod storage_gcs;
+#[cfg(feature = "storage-gcs")]
+use storage_gcs::*;
+
 #[cfg(feature = "storage-hdfs")]
 mod storage_hdfs;
 #[cfg(feature = "storage-hdfs")]

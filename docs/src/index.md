@@ -28,7 +28,7 @@ Apache Paimon Rust provides native Rust libraries for reading and writing Paimon
 Key features:
 
 - Native Rust reader for Paimon table format
-- Support for local filesystem, S3, and OSS storage backends
+- Support for local filesystem, S3, OSS, COS, Azure, OBS, GCS, and HDFS storage backends
 - REST Catalog integration
 - Apache DataFusion integration for SQL queries
 

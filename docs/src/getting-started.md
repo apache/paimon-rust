@@ -44,6 +44,11 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
+| `storage-cos`    | Tencent Cloud COS|
+| `storage-azdls`  | Azure Data Lake Storage Gen2 |
+| `storage-obs`    | Huawei Cloud OBS |
+| `storage-gcs`    | Google Cloud Storage |
+| `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
 
 ## Catalog Management
@@ -76,6 +81,37 @@ options.set(CatalogOptions::WAREHOUSE, "oss://bucket/warehouse");
 options.set("fs.oss.accessKeyId", "your-access-key-id");
 options.set("fs.oss.accessKeySecret", "your-access-key-secret");
 options.set("fs.oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
+let catalog = CatalogFactory::create(options).await?;
+
+// Tencent Cloud COS
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "cosn://bucket/warehouse");
+options.set("fs.cosn.userinfo.secretId", "your-secret-id");
+options.set("fs.cosn.userinfo.secretKey", "your-secret-key");
+options.set("fs.cosn.endpoint", "https://cos.ap-shanghai.myqcloud.com");
+let catalog = CatalogFactory::create(options).await?;
+
+// Azure Data Lake Storage Gen2
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "abfs://filesystem@account.dfs.core.windows.net/warehouse");
+options.set("azure.account-key", "your-account-key");
+let catalog = CatalogFactory::create(options).await?;
+
+// If you use the short form "abfs://filesystem/warehouse", set the endpoint explicitly:
+// options.set("azure.endpoint", "https://account.dfs.core.windows.net");
+
+// Huawei Cloud OBS
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "obs://bucket/warehouse");
+options.set("fs.obs.access.key", "your-access-key-id");
+options.set("fs.obs.secret.key", "your-secret-access-key");
+options.set("fs.obs.endpoint", "https://obs.cn-north-4.myhuaweicloud.com");
+let catalog = CatalogFactory::create(options).await?;
+
+// Google Cloud Storage
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "gs://bucket/warehouse");
+options.set("gcs.credential-path", "/path/to/service-account.json");
 let catalog = CatalogFactory::create(options).await?;
 
 // REST catalog

@@ -30,7 +30,17 @@ version.workspace = true
 
 [features]
 default = ["storage-memory", "storage-fs", "storage-oss"]
-storage-all = ["storage-memory", "storage-fs", "storage-oss", "storage-s3", "storage-hdfs"]
+storage-all = [
+    "storage-memory",
+    "storage-fs",
+    "storage-oss",
+    "storage-s3",
+    "storage-cos",
+    "storage-azdls",
+    "storage-obs",
+    "storage-gcs",
+    "storage-hdfs",
+]
 fulltext = ["tantivy", "tempfile"]
 vortex = ["dep:vortex", "dep:kanal"]
 
@@ -38,6 +48,10 @@ storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3"]
+storage-cos = ["opendal/services-cos"]
+storage-azdls = ["opendal/services-azdls"]
+storage-obs = ["opendal/services-obs"]
+storage-gcs = ["opendal/services-gcs"]
 storage-hdfs = ["opendal/services-hdfs-native"]
 
 [dependencies]

@@ -33,7 +33,7 @@ The core crate implements the Paimon table format, including:
 - **Table** — Table abstraction for reading Paimon tables
 - **Snapshot & Manifest** — Reading snapshot and manifest metadata
 - **Schema** — Table schema management and evolution
-- **File IO** — Abstraction layer for storage backends (local filesystem, S3)
+- **File IO** — Abstraction layer for storage backends (local filesystem, object stores, HDFS)
 - **File Format** — Parquet file reading and writing via Apache Arrow
 
 ### `crates/integrations/datafusion` — DataFusion Integration

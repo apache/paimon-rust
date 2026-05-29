@@ -17,22 +17,47 @@
 
 use std::collections::HashMap;
 #[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
     feature = "storage-oss",
+    feature = "storage-obs",
     feature = "storage-s3",
     feature = "storage-hdfs"
 ))]
 use std::sync::Mutex;
-#[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+#[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-obs",
+    feature = "storage-s3"
+))]
 use std::sync::MutexGuard;
 
+#[cfg(feature = "storage-azdls")]
+use super::AzdlsStorageConfig;
+#[cfg(feature = "storage-cos")]
+use opendal::services::CosConfig;
+#[cfg(feature = "storage-gcs")]
+use opendal::services::GcsConfig;
 #[cfg(feature = "storage-hdfs")]
 use opendal::services::HdfsNativeConfig;
+#[cfg(feature = "storage-obs")]
+use opendal::services::ObsConfig;
 #[cfg(feature = "storage-oss")]
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
-#[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+#[cfg(any(
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-obs",
+    feature = "storage-s3"
+))]
 use url::Url;
 
 use crate::error;
@@ -54,6 +79,26 @@ pub enum Storage {
     #[cfg(feature = "storage-s3")]
     S3 {
         config: Box<S3Config>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
+    #[cfg(feature = "storage-cos")]
+    Cos {
+        config: Box<CosConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
+    #[cfg(feature = "storage-azdls")]
+    Azdls {
+        config: Box<AzdlsStorageConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
+    #[cfg(feature = "storage-obs")]
+    Obs {
+        config: Box<ObsConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
+    #[cfg(feature = "storage-gcs")]
+    Gcs {
+        config: Box<GcsConfig>,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-hdfs")]
@@ -93,6 +138,38 @@ impl Storage {
                     operators: Mutex::new(HashMap::new()),
                 })
             }
+            #[cfg(feature = "storage-cos")]
+            Scheme::Cos => {
+                let config = super::cos_config_parse(props)?;
+                Ok(Self::Cos {
+                    config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
+                })
+            }
+            #[cfg(feature = "storage-azdls")]
+            Scheme::Azdls => {
+                let config = super::azdls_config_parse(props)?;
+                Ok(Self::Azdls {
+                    config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
+                })
+            }
+            #[cfg(feature = "storage-obs")]
+            Scheme::Obs => {
+                let config = super::obs_config_parse(props)?;
+                Ok(Self::Obs {
+                    config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
+                })
+            }
+            #[cfg(feature = "storage-gcs")]
+            Scheme::Gcs => {
+                let config = super::gcs_config_parse(props)?;
+                Ok(Self::Gcs {
+                    config: Box::new(config),
+                    operators: Mutex::new(HashMap::new()),
+                })
+            }
             #[cfg(feature = "storage-hdfs")]
             Scheme::HdfsNative => {
                 let config = super::hdfs_config_parse(props)?;
@@ -123,6 +200,42 @@ impl Storage {
             Storage::S3 { config, operators } => {
                 let (bucket, relative_path) = Self::s3_bucket_and_relative_path(path)?;
                 let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
+                Ok((op, relative_path))
+            }
+            #[cfg(feature = "storage-cos")]
+            Storage::Cos { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "COS", &["cos", "cosn"])?;
+                let op = Self::cached_operator(operators, "COS", &bucket, || {
+                    super::cos_config_build(config, path)
+                })?;
+                Ok((op, relative_path))
+            }
+            #[cfg(feature = "storage-azdls")]
+            Storage::Azdls { config, operators } => {
+                let relative_path = super::azdls_relative_path(path)?;
+                let cache_key = super::azdls_operator_cache_key(config, path)?;
+                let op = Self::cached_operator(operators, "Azure", &cache_key, || {
+                    super::azdls_config_build(config, path)
+                })?;
+                Ok((op, relative_path))
+            }
+            #[cfg(feature = "storage-obs")]
+            Storage::Obs { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "OBS", &["obs"])?;
+                let op = Self::cached_operator(operators, "OBS", &bucket, || {
+                    super::obs_config_build(config, path)
+                })?;
+                Ok((op, relative_path))
+            }
+            #[cfg(feature = "storage-gcs")]
+            Storage::Gcs { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "GCS", &["gcs", "gs"])?;
+                let op = Self::cached_operator(operators, "GCS", &bucket, || {
+                    super::gcs_config_build(config, path)
+                })?;
                 Ok((op, relative_path))
             }
             #[cfg(feature = "storage-hdfs")]
@@ -218,7 +331,50 @@ impl Storage {
         Ok((bucket, relative_path))
     }
 
-    #[cfg(any(feature = "storage-oss", feature = "storage-s3"))]
+    #[cfg(any(
+        feature = "storage-cos",
+        feature = "storage-gcs",
+        feature = "storage-obs"
+    ))]
+    fn bucket_and_relative_path<'a>(
+        path: &'a str,
+        storage_name: &str,
+        allowed_schemes: &[&str],
+    ) -> crate::Result<(String, &'a str)> {
+        let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
+            message: format!("Invalid {storage_name} url: {path}"),
+        })?;
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| error::Error::ConfigInvalid {
+                message: format!("Invalid {storage_name} url: {path}, missing bucket"),
+            })?
+            .to_string();
+        let scheme = url.scheme();
+        if !allowed_schemes.contains(&scheme) {
+            return Err(error::Error::ConfigInvalid {
+                message: format!("Invalid {storage_name} url: {path}, unsupported scheme {scheme}"),
+            });
+        }
+        let prefix = format!("{scheme}://{bucket}/");
+        let relative_path =
+            path.strip_prefix(&prefix)
+                .ok_or_else(|| error::Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid {storage_name} url: {path}, should start with {prefix}"
+                    ),
+                })?;
+        Ok((bucket, relative_path))
+    }
+
+    #[cfg(any(
+        feature = "storage-azdls",
+        feature = "storage-cos",
+        feature = "storage-gcs",
+        feature = "storage-oss",
+        feature = "storage-obs",
+        feature = "storage-s3"
+    ))]
     fn lock_operator_cache<'a>(
         operators: &'a Mutex<HashMap<String, Operator>>,
         storage_name: &str,
@@ -229,6 +385,30 @@ impl Storage {
         })
     }
 
+    #[cfg(any(
+        feature = "storage-azdls",
+        feature = "storage-cos",
+        feature = "storage-gcs",
+        feature = "storage-oss",
+        feature = "storage-obs",
+        feature = "storage-s3"
+    ))]
+    fn cached_operator(
+        operators: &Mutex<HashMap<String, Operator>>,
+        storage_name: &str,
+        cache_key: &str,
+        build: impl FnOnce() -> crate::Result<Operator>,
+    ) -> crate::Result<Operator> {
+        let mut operators = Self::lock_operator_cache(operators, storage_name)?;
+        if let Some(op) = operators.get(cache_key) {
+            return Ok(op.clone());
+        }
+
+        let op = build()?;
+        operators.insert(cache_key.to_string(), op.clone());
+        Ok(op)
+    }
+
     #[cfg(feature = "storage-oss")]
     fn cached_oss_operator(
         config: &OssConfig,
@@ -236,14 +416,9 @@ impl Storage {
         path: &str,
         bucket: &str,
     ) -> crate::Result<Operator> {
-        let mut operators = Self::lock_operator_cache(operators, "OSS")?;
-        if let Some(op) = operators.get(bucket) {
-            return Ok(op.clone());
-        }
-
-        let op = super::oss_config_build(config, path)?;
-        operators.insert(bucket.to_string(), op.clone());
-        Ok(op)
+        Self::cached_operator(operators, "OSS", bucket, || {
+            super::oss_config_build(config, path)
+        })
     }
 
     #[cfg(feature = "storage-s3")]
@@ -253,14 +428,9 @@ impl Storage {
         path: &str,
         bucket: &str,
     ) -> crate::Result<Operator> {
-        let mut operators = Self::lock_operator_cache(operators, "S3")?;
-        if let Some(op) = operators.get(bucket) {
-            return Ok(op.clone());
-        }
-
-        let op = super::s3_config_build(config, path)?;
-        operators.insert(bucket.to_string(), op.clone());
-        Ok(op)
+        Self::cached_operator(operators, "S3", bucket, || {
+            super::s3_config_build(config, path)
+        })
     }
 
     fn parse_scheme(scheme: &str) -> crate::Result<Scheme> {
@@ -268,6 +438,9 @@ impl Storage {
             "memory" => Ok(Scheme::Memory),
             "file" | "" => Ok(Scheme::Fs),
             "s3" | "s3a" => Ok(Scheme::S3),
+            "cosn" => Ok(Scheme::Cos),
+            "abfs" | "abfss" | "az" | "azure" => Ok(Scheme::Azdls),
+            "gs" => Ok(Scheme::Gcs),
             "hdfs" => Ok(Scheme::HdfsNative),
             s => Ok(s.parse::<Scheme>()?),
         }

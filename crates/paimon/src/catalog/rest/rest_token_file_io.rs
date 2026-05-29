@@ -29,7 +29,6 @@ use crate::api::rest_api::RESTApi;
 use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
-use crate::io::storage_oss::OSS_ENDPOINT;
 use crate::io::FileIO;
 use crate::Result;
 
@@ -37,6 +36,7 @@ use super::rest_token::RESTToken;
 
 /// Safe time margin (in milliseconds) before token expiration to trigger refresh.
 const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
+const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 
 /// A FileIO wrapper that supports getting data access tokens from a REST Server.
 ///
