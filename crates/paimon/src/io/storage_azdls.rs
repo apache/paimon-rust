@@ -24,6 +24,8 @@ use url::Url;
 use crate::error::Error;
 use crate::Result;
 
+use super::storage_config::normalize_storage_config;
+
 const AZURE_ENDPOINT: &str = "azure.endpoint";
 const AZURE_ACCOUNT_NAME: &str = "azure.account-name";
 const AZURE_ACCOUNT_KEY: &str = "azure.account-key";
@@ -54,7 +56,7 @@ pub struct AzdlsStorageConfig {
 }
 
 pub(crate) fn azdls_config_parse(props: HashMap<String, String>) -> Result<AzdlsStorageConfig> {
-    let normalized = normalize_config(props);
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "azure.", MIRRORED_KEYS);
     let config = config_from_normalized(&normalized);
 
     Ok(AzdlsStorageConfig { config, normalized })
@@ -110,18 +112,17 @@ fn azdls_config_for_path<'a>(
 }
 
 fn config_from_normalized(normalized: &HashMap<String, String>) -> AzdlsConfig {
-    let mut cfg = AzdlsConfig::default();
-
-    cfg.endpoint = normalized.get(AZURE_ENDPOINT).cloned();
-    cfg.account_name = normalized.get(AZURE_ACCOUNT_NAME).cloned();
-    cfg.account_key = normalized.get(AZURE_ACCOUNT_KEY).cloned();
-    cfg.sas_token = normalized.get(AZURE_SAS_TOKEN).cloned();
-    cfg.client_id = normalized.get("azure.client-id").cloned();
-    cfg.client_secret = normalized.get("azure.client-secret").cloned();
-    cfg.tenant_id = normalized.get("azure.tenant-id").cloned();
-    cfg.authority_host = normalized.get("azure.authority-host").cloned();
-
-    cfg
+    AzdlsConfig {
+        endpoint: normalized.get(AZURE_ENDPOINT).cloned(),
+        account_name: normalized.get(AZURE_ACCOUNT_NAME).cloned(),
+        account_key: normalized.get(AZURE_ACCOUNT_KEY).cloned(),
+        sas_token: normalized.get(AZURE_SAS_TOKEN).cloned(),
+        client_id: normalized.get("azure.client-id").cloned(),
+        client_secret: normalized.get("azure.client-secret").cloned(),
+        tenant_id: normalized.get("azure.tenant-id").cloned(),
+        authority_host: normalized.get("azure.authority-host").cloned(),
+        ..Default::default()
+    }
 }
 
 fn effective_endpoint(cfg: &AzdlsConfig, url: &Url) -> Result<String> {
@@ -273,43 +274,6 @@ fn first_scoped_value(
             .iter()
             .find_map(|suffix| normalized.get(&format!("{prefix}.{suffix}")).cloned())
     })
-}
-
-fn normalize_config(props: HashMap<String, String>) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-
-    for prefix in CONFIG_PREFIXES {
-        for (key, value) in &props {
-            if let Some(suffix) = key.strip_prefix(prefix) {
-                result.insert(format!("azure.{suffix}"), value.clone());
-            }
-        }
-    }
-
-    let mirrored_additions: Vec<(String, String)> = MIRRORED_KEYS
-        .iter()
-        .flat_map(|(a, b)| {
-            let mut pairs = Vec::new();
-
-            if !result.contains_key(*b) {
-                if let Some(v) = result.get(*a) {
-                    pairs.push((b.to_string(), v.clone()));
-                }
-            }
-            if !result.contains_key(*a) {
-                if let Some(v) = result.get(*b) {
-                    pairs.push((a.to_string(), v.clone()));
-                }
-            }
-            pairs
-        })
-        .collect();
-
-    for (k, v) in mirrored_additions {
-        result.insert(k, v);
-    }
-
-    result
 }
 
 #[cfg(test)]

@@ -708,7 +708,15 @@ mod file_action_test {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "storage-cos",
+        feature = "storage-obs",
+        feature = "storage-gcs",
+        feature = "storage-azdls"
+    )
+))]
 mod object_storage_path_test {
     use super::*;
 

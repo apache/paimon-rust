@@ -24,6 +24,8 @@ use url::Url;
 use crate::error::Error;
 use crate::Result;
 
+use super::storage_config::normalize_storage_config;
+
 const GCS_ENDPOINT: &str = "gcs.endpoint";
 const GCS_CREDENTIAL: &str = "gcs.credential";
 const GCS_CREDENTIAL_PATH: &str = "gcs.credential-path";
@@ -56,10 +58,11 @@ const MIRRORED_KEYS: &[(&str, &str)] = &[
     ("gcs.disable-config-load", "gcs.disable_config_load"),
 ];
 
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn gcs_config_parse(props: HashMap<String, String>) -> Result<GcsConfig> {
-    let normalized = normalize_config(props);
-    let mut cfg = GcsConfig::default();
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "gcs.", MIRRORED_KEYS);
 
+    let mut cfg = GcsConfig::default();
     cfg.endpoint = normalized.get(GCS_ENDPOINT).cloned();
     cfg.credential = normalized.get(GCS_CREDENTIAL).cloned();
     cfg.credential_path = normalized.get(GCS_CREDENTIAL_PATH).cloned();
@@ -68,22 +71,15 @@ pub(crate) fn gcs_config_parse(props: HashMap<String, String>) -> Result<GcsConf
     cfg.predefined_acl = normalized.get("gcs.predefined-acl").cloned();
     cfg.default_storage_class = normalized.get("gcs.default-storage-class").cloned();
     cfg.token = normalized.get("gcs.token").cloned();
-
-    if let Some(v) = normalized.get(GCS_ALLOW_ANONYMOUS) {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.allow_anonymous = true;
-        }
-    }
-    if let Some(v) = normalized.get("gcs.disable-vm-metadata") {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.disable_vm_metadata = true;
-        }
-    }
-    if let Some(v) = normalized.get("gcs.disable-config-load") {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.disable_config_load = true;
-        }
-    }
+    cfg.allow_anonymous = normalized
+        .get(GCS_ALLOW_ANONYMOUS)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    cfg.disable_vm_metadata = normalized
+        .get("gcs.disable-vm-metadata")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    cfg.disable_config_load = normalized
+        .get("gcs.disable-config-load")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
     Ok(cfg)
 }
@@ -99,43 +95,6 @@ pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> 
 
     let builder = cfg.clone().into_builder().bucket(bucket);
     Ok(Operator::new(builder)?.finish())
-}
-
-fn normalize_config(props: HashMap<String, String>) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-
-    for prefix in CONFIG_PREFIXES {
-        for (key, value) in &props {
-            if let Some(suffix) = key.strip_prefix(prefix) {
-                result.insert(format!("gcs.{suffix}"), value.clone());
-            }
-        }
-    }
-
-    let mirrored_additions: Vec<(String, String)> = MIRRORED_KEYS
-        .iter()
-        .flat_map(|(a, b)| {
-            let mut pairs = Vec::new();
-
-            if !result.contains_key(*b) {
-                if let Some(v) = result.get(*a) {
-                    pairs.push((b.to_string(), v.clone()));
-                }
-            }
-            if !result.contains_key(*a) {
-                if let Some(v) = result.get(*b) {
-                    pairs.push((a.to_string(), v.clone()));
-                }
-            }
-            pairs
-        })
-        .collect();
-
-    for (k, v) in mirrored_additions {
-        result.insert(k, v);
-    }
-
-    result
 }
 
 #[cfg(test)]

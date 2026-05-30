@@ -24,6 +24,8 @@ use url::Url;
 use crate::error::Error;
 use crate::Result;
 
+use super::storage_config::normalize_storage_config;
+
 /// Configuration key for S3 endpoint.
 ///
 /// Compatible with paimon-java's `s3.endpoint` / `fs.s3a.endpoint`.
@@ -79,26 +81,24 @@ const MIRRORED_KEYS: &[(&str, &str)] = &[
 /// By default, virtual-hosted style addressing is enabled (matching AWS
 /// and Java Paimon behavior). Set `s3.path-style-access=true` to switch
 /// to path-style for S3-compatible stores like MinIO.
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config> {
-    let normalized = normalize_config(props);
+    let normalized = normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", MIRRORED_KEYS);
 
     let mut cfg = S3Config::default();
 
     // Default to virtual-hosted style, matching AWS and Java Paimon.
     // Only disable when path-style-access is explicitly set to true.
-    cfg.enable_virtual_host_style = true;
+    let path_style_access = normalized
+        .get(S3_PATH_STYLE_ACCESS)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    cfg.enable_virtual_host_style = !path_style_access;
 
     // Core connection settings.
     cfg.endpoint = normalized.get(S3_ENDPOINT).cloned();
     cfg.access_key_id = normalized.get(S3_ACCESS_KEY).cloned();
     cfg.secret_access_key = normalized.get(S3_SECRET_KEY).cloned();
     cfg.region = normalized.get(S3_REGION).cloned();
-
-    if let Some(v) = normalized.get(S3_PATH_STYLE_ACCESS) {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.enable_virtual_host_style = false;
-        }
-    }
 
     // Session / assume-role credentials.
     cfg.session_token = normalized.get("s3.session.token").cloned();
@@ -107,11 +107,9 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
     cfg.role_session_name = normalized.get("s3.assumed.role.session.name").cloned();
 
     // Anonymous access.
-    if let Some(v) = normalized.get("s3.anonymous") {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.allow_anonymous = true;
-        }
-    }
+    cfg.allow_anonymous = normalized
+        .get("s3.anonymous")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
     // Server-side encryption.
     cfg.server_side_encryption = normalized.get("s3.sse.type").cloned();
@@ -142,53 +140,6 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
 
     let builder = cfg.clone().into_builder().bucket(bucket);
     Ok(Operator::new(builder)?.finish())
-}
-
-/// Normalize Java-compatible config keys to canonical `s3.*` form.
-///
-/// 1. Strips known prefixes (`fs.s3a.`, `s3a.`, `s3.`) and remaps to `s3.*`.
-/// 2. Applies mirrored key mappings for cross-compatibility.
-/// 3. Earlier prefixes in the list take lower priority (later ones overwrite).
-fn normalize_config(props: HashMap<String, String>) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-
-    // First pass: normalize prefixes. Process in priority order —
-    // `fs.s3a.` (lowest) → `s3a.` → `s3.` (highest, canonical).
-    for prefix in JAVA_CONFIG_PREFIXES {
-        for (key, value) in &props {
-            if let Some(suffix) = key.strip_prefix(prefix) {
-                let canonical = format!("s3.{suffix}");
-                result.insert(canonical, value.clone());
-            }
-        }
-    }
-
-    // Second pass: apply mirrored keys bidirectionally (only if target not already set).
-    let mirrored_additions: Vec<(String, String)> = MIRRORED_KEYS
-        .iter()
-        .flat_map(|(a, b)| {
-            let mut pairs = Vec::new();
-            // a → b
-            if !result.contains_key(*b) {
-                if let Some(v) = result.get(*a) {
-                    pairs.push((b.to_string(), v.clone()));
-                }
-            }
-            // b → a
-            if !result.contains_key(*a) {
-                if let Some(v) = result.get(*b) {
-                    pairs.push((a.to_string(), v.clone()));
-                }
-            }
-            pairs
-        })
-        .collect();
-
-    for (k, v) in mirrored_additions {
-        result.insert(k, v);
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -353,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_s3_config_build_extracts_bucket() {
         let mut cfg = S3Config::default();
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
@@ -363,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_s3_config_build_s3a_scheme() {
         let mut cfg = S3Config::default();
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
@@ -390,7 +343,8 @@ mod tests {
     fn test_mirrored_keys() {
         // `s3.access.key` (dot form) should be mirrored from `s3.access-key` (dash form)
         let props = make_props(&[("s3.access-key", "AKID")]);
-        let normalized = normalize_config(props);
+        let normalized =
+            normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", MIRRORED_KEYS);
         assert_eq!(
             normalized.get("s3.access.key").map(|s| s.as_str()),
             Some("AKID")

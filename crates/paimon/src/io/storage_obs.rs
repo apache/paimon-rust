@@ -24,31 +24,31 @@ use url::Url;
 use crate::error::Error;
 use crate::Result;
 
+use super::storage_config::normalize_storage_config;
+
 const OBS_ENDPOINT: &str = "fs.obs.endpoint";
 const OBS_ACCESS_KEY_ID: &str = "fs.obs.access.key";
 const OBS_SECRET_ACCESS_KEY: &str = "fs.obs.secret.key";
 
 const CONFIG_PREFIXES: &[&str] = &["fs.obs.", "obs."];
 const MIRRORED_KEYS: &[(&str, &str)] = &[
-    ("obs.access-key-id", "obs.access.key"),
-    ("obs.access_key_id", "obs.access.key"),
-    ("obs.secret-access-key", "obs.secret.key"),
-    ("obs.secret_access_key", "obs.secret.key"),
+    ("fs.obs.access-key-id", "fs.obs.access.key"),
+    ("fs.obs.access_key_id", "fs.obs.access.key"),
+    ("fs.obs.secret-access-key", "fs.obs.secret.key"),
+    ("fs.obs.secret_access_key", "fs.obs.secret.key"),
 ];
 
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn obs_config_parse(props: HashMap<String, String>) -> Result<ObsConfig> {
-    let normalized = normalize_config(props);
-    let mut cfg = ObsConfig::default();
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.obs.", MIRRORED_KEYS);
 
+    let mut cfg = ObsConfig::default();
     cfg.endpoint = normalized.get(OBS_ENDPOINT).cloned();
     cfg.access_key_id = normalized.get(OBS_ACCESS_KEY_ID).cloned();
     cfg.secret_access_key = normalized.get(OBS_SECRET_ACCESS_KEY).cloned();
-
-    if let Some(v) = normalized.get("fs.obs.enable-versioning") {
-        if v.eq_ignore_ascii_case("true") {
-            cfg.enable_versioning = true;
-        }
-    }
+    cfg.enable_versioning = normalized
+        .get("fs.obs.enable-versioning")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
     Ok(cfg)
 }
@@ -64,45 +64,6 @@ pub(crate) fn obs_config_build(cfg: &ObsConfig, path: &str) -> Result<Operator> 
 
     let builder = cfg.clone().into_builder().bucket(bucket);
     Ok(Operator::new(builder)?.finish())
-}
-
-fn normalize_config(props: HashMap<String, String>) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-
-    for prefix in CONFIG_PREFIXES {
-        for (key, value) in &props {
-            if let Some(suffix) = key.strip_prefix(prefix) {
-                result.insert(format!("fs.obs.{suffix}"), value.clone());
-            }
-        }
-    }
-
-    let mirrored_additions: Vec<(String, String)> = MIRRORED_KEYS
-        .iter()
-        .flat_map(|(a, b)| {
-            let mut pairs = Vec::new();
-            let canonical_a = format!("fs.obs.{}", a.strip_prefix("obs.").unwrap_or(a));
-            let canonical_b = format!("fs.obs.{}", b.strip_prefix("obs.").unwrap_or(b));
-
-            if !result.contains_key(&canonical_b) {
-                if let Some(v) = result.get(&canonical_a) {
-                    pairs.push((canonical_b.clone(), v.clone()));
-                }
-            }
-            if !result.contains_key(&canonical_a) {
-                if let Some(v) = result.get(&canonical_b) {
-                    pairs.push((canonical_a.clone(), v.clone()));
-                }
-            }
-            pairs
-        })
-        .collect();
-
-    for (k, v) in mirrored_additions {
-        result.insert(k, v);
-    }
-
-    result
 }
 
 #[cfg(test)]
@@ -154,6 +115,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_obs_config_build_extracts_bucket() {
         let mut cfg = ObsConfig::default();
         cfg.endpoint = Some("https://obs.cn-north-4.myhuaweicloud.com".to_string());
