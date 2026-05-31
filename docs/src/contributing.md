@@ -53,7 +53,6 @@ cargo clippy --all-targets --workspace -- -D warnings
 
 - Check [open issues](https://github.com/apache/paimon-rust/issues) for tasks to work on
 - Issues labeled `good first issue` are great starting points
-- See the [0.1.0 tracking issue](https://github.com/apache/paimon-rust/issues/3) for the current roadmap
 
 ## Community
 

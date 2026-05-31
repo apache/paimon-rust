@@ -28,7 +28,7 @@ The rust implementation of Apache Paimon.
 
 ## Issue Tracker
 
-See [Tracking issues of 0.1.0 version for Apache Paimon Rust](https://github.com/apache/paimon-rust/issues/3)
+See [GitHub Issues](https://github.com/apache/paimon-rust/issues)
 
 ## Contributing
 

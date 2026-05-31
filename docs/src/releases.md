@@ -25,18 +25,23 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.2.0 (In Development)
+### 0.3.0 (In Development)
 
-Planned features:
+See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
+
+## Past Releases
+
+### [0.2.0](https://github.com/apache/paimon-rust/releases/tag/v0.2.0)
+
+Key features:
 
 - Primary-key table read/write support with sort-merge deduplication
 - DataFusion DML support (INSERT OVERWRITE, TRUNCATE TABLE, DROP PARTITION, CALL procedures)
-- System tables ($snapshots, $tags, $manifests, $schemas)
+- System tables ($snapshots, $tags, $manifests, $schemas, $partitions, $files, $table_indexes)
 - Multi-catalog support, session-scoped dynamic options (SET/RESET), and temporary tables
 - Lumina vector index read infrastructure and Vortex columnar file format support
 - Exact COUNT(*) pushdown via partition statistics
-
-## Past Releases
+- Partial-update merge engine support (fixed-bucket and dynamic-bucket)
 
 ### [0.1.0](https://github.com/apache/paimon-rust/releases/tag/v0.1.0)
 

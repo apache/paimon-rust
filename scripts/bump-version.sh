@@ -39,14 +39,16 @@ if [ ! -f Cargo.toml ]; then
   exit 1
 fi
 
-# Replace version only within [workspace.package] section to avoid accidentally
-# modifying third-party dependency versions in [workspace.dependencies].
+# Replace version in [workspace.package] section.
+# Also update the paimon crate version in [workspace.dependencies].
 case "$(uname -s)" in
   Darwin)
     sed -i '' '/^\[workspace\.package\]/,/^\[/{s/version = "'"${FROM_VERSION}"'"/version = "'"${TO_VERSION}"'"/;}' Cargo.toml
+    sed -i '' 's/^paimon = { version = "'"${FROM_VERSION}"'"/paimon = { version = "'"${TO_VERSION}"'"/' Cargo.toml
     ;;
   *)
     sed -i '/^\[workspace\.package\]/,/^\[/{s/version = "'"${FROM_VERSION}"'"/version = "'"${TO_VERSION}"'"/;}' Cargo.toml
+    sed -i 's/^paimon = { version = "'"${FROM_VERSION}"'"/paimon = { version = "'"${TO_VERSION}"'"/' Cargo.toml
     ;;
 esac
 

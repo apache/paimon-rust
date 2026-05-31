@@ -215,7 +215,7 @@ git commit -m "chore: bump version to ${NEXT_VERSION}"
 git push origin main
 ```
 
-The script updates `version` in root `Cargo.toml` (`[workspace.package]` and `[workspace.dependencies]`). All member crates inherit the workspace version.
+The script updates `version` in root `Cargo.toml` (`[workspace.package]` and the `paimon` entry in `[workspace.dependencies]`). All member crates inherit the workspace version.
 
 ### Optional: Create PRs for release blog and download page
 
@@ -348,7 +348,7 @@ svn mv -m "Release paimon-rust ${RELEASE_VERSION}" \
 ### Verify published artifacts
 
 - **Rust:** [crates.io/crates/paimon](https://crates.io/crates/paimon) shows version `${RELEASE_VERSION}`
-- **Python:** [PyPI — pypaimon](https://pypi.org/project/pypaimon/) shows version `${RELEASE_VERSION}`
+- **Python:** [PyPI — pypaimon-rust](https://pypi.org/project/pypaimon-rust/) shows version `${RELEASE_VERSION}`
 - **Go:** `go list -m github.com/apache/paimon-rust/bindings/go@v${RELEASE_VERSION}` resolves
 
 ### Create GitHub Release
@@ -383,7 +383,7 @@ The Apache Paimon community is pleased to announce the release of
 Apache Paimon Rust ${RELEASE_VERSION}.
 
 Rust:   cargo add paimon
-Python: pip install pypaimon
+Python: pip install pypaimon-rust
 Go:     go get github.com/apache/paimon-rust/bindings/go@v${RELEASE_VERSION}
 
 Release notes:
