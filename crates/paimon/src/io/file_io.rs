@@ -148,7 +148,7 @@ impl FileIO {
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: meta.is_dir(),
-                path: format!("{base_path}{entry_path}"),
+                path: status_path(base_path, entry_path),
                 last_modified: meta
                     .last_modified()
                     .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
@@ -186,7 +186,7 @@ impl FileIO {
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: false,
-                path: format!("{base_path}{entry_path}"),
+                path: status_path(base_path, entry_path),
                 last_modified: meta
                     .last_modified()
                     .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
@@ -277,6 +277,14 @@ impl FileIO {
             })?;
 
         Ok(())
+    }
+}
+
+fn status_path(base_path: &str, entry_path: &str) -> String {
+    if base_path.ends_with('/') || entry_path.starts_with('/') {
+        format!("{base_path}{entry_path}")
+    } else {
+        format!("{base_path}/{entry_path}")
     }
 }
 
@@ -740,6 +748,25 @@ mod object_storage_path_test {
 
         let base_path = &path[..path.len() - relative_path.len()];
         assert_eq!(format!("{base_path}{relative_path}"), path);
+    }
+
+    #[cfg(feature = "storage-azdls")]
+    #[test]
+    fn test_azdls_root_status_path_without_trailing_slash() {
+        assert_eq!(
+            status_path(
+                "abfs://filesystem@account.dfs.core.windows.net",
+                "warehouse/"
+            ),
+            "abfs://filesystem@account.dfs.core.windows.net/warehouse/"
+        );
+        assert_eq!(
+            status_path(
+                "abfs://filesystem@account.dfs.core.windows.net/",
+                "warehouse/"
+            ),
+            "abfs://filesystem@account.dfs.core.windows.net/warehouse/"
+        );
     }
 
     #[cfg(feature = "storage-cos")]
