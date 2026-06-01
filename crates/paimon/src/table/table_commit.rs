@@ -656,19 +656,22 @@ impl TableCommit {
                     CommitKind::APPEND
                 };
 
-                let index_manifest_name = if new_index_entries.is_empty() {
+                let previous =
+                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
+                let drop_previous_global_indexes =
+                    !entries.is_empty() || !changelog_entries.is_empty();
+                let all = Self::merge_index_entries(
+                    &previous,
+                    new_index_entries,
+                    drop_previous_global_indexes,
+                )?;
+                let index_manifest_changed = all != previous;
+                let index_manifest_name = if index_manifest_changed {
+                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
+                } else {
                     latest_snapshot
                         .as_ref()
                         .and_then(|s| s.index_manifest().map(|s| s.to_string()))
-                } else {
-                    let all = Self::merge_index_entries(
-                        latest_snapshot,
-                        new_index_entries,
-                        file_io,
-                        &manifest_dir,
-                    )
-                    .await?;
-                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
                 };
 
                 Ok(ResolvedCommit {
@@ -676,7 +679,7 @@ impl TableCommit {
                     changelog_entries: changelog_entries.clone(),
                     kind,
                     index_manifest_name,
-                    index_manifest_changed: !new_index_entries.is_empty(),
+                    index_manifest_changed,
                 })
             }
             CommitEntriesPlan::Overwrite {
@@ -730,13 +733,20 @@ impl TableCommit {
         }
     }
 
-    async fn merge_index_entries(
-        latest_snapshot: &Option<Snapshot>,
+    fn merge_index_entries(
+        previous_entries: &[IndexManifestEntry],
         new_index_entries: &[IndexManifestEntry],
-        file_io: &FileIO,
-        manifest_dir: &str,
+        drop_previous_global_indexes: bool,
     ) -> Result<Vec<IndexManifestEntry>> {
-        let mut all = Self::read_prev_index_entries(file_io, manifest_dir, latest_snapshot).await?;
+        let mut all = if drop_previous_global_indexes {
+            previous_entries
+                .iter()
+                .filter(|entry| entry.index_file.global_index_meta.is_none())
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            previous_entries.to_vec()
+        };
         let new_hash_keys: HashSet<(Vec<u8>, i32)> = new_index_entries
             .iter()
             .filter(|e| e.index_file.index_type == "HASH")
@@ -1746,6 +1756,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(index_entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_append_data_invalidates_previous_global_index() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_append_data_invalidates_previous_global_index";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let mut first = CommitMessage::new(vec![], 0, vec![]);
+        first.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        commit.commit(vec![first]).await.unwrap();
+
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 10)],
+            )])
+            .await
+            .unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 2);
+        assert!(snapshot.index_manifest().is_none());
     }
 
     #[tokio::test]
