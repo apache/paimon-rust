@@ -192,13 +192,15 @@ impl Storage {
             Storage::LocalFs { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
             #[cfg(feature = "storage-oss")]
             Storage::Oss { config, operators } => {
-                let (bucket, relative_path) = Self::oss_bucket_and_relative_path(path)?;
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
                 Ok((op, relative_path))
             }
             #[cfg(feature = "storage-s3")]
             Storage::S3 { config, operators } => {
-                let (bucket, relative_path) = Self::s3_bucket_and_relative_path(path)?;
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "S3", &["s3", "s3a"])?;
                 let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
                 Ok((op, relative_path))
             }
@@ -279,62 +281,12 @@ impl Storage {
         }
     }
 
-    #[cfg(feature = "storage-oss")]
-    fn oss_bucket_and_relative_path(path: &str) -> crate::Result<(String, &str)> {
-        let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
-            message: format!("Invalid OSS url: {path}"),
-        })?;
-        let bucket = url
-            .host_str()
-            .ok_or_else(|| error::Error::ConfigInvalid {
-                message: format!("Invalid OSS url: {path}, missing bucket"),
-            })?
-            .to_string();
-        let prefix = format!("oss://{bucket}/");
-        let relative_path =
-            path.strip_prefix(&prefix)
-                .ok_or_else(|| error::Error::ConfigInvalid {
-                    message: format!("Invalid OSS url: {path}, should start with {prefix}"),
-                })?;
-        Ok((bucket, relative_path))
-    }
-
-    #[cfg(feature = "storage-s3")]
-    fn s3_bucket_and_relative_path(path: &str) -> crate::Result<(String, &str)> {
-        let url = Url::parse(path).map_err(|_| error::Error::ConfigInvalid {
-            message: format!("Invalid S3 url: {path}"),
-        })?;
-        let bucket = url
-            .host_str()
-            .ok_or_else(|| error::Error::ConfigInvalid {
-                message: format!("Invalid S3 url: {path}, missing bucket"),
-            })?
-            .to_string();
-        let scheme = url.scheme();
-        let prefix = match scheme {
-            "s3" | "s3a" => format!("{scheme}://{bucket}/"),
-            _ => {
-                return Err(error::Error::ConfigInvalid {
-                    message: format!(
-                        "Invalid S3 url: {path}, should start with s3://{bucket}/ or s3a://{bucket}/"
-                    ),
-                });
-            }
-        };
-        let relative_path =
-            path.strip_prefix(&prefix)
-                .ok_or_else(|| error::Error::ConfigInvalid {
-                    message: format!(
-                    "Invalid S3 url: {path}, should start with s3://{bucket}/ or s3a://{bucket}/"
-                ),
-                })?;
-        Ok((bucket, relative_path))
-    }
-
     #[cfg(any(
         feature = "storage-cos",
         feature = "storage-gcs",
-        feature = "storage-obs"
+        feature = "storage-obs",
+        feature = "storage-oss",
+        feature = "storage-s3"
     ))]
     fn bucket_and_relative_path<'a>(
         path: &'a str,
