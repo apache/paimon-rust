@@ -1348,11 +1348,7 @@ mod tests {
             .is_some_and(|m| !m.is_empty()));
 
         let index_path = format!("{table_path}/index/{}", index_file.file_name);
-        assert!(file_io
-            .new_input(&index_path)
-            .unwrap()
-            .exists()
-            .await
-            .unwrap());
+        let status = file_io.get_status(&index_path).await.unwrap();
+        assert_eq!(index_file.file_size as u64, status.size);
     }
 }
