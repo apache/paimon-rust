@@ -164,7 +164,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
                 uuid::Uuid::new_v4()
             ),
         )
-        .commit(messages)
+        .commit_if_latest_snapshot(messages, snapshot.id())
         .await?;
 
         Ok(shard_count)
@@ -184,6 +184,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         let native_options = LuminaIndexMeta::deserialize(&index_meta)?.options().clone();
 
         let temp_path = temp_lumina_path();
+        let temp_file = TempFileGuard::new(temp_path.clone());
         let temp_path_str = temp_path.to_string_lossy().to_string();
         let builder = LuminaBuilder::create(&native_options)?;
         builder.pretrain(vectors, row_count, dimension)?;
@@ -205,7 +206,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         );
         copy_local_file_to_output(&temp_path, self.table.file_io().new_output(&index_path)?)
             .await?;
-        let _ = std::fs::remove_file(&temp_path);
+        temp_file.cleanup();
 
         let status = self.table.file_io().get_status(&index_path).await?;
         Ok(IndexFileMeta {
@@ -754,6 +755,30 @@ fn temp_lumina_path() -> PathBuf {
     std::env::temp_dir().join(format!("lumina-index-{}.index", uuid::Uuid::new_v4()))
 }
 
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn cleanup(mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 async fn copy_local_file_to_output(
     source_path: &Path,
     output: crate::io::OutputFile,
@@ -1197,6 +1222,17 @@ mod tests {
         assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("too large")));
     }
 
+    #[test]
+    fn test_temp_file_guard_cleans_up_on_drop() {
+        let path = temp_lumina_path();
+        std::fs::write(&path, b"temporary lumina data").unwrap();
+        {
+            let _guard = TempFileGuard::new(path.clone());
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
+    }
+
     async fn setup_dirs(file_io: &FileIO, table_path: &str) {
         file_io
             .mkdirs(&format!("{table_path}/snapshot/"))
@@ -1209,7 +1245,9 @@ mod tests {
     }
 
     fn build_vector_batch(ids: Vec<i32>, vectors: Vec<Vec<f32>>) -> RecordBatch {
-        let mut vector_builder = ListBuilder::new(Float32Builder::new());
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
         for vector in vectors {
             for value in vector {
                 vector_builder.values().append_value(value);
@@ -1218,15 +1256,7 @@ mod tests {
         }
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "embedding",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "element",
-                    ArrowDataType::Float32,
-                    true,
-                ))),
-                true,
-            ),
+            ArrowField::new("embedding", ArrowDataType::List(element_field), true),
         ]));
         RecordBatch::try_new(
             schema,
@@ -1238,8 +1268,12 @@ mod tests {
         .unwrap()
     }
 
+    // Manual run with a local Lumina native library:
+    // LUMINA_LIB_PATH=/path/to/liblumina_py.so cargo test -p paimon \
+    //     table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest \
+    //     --features fulltext,vortex -- --ignored --exact
     #[tokio::test]
-    #[ignore = "requires native Lumina library configured via LUMINA_LIB_PATH"]
+    #[ignore = "requires LUMINA_LIB_PATH; see manual run command above"]
     async fn test_execute_writes_lumina_index_manifest() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let table_path = "memory:/test_lumina_builder_e2e";

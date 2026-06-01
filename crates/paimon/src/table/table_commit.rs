@@ -100,11 +100,37 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        self.try_commit(CommitEntriesPlan::Direct {
-            entries,
-            changelog_entries,
-            new_index_entries,
-        })
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_if_latest_snapshot(
+        &self,
+        commit_messages: Vec<CommitMessage>,
+        expected_snapshot_id: i64,
+    ) -> Result<()> {
+        if commit_messages.is_empty() {
+            return Ok(());
+        }
+
+        let entries = self.messages_to_entries(&commit_messages);
+        let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
+        let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+            },
+            Some(expected_snapshot_id),
+        )
         .await
     }
 
@@ -155,11 +181,14 @@ impl TableCommit {
             self.build_dynamic_partition_filter(&new_entries)?
         };
 
-        self.try_commit(CommitEntriesPlan::Overwrite {
-            partition_filter,
-            new_entries,
-            new_index_entries,
-        })
+        self.try_commit(
+            CommitEntriesPlan::Overwrite {
+                partition_filter,
+                new_entries,
+                new_index_entries,
+            },
+            None,
+        )
         .await
     }
 
@@ -254,11 +283,14 @@ impl TableCommit {
             &partition_fields,
         )?;
 
-        self.try_commit(CommitEntriesPlan::Overwrite {
-            partition_filter: Some(partition_filter),
-            new_entries: vec![],
-            new_index_entries: vec![],
-        })
+        self.try_commit(
+            CommitEntriesPlan::Overwrite {
+                partition_filter: Some(partition_filter),
+                new_entries: vec![],
+                new_index_entries: vec![],
+            },
+            None,
+        )
         .await
     }
 
@@ -289,22 +321,30 @@ impl TableCommit {
 
     /// Truncate the entire table (OVERWRITE with no filter, only deletes).
     pub async fn truncate_table(&self) -> Result<()> {
-        self.try_commit(CommitEntriesPlan::Overwrite {
-            partition_filter: None,
-            new_entries: vec![],
-            new_index_entries: vec![],
-        })
+        self.try_commit(
+            CommitEntriesPlan::Overwrite {
+                partition_filter: None,
+                new_entries: vec![],
+                new_index_entries: vec![],
+            },
+            None,
+        )
         .await
     }
 
     /// Try to commit with retries.
-    async fn try_commit(&self, plan: CommitEntriesPlan) -> Result<()> {
+    async fn try_commit(
+        &self,
+        plan: CommitEntriesPlan,
+        expected_snapshot_id: Option<i64>,
+    ) -> Result<()> {
         let mut retry_count = 0u32;
         let mut last_snapshot_for_dup_check: Option<Snapshot> = None;
         let start_time_ms = current_time_millis();
 
         loop {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
+            validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
             let resolved = self.resolve_commit(&plan, &latest_snapshot).await?;
 
             if resolved.entries.is_empty()
@@ -1299,6 +1339,29 @@ fn global_index_overlap_error(
     }
 }
 
+fn validate_expected_latest_snapshot(
+    expected_snapshot_id: Option<i64>,
+    latest_snapshot: &Option<Snapshot>,
+) -> Result<()> {
+    let Some(expected_snapshot_id) = expected_snapshot_id else {
+        return Ok(());
+    };
+    let actual_snapshot_id = latest_snapshot.as_ref().map(Snapshot::id);
+    if actual_snapshot_id == Some(expected_snapshot_id) {
+        return Ok(());
+    }
+    Err(crate::Error::DataInvalid {
+        message: format!(
+            "Snapshot changed while committing index files: expected latest snapshot {}, got {}",
+            expected_snapshot_id,
+            actual_snapshot_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        source: None,
+    })
+}
+
 fn current_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1562,7 +1625,10 @@ mod tests {
 
         let mut message = CommitMessage::new(vec![], 0, vec![]);
         message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
-        commit.commit(vec![message]).await.unwrap();
+        commit
+            .commit_if_latest_snapshot(vec![message], 1)
+            .await
+            .unwrap();
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
@@ -1579,6 +1645,37 @@ mod tests {
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
         assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+    }
+
+    #[tokio::test]
+    async fn test_index_only_commit_rejects_stale_snapshot_guard() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_index_only_commit_snapshot_guard";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_row_tracking_commit(&file_io, table_path);
+        let mut data_file = test_data_file("data-0.parquet", 10);
+        data_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
+        let result = commit.commit_if_latest_snapshot(vec![message], 0).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Snapshot changed while committing index files"),
+            "expected snapshot guard error, got: {err_msg}"
+        );
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert!(snapshot.index_manifest().is_none());
     }
 
     #[tokio::test]

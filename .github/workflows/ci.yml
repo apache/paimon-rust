@@ -120,6 +120,16 @@ jobs:
           pip install lumina-data
           echo "LUMINA_LIB_PATH=$(python3 -c 'import lumina_data; print(lumina_data.__path__[0])')/lib/liblumina_py.so" >> $GITHUB_ENV
 
+      - name: Core Lumina Native Build Test
+        run: >
+          cargo test -p paimon
+          table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
+          --features fulltext,vortex
+          -- --ignored --exact
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
       - name: DataFusion Integration Test
         run: cargo test -p paimon-datafusion --all-targets
         env:
