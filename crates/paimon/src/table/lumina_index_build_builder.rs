@@ -1282,7 +1282,6 @@ mod tests {
         let mut options = table_options("10");
         options.insert("lumina.index.dimension".to_string(), "2".to_string());
         options.insert("lumina.encoding.type".to_string(), "rawf32".to_string());
-        options.insert("lumina.index.type".to_string(), "flat".to_string());
         let table = test_table_with_io(
             file_io.clone(),
             table_path,
