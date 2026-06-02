@@ -279,24 +279,27 @@ impl MergeFunction for PartialUpdateMergeFunction {
 // AggregateMergeFunction
 // ---------------------------------------------------------------------------
 
-/// Basic aggregation merge: for each non-key, non-sequence column, apply a
-/// per-field aggregator across all rows sharing the same primary key.
+/// Basic aggregation merge: apply a per-field aggregator across all rows
+/// sharing the same primary key.
 ///
-/// The merge function honors the following contract:
+/// For each output column, the aggregator is selected by the following
+/// priority (matching Java `AggregateMergeFunction#getAggFuncName`):
 ///
-/// - Primary-key columns are copied from any row of the group (Paimon
-///   guarantees they all share the same value); no aggregator is constructed
-///   for them.
-/// - Columns listed in the `sequence_fields` constructor argument (which the
-///   reader populates from the `sequence.field` table option) are forced to
-///   `last_value` regardless of any per-field configuration, matching Java
-///   `AggregateMergeFunction#createFieldAggregators`.
-/// - Every other output column requires either
-///   `fields.<col>.aggregate-function` or a fall-back
-///   `fields.default-aggregate-function`; otherwise construction fails with
-///   [`Error::ConfigInvalid`].
-/// - DELETE / UPDATE_BEFORE rows are rejected at runtime; retract handling
-///   is left to a follow-up commit.
+/// 1. Columns listed in the `sequence_fields` constructor argument (which
+///    the reader populates from the `sequence.field` table option) are
+///    forced to `last_value`, regardless of any per-field configuration.
+/// 2. Primary-key columns get no aggregator; their value is copied through
+///    from a representative row (Paimon guarantees same-PK rows share the
+///    same key).
+/// 3. `fields.<col>.aggregate-function`, if set.
+/// 4. `fields.default-aggregate-function`, if set.
+/// 5. Fall back to `last_non_null_value`.
+///
+/// Sequence is checked before primary key so a column that is both a PK
+/// and a sequence field still gets `last_value`.
+///
+/// DELETE / UPDATE_BEFORE rows are rejected at runtime; retract handling
+/// is left to a follow-up commit.
 ///
 /// `aggregators` is held behind a `Mutex` so the implementation can mutate
 /// per-key accumulators inside `MergeFunction::merge(&self, ...)` without
@@ -305,8 +308,6 @@ impl MergeFunction for PartialUpdateMergeFunction {
 /// lock is effectively uncontended.
 ///
 /// Reference: Java `org.apache.paimon.mergetree.compact.aggregate.AggregateMergeFunction`.
-///
-/// [`Error::ConfigInvalid`]: crate::Error::ConfigInvalid
 #[derive(Debug)]
 pub(crate) struct AggregateMergeFunction {
     /// One slot per output column.  `None` marks primary-key columns that are
