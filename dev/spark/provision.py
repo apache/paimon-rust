@@ -822,6 +822,122 @@ def main():
         """
     )
 
+    # ===== Full types boundary table: parquet, orc, avro =====
+    # Each format writes one boundary row and one all-null row for nullable fields.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS full_types_boundary_table (
+            id INT,
+            col_boolean BOOLEAN,
+            col_tinyint TINYINT,
+            col_smallint SMALLINT,
+            col_int INT,
+            col_bigint BIGINT,
+            col_float FLOAT,
+            col_double DOUBLE,
+            col_decimal DECIMAL(10, 2),
+            col_decimal5 DECIMAL(5),
+            col_decimal38 DECIMAL(38, 18),
+            col_string STRING,
+            col_binary BINARY,
+            col_date DATE,
+            col_timestamp TIMESTAMP_NTZ,
+            col_timestamp_ltz TIMESTAMP,
+            col_array ARRAY<INT>,
+            col_map MAP<STRING, INT>,
+            col_struct STRUCT<name: STRING, value: INT>
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO full_types_boundary_table VALUES
+            (1, false, CAST('-128' AS TINYINT), CAST('-32768' AS SMALLINT),
+             CAST('-2147483648' AS INT), CAST('-9223372036854775808' AS BIGINT),
+             CAST(-0.5 AS FLOAT), -1.25, CAST('-99999999.99' AS DECIMAL(10,2)),
+             CAST('-99999' AS DECIMAL(5)),
+             CAST('-99999999999999999999.999999999999999999' AS DECIMAL(38,18)),
+             '', X'',
+             DATE '1969-12-31',
+             TIMESTAMP_NTZ '1970-01-01 00:00:00.000001',
+             TIMESTAMP '1970-01-01 00:00:00.000001',
+             array(CAST(NULL AS INT), CAST('-2147483648' AS INT), CAST(0 AS INT)),
+             map('negative', CAST('-2147483648' AS INT), 'zero', CAST(NULL AS INT)),
+             named_struct('name', CAST(NULL AS STRING), 'value', CAST(-1 AS INT))),
+            (2, CAST(NULL AS BOOLEAN), CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT),
+             CAST(NULL AS INT), CAST(NULL AS BIGINT),
+             CAST(NULL AS FLOAT), CAST(NULL AS DOUBLE), CAST(NULL AS DECIMAL(10,2)),
+             CAST(NULL AS DECIMAL(5)), CAST(NULL AS DECIMAL(38,18)),
+             CAST(NULL AS STRING), CAST(NULL AS BINARY),
+             CAST(NULL AS DATE),
+             CAST(NULL AS TIMESTAMP_NTZ),
+             CAST(NULL AS TIMESTAMP),
+             CAST(NULL AS ARRAY<INT>),
+             CAST(NULL AS MAP<STRING, INT>),
+             CAST(NULL AS STRUCT<name: STRING, value: INT>))
+        """
+    )
+    spark.sql("ALTER TABLE full_types_boundary_table SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        """
+        INSERT INTO full_types_boundary_table VALUES
+            (3, true, CAST('127' AS TINYINT), CAST('32767' AS SMALLINT),
+             CAST('2147483647' AS INT), CAST('9223372036854775807' AS BIGINT),
+             CAST(0.25 AS FLOAT), 0.5, CAST('99999999.99' AS DECIMAL(10,2)),
+             CAST('99999' AS DECIMAL(5)),
+             CAST('99999999999999999999.999999999999999999' AS DECIMAL(38,18)),
+             'orc-boundary', X'00FF',
+             DATE '1970-01-01',
+             TIMESTAMP_NTZ '1970-01-01 00:00:00',
+             TIMESTAMP '1970-01-01 00:00:00',
+             CAST(array() AS ARRAY<INT>),
+             CAST(map() AS MAP<STRING, INT>),
+             named_struct('name', 'orc', 'value', CAST(NULL AS INT))),
+            (4, CAST(NULL AS BOOLEAN), CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT),
+             CAST(NULL AS INT), CAST(NULL AS BIGINT),
+             CAST(NULL AS FLOAT), CAST(NULL AS DOUBLE), CAST(NULL AS DECIMAL(10,2)),
+             CAST(NULL AS DECIMAL(5)), CAST(NULL AS DECIMAL(38,18)),
+             CAST(NULL AS STRING), CAST(NULL AS BINARY),
+             CAST(NULL AS DATE),
+             CAST(NULL AS TIMESTAMP_NTZ),
+             CAST(NULL AS TIMESTAMP),
+             CAST(NULL AS ARRAY<INT>),
+             CAST(NULL AS MAP<STRING, INT>),
+             CAST(NULL AS STRUCT<name: STRING, value: INT>))
+        """
+    )
+    spark.sql("ALTER TABLE full_types_boundary_table SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        """
+        INSERT INTO full_types_boundary_table VALUES
+            (5, false, CAST(0 AS TINYINT), CAST(0 AS SMALLINT),
+             0, 0,
+             CAST(0.0 AS FLOAT), 0.0, CAST(0.00 AS DECIMAL(10,2)),
+             CAST(0 AS DECIMAL(5)), CAST(0 AS DECIMAL(38,18)),
+             'avro-boundary', X'0102',
+             DATE '1970-01-02',
+             TIMESTAMP_NTZ '1970-01-01 00:00:00.999999',
+             TIMESTAMP '1970-01-01 00:00:00.999999',
+             array(CAST(7 AS INT)),
+             map('seven', 7),
+             named_struct('name', 'avro', 'value', 7)),
+            (6, CAST(NULL AS BOOLEAN), CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT),
+             CAST(NULL AS INT), CAST(NULL AS BIGINT),
+             CAST(NULL AS FLOAT), CAST(NULL AS DOUBLE), CAST(NULL AS DECIMAL(10,2)),
+             CAST(NULL AS DECIMAL(5)), CAST(NULL AS DECIMAL(38,18)),
+             CAST(NULL AS STRING), CAST(NULL AS BINARY),
+             CAST(NULL AS DATE),
+             CAST(NULL AS TIMESTAMP_NTZ),
+             CAST(NULL AS TIMESTAMP),
+             CAST(NULL AS ARRAY<INT>),
+             CAST(NULL AS MAP<STRING, INT>),
+             CAST(NULL AS STRUCT<name: STRING, value: INT>))
+        """
+    )
+
 
     # ===== First-Row merge engine PK table =====
     # first-row keeps the earliest inserted row per key; later duplicates are ignored.
