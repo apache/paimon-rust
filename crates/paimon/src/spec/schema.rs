@@ -306,7 +306,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
-        AggregationConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
+        AggregationConfig::new(&options).validate_create_mode(!primary_keys.is_empty(), &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
 
         Ok(Self {
@@ -1101,6 +1101,62 @@ mod tests {
                 "aggregation create-time validation should reject '{key}', got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unknown_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("amount", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            // typo: `amout` instead of `amount`
+            .option("fields.amout.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("amout") && message.contains("amount")),
+            "expected unknown-field rejection at CREATE TABLE, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unknown_function() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("amount", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            .option("fields.amount.aggregate-function", "sume")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sume")),
+            "expected unknown-function rejection at CREATE TABLE, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_incompatible_function_type() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("tag", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            // sum on a VarChar column
+            .option("fields.tag.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sum") && message.contains("tag")),
+            "expected incompatible-type rejection at CREATE TABLE, got {err:?}"
+        );
     }
 
     #[test]
