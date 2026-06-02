@@ -370,6 +370,60 @@ def main():
         "INSERT INTO schema_evolution_type_promotion VALUES (3, 3000000000)"
     )
 
+    # ===== Mixed-format Schema Evolution: Add Column =====
+    # Old Parquet files lack age; new ORC/Avro files contain age.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS format_schema_evolution_add_column (
+            id INT,
+            name STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO format_schema_evolution_add_column VALUES (1, 'alice'), (2, 'bob')"
+    )
+    spark.sql("ALTER TABLE format_schema_evolution_add_column ADD COLUMNS (age INT)")
+    spark.sql("ALTER TABLE format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO format_schema_evolution_add_column VALUES (3, 'carol', 30), (4, 'dave', 40)"
+    )
+    spark.sql("ALTER TABLE format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO format_schema_evolution_add_column VALUES (5, 'eve', 50), (6, 'frank', 60)"
+    )
+
+    # ===== Mixed-format Schema Evolution: Type Promotion (INT -> BIGINT) =====
+    # Old Parquet files have value as INT; new ORC/Avro files have value as BIGINT.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS format_schema_evolution_type_promotion (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO format_schema_evolution_type_promotion VALUES (1, 100), (2, 200)"
+    )
+    spark.sql(
+        "ALTER TABLE format_schema_evolution_type_promotion ALTER COLUMN value TYPE BIGINT"
+    )
+    spark.sql("ALTER TABLE format_schema_evolution_type_promotion SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO format_schema_evolution_type_promotion VALUES (3, 3000000000), (4, 4000000000)"
+    )
+    spark.sql("ALTER TABLE format_schema_evolution_type_promotion SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO format_schema_evolution_type_promotion VALUES (5, 5000000000), (6, 6000000000)"
+    )
+
     # ===== Data Evolution + Schema Evolution: Add Column =====
     # Combines data-evolution (row-tracking + MERGE INTO) with ALTER TABLE ADD COLUMNS.
     # Old files lack the new column; MERGE INTO produces partial-column files.
