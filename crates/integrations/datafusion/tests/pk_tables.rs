@@ -2634,6 +2634,87 @@ async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
     );
 }
 
+/// CREATE TABLE should reject `fields.<typo>.aggregate-function` referring to
+/// a non-existent column, so misconfigured aggregation metadata cannot be
+/// persisted.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_unknown_field() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_typo (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amout.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with unknown field should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("amout") && msg.contains("amount"),
+        "expected unknown-field error to name the typo and surface the available \
+         columns, got {msg}"
+    );
+}
+
+/// CREATE TABLE should reject `fields.<col>.aggregate-function = '<unknown>'`
+/// at create time rather than only failing the first SELECT.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_unknown_function() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_badfn (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sume'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with unknown function should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sume"),
+        "expected unknown-function error to surface the bad name, got {msg}"
+    );
+}
+
+/// CREATE TABLE should reject aggregate-function/column type incompatibility
+/// (e.g. `sum` on a STRING column) at create time.  This is stricter than
+/// Java upstream, which defers the check to the first read/write.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_incompatible_type() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_badtype (
+                id INT NOT NULL, tag STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.tag.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with incompatible function/type should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sum") && msg.contains("tag"),
+        "expected incompatible-type error to mention the function and field, got {msg}"
+    );
+}
+
 /// All-NULL aggregation group on a nullable `sum` column should emit NULL
 /// rather than 0 or an error: nothing was observed, so there is no
 /// arithmetic result to surface.
