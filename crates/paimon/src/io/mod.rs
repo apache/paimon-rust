@@ -21,15 +21,6 @@ pub use file_io::*;
 mod storage;
 pub use storage::*;
 
-#[cfg(any(
-    feature = "storage-s3",
-    feature = "storage-cos",
-    feature = "storage-azdls",
-    feature = "storage-obs",
-    feature = "storage-gcs"
-))]
-mod storage_config;
-
 #[cfg(feature = "storage-fs")]
 mod storage_fs;
 #[cfg(feature = "storage-fs")]
@@ -49,26 +40,6 @@ use storage_oss::*;
 mod storage_s3;
 #[cfg(feature = "storage-s3")]
 use storage_s3::*;
-
-#[cfg(feature = "storage-cos")]
-mod storage_cos;
-#[cfg(feature = "storage-cos")]
-use storage_cos::*;
-
-#[cfg(feature = "storage-azdls")]
-mod storage_azdls;
-#[cfg(feature = "storage-azdls")]
-use storage_azdls::*;
-
-#[cfg(feature = "storage-obs")]
-mod storage_obs;
-#[cfg(feature = "storage-obs")]
-use storage_obs::*;
-
-#[cfg(feature = "storage-gcs")]
-mod storage_gcs;
-#[cfg(feature = "storage-gcs")]
-use storage_gcs::*;
 
 #[cfg(feature = "storage-hdfs")]
 mod storage_hdfs;
