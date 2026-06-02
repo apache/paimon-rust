@@ -328,32 +328,32 @@ impl AggregateMergeFunction {
         let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let seq_set: HashSet<&str> = sequence_fields.iter().map(String::as_str).collect();
 
+        // Per Java AggregateMergeFunction#createFieldAggregators, the priority
+        // order is:
+        //   1. sequence fields  → `last_value`
+        //   2. primary keys     → no aggregator (PK columns are copied through)
+        //   3. per-field `fields.<col>.aggregate-function`
+        //   4. table-level `fields.default-aggregate-function`
+        //   5. fall back to `last_non_null_value`
+        // Sequence is checked before PK so a column that is both PK and sequence
+        // field still gets `last_value` (matching Java).
         let aggregators: Vec<Option<Box<dyn FieldAggregator>>> = output_fields
             .iter()
             .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
                 let name = field.name();
-                if pk_set.contains(name) {
+                let agg_name: &str = if seq_set.contains(name) {
+                    "last_value"
+                } else if pk_set.contains(name) {
                     return Ok(None);
-                }
-                // Sequence fields are forced to last_value, mirroring Java
-                // AggregateMergeFunction#createFieldAggregators.
-                let agg_name: String = if seq_set.contains(name) {
-                    "last_value".to_string()
                 } else if let Some(per_field) = config.agg_function_for_field(name) {
-                    per_field.to_string()
+                    per_field
                 } else if let Some(default) = config.default_agg_function() {
-                    default.to_string()
+                    default
                 } else {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: format!(
-                            "Field '{name}' has no aggregate-function configured for \
-                             merge-engine=aggregation on table '{table_name}'; set \
-                             fields.{name}.aggregate-function or fields.default-aggregate-function"
-                        ),
-                    });
+                    "last_non_null_value"
                 };
                 Ok(Some(new_aggregator(
-                    agg_name.as_str(),
+                    agg_name,
                     name,
                     field.data_type(),
                     table_options,
@@ -2137,20 +2137,21 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_merge_function_requires_agg_function_per_field() {
-        // amount has no per-field nor default aggregate-function configured.
+    fn test_aggregate_merge_function_falls_back_to_last_non_null_value() {
+        // With no per-field nor default aggregate-function configured, each
+        // value column should fall back to last_non_null_value (matching Java
+        // AggregateMergeFunction#getAggFuncName).
         let options = HashMap::from([("merge-engine".to_string(), "aggregation".to_string())]);
-        let err = AggregateMergeFunction::new(
+        let mf = AggregateMergeFunction::new(
             &options,
             "test_table",
             &aggregation_output_fields(),
             &["pk".to_string()],
             &[],
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::ConfigInvalid { message } if message.contains("aggregate-function"))
-        );
+        .expect("aggregation engine must accept tables without explicit per-field config");
+        // Smoke check: construction succeeds.
+        let _ = mf;
     }
 
     #[test]

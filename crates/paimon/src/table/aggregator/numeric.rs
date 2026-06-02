@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Numeric aggregators: sum, product, min, max, count.
+//! Numeric aggregators: sum, product, min, max.
 //!
 //! `sum` operates on every integer / floating / Decimal numeric type.
 //! `product` accepts the same numeric family except DECIMAL — basic mode does
@@ -26,15 +26,12 @@
 //!
 //! `min` / `max` extend to every ordered Paimon type: numerics, Decimal,
 //! Date, Time, Timestamp, and Char/VarChar.  Comparison is by native value
-//! order (numeric for numbers, lexicographic for strings).
-//!
-//! `count` requires the column to be declared as BIGINT and accumulates the
-//! number of non-NULL inputs encountered for the key.  Non-BIGINT columns are
-//! rejected at construction.
+//! order (numeric for numbers, lexicographic for strings).  Float NaN is
+//! treated as greater than any other value, matching Java's
+//! `Float.compare` / `Double.compare`.
 //!
 //! Reference: Java `FieldSumAgg`, `FieldProductAgg`, `FieldMinAgg`,
-//! `FieldMaxAgg`, `FieldCountAgg` under
-//! `org.apache.paimon.mergetree.compact.aggregate`.
+//! `FieldMaxAgg` under `org.apache.paimon.mergetree.compact.aggregate`.
 //!
 //! [`Error::DataInvalid`]: crate::Error::DataInvalid
 
@@ -430,13 +427,18 @@ fn agg_minmax(
     macro_rules! update_float {
         ($acc:expr, $ty:ty) => {{
             let v = downcast::<$ty>(array, field_name)?.value(row_idx);
-            if v.is_nan() {
-                return Ok(()); // mirror Java: NaN values are ignored
-            }
+            // Match Java `Float.compare` / `Double.compare`, which order NaN
+            // greater than any other value (including +Infinity).  Using
+            // `total_cmp` makes that ordering explicit and deterministic.
             *$acc = Some(match *$acc {
                 None => v,
                 Some(prev) => {
-                    let take_new = if keep_smaller { v < prev } else { v > prev };
+                    let cmp = v.total_cmp(&prev);
+                    let take_new = if keep_smaller {
+                        cmp.is_lt()
+                    } else {
+                        cmp.is_gt()
+                    };
                     if take_new {
                         v
                     } else {
@@ -602,75 +604,6 @@ impl FieldAggregator for MaxAgg {
 
     fn result(&self) -> crate::Result<ArrayRef> {
         minmax_result(&self.state, "max", &self.field_name)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Count
-// ---------------------------------------------------------------------------
-
-/// `count` accumulates the number of non-NULL inputs.  The output is a
-/// `BIGINT` scalar; the input column must also be declared as BIGINT so the
-/// existing data-file layout can hold the i64 counter without an extra cast
-/// layer.  Non-BIGINT columns are rejected at construction.
-///
-/// Aligns with Java `FieldCountAgg`, which likewise produces a BIGINT output.
-#[derive(Debug)]
-pub(crate) struct CountAgg {
-    field_name: String,
-    count: i64,
-}
-
-impl CountAgg {
-    pub(crate) fn new(field_name: &str, data_type: &DataType) -> crate::Result<Self> {
-        // Count requires the output column to be BIGINT to hold an i64 value.
-        match data_type {
-            DataType::BigInt(_) => Ok(Self {
-                field_name: field_name.to_string(),
-                count: 0,
-            }),
-            other => Err(crate::Error::ConfigInvalid {
-                message: format!(
-                    "Aggregate function 'count' requires field '{field_name}' to be \
-                     declared as BIGINT, found {other:?}"
-                ),
-            }),
-        }
-    }
-}
-
-impl FieldAggregator for CountAgg {
-    fn name(&self) -> &'static str {
-        "count"
-    }
-
-    fn reset(&mut self) {
-        self.count = 0;
-    }
-
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        // BIGINT input column: existing data files for the count column hold
-        // i64 placeholders (caller writes the per-row count, typically 1).
-        // We follow the Java reference and only check the null bit; the actual
-        // value is ignored.  This lets BIGINT-typed input flow through the
-        // sort-merge reader without an extra cast layer.
-        if !array.is_null(row_idx) {
-            self.count = self
-                .count
-                .checked_add(1)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "Aggregate function 'count' overflowed i64 for field '{}'",
-                        self.field_name
-                    ),
-                    source: None,
-                })?;
-        }
-        Ok(())
-    }
-
-    fn result(&self) -> crate::Result<ArrayRef> {
-        Ok(Arc::new(Int64Array::from(vec![self.count])))
     }
 }
 
@@ -928,15 +861,25 @@ mod tests {
     }
 
     #[test]
-    fn test_min_max_skip_nan_floats() {
-        let mut agg = min_agg(DataType::Float(FloatType::new()));
+    fn test_min_max_treat_nan_as_largest() {
+        // Match Java `Float.compare(NaN, x) > 0`: NaN is greater than every
+        // other value, so min skips it and max picks it.
+        let mut min = min_agg(DataType::Float(FloatType::new()));
         let arr = Float32Array::from(vec![Some(f32::NAN), Some(1.0), Some(0.5)]);
         for i in 0..arr.len() {
-            agg.agg(&arr, i).unwrap();
+            min.agg(&arr, i).unwrap();
         }
-        let v = agg.result().unwrap();
+        let v = min.result().unwrap();
         let v = v.as_any().downcast_ref::<Float32Array>().unwrap().value(0);
         assert!((v - 0.5).abs() < 1e-6);
+
+        let mut max = max_agg(DataType::Float(FloatType::new()));
+        for i in 0..arr.len() {
+            max.agg(&arr, i).unwrap();
+        }
+        let v = max.result().unwrap();
+        let v = v.as_any().downcast_ref::<Float32Array>().unwrap().value(0);
+        assert!(v.is_nan(), "max should pick NaN, got {v}");
     }
 
     #[test]
@@ -1001,41 +944,6 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(v, 30_000);
-    }
-
-    #[test]
-    fn test_count_counts_non_null_and_outputs_bigint() {
-        let mut agg = CountAgg::new("c", &DataType::BigInt(BigIntType::new())).unwrap();
-        let arr = Int64Array::from(vec![Some(1), None, Some(1), Some(1)]);
-        for i in 0..arr.len() {
-            agg.agg(&arr, i).unwrap();
-        }
-        assert_eq!(collect_i64(agg.result().unwrap()), Some(3));
-    }
-
-    #[test]
-    fn test_count_reset_clears_state() {
-        let mut agg = CountAgg::new("c", &DataType::BigInt(BigIntType::new())).unwrap();
-        let arr = Int64Array::from(vec![Some(1), Some(1)]);
-        for i in 0..arr.len() {
-            agg.agg(&arr, i).unwrap();
-        }
-        agg.reset();
-        assert_eq!(collect_i64(agg.result().unwrap()), Some(0));
-    }
-
-    #[test]
-    fn test_count_rejects_non_bigint_column() {
-        let err = CountAgg::new("c", &DataType::Int(IntType::new())).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("BIGINT"))
-        );
-    }
-
-    #[test]
-    fn test_count_empty_group_returns_zero() {
-        let agg = CountAgg::new("c", &DataType::BigInt(BigIntType::new())).unwrap();
-        assert_eq!(collect_i64(agg.result().unwrap()), Some(0));
     }
 
     #[test]

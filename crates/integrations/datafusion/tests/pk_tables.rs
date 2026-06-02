@@ -2383,7 +2383,7 @@ async fn test_pk_aggregation_default_function() {
     assert_eq!(b.value(0), "new"); // latest non-null string
 }
 
-/// Mixed aggregators in a single table: sum / max / bool_or / count.
+/// Mixed aggregators in a single table: sum / max / bool_or / first_non_null_value.
 #[tokio::test]
 async fn test_pk_aggregation_mixed_aggregators() {
     let (_tmp, sql_context) = setup_sql_context().await;
@@ -2391,7 +2391,7 @@ async fn test_pk_aggregation_mixed_aggregators() {
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_agg_mixed (
-                id INT NOT NULL, total INT, peak INT, ok BOOLEAN, cnt BIGINT,
+                id INT NOT NULL, total INT, peak INT, ok BOOLEAN, first_seen STRING,
                 PRIMARY KEY (id)
             ) WITH (
                 'bucket' = '1',
@@ -2399,7 +2399,7 @@ async fn test_pk_aggregation_mixed_aggregators() {
                 'fields.total.aggregate-function' = 'sum',
                 'fields.peak.aggregate-function' = 'max',
                 'fields.ok.aggregate-function' = 'bool_or',
-                'fields.cnt.aggregate-function' = 'count'
+                'fields.first_seen.aggregate-function' = 'first_non_null_value'
             )",
         )
         .await
@@ -2408,9 +2408,9 @@ async fn test_pk_aggregation_mixed_aggregators() {
     sql_context
         .sql(
             "INSERT INTO paimon.test_db.t_agg_mixed VALUES \
-             (1, 10, 5, false, CAST(1 AS BIGINT)), \
-             (1, 5, 8, true, CAST(1 AS BIGINT)), \
-             (1, 3, 7, false, CAST(1 AS BIGINT))",
+             (1, 10, 5, false, 'a'), \
+             (1, 5, 8, true, 'b'), \
+             (1, 3, 7, false, 'c')",
         )
         .await
         .unwrap()
@@ -2419,14 +2419,14 @@ async fn test_pk_aggregation_mixed_aggregators() {
         .unwrap();
 
     let batches = sql_context
-        .sql("SELECT id, total, peak, ok, cnt FROM paimon.test_db.t_agg_mixed")
+        .sql("SELECT id, total, peak, ok, first_seen FROM paimon.test_db.t_agg_mixed")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    use datafusion::arrow::array::{BooleanArray, Int64Array};
+    use datafusion::arrow::array::BooleanArray;
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     let batch = &batches[0];
     let total = batch
@@ -2441,14 +2441,14 @@ async fn test_pk_aggregation_mixed_aggregators() {
         .column_by_name("ok")
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
         .unwrap();
-    let cnt = batch
-        .column_by_name("cnt")
-        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+    let first_seen = batch
+        .column_by_name("first_seen")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         .unwrap();
     assert_eq!(total.value(0), 18); // 10 + 5 + 3
     assert_eq!(peak.value(0), 8); // max(5, 8, 7)
     assert!(ok.value(0)); // bool_or = true if any is true
-    assert_eq!(cnt.value(0), 3); // three non-null rows
+    assert_eq!(first_seen.value(0), "a"); // first non-null wins
 }
 
 /// `sequence.field` forces the named column to `last_value`, even when the
@@ -2565,16 +2565,16 @@ async fn test_pk_aggregation_rejects_delete() {
     }
 }
 
-/// CREATE TABLE with `merge-engine=aggregation` but no `aggregate-function`
-/// configured for any value column should fail at runtime with a clear
-/// message instructing the user which option to set.
+/// `merge-engine=aggregation` with no per-field nor default aggregate-function
+/// should still work: each value column falls back to `last_non_null_value`,
+/// matching Java `AggregateMergeFunction#getAggFuncName`.
 #[tokio::test]
-async fn test_pk_aggregation_requires_agg_function_per_field() {
+async fn test_pk_aggregation_default_fallback_is_last_non_null_value() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
     sql_context
         .sql(
-            "CREATE TABLE paimon.test_db.t_agg_missing (
+            "CREATE TABLE paimon.test_db.t_agg_fallback (
                 id INT NOT NULL, amount INT,
                 PRIMARY KEY (id)
             ) WITH (
@@ -2586,26 +2586,26 @@ async fn test_pk_aggregation_requires_agg_function_per_field() {
         .unwrap();
 
     sql_context
-        .sql("INSERT INTO paimon.test_db.t_agg_missing VALUES (1, 10), (1, 20)")
+        .sql("INSERT INTO paimon.test_db.t_agg_fallback VALUES (1, 10), (1, 20)")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    // First read should fail with the per-field config error.
-    let err = sql_context
-        .sql("SELECT * FROM paimon.test_db.t_agg_missing")
+    let batches = sql_context
+        .sql("SELECT id, amount FROM paimon.test_db.t_agg_fallback")
         .await
         .unwrap()
         .collect()
         .await
-        .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("aggregate-function") && msg.contains("amount"),
-        "expected missing aggregate-function error to name the field, got {msg}"
-    );
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let amount = batches[0]
+        .column_by_name("amount")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    assert_eq!(amount.value(0), 20); // last_non_null_value
 }
 
 /// CREATE TABLE should reject unsupported aggregation knobs in basic mode.

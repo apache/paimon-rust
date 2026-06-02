@@ -41,7 +41,7 @@ mod value;
 
 pub(crate) use bool_agg::{BoolAndAgg, BoolOrAgg};
 pub(crate) use listagg::ListaggAgg;
-pub(crate) use numeric::{CountAgg, MaxAgg, MinAgg, ProductAgg, SumAgg};
+pub(crate) use numeric::{MaxAgg, MinAgg, ProductAgg, SumAgg};
 pub(crate) use value::{FirstNonNullValueAgg, FirstValueAgg, LastNonNullValueAgg, LastValueAgg};
 
 /// Per-field aggregator.
@@ -93,7 +93,6 @@ pub(crate) fn new_aggregator(
         "product" => Ok(Box::new(ProductAgg::new(field_name, data_type)?)),
         "min" => Ok(Box::new(MinAgg::new(field_name, data_type)?)),
         "max" => Ok(Box::new(MaxAgg::new(field_name, data_type)?)),
-        "count" => Ok(Box::new(CountAgg::new(field_name, data_type)?)),
         "last_value" => Ok(Box::new(LastValueAgg::new(field_name, data_type)?)),
         "first_value" => Ok(Box::new(FirstValueAgg::new(field_name, data_type)?)),
         "last_non_null_value" => Ok(Box::new(LastNonNullValueAgg::new(field_name, data_type)?)),
@@ -108,7 +107,7 @@ pub(crate) fn new_aggregator(
         other => Err(crate::Error::ConfigInvalid {
             message: format!(
                 "Unknown aggregate function '{other}' for field '{field_name}'; \
-                 supported: sum, product, min, max, count, last_value, first_value, \
+                 supported: sum, product, min, max, last_value, first_value, \
                  last_non_null_value, first_non_null_value, bool_and, bool_or, listagg"
             ),
         }),
