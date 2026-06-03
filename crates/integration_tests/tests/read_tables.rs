@@ -1507,7 +1507,6 @@ async fn test_read_schema_evolution_drop_column() {
 async fn test_read_schema_evolution_rename_column() {
     let (plan, batches) =
         scan_and_read_with_fs_catalog("schema_evolution_rename_column", None).await;
-
     let formats: HashSet<&str> = plan
         .splits()
         .iter()
@@ -1580,6 +1579,62 @@ async fn test_read_schema_evolution_rename_column() {
             "parquet-old-2".to_string(),
         ],
         "Projection on renamed column should still use field-id mapping"
+    );
+}
+
+/// Test reading a mixed-format table after ALTER TABLE DROP COLUMN.
+/// Old Parquet/ORC data files have the dropped column; new Avro files do not.
+#[tokio::test]
+async fn test_read_mixed_format_schema_evolution_drop_column() {
+    let (plan, batches) =
+        scan_and_read_with_fs_catalog("mixed_format_schema_evolution_drop_column", None).await;
+
+    let formats: HashSet<&str> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
+        .collect();
+    assert_eq!(
+        formats,
+        HashSet::from(["avro", "orc", "parquet"]),
+        "mixed_format_schema_evolution_drop_column should scan all provisioned file formats"
+    );
+
+    for batch in &batches {
+        assert!(
+            batch.column_by_name("score").is_none(),
+            "Dropped column 'score' should not appear in output"
+        );
+    }
+
+    let mut rows: Vec<(i32, String)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string()));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "parquet-alice".into()),
+            (2, "parquet-bob".into()),
+            (3, "orc-carol".into()),
+            (4, "orc-dave".into()),
+            (5, "avro-eve".into()),
+            (6, "avro-frank".into()),
+        ],
+        "Mixed-format DROP COLUMN should expose only remaining columns from all file formats"
     );
 }
 

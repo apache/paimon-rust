@@ -646,6 +646,50 @@ def main():
         """
     )
 
+    # ===== Mixed-format Schema Evolution: Drop Column =====
+    # Old Parquet/ORC files have (id, name, score); after DROP COLUMN, Avro files
+    # have only (id, name). Reader should ignore the dropped column in old files.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS mixed_format_schema_evolution_drop_column (
+            id INT,
+            name STRING,
+            score INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_drop_column VALUES
+            (1, 'parquet-alice', 100),
+            (2, 'parquet-bob', 200)
+        """
+    )
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_drop_column SET TBLPROPERTIES ('file.format' = 'orc')"
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_drop_column VALUES
+            (3, 'orc-carol', 300),
+            (4, 'orc-dave', 400)
+        """
+    )
+    spark.sql("ALTER TABLE mixed_format_schema_evolution_drop_column DROP COLUMN score")
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_drop_column SET TBLPROPERTIES ('file.format' = 'avro')"
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_drop_column VALUES
+            (5, 'avro-eve'),
+            (6, 'avro-frank')
+        """
+    )
+
     # ===== Complex Types table: ARRAY, MAP, STRUCT =====
     spark.sql(
         """
