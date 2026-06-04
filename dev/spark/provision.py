@@ -553,6 +553,45 @@ def main():
         """
     )
 
+    # ===== Schema Evolution: Rename Column across mixed file formats =====
+    # Old files have physical column name 'payload'; after RENAME COLUMN, new files
+    # have 'renamed_payload'. Reader should map by field id and expose the new name.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS schema_evolution_rename_column (
+            id INT,
+            payload STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO schema_evolution_rename_column VALUES
+            (1, 'parquet-old'),
+            (2, 'parquet-old-2')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE schema_evolution_rename_column RENAME COLUMN payload TO renamed_payload"
+    )
+    spark.sql("ALTER TABLE schema_evolution_rename_column SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        """
+        INSERT INTO schema_evolution_rename_column VALUES
+            (3, 'orc-new')
+        """
+    )
+    spark.sql("ALTER TABLE schema_evolution_rename_column SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        """
+        INSERT INTO schema_evolution_rename_column VALUES
+            (4, 'avro-new')
+        """
+    )
+
     # ===== Complex Types table: ARRAY, MAP, STRUCT =====
     spark.sql(
         """
