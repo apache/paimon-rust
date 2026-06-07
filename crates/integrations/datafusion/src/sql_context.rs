@@ -1090,11 +1090,8 @@ impl SQLContext {
 
         let mut stream = df.execute_stream().await?;
 
-        let wb = table.new_write_builder();
-        let mut tw = wb
-            .new_write()
-            .map_err(to_datafusion_error)?
-            .with_overwrite();
+        let wb = table.new_write_builder().with_overwrite();
+        let mut tw = wb.new_write().map_err(to_datafusion_error)?;
         let mut row_count = 0u64;
 
         while let Some(batch_result) = stream.next().await {
