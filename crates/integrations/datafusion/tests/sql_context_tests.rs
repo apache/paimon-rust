@@ -480,23 +480,18 @@ async fn test_alter_table_add_column() {
         .await
         .unwrap();
 
-    // ALTER TABLE is not yet implemented in FileSystemCatalog, so we expect an error
-    let result = sql_context
+    sql_context
         .sql("ALTER TABLE paimon.mydb.alter_test ADD COLUMN age INT")
-        .await;
+        .await
+        .expect("ALTER TABLE ADD COLUMN should succeed");
 
-    // FileSystemCatalog does not support AddColumn schema change yet
-    assert!(
-        result.is_err(),
-        "ALTER TABLE ADD COLUMN should fail because AddColumn is not yet supported"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("not yet implemented")
-            || err_msg.contains("Unsupported")
-            || err_msg.contains("not yet supported"),
-        "Error should indicate alter_table is not implemented, got: {err_msg}"
-    );
+    // The new column is appended to the table schema.
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "alter_test"))
+        .await
+        .unwrap();
+    let names: Vec<&str> = table.schema().fields().iter().map(|f| f.name()).collect();
+    assert_eq!(names, vec!["id", "name", "age"]);
 }
 
 #[tokio::test]

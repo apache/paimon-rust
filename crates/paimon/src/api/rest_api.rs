@@ -25,11 +25,12 @@ use std::collections::HashMap;
 use crate::api::rest_client::HttpClient;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
-use crate::spec::{Partition, PartitionStatistics, Schema, Snapshot};
+use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot};
 use crate::Result;
 
 use super::api_request::{
-    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RenameTableRequest,
+    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateTableRequest,
+    RenameTableRequest,
 };
 use super::api_response::{
     ConfigResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
@@ -339,6 +340,21 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.tables(Some(database));
         let request = CreateTableRequest::new(identifier.clone(), schema);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Alter a table's schema by applying a list of schema changes.
+    pub async fn alter_table(
+        &self,
+        identifier: &Identifier,
+        changes: Vec<SchemaChange>,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.table(database, table);
+        let request = AlterTableRequest::new(changes);
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())
     }

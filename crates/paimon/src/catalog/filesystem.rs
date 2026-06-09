@@ -439,8 +439,26 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
-        let new_schema = current.apply_changes(changes)?;
+        let new_schema = current
+            .apply_changes(changes)
+            .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
+    }
+}
+
+/// `TableSchema::apply_changes` returns column errors without a table name;
+/// fill in the identifier's full name so the message identifies the table.
+fn fill_table_name(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::ColumnNotExist { column, .. } => Error::ColumnNotExist {
+            full_name: identifier.full_name(),
+            column,
+        },
+        Error::ColumnAlreadyExist { column, .. } => Error::ColumnAlreadyExist {
+            full_name: identifier.full_name(),
+            column,
+        },
+        other => other,
     }
 }
 
@@ -727,5 +745,202 @@ mod tests {
                 "default impl never paginates"
             );
         }
+    }
+
+    use crate::spec::{ColumnMove, DataType, IntType, SchemaChange, VarCharType};
+
+    /// Two-column table (id INT, name VARCHAR) used by the alter-table tests.
+    fn two_column_schema() -> Schema {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .build()
+            .unwrap()
+    }
+
+    async fn setup_table(catalog: &FileSystemCatalog, schema: Schema) -> Identifier {
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let id = Identifier::new("db", "t");
+        catalog.create_table(&id, schema, false).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_column_changes() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        // Add a column at the end; it must take highest_field_id + 1.
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::add_column(
+                    "age".to_string(),
+                    DataType::Int(IntType::new()),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let ts = catalog.get_table(&id).await.unwrap();
+        let ts = ts.schema();
+        let names: Vec<&str> = ts.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["id", "name", "age"]);
+        let age = ts.fields().iter().find(|f| f.name() == "age").unwrap();
+        assert_eq!(age.id(), 2, "new column gets highest_field_id + 1");
+        assert_eq!(ts.id(), 1, "schema version bumped");
+
+        // Add a column moved to the front.
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::add_column_with_description_and_column_move(
+                    "rowkey".to_string(),
+                    DataType::Int(IntType::new()),
+                    "primary".to_string(),
+                    ColumnMove::move_first("rowkey".to_string()),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let ts = catalog.get_table(&id).await.unwrap();
+        let ts = ts.schema();
+        assert_eq!(ts.fields()[0].name(), "rowkey");
+        assert_eq!(ts.fields()[0].description(), Some("primary"));
+
+        // Rename, update comment, update type, update nullability, drop.
+        catalog
+            .alter_table(
+                &id,
+                vec![
+                    SchemaChange::rename_column("name".to_string(), "full_name".to_string()),
+                    SchemaChange::update_column_comment("id".to_string(), "the id".to_string()),
+                    SchemaChange::update_column_type(
+                        "age".to_string(),
+                        DataType::BigInt(crate::spec::BigIntType::new()),
+                    ),
+                    SchemaChange::update_column_nullability("id".to_string(), false),
+                    SchemaChange::drop_column("rowkey".to_string()),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        let ts = catalog.get_table(&id).await.unwrap();
+        let ts = ts.schema();
+        let names: Vec<&str> = ts.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["id", "full_name", "age"]);
+        let id_field = ts.fields().iter().find(|f| f.name() == "id").unwrap();
+        assert_eq!(id_field.description(), Some("the id"));
+        assert!(!id_field.data_type().is_nullable());
+        let age_field = ts.fields().iter().find(|f| f.name() == "age").unwrap();
+        assert!(matches!(age_field.data_type(), DataType::BigInt(_)));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_reposition_column() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        // Move `name` before `id`.
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::update_column_position(
+                    ColumnMove::move_first("name".to_string()),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let ts = catalog.get_table(&id).await.unwrap();
+        let names: Vec<&str> = ts.schema().fields().iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["name", "id"]);
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_errors() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        // Add a duplicate column -> ColumnAlreadyExist.
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::add_column(
+                    "name".to_string(),
+                    DataType::Int(IntType::new()),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ColumnAlreadyExist { .. }),
+            "got {err:?}"
+        );
+
+        // Drop a missing column -> ColumnNotExist.
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::drop_column("ghost".to_string())],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ColumnNotExist { .. }), "got {err:?}");
+
+        // Altering a missing table: ignored vs error.
+        let missing = Identifier::new("db", "nope");
+        catalog
+            .alter_table(
+                &missing,
+                vec![SchemaChange::update_column_comment(
+                    "id".to_string(),
+                    "x".to_string(),
+                )],
+                true,
+            )
+            .await
+            .unwrap();
+        let err = catalog
+            .alter_table(
+                &missing,
+                vec![SchemaChange::update_column_comment(
+                    "id".to_string(),
+                    "x".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::TableNotExist { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_primary_key_column_rejected() {
+        let (_tmp, catalog) = create_test_catalog();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .build()
+            .unwrap();
+        let id = setup_table(&catalog, schema).await;
+
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::drop_column("id".to_string())],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
     }
 }

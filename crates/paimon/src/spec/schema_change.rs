@@ -20,77 +20,71 @@ use serde::{Deserialize, Serialize};
 
 /// Schema change to table.
 ///
-/// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L36>
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// The JSON wire format is kept compatible with Java Paimon's `SchemaChange`,
+/// which is an internally-tagged polymorphic type (`@JsonTypeInfo` with an
+/// `"action"` discriminator). Each variant therefore serializes as
+/// `{"action": "<name>", ...fields}` with `fieldNames` arrays (a column path;
+/// only top-level single-element paths are currently applied — see
+/// `TableSchema::apply_changes`).
+///
+/// Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java>
+//
+// Note: `dropPrimaryKey` and `updateColumnDefaultValue` from Java are not yet
+// modeled here; they are out of scope for the current alter-table support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
 pub enum SchemaChange {
     /// A SchemaChange to set a table option.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L95>
     SetOption { key: String, value: String },
     /// A SchemaChange to remove a table option.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L134>
     RemoveOption { key: String },
     /// A SchemaChange to update a table comment.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L167>
     UpdateComment { comment: Option<String> },
     /// A SchemaChange to add a new field.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L201>
     #[serde(rename_all = "camelCase")]
     AddColumn {
-        field_name: String,
+        field_names: Vec<String>,
         data_type: DataType,
-        description: Option<String>,
+        comment: Option<String>,
         #[serde(rename = "move")]
         column_move: Option<ColumnMove>,
     },
     /// A SchemaChange to rename a field.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L260>
     #[serde(rename_all = "camelCase")]
     RenameColumn {
-        field_name: String,
+        field_names: Vec<String>,
         new_name: String,
     },
     /// A SchemaChange to drop a field.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L302>
     #[serde(rename_all = "camelCase")]
-    DropColumn { field_name: String },
+    DropColumn { field_names: Vec<String> },
     /// A SchemaChange to update the field's type.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L335>
     #[serde(rename_all = "camelCase")]
     UpdateColumnType {
-        field_name: String,
-        data_type: DataType,
+        field_names: Vec<String>,
+        new_data_type: DataType,
+        /// When true, keep the existing column's nullability instead of taking
+        /// it from `new_data_type`.
+        #[serde(default)]
+        keep_nullability: bool,
+    },
+    /// A SchemaChange to update the field's nullability.
+    #[serde(rename_all = "camelCase")]
+    UpdateColumnNullability {
+        field_names: Vec<String>,
+        new_nullability: bool,
+    },
+    /// A SchemaChange to update the (nested) field's comment.
+    #[serde(rename_all = "camelCase")]
+    UpdateColumnComment {
+        field_names: Vec<String>,
+        new_comment: String,
     },
     /// A SchemaChange to update the field's position.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L377>
     #[serde(rename_all = "camelCase")]
     UpdateColumnPosition {
         #[serde(rename = "move")]
         column_move: ColumnMove,
-    },
-    /// A SchemaChange to update the field's nullability.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L470>
-    #[serde(rename_all = "camelCase")]
-    UpdateColumnNullability {
-        field_name: Vec<String>,
-        nullable: bool,
-    },
-    /// A SchemaChange to update the (nested) field's comment.
-    ///
-    /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L512>
-    #[serde(rename_all = "camelCase")]
-    UpdateColumnComment {
-        field_names: Vec<String>,
-        new_description: String,
     },
 }
 
@@ -113,9 +107,9 @@ impl SchemaChange {
     /// impl the `add_column`.
     pub fn add_column(field_name: String, data_type: DataType) -> Self {
         SchemaChange::AddColumn {
-            field_name,
+            field_names: vec![field_name],
             data_type,
-            description: None,
+            comment: None,
             column_move: None,
         }
     }
@@ -127,9 +121,9 @@ impl SchemaChange {
         description: String,
     ) -> Self {
         SchemaChange::AddColumn {
-            field_name,
+            field_names: vec![field_name],
             data_type,
-            description: Some(description),
+            comment: Some(description),
             column_move: None,
         }
     }
@@ -142,9 +136,9 @@ impl SchemaChange {
         column_move: ColumnMove,
     ) -> Self {
         SchemaChange::AddColumn {
-            field_name,
+            field_names: vec![field_name],
             data_type,
-            description: Some(description),
+            comment: Some(description),
             column_move: Some(column_move),
         }
     }
@@ -152,21 +146,24 @@ impl SchemaChange {
     /// impl the `rename_column`.
     pub fn rename_column(field_name: String, new_name: String) -> Self {
         SchemaChange::RenameColumn {
-            field_name,
+            field_names: vec![field_name],
             new_name,
         }
     }
 
     /// impl the `drop_column`.
     pub fn drop_column(field_name: String) -> Self {
-        SchemaChange::DropColumn { field_name }
+        SchemaChange::DropColumn {
+            field_names: vec![field_name],
+        }
     }
 
     /// impl the `update_column_type`.
     pub fn update_column_type(field_name: String, new_data_type: DataType) -> Self {
         SchemaChange::UpdateColumnType {
-            field_name,
-            data_type: new_data_type,
+            field_names: vec![field_name],
+            new_data_type,
+            keep_nullability: false,
         }
     }
 
@@ -175,19 +172,19 @@ impl SchemaChange {
         SchemaChange::UpdateColumnPosition { column_move }
     }
 
-    /// impl the `update_column_position`.
+    /// impl the `update_column_nullability`.
     pub fn update_column_nullability(field_name: String, new_nullability: bool) -> Self {
         SchemaChange::UpdateColumnNullability {
-            field_name: vec![field_name],
-            nullable: new_nullability,
+            field_names: vec![field_name],
+            new_nullability,
         }
     }
 
     /// impl the `update_columns_nullability`.
     pub fn update_columns_nullability(field_names: Vec<String>, new_nullability: bool) -> Self {
         SchemaChange::UpdateColumnNullability {
-            field_name: field_names,
-            nullable: new_nullability,
+            field_names,
+            new_nullability,
         }
     }
 
@@ -195,7 +192,7 @@ impl SchemaChange {
     pub fn update_column_comment(field_name: String, comment: String) -> Self {
         SchemaChange::UpdateColumnComment {
             field_names: vec![field_name],
-            new_description: comment,
+            new_comment: comment,
         }
     }
 
@@ -203,28 +200,32 @@ impl SchemaChange {
     pub fn update_columns_comment(field_names: Vec<String>, comment: String) -> Self {
         SchemaChange::UpdateColumnComment {
             field_names,
-            new_description: comment,
+            new_comment: comment,
         }
     }
 }
 
 /// The type of move.
 ///
-/// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L412>
+/// Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ColumnMoveType {
     FIRST,
     AFTER,
+    BEFORE,
+    LAST,
 }
 
 /// Represents a requested column move in a struct.
 ///
-/// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/SchemaChange.java#L410>
+/// Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java>
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColumnMove {
     pub field_name: String,
-    pub referenced_field_name: Option<String>,
+    /// The anchor column for `AFTER`/`BEFORE` moves (`None` for `FIRST`/`LAST`).
+    /// Named `referenceFieldName` on the wire to match Java Paimon.
+    pub reference_field_name: Option<String>,
     #[serde(rename = "type")]
     pub move_type: ColumnMoveType,
 }
@@ -235,9 +236,9 @@ impl ColumnMove {
         &self.field_name
     }
 
-    /// Get the referenced field name.
-    pub fn referenced_field_name(&self) -> Option<&str> {
-        self.referenced_field_name.as_deref()
+    /// Get the reference field name.
+    pub fn reference_field_name(&self) -> Option<&str> {
+        self.reference_field_name.as_deref()
     }
 
     /// Get the move type.
@@ -249,17 +250,35 @@ impl ColumnMove {
     pub fn move_first(field_name: String) -> Self {
         ColumnMove {
             field_name,
-            referenced_field_name: None,
+            reference_field_name: None,
             move_type: ColumnMoveType::FIRST,
         }
     }
 
-    /// Create a new `Move` with `AFTER` move type.
-    pub fn move_after(field_name: String, referenced_field_name: String) -> Self {
+    /// Create a new `Move` with `LAST` move type.
+    pub fn move_last(field_name: String) -> Self {
         ColumnMove {
             field_name,
-            referenced_field_name: Some(referenced_field_name),
+            reference_field_name: None,
+            move_type: ColumnMoveType::LAST,
+        }
+    }
+
+    /// Create a new `Move` with `AFTER` move type.
+    pub fn move_after(field_name: String, reference_field_name: String) -> Self {
+        ColumnMove {
+            field_name,
+            reference_field_name: Some(reference_field_name),
             move_type: ColumnMoveType::AFTER,
+        }
+    }
+
+    /// Create a new `Move` with `BEFORE` move type.
+    pub fn move_before(field_name: String, reference_field_name: String) -> Self {
+        ColumnMove {
+            field_name,
+            reference_field_name: Some(reference_field_name),
+            move_type: ColumnMoveType::BEFORE,
         }
     }
 }
@@ -271,79 +290,66 @@ mod tests {
 
     #[test]
     fn test_schema_change_serialize_deserialize() {
+        // Java-compatible wire format: internally tagged by "action", with
+        // `fieldNames` arrays and `referenceFieldName` move anchors.
         let json_data = r#"
         [
           {
-            "setOption": {
-              "key": "snapshot.time-retained",
-              "value": "2h"
-            }
+            "action": "setOption",
+            "key": "snapshot.time-retained",
+            "value": "2h"
           },
           {
-            "removeOption": {
-              "key": "compaction.max.file-num"
-            }
+            "action": "removeOption",
+            "key": "compaction.max.file-num"
           },
           {
-            "updateComment": {
-              "comment": "table.comment"
-            }
+            "action": "updateComment",
+            "comment": "table.comment"
           },
           {
-            "addColumn": {
+            "action": "addColumn",
+            "fieldNames": ["col1"],
+            "dataType": "INT",
+            "comment": "col1_description",
+            "move": {
               "fieldName": "col1",
-              "dataType": "INT",
-              "description": "col1_description",
-              "move": {
-                "fieldName": "col1_first",
-                "referencedFieldName": null,
-                "type": "FIRST"
-              }
+              "referenceFieldName": null,
+              "type": "FIRST"
             }
           },
           {
-            "renameColumn": {
-              "fieldName": "col3",
-              "newName": "col3_new_name"
+            "action": "renameColumn",
+            "fieldNames": ["col3"],
+            "newName": "col3_new_name"
+          },
+          {
+            "action": "dropColumn",
+            "fieldNames": ["col1"]
+          },
+          {
+            "action": "updateColumnType",
+            "fieldNames": ["col14"],
+            "newDataType": "DOUBLE",
+            "keepNullability": false
+          },
+          {
+            "action": "updateColumnPosition",
+            "move": {
+              "fieldName": "col4",
+              "referenceFieldName": "col3",
+              "type": "AFTER"
             }
           },
           {
-            "dropColumn": {
-              "fieldName": "col1"
-            }
+            "action": "updateColumnNullability",
+            "fieldNames": ["col5", "f2"],
+            "newNullability": false
           },
           {
-            "updateColumnType": {
-              "fieldName": "col14",
-              "dataType": "DOUBLE"
-            }
-          },
-          {
-            "updateColumnPosition": {
-              "move": {
-                "fieldName": "col4_first",
-                "referencedFieldName": null,
-                "type": "FIRST"
-              }
-            }
-          },
-          {
-            "updateColumnNullability": {
-              "fieldName": [
-                "col5",
-                "f2"
-              ],
-              "nullable": false
-            }
-          },
-          {
-            "updateColumnComment": {
-              "fieldNames": [
-                "col5",
-                "f1"
-              ],
-              "newDescription": "col5 f1 field"
-            }
+            "action": "updateColumnComment",
+            "fieldNames": ["col5", "f1"],
+            "newComment": "col5 f1 field"
           }
         ]"#;
 
@@ -364,43 +370,49 @@ mod tests {
                     comment: Some("table.comment".to_string()),
                 },
                 SchemaChange::AddColumn {
-                    field_name: "col1".to_string(),
+                    field_names: vec!["col1".to_string()],
                     data_type: DataType::Int(IntType::new()),
-                    description: Some("col1_description".to_string()),
-                    column_move: Some(ColumnMove {
-                        field_name: "col1_first".to_string(),
-                        referenced_field_name: None,
-                        move_type: ColumnMoveType::FIRST,
-                    }),
+                    comment: Some("col1_description".to_string()),
+                    column_move: Some(ColumnMove::move_first("col1".to_string())),
                 },
                 SchemaChange::RenameColumn {
-                    field_name: "col3".to_string(),
+                    field_names: vec!["col3".to_string()],
                     new_name: "col3_new_name".to_string(),
                 },
                 SchemaChange::DropColumn {
-                    field_name: "col1".to_string(),
+                    field_names: vec!["col1".to_string()],
                 },
                 SchemaChange::UpdateColumnType {
-                    field_name: "col14".to_string(),
-                    data_type: DataType::Double(DoubleType::new()),
+                    field_names: vec!["col14".to_string()],
+                    new_data_type: DataType::Double(DoubleType::new()),
+                    keep_nullability: false,
                 },
                 SchemaChange::UpdateColumnPosition {
-                    column_move: ColumnMove {
-                        field_name: "col4_first".to_string(),
-                        referenced_field_name: None,
-                        move_type: ColumnMoveType::FIRST,
-                    },
+                    column_move: ColumnMove::move_after("col4".to_string(), "col3".to_string()),
                 },
                 SchemaChange::UpdateColumnNullability {
-                    field_name: vec!["col5".to_string(), "f2".to_string()],
-                    nullable: false,
+                    field_names: vec!["col5".to_string(), "f2".to_string()],
+                    new_nullability: false,
                 },
                 SchemaChange::UpdateColumnComment {
                     field_names: vec!["col5".to_string(), "f1".to_string()],
-                    new_description: "col5 f1 field".to_string(),
+                    new_comment: "col5 f1 field".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_schema_change_serialize_shape() {
+        // Verify the serialized JSON carries the Java "action" discriminator.
+        let change = SchemaChange::add_column("c".to_string(), DataType::Int(IntType::new()));
+        let value = serde_json::to_value(&change).unwrap();
+        assert_eq!(value["action"], "addColumn");
+        assert_eq!(value["fieldNames"][0], "c");
+
+        // Round-trip through JSON.
+        let round: SchemaChange = serde_json::from_value(value).unwrap();
+        assert_eq!(round, change);
     }
 
     #[test]
@@ -409,12 +421,12 @@ mod tests {
         [
           {
             "fieldName": "col1",
-            "referencedFieldName": null,
+            "referenceFieldName": null,
             "type": "FIRST"
           },
           {
             "fieldName": "col2_after",
-            "referencedFieldName": "col2",
+            "referenceFieldName": "col2",
             "type": "AFTER"
           }
         ]"#;

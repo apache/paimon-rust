@@ -3182,7 +3182,7 @@ mod tests {
             assert_eq!(identifier.object(), "t1");
             assert_eq!(changes.len(), 1);
             assert!(
-                matches!(&changes[0], SchemaChange::AddColumn { field_name, .. } if field_name == "age")
+                matches!(&changes[0], SchemaChange::AddColumn { field_names, .. } if field_names.first().map(String::as_str) == Some("age"))
             );
         } else {
             panic!("expected AlterTable call");
@@ -3206,10 +3206,10 @@ mod tests {
             assert!(matches!(
                 &changes[0],
                 SchemaChange::AddColumn {
-                    field_name,
+                    field_names,
                     data_type,
                     ..
-                } if field_name == "payload" && matches!(data_type, PaimonDataType::Blob(_))
+                } if field_names.first().map(String::as_str) == Some("payload") && matches!(data_type, PaimonDataType::Blob(_))
             ));
         } else {
             panic!("expected AlterTable call");
@@ -3231,7 +3231,7 @@ mod tests {
         if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
             assert_eq!(changes.len(), 1);
             assert!(
-                matches!(&changes[0], SchemaChange::DropColumn { field_name } if field_name == "age")
+                matches!(&changes[0], SchemaChange::DropColumn { field_names } if field_names.first().map(String::as_str) == Some("age"))
             );
         } else {
             panic!("expected AlterTable call");
@@ -3254,8 +3254,8 @@ mod tests {
             assert_eq!(changes.len(), 1);
             assert!(matches!(
                 &changes[0],
-                SchemaChange::RenameColumn { field_name, new_name }
-                    if field_name == "old_name" && new_name == "new_name"
+                SchemaChange::RenameColumn { field_names, new_name }
+                    if field_names.first().map(String::as_str) == Some("old_name") && new_name == "new_name"
             ));
         } else {
             panic!("expected AlterTable call");

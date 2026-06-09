@@ -17,8 +17,7 @@
 
 use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
-use crate::spec::AggregationConfig;
-use crate::spec::PartialUpdateConfig;
+use crate::spec::{AggregationConfig, ColumnMove, ColumnMoveType, PartialUpdateConfig};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -140,26 +139,152 @@ impl TableSchema {
     }
 
     /// Apply a list of schema changes and return a new schema with incremented ID.
+    ///
+    /// Column-level changes operate on **top-level** columns only: a
+    /// `field_names` path with more than one element (a nested struct field) is
+    /// rejected with [`crate::Error::Unsupported`].
+    ///
+    /// Column errors ([`crate::Error::ColumnNotExist`] /
+    /// [`crate::Error::ColumnAlreadyExist`]) are returned with an empty table
+    /// name; the calling catalog fills in the table's full name.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
+        use crate::spec::SchemaChange;
+
+        // Column errors carry no table name here; the catalog layer fills it in.
+        let full_name = "";
+
         let mut new_schema = self.clone();
         new_schema.id += 1;
         new_schema.time_millis = chrono::Utc::now().timestamp_millis();
 
+        // Operate on an owned field list, then write it back.
+        let mut fields = std::mem::take(&mut new_schema.fields);
+        let mut highest_field_id = new_schema.highest_field_id;
+
         for change in changes {
             match change {
-                crate::spec::SchemaChange::SetOption { key, value } => {
+                SchemaChange::SetOption { key, value } => {
                     new_schema.options.insert(key, value);
                 }
-                crate::spec::SchemaChange::RemoveOption { key } => {
+                SchemaChange::RemoveOption { key } => {
                     new_schema.options.remove(&key);
                 }
-                other => {
-                    return Err(crate::Error::Unsupported {
-                        message: format!("Schema change not yet supported: {other:?}"),
-                    });
+                SchemaChange::UpdateComment { comment } => {
+                    new_schema.comment = comment;
+                }
+                SchemaChange::AddColumn {
+                    field_names,
+                    data_type,
+                    comment,
+                    column_move,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    if field_index(&fields, name).is_some() {
+                        return Err(crate::Error::ColumnAlreadyExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        });
+                    }
+                    highest_field_id += 1;
+                    let field = DataField::new(highest_field_id, name.to_string(), data_type)
+                        .with_description(comment);
+                    insert_field_with_move(&mut fields, field, column_move.as_ref(), full_name)?;
+                }
+                SchemaChange::RenameColumn {
+                    field_names,
+                    new_name,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    if new_name != name && field_index(&fields, &new_name).is_some() {
+                        return Err(crate::Error::ColumnAlreadyExist {
+                            full_name: full_name.to_string(),
+                            column: new_name,
+                        });
+                    }
+                    fields[idx] = fields[idx].clone().with_name(new_name.clone());
+                    rename_in_keys(&mut new_schema.partition_keys, name, &new_name);
+                    rename_in_keys(&mut new_schema.primary_keys, name, &new_name);
+                }
+                SchemaChange::DropColumn { field_names } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    if new_schema.partition_keys.iter().any(|k| k == name)
+                        || new_schema.primary_keys.iter().any(|k| k == name)
+                    {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Cannot drop partition or primary key column '{name}' of table {full_name}"
+                            ),
+                        });
+                    }
+                    fields.remove(idx);
+                }
+                SchemaChange::UpdateColumnType {
+                    field_names,
+                    new_data_type,
+                    keep_nullability,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    let old = &fields[idx];
+                    // Lenient: replace the type without cast-compatibility checks.
+                    let target = if keep_nullability {
+                        new_data_type.copy_with_nullable(old.data_type().is_nullable())?
+                    } else {
+                        new_data_type
+                    };
+                    fields[idx] = DataField::new(old.id(), old.name().to_string(), target)
+                        .with_description(old.description().map(|s| s.to_string()));
+                }
+                SchemaChange::UpdateColumnNullability {
+                    field_names,
+                    new_nullability,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    let old = &fields[idx];
+                    let nt = old.data_type().copy_with_nullable(new_nullability)?;
+                    fields[idx] = DataField::new(old.id(), old.name().to_string(), nt)
+                        .with_description(old.description().map(|s| s.to_string()));
+                }
+                SchemaChange::UpdateColumnComment {
+                    field_names,
+                    new_comment,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    fields[idx] = fields[idx].clone().with_description(Some(new_comment));
+                }
+                SchemaChange::UpdateColumnPosition { column_move } => {
+                    apply_move(&mut fields, &column_move, full_name)?;
                 }
             }
         }
+
+        new_schema.fields = fields;
+        new_schema.highest_field_id =
+            highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
 
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
         PartialUpdateConfig::new(&new_schema.options)
@@ -195,6 +320,107 @@ impl TableSchema {
             .map(|f| f.name().to_string())
             .collect()
     }
+}
+
+/// Extract the single top-level column name from a `field_names` path.
+///
+/// Nested struct field paths (length > 1) are not yet supported.
+fn top_level_field(field_names: &[String]) -> crate::Result<&str> {
+    match field_names {
+        [name] => Ok(name.as_str()),
+        [] => Err(crate::Error::ConfigInvalid {
+            message: "Schema change has empty fieldNames".to_string(),
+        }),
+        _ => Err(crate::Error::Unsupported {
+            message: format!("Altering nested struct fields is not supported yet: {field_names:?}"),
+        }),
+    }
+}
+
+/// Index of the field with the given name, if any.
+fn field_index(fields: &[DataField], name: &str) -> Option<usize> {
+    fields.iter().position(|f| f.name() == name)
+}
+
+/// Rename a key in a partition/primary key list, if present.
+fn rename_in_keys(keys: &mut [String], old: &str, new: &str) {
+    for key in keys.iter_mut() {
+        if key == old {
+            *key = new.to_string();
+        }
+    }
+}
+
+/// Insert a brand-new field according to an optional move (used by `AddColumn`).
+fn insert_field_with_move(
+    fields: &mut Vec<DataField>,
+    field: DataField,
+    column_move: Option<&ColumnMove>,
+    full_name: &str,
+) -> crate::Result<()> {
+    let Some(mv) = column_move else {
+        fields.push(field);
+        return Ok(());
+    };
+    match mv.move_type() {
+        ColumnMoveType::FIRST => fields.insert(0, field),
+        ColumnMoveType::LAST => fields.push(field),
+        ColumnMoveType::AFTER | ColumnMoveType::BEFORE => {
+            let reference = move_reference(mv)?;
+            let ref_idx =
+                field_index(fields, reference).ok_or_else(|| crate::Error::ColumnNotExist {
+                    full_name: full_name.to_string(),
+                    column: reference.to_string(),
+                })?;
+            let at = match mv.move_type() {
+                ColumnMoveType::AFTER => ref_idx + 1,
+                _ => ref_idx,
+            };
+            fields.insert(at, field);
+        }
+    }
+    Ok(())
+}
+
+/// Move an existing field to a new position (used by `UpdateColumnPosition`).
+///
+/// Mirrors Java `SchemaManager.applyMove`: remove the field first, then resolve
+/// the reference index in the reduced list so the offset is already adjusted.
+fn apply_move(fields: &mut Vec<DataField>, mv: &ColumnMove, full_name: &str) -> crate::Result<()> {
+    let idx = field_index(fields, mv.field_name()).ok_or_else(|| crate::Error::ColumnNotExist {
+        full_name: full_name.to_string(),
+        column: mv.field_name().to_string(),
+    })?;
+    let field = fields.remove(idx);
+    match mv.move_type() {
+        ColumnMoveType::FIRST => fields.insert(0, field),
+        ColumnMoveType::LAST => fields.push(field),
+        ColumnMoveType::AFTER | ColumnMoveType::BEFORE => {
+            let reference = move_reference(mv)?;
+            let ref_idx =
+                field_index(fields, reference).ok_or_else(|| crate::Error::ColumnNotExist {
+                    full_name: full_name.to_string(),
+                    column: reference.to_string(),
+                })?;
+            let at = match mv.move_type() {
+                ColumnMoveType::AFTER => ref_idx + 1,
+                _ => ref_idx,
+            };
+            fields.insert(at, field);
+        }
+    }
+    Ok(())
+}
+
+/// The reference (anchor) field name required by `AFTER`/`BEFORE` moves.
+fn move_reference(mv: &ColumnMove) -> crate::Result<&str> {
+    mv.reference_field_name()
+        .ok_or_else(|| crate::Error::ConfigInvalid {
+            message: format!(
+                "Move of type {:?} requires a reference field name",
+                mv.move_type()
+            ),
+        })
 }
 
 pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";

@@ -34,8 +34,9 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use paimon::api::{
-    AlterDatabaseRequest, AuditRESTResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetTableResponse, ListDatabasesResponse, ListTablesResponse, RenameTableRequest, ResourcePaths,
+    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, ErrorResponse,
+    GetDatabaseResponse, GetTableResponse, ListDatabasesResponse, ListTablesResponse,
+    RenameTableRequest, ResourcePaths,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -451,6 +452,40 @@ impl RESTServer {
         }
     }
 
+    /// Handle POST /databases/:db/tables/:table - alter a table.
+    ///
+    /// The mock does not mutate the stored schema; it only validates that the
+    /// table exists, which is enough to exercise the client's alter-table path
+    /// (request serialization + 2xx handling).
+    pub async fn alter_table(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(_request): Json<AlterTableRequest>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        if s.no_permission_tables.contains(&key) {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("No Permission".to_string()),
+                Some(403),
+            );
+            return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+        if s.tables.contains_key(&key) {
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
     /// Handle POST /rename-table - rename a table.
     pub async fn rename_table(
         Extension(state): Extension<Arc<RESTServer>>,
@@ -722,7 +757,9 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table"),
-            get(RESTServer::get_table).delete(RESTServer::drop_table),
+            get(RESTServer::get_table)
+                .post(RESTServer::alter_table)
+                .delete(RESTServer::drop_table),
         )
         .route(
             &format!("{prefix}/tables/rename"),
