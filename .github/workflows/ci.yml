@@ -90,6 +90,12 @@ jobs:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
+      - name: Test paimon-rest-server
+        run: cargo test -p paimon-rest-server --all-targets
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
   integration:
     runs-on: ubuntu-latest
     steps:
