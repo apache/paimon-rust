@@ -18,7 +18,7 @@
 //! UPDATE execution for Paimon tables.
 //!
 //! Supports two execution paths:
-//! - **Data evolution tables**: partial-column writes via [`paimon::table::DataEvolutionWriter`].
+//! - **Data evolution tables**: partial-column writes via [`paimon::table::TableUpdate`].
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
@@ -31,7 +31,7 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{AssignmentTarget, TableFactor, Update};
 
 use paimon::spec::CoreOptions;
-use paimon::table::{CopyOnWriteMergeWriter, DataEvolutionWriter, Table};
+use paimon::table::{CopyOnWriteMergeWriter, Table};
 
 use crate::error::to_datafusion_error;
 use crate::merge_into::{
@@ -113,9 +113,11 @@ async fn execute_update_once(
         exprs.push(assignment.value.to_string());
     }
 
-    // 2. Create DataEvolutionWriter (validates preconditions)
-    let mut writer =
-        DataEvolutionWriter::new(table, columns.clone()).map_err(to_datafusion_error)?;
+    // 2. Create TableUpdate through the table write builder (validates preconditions)
+    let wb = table.new_write_builder();
+    let mut table_update = wb
+        .new_update(columns.clone())
+        .map_err(to_datafusion_error)?;
 
     // 3. Query the target table directly with WHERE filter.
     let table_ref = update.table.to_string();
@@ -144,16 +146,21 @@ async fn execute_update_once(
 
     let update_batches = project_update_columns(&batches, &columns)?;
     for batch in update_batches {
-        writer
+        table_update
             .add_matched_batch(batch)
             .map_err(to_datafusion_error)?;
     }
 
     // 5. Commit
-    let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
+    let messages = table_update
+        .prepare_commit()
+        .await
+        .map_err(to_datafusion_error)?;
     if !messages.is_empty() {
-        let commit = table.new_write_builder().new_commit();
-        commit.commit(messages).await.map_err(to_datafusion_error)?;
+        wb.new_commit()
+            .commit(messages)
+            .await
+            .map_err(to_datafusion_error)?;
     }
 
     ok_result(ctx.ctx(), total_count)

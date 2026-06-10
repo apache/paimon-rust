@@ -18,7 +18,7 @@
 //! MERGE INTO execution for Paimon tables.
 //!
 //! Supports two execution paths:
-//! - **Data evolution tables**: partial-column writes via [`paimon::table::DataEvolutionWriter`].
+//! - **Data evolution tables**: partial-column writes via [`paimon::table::TableUpdate`].
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
@@ -37,7 +37,7 @@ use datafusion::sql::sqlparser::ast::{
 use futures::TryStreamExt;
 
 use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions};
-use paimon::table::{CopyOnWriteMergeWriter, DataEvolutionWriter, DataSplitBuilder, Table};
+use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table};
 
 use crate::error::to_datafusion_error;
 use crate::sql_context::SQLContext;
@@ -119,7 +119,7 @@ where
 /// Execute a MERGE INTO statement on a Paimon table.
 ///
 /// Dispatches to the appropriate execution path based on table type:
-/// - Data evolution tables → partial-column writes via `DataEvolutionWriter`
+/// - Data evolution tables → partial-column writes via `TableUpdate`
 /// - Append-only tables (no PK) → copy-on-write file rewriting via `CopyOnWriteMergeWriter`
 pub(crate) async fn execute_merge_into(
     ctx: &SQLContext,
@@ -632,8 +632,12 @@ async fn execute_merge_into_once(
     let parsed = extract_merge_clauses(merge)?;
 
     // Validate preconditions early and create writer (before executing any SQL)
+    let wb = table.new_write_builder();
     let update_writer = if let Some(ref upd) = parsed.update {
-        Some(DataEvolutionWriter::new(table, upd.columns.clone()).map_err(to_datafusion_error)?)
+        Some(
+            wb.new_update(upd.columns.clone())
+                .map_err(to_datafusion_error)?,
+        )
     } else {
         None
     };
@@ -729,10 +733,7 @@ async fn execute_merge_into_once(
         .await?;
         let insert_count: usize = insert_batches.iter().map(|b| b.num_rows()).sum();
         if insert_count > 0 {
-            let mut table_write = table
-                .new_write_builder()
-                .new_write()
-                .map_err(to_datafusion_error)?;
+            let mut table_write = wb.new_write().map_err(to_datafusion_error)?;
             for batch in &insert_batches {
                 table_write
                     .write_arrow_batch(batch)
@@ -750,8 +751,7 @@ async fn execute_merge_into_once(
 
     // 6. Commit all messages atomically
     if !all_messages.is_empty() {
-        let commit = table.new_write_builder().new_commit();
-        commit
+        wb.new_commit()
             .commit(all_messages)
             .await
             .map_err(to_datafusion_error)?;

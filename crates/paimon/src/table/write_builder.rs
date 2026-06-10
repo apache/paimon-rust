@@ -19,7 +19,7 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
-use crate::table::{Table, TableCommit, TableWrite};
+use crate::table::{Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -87,6 +87,11 @@ impl<'a> WriteBuilder<'a> {
             write
         })
     }
+
+    /// Create a new TableUpdate for data-evolution row-id updates.
+    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+        TableUpdate::new(self.table, update_columns)
+    }
 }
 
 fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
@@ -112,8 +117,10 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
-    use crate::spec::{CommitKind, DataType, IntType, Schema, TableSchema, POSTPONE_BUCKET};
-    use arrow_array::{Int32Array, RecordBatch};
+    use crate::spec::{
+        CommitKind, DataType, IntType, Schema, TableSchema, VarCharType, POSTPONE_BUCKET,
+    };
+    use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -180,6 +187,41 @@ mod tests {
             TableSchema::new(0, &schema),
             None,
         )
+    }
+
+    fn test_data_evolution_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "name",
+                DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+            )
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_data_evolution_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn make_empty_matched_batch() -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -284,5 +326,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+    }
+
+    #[test]
+    fn test_new_update_rejects_non_data_evolution_table() {
+        let table = test_postpone_pk_table(&test_file_io(), "memory:/test_new_update_invalid");
+        let err = table
+            .new_write_builder()
+            .new_update(vec!["value".to_string()])
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("data-evolution.enabled")),
+            "Expected unsupported data-evolution error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_update_prepares_empty_commit_for_empty_batch() {
+        let file_io = test_file_io();
+        let table = test_data_evolution_table(&file_io, "memory:/test_new_update_empty");
+        let mut update = table
+            .new_write_builder()
+            .new_update(vec!["name".to_string()])
+            .unwrap();
+
+        update
+            .add_matched_batch(make_empty_matched_batch())
+            .unwrap();
+        let messages = update.prepare_commit().await.unwrap();
+        assert!(messages.is_empty());
     }
 }

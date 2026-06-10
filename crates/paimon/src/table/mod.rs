@@ -53,6 +53,7 @@ mod stats_filter;
 pub(crate) mod table_commit;
 mod table_read;
 mod table_scan;
+mod table_update;
 pub(crate) mod table_write;
 mod tag_manager;
 mod vector_search_builder;
@@ -78,6 +79,7 @@ pub use source::{
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;
 pub use table_scan::TableScan;
+pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use vector_search_builder::VectorSearchBuilder;
