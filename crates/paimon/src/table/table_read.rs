@@ -80,7 +80,9 @@ impl<'a> TableRead<'a> {
         // PK table with Deduplicate engine: splits that may hold multiple
         // versions of a key (level-0 files or key-overlapping compacted
         // files) need KeyValueFileReader for sort-merge dedup; splits of
-        // disjoint compacted files can use the faster DataFileReader.
+        // disjoint compacted files — and all compacted files of
+        // deletion-vector tables, where DVs mask stale versions — use the
+        // faster DataFileReader.
         if has_primary_keys
             && matches!(
                 merge_engine,
@@ -101,7 +103,9 @@ impl<'a> TableRead<'a> {
     /// versions of a key (any level-0 file, or compacted files with
     /// overlapping key ranges) go through KeyValueFileReader for sort-merge
     /// dedup; splits of disjoint compacted files use the faster
-    /// DataFileReader.
+    /// DataFileReader. Deletion-vector tables are exempt from the overlap
+    /// check: their stale versions are masked by DVs, and KeyValueFileReader
+    /// does not support DVs.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
@@ -111,6 +115,10 @@ impl<'a> TableRead<'a> {
             return self.read_kv(data_splits, core_options);
         }
 
+        // Deletion-vector tables read raw by design: stale versions of a key
+        // are masked by DVs, not merged, and KeyValueFileReader does not
+        // support DVs. Keep the plain level-0 dispatch for them.
+        let dv_enabled = core_options.deletion_vectors_enabled();
         // No comparator means no usable trimmed PK — fall back to merging
         // everything rather than risk raw-reading duplicate keys.
         let comparator = KeyComparator::from_table_schema(self.table.schema());
@@ -118,9 +126,13 @@ impl<'a> TableRead<'a> {
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
-            let needs_merge = match comparator {
-                Some(ref comparator) => split_requires_merge(split.data_files(), comparator),
-                None => true,
+            let needs_merge = if dv_enabled {
+                split.data_files().iter().any(|f| f.level == 0)
+            } else {
+                match comparator {
+                    Some(ref comparator) => split_requires_merge(split.data_files(), comparator),
+                    None => true,
+                }
             };
             if needs_merge {
                 kv_splits.push(split.clone());

@@ -631,7 +631,20 @@ impl<'a> TableScan<'a> {
         // Primary-key tables must keep key-overlapping files in one split so the
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
-        let pk_comparator = KeyComparator::from_table_schema(self.table.schema());
+        //
+        // Deletion-vector and first-row tables read without merging (stale rows
+        // are masked by DVs / level-0 is skipped), so they keep plain size-based
+        // packing like Java's MergeTreeSplitGenerator fast path.
+        let read_merges_overlapping_keys = !core_options.deletion_vectors_enabled()
+            && !matches!(
+                core_options.merge_engine(),
+                Ok(crate::spec::MergeEngine::FirstRow)
+            );
+        let pk_comparator = if read_merges_overlapping_keys {
+            KeyComparator::from_table_schema(self.table.schema())
+        } else {
+            None
+        };
 
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
         let (deletion_files_map, effective_row_ranges) =
