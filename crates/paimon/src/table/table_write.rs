@@ -2567,4 +2567,139 @@ mod tests {
         assert_eq!(ids, vec![1]);
         assert_eq!(values, vec![20]);
     }
+
+    fn tiny_split_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_tiny_split_pk"),
+            table_path.to_string(),
+            pk_changelog_schema(&[
+                ("source.split.target-size", "1b"),
+                ("source.split.open-file-cost", "1b"),
+            ]),
+            None,
+        )
+    }
+
+    async fn commit_one_batch(table: &Table, ids: Vec<i32>, values: Vec<i32>) {
+        let mut tw = TableWrite::new(table, "test-user".to_string()).unwrap();
+        tw.write_arrow_batch(&make_batch(ids, values))
+            .await
+            .unwrap();
+        let msgs = tw.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(msgs)
+            .await
+            .unwrap();
+    }
+
+    async fn read_id_value_rows(table: &Table) -> Vec<(i32, i32)> {
+        let rb = table.new_read_builder();
+        let plan = rb.new_scan().plan().await.unwrap();
+        let read = rb.new_read().unwrap();
+        let batches: Vec<RecordBatch> =
+            futures::TryStreamExt::try_collect(read.to_arrow(plan.splits()).unwrap())
+                .await
+                .unwrap();
+        let mut rows: Vec<(i32, i32)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let values = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(|i| (ids.value(i), values.value(i)))
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test: three commits of the same primary key produce three
+    /// key-overlapping files. Even with a 1-byte split target they must stay
+    /// in one split so the sort-merge reader merges them, instead of each
+    /// split emitting its own (stale) version of the row.
+    #[tokio::test]
+    async fn test_pk_plan_keeps_overlapping_files_in_one_split_under_tiny_target() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tiny_split_overlap";
+        setup_dirs(&file_io, table_path).await;
+        let table = tiny_split_pk_table(&file_io, table_path);
+
+        commit_one_batch(&table, vec![1], vec![10]).await;
+        commit_one_batch(&table, vec![1], vec![20]).await;
+        commit_one_batch(&table, vec![1], vec![30]).await;
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        assert_eq!(
+            plan.splits().len(),
+            1,
+            "overlapping files must share a split"
+        );
+        assert_eq!(plan.splits()[0].data_files().len(), 3);
+
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 30)]);
+    }
+
+    /// Files with disjoint key ranges may still be distributed across splits
+    /// for parallelism when the split target is small.
+    #[tokio::test]
+    async fn test_pk_plan_separates_disjoint_files_under_tiny_target() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tiny_split_disjoint";
+        setup_dirs(&file_io, table_path).await;
+        let table = tiny_split_pk_table(&file_io, table_path);
+
+        commit_one_batch(&table, vec![1], vec![10]).await;
+        commit_one_batch(&table, vec![2], vec![20]).await;
+        commit_one_batch(&table, vec![3], vec![30]).await;
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        assert_eq!(
+            plan.splits().len(),
+            3,
+            "disjoint files keep split parallelism"
+        );
+
+        assert_eq!(
+            read_id_value_rows(&table).await,
+            vec![(1, 10), (2, 20), (3, 30)]
+        );
+    }
+
+    /// Append-only tables have no primary keys (and empty min/max keys); they
+    /// must keep using plain file-level bin packing instead of degrading to a
+    /// single all-files section.
+    #[tokio::test]
+    async fn test_append_table_plan_uses_file_level_bin_pack_under_tiny_target() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tiny_split_append";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+            .option("source.split.target-size", "1b")
+            .option("source.split.open-file-cost", "1b")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_tiny_split_append"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        commit_one_batch(&table, vec![1], vec![10]).await;
+        commit_one_batch(&table, vec![2], vec![20]).await;
+        commit_one_batch(&table, vec![3], vec![30]).await;
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        assert_eq!(
+            plan.splits().len(),
+            3,
+            "append tables keep file-level bin pack"
+        );
+    }
 }

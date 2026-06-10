@@ -31,10 +31,11 @@ use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
+    DataType, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
     TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
+use crate::table::merge_tree_split_generator::{interval_partition, pack_sections, KeyComparator};
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
@@ -627,6 +628,28 @@ impl<'a> TableScan<'a> {
             None
         };
 
+        // Primary-key tables must keep key-overlapping files in one split so the
+        // sort-merge reader sees every version of a key. The comparator decodes
+        // the trimmed-PK min/max keys written by the kv writer.
+        let pk_comparator = {
+            let trimmed_pks = self.table.schema().trimmed_primary_keys();
+            if trimmed_pks.is_empty() {
+                None
+            } else {
+                let fields = self.table.schema().fields();
+                let key_types: Vec<DataType> = trimmed_pks
+                    .iter()
+                    .filter_map(|name| {
+                        fields
+                            .iter()
+                            .find(|f| f.name() == name)
+                            .map(|f| f.data_type().clone())
+                    })
+                    .collect();
+                Some(KeyComparator::new(key_types))
+            }
+        };
+
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
         let (deletion_files_map, effective_row_ranges) =
             if let Some(index_manifest_name) = snapshot.index_manifest() {
@@ -721,6 +744,14 @@ impl<'a> TableScan<'a> {
                 }
 
                 result
+            } else if let Some(ref comparator) = pk_comparator {
+                // Merge-tree path: section files by key-range overlap first, then
+                // bin-pack whole sections. Overlapping files always share a split.
+                pack_sections(
+                    interval_partition(data_files, comparator),
+                    target_split_size,
+                    open_file_cost,
+                )
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
             };
