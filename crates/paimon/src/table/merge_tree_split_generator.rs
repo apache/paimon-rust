@@ -27,7 +27,7 @@
 //! [IntervalPartition](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/mergetree/compact/IntervalPartition.java)
 
 use super::bin_pack::pack_for_ordered;
-use crate::spec::{datum_cmp, BinaryRow, DataFileMeta, DataType, Datum};
+use crate::spec::{datum_cmp, BinaryRow, DataFileMeta, DataType, Datum, TableSchema};
 use std::cmp::{self, Ordering};
 
 /// Compares serialized `BinaryRow` keys field-by-field using the trimmed
@@ -47,6 +47,29 @@ type DecodedKey = Vec<Option<Datum>>;
 impl KeyComparator {
     pub(crate) fn new(key_types: Vec<DataType>) -> Self {
         Self { key_types }
+    }
+
+    /// Build a comparator over a table's trimmed primary keys, matching the
+    /// key layout the kv writer uses for min/max keys. Returns `None` for
+    /// tables without primary keys.
+    pub(crate) fn from_table_schema(schema: &TableSchema) -> Option<Self> {
+        let trimmed_pks = schema.trimmed_primary_keys();
+        if trimmed_pks.is_empty() {
+            return None;
+        }
+        let fields = schema.fields();
+        let key_types: Vec<DataType> = trimmed_pks
+            .iter()
+            .filter_map(|name| {
+                fields
+                    .iter()
+                    .find(|f| f.name() == name)
+                    .map(|f| f.data_type().clone())
+            })
+            .collect();
+        // A PK name missing from the fields (should not happen) leaves the
+        // arity short; decode then fails and callers degrade safely.
+        Some(Self::new(key_types))
     }
 
     /// Decode a serialized min/max key. Returns `None` when the key is empty
@@ -194,6 +217,43 @@ pub(crate) fn pack_sections(
     .into_iter()
     .map(|sections| sections.into_iter().flatten().collect())
     .collect()
+}
+
+/// Whether any two files in the group overlap on primary-key range.
+///
+/// Undecodable key ranges report `true` (overlap assumed), so callers fall
+/// back to the merging read path rather than risk emitting unmerged rows.
+pub(crate) fn has_key_overlap(files: &[DataFileMeta], comparator: &KeyComparator) -> bool {
+    if files.len() <= 1 {
+        return false;
+    }
+    let keyed = match decode_all(files.to_vec(), comparator) {
+        Ok(keyed) => keyed,
+        Err(_) => return true,
+    };
+    let mut ranges: Vec<(&DecodedKey, &DecodedKey)> =
+        keyed.iter().map(|kf| (&kf.min, &kf.max)).collect();
+    ranges.sort_by(|a, b| compare_decoded(a.0, b.0));
+    let mut bound = ranges[0].1;
+    for &(min, max) in &ranges[1..] {
+        if compare_decoded(min, bound) != Ordering::Greater {
+            return true;
+        }
+        if compare_decoded(max, bound) == Ordering::Greater {
+            bound = max;
+        }
+    }
+    false
+}
+
+/// Whether a split's files must go through the sort-merge reader.
+///
+/// Level-0 files may carry unmerged duplicates of any key, and files whose
+/// key ranges overlap (e.g. compacted files on different levels) hold
+/// multiple versions of the same key; both require merging. Disjoint
+/// compacted files can be read raw.
+pub(crate) fn split_requires_merge(files: &[DataFileMeta], comparator: &KeyComparator) -> bool {
+    files.iter().any(|f| f.level == 0) || has_key_overlap(files, comparator)
 }
 
 #[cfg(test)]
@@ -349,5 +409,69 @@ mod tests {
             section_names(&splits),
             vec![vec!["a"], vec!["b"], vec!["c"]]
         );
+    }
+
+    #[test]
+    fn has_key_overlap_detects_cross_level_overlap() {
+        let comparator = int_comparator();
+        let overlapping = vec![
+            keyed_file("l1", 1, 50, 100, 1),
+            keyed_file("l2", 40, 90, 100, 2),
+        ];
+        assert!(has_key_overlap(&overlapping, &comparator));
+
+        let disjoint = vec![
+            keyed_file("l1", 1, 30, 100, 1),
+            keyed_file("l2", 31, 90, 100, 2),
+        ];
+        assert!(!has_key_overlap(&disjoint, &comparator));
+    }
+
+    /// A wide earlier range must keep bounding later files: [1,100] overlaps
+    /// [50,60] even though the middle file [10,20] is disjoint from it.
+    #[test]
+    fn has_key_overlap_tracks_running_bound() {
+        let comparator = int_comparator();
+        let files = vec![
+            keyed_file("wide", 1, 100, 100, 1),
+            keyed_file("mid", 10, 20, 100, 2),
+            keyed_file("late", 50, 60, 100, 3),
+        ];
+        assert!(has_key_overlap(&files, &comparator));
+    }
+
+    #[test]
+    fn has_key_overlap_assumes_overlap_for_undecodable_keys() {
+        let comparator = int_comparator();
+        let mut no_key = keyed_file("a", 1, 2, 100, 1);
+        no_key.min_key = Vec::new();
+        let files = vec![no_key, keyed_file("b", 10, 20, 100, 2)];
+        assert!(has_key_overlap(&files, &comparator));
+    }
+
+    #[test]
+    fn split_requires_merge_for_level_zero_or_overlap() {
+        let comparator = int_comparator();
+
+        // Any level-0 file forces merging, even with disjoint ranges.
+        let with_level_zero = vec![
+            keyed_file("l0", 1, 10, 100, 0),
+            keyed_file("l1", 11, 20, 100, 1),
+        ];
+        assert!(split_requires_merge(&with_level_zero, &comparator));
+
+        // Compacted files with overlapping ranges force merging too.
+        let overlapping_compacted = vec![
+            keyed_file("l1", 1, 50, 100, 1),
+            keyed_file("l2", 40, 90, 100, 2),
+        ];
+        assert!(split_requires_merge(&overlapping_compacted, &comparator));
+
+        // Disjoint compacted files can be read raw.
+        let disjoint_compacted = vec![
+            keyed_file("l1", 1, 30, 100, 1),
+            keyed_file("l2", 31, 90, 100, 2),
+        ];
+        assert!(!split_requires_merge(&disjoint_compacted, &comparator));
     }
 }

@@ -31,7 +31,7 @@ use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    DataType, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
+    FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
     TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
@@ -631,24 +631,7 @@ impl<'a> TableScan<'a> {
         // Primary-key tables must keep key-overlapping files in one split so the
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
-        let pk_comparator = {
-            let trimmed_pks = self.table.schema().trimmed_primary_keys();
-            if trimmed_pks.is_empty() {
-                None
-            } else {
-                let fields = self.table.schema().fields();
-                let key_types: Vec<DataType> = trimmed_pks
-                    .iter()
-                    .filter_map(|name| {
-                        fields
-                            .iter()
-                            .find(|f| f.name() == name)
-                            .map(|f| f.data_type().clone())
-                    })
-                    .collect();
-                Some(KeyComparator::new(key_types))
-            }
-        };
+        let pk_comparator = KeyComparator::from_table_schema(self.table.schema());
 
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
         let (deletion_files_map, effective_row_ranges) =
