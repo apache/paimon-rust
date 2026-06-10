@@ -27,6 +27,7 @@ const AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION: &str = "aggregation.remove-rec
 const FIELDS_DEFAULT_AGG_FUNCTION_OPTION: &str = "fields.default-aggregate-function";
 const FIELDS_PREFIX: &str = "fields.";
 const AGG_FUNCTION_SUFFIX: &str = ".aggregate-function";
+const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
 const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
 const DISTINCT_SUFFIX: &str = ".distinct";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
@@ -93,7 +94,7 @@ impl<'a> AggregationConfig<'a> {
             }
         };
         if mode.is_some() {
-            self.validate_field_aggregators(fields)?;
+            self.validate_field_scoped_options(fields)?;
         }
         Ok(mode)
     }
@@ -156,17 +157,22 @@ impl<'a> AggregationConfig<'a> {
     }
 
     /// Schema-aware checks run by [`validate_create_mode`] once the engine is
-    /// confirmed active.  For every `fields.<col>.aggregate-function` key:
-    /// * the `<col>` segment must name an existing schema field
+    /// confirmed active.  For every `fields.<col>.<known-suffix>` key
+    /// (currently `aggregate-function` and `list-agg-delimiter`):
+    /// * the `<col>` segment must name an existing schema field; this catches
+    ///   typo'd column names that would otherwise silently fall back to the
+    ///   default function / default delimiter at read time.
+    ///
+    /// For `aggregate-function` keys additionally:
     /// * the function name must be one of the supported aggregators
     /// * the function must accept the field's declared data type
     ///
     /// `fields.default-aggregate-function` only has its name validated;
     /// per-column type compatibility for the default is deferred to runtime
     /// because the default applies broadly across columns.
-    fn validate_field_aggregators(&self, fields: &[DataField]) -> crate::Result<()> {
+    fn validate_field_scoped_options(&self, fields: &[DataField]) -> crate::Result<()> {
         for (key, value) in self.options {
-            let Some(col) = parse_field_aggregator_key(key) else {
+            let Some((col, kind)) = parse_field_scoped_option_key(key) else {
                 continue;
             };
             let Some(field) = fields.iter().find(|f| f.name() == col) else {
@@ -180,7 +186,9 @@ impl<'a> AggregationConfig<'a> {
                     ),
                 });
             };
-            validate_aggregator_for_type(value, col, field.data_type())?;
+            if matches!(kind, FieldScopedOptionKind::AggregateFunction) {
+                validate_aggregator_for_type(value, col, field.data_type())?;
+            }
         }
 
         if let Some(default) = self
@@ -202,17 +210,39 @@ impl<'a> AggregationConfig<'a> {
     }
 }
 
-/// Parse the `<col>` segment out of `fields.<col>.aggregate-function`, or
-/// return `None` if `key` is some other option string.
-fn parse_field_aggregator_key(key: &str) -> Option<&str> {
+/// Field-scoped option suffixes that schema-aware validation recognizes.
+/// Each variant maps to a single `fields.<col>.<suffix>` key shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldScopedOptionKind {
+    AggregateFunction,
+    ListAggDelimiter,
+}
+
+/// Parse the `<col>` segment and option kind out of a
+/// `fields.<col>.<known-suffix>` key, or return `None` if `key` doesn't
+/// match any known field-scoped option suffix.
+fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKind)> {
     let inner = key.strip_prefix(FIELDS_PREFIX)?;
-    let col = inner.strip_suffix(AGG_FUNCTION_SUFFIX)?;
-    if col.is_empty() {
-        // `fields..aggregate-function` is malformed; reject by treating as
-        // "no match" so the caller surfaces a typo-style error elsewhere.
-        return None;
+    for (suffix, kind) in [
+        (
+            AGG_FUNCTION_SUFFIX,
+            FieldScopedOptionKind::AggregateFunction,
+        ),
+        (
+            LIST_AGG_DELIMITER_SUFFIX,
+            FieldScopedOptionKind::ListAggDelimiter,
+        ),
+    ] {
+        if let Some(col) = inner.strip_suffix(suffix) {
+            if col.is_empty() {
+                // `fields..<suffix>` is malformed; treat as "no match" so the
+                // caller surfaces a typo-style error elsewhere.
+                continue;
+            }
+            return Some((col, kind));
+        }
     }
-    Some(col)
+    None
 }
 
 const SUPPORTED_AGGREGATOR_NAMES_HINT: &str = "supported: sum, product, min, max, last_value, \
@@ -452,6 +482,26 @@ mod tests {
                     && message.contains("fields.amout.aggregate-function")
                     && message.contains("amount")),
             "expected unknown-field error to surface the typo + available columns, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_create_mode_rejects_unknown_field_for_list_agg_delimiter() {
+        // typo: `tga` instead of `tag`; without this check `listagg` on `tag`
+        // would silently fall back to the default delimiter at read time.
+        let options = aggregation_options(&[
+            ("fields.tag.aggregate-function", "listagg"),
+            ("fields.tga.list-agg-delimiter", "|"),
+        ]);
+        let err = AggregationConfig::new(&options)
+            .validate_create_mode(true, &sample_fields())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("tga")
+                    && message.contains("fields.tga.list-agg-delimiter")
+                    && message.contains("tag")),
+            "expected unknown-field error for list-agg-delimiter typo, got {err:?}"
         );
     }
 
