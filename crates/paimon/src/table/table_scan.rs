@@ -369,6 +369,13 @@ impl<'a> TableScan<'a> {
     }
 
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
+        // A table copy produced by `copy_with_time_travel` already resolved
+        // the selector in its options; reuse it instead of re-reading
+        // tag/snapshot files on every plan.
+        if let Some(snapshot) = self.table.travel_snapshot() {
+            return Ok(Some(snapshot.clone()));
+        }
+
         let file_io = self.table.file_io();
         let table_path = self.table.location();
 

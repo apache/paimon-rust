@@ -86,7 +86,7 @@ pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::{DataField, TableSchema};
+use crate::spec::{DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -101,6 +101,10 @@ pub struct Table {
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
     time_traveled: bool,
+    /// Snapshot resolved by [`Table::copy_with_time_travel`] from this copy's
+    /// options, so scans don't have to resolve the same selector again.
+    /// Cleared whenever options change through [`Table::copy_with_options`].
+    travel_snapshot: Option<Snapshot>,
 }
 
 impl Table {
@@ -121,6 +125,7 @@ impl Table {
             schema_manager,
             rest_env,
             time_traveled: false,
+            travel_snapshot: None,
         }
     }
 
@@ -195,6 +200,9 @@ impl Table {
             schema_manager: self.schema_manager.clone(),
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
+            // The options just changed, so a previously resolved snapshot may
+            // no longer match the selector they contain.
+            travel_snapshot: None,
         }
     }
 
@@ -208,15 +216,12 @@ impl Table {
     /// the table's fields and keys come from that snapshot's schema while the
     /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
     /// Like Java, resolution failures fall back silently to the current
-    /// schema; an invalid selector still fails later at scan planning.
+    /// schema (the `if let Ok` below swallows them); an invalid selector
+    /// still fails later at scan planning.
     pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
         let mut table = self.copy_with_options(extra);
-        let core_options = crate::spec::CoreOptions::new(table.schema.options());
-        // No selector configured: nothing to resolve, no IO.
-        match core_options.try_time_travel_selector() {
-            Ok(Some(_)) => {}
-            _ => return Ok(table),
-        }
+        // travel_to_snapshot returns Ok(None) without IO when the merged
+        // options contain no selector.
         if let Ok(Some(snapshot)) =
             time_travel::travel_to_snapshot(&table.file_io, &table.location, table.schema.options())
                 .await
@@ -227,6 +232,7 @@ impl Table {
                     snapshot_schema.copy_with_replaced_options(table.schema.options().clone());
                 table.time_traveled = true;
             }
+            table.travel_snapshot = Some(snapshot);
         }
         Ok(table)
     }
@@ -235,6 +241,12 @@ impl Table {
     /// historical schema (see [`Table::copy_with_time_travel`]).
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
+    }
+
+    /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
+    /// copy's options, if any. Lets scans skip re-resolving the selector.
+    pub(crate) fn travel_snapshot(&self) -> Option<&Snapshot> {
+        self.travel_snapshot.as_ref()
     }
 }
 

@@ -224,6 +224,11 @@ mod tests {
             traveled.schema().options().get("scan.version"),
             Some(&"1".to_string())
         );
+        // The resolved snapshot is cached for scans, and invalidated when the
+        // options change again.
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(1));
+        let recopied = traveled.copy_with_options(options(&[("k", "v")]));
+        assert!(recopied.travel_snapshot().is_none());
     }
 
     #[tokio::test]

@@ -176,6 +176,26 @@ async fn test_session_scan_version_uses_snapshot_schema() {
         "error should mention time travel: {err}"
     );
 
+    // Other write statements are rejected up front instead of silently
+    // ignoring the active selector and writing to the latest state.
+    for sql in [
+        "UPDATE paimon.default.t SET name = 'x' WHERE id = 1",
+        "DELETE FROM paimon.default.t WHERE id = 1",
+        "TRUNCATE TABLE paimon.default.t",
+    ] {
+        let err = match sql_context.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => match df.collect().await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{sql} should fail while scan.version is set"),
+            },
+        };
+        assert!(
+            err.contains("time-travel option"),
+            "{sql} should mention the active time-travel option: {err}"
+        );
+    }
+
     sql_context
         .sql("RESET 'paimon.scan.version'")
         .await
