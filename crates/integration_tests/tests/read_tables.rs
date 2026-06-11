@@ -1587,20 +1587,9 @@ async fn test_read_schema_evolution_rename_column() {
 /// Old Parquet/ORC data files have the dropped column; new Avro files do not.
 #[tokio::test]
 async fn test_read_mixed_format_schema_evolution_drop_column() {
-    let (plan, batches) =
-        scan_and_read_with_fs_catalog("mixed_format_schema_evolution_drop_column", None).await;
-
-    let formats: HashSet<&str> = plan
-        .splits()
-        .iter()
-        .flat_map(|split| split.data_files())
-        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
-        .collect();
-    assert_eq!(
-        formats,
-        HashSet::from(["avro", "orc", "parquet"]),
-        "mixed_format_schema_evolution_drop_column should scan all provisioned file formats"
-    );
+    let table_name = "mixed_format_schema_evolution_drop_column";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
 
     for batch in &batches {
         assert!(
