@@ -222,6 +222,8 @@ impl DataEvolutionWriter {
             rb.with_projection(&col_refs);
             let read = rb.new_read()?;
 
+            // Base + partial-column files share row-id ranges, so physical
+            // row counts overcount the group's logical rows.
             let split = DataSplitBuilder::new()
                 .with_snapshot(file_range.snapshot_id)
                 .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
@@ -229,6 +231,7 @@ impl DataEvolutionWriter {
                 .with_bucket_path(file_range.bucket_path.clone())
                 .with_total_buckets(file_range.total_buckets)
                 .with_data_files(file_range.files.clone())
+                .with_raw_convertible(file_range.files.len() == 1)
                 .build()?;
 
             let stream = read.to_arrow(&[split])?;

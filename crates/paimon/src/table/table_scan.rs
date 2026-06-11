@@ -35,7 +35,9 @@ use crate::spec::{
     TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
-use crate::table::merge_tree_split_generator::{interval_partition, pack_sections, KeyComparator};
+use crate::table::merge_tree_split_generator::{
+    merge_tree_split_for_batch, KeyComparator, SplitGroup,
+};
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
@@ -421,16 +423,13 @@ impl<'a> TableScan<'a> {
 
     /// Apply a limit-pushdown hint to the generated splits.
     ///
-    /// Iterates through splits and accumulates `merged_row_count()` until the
-    /// limit hint is reached. Returns only the splits likely needed to satisfy
-    /// that hint.
-    ///
-    /// This does not guarantee an exact final row count. If a split's
-    /// `merged_row_count()` is `None` (for example because of unknown deletion
-    /// cardinality), that split is kept even though its contribution to the
-    /// limit is unknown. Planning may still stop early later if the
-    /// accumulated known `merged_row_count()` reaches the limit, and the
-    /// caller or query engine must enforce the final LIMIT.
+    /// Mirrors Java `DataTableBatchScan#applyPushDownLimit`: splits whose
+    /// `merged_row_count()` is unknown (for example merge-needed PK splits or
+    /// unknown deletion cardinality) are skipped — they contribute an unknown
+    /// number of rows, so they cannot help satisfy the limit. Pruning is
+    /// committed only once the accumulated known row count reaches the limit;
+    /// if it never does, the original split list is returned unchanged. The
+    /// caller or query engine must still enforce the final LIMIT.
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         let limit = match self.limit {
             Some(l) => l,
@@ -447,22 +446,17 @@ impl<'a> TableScan<'a> {
         let mut limited_splits = Vec::new();
         let mut scanned_row_count: i64 = 0;
 
-        for split in splits {
-            match split.merged_row_count() {
-                Some(merged_count) => {
-                    limited_splits.push(split);
-                    scanned_row_count += merged_count;
-                    if scanned_row_count >= limit as i64 {
-                        return limited_splits;
-                    }
-                }
-                None => {
-                    limited_splits.push(split);
+        for split in &splits {
+            if let Some(merged_count) = split.merged_row_count() {
+                limited_splits.push(split.clone());
+                scanned_row_count += merged_count;
+                if scanned_row_count >= limit as i64 {
+                    return limited_splits;
                 }
             }
         }
 
-        limited_splits
+        splits
     }
 
     /// Read all manifest entries from a snapshot, applying filters and merging.
@@ -696,7 +690,7 @@ impl<'a> TableScan<'a> {
             // Data-evolution tables merge overlapping row-id groups column-wise during read.
             // Keep that split boundary intact and only bin-pack single-file groups.
             // Apply group-level predicate filtering after grouping by row_id range.
-            let file_groups: Vec<Vec<DataFileMeta>> = if data_evolution_enabled {
+            let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
 
                 // Filter groups by merged stats before splitting.
@@ -731,28 +725,49 @@ impl<'a> TableScan<'a> {
 
                 let mut result = Vec::new();
                 for group in multis {
-                    result.push(group);
+                    // Files sharing a row-id range hold column slices of the
+                    // same logical rows; physical counts overcount them
+                    // (Java DataEvolutionSplitGenerator: not raw convertible).
+                    result.push(SplitGroup {
+                        files: group,
+                        raw_convertible: false,
+                    });
                 }
 
                 let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
                 for file_group in split_for_batch(single_files, target_split_size, open_file_cost) {
-                    result.push(file_group);
+                    result.push(SplitGroup {
+                        files: file_group,
+                        raw_convertible: true,
+                    });
                 }
 
                 result
             } else if let Some(ref comparator) = pk_comparator {
-                // Merge-tree path: section files by key-range overlap first, then
-                // bin-pack whole sections. Overlapping files always share a split.
-                pack_sections(
-                    interval_partition(data_files, comparator),
+                // Merge-tree path: keep key-overlapping files in one split and
+                // mark which splits the sort-merge reader can skip (mirrors
+                // Java MergeTreeSplitGenerator#splitForBatch).
+                merge_tree_split_for_batch(
+                    data_files,
+                    comparator,
                     target_split_size,
                     open_file_cost,
                 )
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
+                    .into_iter()
+                    .map(|files| SplitGroup {
+                        files,
+                        raw_convertible: true,
+                    })
+                    .collect()
             };
 
-            for file_group in file_groups {
+            for group in file_groups {
+                let SplitGroup {
+                    files: file_group,
+                    raw_convertible,
+                } = group;
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
@@ -782,7 +797,8 @@ impl<'a> TableScan<'a> {
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
-                    .with_data_files(file_group);
+                    .with_data_files(file_group)
+                    .with_raw_convertible(raw_convertible);
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
                 }
@@ -1007,10 +1023,30 @@ mod tests {
         assert!(pruned.is_empty());
     }
 
+    /// Java semantics: unknown-count splits are skipped — they cannot prove
+    /// progress toward the limit — and pruning commits once the counted
+    /// splits alone cover the limit.
     #[test]
-    fn test_apply_limit_pushdown_keeps_unknown_merged_row_count() {
+    fn test_apply_limit_pushdown_skips_unknown_merged_row_count() {
         let table = limit_test_table();
         let scan = TableScan::new(&table, None, vec![], None, Some(3), None);
+        let splits = vec![
+            limit_test_split("a.parquet", 2),
+            limit_test_split_with_unknown_merged_row_count("b.parquet", 4),
+            limit_test_split("c.parquet", 3),
+        ];
+
+        let pruned = scan.apply_limit_pushdown(splits);
+
+        assert_eq!(split_file_names(&pruned), vec!["a.parquet", "c.parquet"]);
+    }
+
+    /// When counted splits never reach the limit, the original split list is
+    /// returned unchanged (mirrors Java `applyPushDownLimit`).
+    #[test]
+    fn test_apply_limit_pushdown_returns_all_when_limit_not_reached() {
+        let table = limit_test_table();
+        let scan = TableScan::new(&table, None, vec![], None, Some(100), None);
         let splits = vec![
             limit_test_split("a.parquet", 2),
             limit_test_split_with_unknown_merged_row_count("b.parquet", 4),
@@ -1023,6 +1059,35 @@ mod tests {
             split_file_names(&pruned),
             vec!["a.parquet", "b.parquet", "c.parquet"]
         );
+    }
+
+    /// A non-raw-convertible split (merge-needed PK split) has an unknown
+    /// merged row count: its physical rows overcount merged versions, so it
+    /// must not satisfy the limit on its own.
+    #[test]
+    fn test_apply_limit_pushdown_treats_merge_splits_as_unknown() {
+        let table = limit_test_table();
+        let scan = TableScan::new(&table, None, vec![], None, Some(3), None);
+
+        let mut merge_file = test_data_file_meta(Vec::new(), Vec::new(), Vec::new(), 10);
+        merge_file.file_name = "merge.parquet".to_string();
+        let merge_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/merge.parquet".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![merge_file])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+        assert_eq!(merge_split.merged_row_count(), None);
+
+        let splits = vec![merge_split, limit_test_split("a.parquet", 3)];
+        let pruned = scan.apply_limit_pushdown(splits);
+
+        // The merge split is skipped; only the counted split commits pruning.
+        assert_eq!(split_file_names(&pruned), vec!["a.parquet"]);
     }
 
     #[test]

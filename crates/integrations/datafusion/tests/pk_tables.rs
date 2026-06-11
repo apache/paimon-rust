@@ -2025,6 +2025,74 @@ async fn test_pk_dedup_merges_across_tiny_splits() {
     assert_eq!(rows, vec![(1, 30)]);
 }
 
+/// LIMIT must not be starved by merge-needed splits: the three versions of
+/// key 1 share one split whose physical row count (3) overstates its single
+/// logical row. Such splits report an unknown merged row count, so limit
+/// pushdown cannot stop before the split holding key 2.
+#[tokio::test]
+async fn test_pk_limit_not_starved_by_merge_splits() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_tiny_split_limit (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'source.split.target-size' = '1b',
+                'source.split.open-file-cost' = '1b'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Three versions of key 1 (one overlapping section), then key 2.
+    for value in [10, 20, 30] {
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.t_tiny_split_limit VALUES (1, {value})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_tiny_split_limit VALUES (2, 200)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Two logical rows exist; LIMIT 2 must return both.
+    let returned = row_count(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_tiny_split_limit LIMIT 2",
+    )
+    .await;
+    assert_eq!(returned, 2, "LIMIT 2 must yield 2 rows");
+
+    // COUNT(*) must reflect logical rows, not the physical (pre-merge) count
+    // that DataFusion could otherwise read from exact scan statistics.
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_tiny_split_limit")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "COUNT(*) must count merged rows");
+}
+
 /// Same regression for the partial-update engine: per-column updates of one
 /// key spread over three commits/files must merge into a single row even
 /// when the split target would otherwise separate the files.

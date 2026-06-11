@@ -37,7 +37,7 @@ use crate::spec::{
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, Error};
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchOptions};
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -339,11 +339,16 @@ impl KeyValueFileReader {
                         .iter()
                         .map(|&src| batch.column(src).clone())
                         .collect();
-                    let reordered = RecordBatch::try_new(output_schema.clone(), columns)
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!("Failed to reorder merged RecordBatch: {e}"),
-                            source: Some(Box::new(e)),
-                        })?;
+                    // An explicit row count keeps empty projections working
+                    // (e.g. COUNT(*) reads no columns).
+                    let options =
+                        RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                    let reordered =
+                        RecordBatch::try_new_with_options(output_schema.clone(), columns, &options)
+                            .map_err(|e| Error::UnexpectedError {
+                                message: format!("Failed to reorder merged RecordBatch: {e}"),
+                                source: Some(Box::new(e)),
+                            })?;
                     yield reordered;
                 }
             }

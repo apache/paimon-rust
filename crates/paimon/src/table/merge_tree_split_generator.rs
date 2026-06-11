@@ -219,41 +219,82 @@ pub(crate) fn pack_sections(
     .collect()
 }
 
-/// Whether any two files in the group overlap on primary-key range.
+/// A group of files forming one split, plus whether the split can be read
+/// raw — without the sort-merge reader — so its physical row count equals
+/// its logical row count.
 ///
-/// Undecodable key ranges report `true` (overlap assumed), so callers fall
-/// back to the merging read path rather than risk emitting unmerged rows.
-pub(crate) fn has_key_overlap(files: &[DataFileMeta], comparator: &KeyComparator) -> bool {
-    if files.len() <= 1 {
-        return false;
-    }
-    let keyed = match decode_all(files.to_vec(), comparator) {
-        Ok(keyed) => keyed,
-        Err(_) => return true,
-    };
-    let mut ranges: Vec<(&DecodedKey, &DecodedKey)> =
-        keyed.iter().map(|kf| (&kf.min, &kf.max)).collect();
-    ranges.sort_by(|a, b| compare_decoded(a.0, b.0));
-    let mut bound = ranges[0].1;
-    for &(min, max) in &ranges[1..] {
-        if compare_decoded(min, bound) != Ordering::Greater {
-            return true;
-        }
-        if compare_decoded(max, bound) == Ordering::Greater {
-            bound = max;
-        }
-    }
-    false
+/// Mirrors Java `SplitGenerator.SplitGroup`.
+#[derive(Debug)]
+pub(crate) struct SplitGroup {
+    pub(crate) files: Vec<DataFileMeta>,
+    pub(crate) raw_convertible: bool,
 }
 
-/// Whether a split's files must go through the sort-merge reader.
+/// Whether a file is known to contain no DELETE rows.
 ///
-/// Level-0 files may carry unmerged duplicates of any key, and files whose
-/// key ranges overlap (e.g. compacted files on different levels) hold
-/// multiple versions of the same key; both require merging. Disjoint
-/// compacted files can be read raw.
-pub(crate) fn split_requires_merge(files: &[DataFileMeta], comparator: &KeyComparator) -> bool {
-    files.iter().any(|f| f.level == 0) || has_key_overlap(files, comparator)
+/// Mirrors Java `MergeTreeSplitGenerator#withoutDeleteRow`: a missing
+/// `delete_row_count` is treated as "no deletes" for compatibility with files
+/// written by old versions.
+fn without_delete_row(file: &DataFileMeta) -> bool {
+    file.delete_row_count.is_none_or(|count| count == 0)
+}
+
+/// Generate batch splits for a merge-tree (primary-key) bucket.
+///
+/// Mirrors Java `MergeTreeSplitGenerator#splitForBatch` for the merging read
+/// path (deletion-vector and first-row tables are routed to plain size-based
+/// packing before reaching this function, matching Java's
+/// `alwaysRawConvertible` fast path):
+///
+/// * If every file is compacted (level != 0), has no delete rows, and all
+///   files sit on a single level, no two files can overlap on key range, so
+///   the files are bin-packed individually and every group is raw
+///   convertible.
+/// * Otherwise files are sectioned by key-range overlap and whole sections
+///   are bin-packed; a group is raw convertible only when it holds exactly
+///   one file without delete rows.
+pub(crate) fn merge_tree_split_for_batch(
+    files: Vec<DataFileMeta>,
+    comparator: &KeyComparator,
+    target_split_size: i64,
+    open_file_cost: i64,
+) -> Vec<SplitGroup> {
+    let raw_convertible = files.iter().all(|f| f.level != 0 && without_delete_row(f));
+    let one_level = {
+        let mut levels: Vec<i32> = files.iter().map(|f| f.level).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        levels.len() == 1
+    };
+
+    if raw_convertible && one_level {
+        return pack_for_ordered(
+            files,
+            |f| cmp::max(f.file_size, open_file_cost),
+            target_split_size,
+        )
+        .into_iter()
+        .map(|files| SplitGroup {
+            files,
+            raw_convertible: true,
+        })
+        .collect();
+    }
+
+    pack_sections(
+        interval_partition(files, comparator),
+        target_split_size,
+        open_file_cost,
+    )
+    .into_iter()
+    .map(|files| {
+        let raw_convertible = files.len() == 1 && without_delete_row(&files[0]);
+        SplitGroup {
+            files,
+            raw_convertible,
+        }
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -411,67 +452,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn has_key_overlap_detects_cross_level_overlap() {
-        let comparator = int_comparator();
-        let overlapping = vec![
-            keyed_file("l1", 1, 50, 100, 1),
-            keyed_file("l2", 40, 90, 100, 2),
-        ];
-        assert!(has_key_overlap(&overlapping, &comparator));
-
-        let disjoint = vec![
-            keyed_file("l1", 1, 30, 100, 1),
-            keyed_file("l2", 31, 90, 100, 2),
-        ];
-        assert!(!has_key_overlap(&disjoint, &comparator));
+    fn group_names(groups: &[SplitGroup]) -> Vec<Vec<&str>> {
+        groups
+            .iter()
+            .map(|g| g.files.iter().map(|f| f.file_name.as_str()).collect())
+            .collect()
     }
 
-    /// A wide earlier range must keep bounding later files: [1,100] overlaps
-    /// [50,60] even though the middle file [10,20] is disjoint from it.
+    /// All files compacted on one level: the fast path bin-packs files
+    /// individually and every group is raw convertible, even multi-file ones
+    /// (same-level files never overlap).
     #[test]
-    fn has_key_overlap_tracks_running_bound() {
+    fn split_for_batch_one_level_fast_path_is_raw_convertible() {
         let comparator = int_comparator();
         let files = vec![
-            keyed_file("wide", 1, 100, 100, 1),
-            keyed_file("mid", 10, 20, 100, 2),
-            keyed_file("late", 50, 60, 100, 3),
+            keyed_file("a", 1, 10, 100, 5),
+            keyed_file("b", 11, 20, 100, 5),
+            keyed_file("c", 21, 30, 100, 5),
         ];
-        assert!(has_key_overlap(&files, &comparator));
+        let groups = merge_tree_split_for_batch(files, &comparator, 250, 1);
+        assert_eq!(group_names(&groups), vec![vec!["a", "b"], vec!["c"]]);
+        assert!(groups.iter().all(|g| g.raw_convertible));
     }
 
+    /// A delete-row file disables the fast path; after sectioning, only
+    /// single-file groups without delete rows stay raw convertible.
     #[test]
-    fn has_key_overlap_assumes_overlap_for_undecodable_keys() {
+    fn split_for_batch_delete_rows_disable_raw_conversion() {
         let comparator = int_comparator();
-        let mut no_key = keyed_file("a", 1, 2, 100, 1);
-        no_key.min_key = Vec::new();
-        let files = vec![no_key, keyed_file("b", 10, 20, 100, 2)];
-        assert!(has_key_overlap(&files, &comparator));
+        let mut with_deletes = keyed_file("del", 1, 10, 100, 5);
+        with_deletes.delete_row_count = Some(3);
+        let files = vec![with_deletes, keyed_file("clean", 11, 20, 100, 5)];
+        // Large target size packs both disjoint sections into one split.
+        let groups = merge_tree_split_for_batch(files, &comparator, 1000, 1);
+        assert_eq!(group_names(&groups), vec![vec!["del", "clean"]]);
+        assert!(!groups[0].raw_convertible, "multi-file group is never raw");
+
+        // Tiny target size keeps each section alone; the delete-row file is
+        // still not raw convertible, the clean one is.
+        let mut with_deletes = keyed_file("del", 1, 10, 100, 5);
+        with_deletes.delete_row_count = Some(3);
+        let files = vec![with_deletes, keyed_file("clean", 11, 20, 100, 5)];
+        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1);
+        assert_eq!(group_names(&groups), vec![vec!["del"], vec!["clean"]]);
+        assert!(!groups[0].raw_convertible);
+        assert!(groups[1].raw_convertible);
     }
 
+    /// Level-0 or cross-level files take the sectioning path; overlapping
+    /// files share a non-raw-convertible group while a disjoint single file
+    /// stays raw convertible. Missing delete_row_count counts as "no deletes"
+    /// (old-version files).
     #[test]
-    fn split_requires_merge_for_level_zero_or_overlap() {
+    fn split_for_batch_sections_overlapping_files() {
         let comparator = int_comparator();
-
-        // Any level-0 file forces merging, even with disjoint ranges.
-        let with_level_zero = vec![
-            keyed_file("l0", 1, 10, 100, 0),
-            keyed_file("l1", 11, 20, 100, 1),
+        let files = vec![
+            keyed_file("l0", 1, 50, 100, 0),
+            keyed_file("l1", 40, 90, 100, 1),
+            keyed_file("solo", 100, 120, 100, 2),
         ];
-        assert!(split_requires_merge(&with_level_zero, &comparator));
-
-        // Compacted files with overlapping ranges force merging too.
-        let overlapping_compacted = vec![
-            keyed_file("l1", 1, 50, 100, 1),
-            keyed_file("l2", 40, 90, 100, 2),
-        ];
-        assert!(split_requires_merge(&overlapping_compacted, &comparator));
-
-        // Disjoint compacted files can be read raw.
-        let disjoint_compacted = vec![
-            keyed_file("l1", 1, 30, 100, 1),
-            keyed_file("l2", 31, 90, 100, 2),
-        ];
-        assert!(!split_requires_merge(&disjoint_compacted, &comparator));
+        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1);
+        assert_eq!(group_names(&groups), vec![vec!["l0", "l1"], vec!["solo"]]);
+        assert!(
+            !groups[0].raw_convertible,
+            "overlapping versions must merge"
+        );
+        assert!(groups[1].raw_convertible, "disjoint single compacted file");
     }
 }

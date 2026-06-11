@@ -425,6 +425,10 @@ pub struct DataSplit {
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Whether the split can be read raw, without the merge reader: its
+    /// physical rows are exactly its logical rows (modulo deletion files).
+    /// Mirrors Java `DataSplit#rawConvertible`.
+    raw_convertible: bool,
 }
 
 impl DataSplit {
@@ -457,6 +461,12 @@ impl DataSplit {
         self.row_ranges.as_deref()
     }
 
+    /// Whether this split can be read raw (no sort-merge needed); see the
+    /// field doc. Mirrors Java `DataSplit#rawConvertible`.
+    pub fn raw_convertible(&self) -> bool {
+        self.raw_convertible
+    }
+
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
     pub fn deletion_file_for_data_file_index(&self, index: usize) -> Option<&DeletionFile> {
         self.data_deletion_files
@@ -487,21 +497,33 @@ impl DataSplit {
 
     /// Returns the merged row count if it can be computed.
     ///
-    /// Two paths:
-    /// 1. If all files have `first_row_id` (data evolution mode): merge overlapping
-    ///    row ID ranges and take max row count per group.
-    /// 2. Otherwise: row_count() minus deleted rows (if deletion file cardinality is known).
+    /// Two paths, checked in the same order as Java:
+    /// 1. Raw convertible splits (with all deletion-file cardinalities known):
+    ///    physical row counts equal logical row counts, so sum `row_count`
+    ///    minus deleted rows. Splits that need the sort-merge reader may
+    ///    collapse multiple versions of a key into one row, so their physical
+    ///    counts are only an upper bound and are never reported.
+    /// 2. If all files have `first_row_id` (data evolution mode): merge
+    ///    overlapping row ID ranges and take max row count per group.
     ///
-    /// Returns `None` if deletion files exist but cardinality is unknown.
+    /// Returns `None` otherwise.
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
-        // Try data evolution merged row count first (all files have first_row_id)
-        if let Some(count) = self.data_evolution_merged_row_count() {
+        if let Some(count) = self.raw_merged_row_count() {
             return Some(count);
         }
+        self.data_evolution_merged_row_count()
+    }
 
-        // Fallback: row_count - deleted rows
+    /// Physical row count minus deletions, valid only for raw convertible
+    /// splits with all deletion-file cardinalities known.
+    ///
+    /// Mirrors Java `rawMergedRowCountAvailable` + `rawMergedRowCount`.
+    fn raw_merged_row_count(&self) -> Option<i64> {
+        if !self.raw_convertible {
+            return None;
+        }
         match &self.data_deletion_files {
             None => Some(self.row_count()),
             Some(deletion_files) => {
@@ -565,6 +587,7 @@ pub struct DataSplitBuilder {
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    raw_convertible: bool,
 }
 
 impl DataSplitBuilder {
@@ -578,6 +601,10 @@ impl DataSplitBuilder {
             data_files: None,
             data_deletion_files: None,
             row_ranges: None,
+            // Splits with no merge semantics (append tables, single-file
+            // utility splits) are raw by nature; the merge-tree and
+            // data-evolution scan paths set this explicitly per split group.
+            raw_convertible: true,
         }
     }
 
@@ -617,6 +644,12 @@ impl DataSplitBuilder {
 
     pub fn with_row_ranges(mut self, row_ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(row_ranges);
+        self
+    }
+
+    /// Mark whether the split can be read raw; see [`DataSplit::raw_convertible`].
+    pub fn with_raw_convertible(mut self, raw_convertible: bool) -> Self {
+        self.raw_convertible = raw_convertible;
         self
     }
 
@@ -672,6 +705,7 @@ impl DataSplitBuilder {
             data_files,
             data_deletion_files: self.data_deletion_files,
             row_ranges: self.row_ranges,
+            raw_convertible: self.raw_convertible,
         })
     }
 }
@@ -698,5 +732,122 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::stats::BinaryTableStats;
+
+    fn file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: 128,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 1,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+            external_path: None,
+            file_source: None,
+            value_stats_cols: None,
+        }
+    }
+
+    fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_raw_convertible(raw_convertible)
+            .build()
+            .unwrap()
+    }
+
+    /// Raw convertible split without deletion files: physical sum is exact.
+    #[test]
+    fn test_merged_row_count_raw_convertible_sums_physical_rows() {
+        let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
+        assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    /// Merge-needed split (multiple versions of a key may collapse): the
+    /// physical sum is only an upper bound, so the count is unknown.
+    /// Mirrors Java `rawMergedRowCountAvailable`.
+    #[test]
+    fn test_merged_row_count_unknown_for_merge_splits() {
+        let s = split(vec![file("a", 10, None), file("b", 5, None)], false);
+        assert_eq!(s.merged_row_count(), None);
+    }
+
+    /// Non-raw-convertible split where all files carry `first_row_id`: the
+    /// data-evolution branch still applies (overlapping row-id groups count
+    /// the max row count per group).
+    #[test]
+    fn test_merged_row_count_data_evolution_branch() {
+        let mut a = file("a", 10, Some(0));
+        a.row_count = 10;
+        let mut b = file("b", 4, Some(0));
+        b.row_count = 4;
+        let c = file("c", 7, Some(100));
+        let s = split(vec![a, b, c], false);
+        // a and b share row ids [0, ..): max(10, 4) = 10; c adds 7.
+        assert_eq!(s.merged_row_count(), Some(17));
+    }
+
+    /// Raw convertible split with a deletion file of known cardinality:
+    /// deleted rows are subtracted; unknown cardinality makes the raw branch
+    /// unavailable.
+    #[test]
+    fn test_merged_row_count_with_deletion_files() {
+        let s = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("a", 10, None)])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "file:/tmp/a.dv".to_string(),
+                0,
+                0,
+                Some(3),
+            ))])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+        assert_eq!(s.merged_row_count(), Some(7));
+
+        let unknown = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("a", 10, None)])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "file:/tmp/a.dv".to_string(),
+                0,
+                0,
+                None,
+            ))])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+        assert_eq!(unknown.merged_row_count(), None);
     }
 }
