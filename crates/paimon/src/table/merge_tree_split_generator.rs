@@ -199,6 +199,10 @@ pub(crate) fn interval_partition(
 /// Bin-pack whole sections into splits. A section is atomic: its files
 /// overlap on primary key and must never be separated, even when the section
 /// alone exceeds `target_split_size`.
+///
+/// Mirrors Java `MergeTreeSplitGenerator#packSplits`: a section's weight is
+/// `max(total file size, open_file_cost)` — the open-file cost is charged
+/// once per section, not per file.
 pub(crate) fn pack_sections(
     sections: Vec<Vec<DataFileMeta>>,
     target_split_size: i64,
@@ -207,10 +211,10 @@ pub(crate) fn pack_sections(
     pack_for_ordered(
         sections,
         |section| {
-            section
-                .iter()
-                .map(|f| cmp::max(f.file_size, open_file_cost))
-                .sum()
+            cmp::max(
+                section.iter().map(|f| f.file_size).sum::<i64>(),
+                open_file_cost,
+            )
         },
         target_split_size,
     )
@@ -444,11 +448,36 @@ mod tests {
             vec![keyed_file("b", 2, 2, 2, 0)],
             vec![keyed_file("c", 3, 3, 2, 0)],
         ];
-        // Weight is max(file_size=2, open_file_cost=100) = 100 each.
+        // Weight per section is max(total file size=2, open_file_cost=100) = 100.
         let splits = pack_sections(sections, 150, 100);
         assert_eq!(
             section_names(&splits),
             vec![vec!["a"], vec!["b"], vec!["c"]]
+        );
+    }
+
+    /// The open-file cost is charged once per section, not per file (Java
+    /// `packSplits`): two 3-file sections weigh max(6, 100) = 100 each and
+    /// share one split under a 250 target, where a per-file charge (3 × 100)
+    /// would split them apart.
+    #[test]
+    fn pack_sections_charges_open_file_cost_per_section() {
+        let sections = vec![
+            vec![
+                keyed_file("a1", 1, 2, 2, 0),
+                keyed_file("a2", 1, 2, 2, 0),
+                keyed_file("a3", 1, 2, 2, 0),
+            ],
+            vec![
+                keyed_file("b1", 3, 4, 2, 0),
+                keyed_file("b2", 3, 4, 2, 0),
+                keyed_file("b3", 3, 4, 2, 0),
+            ],
+        ];
+        let splits = pack_sections(sections, 250, 100);
+        assert_eq!(
+            section_names(&splits),
+            vec![vec!["a1", "a2", "a3", "b1", "b2", "b3"]]
         );
     }
 
