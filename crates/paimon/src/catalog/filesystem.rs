@@ -747,7 +747,9 @@ mod tests {
         }
     }
 
-    use crate::spec::{ColumnMove, DataType, IntType, SchemaChange, VarCharType};
+    use crate::spec::{
+        ColumnMove, DataField, DataType, IntType, RowType, SchemaChange, VarCharType,
+    };
 
     /// Two-column table (id INT, name VARCHAR) used by the alter-table tests.
     fn two_column_schema() -> Schema {
@@ -942,5 +944,239 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_not_null_column_rejected() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::add_column(
+                    "age".to_string(),
+                    DataType::Int(IntType::with_nullable(false)),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot specify NOT NULL"),
+            "got {err:?}"
+        );
+    }
+
+    /// Collect the IDs of all fields nested inside row types.
+    fn nested_row_field_ids(data_type: &DataType, ids: &mut Vec<i32>) {
+        if let DataType::Row(row) = data_type {
+            for f in row.fields() {
+                ids.push(f.id());
+                nested_row_field_ids(f.data_type(), ids);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_nested_column_reassigns_field_ids() {
+        let (_tmp, catalog) = create_test_catalog();
+        // Existing columns take IDs 0 and 1.
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        // Nested field IDs as requested by the caller deliberately collide
+        // with the existing columns; they must all be reassigned.
+        let nested = DataType::Row(RowType::new(vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "b".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    2,
+                    "c".to_string(),
+                    DataType::Int(IntType::new()),
+                )])),
+            ),
+        ]));
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::add_column("s".to_string(), nested)],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.get_table(&id).await.unwrap();
+        let ts = table.schema();
+        let s = ts.fields().iter().find(|f| f.name() == "s").unwrap();
+        assert_eq!(s.id(), 2, "top-level column takes highest_field_id + 1");
+        let mut ids = Vec::new();
+        nested_row_field_ids(s.data_type(), &mut ids);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 4, 5], "nested IDs are fresh and unique");
+        assert_eq!(ts.highest_field_id(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_all_columns_rejected() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, two_column_schema()).await;
+
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![
+                    SchemaChange::drop_column("id".to_string()),
+                    SchemaChange::drop_column("name".to_string()),
+                ],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot drop all fields"),
+            "got {err:?}"
+        );
+    }
+
+    /// Partitioned primary-key table: dt VARCHAR (partition), id INT, v INT,
+    /// primary key (dt, id).
+    fn partitioned_pk_schema() -> Schema {
+        Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("v", DataType::Int(IntType::new()))
+            .partition_keys(["dt"])
+            .primary_key(["dt", "id"])
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_key_column_guards() {
+        let (_tmp, catalog) = create_test_catalog();
+        let id = setup_table(&catalog, partitioned_pk_schema()).await;
+
+        // Renaming a partition column is rejected.
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::rename_column(
+                    "dt".to_string(),
+                    "day".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot rename partition column"),
+            "got {err:?}"
+        );
+
+        // Updating the type of a partition column is rejected.
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::update_column_type(
+                    "dt".to_string(),
+                    DataType::VarChar(VarCharType::string_type()),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot update partition column"),
+            "got {err:?}"
+        );
+
+        // Updating the type of a primary key column is rejected.
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::update_column_type(
+                    "id".to_string(),
+                    DataType::BigInt(crate::spec::BigIntType::new()),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot update primary key"),
+            "got {err:?}"
+        );
+
+        // Making a primary key column nullable is rejected ...
+        let err = catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::update_column_nullability(
+                    "id".to_string(),
+                    true,
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cannot change nullability of primary key"),
+            "got {err:?}"
+        );
+
+        // ... while NOT NULL stays allowed (it is already non-nullable).
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::update_column_nullability(
+                    "id".to_string(),
+                    false,
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rename_primary_key_column_propagates() {
+        let (_tmp, catalog) = create_test_catalog();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("v", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket-key", "id")
+            .option("sequence.field", "v")
+            .build()
+            .unwrap();
+        let id = setup_table(&catalog, schema).await;
+
+        catalog
+            .alter_table(
+                &id,
+                vec![
+                    SchemaChange::rename_column("id".to_string(), "user_id".to_string()),
+                    SchemaChange::rename_column("v".to_string(), "ver".to_string()),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.get_table(&id).await.unwrap();
+        let ts = table.schema();
+        assert_eq!(ts.primary_keys(), ["user_id".to_string()]);
+        assert_eq!(
+            ts.options().get("bucket-key").map(String::as_str),
+            Some("user_id")
+        );
+        assert_eq!(
+            ts.options().get("sequence.field").map(String::as_str),
+            Some("ver")
+        );
     }
 }

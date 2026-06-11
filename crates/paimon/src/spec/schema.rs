@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
+use crate::spec::core_options::{
+    first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION, SEQUENCE_FIELD_OPTION,
+};
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::{AggregationConfig, ColumnMove, ColumnMoveType, PartialUpdateConfig};
 use serde::{Deserialize, Serialize};
@@ -63,9 +65,14 @@ impl TableSchema {
         }
     }
 
-    /// Get the highest field ID from a list of fields.
+    /// Get the highest field ID from a list of fields, including fields nested
+    /// inside row types (mirrors Java `RowType.currentHighestFieldId`).
     pub fn current_highest_field_id(fields: &[DataField]) -> i32 {
-        fields.iter().map(|f| f.id()).max().unwrap_or(-1)
+        fields
+            .iter()
+            .map(|f| f.id().max(highest_nested_field_id(f.data_type())))
+            .max()
+            .unwrap_or(-1)
     }
 
     pub fn version(&self) -> i32 {
@@ -185,9 +192,18 @@ impl TableSchema {
                             column: name.to_string(),
                         });
                     }
+                    // Mirrors Java: an added column has no value for existing
+                    // rows, so it must be nullable.
+                    if !data_type.is_nullable() {
+                        return Err(crate::Error::ConfigInvalid {
+                            message: format!("Column {name} cannot specify NOT NULL."),
+                        });
+                    }
                     highest_field_id += 1;
-                    let field = DataField::new(highest_field_id, name.to_string(), data_type)
-                        .with_description(comment);
+                    let id = highest_field_id;
+                    let data_type = reassign_field_ids(data_type, &mut highest_field_id);
+                    let field =
+                        DataField::new(id, name.to_string(), data_type).with_description(comment);
                     insert_field_with_move(&mut fields, field, column_move.as_ref(), full_name)?;
                 }
                 SchemaChange::RenameColumn {
@@ -195,6 +211,13 @@ impl TableSchema {
                     new_name,
                 } => {
                     let name = top_level_field(&field_names)?;
+                    // Existing partition data is laid out with the old key name
+                    // in paths and metadata; renaming would break resolution.
+                    if new_schema.partition_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot rename partition column: [{name}]"),
+                        });
+                    }
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -207,8 +230,19 @@ impl TableSchema {
                         });
                     }
                     fields[idx] = fields[idx].clone().with_name(new_name.clone());
-                    rename_in_keys(&mut new_schema.partition_keys, name, &new_name);
                     rename_in_keys(&mut new_schema.primary_keys, name, &new_name);
+                    rename_in_option_list(
+                        &mut new_schema.options,
+                        BUCKET_KEY_OPTION,
+                        name,
+                        &new_name,
+                    );
+                    rename_in_option_list(
+                        &mut new_schema.options,
+                        SEQUENCE_FIELD_OPTION,
+                        name,
+                        &new_name,
+                    );
                 }
                 SchemaChange::DropColumn { field_names } => {
                     let name = top_level_field(&field_names)?;
@@ -226,6 +260,11 @@ impl TableSchema {
                             ),
                         });
                     }
+                    if fields.len() == 1 {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot drop all fields in table".to_string(),
+                        });
+                    }
                     fields.remove(idx);
                 }
                 SchemaChange::UpdateColumnType {
@@ -234,6 +273,18 @@ impl TableSchema {
                     keep_nullability,
                 } => {
                     let name = top_level_field(&field_names)?;
+                    // Existing partitions, bucket assignment, and key encoding
+                    // were all written with the old key type.
+                    if new_schema.partition_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot update partition column: [{name}]"),
+                        });
+                    }
+                    if new_schema.primary_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot update primary key".to_string(),
+                        });
+                    }
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -254,6 +305,13 @@ impl TableSchema {
                     new_nullability,
                 } => {
                     let name = top_level_field(&field_names)?;
+                    // Primary keys are normalized to NOT NULL at create time;
+                    // a nullable key column would break key/bucket semantics.
+                    if new_nullability && new_schema.primary_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot change nullability of primary key".to_string(),
+                        });
+                    }
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -348,6 +406,83 @@ fn rename_in_keys(keys: &mut [String], old: &str, new: &str) {
         if key == old {
             *key = new.to_string();
         }
+    }
+}
+
+/// Rename a column inside a comma-separated column-list option (`bucket-key`,
+/// `sequence.field`), if the option is set and references the column.
+///
+/// Mirrors Java `SchemaManager.applyRenameColumnsToOptions`.
+fn rename_in_option_list(
+    options: &mut HashMap<String, String>,
+    option_key: &str,
+    old: &str,
+    new: &str,
+) {
+    let Some(value) = options.get(option_key) else {
+        return;
+    };
+    let renamed = value
+        .split(',')
+        .map(|col| if col == old { new } else { col })
+        .collect::<Vec<_>>()
+        .join(",");
+    options.insert(option_key.to_string(), renamed);
+}
+
+/// The highest field ID nested inside a data type, or -1 if it contains none.
+fn highest_nested_field_id(data_type: &DataType) -> i32 {
+    match data_type {
+        DataType::Array(t) => highest_nested_field_id(t.element_type()),
+        DataType::Multiset(t) => highest_nested_field_id(t.element_type()),
+        DataType::Map(t) => {
+            highest_nested_field_id(t.key_type()).max(highest_nested_field_id(t.value_type()))
+        }
+        DataType::Row(t) => t
+            .fields()
+            .iter()
+            .map(|f| f.id().max(highest_nested_field_id(f.data_type())))
+            .max()
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
+/// Reassign the IDs of all row fields nested inside a data type from the
+/// table-wide highest field ID, so they cannot collide with existing fields.
+///
+/// Mirrors Java `ReassignFieldId`: IDs nested inside a field's type are
+/// assigned before the field's own ID.
+fn reassign_field_ids(data_type: DataType, next_id: &mut i32) -> DataType {
+    let nullable = data_type.is_nullable();
+    match data_type {
+        DataType::Array(t) => DataType::Array(ArrayType::with_nullable(
+            nullable,
+            reassign_field_ids(t.element_type().clone(), next_id),
+        )),
+        DataType::Multiset(t) => DataType::Multiset(MultisetType::with_nullable(
+            nullable,
+            reassign_field_ids(t.element_type().clone(), next_id),
+        )),
+        DataType::Map(t) => DataType::Map(MapType::with_nullable(
+            nullable,
+            reassign_field_ids(t.key_type().clone(), next_id),
+            reassign_field_ids(t.value_type().clone(), next_id),
+        )),
+        DataType::Row(t) => {
+            let fields = t
+                .fields()
+                .iter()
+                .map(|f| {
+                    let typ = reassign_field_ids(f.data_type().clone(), next_id);
+                    *next_id += 1;
+                    DataField::new(*next_id, f.name().to_string(), typ)
+                        .with_description(f.description().map(|s| s.to_string()))
+                })
+                .collect();
+            DataType::Row(RowType::with_nullable(nullable, fields))
+        }
+        other => other,
     }
 }
 
@@ -1013,6 +1148,25 @@ mod tests {
         assert_eq!(data_field.name(), name);
         assert_eq!(data_field.data_type(), &typ);
         assert_eq!(data_field.description(), Some(description).as_deref());
+    }
+
+    #[test]
+    fn test_current_highest_field_id_includes_nested_fields() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "s".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    7,
+                    "a".to_string(),
+                    DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                        DataField::new(9, "b".to_string(), DataType::Int(IntType::new())),
+                    ])))),
+                )])),
+            ),
+        ];
+        assert_eq!(TableSchema::current_highest_field_id(&fields), 9);
     }
 
     #[test]
