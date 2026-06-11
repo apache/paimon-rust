@@ -933,6 +933,135 @@ mod tests {
         assert_eq!(merged_seq, vec![1002, 1003]);
     }
 
+    /// Lock the flush-time merge to the read-side `PartialUpdateMergeFunction`.
+    ///
+    /// Java uses one `MergeFunction` for write flush, compaction, and reads,
+    /// so engine semantics have a single source of truth. The Rust write side
+    /// is a vectorized re-implementation (per-column take) of the read side's
+    /// streaming merge; this test feeds the same key groups through both and
+    /// asserts identical output, so the two implementations cannot drift.
+    #[test]
+    fn test_flush_merge_matches_read_side_partial_update_merge() {
+        use crate::table::sort_merge::{
+            BufferedBatch, MergeFunction, MergeResult, MergeRow, PartialUpdateMergeFunction,
+        };
+        use arrow_array::StringArray;
+
+        // Arrival order; auto-seq = 1000 + row index. The `seq` column is the
+        // user sequence field (test_write_config: sequence_field_indices=[1]).
+        //
+        // Key 1 ordering by (user seq, auto-seq): r2(10) < r0(20,@1000) < r3(20,@1003)
+        //   v1: latest non-null = r3 (7); v2: latest non-null = r0 ("b").
+        // Key 2 ordering: r1(5,@1001) < r4(5,@1004)
+        //   v1: latest non-null = r1 (9); v2: null in every row.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            Arc::new(ArrowField::new("v1", ArrowDataType::Int32, true)),
+            Arc::new(ArrowField::new("v2", ArrowDataType::Utf8, true)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1, 1, 2])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![20, 5, 10, 20, 5])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int32Array::from(vec![
+                    None,
+                    Some(9),
+                    Some(100),
+                    Some(7),
+                    None,
+                ])) as Arc<dyn arrow_array::Array>,
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    None,
+                    Some("a"),
+                    None,
+                    None,
+                ])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let seq_values: Vec<i64> = (1000..1005).collect();
+        let seq_array = Int64Array::from(seq_values.clone());
+
+        // Write side: replicate the flush sort (PK + sequence field + auto-seq).
+        let sort_columns = vec![
+            SortColumn {
+                values: batch.column(0).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            },
+            SortColumn {
+                values: batch.column(1).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            },
+            SortColumn {
+                values: Arc::new(seq_array.clone()),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            },
+        ];
+        let sorted_indices = lexsort_to_indices(&sort_columns, None).unwrap();
+        let (merged, merged_seq) = partial_update_writer()
+            .merge_partial_update_rows(&batch, &seq_array, &sorted_indices)
+            .unwrap();
+        assert_eq!(merged.num_rows(), 2, "two keys, one merged row each");
+        assert_eq!(
+            merged_seq
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec(),
+            vec![1003, 1004],
+            "merged rows carry each group's highest sequence number"
+        );
+
+        // Read side: feed the same key groups (in arrival order — the merge
+        // function orders rows itself) through PartialUpdateMergeFunction.
+        let table_options =
+            HashMap::from([("merge-engine".to_string(), "partial-update".to_string())]);
+        let merge_fn =
+            PartialUpdateMergeFunction::new(&table_options, "default.test_table").unwrap();
+        let buffer = [BufferedBatch::Source(batch.clone())];
+        let identity: Vec<usize> = (0..batch.num_columns()).collect();
+        let seq_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for (group_idx, group_rows) in [vec![0usize, 2, 3], vec![1usize, 4]].iter().enumerate() {
+            let rows: Vec<MergeRow> = group_rows
+                .iter()
+                .map(|&row_idx| MergeRow {
+                    batch_idx: 0,
+                    row_idx,
+                    sequence_number: seq_values[row_idx],
+                    value_kind: 0,
+                    user_sequences: vec![Some(seq_col.value(row_idx) as i128)],
+                })
+                .collect();
+            let result = merge_fn.merge(&rows, &buffer, &identity, &schema).unwrap();
+            let MergeResult::MaterializedRow(read_row) = result else {
+                panic!("partial-update merge must materialize a row");
+            };
+            assert_eq!(
+                merged.slice(group_idx, 1),
+                read_row,
+                "flush merge and read-side merge must agree for group {group_idx}"
+            );
+        }
+    }
+
     /// Retract rows are rejected at flush, matching the read-side
     /// PartialUpdateMergeFunction error.
     #[test]
