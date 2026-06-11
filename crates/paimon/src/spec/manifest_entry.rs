@@ -35,10 +35,19 @@ pub struct Identifier {
 }
 
 impl Hash for Identifier {
+    // Hash every field that participates in `Eq`, matching Java
+    // `FileEntry.Identifier.hashCode`. `level` in particular must be included:
+    // a single-run compaction upgrades a file in place (same name, new level),
+    // producing distinct identifiers that would otherwise all collide and
+    // degrade the hash sets used to net add/delete entries during scan.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.partition.hash(state);
         self.bucket.hash(state);
+        self.level.hash(state);
         self.file_name.hash(state);
+        self.extra_files.hash(state);
+        self.embedded_index.hash(state);
+        self.external_path.hash(state);
     }
 }
 
@@ -226,3 +235,46 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
         {"name": "_VERSION", "type": "int"}
     ]
 }]"#;
+
+#[cfg(test)]
+mod tests {
+    use super::Identifier;
+    use std::collections::HashSet;
+
+    fn ident(file_name: &str, level: i32) -> Identifier {
+        Identifier {
+            partition: vec![1, 2, 3],
+            bucket: 0,
+            level,
+            file_name: file_name.to_string(),
+            extra_files: Vec::new(),
+            embedded_index: None,
+            external_path: None,
+        }
+    }
+
+    /// A single-run compaction upgrades a file in place: same name, new level.
+    /// The two identifiers must be distinct (Eq) and must not collapse together
+    /// in a HashSet (Hash), otherwise netting add/delete by identifier would
+    /// drop the upgraded file. Guards both the `Eq` and the `Hash` impl.
+    #[test]
+    fn test_identifier_distinguishes_in_place_level_upgrade() {
+        let l0 = ident("f.parquet", 0);
+        let l5 = ident("f.parquet", 5);
+
+        assert_ne!(l0, l5, "same name at different levels are different files");
+
+        let mut set = HashSet::new();
+        set.insert(l0.clone());
+        assert!(
+            !set.contains(&l5),
+            "upgraded file must not alias the old one"
+        );
+        set.insert(l5.clone());
+        assert_eq!(set.len(), 2, "both levels coexist as distinct identifiers");
+
+        // Equal identifiers must hash/compare equal (set dedups them).
+        set.insert(ident("f.parquet", 5));
+        assert_eq!(set.len(), 2, "equal identifiers dedup");
+    }
+}

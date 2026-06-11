@@ -236,39 +236,32 @@ fn build_deletion_files_map(
     map
 }
 
-/// Merges add/delete manifest entries following pypaimon's `adds - deletes` behavior.
+/// Nets add/delete manifest entries for a scan, returning only the live ADD set.
 ///
-/// The identifier must be rich enough to match Paimon's file identity, otherwise a delete
-/// for one file version can incorrectly remove another with the same file name.
+/// Mirrors Java `AbstractFileStoreScan.readAndMergeFileEntries`: first collect
+/// the full [`Identifier`] of every DELETE entry, then keep the ADD entries
+/// whose identifier is not in that set. The identity is the complete Paimon file
+/// identity (`partition, bucket, level, file_name, extra_files, embedded_index,
+/// external_path`, matching Java `FileEntry.Identifier`).
+///
+/// Keying on file name alone is wrong: a single-run compaction upgrades a file
+/// *in place* — `DELETE f@oldLevel` plus `ADD f@newLevel` with the same file
+/// name (`PojoDataFileMeta.upgrade` reuses the name, only changing `level`). An
+/// identity without `level` lets the DELETE cancel the upgraded ADD, dropping
+/// the file from the scan and silently losing its rows on read.
+///
+/// Collecting deletes first (rather than insert/remove while iterating) makes
+/// the result independent of ADD/DELETE ordering, matching the Java scan path.
 fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
-    let mut delete_entries = Vec::with_capacity(entries.len() / 4);
-    let mut added_entries = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        match entry.kind() {
-            FileKind::Add => added_entries.push(entry),
-            FileKind::Delete => delete_entries.push(entry),
-        }
-    }
-
-    if delete_entries.is_empty() {
-        return added_entries;
-    }
-
-    let deleted_keys: HashSet<(&[u8], i32, &str)> = delete_entries
+    use crate::spec::Identifier;
+    let deleted: HashSet<Identifier> = entries
         .iter()
-        .map(|e| (e.partition(), e.bucket(), e.file().file_name.as_str()))
+        .filter(|e| *e.kind() == FileKind::Delete)
+        .map(|e| e.identifier())
         .collect();
-
-    added_entries
+    entries
         .into_iter()
-        .filter(|entry| {
-            !deleted_keys.contains(&(
-                entry.partition(),
-                entry.bucket(),
-                entry.file().file_name.as_str(),
-            ))
-        })
+        .filter(|e| *e.kind() == FileKind::Add && !deleted.contains(&e.identifier()))
         .collect()
 }
 
@@ -827,6 +820,41 @@ mod tests {
             file_source: None,
             value_stats_cols: None,
         }
+    }
+
+    #[test]
+    fn test_merge_manifest_entries_keeps_in_place_upgraded_file() {
+        // Reproduces a single-run compaction "upgrade": the SAME file name is
+        // deleted at level 0 and re-added at a higher level (Paimon promotes a
+        // lone sorted run in place instead of rewriting it). Netting ADD/DELETE
+        // by file name alone (ignoring `level`) wrongly drops the upgraded file.
+        // Matches Java `FileEntry.Identifier`, which includes `level`.
+        use super::merge_manifest_entries;
+        use crate::spec::ManifestEntry;
+
+        let entry = |kind: FileKind, name: &str, level: i32| -> ManifestEntry {
+            let mut file = make_evo_file(name, 1, 1, 1, None);
+            file.level = level;
+            ManifestEntry::new(kind, Vec::new(), 0, 1, file, 2)
+        };
+
+        let entries = vec![
+            entry(FileKind::Add, "f.parquet", 0), // original level-0 write
+            entry(FileKind::Delete, "f.parquet", 0), // compaction removes the L0 version
+            entry(FileKind::Add, "f.parquet", 5), // same file upgraded to level 5
+            entry(FileKind::Add, "g.parquet", 0), // unrelated fresh file
+        ];
+
+        let mut live: Vec<(String, i32)> = merge_manifest_entries(entries)
+            .into_iter()
+            .map(|e| (e.file().file_name.clone(), e.file().level))
+            .collect();
+        live.sort();
+        assert_eq!(
+            live,
+            vec![("f.parquet".to_string(), 5), ("g.parquet".to_string(), 0)],
+            "upgraded file (f@L5) must survive; only f@L0 is cancelled by the DELETE"
+        );
     }
 
     fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {
