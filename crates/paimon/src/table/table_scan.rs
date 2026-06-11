@@ -32,7 +32,6 @@ use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta,
     FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
-    TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::source::{
@@ -40,8 +39,6 @@ use crate::table::source::{
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 use crate::table::SnapshotManager;
-use crate::table::TagManager;
-use crate::Error;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -374,40 +371,20 @@ impl<'a> TableScan<'a> {
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
-        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
-        let core_options = CoreOptions::new(self.table.schema().options());
 
-        match core_options.try_time_travel_selector()? {
-            Some(TimeTravelSelector::TimestampMillis(ts)) => {
-                match snapshot_manager.earlier_or_equal_time_millis(ts).await? {
-                    Some(s) => Ok(Some(s)),
-                    None => Err(Error::DataInvalid {
-                        message: format!("No snapshot found with timestamp <= {ts}"),
-                        source: None,
-                    }),
-                }
+        match super::time_travel::travel_to_snapshot(
+            file_io,
+            table_path,
+            self.table.schema().options(),
+        )
+        .await?
+        {
+            Some(snapshot) => Ok(Some(snapshot)),
+            None => {
+                let snapshot_manager =
+                    SnapshotManager::new(file_io.clone(), table_path.to_string());
+                snapshot_manager.get_latest_snapshot().await
             }
-            Some(TimeTravelSelector::Version(v)) => {
-                // Tag first, then snapshot id, else error.
-                let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
-                if tag_manager.tag_exists(v).await? {
-                    match tag_manager.get(v).await? {
-                        Some(s) => Ok(Some(s)),
-                        None => Err(Error::DataInvalid {
-                            message: format!("Tag '{v}' doesn't exist."),
-                            source: None,
-                        }),
-                    }
-                } else if let Ok(id) = v.parse::<i64>() {
-                    snapshot_manager.get_snapshot(id).await.map(Some)
-                } else {
-                    Err(Error::DataInvalid {
-                        message: format!("Version '{v}' is not a valid tag name or snapshot id."),
-                        source: None,
-                    })
-                }
-            }
-            None => snapshot_manager.get_latest_snapshot().await,
         }
     }
 

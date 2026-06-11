@@ -126,6 +126,18 @@ impl TableSchema {
         new_schema
     }
 
+    /// Create a copy of this schema with the options replaced entirely,
+    /// keeping id, fields, keys, comment, and timestamps.
+    ///
+    /// Corresponds to Java `TableSchema.copy(Map<String, String> newOptions)`,
+    /// which constructs a new schema with the given options rather than
+    /// merging them.
+    pub fn copy_with_replaced_options(&self, options: HashMap<String, String>) -> Self {
+        let mut new_schema = self.clone();
+        new_schema.options = options;
+        new_schema
+    }
+
     /// Apply a list of schema changes and return a new schema with incremented ID.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
         let mut new_schema = self.clone();
@@ -837,6 +849,35 @@ mod tests {
             !id_field.data_type().is_nullable(),
             "primary key column should be normalized to NOT NULL"
         );
+    }
+
+    #[test]
+    fn test_copy_with_replaced_options() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("old-key", "old-value")
+            .comment(Some("c".into()))
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(3, &schema);
+
+        let mut new_options = HashMap::new();
+        new_options.insert("new-key".to_string(), "new-value".to_string());
+        let copied = table_schema.copy_with_replaced_options(new_options);
+
+        // Options are replaced entirely, not merged.
+        assert_eq!(copied.options().get("old-key"), None);
+        assert_eq!(
+            copied.options().get("new-key"),
+            Some(&"new-value".to_string())
+        );
+        // Everything else is preserved.
+        assert_eq!(copied.id(), table_schema.id());
+        assert_eq!(copied.fields(), table_schema.fields());
+        assert_eq!(copied.primary_keys(), table_schema.primary_keys());
+        assert_eq!(copied.comment(), table_schema.comment());
+        assert_eq!(copied.time_millis(), table_schema.time_millis());
     }
 
     #[test]

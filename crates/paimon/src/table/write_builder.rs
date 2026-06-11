@@ -80,6 +80,16 @@ impl<'a> WriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
+        // A time-travelled table copy carries a historical schema; writing
+        // through it would silently produce data shaped like the old schema.
+        // Java avoids this structurally (write paths use copyWithoutTimeTravel);
+        // here the same table copy can serve both reads and writes, so reject
+        // explicitly. Commit-only flows (new_commit) stay untouched.
+        if self.table.is_time_traveled() {
+            return Err(crate::Error::Unsupported {
+                message: "Cannot write to a table at a time-travelled snapshot".to_string(),
+            });
+        }
         let write = TableWrite::new(self.table, self.commit_user.clone())?;
         Ok(if self.overwrite {
             write.with_overwrite()

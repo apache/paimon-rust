@@ -395,7 +395,13 @@ impl SchemaProvider for PaimonSchemaProvider {
                     let table = if opts.is_empty() {
                         table
                     } else {
-                        table.copy_with_options(opts)
+                        // Dynamic options may select a historical snapshot
+                        // (e.g. `SET 'paimon.scan.version'`); switch to its
+                        // schema so planning sees the snapshot's columns.
+                        table
+                            .copy_with_time_travel(opts)
+                            .await
+                            .map_err(to_datafusion_error)?
                     };
                     let provider = PaimonTableProvider::try_new_with_blob_reader_registry(
                         table,

@@ -88,7 +88,15 @@ impl RelationPlanner for PaimonRelationPlanner {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        let new_table = paimon_provider.table().copy_with_options(extra_options);
+        // Resolving time travel may switch the table to the snapshot's schema,
+        // which requires async IO; this planner hook is synchronous, so bridge
+        // through the shared runtime like other sync DataFusion callbacks.
+        let table = paimon_provider.table().clone();
+        let new_table = crate::runtime::block_on_with_runtime(
+            async move { table.copy_with_time_travel(extra_options).await },
+            "paimon time travel resolution thread panicked",
+        )
+        .map_err(crate::to_datafusion_error)?;
         let new_provider = PaimonTableProvider::try_new(new_table)?;
         let new_source = provider_as_source(Arc::new(new_provider));
 

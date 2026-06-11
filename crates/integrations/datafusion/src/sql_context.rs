@@ -509,7 +509,10 @@ impl SQLContext {
             let mut options = self.dynamic_options.read().unwrap().clone();
             options.insert(SCAN_VERSION_OPTION.to_string(), info.version.clone());
 
-            let table_with_options = paimon_table.copy_with_options(options);
+            let table_with_options = paimon_table
+                .copy_with_time_travel(options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
                 table_with_options,
                 self.blob_reader_registry.clone(),
@@ -538,7 +541,10 @@ impl SQLContext {
             let mut options = self.dynamic_options.read().unwrap().clone();
             options.insert(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string());
 
-            let table_with_options = paimon_table.copy_with_options(options);
+            let table_with_options = paimon_table
+                .copy_with_time_travel(options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
                 table_with_options,
                 self.blob_reader_registry.clone(),
