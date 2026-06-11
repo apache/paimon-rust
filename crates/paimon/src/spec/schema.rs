@@ -306,7 +306,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
-        AggregationConfig::new(&options).validate_create_mode(!primary_keys.is_empty(), &fields)?;
+        AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
 
         Ok(Self {

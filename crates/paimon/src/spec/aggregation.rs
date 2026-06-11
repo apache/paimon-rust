@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::spec::{DataField, DataType};
+use crate::spec::{CoreOptions, DataField, DataType};
 
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const AGGREGATION_ENGINE: &str = "aggregation";
@@ -68,9 +68,9 @@ impl<'a> AggregationConfig<'a> {
             .is_some_and(|value| value.eq_ignore_ascii_case(AGGREGATION_ENGINE))
     }
 
-    /// Validate options at CREATE TABLE time, using the schema's fields to
-    /// reject typo'd column names, unknown aggregate functions, and
-    /// function/type pairs that the runtime would refuse.
+    /// Validate options at CREATE TABLE time, using the schema's fields and
+    /// primary keys to reject typo'd column names, unknown aggregate
+    /// functions, and function/type pairs that the runtime would refuse.
     ///
     /// Java upstream rejects unknown columns and unknown function names in
     /// `SchemaValidation.validateFieldsPrefix` + `validateMergeFunctionFactory`;
@@ -79,10 +79,10 @@ impl<'a> AggregationConfig<'a> {
     /// three at CREATE TABLE keeps invalid metadata from being persisted.
     pub(crate) fn validate_create_mode(
         &self,
-        has_primary_keys: bool,
+        primary_keys: &[String],
         fields: &[DataField],
     ) -> crate::Result<Option<AggregationMode>> {
-        let mode = match self.validated_mode(has_primary_keys) {
+        let mode = match self.validated_mode(!primary_keys.is_empty()) {
             Ok(mode) => mode,
             Err(unsupported_options) => {
                 return Err(crate::Error::ConfigInvalid {
@@ -94,7 +94,7 @@ impl<'a> AggregationConfig<'a> {
             }
         };
         if mode.is_some() {
-            self.validate_field_scoped_options(fields)?;
+            self.validate_field_scoped_options(fields, primary_keys)?;
         }
         Ok(mode)
     }
@@ -165,12 +165,24 @@ impl<'a> AggregationConfig<'a> {
     ///
     /// For `aggregate-function` keys additionally:
     /// * the function name must be one of the supported aggregators
-    /// * the function must accept the field's declared data type
+    /// * the function must accept the field's declared data type — except for
+    ///   `sequence.field` columns (forced to `last_value` at runtime) and
+    ///   primary-key columns (no aggregator; copied through), where the
+    ///   configured function is ignored by the merge function's priority
+    ///   order (Java `AggregateMergeFunction#getAggFuncName`), so only the
+    ///   function name is validated.
     ///
     /// `fields.default-aggregate-function` only has its name validated;
     /// per-column type compatibility for the default is deferred to runtime
     /// because the default applies broadly across columns.
-    fn validate_field_scoped_options(&self, fields: &[DataField]) -> crate::Result<()> {
+    fn validate_field_scoped_options(
+        &self,
+        fields: &[DataField],
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        // Same source as the read path: `sequence.field` parsed by CoreOptions.
+        let core_options = CoreOptions::new(self.options);
+        let sequence_fields = core_options.sequence_fields();
         for (key, value) in self.options {
             let Some((col, kind)) = parse_field_scoped_option_key(key) else {
                 continue;
@@ -187,7 +199,20 @@ impl<'a> AggregationConfig<'a> {
                 });
             };
             if matches!(kind, FieldScopedOptionKind::AggregateFunction) {
-                validate_aggregator_for_type(value, col, field.data_type())?;
+                let runtime_ignores_function =
+                    sequence_fields.contains(&col) || primary_keys.iter().any(|pk| pk == col);
+                if runtime_ignores_function {
+                    if !is_known_aggregator_name(value) {
+                        return Err(crate::Error::ConfigInvalid {
+                            message: format!(
+                                "Unknown aggregate function '{value}' for field '{col}'; \
+                                 {SUPPORTED_AGGREGATOR_NAMES_HINT}"
+                            ),
+                        });
+                    }
+                } else {
+                    validate_aggregator_for_type(value, col, field.data_type())?;
+                }
             }
         }
 
@@ -371,6 +396,10 @@ mod tests {
         options
     }
 
+    fn pk() -> Vec<String> {
+        vec!["id".to_string()]
+    }
+
     fn sample_fields() -> Vec<DataField> {
         vec![
             DataField::new(0, "id".into(), DataType::Int(IntType::new())),
@@ -404,7 +433,9 @@ mod tests {
         let config = AggregationConfig::new(&options);
 
         assert_eq!(
-            config.validate_create_mode(true, &sample_fields()).unwrap(),
+            config
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap(),
             Some(AggregationMode::Basic)
         );
     }
@@ -415,9 +446,7 @@ mod tests {
         let config = AggregationConfig::new(&options);
 
         assert_eq!(
-            config
-                .validate_create_mode(false, &sample_fields())
-                .unwrap(),
+            config.validate_create_mode(&[], &sample_fields()).unwrap(),
             None
         );
     }
@@ -428,7 +457,9 @@ mod tests {
         let config = AggregationConfig::new(&options);
         assert!(!config.is_enabled());
         assert_eq!(
-            config.validate_create_mode(true, &sample_fields()).unwrap(),
+            config
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap(),
             None
         );
     }
@@ -448,7 +479,7 @@ mod tests {
             let options = aggregation_options(&[(key, "value")]);
             let config = AggregationConfig::new(&options);
             let err = config
-                .validate_create_mode(true, &sample_fields())
+                .validate_create_mode(&pk(), &sample_fields())
                 .unwrap_err();
             assert!(
                 matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
@@ -474,7 +505,7 @@ mod tests {
         // typo: `amout` instead of `amount`
         let options = aggregation_options(&[("fields.amout.aggregate-function", "sum")]);
         let err = AggregationConfig::new(&options)
-            .validate_create_mode(true, &sample_fields())
+            .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
@@ -494,7 +525,7 @@ mod tests {
             ("fields.tga.list-agg-delimiter", "|"),
         ]);
         let err = AggregationConfig::new(&options)
-            .validate_create_mode(true, &sample_fields())
+            .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
@@ -509,7 +540,7 @@ mod tests {
     fn test_validate_create_mode_rejects_unknown_function_name() {
         let options = aggregation_options(&[("fields.amount.aggregate-function", "sume")]);
         let err = AggregationConfig::new(&options)
-            .validate_create_mode(true, &sample_fields())
+            .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
@@ -523,7 +554,7 @@ mod tests {
         // sum on a VarChar column.
         let options = aggregation_options(&[("fields.tag.aggregate-function", "sum")]);
         let err = AggregationConfig::new(&options)
-            .validate_create_mode(true, &sample_fields())
+            .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
@@ -533,11 +564,63 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_create_mode_skips_type_check_for_sequence_field() {
+        // `listagg` is incompatible with INT, but `amount` is a sequence
+        // field, so the runtime forces `last_value` and ignores the
+        // configured function — the definition is usable and must be accepted.
+        let options = aggregation_options(&[
+            ("sequence.field", "amount"),
+            ("fields.amount.aggregate-function", "listagg"),
+        ]);
+        let config = AggregationConfig::new(&options);
+
+        assert_eq!(
+            config
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap(),
+            Some(AggregationMode::Basic)
+        );
+    }
+
+    #[test]
+    fn test_validate_create_mode_skips_type_check_for_primary_key() {
+        // `id` is an INT primary key; the runtime copies PK columns through
+        // without an aggregator, so the incompatible `listagg` is ignored.
+        let options = aggregation_options(&[("fields.id.aggregate-function", "listagg")]);
+        let config = AggregationConfig::new(&options);
+
+        assert_eq!(
+            config
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap(),
+            Some(AggregationMode::Basic)
+        );
+    }
+
+    #[test]
+    fn test_validate_create_mode_still_rejects_unknown_function_on_sequence_field() {
+        // The function name itself must stay valid even when the runtime
+        // would ignore it — typos should fail fast at CREATE TABLE.
+        let options = aggregation_options(&[
+            ("sequence.field", "amount"),
+            ("fields.amount.aggregate-function", "lisstagg"),
+        ]);
+        let err = AggregationConfig::new(&options)
+            .validate_create_mode(&pk(), &sample_fields())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("lisstagg") && message.contains("amount")),
+            "expected unknown-function error on sequence field, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_create_mode_rejects_unknown_default_function() {
         let options =
             aggregation_options(&[("fields.default-aggregate-function", "totally_made_up")]);
         let err = AggregationConfig::new(&options)
-            .validate_create_mode(true, &sample_fields())
+            .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }

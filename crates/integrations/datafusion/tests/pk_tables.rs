@@ -2715,6 +2715,34 @@ async fn test_pk_aggregation_create_table_rejects_incompatible_type() {
     );
 }
 
+/// CREATE TABLE must accept a function/type pair that the runtime would
+/// ignore: `sequence.field` columns are forced to `last_value` and primary-key
+/// columns get no aggregator, so type compatibility is not checked for them.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_accepts_ignored_function_on_seq_and_pk() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    // `listagg` is incompatible with INT, but `amount` is the sequence field
+    // (forced to last_value) and `id` is a PK (copied through), so both
+    // configurations are usable at runtime and must pass CREATE TABLE.
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_seq_pk_ok (
+                id INT NOT NULL, amount INT, v INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'sequence.field' = 'amount',
+                'fields.amount.aggregate-function' = 'listagg',
+                'fields.id.aggregate-function' = 'listagg',
+                'fields.v.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect("CREATE TABLE with runtime-ignored function/type pairs should succeed");
+}
+
 /// All-NULL aggregation group on a nullable `sum` column should emit NULL
 /// rather than 0 or an error: nothing was observed, so there is no
 /// arithmetic result to surface.
