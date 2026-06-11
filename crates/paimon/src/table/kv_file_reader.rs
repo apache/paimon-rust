@@ -330,8 +330,9 @@ impl KeyValueFileReader {
                     continue;
                 }
 
-                // Always go through sort-merge even for single file,
-                // because a single file may contain duplicate keys.
+                // Always go through sort-merge even for a single file: files
+                // written before the writer merged key groups at flush may
+                // still contain duplicate keys.
                 let mut merge_stream = SortMergeReaderBuilder::new(
                     file_streams,
                     internal_schema.clone(),
