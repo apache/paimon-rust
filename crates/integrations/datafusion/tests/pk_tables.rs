@@ -2093,6 +2093,72 @@ async fn test_pk_limit_not_starved_by_merge_splits() {
     assert_eq!(count, 2, "COUNT(*) must count merged rows");
 }
 
+/// Partial-update files can hold several physical rows of one key (the
+/// writer keeps all rows for read-side field-wise merge), so their splits
+/// must never report physical row counts as merged row counts: COUNT(*) has
+/// to count merged rows and LIMIT must not be starved.
+#[tokio::test]
+async fn test_pk_partial_update_count_and_limit_see_merged_rows() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_pu_count (
+                id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'partial-update',
+                'source.split.target-size' = '1b',
+                'source.split.open-file-cost' = '1b'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // One INSERT writes three partial updates of key 1 into a single file,
+    // plus an independent key 2.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_pu_count VALUES
+             (1, 10, CAST(NULL AS STRING)),
+             (1, CAST(NULL AS INT), 'hello'),
+             (1, 100, CAST(NULL AS STRING)),
+             (2, 200, 'world')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // COUNT(*) must count merged rows, not the physical rows a single file
+    // holds (DataFusion may answer COUNT(*) from exact scan statistics).
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_pu_count")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "COUNT(*) must count merged rows");
+
+    // Two logical rows exist; LIMIT 2 must not be starved by the
+    // multi-version file of key 1.
+    let returned = row_count(
+        &sql_context,
+        "SELECT id, v_int FROM paimon.test_db.t_pu_count LIMIT 2",
+    )
+    .await;
+    assert_eq!(returned, 2, "LIMIT 2 must yield 2 rows");
+}
+
 /// Same regression for the partial-update engine: per-column updates of one
 /// key spread over three commits/files must merge into a single row even
 /// when the split target would otherwise separate the files.

@@ -257,11 +257,22 @@ fn without_delete_row(file: &DataFileMeta) -> bool {
 /// * Otherwise files are sectioned by key-range overlap and whole sections
 ///   are bin-packed; a group is raw convertible only when it holds exactly
 ///   one file without delete rows.
+///
+/// `file_keys_unique` is a deliberate deviation from Java: raw convertibility
+/// additionally assumes a file never holds two rows of one key. Java's
+/// `MergeTreeWriter#flushWriteBuffer` runs the merge function before flushing,
+/// so that holds for every engine; the Rust writer only deduplicates at flush
+/// for deduplicate/first-row, while partial-update keeps all rows for
+/// read-side field-wise merge (`kv_file_writer.rs`, `select_flush_indices`).
+/// Callers pass `false` for engines without that write-time guarantee, forcing
+/// every group non-raw-convertible. Can be relaxed once the writer merges on
+/// flush like Java.
 pub(crate) fn merge_tree_split_for_batch(
     files: Vec<DataFileMeta>,
     comparator: &KeyComparator,
     target_split_size: i64,
     open_file_cost: i64,
+    file_keys_unique: bool,
 ) -> Vec<SplitGroup> {
     let raw_convertible = files.iter().all(|f| f.level != 0 && without_delete_row(f));
     let one_level = {
@@ -280,7 +291,7 @@ pub(crate) fn merge_tree_split_for_batch(
         .into_iter()
         .map(|files| SplitGroup {
             files,
-            raw_convertible: true,
+            raw_convertible: file_keys_unique,
         })
         .collect();
     }
@@ -292,7 +303,7 @@ pub(crate) fn merge_tree_split_for_batch(
     )
     .into_iter()
     .map(|files| {
-        let raw_convertible = files.len() == 1 && without_delete_row(&files[0]);
+        let raw_convertible = file_keys_unique && files.len() == 1 && without_delete_row(&files[0]);
         SplitGroup {
             files,
             raw_convertible,
@@ -499,7 +510,7 @@ mod tests {
             keyed_file("b", 11, 20, 100, 5),
             keyed_file("c", 21, 30, 100, 5),
         ];
-        let groups = merge_tree_split_for_batch(files, &comparator, 250, 1);
+        let groups = merge_tree_split_for_batch(files, &comparator, 250, 1, true);
         assert_eq!(group_names(&groups), vec![vec!["a", "b"], vec!["c"]]);
         assert!(groups.iter().all(|g| g.raw_convertible));
     }
@@ -513,7 +524,7 @@ mod tests {
         with_deletes.delete_row_count = Some(3);
         let files = vec![with_deletes, keyed_file("clean", 11, 20, 100, 5)];
         // Large target size packs both disjoint sections into one split.
-        let groups = merge_tree_split_for_batch(files, &comparator, 1000, 1);
+        let groups = merge_tree_split_for_batch(files, &comparator, 1000, 1, true);
         assert_eq!(group_names(&groups), vec![vec!["del", "clean"]]);
         assert!(!groups[0].raw_convertible, "multi-file group is never raw");
 
@@ -522,10 +533,39 @@ mod tests {
         let mut with_deletes = keyed_file("del", 1, 10, 100, 5);
         with_deletes.delete_row_count = Some(3);
         let files = vec![with_deletes, keyed_file("clean", 11, 20, 100, 5)];
-        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1);
+        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1, true);
         assert_eq!(group_names(&groups), vec![vec!["del"], vec!["clean"]]);
         assert!(!groups[0].raw_convertible);
         assert!(groups[1].raw_convertible);
+    }
+
+    /// Engines whose writer does not deduplicate at flush (partial-update
+    /// keeps all rows of a key in one file) cannot prove file-internal key
+    /// uniqueness: every group must stay non-raw-convertible on both the fast
+    /// path and the sectioned path, so physical row counts are never reported
+    /// as merged row counts.
+    #[test]
+    fn split_for_batch_without_unique_keys_never_raw_convertible() {
+        let comparator = int_comparator();
+
+        // Fast-path shape: all compacted, one level, no delete rows.
+        let files = vec![
+            keyed_file("a", 1, 10, 100, 5),
+            keyed_file("b", 11, 20, 100, 5),
+        ];
+        let groups = merge_tree_split_for_batch(files, &comparator, 250, 1, false);
+        assert_eq!(group_names(&groups), vec![vec!["a", "b"]]);
+        assert!(groups.iter().all(|g| !g.raw_convertible));
+
+        // Sectioned shape: a disjoint single compacted file would be raw for
+        // deduplicate, but not without the write-time uniqueness guarantee.
+        let files = vec![
+            keyed_file("l0", 1, 50, 100, 0),
+            keyed_file("solo", 100, 120, 100, 2),
+        ];
+        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1, false);
+        assert_eq!(group_names(&groups), vec![vec!["l0"], vec!["solo"]]);
+        assert!(groups.iter().all(|g| !g.raw_convertible));
     }
 
     /// Level-0 or cross-level files take the sectioning path; overlapping
@@ -540,7 +580,7 @@ mod tests {
             keyed_file("l1", 40, 90, 100, 1),
             keyed_file("solo", 100, 120, 100, 2),
         ];
-        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1);
+        let groups = merge_tree_split_for_batch(files, &comparator, 1, 1, true);
         assert_eq!(group_names(&groups), vec![vec!["l0", "l1"], vec!["solo"]]);
         assert!(
             !groups[0].raw_convertible,

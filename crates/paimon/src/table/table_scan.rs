@@ -746,12 +746,23 @@ impl<'a> TableScan<'a> {
             } else if let Some(ref comparator) = pk_comparator {
                 // Merge-tree path: keep key-overlapping files in one split and
                 // mark which splits the sort-merge reader can skip (mirrors
-                // Java MergeTreeSplitGenerator#splitForBatch).
+                // Java MergeTreeSplitGenerator#splitForBatch). Only engines
+                // whose writer deduplicates at flush guarantee a file never
+                // holds two rows of one key, so only they may mark groups raw
+                // convertible; see merge_tree_split_for_batch. (First-row
+                // tables do not take this path today, but its writer dedups
+                // too, so keep the gate accurate.)
+                let file_keys_unique = matches!(
+                    core_options.merge_engine(),
+                    Ok(crate::spec::MergeEngine::Deduplicate)
+                        | Ok(crate::spec::MergeEngine::FirstRow)
+                );
                 merge_tree_split_for_batch(
                     data_files,
                     comparator,
                     target_split_size,
                     open_file_cost,
+                    file_keys_unique,
                 )
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
