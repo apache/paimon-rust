@@ -814,6 +814,21 @@ mod tests {
         assert_eq!(ts.fields()[0].name(), "rowkey");
         assert_eq!(ts.fields()[0].description(), Some("primary"));
 
+        // Converting nullable `id` to NOT NULL below is rejected by default;
+        // allow it explicitly. The flag is read from the pre-alter options, so
+        // it must be set in a separate alter.
+        catalog
+            .alter_table(
+                &id,
+                vec![SchemaChange::set_option(
+                    "alter-column-null-to-not-null.disabled".to_string(),
+                    "false".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+
         // Rename, update comment, update type, update nullability, drop.
         catalog
             .alter_table(

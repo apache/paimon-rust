@@ -38,6 +38,9 @@ pub(crate) use partial_update::PartialUpdateConfig;
 mod aggregation;
 pub(crate) use aggregation::AggregationConfig;
 
+mod data_type_casts;
+pub(crate) use data_type_casts::supports_cast;
+
 mod schema;
 pub use schema::*;
 

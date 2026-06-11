@@ -47,6 +47,9 @@ const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
+pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
+pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
+    "alter-column-null-to-not-null.disabled";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";

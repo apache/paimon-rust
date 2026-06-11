@@ -160,6 +160,19 @@ impl TableSchema {
         // Column errors carry no table name here; the catalog layer fills it in.
         let full_name = "";
 
+        // Both flags are read from the pre-alter options, mirroring Java
+        // `SchemaManager.applySchemaChanges`.
+        let disable_null_to_not_null = self
+            .options
+            .get(crate::spec::DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION)
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let allow_explicit_cast = self
+            .options
+            .get(crate::spec::DISABLE_EXPLICIT_TYPE_CASTING_OPTION)
+            .map(|v| v != "true")
+            .unwrap_or(true);
+
         let mut new_schema = self.clone();
         new_schema.id += 1;
         new_schema.time_millis = chrono::Utc::now().timestamp_millis();
@@ -291,12 +304,45 @@ impl TableSchema {
                             column: name.to_string(),
                         })?;
                     let old = &fields[idx];
-                    // Lenient: replace the type without cast-compatibility checks.
+                    // Mirrors Java `assertNotChangingBlobColumnType`: BLOB
+                    // columns use a dedicated storage layout that other types
+                    // cannot be converted to or from.
+                    if old.data_type().is_blob_type() || new_data_type.is_blob_type() {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Cannot change column type involving BLOB: [{name}] {:?} -> {new_data_type:?}",
+                                old.data_type()
+                            ),
+                        });
+                    }
                     let target = if keep_nullability {
                         new_data_type.copy_with_nullable(old.data_type().is_nullable())?
                     } else {
+                        assert_nullability_change(
+                            old.data_type().is_nullable(),
+                            new_data_type.is_nullable(),
+                            name,
+                            disable_null_to_not_null,
+                        )?;
                         new_data_type
                     };
+                    // Existing data files keep the old schema; the read path
+                    // casts old columns to the new type, so the change must be
+                    // both a supported Paimon cast and executable by arrow.
+                    let arrow_castable = arrow_cast::can_cast_types(
+                        &crate::arrow::paimon_type_to_arrow(old.data_type())?,
+                        &crate::arrow::paimon_type_to_arrow(&target)?,
+                    );
+                    if !crate::spec::supports_cast(old.data_type(), &target, allow_explicit_cast)
+                        || !arrow_castable
+                    {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Column type {name}[{:?}] cannot be converted to {target:?} without losing information.",
+                                old.data_type()
+                            ),
+                        });
+                    }
                     fields[idx] = DataField::new(old.id(), old.name().to_string(), target)
                         .with_description(old.description().map(|s| s.to_string()));
                 }
@@ -318,6 +364,12 @@ impl TableSchema {
                             column: name.to_string(),
                         })?;
                     let old = &fields[idx];
+                    assert_nullability_change(
+                        old.data_type().is_nullable(),
+                        new_nullability,
+                        name,
+                        disable_null_to_not_null,
+                    )?;
                     let nt = old.data_type().copy_with_nullable(new_nullability)?;
                     fields[idx] = DataField::new(old.id(), old.name().to_string(), nt)
                         .with_description(old.description().map(|s| s.to_string()));
@@ -344,11 +396,18 @@ impl TableSchema {
         new_schema.highest_field_id =
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
 
-        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        // Re-run create-time validations on the final schema, mirroring Java
+        // `SchemaValidation.validateTableSchema` after applying changes.
+        Schema::validate_blob_fields(
+            &new_schema.fields,
+            &new_schema.partition_keys,
+            &new_schema.options,
+        )?;
         PartialUpdateConfig::new(&new_schema.options)
             .validate_create_mode(!new_schema.primary_keys.is_empty())?;
         AggregationConfig::new(&new_schema.options)
             .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
+        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
         Ok(new_schema)
     }
 
@@ -398,6 +457,27 @@ fn top_level_field(field_names: &[String]) -> crate::Result<&str> {
 /// Index of the field with the given name, if any.
 fn field_index(fields: &[DataField], name: &str) -> Option<usize> {
     fields.iter().position(|f| f.name() == name)
+}
+
+/// Mirrors Java `SchemaManager.assertNullabilityChange`: converting a nullable
+/// column to NOT NULL is rejected unless explicitly enabled, because existing
+/// rows may already contain NULLs.
+fn assert_nullability_change(
+    old_nullable: bool,
+    new_nullable: bool,
+    field_name: &str,
+    disable_null_to_not_null: bool,
+) -> crate::Result<()> {
+    if disable_null_to_not_null && old_nullable && !new_nullable {
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "Cannot update column type from nullable to non nullable for {field_name}. \
+                 You can set table configuration option 'alter-column-null-to-not-null.disabled' = 'false' \
+                 to allow converting null columns to not null"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Rename a key in a partition/primary key list, if present.
@@ -1662,6 +1742,228 @@ mod tests {
                 .get("changelog-producer")
                 .map(String::as_str),
             Some("lookup")
+        );
+    }
+
+    fn cast_test_schema(options: &[(&str, &str)]) -> TableSchema {
+        let mut builder = Schema::builder()
+            .column("a", DataType::Int(IntType::new()))
+            .column("b", DataType::BigInt(crate::spec::BigIntType::new()))
+            .column(
+                "d",
+                DataType::Timestamp(crate::spec::TimestampType::new(3).unwrap()),
+            );
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        TableSchema::new(0, &builder.build().unwrap())
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_cast_compatibility() {
+        let table_schema = cast_test_schema(&[]);
+
+        // Implicit widening.
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )])
+            .unwrap();
+        assert!(matches!(
+            new_schema.fields()[0].data_type(),
+            DataType::BigInt(_)
+        ));
+
+        // Narrowing is an explicit cast, allowed by default.
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "b".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        assert!(matches!(
+            new_schema.fields()[1].data_type(),
+            DataType::Int(_)
+        ));
+
+        // Unsupported conversions are rejected before committing the schema.
+        for new_type in [
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            DataType::Boolean(crate::spec::BooleanType::new()),
+        ] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                    "d".to_string(),
+                    new_type,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("cannot be converted") && message.contains('d')),
+                "expected cast rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_respects_disable_explicit_casting() {
+        let table_schema = cast_test_schema(&[("disable-explicit-type-casting", "true")]);
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "b".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("cannot be converted")),
+            "narrowing should be rejected when explicit casting is disabled, got {err:?}"
+        );
+
+        // Implicit widening is still allowed.
+        table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_rejects_blob() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+
+        for (column, new_type) in [
+            (
+                "payload",
+                DataType::VarChar(crate::spec::VarCharType::new(10).unwrap()),
+            ),
+            ("id", DataType::Blob(BlobType::new())),
+        ] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                    column.to_string(),
+                    new_type,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("involving BLOB") && message.contains(column)),
+                "expected BLOB type-change rejection for {column}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_nullable_to_not_null_guard() {
+        let table_schema = cast_test_schema(&[]);
+        let not_null_int = DataType::Int(IntType::new())
+            .copy_with_nullable(false)
+            .unwrap();
+
+        // Both nullability change paths are rejected by default.
+        let changes: Vec<crate::spec::SchemaChange> = vec![
+            crate::spec::SchemaChange::update_column_nullability("a".to_string(), false),
+            crate::spec::SchemaChange::update_column_type("a".to_string(), not_null_int.clone()),
+        ];
+        for change in changes {
+            let err = table_schema.apply_changes(vec![change]).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("nullable to non nullable")),
+                "expected null-to-not-null rejection, got {err:?}"
+            );
+        }
+
+        // Allowed when explicitly enabled via table option.
+        let table_schema = cast_test_schema(&[("alter-column-null-to-not-null.disabled", "false")]);
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_nullability(
+                "a".to_string(),
+                false,
+            )])
+            .unwrap();
+        assert!(!new_schema.fields()[0].data_type().is_nullable());
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                not_null_int,
+            )])
+            .unwrap();
+        assert!(!new_schema.fields()[0].data_type().is_nullable());
+    }
+
+    #[test]
+    fn test_apply_changes_revalidates_blob_fields() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "payload".to_string(),
+                DataType::Blob(BlobType::new()),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Data evolution config must enabled")),
+            "adding a BLOB column without data-evolution.enabled should fail, got {err:?}"
+        );
+
+        // Enabling data evolution in the same alter makes the final schema valid.
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "data-evolution.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::add_column(
+                    "payload".to_string(),
+                    DataType::Blob(BlobType::new()),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(new_schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_apply_changes_revalidates_partial_update_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.value.sequence-group".to_string(),
+                "value".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("partial-update") && message.contains("sequence-group")),
+            "unsupported partial-update option should be rejected on alter, got {err:?}"
         );
     }
 
