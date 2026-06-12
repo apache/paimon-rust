@@ -172,7 +172,7 @@ async fn test_session_scan_version_uses_snapshot_schema() {
         },
     };
     assert!(
-        err.contains("time-travelled"),
+        err.contains("time-travel option"),
         "error should mention time travel: {err}"
     );
 
@@ -195,6 +195,30 @@ async fn test_session_scan_version_uses_snapshot_schema() {
             "{sql} should mention the active time-travel option: {err}"
         );
     }
+
+    // A selector resolving to a snapshot with the current schema id pins the
+    // read just the same, so INSERT stays rejected.
+    sql_context
+        .sql("SET 'paimon.scan.version' = '2'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let result = sql_context
+        .sql("INSERT INTO paimon.default.t VALUES (6, 'f', 16)")
+        .await;
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(df) => match df.collect().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("INSERT should fail while scan.version pins a same-schema snapshot"),
+        },
+    };
+    assert!(
+        err.contains("time-travel option"),
+        "error should mention time travel: {err}"
+    );
 
     sql_context
         .sql("RESET 'paimon.scan.version'")

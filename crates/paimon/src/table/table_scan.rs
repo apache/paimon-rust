@@ -375,6 +375,18 @@ impl<'a> TableScan<'a> {
         if let Some(snapshot) = self.table.travel_snapshot() {
             return Ok(Some(snapshot.clone()));
         }
+        // A time-travelled schema without its resolved snapshot means the
+        // selector was changed after the travel (`copy_with_options`).
+        // Resolving the new selector here would evolve a different snapshot's
+        // files to the stale historical schema, so fail instead.
+        if self.table.is_time_traveled() {
+            return Err(crate::Error::DataInvalid {
+                message: "Table options changed after time travel; \
+                          use copy_with_time_travel to re-resolve the snapshot and schema"
+                    .to_string(),
+                source: None,
+            });
+        }
 
         let file_io = self.table.file_io();
         let table_path = self.table.location();

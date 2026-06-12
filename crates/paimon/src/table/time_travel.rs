@@ -225,17 +225,20 @@ mod tests {
             Some(&"1".to_string())
         );
         // The resolved snapshot is cached for scans, and invalidated when the
-        // options change again.
+        // selector changes.
         assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(1));
-        let recopied = traveled.copy_with_options(options(&[("k", "v")]));
+        let recopied = traveled.copy_with_options(options(&[("scan.version", "2")]));
         assert!(recopied.travel_snapshot().is_none());
     }
 
     #[tokio::test]
-    async fn test_copy_with_time_travel_same_schema_keeps_table_writable() {
+    async fn test_copy_with_time_travel_same_schema_still_rejects_write() {
         let (file_io, table_path) = setup_evolved_table().await;
         let table = latest_table(&file_io, &table_path);
 
+        // Snapshot 2 carries the current schema, so the schema is not
+        // switched — but the copy still reads a pinned snapshot, so writing
+        // through it is rejected like any other time-travelled copy.
         let traveled = table
             .copy_with_time_travel(options(&[("scan.version", "2")]))
             .await
@@ -243,6 +246,7 @@ mod tests {
 
         assert_eq!(traveled.schema().id(), 1);
         assert!(!traveled.is_time_traveled());
+        assert!(traveled.new_write_builder().new_write().is_err());
     }
 
     #[tokio::test]
@@ -324,11 +328,51 @@ mod tests {
         };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("time-travelled")),
+                if message.contains("time-travel option")),
             "expected write rejection on time-travelled table, got {err:?}"
         );
         // The latest table is unaffected.
         assert!(table.new_write_builder().new_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_changing_selector_after_travel_fails_scan() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let table = latest_table(&file_io, &table_path);
+
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.version", "1")]))
+            .await
+            .unwrap();
+
+        // Merging unrelated options keeps the resolved snapshot/schema pair.
+        let recopied = traveled.copy_with_options(options(&[("k", "v")]));
+        assert_eq!(recopied.travel_snapshot().map(|s| s.id()), Some(1));
+
+        // Changing the selector without re-resolving leaves a historical
+        // schema with no matching snapshot; scanning such a copy must fail
+        // instead of evolving another snapshot's files to the stale schema.
+        let stale = traveled.copy_with_options(options(&[("scan.version", "2")]));
+        assert!(stale.travel_snapshot().is_none());
+        let err = stale
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .expect_err("scan after selector change must fail");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("copy_with_time_travel")),
+            "expected stale time-travel state error, got {err:?}"
+        );
+
+        // Re-resolving through copy_with_time_travel is the supported path.
+        let retraveled = traveled
+            .copy_with_time_travel(options(&[("scan.version", "2")]))
+            .await
+            .unwrap();
+        assert_eq!(retraveled.schema().id(), 1);
+        assert_eq!(retraveled.travel_snapshot().map(|s| s.id()), Some(2));
     }
 
     #[tokio::test]

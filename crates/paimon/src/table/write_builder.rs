@@ -80,14 +80,21 @@ impl<'a> WriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
-        // A time-travelled table copy carries a historical schema; writing
-        // through it would silently produce data shaped like the old schema.
+        // A table with a time-travel selector reads a pinned snapshot (and may
+        // carry that snapshot's historical schema), so writing through the
+        // same copy would be inconsistent with what its reads observe — even
+        // when the pinned snapshot happens to share the current schema id.
         // Java avoids this structurally (write paths use copyWithoutTimeTravel);
         // here the same table copy can serve both reads and writes, so reject
-        // explicitly. Commit-only flows (new_commit) stay untouched.
-        if self.table.is_time_traveled() {
+        // explicitly. Conflicting selectors (`Err`) cannot be valid for writes
+        // either. Commit-only flows (new_commit) stay untouched.
+        let selector =
+            crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
+        if !matches!(selector, Ok(None)) {
             return Err(crate::Error::Unsupported {
-                message: "Cannot write to a table at a time-travelled snapshot".to_string(),
+                message: "Cannot write to a table with a time-travel option set \
+                          (scan.version / scan.timestamp-millis)"
+                    .to_string(),
             });
         }
         let write = TableWrite::new(self.table, self.commit_user.clone())?;

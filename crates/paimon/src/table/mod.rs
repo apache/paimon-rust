@@ -103,7 +103,7 @@ pub struct Table {
     time_traveled: bool,
     /// Snapshot resolved by [`Table::copy_with_time_travel`] from this copy's
     /// options, so scans don't have to resolve the same selector again.
-    /// Cleared whenever options change through [`Table::copy_with_options`].
+    /// Cleared when [`Table::copy_with_options`] changes the selector.
     travel_snapshot: Option<Snapshot>,
 }
 
@@ -192,6 +192,13 @@ impl Table {
     /// [`Table::copy_with_time_travel`] when the options may select a
     /// historical snapshot whose schema should be used for reading.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        // Changing the time-travel selector invalidates the resolved snapshot
+        // (a time-travelled schema then has no matching snapshot anymore, and
+        // scans of such a copy fail until `copy_with_time_travel` re-resolves
+        // it). Unrelated options keep the snapshot/schema pair intact.
+        let selector_changed = extra.keys().any(|k| {
+            k == crate::spec::SCAN_VERSION_OPTION || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+        });
         Self {
             file_io: self.file_io.clone(),
             identifier: self.identifier.clone(),
@@ -200,9 +207,11 @@ impl Table {
             schema_manager: self.schema_manager.clone(),
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
-            // The options just changed, so a previously resolved snapshot may
-            // no longer match the selector they contain.
-            travel_snapshot: None,
+            travel_snapshot: if selector_changed {
+                None
+            } else {
+                self.travel_snapshot.clone()
+            },
         }
     }
 
