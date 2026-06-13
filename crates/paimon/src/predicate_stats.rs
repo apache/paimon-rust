@@ -59,7 +59,8 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::IsNotNull => {
             return all_null != Some(true);
         }
-        PredicateOperator::In | PredicateOperator::NotIn => {
+        PredicateOperator::In => {}
+        PredicateOperator::NotIn => {
             return true;
         }
         PredicateOperator::EndsWith | PredicateOperator::Contains => {
@@ -113,6 +114,10 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     };
 
     match op {
+        PredicateOperator::In => literals.iter().any(|literal| {
+            !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
+                && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
+        }),
         PredicateOperator::Eq => {
             !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
@@ -180,7 +185,6 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
-        | PredicateOperator::In
         | PredicateOperator::NotIn
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains

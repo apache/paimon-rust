@@ -2006,6 +2006,80 @@ mod tests {
     }
 
     #[test]
+    fn test_data_file_matches_in_prunes_when_all_literals_out_of_range() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in("id", vec![Datum::Int(1), Datum::Int(30)])
+            .unwrap();
+
+        assert!(!data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_in_keeps_when_any_literal_in_range() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in("id", vec![Datum::Int(1), Datum::Int(15), Datum::Int(30)])
+            .unwrap();
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_in_prunes_all_null_file() {
+        let fields = int_field();
+        let file = test_data_file_meta(int_stats_row(None), int_stats_row(None), vec![Some(5)], 5);
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in("id", vec![Datum::Int(10)])
+            .unwrap();
+
+        assert!(!data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_in_with_corrupt_stats_fails_open() {
+        let fields = int_field();
+        let file = test_data_file_meta(Vec::new(), Vec::new(), vec![Some(0)], 5);
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in("id", vec![Datum::Int(30)])
+            .unwrap();
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
     fn test_data_file_matches_is_null_prunes_when_null_count_is_zero() {
         let fields = int_field();
         let file = test_data_file_meta(
