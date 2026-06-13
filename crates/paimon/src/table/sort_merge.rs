@@ -1941,7 +1941,8 @@ mod tests {
             DataField::new(
                 2,
                 "tag".into(),
-                PaimonDataType::VarChar(VarCharType::new(255).unwrap()),
+                // listagg requires unbounded VARCHAR (STRING), matching Java.
+                PaimonDataType::VarChar(VarCharType::string_type()),
             ),
         ]
     }

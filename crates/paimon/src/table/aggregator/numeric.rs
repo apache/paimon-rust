@@ -22,7 +22,10 @@
 //! not yet implement BigDecimal-style scale rebasing for Decimal product, so
 //! Decimal columns are rejected at construction.  Integer overflow on either
 //! aggregator is reported as [`Error::DataInvalid`] so silent wrap cannot
-//! produce misleading aggregated values.
+//! produce misleading aggregated values.  A Decimal `sum` whose result no
+//! longer fits the declared precision yields a NULL cell, matching Java
+//! `DecimalUtils.add` / `Decimal.fromBigDecimal` (which return null on
+//! precision overflow rather than throwing).
 //!
 //! `min` / `max` extend to every ordered Paimon type: numerics, Decimal,
 //! Date, Time, Timestamp, and Char/VarChar.  Comparison is by native value
@@ -188,7 +191,14 @@ impl FieldAggregator for SumAgg {
                 precision,
                 scale,
                 acc,
-            } => decimal_array(*precision, *scale, *acc, "sum", &self.field_name)?,
+            } => {
+                // Java parity: `DecimalUtils.add` -> `Decimal.fromBigDecimal`
+                // returns null when the summed value no longer fits the
+                // declared precision, so an overflowing sum yields a NULL cell
+                // rather than a silently out-of-range Decimal.
+                let fitted = acc.filter(|v| decimal_fits_precision(*v, *precision));
+                decimal_array(*precision, *scale, fitted, "sum", &self.field_name)?
+            }
         })
     }
 }
@@ -652,6 +662,17 @@ fn overflow_error(agg_name: &str, field_name: &str) -> crate::Error {
     }
 }
 
+/// Whether `value` (an unscaled Decimal128 raw value) fits within `precision`
+/// decimal digits, i.e. `|value| < 10^precision`. Decimal128 precision is at
+/// most 38, so `10^precision` always fits in `u128`; the `checked_pow` guard
+/// degrades to "fits" only for impossible precisions.
+fn decimal_fits_precision(value: i128, precision: u8) -> bool {
+    10u128
+        .checked_pow(precision as u32)
+        .map(|limit| value.unsigned_abs() < limit)
+        .unwrap_or(true)
+}
+
 fn decimal_array(
     precision: u8,
     scale: i8,
@@ -794,6 +815,50 @@ mod tests {
         let out = agg.result().unwrap();
         let out_arr = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(out_arr.value(0), 350); // 3.50
+    }
+
+    #[test]
+    fn test_sum_decimal_in_range_keeps_value() {
+        // DECIMAL(3,2): 1.23 + 4.56 = 5.79 (raw 579) still fits precision 3.
+        let mut agg = sum_agg(DataType::Decimal(DecimalType::new(3, 2).unwrap()));
+        let mut b = Decimal128Builder::with_capacity(2)
+            .with_precision_and_scale(3, 2)
+            .unwrap();
+        b.append_value(123); // 1.23
+        b.append_value(456); // 4.56
+        let arr = b.finish();
+        for i in 0..arr.len() {
+            agg.agg(&arr, i).unwrap();
+        }
+        let out = agg.result().unwrap();
+        let out_arr = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert!(!out_arr.is_null(0));
+        assert_eq!(out_arr.value(0), 579); // 5.79
+    }
+
+    #[test]
+    fn test_sum_decimal_precision_overflow_yields_null() {
+        // DECIMAL(3,2) tops out at 9.99 (raw 999). 9.99 + 0.01 = 10.00 (raw
+        // 1000) needs precision 4, so the sum no longer fits and must become
+        // NULL — matching Java `Decimal.fromBigDecimal` returning null instead
+        // of persisting an out-of-range value.
+        let mut agg = sum_agg(DataType::Decimal(DecimalType::new(3, 2).unwrap()));
+        let mut b = Decimal128Builder::with_capacity(2)
+            .with_precision_and_scale(3, 2)
+            .unwrap();
+        b.append_value(999); // 9.99
+        b.append_value(1); // 0.01
+        let arr = b.finish();
+        for i in 0..arr.len() {
+            agg.agg(&arr, i).unwrap();
+        }
+        let out = agg.result().unwrap();
+        let out_arr = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert!(
+            out_arr.is_null(0),
+            "precision-overflowing decimal sum must be NULL, got {}",
+            out_arr.value(0)
+        );
     }
 
     #[test]

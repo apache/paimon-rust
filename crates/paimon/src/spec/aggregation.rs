@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::spec::{CoreOptions, DataField, DataType};
+use crate::spec::{CoreOptions, DataField, DataType, VarCharType};
 
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const AGGREGATION_ENGINE: &str = "aggregation";
@@ -339,7 +339,9 @@ pub(crate) fn validate_aggregator_for_type(
                 | DataType::VarChar(_)
         ),
         "bool_and" | "bool_or" => matches!(dt, DataType::Boolean(_)),
-        "listagg" => matches!(dt, DataType::Char(_) | DataType::VarChar(_)),
+        // Java `FieldListaggAggFactory` only accepts unbounded VARCHAR (STRING);
+        // CHAR and bounded VARCHAR(n) are rejected.
+        "listagg" => matches!(dt, DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH),
         "last_value" | "first_value" | "last_non_null_value" | "first_non_null_value" => true,
         _ => {
             return Err(crate::Error::ConfigInvalid {
@@ -401,6 +403,8 @@ mod tests {
     }
 
     fn sample_fields() -> Vec<DataField> {
+        // String columns are unbounded VARCHAR (STRING): that is what Java
+        // `listagg` requires, and what DataFusion produces for `STRING`.
         vec![
             DataField::new(0, "id".into(), DataType::Int(IntType::new())),
             DataField::new(1, "price".into(), DataType::Int(IntType::new())),
@@ -408,17 +412,17 @@ mod tests {
             DataField::new(
                 3,
                 "tag".into(),
-                DataType::VarChar(VarCharType::new(255).unwrap()),
+                DataType::VarChar(VarCharType::string_type()),
             ),
             DataField::new(
                 4,
                 "tags".into(),
-                DataType::VarChar(VarCharType::new(255).unwrap()),
+                DataType::VarChar(VarCharType::string_type()),
             ),
             DataField::new(
                 5,
                 "payload".into(),
-                DataType::VarChar(VarCharType::new(255).unwrap()),
+                DataType::VarChar(VarCharType::string_type()),
             ),
         ]
     }
@@ -666,7 +670,10 @@ mod tests {
             DataType::Date(DateType::new()),
             DataType::Time(TimeType::new(3).unwrap()),
             DataType::Timestamp(TimestampType::new(6).unwrap()),
+            // Bounded VARCHAR (listagg must reject) and unbounded STRING
+            // (listagg must accept) — exercises both sides of the listagg rule.
             DataType::VarChar(VarCharType::new(255).unwrap()),
+            DataType::VarChar(VarCharType::string_type()),
         ];
 
         let opts: HashMap<String, String> = HashMap::new();

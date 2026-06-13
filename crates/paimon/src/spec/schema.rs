@@ -1063,7 +1063,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
-            .column("tags", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("tags", DataType::VarChar(VarCharType::string_type()))
             .primary_key(["id"])
             .option("merge-engine", "aggregation")
             .option("fields.value.aggregate-function", "sum")

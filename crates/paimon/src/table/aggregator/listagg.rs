@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StringArray};
 
-use super::{unsupported_type_error, FieldAggregator};
-use crate::spec::DataType;
+use super::FieldAggregator;
+use crate::spec::{DataType, VarCharType};
 
 const FIELDS_PREFIX: &str = "fields.";
 const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
@@ -56,9 +56,19 @@ impl ListaggAgg {
         data_type: &DataType,
         table_options: &HashMap<String, String>,
     ) -> crate::Result<Self> {
+        // Java `FieldListaggAggFactory` only accepts unbounded VARCHAR (STRING);
+        // CHAR and bounded VARCHAR(n) are rejected so we never persist metadata
+        // that Java would refuse to read.
         match data_type {
-            DataType::Char(_) | DataType::VarChar(_) => {}
-            other => return Err(unsupported_type_error("listagg", field_name, other)),
+            DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH => {}
+            other => {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Aggregate function 'listagg' for field '{field_name}' requires an \
+                         unbounded VARCHAR (STRING) column, but was {other:?}"
+                    ),
+                })
+            }
         }
         Ok(Self {
             field_name: field_name.to_string(),
@@ -111,7 +121,7 @@ impl FieldAggregator for ListaggAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{IntType, VarCharType};
+    use crate::spec::{CharType, IntType, VarCharType};
 
     fn collect(arr: ArrayRef) -> Option<String> {
         let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -122,8 +132,9 @@ mod tests {
         }
     }
 
+    // listagg only accepts unbounded VARCHAR (STRING), matching Java.
     fn varchar_type() -> DataType {
-        DataType::VarChar(VarCharType::new(255).unwrap())
+        DataType::VarChar(VarCharType::string_type())
     }
 
     #[test]
@@ -172,6 +183,41 @@ mod tests {
         assert!(
             matches!(err, crate::Error::ConfigInvalid { message } if message.contains("listagg"))
         );
+    }
+
+    #[test]
+    fn test_listagg_rejects_char() {
+        // CHAR is bounded; Java requires unbounded VARCHAR (STRING).
+        let err = ListaggAgg::new(
+            "v",
+            &DataType::Char(CharType::new(10).unwrap()),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::ConfigInvalid { message } if message.contains("listagg")),
+            "expected listagg ConfigInvalid for CHAR, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_listagg_rejects_bounded_varchar() {
+        // Bounded VARCHAR(n) (n < MAX_LENGTH) is rejected; only STRING is allowed.
+        let err = ListaggAgg::new(
+            "v",
+            &DataType::VarChar(VarCharType::new(255).unwrap()),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::ConfigInvalid { message } if message.contains("listagg")),
+            "expected listagg ConfigInvalid for bounded VARCHAR, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_listagg_accepts_unbounded_string() {
+        assert!(ListaggAgg::new("v", &varchar_type(), &HashMap::new()).is_ok());
     }
 
     #[test]
