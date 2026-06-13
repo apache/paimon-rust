@@ -37,7 +37,7 @@ use datafusion::sql::sqlparser::ast::{
 use futures::TryStreamExt;
 
 use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions};
-use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table};
+use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table, WriteBuilder};
 
 use crate::error::to_datafusion_error;
 use crate::sql_context::SQLContext;
@@ -361,6 +361,7 @@ async fn execute_cow_merge_once(
     let mut temp_tracker = TempTableTracker::new(ctx);
     let (has_target_data, cow_table_name) =
         register_cow_target_table(ctx, table, &writer, &mut temp_tracker).await?;
+    let wb = table.new_write_builder();
 
     let merge_ctx = CowMergeContext {
         source_ref: &source_ref,
@@ -376,6 +377,7 @@ async fn execute_cow_merge_once(
         ctx,
         &clauses,
         &mut writer,
+        &wb,
         table,
         &merge_ctx,
         &mut temp_tracker,
@@ -391,8 +393,7 @@ async fn execute_cow_merge_once(
     all_messages.extend(insert_messages);
 
     if !all_messages.is_empty() {
-        let commit = table.new_write_builder().new_commit();
-        commit
+        wb.new_commit()
             .commit(all_messages)
             .await
             .map_err(to_datafusion_error)?;
@@ -418,6 +419,7 @@ async fn execute_cow_merge_inner(
     ctx: &SQLContext,
     clauses: &CowMergeClauses,
     writer: &mut CopyOnWriteMergeWriter,
+    wb: &WriteBuilder<'_>,
     table: &Table,
     merge_ctx: &CowMergeContext<'_>,
     temp_tracker: &mut TempTableTracker<'_>,
@@ -596,10 +598,7 @@ async fn execute_cow_merge_inner(
 
             let insert_count: usize = insert_batches.iter().map(|b| b.num_rows()).sum();
             if insert_count > 0 {
-                let mut table_write = table
-                    .new_write_builder()
-                    .new_write()
-                    .map_err(to_datafusion_error)?;
+                let mut table_write = wb.new_write().map_err(to_datafusion_error)?;
                 for batch in &insert_batches {
                     table_write
                         .write_arrow_batch(batch)

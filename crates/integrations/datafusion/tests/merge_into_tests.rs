@@ -1289,3 +1289,36 @@ async fn test_rejects_table_with_primary_keys() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_rejects_primary_key_table_without_data_evolution() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.pk_plain_target (\
+                id INT NOT NULL, name STRING, PRIMARY KEY (id)\
+            ) WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_pk_plain AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
+    )
+    .await;
+
+    assert_merge_error(
+        &sql_context,
+        "MERGE INTO paimon.test_db.pk_plain_target t USING paimon.test_db.src_pk_plain s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET name = s.name",
+        "primary-key tables without data-evolution",
+    )
+    .await;
+}

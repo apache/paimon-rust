@@ -138,6 +138,21 @@ pub async fn dml_count(sql_context: &SQLContext, sql_str: &str) -> u64 {
         .value(0)
 }
 
+#[allow(dead_code)]
+pub async fn assert_sql_error(sql_context: &SQLContext, sql: &str, expected_substring: &str) {
+    let err_msg = match sql_context.sql(sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(_) => panic!("Expected error containing '{expected_substring}', but got Ok"),
+            Err(err) => err.to_string(),
+        },
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err_msg.contains(expected_substring),
+        "Error message '{err_msg}' does not contain '{expected_substring}'"
+    );
+}
+
 /// Collect (i32, i32, String) rows from batches, sorted by (col0, col1).
 #[allow(dead_code)]
 pub fn collect_int_int_str(batches: &[RecordBatch]) -> Vec<(i32, i32, String)> {

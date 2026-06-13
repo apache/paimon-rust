@@ -23,7 +23,9 @@ mod common;
 
 use paimon_datafusion::SQLContext;
 
-use common::{create_sql_context, create_test_env, dml_count, exec, query_int_str_int};
+use common::{
+    assert_sql_error, create_sql_context, create_test_env, dml_count, exec, query_int_str_int,
+};
 
 // ======================= Helpers =======================
 
@@ -474,4 +476,74 @@ async fn test_update_empty_table() {
     let cnt = dml_count(&sql_context, "UPDATE paimon.test_db.t SET name = 'x'").await;
     assert_eq!(cnt, 0);
     drop(tmp);
+}
+
+// ======================= Unsupported cases =======================
+
+#[tokio::test]
+async fn test_update_rejects_primary_key_table_without_data_evolution() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.pk_t (\
+                id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)\
+            ) WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "UPDATE paimon.test_db.pk_t SET name = 'x' WHERE id = 1",
+        "primary-key tables without data-evolution",
+    )
+    .await;
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn test_update_rejects_primary_key_table_with_data_evolution() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.pk_de_t (\
+                id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)\
+            ) WITH (\
+                'bucket' = '1',\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true'\
+            )",
+        )
+        .await
+        .unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "UPDATE paimon.test_db.pk_de_t SET name = 'x' WHERE id = 1",
+        "does not support primary keys",
+    )
+    .await;
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn test_update_rejects_table_alias() {
+    let (_tmp, sql_context) = setup().await;
+
+    assert_sql_error(
+        &sql_context,
+        "UPDATE paimon.test_db.t AS target SET name = 'x' WHERE id = 1",
+        "Table alias 'target' in UPDATE is not yet supported",
+    )
+    .await;
 }

@@ -227,6 +227,21 @@ ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 
 ## DML
 
+The table type determines which row-level DML operations are supported:
+
+| Operation | Append-only table | Primary-key table | Data-evolution row-tracking table (no primary key) |
+|---|---|---|---|
+| `INSERT INTO` | Supported | Supported | Supported |
+| `INSERT OVERWRITE` | Supported | Supported | Supported |
+| `INSERT OVERWRITE ... PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
+| `TRUNCATE TABLE` | Supported | Supported | Supported |
+| `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
+| `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
+| `DELETE` | Supported via Copy-on-Write | Not supported | Not supported |
+| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE` and not-matched `INSERT`; matched `DELETE` is not supported |
+
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+
 ### INSERT INTO
 
 ```sql
@@ -279,7 +294,7 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For primary-key tables, `data-evolution.enabled` must be enabled to perform UPDATE.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
 
 ### DELETE
 
@@ -288,6 +303,8 @@ For append-only tables, deletes are executed using Copy-on-Write:
 ```sql
 DELETE FROM paimon.my_db.t WHERE name = 'b';
 ```
+
+`DELETE` is not supported on primary-key tables or data-evolution tables.
 
 ### MERGE INTO
 
@@ -326,7 +343,7 @@ ON target.id = source.id
 WHEN MATCHED THEN UPDATE SET name = source.name;
 ```
 
-For data-evolution tables, MERGE INTO uses the `_ROW_ID` virtual column for row-level tracking. For append-only tables, it uses Copy-on-Write file rewriting.
+For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE` plus not-matched `INSERT`; matched `DELETE` is not yet supported. Primary-key tables are not supported for `MERGE INTO`.
 
 ### TRUNCATE TABLE
 
