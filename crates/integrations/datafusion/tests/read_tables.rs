@@ -478,7 +478,7 @@ async fn test_residual_filter_limit_keeps_connector_limit_and_correctness() {
     assert!(
         scan_lines
             .iter()
-            .all(|line| !line.contains("limit=")),
+            .all(|line| !line.contains(", limit=")),
         "Residual filter queries should not push a scan limit hint when residual filters stay above the scan, plan:\n{plan_text}"
     );
 

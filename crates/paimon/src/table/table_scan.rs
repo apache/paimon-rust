@@ -41,6 +41,7 @@ use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+use crate::table::ScanTrace;
 use crate::table::SnapshotManager;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,29 @@ use std::sync::Arc;
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
 const INDEX_DIR: &str = "index";
+
+#[derive(Debug, Default)]
+struct ManifestReadCounters {
+    entries_read: usize,
+    pruned_by_bucket: usize,
+    pruned_by_partition: usize,
+    after_entry_pruning: usize,
+    pruned_by_level: usize,
+    pruned_by_data_stats: usize,
+    after_manifest_filters: usize,
+}
+
+impl ManifestReadCounters {
+    fn merge(&mut self, other: Self) {
+        self.entries_read += other.entries_read;
+        self.pruned_by_bucket += other.pruned_by_bucket;
+        self.pruned_by_partition += other.pruned_by_partition;
+        self.after_entry_pruning += other.after_entry_pruning;
+        self.pruned_by_level += other.pruned_by_level;
+        self.pruned_by_data_stats += other.pruned_by_data_stats;
+        self.after_manifest_filters += other.after_manifest_filters;
+    }
+}
 
 /// Reads a manifest list file (Avro) and returns manifest file metas.
 async fn read_manifest_list(
@@ -92,15 +116,21 @@ async fn read_all_manifest_entries(
     schema_fields: &[DataField],
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
+    trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let (mut manifest_files, delta) = futures::try_join!(
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
         read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
     )?;
+    let mut trace = trace;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.record_manifest_lists(manifest_files.len(), delta.len());
+    }
     manifest_files.extend(delta);
 
     // Manifest-file-level partition stats pruning: skip entire manifest files
     // whose partition range doesn't overlap the partition predicate.
+    let manifest_files_before_partition_pruning = manifest_files.len();
     if let Some(pf) = partition_filter {
         if !partition_fields.is_empty() {
             manifest_files.retain(|meta| {
@@ -118,58 +148,76 @@ async fn read_all_manifest_entries(
             });
         }
     }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
+        trace.manifest_files_after_partition_pruning = manifest_files.len();
+    }
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
     let shared_cache = SharedSchemaCache::new();
-    let all_entries: Vec<ManifestEntry> = futures::stream::iter(manifest_files)
-        .map(|meta| {
-            let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
-            let cache = shared_cache.clone();
-            async move {
-                let input_file = file_io.new_input(&path)?;
-                let content = input_file.read().await?;
+    let manifest_results: Vec<(Vec<ManifestEntry>, ManifestReadCounters)> =
+        futures::stream::iter(manifest_files)
+            .map(|meta| {
+                let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+                let cache = shared_cache.clone();
+                async move {
+                    let input_file = file_io.new_input(&path)?;
+                    let content = input_file.read().await?;
 
-                // Per-task bucket cache (few distinct total_buckets values per manifest).
-                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                    // Per-task bucket cache (few distinct total_buckets values per manifest).
+                    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                    let mut counters = ManifestReadCounters::default();
 
-                let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
-                    &content,
-                    &cache,
-                    &mut |_kind, partition_bytes, bucket, total_buckets| {
-                        // Bucket filter (negative bucket = unassigned)
-                        if has_primary_keys && !scan_all_files && bucket < 0 {
-                            return false;
-                        }
-                        if let Some(pred) = bucket_predicate {
-                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                                compute_target_buckets(pred, bucket_key_fields, total_buckets)
-                            });
-                            if let Some(targets) = targets {
-                                if !targets.contains(&bucket) {
-                                    return false;
+                    let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
+                        &content,
+                        &cache,
+                        &mut |_kind, partition_bytes, bucket, total_buckets| {
+                            counters.entries_read += 1;
+                            // Bucket filter (negative bucket = unassigned)
+                            if has_primary_keys && !scan_all_files && bucket < 0 {
+                                counters.pruned_by_bucket += 1;
+                                return false;
+                            }
+                            if let Some(pred) = bucket_predicate {
+                                let targets =
+                                    bucket_cache.entry(total_buckets).or_insert_with(|| {
+                                        compute_target_buckets(
+                                            pred,
+                                            bucket_key_fields,
+                                            total_buckets,
+                                        )
+                                    });
+                                if let Some(targets) = targets {
+                                    if !targets.contains(&bucket) {
+                                        counters.pruned_by_bucket += 1;
+                                        return false;
+                                    }
                                 }
                             }
-                        }
 
-                        // Partition filter
-                        if let Some(pf) = partition_filter {
-                            match pf.matches_entry(partition_bytes) {
-                                Ok(false) => return false,
-                                Ok(true) => {}
-                                Err(_) => {}
+                            // Partition filter
+                            if let Some(pf) = partition_filter {
+                                match pf.matches_entry(partition_bytes) {
+                                    Ok(false) => {
+                                        counters.pruned_by_partition += 1;
+                                        return false;
+                                    }
+                                    Ok(true) => {}
+                                    Err(_) => {}
+                                }
                             }
-                        }
 
-                        true
-                    },
-                )?;
+                            true
+                        },
+                    )?;
+                    counters.after_entry_pruning = entries.len();
 
-                // Post-filter: level-0 and data predicates (need DataFileMeta)
-                let filtered: Vec<ManifestEntry> = entries
-                    .into_iter()
-                    .filter(|entry| {
+                    // Post-filter: level-0 and data predicates (need DataFileMeta)
+                    let mut filtered = Vec::with_capacity(entries.len());
+                    for entry in entries {
                         if skip_level_zero && has_primary_keys && entry.file().level == 0 {
-                            return false;
+                            counters.pruned_by_level += 1;
+                            continue;
                         }
                         if !data_predicates.is_empty()
                             && !data_file_matches_predicates(
@@ -179,20 +227,34 @@ async fn read_all_manifest_entries(
                                 schema_fields,
                             )
                         {
-                            return false;
+                            counters.pruned_by_data_stats += 1;
+                            continue;
                         }
-                        true
-                    })
-                    .collect();
-                Ok::<_, crate::Error>(filtered)
-            }
-        })
-        .buffered(64)
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+                        filtered.push(entry);
+                    }
+                    counters.after_manifest_filters = filtered.len();
+                    Ok::<_, crate::Error>((filtered, counters))
+                }
+            })
+            .buffered(64)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+    let mut counters = ManifestReadCounters::default();
+    let mut all_entries = Vec::new();
+    for (entries, manifest_counters) in manifest_results {
+        counters.merge(manifest_counters);
+        all_entries.extend(entries);
+    }
+    if let Some(trace) = trace {
+        trace.manifest_entries_read = counters.entries_read;
+        trace.manifest_entries_pruned_by_bucket = counters.pruned_by_bucket;
+        trace.manifest_entries_pruned_by_partition = counters.pruned_by_partition;
+        trace.manifest_entries_after_entry_pruning = counters.after_entry_pruning;
+        trace.manifest_entries_pruned_by_level = counters.pruned_by_level;
+        trace.manifest_entries_pruned_by_data_stats = counters.pruned_by_data_stats;
+        trace.manifest_entries_after_manifest_filters = counters.after_manifest_filters;
+    }
     Ok(all_entries)
 }
 
@@ -368,7 +430,22 @@ impl<'a> TableScan<'a> {
             Some(snapshot) => snapshot,
             None => return Ok(Plan::new(Vec::new())),
         };
-        self.plan_snapshot(snapshot).await
+        self.plan_snapshot(snapshot, None).await
+    }
+
+    /// Plan the full scan and return metadata-pruning trace counters.
+    pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+        let mut trace = ScanTrace {
+            limit: self.limit,
+            ..Default::default()
+        };
+        let snapshot = match self.resolve_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => return Ok((Plan::new(Vec::new()), trace)),
+        };
+        trace.snapshot_id = Some(snapshot.id());
+        let plan = self.plan_snapshot(snapshot, Some(&mut trace)).await?;
+        Ok((plan, trace))
     }
 
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
@@ -457,6 +534,14 @@ impl<'a> TableScan<'a> {
         &self,
         snapshot: &Snapshot,
     ) -> crate::Result<Vec<ManifestEntry>> {
+        self.plan_manifest_entries_with_trace(snapshot, None).await
+    }
+
+    async fn plan_manifest_entries_with_trace(
+        &self,
+        snapshot: &Snapshot,
+        mut trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -527,16 +612,25 @@ impl<'a> TableScan<'a> {
             self.table.schema().fields(),
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
+            trace.as_deref_mut(),
         )
         .await?;
-        Ok(merge_manifest_entries(entries))
+        let merged = merge_manifest_entries(entries);
+        if let Some(trace) = trace {
+            trace.manifest_entries_after_merge = merged.len();
+        }
+        Ok(merged)
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
         can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
     }
 
-    async fn plan_snapshot(&self, snapshot: Snapshot) -> crate::Result<Plan> {
+    async fn plan_snapshot(
+        &self,
+        snapshot: Snapshot,
+        mut trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -545,8 +639,13 @@ impl<'a> TableScan<'a> {
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
 
-        let entries = self.plan_manifest_entries(&snapshot).await?;
+        let entries = self
+            .plan_manifest_entries_with_trace(&snapshot, trace.as_deref_mut())
+            .await?;
         if entries.is_empty() {
+            if let Some(trace) = trace {
+                trace.record_final_plan(0, 0, 0);
+            }
             return Ok(Plan::new(Vec::new()));
         }
 
@@ -560,8 +659,12 @@ impl<'a> TableScan<'a> {
                 .iter()
                 .any(|e| e.file().schema_id != current_schema_id);
             if !has_cross_schema {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.manifest_entries_after_cross_schema_stats = entries.len();
+                }
                 entries
             } else {
+                let before = entries.len();
                 let mut kept = Vec::with_capacity(entries.len());
                 let mut schema_cache: HashMap<i64, Option<Arc<ResolvedStatsSchema>>> =
                     HashMap::new();
@@ -578,11 +681,22 @@ impl<'a> TableScan<'a> {
                         kept.push(entry);
                     }
                 }
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.manifest_entries_pruned_by_cross_schema_stats += before - kept.len();
+                    trace.manifest_entries_after_cross_schema_stats = kept.len();
+                }
                 kept
             }
         };
         if entries.is_empty() {
+            if let Some(trace) = trace {
+                trace.record_final_plan(0, 0, 0);
+            }
             return Ok(Plan::new(Vec::new()));
+        } else if let Some(trace) = trace.as_deref_mut() {
+            if trace.manifest_entries_after_cross_schema_stats == 0 {
+                trace.manifest_entries_after_cross_schema_stats = entries.len();
+            }
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
@@ -681,12 +795,16 @@ impl<'a> TableScan<'a> {
             // Apply group-level predicate filtering after grouping by row_id range.
             let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
                 let row_id_groups = group_by_overlapping_row_id(data_files);
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.data_evolution_groups_before_stats += row_id_groups.len();
+                }
 
                 // Filter groups by merged stats before splitting.
                 let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
-                    row_id_groups
+                    let before = row_id_groups.len();
+                    let groups = row_id_groups
                         .into_iter()
                         .filter(|group| {
                             data_evolution_group_matches_predicates(
@@ -695,15 +813,24 @@ impl<'a> TableScan<'a> {
                                 self.table.schema().fields(),
                             )
                         })
-                        .collect()
+                        .collect::<Vec<_>>();
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.data_evolution_groups_pruned_by_stats += before - groups.len();
+                    }
+                    groups
                 };
 
                 // Filter groups by row ID ranges.
                 let row_id_groups = if let Some(ref ranges) = effective_row_ranges {
-                    row_id_groups
+                    let before = row_id_groups.len();
+                    let groups = row_id_groups
                         .into_iter()
                         .filter(|group| group.iter().any(|f| any_range_overlaps_file(ranges, f)))
-                        .collect()
+                        .collect::<Vec<_>>();
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.data_evolution_groups_pruned_by_row_ranges += before - groups.len();
+                    }
+                    groups
                 } else {
                     row_id_groups
                 };
@@ -811,11 +938,16 @@ impl<'a> TableScan<'a> {
 
         // With data predicates or row_ranges, merged_row_count() reflects pre-filter
         // row counts, so stopping early could return fewer rows than the limit.
+        let splits_before_limit = splits.len();
         let splits = if self.can_push_down_limit_hint(effective_row_ranges.as_deref()) {
             self.apply_limit_pushdown(splits)
         } else {
             splits
         };
+        if let Some(trace) = trace {
+            let final_files = splits.iter().map(|split| split.data_files().len()).sum();
+            trace.record_final_plan(splits_before_limit, splits.len(), final_files);
+        }
 
         Ok(Plan::new(splits))
     }
@@ -836,7 +968,7 @@ mod tests {
     use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
     use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
-    use crate::table::Table;
+    use crate::table::{CommitMessage, Table, TableCommit};
     use crate::Error;
     use chrono::{DateTime, Utc};
 
@@ -983,6 +1115,46 @@ mod tests {
             file_source: None,
             value_stats_cols: None,
         }
+    }
+
+    fn scan_trace_test_table(table_path: &str) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "scan_trace"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        )
+    }
+
+    async fn setup_scan_trace_dirs(table: &Table) {
+        table
+            .file_io()
+            .mkdirs(&format!("{}/snapshot/", table.location()))
+            .await
+            .unwrap();
+        table
+            .file_io()
+            .mkdirs(&format!("{}/manifest/", table.location()))
+            .await
+            .unwrap();
+    }
+
+    fn stats_trace_file(name: &str, min_id: i32, max_id: i32) -> DataFileMeta {
+        let mut file = test_data_file_meta(
+            int_stats_row(Some(min_id)),
+            int_stats_row(Some(max_id)),
+            vec![Some(0)],
+            2,
+        );
+        file.file_name = name.to_string();
+        file
     }
 
     fn limit_test_table() -> Table {
@@ -1282,6 +1454,45 @@ mod tests {
             TEST_SCHEMA_ID,
             &test_schema_fields(),
         ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_trace_records_between_data_stats_pruning() {
+        let table_path = "memory:/test_plan_with_trace_records_between_data_stats_pruning";
+        let table = scan_trace_test_table(table_path);
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "scan-trace-test".to_string())
+            .commit(vec![CommitMessage::new(
+                Vec::new(),
+                0,
+                vec![
+                    stats_trace_file("stats-1.parquet", 1, 2),
+                    stats_trace_file("stats-2.parquet", 10, 20),
+                    stats_trace_file("stats-3.parquet", 100, 101),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let fields = int_field();
+        let pb = PredicateBuilder::new(&fields);
+        let between = Predicate::and(vec![
+            pb.greater_or_equal("id", Datum::Int(10)).unwrap(),
+            pb.less_or_equal("id", Datum::Int(20)).unwrap(),
+        ]);
+        let mut reader = table.new_read_builder();
+        reader.with_filter(between);
+        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(
+            trace.final_files, 1,
+            "BETWEEN should keep only the overlapping stats range: {trace:?}"
+        );
+        assert!(
+            trace.manifest_entries_pruned_by_data_stats >= 2,
+            "BETWEEN should prune files outside the min/max range: {trace:?}"
+        );
     }
 
     #[test]

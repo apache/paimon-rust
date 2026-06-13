@@ -103,6 +103,7 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
     pub(crate) schema: &'a ArrowSchemaRef,
     pub(crate) plan: &'a paimon::table::Plan,
+    pub(crate) scan_trace: Option<paimon::table::ScanTrace>,
     pub(crate) projection: Option<&'a Vec<usize>>,
     pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
     pub(crate) limit: Option<usize>,
@@ -149,6 +150,7 @@ impl PaimonScanBuilder<'_> {
             planned_partitions,
             self.limit,
             self.filter_exact,
+            self.scan_trace,
         )))
     }
 }
@@ -189,7 +191,7 @@ impl TableProvider for PaimonTableProvider {
         // Tokio runtime. `scan.plan()` can reach OpenDAL/Tokio filesystem calls while
         // reading Paimon metadata, so we must provide a runtime here instead of
         // assuming the caller already entered one.
-        let plan = await_with_runtime(scan.plan())
+        let (plan, scan_trace) = await_with_runtime(scan.plan_with_trace())
             .await
             .map_err(to_datafusion_error)?;
 
@@ -203,6 +205,7 @@ impl TableProvider for PaimonTableProvider {
             table: &self.table,
             schema: &self.schema,
             plan: &plan,
+            scan_trace: Some(scan_trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,
             limit: pushed_limit,
