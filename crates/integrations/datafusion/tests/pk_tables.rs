@@ -32,7 +32,7 @@ use common::{
     collect_id_name, collect_id_value, collect_int_int_str, create_sql_context, create_test_env,
     row_count, setup_sql_context,
 };
-use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::Catalog;
 
@@ -2843,4 +2843,64 @@ async fn test_pk_aggregation_routing_uses_kv_path() {
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
         .unwrap();
     assert_eq!(amount.value(0), 30);
+}
+
+/// Regression: `COUNT(*)` pushes an empty projection down to the scan, so the
+/// KV merge read path must preserve the row count when reordering a batch with
+/// zero columns. Aggregation tables route through that path; without an
+/// explicit `with_row_count`, the reordered batch would report 0 rows and
+/// `COUNT(*)` would collapse to 0 even though the merge produced rows.
+#[tokio::test]
+async fn test_pk_aggregation_count_star_empty_projection() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_count (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Two commits with overlapping primary keys so the read path must merge:
+    // raw row count is 5, but the table holds 3 distinct keys (1, 2, 3).
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_count VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_count VALUES (1, 5), (2, 7), (3, 99)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_agg_count")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        count.value(0),
+        3,
+        "COUNT(*) over an aggregation table must reflect merged rows; a 0/wrong \
+         count means the empty-projection reorder dropped the row count"
+    );
 }
