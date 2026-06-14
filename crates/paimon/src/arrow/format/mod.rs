@@ -17,6 +17,8 @@
 
 mod avro;
 pub(crate) mod blob;
+#[cfg(feature = "mosaic")]
+mod mosaic;
 mod orc;
 mod parquet;
 #[cfg(feature = "vortex")]
@@ -105,16 +107,34 @@ pub(crate) fn create_format_reader(
     } else if lower.ends_with(".avro") {
         Ok(Box::new(avro::AvroFormatReader))
     } else {
+        #[cfg(feature = "mosaic")]
+        if lower.ends_with(".mosaic") {
+            return Ok(Box::new(mosaic::MosaicFormatReader));
+        }
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
             return Ok(Box::new(vortex::VortexFormatReader));
         }
         Err(Error::Unsupported {
             message: format!(
-                "unsupported file format: expected .parquet, .blob, .orc, or .avro, got: {path}"
+                "unsupported file format: expected {}, got: {path}",
+                supported_read_formats().join(", ")
             ),
         })
     }
+}
+
+fn supported_read_formats() -> Vec<&'static str> {
+    vec![
+        ".parquet",
+        ".blob",
+        ".orc",
+        ".avro",
+        #[cfg(feature = "mosaic")]
+        ".mosaic",
+        #[cfg(feature = "vortex")]
+        ".vortex",
+    ]
 }
 
 /// Create a format writer that streams directly to storage.

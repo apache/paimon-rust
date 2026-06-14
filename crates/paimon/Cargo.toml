@@ -42,6 +42,7 @@ storage-all = [
     "storage-hdfs",
 ]
 fulltext = ["tantivy", "tempfile"]
+mosaic = ["dep:paimon-mosaic-core"]
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
@@ -101,6 +102,7 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
+paimon-mosaic-core = { version = "0.1.0", optional = true }
 vortex = { version = "0.68", features = ["tokio"], optional = true }
 libloading = "0.9"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
