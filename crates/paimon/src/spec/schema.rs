@@ -162,6 +162,10 @@ impl TableSchema {
         }
 
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        PartialUpdateConfig::new(&new_schema.options)
+            .validate_create_mode(!new_schema.primary_keys.is_empty())?;
+        AggregationConfig::new(&new_schema.options)
+            .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
         Ok(new_schema)
     }
 
@@ -1278,6 +1282,93 @@ mod tests {
                 .get("changelog-producer")
                 .map(String::as_str),
             Some("lookup")
+        );
+    }
+
+    #[test]
+    fn test_aggregation_apply_changes_rejects_unknown_field() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.valuee.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("is not declared")
+                    && message.contains("valuee")),
+            "aggregation alter should reject typo'd column, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_update_apply_changes_rejects_unsupported_option() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "ignore-delete".to_string(),
+                "true".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("merge-engine=partial-update")
+                    && message.contains("ignore-delete")),
+            "partial-update alter should reject unsupported option, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_apply_changes_accepts_valid_option() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.value.aggregate-function".to_string(),
+                "max".to_string(),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.value.aggregate-function")
+                .map(String::as_str),
+            Some("max")
         );
     }
 
