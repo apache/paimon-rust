@@ -1539,6 +1539,48 @@ mod tests {
         assert_eq!(total_rows, 4);
     }
 
+    #[cfg(feature = "vortex")]
+    #[tokio::test]
+    async fn test_vortex_write_rolling_on_target_file_size() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_vortex_table_write_rolling";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("target-file-size", "1b")
+            .option("file.format", "vortex")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![3, 4], vec![30, 40]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 2);
+
+        let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 4);
+    }
+
     // -----------------------------------------------------------------------
     // Primary-key table write tests
     // -----------------------------------------------------------------------

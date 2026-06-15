@@ -42,7 +42,7 @@ storage-all = [
     "storage-hdfs",
 ]
 fulltext = ["tantivy", "tempfile"]
-vortex = ["dep:vortex", "dep:kanal"]
+vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
@@ -102,11 +102,10 @@ urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
 vortex = { version = "0.68", features = ["tokio"], optional = true }
-kanal = { version = "0.1.1", optional = true }
 libloading = "0.9"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
-unicode-segmentation = "=1.13.3"
+unicode-segmentation = "=1.13.2"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
