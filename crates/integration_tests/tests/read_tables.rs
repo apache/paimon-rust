@@ -97,7 +97,18 @@ async fn scan_and_read_with_filter(
     table: &paimon::Table,
     filter: Predicate,
 ) -> (Plan, Vec<RecordBatch>) {
+    scan_and_read_with_projection_and_filter(table, None, filter).await
+}
+
+async fn scan_and_read_with_projection_and_filter(
+    table: &paimon::Table,
+    projection: Option<&[&str]>,
+    filter: Predicate,
+) -> (Plan, Vec<RecordBatch>) {
     let mut read_builder = table.new_read_builder();
+    if let Some(cols) = projection {
+        read_builder.with_projection(cols);
+    }
     read_builder.with_filter(filter);
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
@@ -2933,6 +2944,134 @@ async fn test_read_full_types_table() {
     assert_eq!(r.16, vec![6]); // array
     assert_eq!(r.17, vec![("d".into(), 40), ("e".into(), 50)]); // map
     assert_eq!(r.18, ("carol".into(), 300)); // struct
+}
+
+#[tokio::test]
+async fn test_read_orc_with_filter_only_column_projection() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("id", Datum::Int(2))
+        .expect("Failed to build id predicate");
+
+    let (_, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "col_string");
+        let col_string = batch
+            .column_by_name("col_string")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for col_string");
+        values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
+    }
+
+    assert_eq!(values, vec!["orc-world"]);
+}
+
+async fn assert_full_types_orc_filter_matches(
+    filter: Predicate,
+    projected_column: &str,
+    expected_string_values: &[&str],
+) {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+
+    let (_, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&[projected_column]), filter).await;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), projected_column);
+        let column = batch
+            .column_by_name(projected_column)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for projected column");
+        values.extend((0..batch.num_rows()).map(|row| column.value(row).to_string()));
+    }
+
+    assert_eq!(values, expected_string_values);
+}
+
+#[tokio::test]
+async fn test_read_orc_with_supported_predicate_pushdown_types() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let cases = vec![
+        pb.equal("col_boolean", Datum::Bool(false))
+            .expect("build boolean predicate"),
+        pb.equal("col_tinyint", Datum::TinyInt(2))
+            .expect("build tinyint predicate"),
+        pb.equal("col_smallint", Datum::SmallInt(200))
+            .expect("build smallint predicate"),
+        pb.equal("col_int", Datum::Int(2000))
+            .expect("build int predicate"),
+        pb.equal("col_bigint", Datum::Long(200000))
+            .expect("build bigint predicate"),
+        pb.greater_or_equal("col_string", Datum::String("orc-world".to_string()))
+            .expect("build string lower-bound predicate"),
+        pb.less_or_equal("col_string", Datum::String("orc-world".to_string()))
+            .expect("build string upper-bound predicate"),
+    ];
+
+    for filter in cases {
+        let (_, batches) =
+            scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 1);
+            assert_eq!(batch.schema().field(0).name(), "col_string");
+            let col_string = batch
+                .column_by_name("col_string")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("Expected StringArray for col_string");
+            values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
+        }
+
+        assert_eq!(values, vec!["orc-world"]);
+    }
+}
+
+#[tokio::test]
+async fn test_read_orc_with_unsupported_date_predicate_remains_residual() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .greater_or_equal("col_date", Datum::Date(19889))
+        .expect("build date predicate");
+
+    assert_full_types_orc_filter_matches(filter, "col_string", &["orc-world", "avro-test"]).await;
+}
+
+#[tokio::test]
+async fn test_read_orc_predicate_pushdown_remains_conservative() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb.equal("id", Datum::Int(2)).expect("build id predicate");
+
+    assert!(
+        !table.new_read_builder().is_exact_filter_pushdown(&filter),
+        "ORC reader pruning must not make data predicates exact at the table boundary"
+    );
+
+    assert_full_types_orc_filter_matches(filter, "col_string", &["orc-world"]).await;
 }
 
 #[tokio::test]

@@ -43,7 +43,8 @@ pub(crate) struct FilePredicates {
 ///
 /// Each implementation (Parquet, ORC, ...) handles:
 /// - Column projection
-/// - Predicate pushdown (row-group/stripe pruning + row-level filtering)
+/// - Predicate pushdown where supported (row-group/stripe pruning and, for
+///   some formats, row-level filtering)
 /// - Row range selection
 #[async_trait]
 pub(crate) trait FormatFileReader: Send + Sync {
