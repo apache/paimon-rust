@@ -419,6 +419,24 @@ Rollback a table to a specific timestamp:
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
 
+### create_lumina_index
+
+Build and commit a Lumina global vector index for a table column:
+
+```sql
+CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
+```
+
+Optional Lumina builder settings can be supplied as comma-separated `key=value` pairs:
+
+```sql
+CALL sys.create_lumina_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'embedding',
+  options => 'lumina.index.dimension=128,lumina.encoding.type=pq'
+);
+```
+
 ## Queries
 
 ### Basic Queries

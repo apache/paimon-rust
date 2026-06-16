@@ -130,6 +130,16 @@ jobs:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
+      - name: DataFusion Lumina Build Query E2E Test
+        run: >
+          cargo test -p paimon-datafusion
+          --features vortex
+          vector_search_tests::test_lumina_build_then_vector_search_query
+          -- --ignored --exact
+        env:
+          RUST_LOG: DEBUG
+          RUST_BACKTRACE: full
+
       - name: DataFusion Integration Test
         run: cargo test -p paimon-datafusion --all-targets
         env:
