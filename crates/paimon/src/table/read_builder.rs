@@ -150,12 +150,11 @@ impl<'a> ReadBuilder<'a> {
     /// Stats pruning is per file. Files with a different `schema_id`,
     /// incompatible stats layout, or inconclusive stats are kept.
     ///
-    /// [`TableRead`] may use supported non-partition data predicates on regular
-    /// Parquet and ORC read paths for conservative row-group pruning. Parquet
-    /// may also use native row filtering. Unsupported predicates, formats
-    /// without reader pruning, and data-evolution reads remain residual and
-    /// should still be applied by the caller if exact filtering semantics are
-    /// required.
+    /// [`TableRead`] may use supported non-partition data predicates on formats
+    /// with reader pruning for conservative row-group pruning. Parquet may also
+    /// use native row filtering. Unsupported predicates, formats without reader
+    /// pruning, and data-evolution reads remain residual and should still be
+    /// applied by the caller if exact filtering semantics are required.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);
         self.try_extract_row_id_ranges();
