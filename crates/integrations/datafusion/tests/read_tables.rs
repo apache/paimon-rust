@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
@@ -96,6 +97,15 @@ async fn collect_query(
 ) -> datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
     let ctx = create_context().await;
     ctx.sql(sql).await?.collect().await
+}
+
+async fn assert_sql(sql: &str, expected: &[&str]) {
+    let batches = collect_query(sql).await.expect("query should succeed");
+    let actual = pretty_format_batches(&batches)
+        .expect("query result should format")
+        .to_string();
+    let expected = expected.join("\n");
+    assert_eq!(actual, expected, "unexpected result for SQL: {sql}");
 }
 
 async fn create_physical_plan(sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -740,6 +750,170 @@ async fn test_data_evolution_drop_column_null_fill() {
         ],
         "Old rows should have extra=NULL, new row should have extra='new'"
     );
+}
+
+#[tokio::test]
+async fn test_sql_read_format_schema_evolution_add_column() {
+    assert_sql(
+        "SELECT id, name, age FROM paimon.default.format_schema_evolution_add_column ORDER BY id",
+        &[
+            "+----+-------+-----+",
+            "| id | name  | age |",
+            "+----+-------+-----+",
+            "| 1  | alice |     |",
+            "| 2  | bob   |     |",
+            "| 3  | carol | 30  |",
+            "| 4  | dave  | 40  |",
+            "| 5  | eve   | 50  |",
+            "| 6  | frank | 60  |",
+            "+----+-------+-----+",
+        ],
+    )
+    .await;
+
+    assert_sql(
+        "SELECT id, age FROM paimon.default.format_schema_evolution_add_column WHERE age IS NULL ORDER BY id",
+        &[
+            "+----+-----+",
+            "| id | age |",
+            "+----+-----+",
+            "| 1  |     |",
+            "| 2  |     |",
+            "+----+-----+",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_format_schema_evolution_type_promotion() {
+    assert_sql(
+        "SELECT id, value FROM paimon.default.format_schema_evolution_type_promotion ORDER BY id",
+        &[
+            "+----+------------+",
+            "| id | value      |",
+            "+----+------------+",
+            "| 1  | 100        |",
+            "| 2  | 200        |",
+            "| 3  | 3000000000 |",
+            "| 4  | 4000000000 |",
+            "| 5  | 5000000000 |",
+            "| 6  | 6000000000 |",
+            "+----+------------+",
+        ],
+    )
+    .await;
+
+    assert_sql(
+        "SELECT id, value FROM paimon.default.format_schema_evolution_type_promotion WHERE value > 3000000000 ORDER BY id",
+        &[
+            "+----+------------+",
+            "| id | value      |",
+            "+----+------------+",
+            "| 4  | 4000000000 |",
+            "| 5  | 5000000000 |",
+            "| 6  | 6000000000 |",
+            "+----+------------+",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_schema_evolution_rename_column() {
+    assert_sql(
+        "SELECT id, renamed_payload FROM paimon.default.schema_evolution_rename_column ORDER BY id",
+        &[
+            "+----+-----------------+",
+            "| id | renamed_payload |",
+            "+----+-----------------+",
+            "| 1  | parquet-old     |",
+            "| 2  | parquet-old-2   |",
+            "| 3  | orc-new         |",
+            "| 4  | avro-new        |",
+            "+----+-----------------+",
+        ],
+    )
+    .await;
+
+    assert_sql(
+        "SELECT id, renamed_payload FROM paimon.default.schema_evolution_rename_column WHERE renamed_payload LIKE '%new' ORDER BY id",
+        &[
+            "+----+-----------------+",
+            "| id | renamed_payload |",
+            "+----+-----------------+",
+            "| 3  | orc-new         |",
+            "| 4  | avro-new        |",
+            "+----+-----------------+",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_mixed_format_schema_evolution_drop_column() {
+    assert_sql(
+        "SELECT id, name FROM paimon.default.mixed_format_schema_evolution_drop_column ORDER BY id",
+        &[
+            "+----+---------------+",
+            "| id | name          |",
+            "+----+---------------+",
+            "| 1  | parquet-alice |",
+            "| 2  | parquet-bob   |",
+            "| 3  | orc-carol     |",
+            "| 4  | orc-dave      |",
+            "| 5  | avro-eve      |",
+            "| 6  | avro-frank    |",
+            "+----+---------------+",
+        ],
+    )
+    .await;
+
+    assert_sql(
+        "SELECT id, name FROM paimon.default.mixed_format_schema_evolution_drop_column WHERE name LIKE 'avro-%' ORDER BY id",
+        &[
+            "+----+------------+",
+            "| id | name       |",
+            "+----+------------+",
+            "| 5  | avro-eve   |",
+            "| 6  | avro-frank |",
+            "+----+------------+",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_mixed_format_schema_evolution_reorder_move_column() {
+    assert_sql(
+        "SELECT right_value, left_value, id FROM paimon.default.mixed_format_schema_evolution_reorder_move_column ORDER BY id",
+        &[
+            "+-----------------+----------------+----+",
+            "| right_value     | left_value     | id |",
+            "+-----------------+----------------+----+",
+            "| parquet-right-1 | parquet-left-1 | 1  |",
+            "| parquet-right-2 | parquet-left-2 | 2  |",
+            "| orc-right-3     | orc-left-3     | 3  |",
+            "| orc-right-4     | orc-left-4     | 4  |",
+            "| avro-right-5    | avro-left-5    | 5  |",
+            "| avro-right-6    | avro-left-6    | 6  |",
+            "+-----------------+----------------+----+",
+        ],
+    )
+    .await;
+
+    assert_sql(
+        "SELECT id, right_value FROM paimon.default.mixed_format_schema_evolution_reorder_move_column WHERE right_value LIKE 'orc-%' ORDER BY id",
+        &[
+            "+----+-------------+",
+            "| id | right_value |",
+            "+----+-------------+",
+            "| 3  | orc-right-3 |",
+            "| 4  | orc-right-4 |",
+            "+----+-------------+",
+        ],
+    )
+    .await;
 }
 
 // ======================= Complex Type Tests =======================
