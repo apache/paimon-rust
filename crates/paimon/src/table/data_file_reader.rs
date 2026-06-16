@@ -463,3 +463,185 @@ pub(super) fn append_null_row_id_column(
     let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::new_null(batch.num_rows()));
     insert_column_at(batch, array, insert_index, output_schema)
 }
+
+#[cfg(all(test, feature = "mosaic"))]
+mod tests {
+    use super::*;
+    use crate::arrow::build_target_arrow_schema;
+    use crate::io::FileIOBuilder;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{ArrayType, DataFileMeta, DataType, IntType, VarCharType};
+    use crate::table::source::DataSplitBuilder;
+    use arrow_array::{Int32Array, StringArray};
+    use bytes::Bytes;
+    use futures::TryStreamExt;
+    use paimon_mosaic_core::spec::COMPRESSION_NONE;
+    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+    use std::io;
+
+    struct MemOutputFile {
+        data: Vec<u8>,
+    }
+
+    impl MemOutputFile {
+        fn new() -> Self {
+            Self { data: Vec::new() }
+        }
+    }
+
+    impl OutputFile for MemOutputFile {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn pos(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    fn data_field(id: i32, name: &str, data_type: DataType) -> DataField {
+        DataField::new(id, name.to_string(), data_type)
+    }
+
+    fn data_file(file_name: &str, file_size: i64, row_count: i64, schema_id: i64) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    fn write_mosaic(batch: &RecordBatch) -> Bytes {
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(
+            out,
+            batch.schema().as_ref(),
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 2,
+                row_group_max_size: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(writer.output().data.to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_mosaic_physical_missing_column_is_null_filled() {
+        let physical_fields = vec![
+            data_field(0, "id", DataType::Int(IntType::with_nullable(false))),
+            data_field(
+                1,
+                "name",
+                DataType::VarChar(VarCharType::with_nullable(true, 20).unwrap()),
+            ),
+        ];
+        let read_fields = vec![
+            physical_fields[0].clone(),
+            data_field(
+                2,
+                "items",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            ),
+            physical_fields[1].clone(),
+        ];
+
+        let physical_arrow_schema = build_target_arrow_schema(&physical_fields).unwrap();
+        let batch = RecordBatch::try_new(
+            physical_arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let data = write_mosaic(&batch);
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/mosaic_schema_evolution";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        let file_path = format!("{bucket_path}/{file_name}");
+        file_io
+            .new_output(&file_path)
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+
+        let table_schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(
+                file_name,
+                data.len() as i64,
+                3,
+                table_schema_id,
+            )])
+            .build()
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            table_schema_id,
+            read_fields.clone(),
+            read_fields.clone(),
+            Vec::new(),
+        );
+        let stream = reader.read(&[split]).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "id");
+        assert_eq!(result.schema().field(1).name(), "items");
+        assert_eq!(result.schema().field(2).name(), "name");
+        assert_eq!(result.column(1).null_count(), 3);
+
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2, 3]);
+        let names = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "a");
+        assert_eq!(names.value(2), "c");
+    }
+}
