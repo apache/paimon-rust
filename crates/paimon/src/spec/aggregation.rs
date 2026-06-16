@@ -270,6 +270,35 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
     None
 }
 
+/// Field-scoped aggregation option suffixes whose key names a single column,
+/// so the column rename/drop path can keep them in sync with the schema.
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 2] =
+    [AGG_FUNCTION_SUFFIX, LIST_AGG_DELIMITER_SUFFIX];
+
+/// Rename a column inside field-scoped aggregation option KEYS, mirroring
+/// Java `SchemaManager.applyRenameColumnsToOptions` (case 2): the value is
+/// unchanged, only `fields.<old>.<suffix>` -> `fields.<new>.<suffix>`.
+pub(crate) fn rename_field_scoped_options(
+    options: &mut HashMap<String, String>,
+    old: &str,
+    new: &str,
+) {
+    for suffix in FIELD_SCOPED_RENAMEABLE_SUFFIXES {
+        let old_key = format!("{FIELDS_PREFIX}{old}{suffix}");
+        if let Some(value) = options.remove(&old_key) {
+            options.insert(format!("{FIELDS_PREFIX}{new}{suffix}"), value);
+        }
+    }
+}
+
+/// Remove a dropped column's field-scoped aggregation option keys so no
+/// orphaned `fields.<col>.*` options remain after the column is gone.
+pub(crate) fn remove_field_scoped_options(options: &mut HashMap<String, String>, col: &str) {
+    for suffix in FIELD_SCOPED_RENAMEABLE_SUFFIXES {
+        options.remove(&format!("{FIELDS_PREFIX}{col}{suffix}"));
+    }
+}
+
 const SUPPORTED_AGGREGATOR_NAMES_HINT: &str = "supported: sum, product, min, max, last_value, \
     first_value, last_non_null_value, first_non_null_value, bool_and, bool_or, listagg";
 

@@ -19,7 +19,10 @@ use crate::spec::core_options::{
     first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION, SEQUENCE_FIELD_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
-use crate::spec::{AggregationConfig, ColumnMove, ColumnMoveType, PartialUpdateConfig};
+use crate::spec::{
+    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, ColumnMove,
+    ColumnMoveType, PartialUpdateConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -256,6 +259,11 @@ impl TableSchema {
                         name,
                         &new_name,
                     );
+                    // Field-scoped aggregation options encode the column in the
+                    // key (`fields.<col>.aggregate-function` / `.list-agg-delimiter`),
+                    // so they must be rewritten too, mirroring Java
+                    // `SchemaManager.applyRenameColumnsToOptions`.
+                    rename_field_scoped_options(&mut new_schema.options, name, &new_name);
                 }
                 SchemaChange::DropColumn { field_names } => {
                     let name = top_level_field(&field_names)?;
@@ -273,12 +281,40 @@ impl TableSchema {
                             ),
                         });
                     }
+                    // Dropping a column referenced by `bucket-key` / `sequence.field`
+                    // would silently break bucket assignment / sequence ordering on
+                    // existing data (e.g. `bucket_key_indices` becomes empty and writes
+                    // fall back to bucket 0), so reject it instead.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        if core_options
+                            .bucket_key()
+                            .is_some_and(|keys| keys.iter().any(|k| k == name))
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop column '{name}' referenced by '{BUCKET_KEY_OPTION}'"
+                                ),
+                            });
+                        }
+                        if core_options.sequence_fields().contains(&name) {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop column '{name}' referenced by '{SEQUENCE_FIELD_OPTION}'"
+                                ),
+                            });
+                        }
+                    }
                     if fields.len() == 1 {
                         return Err(crate::Error::Unsupported {
                             message: "Cannot drop all fields in table".to_string(),
                         });
                     }
                     fields.remove(idx);
+                    // Drop the column's field-scoped aggregation options so no
+                    // orphaned `fields.<col>.*` keys remain (which would otherwise
+                    // fail the aggregation re-validation below).
+                    remove_field_scoped_options(&mut new_schema.options, name);
                 }
                 SchemaChange::UpdateColumnType {
                     field_names,
@@ -2052,6 +2088,150 @@ mod tests {
                 .map(String::as_str),
             Some("max")
         );
+    }
+
+    #[test]
+    fn test_rename_column_rewrites_field_scoped_agg_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("tag", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.tag.aggregate-function", "listagg")
+                .option("fields.tag.list-agg-delimiter", ";")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "tag".to_string(),
+                "label".to_string(),
+            )])
+            .unwrap();
+
+        // Field-scoped option keys follow the column to its new name.
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.label.aggregate-function")
+                .map(String::as_str),
+            Some("listagg")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.label.list-agg-delimiter")
+                .map(String::as_str),
+            Some(";")
+        );
+        // The old keys are gone.
+        assert_eq!(
+            new_schema.options().get("fields.tag.aggregate-function"),
+            None
+        );
+        assert_eq!(
+            new_schema.options().get("fields.tag.list-agg-delimiter"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drop_column_referenced_by_bucket_key_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .option("bucket", "4")
+                .option("bucket-key", "name")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "name".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("bucket-key") && message.contains("name")),
+            "drop of a bucket-key column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_column_referenced_by_sequence_field_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("sequence.field", "ts")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "ts".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("sequence.field") && message.contains("ts")),
+            "drop of a sequence.field column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_column_removes_field_scoped_agg_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .column("tag", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .option("fields.tag.aggregate-function", "listagg")
+                .option("fields.tag.list-agg-delimiter", ";")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "tag".to_string(),
+            )])
+            .unwrap();
+
+        // The dropped column's field-scoped options are removed...
+        assert_eq!(
+            new_schema.options().get("fields.tag.aggregate-function"),
+            None
+        );
+        assert_eq!(
+            new_schema.options().get("fields.tag.list-agg-delimiter"),
+            None
+        );
+        // ...while the surviving column's option is untouched.
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.value.aggregate-function")
+                .map(String::as_str),
+            Some("sum")
+        );
+        assert!(new_schema.fields().iter().all(|f| f.name() != "tag"));
     }
 
     #[test]
