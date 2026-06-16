@@ -3009,43 +3009,50 @@ async fn test_read_orc_with_supported_predicate_pushdown_types() {
 
     let cases = vec![
         (
+            "col_boolean_eq",
             pb.equal("col_boolean", Datum::Bool(false))
                 .expect("build boolean predicate"),
             vec!["orc-world"],
         ),
         (
+            "col_tinyint_eq",
             pb.equal("col_tinyint", Datum::TinyInt(2))
                 .expect("build tinyint predicate"),
             vec!["orc-world"],
         ),
         (
+            "col_smallint_eq",
             pb.equal("col_smallint", Datum::SmallInt(200))
                 .expect("build smallint predicate"),
             vec!["orc-world"],
         ),
         (
+            "col_int_eq",
             pb.equal("col_int", Datum::Int(2000))
                 .expect("build int predicate"),
             vec!["orc-world"],
         ),
         (
+            "col_bigint_eq",
             pb.equal("col_bigint", Datum::Long(200000))
                 .expect("build bigint predicate"),
             vec!["orc-world"],
         ),
         (
+            "col_string_gte",
             pb.greater_or_equal("col_string", Datum::String("orc-world".to_string()))
                 .expect("build string lower-bound predicate"),
-            vec!["orc-world"],
+            vec!["parquet-hello", "orc-world"],
         ),
         (
+            "col_string_lte",
             pb.less_or_equal("col_string", Datum::String("orc-world".to_string()))
                 .expect("build string upper-bound predicate"),
-            vec!["parquet-hello", "orc-world"],
+            vec!["orc-world", "avro-test"],
         ),
     ];
 
-    for (filter, expected_string_values) in cases {
+    for (case_name, filter, expected_string_values) in cases {
         let (_, batches) =
             scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
 
@@ -3060,7 +3067,7 @@ async fn test_read_orc_with_supported_predicate_pushdown_types() {
             values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
         }
 
-        assert_eq!(values, expected_string_values);
+        assert_eq!(values, expected_string_values, "case {case_name}");
     }
 }
 
