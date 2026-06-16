@@ -3008,23 +3008,44 @@ async fn test_read_orc_with_supported_predicate_pushdown_types() {
     let pb = PredicateBuilder::new(table.schema().fields());
 
     let cases = vec![
-        pb.equal("col_boolean", Datum::Bool(false))
-            .expect("build boolean predicate"),
-        pb.equal("col_tinyint", Datum::TinyInt(2))
-            .expect("build tinyint predicate"),
-        pb.equal("col_smallint", Datum::SmallInt(200))
-            .expect("build smallint predicate"),
-        pb.equal("col_int", Datum::Int(2000))
-            .expect("build int predicate"),
-        pb.equal("col_bigint", Datum::Long(200000))
-            .expect("build bigint predicate"),
-        pb.greater_or_equal("col_string", Datum::String("orc-world".to_string()))
-            .expect("build string lower-bound predicate"),
-        pb.less_or_equal("col_string", Datum::String("orc-world".to_string()))
-            .expect("build string upper-bound predicate"),
+        (
+            pb.equal("col_boolean", Datum::Bool(false))
+                .expect("build boolean predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.equal("col_tinyint", Datum::TinyInt(2))
+                .expect("build tinyint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.equal("col_smallint", Datum::SmallInt(200))
+                .expect("build smallint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.equal("col_int", Datum::Int(2000))
+                .expect("build int predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.equal("col_bigint", Datum::Long(200000))
+                .expect("build bigint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.greater_or_equal("col_string", Datum::String("orc-world".to_string()))
+                .expect("build string lower-bound predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            pb.less_or_equal("col_string", Datum::String("orc-world".to_string()))
+                .expect("build string upper-bound predicate"),
+            vec!["parquet-hello", "orc-world"],
+        ),
     ];
 
-    for filter in cases {
+    for (filter, expected_string_values) in cases {
         let (_, batches) =
             scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
 
@@ -3039,7 +3060,7 @@ async fn test_read_orc_with_supported_predicate_pushdown_types() {
             values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
         }
 
-        assert_eq!(values, vec!["orc-world"]);
+        assert_eq!(values, expected_string_values);
     }
 }
 
