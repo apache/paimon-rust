@@ -244,6 +244,7 @@ impl KeyValueFileWriter {
         //   Deduplicate   → keep last row per key group (highest seq)
         //   FirstRow      → keep first row per key group (lowest seq)
         //   PartialUpdate → per column, keep the latest non-null value
+        //   Aggregation   → keep all rows for read-side field-wise merge
         let (data_batch, data_seq, data_indices) = match self.config.merge_engine {
             MergeEngine::PartialUpdate => {
                 let (merged, merged_seq) =
@@ -252,7 +253,7 @@ impl KeyValueFileWriter {
                     UInt32Array::from_iter_values(0..u32::try_from(merged.num_rows()).unwrap());
                 (merged, merged_seq, identity)
             }
-            MergeEngine::Deduplicate | MergeEngine::FirstRow => {
+            MergeEngine::Deduplicate | MergeEngine::FirstRow | MergeEngine::Aggregation => {
                 let selected = self.select_flush_indices(&combined, &sorted_indices)?;
                 (
                     combined.clone(),
