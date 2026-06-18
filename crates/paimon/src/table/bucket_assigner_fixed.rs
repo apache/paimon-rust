@@ -19,9 +19,10 @@
 
 use crate::io::FileIO;
 use crate::spec::{
-    batch_hash_codes, batch_to_serialized_bytes, DataField, IndexFileMeta, EMPTY_SERIALIZED_ROW,
+    batch_to_serialized_bytes, BucketFunctionType, DataField, IndexFileMeta, EMPTY_SERIALIZED_ROW,
 };
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssigner, PartitionBucketKey};
+use crate::table::bucket_function::batch_bucket_ids;
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
@@ -33,6 +34,7 @@ use std::collections::HashMap;
 pub(crate) struct FixedBucketAssigner {
     partition_field_indices: Vec<usize>,
     bucket_key_indices: Vec<usize>,
+    bucket_function_type: BucketFunctionType,
     total_buckets: i32,
 }
 
@@ -40,11 +42,13 @@ impl FixedBucketAssigner {
     pub fn new(
         partition_field_indices: Vec<usize>,
         bucket_key_indices: Vec<usize>,
+        bucket_function_type: BucketFunctionType,
         total_buckets: i32,
     ) -> Self {
         Self {
             partition_field_indices,
             bucket_key_indices,
+            bucket_function_type,
             total_buckets,
         }
     }
@@ -63,11 +67,13 @@ impl BucketAssigner for FixedBucketAssigner {
             batch_to_serialized_bytes(batch, &self.partition_field_indices, fields)?
         };
 
-        let hash_codes = batch_hash_codes(batch, &self.bucket_key_indices, fields)?;
-        let buckets: Vec<i32> = hash_codes
-            .iter()
-            .map(|h| (h % self.total_buckets).wrapping_abs())
-            .collect();
+        let buckets = batch_bucket_ids(
+            batch,
+            &self.bucket_key_indices,
+            fields,
+            self.bucket_function_type,
+            self.total_buckets,
+        )?;
 
         Ok(BatchAssignOutput {
             partition_bytes,

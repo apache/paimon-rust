@@ -23,8 +23,8 @@
 use crate::arrow::build_target_arrow_schema;
 use crate::spec::PartitionComputer;
 use crate::spec::{
-    first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataType,
-    MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
+    DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
 use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -32,6 +32,7 @@ use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
 use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
+use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
@@ -259,6 +260,7 @@ impl TableWrite {
         }
 
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
+        let bucket_function_type = core_options.bucket_function_type()?;
 
         let bucket_assigner = if is_dynamic_cross_partition {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
@@ -286,9 +288,15 @@ impl TableWrite {
         } else if total_buckets <= 1 || bucket_key_indices.is_empty() {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(partition_field_indices, 0))
         } else {
+            let bucket_key_fields: Vec<DataField> = bucket_key_indices
+                .iter()
+                .map(|&idx| fields[idx].clone())
+                .collect();
+            validate_bucket_function(bucket_function_type, &bucket_key_fields)?;
             BucketAssignerEnum::Fixed(FixedBucketAssigner::new(
                 partition_field_indices,
                 bucket_key_indices,
+                bucket_function_type,
                 total_buckets,
             ))
         };
@@ -740,7 +748,7 @@ mod tests {
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
-    use arrow_array::{Int32Array, Int64Array, Int8Array};
+    use arrow_array::{Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
     };
@@ -1317,6 +1325,117 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_mod_bucket_function_routes_by_floor_mod() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_mod_bucket_function";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "5")
+            .option("bucket-key", "id")
+            .option("bucket-function.type", "mod")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let fields = table.schema().fields().to_vec();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let output = table_write
+            .bucket_assigner
+            .assign_batch(&make_batch(vec![-3, 17, 5], vec![10, 20, 30]), &fields)
+            .await
+            .unwrap();
+
+        assert_eq!(output.buckets, vec![2, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_mod_bucket_function_rejects_non_integral_key() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_mod_bucket_invalid";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::VarChar(VarCharType::string_type()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "5")
+            .option("bucket-key", "id")
+            .option("bucket-function.type", "mod")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let err = match TableWrite::new(&table, "test-user".to_string()) {
+            Ok(_) => panic!("expected mod bucket function to reject non-integral key"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("INT or BIGINT")),
+            "expected ConfigInvalid for non-integral mod bucket key, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hive_bucket_function_routes_by_hive_hash() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_hive_bucket_function";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("bucket", "8")
+            .option("bucket-key", "id,name")
+            .option("bucket-function.type", "hive")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["hello"])),
+            ],
+        )
+        .unwrap();
+
+        let fields = table.schema().fields().to_vec();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let output = table_write
+            .bucket_assigner
+            .assign_batch(&batch, &fields)
+            .await
+            .unwrap();
+
+        assert_eq!(output.buckets, vec![3]);
     }
 
     #[tokio::test]

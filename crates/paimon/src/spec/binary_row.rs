@@ -1131,7 +1131,7 @@ fn write_typed_value(
 
 /// Build BinaryRows for all rows in the batch for the given field indices.
 /// Downcasts columns once, then iterates rows — O(F) downcasts instead of O(N*F).
-fn batch_build_binary_rows(
+pub(crate) fn batch_build_binary_rows(
     batch: &RecordBatch,
     field_indices: &[usize],
     fields: &[crate::spec::DataField],

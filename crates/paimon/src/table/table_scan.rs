@@ -30,8 +30,9 @@ use super::stats_filter::{
 use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
-    avro::SharedSchemaCache, bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate, Snapshot,
+    avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
+    DataField, DataFileMeta, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate,
+    Snapshot,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::merge_tree_split_generator::{
@@ -92,6 +93,7 @@ async fn read_all_manifest_entries(
     schema_fields: &[DataField],
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
+    bucket_function_type: BucketFunctionType,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let (mut manifest_files, delta) = futures::try_join!(
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
@@ -142,7 +144,12 @@ async fn read_all_manifest_entries(
                         }
                         if let Some(pred) = bucket_predicate {
                             let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                                compute_target_buckets(pred, bucket_key_fields, total_buckets)
+                                compute_target_buckets(
+                                    pred,
+                                    bucket_key_fields,
+                                    bucket_function_type,
+                                    total_buckets,
+                                )
                             });
                             if let Some(targets) = targets {
                                 if !targets.contains(&bucket) {
@@ -489,29 +496,29 @@ impl<'a> TableScan<'a> {
             self.data_predicates.as_slice()
         };
 
-        let bucket_key_fields: Vec<DataField> =
-            if self.bucket_predicate.is_none() || !core_options.is_default_bucket_function() {
-                Vec::new()
-            } else {
-                let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
-                    if has_primary_keys {
-                        self.table.schema().trimmed_primary_keys()
-                    } else {
-                        Vec::new()
-                    }
-                });
-                bucket_keys
-                    .iter()
-                    .filter_map(|key| {
-                        self.table
-                            .schema()
-                            .fields()
-                            .iter()
-                            .find(|f| f.name() == key)
-                            .cloned()
-                    })
-                    .collect::<Vec<_>>()
-            };
+        let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
+            Vec::new()
+        } else {
+            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
+                if has_primary_keys {
+                    self.table.schema().trimmed_primary_keys()
+                } else {
+                    Vec::new()
+                }
+            });
+            bucket_keys
+                .iter()
+                .filter_map(|key| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .find(|f| f.name() == key)
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let bucket_function_type = core_options.bucket_function_type()?;
 
         let entries = read_all_manifest_entries(
             file_io,
@@ -527,6 +534,7 @@ impl<'a> TableScan<'a> {
             self.table.schema().fields(),
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
+            bucket_function_type,
         )
         .await?;
         Ok(merge_manifest_entries(entries))
@@ -827,10 +835,10 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, DataField, DataFileMeta,
-        DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta, IndexManifestEntry, IntType,
-        Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema, TableSchema,
-        VarCharType,
+        stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
+        DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta,
+        IndexManifestEntry, IntType, Predicate, PredicateBuilder, PredicateOperator,
+        Schema as PaimonSchema, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -839,6 +847,7 @@ mod tests {
     use crate::table::Table;
     use crate::Error;
     use chrono::{DateTime, Utc};
+    use std::collections::HashSet;
 
     /// Helper to build a DataFileMeta with data evolution fields.
     fn make_evo_file(
@@ -1524,7 +1533,7 @@ mod tests {
             literals: vec![Datum::Int(42)],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 4);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
         assert!(buckets.is_some());
         let buckets = buckets.unwrap();
         assert_eq!(buckets.len(), 1);
@@ -1544,7 +1553,7 @@ mod tests {
             literals: vec![Datum::Int(1), Datum::Int(2), Datum::Int(3)],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 4);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
         assert!(buckets.is_some());
         let buckets = buckets.unwrap();
         // Should have at most 3 buckets (could be fewer if some hash to the same bucket)
@@ -1566,7 +1575,7 @@ mod tests {
             literals: vec![Datum::Int(10)],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 4);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
         assert!(
             buckets.is_none(),
             "Range predicates cannot determine target buckets"
@@ -1596,7 +1605,7 @@ mod tests {
             },
         ]);
 
-        let buckets = compute_target_buckets(&pred, &fields, 8);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 8);
         assert!(buckets.is_some());
         let buckets = buckets.unwrap();
         assert_eq!(buckets.len(), 1);
@@ -1619,7 +1628,7 @@ mod tests {
             literals: vec![Datum::Int(1)],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 8);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 8);
         assert!(
             buckets.is_none(),
             "Partial bucket key should not determine target buckets"
@@ -1641,12 +1650,58 @@ mod tests {
             literals: vec![Datum::String("alice".into())],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 4);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
         assert!(buckets.is_some());
         let buckets = buckets.unwrap();
         assert_eq!(buckets.len(), 1);
         let bucket = *buckets.iter().next().unwrap();
         assert!((0..4).contains(&bucket));
+    }
+
+    #[test]
+    fn test_compute_target_buckets_mod_function() {
+        let fields = bucket_key_fields();
+        let pred = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(-3)],
+        };
+
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Mod, 5);
+        assert_eq!(buckets, Some(HashSet::from([2])));
+    }
+
+    #[test]
+    fn test_compute_target_buckets_hive_function() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+        ];
+        let pred = Predicate::And(vec![
+            Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Int(7)],
+            },
+            Predicate::Leaf {
+                column: "name".into(),
+                index: 1,
+                data_type: DataType::VarChar(VarCharType::default()),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::String("hello".into())],
+            },
+        ]);
+
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Hive, 8);
+        assert_eq!(buckets, Some(HashSet::from([3])));
     }
 
     #[test]
@@ -1660,7 +1715,7 @@ mod tests {
             literals: vec![],
         };
 
-        let buckets = compute_target_buckets(&pred, &fields, 4);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 4);
         assert!(buckets.is_some(), "IsNull should determine a target bucket");
         let buckets = buckets.unwrap();
         assert_eq!(buckets.len(), 1);
@@ -1698,7 +1753,7 @@ mod tests {
             },
         ]);
 
-        let buckets = compute_target_buckets(&pred, &fields, 8);
+        let buckets = compute_target_buckets(&pred, &fields, BucketFunctionType::Default, 8);
         assert!(
             buckets.is_some(),
             "Composite key with IsNull should determine a target bucket"

@@ -70,10 +70,6 @@ pub(super) fn split_scan_predicates(
 
 fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     let core_options = CoreOptions::new(table.schema().options());
-    if !core_options.is_default_bucket_function() {
-        return None;
-    }
-
     let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
         if table.schema().trimmed_primary_keys().is_empty() {
             Vec::new()

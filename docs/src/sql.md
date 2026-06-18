@@ -903,6 +903,7 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'bucket' = '-1'` | Dynamic bucket mode (HASH index) |
 | `'bucket' = '-2'` | Postpone bucket mode (deferred assignment) |
 | `'bucket-key' = 'col'` | Explicit bucket key column |
+| `'bucket-function.type' = 'default' \| 'mod' \| 'hive'` | Function used to map fixed bucket keys to bucket ids |
 
 ### Merge Engine
 

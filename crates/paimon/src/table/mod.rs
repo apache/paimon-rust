@@ -27,6 +27,7 @@ mod bucket_assigner_cross;
 mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
+mod bucket_function;
 mod commit_message;
 pub(crate) mod cow_writer;
 mod data_evolution_reader;

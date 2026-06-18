@@ -102,6 +102,26 @@ pub enum ChangelogProducer {
     Lookup,
 }
 
+/// Bucket function used to map bucket keys to fixed bucket ids.
+///
+/// Reference: Java `CoreOptions.BucketFunctionType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFunctionType {
+    Default,
+    Mod,
+    Hive,
+}
+
+impl BucketFunctionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Mod => "mod",
+            Self::Hive => "hive",
+        }
+    }
+}
+
 impl ChangelogProducer {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -388,15 +408,22 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_BUCKET)
     }
 
-    /// Whether the bucket function type is the default hash-based function.
-    ///
-    /// Only the default function (`Math.abs(hash % numBuckets)`) is supported
-    /// for bucket predicate pruning. `mod` and `hive` use different algorithms.
-    pub fn is_default_bucket_function(&self) -> bool {
-        self.options
+    /// Bucket function type. Defaults to Java-compatible Paimon hash.
+    pub fn bucket_function_type(&self) -> crate::Result<BucketFunctionType> {
+        match self
+            .options
             .get(BUCKET_FUNCTION_TYPE_OPTION)
-            .map(|v| v.eq_ignore_ascii_case("default"))
-            .unwrap_or(true)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref()
+            .unwrap_or("default")
+        {
+            "default" => Ok(BucketFunctionType::Default),
+            "mod" => Ok(BucketFunctionType::Mod),
+            "hive" => Ok(BucketFunctionType::Hive),
+            other => Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported bucket-function.type: {other}"),
+            }),
+        }
     }
 
     /// Target file size for data files. Default is 128MB.
