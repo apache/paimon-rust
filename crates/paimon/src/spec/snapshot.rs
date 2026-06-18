@@ -103,6 +103,10 @@ pub struct Snapshot {
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
     statistics: Option<String>,
+    /// user-facing properties of this snapshot
+    #[builder(default = None)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    properties: Option<HashMap<String, String>>,
     /// next row id for row tracking
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +210,12 @@ impl Snapshot {
         self.statistics.as_deref()
     }
 
+    /// Get the properties of this snapshot.
+    #[inline]
+    pub fn properties(&self) -> Option<&HashMap<String, String>> {
+        self.properties.as_ref()
+    }
+
     /// Get the next row id of this snapshot.
     #[inline]
     pub fn next_row_id(&self) -> Option<i64> {
@@ -261,6 +271,10 @@ mod tests {
                     .delta_record_count(Some(2))
                     .changelog_record_count(Some(2))
                     .statistics(Some("statistics_string".to_string()))
+                    .properties(Some(HashMap::from([(
+                        "scan.snapshot-id".to_string(),
+                        "2".to_string(),
+                    )])))
                     .build(),
             ),
             (

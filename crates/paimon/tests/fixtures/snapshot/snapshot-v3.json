@@ -13,5 +13,8 @@
   "totalRecordCount": 4,
   "deltaRecordCount": 2,
   "changelogRecordCount": 2,
-  "statistics": "statistics_string"
+  "statistics": "statistics_string",
+  "properties": {
+    "scan.snapshot-id": "2"
+  }
 }
