@@ -1021,9 +1021,10 @@ mod vector_search_tests {
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_vector_search, SQLContext};
 
-    fn extract_test_warehouse() -> (tempfile::TempDir, String) {
+    fn extract_test_warehouse(archive_name: &str) -> (tempfile::TempDir, String) {
         let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/test_lumina_vector.tar.gz");
+            .join("testdata")
+            .join(archive_name);
         let file = std::fs::File::open(&archive_path)
             .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
         let decoder = flate2::read::GzDecoder::new(file);
@@ -1038,8 +1039,8 @@ mod vector_search_tests {
         (tmp, warehouse)
     }
 
-    async fn create_vector_search_context() -> (SQLContext, tempfile::TempDir) {
-        let (tmp, warehouse) = extract_test_warehouse();
+    async fn create_vector_search_context(archive_name: &str) -> (SQLContext, tempfile::TempDir) {
+        let (tmp, warehouse) = extract_test_warehouse(archive_name);
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
@@ -1051,6 +1052,14 @@ mod vector_search_tests {
             .expect("Failed to register catalog");
         register_vector_search(ctx.ctx(), catalog, "default");
         (ctx, tmp)
+    }
+
+    async fn create_lumina_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+        create_vector_search_context("test_lumina_vector.tar.gz").await
+    }
+
+    async fn create_java_vindex_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+        create_vector_search_context("test_java_vindex_vector.tar.gz").await
     }
 
     fn extract_ids(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
@@ -1070,7 +1079,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top3() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
             .await
@@ -1086,7 +1095,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top6_returns_all() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
             .await
@@ -1101,7 +1110,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_without_matching_index_returns_empty() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
             .await
@@ -1115,5 +1124,20 @@ mod vector_search_tests {
             total_rows, 0,
             "vector_search without a matching Lumina index should not fall back to a full table scan"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_java_vindex_table() {
+        let (ctx, _tmp) = create_java_vindex_vector_search_context().await;
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ids = extract_ids(&batches);
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 }

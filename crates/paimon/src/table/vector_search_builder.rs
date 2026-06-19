@@ -15,15 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::lumina::is_lumina_index_type;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::{is_lumina_index_type, GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::{find_field_id_by_name, RowRange, Table};
+use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
+use crate::vindex::is_vindex_index_type;
+use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use std::collections::HashMap;
 use std::io::Cursor;
 
 const INDEX_DIR: &str = "index";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorIndexBackend {
+    Lumina,
+    Vindex,
+}
+
+impl VectorIndexBackend {
+    fn from_index_type(index_type: &str) -> Option<Self> {
+        if is_lumina_index_type(index_type) {
+            Some(Self::Lumina)
+        } else if is_vindex_index_type(index_type) {
+            Some(Self::Vindex)
+        } else {
+            None
+        }
+    }
+
+    fn error_name(self) -> &'static str {
+        match self {
+            Self::Lumina => "Lumina",
+            Self::Vindex => "vindex",
+        }
+    }
+}
 
 pub struct VectorSearchBuilder<'a> {
     table: &'a Table,
@@ -126,11 +154,11 @@ async fn evaluate_vector_search(
         None => return Ok(Vec::new()),
     };
 
-    let lumina_entries: Vec<_> = index_entries
+    let vector_entries: Vec<_> = index_entries
         .iter()
         .filter(|e| {
             e.kind == FileKind::Add
-                && is_lumina_index_type(&e.index_file.index_type)
+                && VectorIndexBackend::from_index_type(&e.index_file.index_type).is_some()
                 && e.index_file
                     .global_index_meta
                     .as_ref()
@@ -138,14 +166,16 @@ async fn evaluate_vector_search(
         })
         .collect();
 
-    if lumina_entries.is_empty() {
+    if vector_entries.is_empty() {
         return Ok(Vec::new());
     }
 
-    let futures: Vec<_> = lumina_entries
+    let futures: Vec<_> = vector_entries
         .into_iter()
         .map(|entry| {
             let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
+            let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
+                .expect("filtered vector index type");
             let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
             let file_name = entry.index_file.file_name.clone();
             let file_size = entry.index_file.file_size as u64;
@@ -157,16 +187,30 @@ async fn evaluate_vector_search(
             async move {
                 let input = input?;
                 let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                    message: format!("Failed to read Lumina index file '{}': {}", file_name, e),
+                    message: format!(
+                        "Failed to read {} index file '{}': {}",
+                        backend.error_name(),
+                        file_name,
+                        e
+                    ),
                     source: None,
                 })?;
 
                 let io_meta =
                     GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
-                let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
                 let data = bytes.to_vec();
-                let result =
-                    reader.visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?;
+                let result = match backend {
+                    VectorIndexBackend::Lumina => {
+                        let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
+                        reader
+                            .visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?
+                    }
+                    VectorIndexBackend::Vindex => {
+                        let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+                        reader
+                            .visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?
+                    }
+                };
 
                 match result {
                     Some(scored_map) => Ok::<_, crate::Error>(
@@ -192,6 +236,7 @@ mod tests {
     use super::*;
     use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
     use crate::spec::{DataType, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType};
+    use crate::vindex::IVF_FLAT_IDENTIFIER;
 
     fn make_field(id: i32, name: &str) -> DataField {
         DataField::new(id, name.to_string(), DataType::Int(IntType::default()))
@@ -239,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evaluate_ignores_non_lumina_index_type() {
+    async fn test_evaluate_ignores_non_vector_index_type() {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
@@ -362,6 +407,31 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Failed to read Lumina index file 'missing.idx'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_accepts_vindex_index_type() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(2, "embedding")];
+        let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+
+        let entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+
+        let err = evaluate_vector_search(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &[entry],
+            &vs,
+            &fields,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to read vindex index file 'missing.idx'"),
             "unexpected error: {err}"
         );
     }
