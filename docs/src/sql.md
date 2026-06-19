@@ -427,6 +427,17 @@ Build and commit a Lumina global vector index for a table column:
 CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
 ```
 
+The optional `index_type` argument selects the Lumina index identifier. It defaults to
+`lumina`. Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
+
+```sql
+CALL sys.create_lumina_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'embedding',
+  index_type => 'lumina'
+);
+```
+
 Optional Lumina builder settings can be supplied as comma-separated `key=value` pairs:
 
 ```sql
