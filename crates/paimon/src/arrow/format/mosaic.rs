@@ -532,10 +532,15 @@ mod tests {
     use super::*;
     use crate::arrow::format::{FilePredicates, FormatFileReader};
     use crate::spec::{
-        ArrayType, DataType, Datum, IntType, Predicate, PredicateBuilder, RowType, TimestampType,
-        VarCharType,
+        ArrayType, BigIntType, BooleanType, DataType, DateType, Datum, DecimalType, DoubleType,
+        FloatType, IntType, LocalZonedTimestampType, Predicate, PredicateBuilder, RowType,
+        SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
     };
-    use arrow_array::{Array, Int32Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    };
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -1153,5 +1158,455 @@ mod tests {
         assert!(
             matches!(err, Error::Unsupported { message } if message.contains("Mosaic format does not support column 'nested'"))
         );
+    }
+
+    fn full_type_fields() -> Vec<DataField> {
+        vec![
+            field(
+                0,
+                "f_bool",
+                DataType::Boolean(BooleanType::with_nullable(true)),
+            ),
+            field(
+                1,
+                "f_tinyint",
+                DataType::TinyInt(TinyIntType::with_nullable(true)),
+            ),
+            field(
+                2,
+                "f_smallint",
+                DataType::SmallInt(SmallIntType::with_nullable(true)),
+            ),
+            field(3, "f_int", DataType::Int(IntType::with_nullable(false))),
+            field(
+                4,
+                "f_bigint",
+                DataType::BigInt(BigIntType::with_nullable(true)),
+            ),
+            field(
+                5,
+                "f_float",
+                DataType::Float(FloatType::with_nullable(true)),
+            ),
+            field(
+                6,
+                "f_double",
+                DataType::Double(DoubleType::with_nullable(true)),
+            ),
+            field(7, "f_date", DataType::Date(DateType::with_nullable(true))),
+            field(
+                8,
+                "f_time",
+                DataType::Time(TimeType::with_nullable(true, 3).unwrap()),
+            ),
+            field(
+                9,
+                "f_string",
+                DataType::VarChar(VarCharType::with_nullable(true, 20).unwrap()),
+            ),
+            field(
+                10,
+                "f_binary",
+                DataType::VarBinary(VarBinaryType::try_new(true, 20).unwrap()),
+            ),
+            field(
+                11,
+                "f_decimal_compact",
+                DataType::Decimal(DecimalType::with_nullable(true, 5, 2).unwrap()),
+            ),
+            field(
+                12,
+                "f_decimal_large",
+                DataType::Decimal(DecimalType::with_nullable(true, 20, 0).unwrap()),
+            ),
+            field(
+                13,
+                "f_ts3",
+                DataType::Timestamp(TimestampType::with_nullable(true, 3).unwrap()),
+            ),
+            field(
+                14,
+                "f_ts6",
+                DataType::Timestamp(TimestampType::with_nullable(true, 6).unwrap()),
+            ),
+            field(
+                15,
+                "f_ts9",
+                DataType::Timestamp(TimestampType::with_nullable(true, 9).unwrap()),
+            ),
+            field(
+                16,
+                "f_ltz",
+                DataType::LocalZonedTimestamp(
+                    LocalZonedTimestampType::with_nullable(true, 6).unwrap(),
+                ),
+            ),
+        ]
+    }
+
+    /// Round-trips every scalar/temporal type Mosaic supports through write + read,
+    /// asserting values survive the format. ARRAY/MAP are intentionally excluded:
+    /// `paimon-mosaic-core` 0.1.0 does not support them and the reader rejects them.
+    #[tokio::test]
+    async fn test_read_full_types() {
+        let fields = full_type_fields();
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+                Arc::new(Int8Array::from(vec![Some(1i8), Some(-2)])),
+                Arc::new(Int16Array::from(vec![Some(100i16), Some(-200)])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![Some(1_000i64), Some(-2_000)])),
+                Arc::new(Float32Array::from(vec![Some(1.5f32), Some(-2.5)])),
+                Arc::new(Float64Array::from(vec![Some(3.25f64), Some(-4.75)])),
+                Arc::new(Date32Array::from(vec![Some(18_000), Some(19_000)])),
+                Arc::new(Time32MillisecondArray::from(vec![
+                    Some(3_600_000),
+                    Some(7_200_000),
+                ])),
+                Arc::new(StringArray::from(vec![Some("hello"), Some("mosaic")])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"ab".as_ref()),
+                    Some(b"cd".as_ref()),
+                ])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345i128), Some(-678)])
+                        .with_precision_and_scale(5, 2)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345_678_901_234_567_890i128), Some(-1)])
+                        .with_precision_and_scale(20, 0)
+                        .unwrap(),
+                ),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1_700_000_000_000i64),
+                    Some(-1),
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(1_700_000_000_000_000i64),
+                    Some(-1),
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1_700_000_000_123_456_789i64),
+                    Some(-1),
+                ])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000i64), Some(-1)])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let data = write_mosaic(&batch);
+        let batches = read_batches(data, &fields, None).await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), fields.len());
+
+        let col = |i: usize| result.column(i);
+        let downcast = |i: usize| col(i).as_any();
+
+        assert!(downcast(0).downcast_ref::<BooleanArray>().unwrap().value(0));
+        assert!(!downcast(0).downcast_ref::<BooleanArray>().unwrap().value(1));
+        assert_eq!(
+            downcast(1).downcast_ref::<Int8Array>().unwrap().value(1),
+            -2
+        );
+        assert_eq!(
+            downcast(2).downcast_ref::<Int16Array>().unwrap().value(0),
+            100
+        );
+        assert_eq!(
+            downcast(3).downcast_ref::<Int32Array>().unwrap().values(),
+            &[10, 20]
+        );
+        assert_eq!(
+            downcast(4).downcast_ref::<Int64Array>().unwrap().value(1),
+            -2_000
+        );
+        assert_eq!(
+            downcast(5).downcast_ref::<Float32Array>().unwrap().value(0),
+            1.5
+        );
+        assert_eq!(
+            downcast(6).downcast_ref::<Float64Array>().unwrap().value(1),
+            -4.75
+        );
+        assert_eq!(
+            downcast(7).downcast_ref::<Date32Array>().unwrap().value(0),
+            18_000
+        );
+        assert_eq!(
+            downcast(8)
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap()
+                .value(0),
+            3_600_000
+        );
+        assert_eq!(
+            downcast(9).downcast_ref::<StringArray>().unwrap().value(1),
+            "mosaic"
+        );
+        assert_eq!(
+            downcast(10).downcast_ref::<BinaryArray>().unwrap().value(0),
+            b"ab"
+        );
+        assert_eq!(
+            downcast(11)
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            12_345
+        );
+        assert_eq!(
+            downcast(12)
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            12_345_678_901_234_567_890
+        );
+        assert_eq!(
+            downcast(13)
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(0),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            downcast(14)
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_700_000_000_000_000
+        );
+        assert_eq!(
+            downcast(15)
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(0),
+            1_700_000_000_123_456_789
+        );
+        assert_eq!(
+            downcast(16)
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_700_000_000_000_000
+        );
+        assert_eq!(
+            result.schema().field(16).data_type(),
+            &ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    /// Null values in nullable columns must round-trip as nulls.
+    #[tokio::test]
+    async fn test_read_null_values() {
+        let fields = data_fields();
+        let batch = RecordBatch::try_new(
+            arrow_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Arc::new(Int32Array::from(vec![Some(10), None, None])),
+            ],
+        )
+        .unwrap();
+        let data = write_mosaic(&batch);
+        let batches = read_batches(data, &fields, None).await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 3);
+
+        let names = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "a");
+        assert!(names.is_null(1));
+        assert_eq!(names.value(2), "c");
+
+        let scores = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(scores.value(0), 10);
+        assert_eq!(scores.null_count(), 2);
+    }
+
+    #[test]
+    fn test_mosaic_value_to_datum_conversions() {
+        let ts = |p| DataType::Timestamp(TimestampType::new(p).unwrap());
+        let ltz = |p| DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(p).unwrap());
+
+        // Each supported variant maps to the matching Datum.
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::Boolean(true),
+                &DataType::Boolean(BooleanType::new())
+            ),
+            Some(Datum::Bool(true))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::TinyInt(7),
+                &DataType::TinyInt(TinyIntType::new())
+            ),
+            Some(Datum::TinyInt(7))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::SmallInt(-9),
+                &DataType::SmallInt(SmallIntType::new())
+            ),
+            Some(Datum::SmallInt(-9))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::Integer(42), &DataType::Int(IntType::new())),
+            Some(Datum::Int(42))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::BigInt(1_000),
+                &DataType::BigInt(BigIntType::new())
+            ),
+            Some(Datum::Long(1_000))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::Float(1.5), &DataType::Float(FloatType::new())),
+            Some(Datum::Float(1.5))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::Double(2.5),
+                &DataType::Double(DoubleType::new())
+            ),
+            Some(Datum::Double(2.5))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::Date(100), &DataType::Date(DateType::new())),
+            Some(Datum::Date(100))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::Time(200),
+                &DataType::Time(TimeType::new(3).unwrap())
+            ),
+            Some(Datum::Time(200))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::String(b"hi".to_vec()),
+                &DataType::VarChar(VarCharType::new(20).unwrap())
+            ),
+            Some(Datum::String("hi".to_string()))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::Bytes(vec![1, 2]),
+                &DataType::VarBinary(VarBinaryType::try_new(true, 20).unwrap())
+            ),
+            Some(Datum::Bytes(vec![1, 2]))
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::DecimalCompact(1_000),
+                &DataType::Decimal(DecimalType::new(5, 2).unwrap())
+            ),
+            Some(Datum::Decimal {
+                unscaled: 1_000,
+                precision: 5,
+                scale: 2,
+            })
+        );
+
+        // Timestamp precision boundaries select the matching Mosaic encoding.
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::TimestampMillis(5), &ts(3)),
+            Some(Datum::Timestamp {
+                millis: 5,
+                nanos: 0
+            })
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::TimestampMillis(5), &ltz(3)),
+            Some(Datum::LocalZonedTimestamp {
+                millis: 5,
+                nanos: 0
+            })
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::TimestampMicros(1_500), &ts(6)),
+            Some(Datum::Timestamp {
+                millis: 1,
+                nanos: 500_000,
+            })
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::TimestampNanos {
+                    millis: 1,
+                    nanos_of_milli: 2,
+                },
+                &ts(9)
+            ),
+            Some(Datum::Timestamp {
+                millis: 1,
+                nanos: 2
+            })
+        );
+
+        // Ambiguous or unsupported inputs must fail open (None).
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::Null, &DataType::Int(IntType::new())),
+            None
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::Integer(1),
+                &DataType::BigInt(BigIntType::new())
+            ),
+            None,
+            "type mismatch must not convert"
+        );
+        assert_eq!(
+            mosaic_value_to_datum(
+                &MosaicValue::DecimalLarge(vec![0, 0]),
+                &DataType::Decimal(DecimalType::new(20, 0).unwrap())
+            ),
+            None,
+            "large decimal stats are not converted"
+        );
+        assert_eq!(
+            mosaic_value_to_datum(&MosaicValue::TimestampMillis(5), &ts(6)),
+            None,
+            "millis encoding must not satisfy a micros-precision type"
+        );
+    }
+
+    #[test]
+    fn test_split_batch() {
+        let chunks = split_batch(sample_batch(), 2);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+
+        let unsplit = split_batch(sample_batch(), 0);
+        assert_eq!(unsplit.len(), 1);
+        assert_eq!(unsplit[0].num_rows(), 5);
+
+        let whole = split_batch(sample_batch(), 10);
+        assert_eq!(whole.len(), 1);
     }
 }

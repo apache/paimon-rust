@@ -470,13 +470,16 @@ mod tests {
     use crate::arrow::build_target_arrow_schema;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{ArrayType, DataFileMeta, DataType, IntType, VarCharType};
-    use crate::table::source::DataSplitBuilder;
+    use crate::spec::{
+        ArrayType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, VarCharType,
+    };
+    use crate::table::source::{DataSplitBuilder, DeletionFile};
     use arrow_array::{Int32Array, StringArray};
     use bytes::Bytes;
     use futures::TryStreamExt;
     use paimon_mosaic_core::spec::COMPRESSION_NONE;
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+    use roaring::RoaringBitmap;
     use std::io;
 
     struct MemOutputFile {
@@ -643,5 +646,299 @@ mod tests {
             .unwrap();
         assert_eq!(names.value(0), "a");
         assert_eq!(names.value(2), "c");
+    }
+
+    fn pk_fields() -> Vec<DataField> {
+        vec![
+            data_field(0, "id", DataType::Int(IntType::with_nullable(false))),
+            data_field(
+                1,
+                "name",
+                DataType::VarChar(VarCharType::with_nullable(true, 20).unwrap()),
+            ),
+        ]
+    }
+
+    fn pk_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            build_target_arrow_schema(&pk_fields()).unwrap(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn write_multi_row_group_mosaic(batches: &[RecordBatch], stats_columns: Vec<String>) -> Bytes {
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(
+            out,
+            batches[0].schema().as_ref(),
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 2,
+                // One row group per written batch, so each batch carries its own stats.
+                row_group_max_size: 1,
+                stats_columns,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for batch in batches {
+            writer.write_batch(batch).unwrap();
+        }
+        writer.close().unwrap();
+        Bytes::from(writer.output().data.to_vec())
+    }
+
+    fn write_parquet(batch: &RecordBatch) -> Bytes {
+        let mut buf = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Writes a Paimon deletion-vector blob and returns the `DeletionFile` pointing at it.
+    /// Layout matches [`DeletionVector::read_from_bytes`]:
+    /// `i32 bitmapLength (magic + bitmap) | i32 magic | bitmap bytes | i32 crc`.
+    async fn write_deletion_file(
+        file_io: &crate::io::FileIO,
+        path: &str,
+        deleted_rows: &[u32],
+    ) -> DeletionFile {
+        // BitmapDeletionVector.MAGIC_NUMBER, see crate::deletion_vector.
+        const MAGIC_NUMBER: i32 = 1581511376;
+        let mut bitmap = RoaringBitmap::new();
+        for row in deleted_rows {
+            bitmap.insert(*row);
+        }
+        let mut bitmap_bytes = Vec::new();
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+
+        let bitmap_length = 4 + bitmap_bytes.len() as i32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&bitmap_length.to_be_bytes());
+        blob.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        blob.extend_from_slice(&bitmap_bytes);
+        blob.extend_from_slice(&0i32.to_be_bytes()); // crc, skipped on read
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(blob))
+            .await
+            .unwrap();
+
+        DeletionFile::new(
+            path.to_string(),
+            0,
+            bitmap_length as i64,
+            Some(deleted_rows.len() as i64),
+        )
+    }
+
+    fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// Deletion vectors are applied format-agnostically by `DataFileReader`; verify a
+    /// Mosaic file honors deleted rows end to end.
+    #[tokio::test]
+    async fn test_mosaic_with_deletion_vector() {
+        let fields = pk_fields();
+        let data = write_mosaic(&pk_batch(vec![1, 2, 3], vec!["a", "b", "c"]));
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/mosaic_dv";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        // Delete row index 1 (id = 2).
+        let dv = write_deletion_file(&file_io, &format!("{table_path}/index/dv-0"), &[1]).await;
+
+        let table_schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(
+                file_name,
+                data.len() as i64,
+                3,
+                table_schema_id,
+            )])
+            .with_data_deletion_files(vec![Some(dv)])
+            .build()
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            table_schema_id,
+            fields.clone(),
+            fields.clone(),
+            Vec::new(),
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_ids(&batches), vec![1, 3]);
+    }
+
+    /// A Mosaic file and a Parquet file in the same split must both be read and concatenated.
+    #[tokio::test]
+    async fn test_mosaic_mixed_format_read() {
+        let fields = pk_fields();
+        let mosaic_data = write_mosaic(&pk_batch(vec![1, 2], vec!["a", "b"]));
+        let parquet_data = write_parquet(&pk_batch(vec![3, 4], vec!["c", "d"]));
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/mosaic_mixed";
+        let bucket_path = format!("{table_path}/bucket-0");
+        for (name, data) in [
+            ("part-0.mosaic", &mosaic_data),
+            ("part-1.parquet", &parquet_data),
+        ] {
+            file_io
+                .new_output(&format!("{bucket_path}/{name}"))
+                .unwrap()
+                .write(data.clone())
+                .await
+                .unwrap();
+        }
+
+        let table_schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file(
+                    "part-0.mosaic",
+                    mosaic_data.len() as i64,
+                    2,
+                    table_schema_id,
+                ),
+                data_file(
+                    "part-1.parquet",
+                    parquet_data.len() as i64,
+                    2,
+                    table_schema_id,
+                ),
+            ])
+            .build()
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            table_schema_id,
+            fields.clone(),
+            fields.clone(),
+            Vec::new(),
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let mut ids = collect_ids(&batches);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    /// Row-group predicate pruning, deletion vectors and projection must compose correctly:
+    /// the predicate keeps one row group, the DV deletes one of its rows, projection keeps `id`.
+    #[tokio::test]
+    async fn test_mosaic_predicate_dv_projection_combination() {
+        let fields = pk_fields();
+        let data = write_multi_row_group_mosaic(
+            &[
+                pk_batch(vec![1, 2], vec!["a", "b"]),
+                pk_batch(vec![10, 11], vec!["c", "d"]),
+                pk_batch(vec![20, 21], vec!["e", "f"]),
+            ],
+            vec!["id".to_string()],
+        );
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/mosaic_combo";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        // Delete global row index 2 (id = 10, first row of the second row group).
+        let dv = write_deletion_file(&file_io, &format!("{table_path}/index/dv-0"), &[2]).await;
+
+        let table_schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(
+                file_name,
+                data.len() as i64,
+                6,
+                table_schema_id,
+            )])
+            .with_data_deletion_files(vec![Some(dv)])
+            .build()
+            .unwrap();
+
+        let predicate: Predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(10))
+            .unwrap();
+        let read_type = vec![fields[0].clone()];
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            table_schema_id,
+            fields.clone(),
+            read_type,
+            vec![predicate],
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(|b| b.num_columns()).max(), Some(1));
+        assert_eq!(collect_ids(&batches), vec![11]);
     }
 }
