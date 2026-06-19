@@ -45,6 +45,10 @@ const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
 const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
+const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
+const MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION: &str =
+    "manifest.full-compaction-threshold-size";
+const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
@@ -65,6 +69,9 @@ const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
+const DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE: i64 = 16 * 1024 * 1024;
+const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
@@ -414,6 +421,37 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_else(|| self.target_file_size())
     }
 
+    /// Suggested file size of a manifest file.
+    ///
+    /// Corresponds to Java `CoreOptions.MANIFEST_TARGET_FILE_SIZE`.
+    pub fn manifest_target_file_size(&self) -> i64 {
+        self.options
+            .get(MANIFEST_TARGET_FILE_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or(DEFAULT_MANIFEST_TARGET_FILE_SIZE)
+    }
+
+    /// Size threshold for triggering full compaction of manifests.
+    ///
+    /// Corresponds to Java `CoreOptions.MANIFEST_FULL_COMPACTION_FILE_SIZE`.
+    pub fn manifest_full_compaction_threshold_size(&self) -> i64 {
+        self.options
+            .get(MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or(DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE)
+    }
+
+    /// Minimum number of trailing manifest files to merge.
+    ///
+    /// Corresponds to Java `CoreOptions.MANIFEST_MERGE_MIN_COUNT`.
+    pub fn manifest_merge_min_count(&self) -> usize {
+        self.options
+            .get(MANIFEST_MERGE_MIN_COUNT_OPTION)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
+    }
+
     /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
     /// Default is "parquet".
     pub fn file_format(&self) -> &str {
@@ -617,6 +655,34 @@ mod tests {
         assert_eq!(parse_memory_size("100 b"), Some(100));
         assert_eq!(parse_memory_size(""), None);
         assert_eq!(parse_memory_size("abc"), None);
+    }
+
+    #[test]
+    fn test_manifest_compaction_options_match_java_defaults_and_overrides() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.manifest_target_file_size(), 8 * 1024 * 1024);
+        assert_eq!(
+            core.manifest_full_compaction_threshold_size(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(core.manifest_merge_min_count(), 30);
+
+        let options = HashMap::from([
+            (
+                MANIFEST_TARGET_FILE_SIZE_OPTION.to_string(),
+                "500B".to_string(),
+            ),
+            (
+                MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION.to_string(),
+                "200B".to_string(),
+            ),
+            (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.manifest_target_file_size(), 500);
+        assert_eq!(core.manifest_full_compaction_threshold_size(), 200);
+        assert_eq!(core.manifest_merge_min_count(), 3);
     }
 
     #[test]

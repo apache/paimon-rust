@@ -56,6 +56,9 @@ pub struct TableCommit {
     commit_max_retry_wait_ms: u64,
     row_tracking_enabled: bool,
     partition_default_name: String,
+    manifest_target_file_size: i64,
+    manifest_full_compaction_threshold_size: i64,
+    manifest_merge_min_count: usize,
 }
 
 impl TableCommit {
@@ -76,6 +79,10 @@ impl TableCommit {
         let commit_max_retry_wait_ms = core_options.commit_max_retry_wait_ms();
         let row_tracking_enabled = core_options.row_tracking_enabled();
         let partition_default_name = core_options.partition_default_name().to_string();
+        let manifest_target_file_size = core_options.manifest_target_file_size();
+        let manifest_full_compaction_threshold_size =
+            core_options.manifest_full_compaction_threshold_size();
+        let manifest_merge_min_count = core_options.manifest_merge_min_count();
         Self {
             table,
             snapshot_manager,
@@ -88,6 +95,9 @@ impl TableCommit {
             commit_max_retry_wait_ms,
             row_tracking_enabled,
             partition_default_name,
+            manifest_target_file_size,
+            manifest_full_compaction_threshold_size,
+            manifest_merge_min_count,
         }
     }
 
@@ -505,6 +515,9 @@ impl TableCommit {
         } else {
             vec![]
         };
+        let existing_manifest_files = self
+            .compact_manifest_files_if_needed(file_io, &manifest_dir, existing_manifest_files)
+            .await?;
 
         ManifestList::write(file_io, &base_manifest_list_path, &existing_manifest_files).await?;
 
@@ -539,6 +552,263 @@ impl TableCommit {
         let statistics = self.generate_partition_statistics(&resolved.entries)?;
 
         self.snapshot_commit.commit(&snapshot, &statistics).await
+    }
+
+    async fn compact_manifest_files_if_needed(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if manifest_files.len() <= 1 {
+            return Ok(manifest_files);
+        }
+
+        if let Some(compacted) = self
+            .full_compact_manifest_files(file_io, manifest_dir, &manifest_files)
+            .await?
+        {
+            return Ok(compacted);
+        }
+
+        self.minor_compact_manifest_files(file_io, manifest_dir, manifest_files)
+            .await
+    }
+
+    fn should_full_compact_manifests(&self, manifest_files: &[ManifestFileMeta]) -> bool {
+        let delta_size: i64 = manifest_files
+            .iter()
+            .filter(|file| {
+                file.num_deleted_files() > 0 || file.file_size() < self.manifest_target_file_size
+            })
+            .map(ManifestFileMeta::file_size)
+            .sum();
+        delta_size >= self.manifest_full_compaction_threshold_size
+    }
+
+    async fn full_compact_manifest_files(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+    ) -> Result<Option<Vec<ManifestFileMeta>>> {
+        if !self.should_full_compact_manifests(manifest_files) {
+            return Ok(None);
+        }
+
+        let delete_identifiers = self
+            .read_deleted_manifest_identifiers(file_io, manifest_dir, manifest_files)
+            .await?;
+        let delete_partitions: HashSet<Vec<u8>> = delete_identifiers
+            .iter()
+            .map(|identifier| identifier.partition.clone())
+            .collect();
+
+        let mut result = Vec::new();
+        let mut candidates = Vec::new();
+        for manifest_file in manifest_files {
+            let must_change = self.manifest_must_change(manifest_file);
+            let affected_by_deletes =
+                self.manifest_may_contain_deleted_partitions(manifest_file, &delete_partitions);
+            if must_change || affected_by_deletes {
+                candidates.push(manifest_file.clone());
+            } else {
+                result.push(manifest_file.clone());
+            }
+        }
+
+        if candidates.len() <= 1 {
+            return Ok(None);
+        }
+
+        result.extend(
+            self.merge_manifest_candidates(file_io, manifest_dir, &candidates)
+                .await?,
+        );
+        Ok(Some(result))
+    }
+
+    async fn read_deleted_manifest_identifiers(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+    ) -> Result<HashSet<crate::spec::Identifier>> {
+        let mut identifiers = HashSet::new();
+        for manifest_file in manifest_files {
+            if manifest_file.num_deleted_files() == 0 {
+                continue;
+            }
+            let path = format!("{manifest_dir}/{}", manifest_file.file_name());
+            for entry in Manifest::read(file_io, &path).await? {
+                if *entry.kind() == FileKind::Delete {
+                    identifiers.insert(entry.into_identifier());
+                }
+            }
+        }
+        Ok(identifiers)
+    }
+
+    fn manifest_must_change(&self, manifest_file: &ManifestFileMeta) -> bool {
+        manifest_file.num_deleted_files() > 0
+            || manifest_file.file_size() < self.manifest_target_file_size
+    }
+
+    fn manifest_may_contain_deleted_partitions(
+        &self,
+        manifest_file: &ManifestFileMeta,
+        delete_partitions: &HashSet<Vec<u8>>,
+    ) -> bool {
+        if delete_partitions.is_empty() {
+            return false;
+        }
+
+        let partition_fields = self.table.schema().partition_fields();
+        if partition_fields.is_empty() {
+            return true;
+        }
+
+        delete_partitions.iter().any(|partition| {
+            self.partition_may_match_manifest_stats(
+                partition,
+                manifest_file.partition_stats(),
+                &partition_fields,
+            )
+        })
+    }
+
+    fn partition_may_match_manifest_stats(
+        &self,
+        partition: &[u8],
+        stats: &BinaryTableStats,
+        partition_fields: &[crate::spec::DataField],
+    ) -> bool {
+        let Ok(partition_row) = BinaryRow::from_serialized_bytes(partition) else {
+            return true;
+        };
+        let Ok(min_row) = BinaryRow::from_serialized_bytes(stats.min_values()) else {
+            return true;
+        };
+        let Ok(max_row) = BinaryRow::from_serialized_bytes(stats.max_values()) else {
+            return true;
+        };
+        if partition_row.arity() < partition_fields.len() as i32
+            || min_row.arity() < partition_fields.len() as i32
+            || max_row.arity() < partition_fields.len() as i32
+        {
+            return true;
+        }
+
+        for (idx, field) in partition_fields.iter().enumerate() {
+            let data_type = field.data_type();
+            let Ok(partition_datum) = extract_datum(&partition_row, idx, data_type) else {
+                return true;
+            };
+            let Ok(min_datum) = extract_datum(&min_row, idx, data_type) else {
+                return true;
+            };
+            let Ok(max_datum) = extract_datum(&max_row, idx, data_type) else {
+                return true;
+            };
+
+            match partition_datum {
+                Some(datum) => {
+                    let (Some(min), Some(max)) = (min_datum, max_datum) else {
+                        return true;
+                    };
+                    if datum < min || datum > max {
+                        return false;
+                    }
+                }
+                None => {
+                    if matches!(stats.null_counts().get(idx), Some(Some(0))) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    async fn minor_compact_manifest_files(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        let mut result = Vec::new();
+        let mut candidates = Vec::new();
+        let mut total_size = 0;
+
+        for manifest_file in manifest_files {
+            total_size += manifest_file.file_size();
+            candidates.push(manifest_file);
+            if total_size >= self.manifest_target_file_size {
+                let merged = self
+                    .merge_manifest_candidates(file_io, manifest_dir, &candidates)
+                    .await?;
+                result.extend(merged);
+                candidates.clear();
+                total_size = 0;
+            }
+        }
+
+        if candidates.len() >= self.manifest_merge_min_count {
+            let merged = self
+                .merge_manifest_candidates(file_io, manifest_dir, &candidates)
+                .await?;
+            result.extend(merged);
+        } else {
+            result.extend(candidates);
+        }
+
+        Ok(result)
+    }
+
+    async fn merge_manifest_candidates(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        candidates: &[ManifestFileMeta],
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if candidates.len() == 1 {
+            return Ok(vec![candidates[0].clone()]);
+        }
+
+        let merged_entries = self
+            .merge_manifest_candidate_entries(file_io, manifest_dir, candidates)
+            .await?;
+        if merged_entries.is_empty() {
+            return Ok(vec![]);
+        }
+        let compacted_manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
+        let compacted_manifest_path = format!("{manifest_dir}/{compacted_manifest_name}");
+        let compacted_meta = self
+            .write_manifest_file(
+                file_io,
+                &compacted_manifest_path,
+                &compacted_manifest_name,
+                &merged_entries,
+            )
+            .await?;
+        Ok(vec![compacted_meta])
+    }
+
+    async fn merge_manifest_candidate_entries(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+    ) -> Result<Vec<ManifestEntry>> {
+        let mut merged_entries = HashMap::new();
+        for manifest_file in manifest_files {
+            let path = format!("{manifest_dir}/{}", manifest_file.file_name());
+            for entry in Manifest::read(file_io, &path).await? {
+                merge_manifest_entry_for_compaction(&mut merged_entries, entry)?;
+            }
+        }
+        Ok(merged_entries.into_values().collect())
     }
 
     /// Write an index manifest file from already-merged entries.
@@ -1295,6 +1565,35 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
     builder.build_serialized()
 }
 
+fn merge_manifest_entry_for_compaction(
+    entries: &mut HashMap<crate::spec::Identifier, ManifestEntry>,
+    entry: ManifestEntry,
+) -> Result<()> {
+    let identifier = entry.identifier();
+    match *entry.kind() {
+        FileKind::Add => {
+            if entries.contains_key(&identifier) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Trying to add file {:?} which is already in the manifest entry map",
+                        identifier
+                    ),
+                    source: None,
+                });
+            }
+            entries.insert(identifier, entry);
+        }
+        FileKind::Delete => {
+            if entries.contains_key(&identifier) {
+                entries.remove(&identifier);
+            } else {
+                entries.insert(identifier, entry);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
@@ -1430,11 +1729,19 @@ mod tests {
     }
 
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
+        test_table_with_options(file_io, table_path, HashMap::new())
+    }
+
+    fn test_table_with_options(
+        file_io: &FileIO,
+        table_path: &str,
+        options: HashMap<String, String>,
+    ) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_table"),
             table_path.to_string(),
-            test_schema(),
+            test_schema().copy_with_options(options),
             None,
         )
     }
@@ -1505,8 +1812,32 @@ mod tests {
         TableCommit::new(table, "test-user".to_string())
     }
 
+    fn setup_commit_with_options(
+        file_io: &FileIO,
+        table_path: &str,
+        options: HashMap<String, String>,
+    ) -> TableCommit {
+        let table = test_table_with_options(file_io, table_path, options);
+        TableCommit::new(table, "test-user".to_string())
+    }
+
     fn setup_partitioned_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_partitioned_table(file_io, table_path);
+        TableCommit::new(table, "test-user".to_string())
+    }
+
+    fn setup_partitioned_commit_with_options(
+        file_io: &FileIO,
+        table_path: &str,
+        options: HashMap<String, String>,
+    ) -> TableCommit {
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_partitioned_schema().copy_with_options(options),
+            None,
+        );
         TableCommit::new(table, "test-user".to_string())
     }
 
@@ -1603,6 +1934,255 @@ mod tests {
         assert_eq!(snapshot.id(), 2);
         assert_eq!(snapshot.total_record_count(), Some(300));
         assert_eq!(snapshot.delta_record_count(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_commit_keeps_manifest_tail_below_default_merge_min_count() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_keeps_manifest_tail_below_default_merge_min_count";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        for i in 0..6 {
+            commit
+                .commit(vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file(&format!("data-{i}.parquet"), 10)],
+                )])
+                .await
+                .unwrap();
+        }
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 6);
+        assert_eq!(snapshot.total_record_count(), Some(60));
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let base_path = format!("{manifest_dir}/{}", snapshot.base_manifest_list());
+        let base_metas = ManifestList::read(&file_io, &base_path).await.unwrap();
+        assert_eq!(
+            base_metas.len(),
+            5,
+            "default manifest.merge-min-count=30 should keep a small tail unchanged"
+        );
+
+        let delta_path = format!("{manifest_dir}/{}", snapshot.delta_manifest_list());
+        let delta_metas = ManifestList::read(&file_io, &delta_path).await.unwrap();
+        assert_eq!(delta_metas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_compacts_manifest_tail_when_merge_min_count_is_reached() {
+        let file_io = test_file_io();
+        let table_path =
+            "memory:/test_commit_compacts_manifest_tail_when_merge_min_count_is_reached";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.merge-min-count".to_string(), "3".to_string())]),
+        );
+        for i in 0..4 {
+            commit
+                .commit(vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file(&format!("data-{i}.parquet"), 10)],
+                )])
+                .await
+                .unwrap();
+        }
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 4);
+        assert_eq!(snapshot.total_record_count(), Some(40));
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let base_path = format!("{manifest_dir}/{}", snapshot.base_manifest_list());
+        let base_metas = ManifestList::read(&file_io, &base_path).await.unwrap();
+        assert_eq!(
+            base_metas.len(),
+            1,
+            "manifest.merge-min-count=3 should merge the tail of 3 manifests"
+        );
+
+        let compacted_entries = Manifest::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", base_metas[0].file_name()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compacted_entries.len(), 3);
+        assert!(
+            !base_metas[0].file_name().ends_with("-compact"),
+            "compacted manifest file names should match Java-style manifest-<uuid>-<count>"
+        );
+
+        let delta_path = format!("{manifest_dir}/{}", snapshot.delta_manifest_list());
+        let delta_metas = ManifestList::read(&file_io, &delta_path).await.unwrap();
+        assert_eq!(delta_metas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_full_manifest_compaction_skips_unaffected_base_manifests() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_full_manifest_compaction_skips_unaffected_base_manifests";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_partitioned_commit_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([
+                (
+                    "manifest.full-compaction-threshold-size".to_string(),
+                    "1B".to_string(),
+                ),
+                ("manifest.target-file-size".to_string(), "1B".to_string()),
+            ]),
+        );
+        let manifest_dir = format!("{table_path}/manifest");
+
+        let keep_entry = ManifestEntry::new(
+            FileKind::Add,
+            partition_bytes("keep"),
+            0,
+            1,
+            test_data_file("keep.parquet", 10),
+            2,
+        );
+        let keep_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-keep-0"),
+                "manifest-keep-0",
+                &[keep_entry],
+            )
+            .await
+            .unwrap();
+
+        let drop_file = test_data_file("drop.parquet", 10);
+        let drop_entry = ManifestEntry::new(
+            FileKind::Add,
+            partition_bytes("drop"),
+            0,
+            1,
+            drop_file.clone(),
+            2,
+        );
+        let drop_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-drop-0"),
+                "manifest-drop-0",
+                &[drop_entry],
+            )
+            .await
+            .unwrap();
+
+        let delete_entry = ManifestEntry::new(
+            FileKind::Delete,
+            partition_bytes("drop"),
+            0,
+            1,
+            drop_file,
+            2,
+        );
+        let delete_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-delete-0"),
+                "manifest-delete-0",
+                &[delete_entry],
+            )
+            .await
+            .unwrap();
+
+        assert!(commit.should_full_compact_manifests(&[
+            keep_meta.clone(),
+            drop_meta.clone(),
+            delete_meta.clone(),
+        ]));
+
+        let compacted = commit
+            .compact_manifest_files_if_needed(
+                &file_io,
+                &manifest_dir,
+                vec![keep_meta.clone(), drop_meta, delete_meta],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            compacted.len(),
+            1,
+            "full compaction should preserve unaffected base manifests and drop fully canceled candidates"
+        );
+        assert_eq!(compacted[0].file_name(), keep_meta.file_name());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_compaction_preserves_unmatched_delete_entries() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_manifest_compaction_preserves_unmatched_delete_entries";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let manifest_dir = format!("{table_path}/manifest");
+
+        let deleted_file = test_data_file("deleted-in-base.parquet", 10);
+        let delete_entry =
+            ManifestEntry::new(FileKind::Delete, vec![], 0, 1, deleted_file.clone(), 2);
+        let delete_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-delete-only-0"),
+                "manifest-delete-only-0",
+                &[delete_entry],
+            )
+            .await
+            .unwrap();
+
+        let add_entry = ManifestEntry::new(
+            FileKind::Add,
+            vec![],
+            0,
+            1,
+            test_data_file("unrelated.parquet", 5),
+            2,
+        );
+        let add_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-add-only-0"),
+                "manifest-add-only-0",
+                &[add_entry],
+            )
+            .await
+            .unwrap();
+
+        let compacted = commit
+            .merge_manifest_candidates(&file_io, &manifest_dir, &[delete_meta, add_meta])
+            .await
+            .unwrap();
+        assert_eq!(compacted.len(), 1);
+
+        let compacted_entries = Manifest::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", compacted[0].file_name()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compacted_entries.len(), 2);
+        assert!(
+            compacted_entries.iter().any(|entry| {
+                *entry.kind() == FileKind::Delete && entry.file().file_name == deleted_file.file_name
+            }),
+            "Java FileEntry.mergeEntries keeps unmatched DELETE entries because the ADD can live in an older manifest"
+        );
     }
 
     #[tokio::test]
