@@ -79,12 +79,10 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
         let (op, relative_path) = self.storage.create(path)?;
-        let path = path.to_string();
-        let relative_path_pos = path.len() - relative_path.len();
         Ok(InputFile {
             op,
-            path,
-            relative_path_pos,
+            path: path.to_string(),
+            relative_path: relative_path.into_owned(),
         })
     }
 
@@ -93,12 +91,10 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> Result<OutputFile> {
         let (op, relative_path) = self.storage.create(path)?;
-        let path = path.to_string();
-        let relative_path_pos = path.len() - relative_path.len();
         Ok(OutputFile {
             op,
-            path,
-            relative_path_pos,
+            path: path.to_string(),
+            relative_path: relative_path.into_owned(),
         })
     }
 
@@ -107,9 +103,12 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
         let (op, relative_path) = self.storage.create(path)?;
-        let meta = op.stat(relative_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to get file status for '{path}'"),
-        })?;
+        let meta = op
+            .stat(relative_path.as_ref())
+            .await
+            .context(IoUnexpectedSnafu {
+                message: format!("Failed to get file status for '{path}'"),
+            })?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -128,10 +127,15 @@ impl FileIO {
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
         let (op, relative_path) = self.storage.create(path)?;
+        // `relative_path` is a byte-suffix of `path` for object stores and POSIX
+        // local paths, so this recovers the scheme/root prefix. For a Windows
+        // local path the relative form only swaps `\`->`/` (length-preserving),
+        // so this is `""` and entries are reported in opendal's normalized
+        // `/C:/...` form — which still round-trips back through `create`.
         let base_path = &path[..path.len() - relative_path.len()];
         // Opendal list() expects directory path to end with `/`.
         // use normalize_root to make sure it end with `/`.
-        let list_path = normalize_root(relative_path);
+        let list_path = normalize_root(relative_path.as_ref());
 
         let entries = op.list_with(&list_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to list files in '{path}'"),
@@ -161,8 +165,10 @@ impl FileIO {
     /// List all files recursively under the given directory path.
     pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
         let (op, relative_path) = self.storage.create(path)?;
+        // See `list_status`: `relative_path` is a byte-suffix of `path` except
+        // for Windows local paths, where it only swaps separators (same length).
         let base_path = &path[..path.len() - relative_path.len()];
-        let list_path = normalize_root(relative_path);
+        let list_path = normalize_root(relative_path.as_ref());
 
         let entries =
             op.list_with(&list_path)
@@ -202,9 +208,11 @@ impl FileIO {
     pub async fn exists(&self, path: &str) -> Result<bool> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.exists(relative_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to check existence of '{path}'"),
-        })
+        op.exists(relative_path.as_ref())
+            .await
+            .context(IoUnexpectedSnafu {
+                message: format!("Failed to check existence of '{path}'"),
+            })
     }
 
     /// Delete a file.
@@ -213,9 +221,11 @@ impl FileIO {
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.delete(relative_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to delete file '{path}'"),
-        })?;
+        op.delete(relative_path.as_ref())
+            .await
+            .context(IoUnexpectedSnafu {
+                message: format!("Failed to delete file '{path}'"),
+            })?;
 
         Ok(())
     }
@@ -226,7 +236,7 @@ impl FileIO {
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.remove_all(relative_path)
+        op.remove_all(relative_path.as_ref())
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete directory '{path}'"),
@@ -243,7 +253,7 @@ impl FileIO {
     pub async fn mkdirs(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
         // Opendal create_dir expects the path to end with `/` to indicate a directory.
-        let dir_path = normalize_root(relative_path);
+        let dir_path = normalize_root(relative_path.as_ref());
         op.create_dir(&dir_path).await.context(IoUnexpectedSnafu {
             message: format!("Failed to create directory '{path}'"),
         })?;
@@ -270,7 +280,7 @@ impl FileIO {
         let (_, relative_path_dst) = self.storage.create(dst)?;
 
         op_src
-            .rename(relative_path_src, relative_path_dst)
+            .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to rename '{src}' to '{dst}'"),
@@ -288,7 +298,8 @@ fn status_path(base_path: &str, entry_path: &str) -> String {
     }
 }
 
-fn looks_like_windows_drive_path(path: &str) -> bool {
+/// Whether `path` begins with a Windows drive specifier such as `C:\` or `C:/`.
+pub(crate) fn looks_like_windows_drive_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -384,7 +395,9 @@ pub struct FileStatus {
 pub struct InputFile {
     op: Operator,
     path: String,
-    relative_path_pos: usize,
+    /// The opendal-relative path (see [`FileIO::new_input`]); not necessarily a
+    /// suffix of `path`, since local paths are separator-normalized.
+    relative_path: String,
 }
 
 impl InputFile {
@@ -393,11 +406,11 @@ impl InputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
+        Ok(self.op.exists(&self.relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
-        let meta = self.op.stat(&self.path[self.relative_path_pos..]).await?;
+        let meta = self.op.stat(&self.relative_path).await?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -410,15 +423,11 @@ impl InputFile {
     }
 
     pub async fn read(&self) -> crate::Result<Bytes> {
-        Ok(self
-            .op
-            .read(&self.path[self.relative_path_pos..])
-            .await?
-            .to_bytes())
+        Ok(self.op.read(&self.relative_path).await?.to_bytes())
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
-        Ok(self.op.reader(&self.path[self.relative_path_pos..]).await?)
+        Ok(self.op.reader(&self.relative_path).await?)
     }
 }
 
@@ -426,7 +435,9 @@ impl InputFile {
 pub struct OutputFile {
     op: Operator,
     path: String,
-    relative_path_pos: usize,
+    /// The opendal-relative path (see [`FileIO::new_output`]); not necessarily a
+    /// suffix of `path`, since local paths are separator-normalized.
+    relative_path: String,
 }
 
 impl OutputFile {
@@ -435,14 +446,14 @@ impl OutputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
+        Ok(self.op.exists(&self.relative_path).await?)
     }
 
     pub fn to_input_file(self) -> InputFile {
         InputFile {
             op: self.op,
             path: self.path,
-            relative_path_pos: self.relative_path_pos,
+            relative_path: self.relative_path,
         }
     }
 
@@ -467,7 +478,7 @@ impl OutputFile {
     }
 
     async fn opendal_writer(&self) -> crate::Result<opendal::Writer> {
-        Ok(self.op.writer(&self.path[self.relative_path_pos..]).await?)
+        Ok(self.op.writer(&self.relative_path).await?)
     }
 }
 
@@ -731,20 +742,14 @@ mod object_storage_path_test {
     fn assert_relative_paths(file_io: &FileIO, path: &str, expected_relative_path: &str) {
         let input = file_io.new_input(path).unwrap();
         assert_eq!(input.location(), path);
-        assert_eq!(
-            &input.path[input.relative_path_pos..],
-            expected_relative_path
-        );
+        assert_eq!(input.relative_path, expected_relative_path);
 
         let output = file_io.new_output(path).unwrap();
         assert_eq!(output.location(), path);
-        assert_eq!(
-            &output.path[output.relative_path_pos..],
-            expected_relative_path
-        );
+        assert_eq!(output.relative_path, expected_relative_path);
 
         let (_op, relative_path) = file_io.storage.create(path).unwrap();
-        assert_eq!(relative_path, expected_relative_path);
+        assert_eq!(relative_path.as_ref(), expected_relative_path);
 
         let base_path = &path[..path.len() - relative_path.len()];
         assert_eq!(format!("{base_path}{relative_path}"), path);

@@ -463,7 +463,11 @@ fn fill_table_name(err: Error, identifier: &Identifier) -> Error {
 }
 
 #[cfg(test)]
-#[cfg(not(windows))] // Skip on Windows due to path compatibility issues
+// Skip on Windows: these tests list directories, and opendal's `fs` lister
+// panics (`StripPrefixError`) when listing under a drive-rooted path with the
+// `root="/"` operator setup. Single-file ops work after the drive-letter fix;
+// directory listing needs the opendal root rework tracked in #397.
+#[cfg(not(windows))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

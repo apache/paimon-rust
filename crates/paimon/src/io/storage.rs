@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(any(
     feature = "storage-azdls",
@@ -184,10 +185,12 @@ impl Storage {
         }
     }
 
-    pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, &'a str)> {
+    pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, Cow<'a, str>)> {
         match self {
             #[cfg(feature = "storage-memory")]
-            Storage::Memory { op } => Ok((op.clone(), Self::memory_relative_path(path)?)),
+            Storage::Memory { op } => {
+                Ok((op.clone(), Cow::Borrowed(Self::memory_relative_path(path)?)))
+            }
             #[cfg(feature = "storage-fs")]
             Storage::LocalFs { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
             #[cfg(feature = "storage-oss")]
@@ -195,14 +198,14 @@ impl Storage {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-s3")]
             Storage::S3 { config, operators } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "S3", &["s3", "s3a"])?;
                 let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-cos")]
             Storage::Cos { config, operators } => {
@@ -211,7 +214,7 @@ impl Storage {
                 let op = Self::cached_operator(operators, "COS", &bucket, || {
                     super::cos_config_build(config, path)
                 })?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-azdls")]
             Storage::Azdls { config, operators } => {
@@ -220,7 +223,7 @@ impl Storage {
                 let op = Self::cached_operator(operators, "Azure", &cache_key, || {
                     super::azdls_config_build(config, path)
                 })?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-obs")]
             Storage::Obs { config, operators } => {
@@ -229,7 +232,7 @@ impl Storage {
                 let op = Self::cached_operator(operators, "OBS", &bucket, || {
                     super::obs_config_build(config, path)
                 })?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-gcs")]
             Storage::Gcs { config, operators } => {
@@ -238,7 +241,7 @@ impl Storage {
                 let op = Self::cached_operator(operators, "GCS", &bucket, || {
                     super::gcs_config_build(config, path)
                 })?;
-                Ok((op, relative_path))
+                Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-hdfs")]
             Storage::Hdfs { config, op } => {
@@ -254,7 +257,10 @@ impl Storage {
                 if guard.is_none() {
                     *guard = Some(super::hdfs_config_build(config, path)?);
                 }
-                Ok((guard.as_ref().unwrap().clone(), relative_path))
+                Ok((
+                    guard.as_ref().unwrap().clone(),
+                    Cow::Borrowed(relative_path),
+                ))
             }
         }
     }
@@ -270,15 +276,38 @@ impl Storage {
         }
     }
 
+    /// Turn an absolute local path into the relative path that opendal's `fs`
+    /// service joins onto its `/` root.
+    ///
+    /// On POSIX an absolute path `/tmp/wh` becomes `tmp/wh`: dropping the single
+    /// leading separator lets opendal rebuild `/tmp/wh` from its `/` root.
+    ///
+    /// A bare drop-the-first-char would corrupt a Windows path such as
+    /// `C:\dir` into `:\dir` (the drive letter is lost — the historical source
+    /// of the "invalid filename" failures on Windows). Instead we keep the
+    /// drive specifier and only normalize separators to `/`, mirroring how Java
+    /// Paimon's `Path` (modeled on Hadoop's) handles Windows paths. opendal then
+    /// does `PathBuf::from("/").join("C:/dir")`, and because the argument
+    /// carries a drive prefix `Path::join` replaces the base, yielding the real
+    /// `C:\dir` on Windows.
     #[cfg(feature = "storage-fs")]
-    fn fs_relative_path(path: &str) -> crate::Result<&str> {
+    fn fs_relative_path(path: &str) -> crate::Result<Cow<'_, str>> {
+        // A `file://` / `file:/` URL is already in scheme-relative form.
         if let Some(stripped) = path.strip_prefix("file:/") {
-            Ok(stripped)
-        } else {
-            path.get(1..).ok_or_else(|| error::Error::ConfigInvalid {
+            return Ok(if stripped.contains('\\') {
+                Cow::Owned(stripped.replace('\\', "/"))
+            } else {
+                Cow::Borrowed(stripped)
+            });
+        }
+        if super::looks_like_windows_drive_path(path) {
+            return Ok(Cow::Owned(path.replace('\\', "/")));
+        }
+        path.get(1..)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| error::Error::ConfigInvalid {
                 message: format!("Invalid file path: {path}"),
             })
-        }
     }
 
     #[cfg(any(
@@ -396,5 +425,45 @@ impl Storage {
             "hdfs" => Ok(Scheme::HdfsNative),
             s => Ok(s.parse::<Scheme>()?),
         }
+    }
+}
+
+#[cfg(all(test, feature = "storage-fs"))]
+mod fs_relative_path_tests {
+    use super::Storage;
+
+    fn rel(path: &str) -> String {
+        Storage::fs_relative_path(path).unwrap().into_owned()
+    }
+
+    #[test]
+    fn posix_absolute_path_drops_leading_separator() {
+        // opendal joins the result onto its `/` root, rebuilding `/tmp/wh`.
+        assert_eq!(rel("/tmp/wh"), "tmp/wh");
+        assert_eq!(rel("/tmp/wh/db.db/t"), "tmp/wh/db.db/t");
+    }
+
+    #[test]
+    fn file_scheme_is_stripped() {
+        assert_eq!(rel("file:/tmp/wh"), "tmp/wh");
+        // `file://` keeps the leading authority slash, matching prior behavior.
+        assert_eq!(rel("file:///tmp/wh"), "//tmp/wh");
+    }
+
+    #[test]
+    fn windows_drive_path_keeps_drive_and_normalizes_separators() {
+        // The historical bug dropped the drive letter (`C:\wh` -> `:\wh`); we
+        // must keep it and only switch `\` to `/` so opendal's
+        // `PathBuf::from("/").join(..)` rebuilds the real `C:\wh` on Windows.
+        assert_eq!(rel(r"C:\Users\wh"), "C:/Users/wh");
+        assert_eq!(rel("C:/Users/wh"), "C:/Users/wh");
+        assert_eq!(rel(r"D:\a\b\c"), "D:/a/b/c");
+    }
+
+    #[test]
+    fn windows_mixed_separators_are_normalized() {
+        // make_path concatenates with `/`, so a Windows warehouse yields a
+        // mixed-separator path that must still normalize cleanly.
+        assert_eq!(rel(r"C:\Users\wh/db.db/t"), "C:/Users/wh/db.db/t");
     }
 }
