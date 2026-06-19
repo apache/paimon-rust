@@ -73,6 +73,7 @@ Served under the configured prefix (`/v1/...` by default):
 | GET / POST / DELETE | `/databases/{db}/tables/{table}` | get / alter / drop table |
 | POST | `/tables/rename` | rename table |
 | POST | `/databases/{db}/tables/{table}/commit` | commit a snapshot |
+| GET | `/databases/{db}/tables/{table}/partitions` | list partitions |
 
 The data-token endpoint returns `501`; it is never called when
 `data-token.enabled=false` (the default).

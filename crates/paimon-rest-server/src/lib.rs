@@ -52,9 +52,9 @@ use serde_json::json;
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateTableRequest,
     ErrorResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListTablesResponse, RenameTableRequest, ResourcePaths,
+    ListPartitionsResponse, ListTablesResponse, RenameTableRequest, ResourcePaths,
 };
-use paimon::catalog::{Catalog, Identifier};
+use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{Schema, Snapshot};
 use paimon::table::SnapshotManager;
@@ -168,6 +168,10 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
         .route(
             &format!("{base}/databases/:db/tables/:table/commit"),
             post(commit),
+        )
+        .route(
+            &format!("{base}/databases/:db/tables/:table/partitions"),
+            get(list_partitions),
         )
         // Token endpoint is never hit when `data-token.enabled=false` (default),
         // but we serve a stub so a misconfigured client gets a clear 501.
@@ -470,6 +474,32 @@ async fn commit(
     let manager = SnapshotManager::new(resolved.file_io().clone(), resolved.location().to_string());
     match manager.commit_snapshot(&request.snapshot).await {
         Ok(success) => (StatusCode::OK, Json(json!({ "success": success }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// List a table's partitions, computed from the latest snapshot on disk.
+///
+/// Mirrors `Catalog::list_partitions`: resolve the table, then derive partition
+/// aggregates from the filesystem via [`list_partitions_from_file_system`]. The
+/// pagination params (`maxResults`/`pageToken`) are accepted but ignored — the
+/// whole set is returned in one page (`nextPageToken = null`).
+async fn list_partitions(
+    Path((db, table)): Path<(String, String)>,
+    Query(_params): Query<HashMap<String, String>>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Response {
+    let identifier = Identifier::new(db, table);
+    let resolved = match state.catalog.get_table(&identifier).await {
+        Ok(t) => t,
+        Err(e) => return error_response(e),
+    };
+    match list_partitions_from_file_system(&resolved).await {
+        Ok(partitions) => (
+            StatusCode::OK,
+            Json(ListPartitionsResponse::new(Some(partitions), None)),
+        )
+            .into_response(),
         Err(e) => error_response(e),
     }
 }

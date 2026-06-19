@@ -93,6 +93,32 @@ fn sample_batch() -> RecordBatch {
     .expect("build batch")
 }
 
+fn partitioned_schema() -> Schema {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("region", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .partition_keys(["region"])
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .expect("build schema")
+}
+
+fn partitioned_batch() -> RecordBatch {
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, true),
+        ArrowField::new("region", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["us", "eu", "us"])),
+        ],
+    )
+    .expect("build batch")
+}
+
 // ==================== Database metadata ====================
 
 #[tokio::test]
@@ -298,4 +324,54 @@ async fn test_alter_table_columns() {
         )
         .await
         .is_err());
+}
+
+// ==================== list partitions over REST ====================
+
+#[tokio::test]
+async fn test_list_partitions() {
+    let ctx = setup().await;
+    let cat = &ctx.catalog;
+
+    cat.create_database("db", false, HashMap::new())
+        .await
+        .unwrap();
+    let ident = Identifier::new("db", "events");
+    cat.create_table(&ident, partitioned_schema(), false)
+        .await
+        .unwrap();
+
+    // Write rows spanning two partitions (region=us has 2 rows, region=eu 1),
+    // then commit through the server's commit endpoint.
+    let table = cat.get_table(&ident).await.unwrap();
+    let write_builder = table.new_write_builder();
+    let mut writer = write_builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&partitioned_batch())
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert!(!messages.is_empty(), "expected at least one commit message");
+    write_builder.new_commit().commit(messages).await.unwrap();
+
+    // The partitions endpoint must serve the two partitions (no 404 fallback);
+    // the client receives them directly from the server.
+    let partitions = cat.list_partitions(&ident).await.unwrap();
+    assert_eq!(partitions.len(), 2, "expected two partitions");
+
+    let mut regions: Vec<String> = partitions
+        .iter()
+        .map(|p| p.spec.get("region").cloned().unwrap_or_default())
+        .collect();
+    regions.sort();
+    assert_eq!(regions, vec!["eu".to_string(), "us".to_string()]);
+
+    let total: i64 = partitions.iter().map(|p| p.record_count).sum();
+    assert_eq!(total, 3, "partition record counts should sum to all rows");
+
+    let us = partitions
+        .iter()
+        .find(|p| p.spec.get("region").map(String::as_str) == Some("us"))
+        .expect("us partition present");
+    assert_eq!(us.record_count, 2, "region=us holds two rows");
 }
