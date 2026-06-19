@@ -90,7 +90,11 @@ jobs:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
 
+      # The e2e tests round-trip through a real FileSystemCatalog, which has
+      # known Windows path-compatibility issues (the `paimon` filesystem
+      # catalog tests are likewise gated with `#[cfg(not(windows))]`).
       - name: Test paimon-rest-server
+        if: runner.os != 'Windows'
         run: cargo test -p paimon-rest-server --all-targets
         env:
           RUST_LOG: DEBUG
