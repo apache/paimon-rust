@@ -664,6 +664,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_minor_merge_keeps_tail_below_merge_min_count() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_minor_merge_keeps_tail_below_merge_min_count";
+        setup_dirs(&file_io, table_path).await;
+        let schema = test_schema();
+        let partition_fields = schema.partition_fields();
+        let manifest_dir = format!("{table_path}/manifest");
+        let merger = manifest_merger(
+            &file_io,
+            &manifest_dir,
+            &partition_fields,
+            schema.id(),
+            HashMap::from([
+                ("manifest.merge-min-count".to_string(), "3".to_string()),
+                ("manifest.target-file-size".to_string(), "1GB".to_string()),
+            ]),
+        );
+
+        let first_meta = write_manifest(
+            &merger,
+            "manifest-first-0",
+            &[ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                1,
+                test_data_file("first.parquet", 5),
+                2,
+            )],
+        )
+        .await;
+        let second_meta = write_manifest(
+            &merger,
+            "manifest-second-0",
+            &[ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                1,
+                test_data_file("second.parquet", 5),
+                2,
+            )],
+        )
+        .await;
+
+        let merged = merger
+            .merge(vec![first_meta.clone(), second_meta.clone()])
+            .await
+            .unwrap();
+        assert_eq!(merged, vec![first_meta, second_meta]);
+    }
+
+    #[tokio::test]
     async fn test_full_manifest_compaction_filters_delete_entries() {
         let file_io = test_file_io();
         let table_path = "memory:/test_full_manifest_compaction_filters_delete_entries";
