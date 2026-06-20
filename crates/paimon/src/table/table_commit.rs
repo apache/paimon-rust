@@ -24,9 +24,9 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    datums_to_binary_row, extract_datum, BinaryRow, BinaryRowBuilder, CommitKind, CoreOptions,
-    DataType, Datum, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta,
-    ManifestList, PartitionStatistics, Snapshot,
+    datums_to_binary_row, extract_datum, merge_entries, BinaryRow, BinaryRowBuilder, CommitKind,
+    CoreOptions, DataType, Datum, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
+    ManifestFileMeta, ManifestList, PartitionStatistics, Snapshot,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
@@ -621,11 +621,54 @@ impl TableCommit {
             return Ok(None);
         }
 
+        let mut merged_entries = Vec::new();
+        for manifest_file in candidates {
+            let (require_change, entries) = self
+                .read_manifest_for_full_compaction(
+                    file_io,
+                    manifest_dir,
+                    &manifest_file,
+                    &delete_identifiers,
+                )
+                .await?;
+
+            if require_change {
+                merged_entries.extend(entries);
+            } else {
+                result.push(manifest_file);
+            }
+        }
+
         result.extend(
-            self.merge_manifest_candidates(file_io, manifest_dir, &candidates)
+            self.write_compacted_manifest_entries(file_io, manifest_dir, &merged_entries)
                 .await?,
         );
         Ok(Some(result))
+    }
+
+    async fn read_manifest_for_full_compaction(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_file: &ManifestFileMeta,
+        delete_identifiers: &HashSet<crate::spec::Identifier>,
+    ) -> Result<(bool, Vec<ManifestEntry>)> {
+        let path = format!("{manifest_dir}/{}", manifest_file.file_name());
+        let mut require_change = self.manifest_must_change(manifest_file);
+        let mut entries = Vec::new();
+
+        for entry in Manifest::read(file_io, &path).await? {
+            if *entry.kind() != FileKind::Add {
+                continue;
+            }
+            if delete_identifiers.contains(&entry.identifier()) {
+                require_change = true;
+            } else {
+                entries.push(entry);
+            }
+        }
+
+        Ok((require_change, entries))
     }
 
     async fn read_deleted_manifest_identifiers(
@@ -779,20 +822,8 @@ impl TableCommit {
         let merged_entries = self
             .merge_manifest_candidate_entries(file_io, manifest_dir, candidates)
             .await?;
-        if merged_entries.is_empty() {
-            return Ok(vec![]);
-        }
-        let compacted_manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
-        let compacted_manifest_path = format!("{manifest_dir}/{compacted_manifest_name}");
-        let compacted_meta = self
-            .write_manifest_file(
-                file_io,
-                &compacted_manifest_path,
-                &compacted_manifest_name,
-                &merged_entries,
-            )
-            .await?;
-        Ok(vec![compacted_meta])
+        self.write_compacted_manifest_entries(file_io, manifest_dir, &merged_entries)
+            .await
     }
 
     async fn merge_manifest_candidate_entries(
@@ -801,14 +832,30 @@ impl TableCommit {
         manifest_dir: &str,
         manifest_files: &[ManifestFileMeta],
     ) -> Result<Vec<ManifestEntry>> {
-        let mut merged_entries = HashMap::new();
+        let mut entries = Vec::new();
         for manifest_file in manifest_files {
             let path = format!("{manifest_dir}/{}", manifest_file.file_name());
-            for entry in Manifest::read(file_io, &path).await? {
-                merge_manifest_entry_for_compaction(&mut merged_entries, entry)?;
-            }
+            entries.extend(Manifest::read(file_io, &path).await?);
         }
-        Ok(merged_entries.into_values().collect())
+        merge_entries(entries)
+    }
+
+    async fn write_compacted_manifest_entries(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        entries: &[ManifestEntry],
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
+        let manifest_path = format!("{manifest_dir}/{manifest_name}");
+        let manifest_meta = self
+            .write_manifest_file(file_io, &manifest_path, &manifest_name, entries)
+            .await?;
+        Ok(vec![manifest_meta])
     }
 
     /// Write an index manifest file from already-merged entries.
@@ -1565,35 +1612,6 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
     builder.build_serialized()
 }
 
-fn merge_manifest_entry_for_compaction(
-    entries: &mut HashMap<crate::spec::Identifier, ManifestEntry>,
-    entry: ManifestEntry,
-) -> Result<()> {
-    let identifier = entry.identifier();
-    match *entry.kind() {
-        FileKind::Add => {
-            if entries.contains_key(&identifier) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Trying to add file {:?} which is already in the manifest entry map",
-                        identifier
-                    ),
-                    source: None,
-                });
-            }
-            entries.insert(identifier, entry);
-        }
-        FileKind::Delete => {
-            if entries.contains_key(&identifier) {
-                entries.remove(&identifier);
-            } else {
-                entries.insert(identifier, entry);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
@@ -2183,6 +2201,72 @@ mod tests {
             }),
             "Java FileEntry.mergeEntries keeps unmatched DELETE entries because the ADD can live in an older manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn test_full_manifest_compaction_filters_delete_entries() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_full_manifest_compaction_filters_delete_entries";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([
+                (
+                    "manifest.full-compaction-threshold-size".to_string(),
+                    "1B".to_string(),
+                ),
+                ("manifest.target-file-size".to_string(), "1B".to_string()),
+            ]),
+        );
+        let manifest_dir = format!("{table_path}/manifest");
+
+        let deleted_file = test_data_file("deleted-in-base.parquet", 10);
+        let delete_entry =
+            ManifestEntry::new(FileKind::Delete, vec![], 0, 1, deleted_file.clone(), 2);
+        let delete_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-delete-only-0"),
+                "manifest-delete-only-0",
+                &[delete_entry],
+            )
+            .await
+            .unwrap();
+
+        let add_entry = ManifestEntry::new(
+            FileKind::Add,
+            vec![],
+            0,
+            1,
+            test_data_file("unrelated.parquet", 5),
+            2,
+        );
+        let add_meta = commit
+            .write_manifest_file(
+                &file_io,
+                &format!("{manifest_dir}/manifest-add-only-0"),
+                "manifest-add-only-0",
+                &[add_entry],
+            )
+            .await
+            .unwrap();
+
+        let compacted = commit
+            .compact_manifest_files_if_needed(
+                &file_io,
+                &manifest_dir,
+                vec![delete_meta, add_meta.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            compacted.len(),
+            1,
+            "full compaction should remove delete-only manifests instead of writing DELETE entries back"
+        );
+        assert_eq!(compacted[0].file_name(), add_meta.file_name());
     }
 
     #[tokio::test]
