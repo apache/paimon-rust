@@ -24,11 +24,12 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    datums_to_binary_row, extract_datum, merge_entries, BinaryRow, BinaryRowBuilder, CommitKind,
-    CoreOptions, DataType, Datum, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
-    ManifestFileMeta, ManifestList, PartitionStatistics, Snapshot,
+    datums_to_binary_row, extract_datum, BinaryRow, BinaryRowBuilder, CommitKind, CoreOptions,
+    DataType, Datum, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta,
+    ManifestList, PartitionStatistics, Snapshot,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::manifest_file_merger::ManifestFileMerger;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
@@ -560,302 +561,18 @@ impl TableCommit {
         manifest_dir: &str,
         manifest_files: Vec<ManifestFileMeta>,
     ) -> Result<Vec<ManifestFileMeta>> {
-        if manifest_files.len() <= 1 {
-            return Ok(manifest_files);
-        }
-
-        if let Some(compacted) = self
-            .full_compact_manifest_files(file_io, manifest_dir, &manifest_files)
-            .await?
-        {
-            return Ok(compacted);
-        }
-
-        self.minor_compact_manifest_files(file_io, manifest_dir, manifest_files)
-            .await
-    }
-
-    fn should_full_compact_manifests(&self, manifest_files: &[ManifestFileMeta]) -> bool {
-        let delta_size: i64 = manifest_files
-            .iter()
-            .filter(|file| {
-                file.num_deleted_files() > 0 || file.file_size() < self.manifest_target_file_size
-            })
-            .map(ManifestFileMeta::file_size)
-            .sum();
-        delta_size >= self.manifest_full_compaction_threshold_size
-    }
-
-    async fn full_compact_manifest_files(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        manifest_files: &[ManifestFileMeta],
-    ) -> Result<Option<Vec<ManifestFileMeta>>> {
-        if !self.should_full_compact_manifests(manifest_files) {
-            return Ok(None);
-        }
-
-        let delete_identifiers = self
-            .read_deleted_manifest_identifiers(file_io, manifest_dir, manifest_files)
-            .await?;
-        let delete_partitions: HashSet<Vec<u8>> = delete_identifiers
-            .iter()
-            .map(|identifier| identifier.partition.clone())
-            .collect();
-
-        let mut result = Vec::new();
-        let mut candidates = Vec::new();
-        for manifest_file in manifest_files {
-            let must_change = self.manifest_must_change(manifest_file);
-            let affected_by_deletes =
-                self.manifest_may_contain_deleted_partitions(manifest_file, &delete_partitions);
-            if must_change || affected_by_deletes {
-                candidates.push(manifest_file.clone());
-            } else {
-                result.push(manifest_file.clone());
-            }
-        }
-
-        if candidates.len() <= 1 {
-            return Ok(None);
-        }
-
-        let mut merged_entries = Vec::new();
-        for manifest_file in candidates {
-            let (require_change, entries) = self
-                .read_manifest_for_full_compaction(
-                    file_io,
-                    manifest_dir,
-                    &manifest_file,
-                    &delete_identifiers,
-                )
-                .await?;
-
-            if require_change {
-                merged_entries.extend(entries);
-            } else {
-                result.push(manifest_file);
-            }
-        }
-
-        result.extend(
-            self.write_compacted_manifest_entries(file_io, manifest_dir, &merged_entries)
-                .await?,
-        );
-        Ok(Some(result))
-    }
-
-    async fn read_manifest_for_full_compaction(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        manifest_file: &ManifestFileMeta,
-        delete_identifiers: &HashSet<crate::spec::Identifier>,
-    ) -> Result<(bool, Vec<ManifestEntry>)> {
-        let path = format!("{manifest_dir}/{}", manifest_file.file_name());
-        let mut require_change = self.manifest_must_change(manifest_file);
-        let mut entries = Vec::new();
-
-        for entry in Manifest::read(file_io, &path).await? {
-            if *entry.kind() != FileKind::Add {
-                continue;
-            }
-            if delete_identifiers.contains(&entry.identifier()) {
-                require_change = true;
-            } else {
-                entries.push(entry);
-            }
-        }
-
-        Ok((require_change, entries))
-    }
-
-    async fn read_deleted_manifest_identifiers(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        manifest_files: &[ManifestFileMeta],
-    ) -> Result<HashSet<crate::spec::Identifier>> {
-        let mut identifiers = HashSet::new();
-        for manifest_file in manifest_files {
-            if manifest_file.num_deleted_files() == 0 {
-                continue;
-            }
-            let path = format!("{manifest_dir}/{}", manifest_file.file_name());
-            for entry in Manifest::read(file_io, &path).await? {
-                if *entry.kind() == FileKind::Delete {
-                    identifiers.insert(entry.into_identifier());
-                }
-            }
-        }
-        Ok(identifiers)
-    }
-
-    fn manifest_must_change(&self, manifest_file: &ManifestFileMeta) -> bool {
-        manifest_file.num_deleted_files() > 0
-            || manifest_file.file_size() < self.manifest_target_file_size
-    }
-
-    fn manifest_may_contain_deleted_partitions(
-        &self,
-        manifest_file: &ManifestFileMeta,
-        delete_partitions: &HashSet<Vec<u8>>,
-    ) -> bool {
-        if delete_partitions.is_empty() {
-            return false;
-        }
-
         let partition_fields = self.table.schema().partition_fields();
-        if partition_fields.is_empty() {
-            return true;
-        }
-
-        delete_partitions.iter().any(|partition| {
-            self.partition_may_match_manifest_stats(
-                partition,
-                manifest_file.partition_stats(),
-                &partition_fields,
-            )
-        })
-    }
-
-    fn partition_may_match_manifest_stats(
-        &self,
-        partition: &[u8],
-        stats: &BinaryTableStats,
-        partition_fields: &[crate::spec::DataField],
-    ) -> bool {
-        let Ok(partition_row) = BinaryRow::from_serialized_bytes(partition) else {
-            return true;
-        };
-        let Ok(min_row) = BinaryRow::from_serialized_bytes(stats.min_values()) else {
-            return true;
-        };
-        let Ok(max_row) = BinaryRow::from_serialized_bytes(stats.max_values()) else {
-            return true;
-        };
-        if partition_row.arity() < partition_fields.len() as i32
-            || min_row.arity() < partition_fields.len() as i32
-            || max_row.arity() < partition_fields.len() as i32
-        {
-            return true;
-        }
-
-        for (idx, field) in partition_fields.iter().enumerate() {
-            let data_type = field.data_type();
-            let Ok(partition_datum) = extract_datum(&partition_row, idx, data_type) else {
-                return true;
-            };
-            let Ok(min_datum) = extract_datum(&min_row, idx, data_type) else {
-                return true;
-            };
-            let Ok(max_datum) = extract_datum(&max_row, idx, data_type) else {
-                return true;
-            };
-
-            match partition_datum {
-                Some(datum) => {
-                    let (Some(min), Some(max)) = (min_datum, max_datum) else {
-                        return true;
-                    };
-                    if datum < min || datum > max {
-                        return false;
-                    }
-                }
-                None => {
-                    if matches!(stats.null_counts().get(idx), Some(Some(0))) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    async fn minor_compact_manifest_files(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        manifest_files: Vec<ManifestFileMeta>,
-    ) -> Result<Vec<ManifestFileMeta>> {
-        let mut result = Vec::new();
-        let mut candidates = Vec::new();
-        let mut total_size = 0;
-
-        for manifest_file in manifest_files {
-            total_size += manifest_file.file_size();
-            candidates.push(manifest_file);
-            if total_size >= self.manifest_target_file_size {
-                let merged = self
-                    .merge_manifest_candidates(file_io, manifest_dir, &candidates)
-                    .await?;
-                result.extend(merged);
-                candidates.clear();
-                total_size = 0;
-            }
-        }
-
-        if candidates.len() >= self.manifest_merge_min_count {
-            let merged = self
-                .merge_manifest_candidates(file_io, manifest_dir, &candidates)
-                .await?;
-            result.extend(merged);
-        } else {
-            result.extend(candidates);
-        }
-
-        Ok(result)
-    }
-
-    async fn merge_manifest_candidates(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        candidates: &[ManifestFileMeta],
-    ) -> Result<Vec<ManifestFileMeta>> {
-        if candidates.len() == 1 {
-            return Ok(vec![candidates[0].clone()]);
-        }
-
-        let merged_entries = self
-            .merge_manifest_candidate_entries(file_io, manifest_dir, candidates)
-            .await?;
-        self.write_compacted_manifest_entries(file_io, manifest_dir, &merged_entries)
-            .await
-    }
-
-    async fn merge_manifest_candidate_entries(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        manifest_files: &[ManifestFileMeta],
-    ) -> Result<Vec<ManifestEntry>> {
-        let mut entries = Vec::new();
-        for manifest_file in manifest_files {
-            let path = format!("{manifest_dir}/{}", manifest_file.file_name());
-            entries.extend(Manifest::read(file_io, &path).await?);
-        }
-        merge_entries(entries)
-    }
-
-    async fn write_compacted_manifest_entries(
-        &self,
-        file_io: &FileIO,
-        manifest_dir: &str,
-        entries: &[ManifestEntry],
-    ) -> Result<Vec<ManifestFileMeta>> {
-        if entries.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let manifest_name = format!("manifest-{}-0", uuid::Uuid::new_v4());
-        let manifest_path = format!("{manifest_dir}/{manifest_name}");
-        let manifest_meta = self
-            .write_manifest_file(file_io, &manifest_path, &manifest_name, entries)
-            .await?;
-        Ok(vec![manifest_meta])
+        ManifestFileMerger::new(
+            file_io,
+            manifest_dir,
+            &partition_fields,
+            self.table.schema().id(),
+            self.manifest_target_file_size,
+            self.manifest_full_compaction_threshold_size,
+            self.manifest_merge_min_count,
+        )
+        .merge(manifest_files)
+        .await
     }
 
     /// Write an index manifest file from already-merged entries.
@@ -2119,12 +1836,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(commit.should_full_compact_manifests(&[
-            keep_meta.clone(),
-            drop_meta.clone(),
-            delete_meta.clone(),
-        ]));
-
         let compacted = commit
             .compact_manifest_files_if_needed(
                 &file_io,
@@ -2148,7 +1859,11 @@ mod tests {
         let table_path = "memory:/test_manifest_compaction_preserves_unmatched_delete_entries";
         setup_dirs(&file_io, table_path).await;
 
-        let commit = setup_commit(&file_io, table_path);
+        let commit = setup_commit_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.merge-min-count".to_string(), "2".to_string())]),
+        );
         let manifest_dir = format!("{table_path}/manifest");
 
         let deleted_file = test_data_file("deleted-in-base.parquet", 10);
@@ -2183,7 +1898,7 @@ mod tests {
             .unwrap();
 
         let compacted = commit
-            .merge_manifest_candidates(&file_io, &manifest_dir, &[delete_meta, add_meta])
+            .compact_manifest_files_if_needed(&file_io, &manifest_dir, vec![delete_meta, add_meta])
             .await
             .unwrap();
         assert_eq!(compacted.len(), 1);

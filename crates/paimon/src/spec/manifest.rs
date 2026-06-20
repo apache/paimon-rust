@@ -22,7 +22,6 @@ use crate::spec::manifest_entry::MANIFEST_ENTRY_SCHEMA;
 use crate::spec::FileKind;
 
 use crate::Result;
-use std::collections::HashMap;
 
 /// Manifest file reader and writer.
 ///
@@ -69,54 +68,13 @@ impl Manifest {
     }
 }
 
-/// Merge ADD/DELETE entries by file identifier, matching Java `FileEntry.mergeEntries`.
-///
-/// An unmatched DELETE is preserved because its matching ADD may live in an
-/// older manifest that is not part of this merge batch.
-pub(crate) fn merge_entries(
-    entries: impl IntoIterator<Item = ManifestEntry>,
-) -> Result<Vec<ManifestEntry>> {
-    let mut merged_entries = HashMap::new();
-    for entry in entries {
-        merge_entry(&mut merged_entries, entry)?;
-    }
-    Ok(merged_entries.into_values().collect())
-}
-
-fn merge_entry(
-    merged_entries: &mut HashMap<crate::spec::Identifier, ManifestEntry>,
-    entry: ManifestEntry,
-) -> Result<()> {
-    let identifier = entry.identifier();
-    match *entry.kind() {
-        FileKind::Add => {
-            if merged_entries.contains_key(&identifier) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Trying to add file {:?} which is already in the manifest entry map",
-                        identifier
-                    ),
-                    source: None,
-                });
-            }
-            merged_entries.insert(identifier, entry);
-        }
-        FileKind::Delete => {
-            if merged_entries.contains_key(&identifier) {
-                merged_entries.remove(&identifier);
-            } else {
-                merged_entries.insert(identifier, entry);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Merge ADD/DELETE entries by file identifier for scan-style visibility,
 /// returning only the active ADD set. Manifest compaction must preserve
 /// unmatched DELETE entries and uses a table-commit-specific merge path.
 /// Return order is unspecified.
 pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    use std::collections::HashMap;
+
     use crate::spec::manifest_entry::Identifier;
     let mut map: HashMap<Identifier, ManifestEntry> = HashMap::new();
     for entry in entries {
@@ -212,19 +170,5 @@ mod tests {
         ]);
         assert_eq!(compacted.len(), 1);
         assert_eq!(compacted[0].file().level, 1);
-    }
-
-    #[test]
-    fn test_merge_entries_preserves_unmatched_delete() {
-        let merged = merge_entries(vec![
-            entry(FileKind::Delete, "deleted-in-base.parquet", 0),
-            entry(FileKind::Add, "unrelated.parquet", 0),
-        ])
-        .unwrap();
-
-        assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|entry| {
-            *entry.kind() == FileKind::Delete && entry.file().file_name == "deleted-in-base.parquet"
-        }));
     }
 }
