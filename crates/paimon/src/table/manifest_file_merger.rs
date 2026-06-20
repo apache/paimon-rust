@@ -22,6 +22,7 @@ use crate::spec::{
     Manifest, ManifestEntry, ManifestFileMeta,
 };
 use crate::Result;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 /// Manifest file merger with Java `ManifestFileMerger`-style full and minor compaction.
@@ -110,19 +111,19 @@ impl<'a> ManifestFileMerger<'a> {
             return Ok(None);
         }
 
-        let mut merged_entries = Vec::new();
+        let mut new_files = Vec::new();
         for manifest_file in to_be_merged {
             let read_result = self
                 .read_for_full_compaction(&manifest_file, &delete_identifiers)
                 .await?;
             if read_result.require_change {
-                merged_entries.extend(read_result.entries);
+                new_files.extend(self.write_compacted_entries(&read_result.entries).await?);
             } else {
                 result.push(read_result.file);
             }
         }
 
-        result.extend(self.write_compacted_entries(&merged_entries).await?);
+        result.extend(new_files);
         Ok(Some(result))
     }
 
@@ -370,22 +371,22 @@ fn merge_entry(
 ) -> Result<()> {
     let identifier = entry.identifier();
     match *entry.kind() {
-        FileKind::Add => {
-            if merged_entries.contains_key(&identifier) {
+        FileKind::Add => match merged_entries.entry(identifier) {
+            Entry::Vacant(entry_slot) => {
+                entry_slot.insert(entry);
+            }
+            Entry::Occupied(entry_slot) => {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
                         "Trying to add file {:?} which is already in the manifest entry map",
-                        identifier
+                        entry_slot.key()
                     ),
                     source: None,
-                });
+                })
             }
-            merged_entries.insert(identifier, entry);
-        }
+        },
         FileKind::Delete => {
-            if merged_entries.contains_key(&identifier) {
-                merged_entries.remove(&identifier);
-            } else {
+            if merged_entries.remove(&identifier).is_none() {
                 merged_entries.insert(identifier, entry);
             }
         }
@@ -771,6 +772,77 @@ mod tests {
             .unwrap();
         assert_eq!(compacted.len(), 1);
         assert_eq!(compacted[0].file_name(), add_meta.file_name());
+    }
+
+    #[tokio::test]
+    async fn test_full_manifest_compaction_writes_each_changed_manifest_without_accumulating() {
+        let file_io = test_file_io();
+        let table_path =
+            "memory:/test_full_manifest_compaction_writes_each_changed_manifest_without_accumulating";
+        setup_dirs(&file_io, table_path).await;
+        let schema = test_schema();
+        let partition_fields = schema.partition_fields();
+        let manifest_dir = format!("{table_path}/manifest");
+        let merger = manifest_merger(
+            &file_io,
+            &manifest_dir,
+            &partition_fields,
+            schema.id(),
+            HashMap::from([
+                (
+                    "manifest.full-compaction-threshold-size".to_string(),
+                    "1B".to_string(),
+                ),
+                ("manifest.target-file-size".to_string(), "1GB".to_string()),
+            ]),
+        );
+
+        let first_meta = write_manifest(
+            &merger,
+            "manifest-first-0",
+            &[ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                1,
+                test_data_file("first.parquet", 5),
+                2,
+            )],
+        )
+        .await;
+        let second_meta = write_manifest(
+            &merger,
+            "manifest-second-0",
+            &[ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                1,
+                test_data_file("second.parquet", 5),
+                2,
+            )],
+        )
+        .await;
+
+        let compacted = merger.merge(vec![first_meta, second_meta]).await.unwrap();
+
+        assert_eq!(compacted.len(), 2);
+        let mut compacted_file_names = Vec::new();
+        for file in &compacted {
+            let entries = Manifest::read(
+                &file_io,
+                &format!("{}/{}", merger.manifest_dir, file.file_name()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(entries.len(), 1);
+            compacted_file_names.push(entries[0].file().file_name.clone());
+        }
+        compacted_file_names.sort();
+        assert_eq!(
+            compacted_file_names,
+            vec!["first.parquet".to_string(), "second.parquet".to_string()]
+        );
     }
 
     #[tokio::test]
