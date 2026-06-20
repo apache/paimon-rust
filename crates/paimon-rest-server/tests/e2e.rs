@@ -375,3 +375,57 @@ async fn test_list_partitions() {
         .expect("us partition present");
     assert_eq!(us.record_count, 2, "region=us holds two rows");
 }
+
+// ==================== Path codec round trip ====================
+
+/// Database/table names with characters the REST path codec encodes specially
+/// must survive the client encode -> server decode round trip.
+///
+/// The client builds path segments with `RESTUtil::encode_string`
+/// (`application/x-www-form-urlencoded`), so a space becomes `+` and a literal
+/// `+` becomes `%2B`. The server must decode them back to the exact original
+/// names; otherwise these databases/tables are unaddressable through
+/// `RESTCatalog`. A literal `+` additionally proves the server decodes the raw
+/// segment (not Axum's already percent-decoded value), since `+` and a space
+/// would otherwise be indistinguishable.
+#[tokio::test]
+async fn test_special_char_names() {
+    let ctx = setup().await;
+    let cat = &ctx.catalog;
+
+    // Two databases: one with a space, one with a literal `+`.
+    let space_db = "sales db";
+    let plus_db = "a+b";
+    cat.create_database(space_db, false, HashMap::new())
+        .await
+        .unwrap();
+    cat.create_database(plus_db, false, HashMap::new())
+        .await
+        .unwrap();
+
+    let mut dbs = cat.list_databases().await.unwrap();
+    dbs.sort();
+    assert_eq!(dbs, vec![plus_db.to_string(), space_db.to_string()]);
+
+    // get_database must address each one by its exact name.
+    assert_eq!(cat.get_database(space_db).await.unwrap().name, space_db);
+    assert_eq!(cat.get_database(plus_db).await.unwrap().name, plus_db);
+
+    // A table whose name also contains a space, under the space database.
+    let ident = Identifier::new(space_db, "my table");
+    cat.create_table(&ident, append_only_schema(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        cat.list_tables(space_db).await.unwrap(),
+        vec!["my table".to_string()]
+    );
+    let table = cat.get_table(&ident).await.unwrap();
+    assert_eq!(table.schema().fields().len(), 2);
+
+    // Drop the table and both databases by their exact names.
+    cat.drop_table(&ident, false).await.unwrap();
+    cat.drop_database(space_db, false, false).await.unwrap();
+    cat.drop_database(plus_db, false, false).await.unwrap();
+    assert!(cat.list_databases().await.unwrap().is_empty());
+}

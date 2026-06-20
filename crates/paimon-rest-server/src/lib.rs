@@ -40,7 +40,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Json, Path, Query},
+    extract::{Extension, FromRequestParts, Json, MatchedPath, Query},
+    http::request::Parts,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -52,7 +53,7 @@ use serde_json::json;
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateTableRequest,
     ErrorResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListPartitionsResponse, ListTablesResponse, RenameTableRequest, ResourcePaths,
+    ListPartitionsResponse, ListTablesResponse, RESTUtil, RenameTableRequest, ResourcePaths,
 };
 use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::common::{CatalogOptions, Options};
@@ -250,6 +251,58 @@ fn ok_empty() -> Response {
 }
 
 // ============================================================================
+// Path parameter decoding
+//
+// The client (`ResourcePaths`) builds path segments with `RESTUtil::encode_string`
+// (`application/x-www-form-urlencoded`), so e.g. a space becomes `+`. Axum's own
+// `Path`/`RawPathParams` extractors percent-decode `%xx` but leave `+` untouched,
+// which makes catalog names containing spaces unaddressable through `RESTCatalog`.
+//
+// We therefore decode the *raw* (still percent-encoded) URI segments with the
+// same `RESTUtil` codec, mirroring Java's `RESTCatalogServer`, which calls
+// `RESTUtil.decodeString` on the raw segments. Decoding the raw segment (rather
+// than post-processing Axum's already percent-decoded value) is the only way to
+// recover names correctly for all inputs — a literal `+` (encoded as `%2B`) and
+// a real space (encoded as `+`) are indistinguishable once `%xx` is decoded.
+// ============================================================================
+
+/// Path parameters captured from the matched route, decoded with the REST codec.
+struct RestPath(HashMap<String, String>);
+
+impl RestPath {
+    /// The decoded value of a captured parameter (empty string if absent).
+    fn get(&self, key: &str) -> String {
+        self.0.get(key).cloned().unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for RestPath {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // The route pattern (e.g. `/v1/databases/:db/tables/:table`) is recorded
+        // by Axum in the request extensions once a route matches.
+        let pattern = parts
+            .extensions
+            .get::<MatchedPath>()
+            .map(|m| m.as_str().to_string());
+        // `parts.uri.path()` is the original, still-percent-encoded request path.
+        let raw_path = parts.uri.path().to_string();
+
+        let mut params = HashMap::new();
+        if let Some(pattern) = pattern {
+            for (pat_seg, raw_seg) in pattern.split('/').zip(raw_path.split('/')) {
+                if let Some(name) = pat_seg.strip_prefix(':') {
+                    params.insert(name.to_string(), RESTUtil::decode_string(raw_seg));
+                }
+            }
+        }
+        Ok(RestPath(params))
+    }
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -284,10 +337,8 @@ async fn create_database(
     }
 }
 
-async fn get_database(
-    Path(db): Path<String>,
-    Extension(state): Extension<Arc<AppState>>,
-) -> Response {
+async fn get_database(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let db = path.get("db");
     match state.catalog.get_database(&db).await {
         Ok(database) => {
             let response = GetDatabaseResponse::new(
@@ -308,20 +359,19 @@ async fn get_database(
 /// this. We only validate that the database exists and return OK; the request
 /// is intentionally a no-op.
 async fn alter_database(
-    Path(db): Path<String>,
+    path: RestPath,
     Extension(state): Extension<Arc<AppState>>,
     Json(_request): Json<AlterDatabaseRequest>,
 ) -> Response {
+    let db = path.get("db");
     match state.catalog.get_database(&db).await {
         Ok(_) => ok_empty(),
         Err(e) => error_response(e),
     }
 }
 
-async fn drop_database(
-    Path(db): Path<String>,
-    Extension(state): Extension<Arc<AppState>>,
-) -> Response {
+async fn drop_database(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let db = path.get("db");
     // The client (`RESTCatalog::drop_database`) already enforces the non-cascade
     // "database must be empty" check before issuing the DELETE, so the server
     // force-drops with cascade=true.
@@ -331,10 +381,8 @@ async fn drop_database(
     }
 }
 
-async fn list_tables(
-    Path(db): Path<String>,
-    Extension(state): Extension<Arc<AppState>>,
-) -> Response {
+async fn list_tables(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let db = path.get("db");
     match state.catalog.list_tables(&db).await {
         Ok(mut tables) => {
             tables.sort();
@@ -349,12 +397,12 @@ async fn list_tables(
 }
 
 async fn create_table(
-    Path(db): Path<String>,
+    path: RestPath,
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<CreateTableRequest>,
 ) -> Response {
     // Trust the path's database; take the table name from the request body.
-    let identifier = Identifier::new(db, request.identifier.object().to_string());
+    let identifier = Identifier::new(path.get("db"), request.identifier.object().to_string());
     match state
         .catalog
         .create_table(&identifier, request.schema, false)
@@ -365,11 +413,9 @@ async fn create_table(
     }
 }
 
-async fn get_table(
-    Path((db, table)): Path<(String, String)>,
-    Extension(state): Extension<Arc<AppState>>,
-) -> Response {
-    let identifier = Identifier::new(db, table.clone());
+async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let table = path.get("table");
+    let identifier = Identifier::new(path.get("db"), table.clone());
     let resolved = match state.catalog.get_table(&identifier).await {
         Ok(t) => t,
         Err(e) => return error_response(e),
@@ -404,11 +450,8 @@ async fn get_table(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn drop_table(
-    Path((db, table)): Path<(String, String)>,
-    Extension(state): Extension<Arc<AppState>>,
-) -> Response {
-    let identifier = Identifier::new(db, table);
+async fn drop_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
     match state.catalog.drop_table(&identifier, false).await {
         Ok(()) => ok_empty(),
         Err(e) => error_response(e),
@@ -416,11 +459,11 @@ async fn drop_table(
 }
 
 async fn alter_table(
-    Path((db, table)): Path<(String, String)>,
+    path: RestPath,
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<AlterTableRequest>,
 ) -> Response {
-    let identifier = Identifier::new(db, table);
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
     match state
         .catalog
         .alter_table(&identifier, request.changes, false)
@@ -458,12 +501,12 @@ struct CommitRequest {
 }
 
 async fn commit(
-    Path((db, table)): Path<(String, String)>,
+    path: RestPath,
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<CommitRequest>,
 ) -> Response {
     let _ = (request.table_uuid, request.statistics);
-    let identifier = Identifier::new(db, table);
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
 
     // Resolve the table's FileIO and on-disk location, then persist the posted
     // snapshot exactly like the filesystem catalog's own commit path does.
@@ -485,11 +528,11 @@ async fn commit(
 /// pagination params (`maxResults`/`pageToken`) are accepted but ignored — the
 /// whole set is returned in one page (`nextPageToken = null`).
 async fn list_partitions(
-    Path((db, table)): Path<(String, String)>,
+    path: RestPath,
     Query(_params): Query<HashMap<String, String>>,
     Extension(state): Extension<Arc<AppState>>,
 ) -> Response {
-    let identifier = Identifier::new(db, table);
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
     let resolved = match state.catalog.get_table(&identifier).await {
         Ok(t) => t,
         Err(e) => return error_response(e),
@@ -504,7 +547,7 @@ async fn list_partitions(
     }
 }
 
-async fn table_token_stub(Path((_db, _table)): Path<(String, String)>) -> Response {
+async fn table_token_stub() -> Response {
     let body = ErrorResponse::new(
         None,
         None,
