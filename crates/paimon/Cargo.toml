@@ -104,7 +104,7 @@ tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
 paimon-mosaic-core = { version = "0.1.0", optional = true }
 paimon-vindex-core = "0.1.0"
-vortex = { version = "0.68", features = ["tokio"], optional = true }
+vortex = { version = "0.75.0", features = ["tokio"], optional = true }
 libloading = "0.9"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
