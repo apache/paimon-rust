@@ -31,6 +31,18 @@ datafusion = "53"
 tokio = { version = "1", features = ["full"] }
 ```
 
+To query tables with Mosaic data files, enable the `mosaic` feature on both crates:
+
+```toml
+[dependencies]
+paimon = { version = "0.1.0", features = ["mosaic"] }
+paimon-datafusion = { version = "0.1.0", features = ["mosaic"] }
+datafusion = "53"
+tokio = { version = "1", features = ["full"] }
+```
+
+Mosaic support is currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+
 ## Registering Catalog
 
 Register an entire Paimon catalog so all databases and tables are accessible via `paimon.database.table` syntax:
@@ -255,6 +267,12 @@ INSERT INTO paimon.my_db.users SELECT * FROM source_table;
 ```
 
 For primary-key tables, records with duplicate keys are deduplicated according to the merge engine (default: Deduplicate engine, where the last written value wins).
+
+### Mosaic Read Scope
+
+The Mosaic reader uses row-group statistics for conservative pruning when they are present. This pruning is not row-level filter enforcement; DataFusion still applies SQL filters above the reader to produce exact query results.
+
+Unsupported or limited Mosaic areas include writing `.mosaic` files, emitting manifest `value_stats` for Mosaic writes, Mosaic bloom filters, and Mosaic-specific performance tuning.
 
 ### INSERT OVERWRITE
 
