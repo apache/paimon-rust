@@ -51,6 +51,17 @@ Available storage features:
 | `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
 
+## Optional File Formats
+
+Mosaic data files can be read by enabling the `mosaic` feature:
+
+```toml
+[dependencies]
+paimon = { version = "0.1.0", features = ["mosaic"] }
+```
+
+The current Mosaic support is read-only. Paimon Rust can read existing `.mosaic` data files in a Paimon table, but it does not write Mosaic data files yet.
+
 ## Catalog Management
 
 Paimon supports multiple catalog types. The `CatalogFactory` provides a unified way to create catalogs based on configuration options.

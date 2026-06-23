@@ -92,7 +92,29 @@ impl BinaryRow {
             });
         }
         let arity = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        Ok(Self::from_bytes(arity, data[4..].to_vec()))
+        if arity < 0 {
+            return Err(crate::Error::UnexpectedError {
+                message: format!("BinaryRow: serialized data has negative arity: {arity}"),
+                source: None,
+            });
+        }
+        let body = &data[4..];
+        // The body must hold at least the null bitmap and the fixed part
+        // (8 bytes per field); reject truncated input rather than panicking
+        // later when reading the null bitmap or a field. The size is computed
+        // in i64 so an absurd arity in malformed input cannot overflow.
+        let bit_set_width = ((arity as i64 + 63 + Self::HEADER_SIZE_IN_BYTES as i64) / 64) * 8;
+        let fix_part_size = bit_set_width + 8 * arity as i64;
+        if (body.len() as i64) < fix_part_size {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: serialized body too short for arity {arity}: {} bytes, need at least {fix_part_size}",
+                    body.len()
+                ),
+                source: None,
+            });
+        }
+        Ok(Self::from_bytes(arity, body.to_vec()))
     }
 
     /// Serialize this BinaryRow to bytes (arity prefix + data), the inverse of `from_serialized_bytes`.
@@ -119,7 +141,13 @@ impl BinaryRow {
         let bit_index = pos + Self::HEADER_SIZE_IN_BYTES as usize;
         let byte_index = bit_index / 8;
         let bit_offset = bit_index % 8;
-        (self.data[byte_index] & (1 << bit_offset)) != 0
+        // Index defensively: a truncated buffer that lacks the null bitmap
+        // byte is reported as not-null so the typed field readers can return
+        // a graceful error instead of this method panicking.
+        match self.data.get(byte_index) {
+            Some(byte) => (byte & (1 << bit_offset)) != 0,
+            None => false,
+        }
     }
 
     fn field_offset(&self, pos: usize) -> usize {
@@ -1103,7 +1131,7 @@ fn write_typed_value(
 
 /// Build BinaryRows for all rows in the batch for the given field indices.
 /// Downcasts columns once, then iterates rows — O(F) downcasts instead of O(N*F).
-fn batch_build_binary_rows(
+pub(crate) fn batch_build_binary_rows(
     batch: &RecordBatch,
     field_indices: &[usize],
     fields: &[crate::spec::DataField],
@@ -1184,6 +1212,50 @@ mod tests {
     #[test]
     fn test_from_serialized_bytes_too_short() {
         assert!(BinaryRow::from_serialized_bytes(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_truncated_body() {
+        // Valid 4-byte arity prefix (arity = 1) but the body is empty, so it
+        // cannot hold the null bitmap. This must be rejected gracefully rather
+        // than panicking when the null bitmap is later read.
+        let truncated = [0u8, 0, 0, 1];
+        assert!(BinaryRow::from_serialized_bytes(&truncated).is_err());
+
+        // Body present but still shorter than the fixed part (null bitmap of 8
+        // bytes + one 8-byte field = 16 bytes for arity 1).
+        let mut short_body = vec![0u8, 0, 0, 1];
+        short_body.extend_from_slice(&[0u8; 4]);
+        assert!(BinaryRow::from_serialized_bytes(&short_body).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_negative_arity() {
+        // arity = -1 (0xFFFFFFFF) must be rejected, not used in size math.
+        let data = [0xFFu8, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        assert!(BinaryRow::from_serialized_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_well_formed_decodes() {
+        // Negative control: a correctly sized body decodes and reads back fine.
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_int(0, 7);
+        let serialized = builder.build_serialized();
+        let row = BinaryRow::from_serialized_bytes(&serialized).unwrap();
+        assert_eq!(row.arity(), 1);
+        assert!(!row.is_null_at(0));
+        assert_eq!(row.get_int(0).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_is_null_at_short_buffer_does_not_panic() {
+        // A row whose backing buffer lacks the null bitmap byte must not panic
+        // in is_null_at; the position is reported as not-null and the typed
+        // reader then returns a graceful error.
+        let row = BinaryRow::from_bytes(1, Vec::new());
+        assert!(!row.is_null_at(0));
+        assert!(row.get_int(0).is_err());
     }
 
     #[test]

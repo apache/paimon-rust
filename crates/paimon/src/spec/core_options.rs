@@ -20,11 +20,12 @@ use std::collections::{HashMap, HashSet};
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
+const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
-const BUCKET_KEY_OPTION: &str = "bucket-key";
+pub(crate) const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
 const DEFAULT_BUCKET: i32 = -1;
@@ -46,7 +47,10 @@ const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
-const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
+pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
+pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
+pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
+    "alter-column-null-to-not-null.disabled";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
@@ -64,6 +68,7 @@ const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
+const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 
@@ -95,6 +100,26 @@ pub enum ChangelogProducer {
     FullCompaction,
     /// Generate changelog files through lookup compaction.
     Lookup,
+}
+
+/// Bucket function used to map bucket keys to fixed bucket ids.
+///
+/// Reference: Java `CoreOptions.BucketFunctionType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFunctionType {
+    Default,
+    Mod,
+    Hive,
+}
+
+impl BucketFunctionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Mod => "mod",
+            Self::Hive => "hive",
+        }
+    }
 }
 
 impl ChangelogProducer {
@@ -220,6 +245,22 @@ impl<'a> CoreOptions<'a> {
             .get(GLOBAL_INDEX_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    pub fn global_index_row_count_per_shard(&self) -> crate::Result<i64> {
+        let value = self
+            .parse_i64_option(GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than 0, got: {}",
+                    GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
     }
 
     pub fn source_split_target_size(&self) -> i64 {
@@ -367,15 +408,22 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_BUCKET)
     }
 
-    /// Whether the bucket function type is the default hash-based function.
-    ///
-    /// Only the default function (`Math.abs(hash % numBuckets)`) is supported
-    /// for bucket predicate pruning. `mod` and `hive` use different algorithms.
-    pub fn is_default_bucket_function(&self) -> bool {
-        self.options
+    /// Bucket function type. Defaults to Java-compatible Paimon hash.
+    pub fn bucket_function_type(&self) -> crate::Result<BucketFunctionType> {
+        match self
+            .options
             .get(BUCKET_FUNCTION_TYPE_OPTION)
-            .map(|v| v.eq_ignore_ascii_case("default"))
-            .unwrap_or(true)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref()
+            .unwrap_or("default")
+        {
+            "default" => Ok(BucketFunctionType::Default),
+            "mod" => Ok(BucketFunctionType::Mod),
+            "hive" => Ok(BucketFunctionType::Hive),
+            other => Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported bucket-function.type: {other}"),
+            }),
+        }
     }
 
     /// Target file size for data files. Default is 128MB.
@@ -536,6 +584,10 @@ mod tests {
 
         assert_eq!(core_options.source_split_target_size(), 128 * 1024 * 1024);
         assert_eq!(core_options.source_split_open_file_cost(), 4 * 1024 * 1024);
+        assert_eq!(
+            core_options.global_index_row_count_per_shard().unwrap(),
+            100_000
+        );
     }
 
     #[test]
@@ -549,11 +601,36 @@ mod tests {
                 SOURCE_SPLIT_OPEN_FILE_COST_OPTION.to_string(),
                 "8 mb".to_string(),
             ),
+            (
+                GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION.to_string(),
+                "2048".to_string(),
+            ),
         ]);
         let core_options = CoreOptions::new(&options);
 
         assert_eq!(core_options.source_split_target_size(), 256 * 1024 * 1024);
         assert_eq!(core_options.source_split_open_file_cost(), 8 * 1024 * 1024);
+        assert_eq!(
+            core_options.global_index_row_count_per_shard().unwrap(),
+            2048
+        );
+    }
+
+    #[test]
+    fn test_global_index_row_count_per_shard_rejects_invalid_values() {
+        for value in ["0", "-1", "abc"] {
+            let options = HashMap::from([(
+                GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            let core = CoreOptions::new(&options);
+
+            let err = core
+                .global_index_row_count_per_shard()
+                .expect_err("invalid rows-per-shard should fail");
+            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                    if message.contains(GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION)));
+        }
     }
 
     #[test]

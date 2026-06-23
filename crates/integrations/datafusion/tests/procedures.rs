@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{exec, row_count, setup_sql_context};
+use common::{assert_sql_error, exec, row_count, setup_sql_context};
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -83,6 +83,42 @@ async fn test_create_tag_with_snapshot_id() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_create_lumina_index_requires_index_column() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_lumina_index(table => 'test_db.t1')",
+        "Missing required argument: 'index_column'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_lumina_index_rejects_invalid_index_type() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_lumina_index(table => 'test_db.t1', index_column => 'name', index_type => 'btree')",
+        "Unsupported Lumina index type: btree",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_lumina_index_rejects_invalid_options() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_lumina_index(table => 'test_db.t1', index_column => 'name', options => 'lumina.index.dimension')",
+        "Expected comma-separated key=value pairs",
+    )
+    .await;
 }
 
 #[tokio::test]

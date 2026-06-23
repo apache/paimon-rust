@@ -31,7 +31,8 @@ mod api_response;
 
 // Re-export request types
 pub use api_request::{
-    AlterDatabaseRequest, CreateDatabaseRequest, CreateTableRequest, RenameTableRequest,
+    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateTableRequest,
+    RenameTableRequest,
 };
 
 // Re-export response types

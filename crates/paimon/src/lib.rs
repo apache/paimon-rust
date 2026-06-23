@@ -37,6 +37,8 @@ pub mod spec;
 pub mod table;
 #[cfg(feature = "fulltext")]
 pub mod tantivy;
+pub mod vector_search;
+pub mod vindex;
 
 pub use catalog::Catalog;
 pub use catalog::CatalogFactory;

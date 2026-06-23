@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
@@ -91,11 +93,40 @@ async fn read_rows(table_name: &str) -> Vec<(i32, String)> {
     actual_rows
 }
 
-async fn collect_query(
-    sql: &str,
-) -> datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+async fn collect_query(sql: &str) -> datafusion::error::Result<Vec<RecordBatch>> {
     let ctx = create_context().await;
     ctx.sql(sql).await?.collect().await
+}
+
+fn collect_rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                if column.is_null(row_index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(
+                        array_value_to_string(column.as_ref(), row_index)
+                            .expect("query result value should format"),
+                    );
+                }
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+async fn assert_sql_rows(sql: &str, expected: &[&[&str]]) {
+    let batches = collect_query(sql).await.expect("query should succeed");
+    let actual = collect_rows(&batches);
+    let expected: Vec<Vec<String>> = expected
+        .iter()
+        .map(|row| row.iter().map(|value| value.to_string()).collect())
+        .collect();
+    assert_eq!(actual, expected, "unexpected result for SQL: {sql}");
 }
 
 async fn create_physical_plan(sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -742,6 +773,114 @@ async fn test_data_evolution_drop_column_null_fill() {
     );
 }
 
+#[tokio::test]
+async fn test_sql_read_format_schema_evolution_add_column() {
+    assert_sql_rows(
+        "SELECT id, name, age FROM paimon.default.format_schema_evolution_add_column ORDER BY id",
+        &[
+            &["1", "alice", "NULL"],
+            &["2", "bob", "NULL"],
+            &["3", "carol", "30"],
+            &["4", "dave", "40"],
+            &["5", "eve", "50"],
+            &["6", "frank", "60"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, age FROM paimon.default.format_schema_evolution_add_column WHERE age IS NULL ORDER BY id",
+        &[&["1", "NULL"], &["2", "NULL"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_format_schema_evolution_type_promotion() {
+    assert_sql_rows(
+        "SELECT id, value FROM paimon.default.format_schema_evolution_type_promotion ORDER BY id",
+        &[
+            &["1", "100"],
+            &["2", "200"],
+            &["3", "3000000000"],
+            &["4", "4000000000"],
+            &["5", "5000000000"],
+            &["6", "6000000000"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, value FROM paimon.default.format_schema_evolution_type_promotion WHERE value > 3000000000 ORDER BY id",
+        &[&["4", "4000000000"], &["5", "5000000000"], &["6", "6000000000"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_schema_evolution_rename_column() {
+    assert_sql_rows(
+        "SELECT id, renamed_payload FROM paimon.default.schema_evolution_rename_column ORDER BY id",
+        &[
+            &["1", "parquet-old"],
+            &["2", "parquet-old-2"],
+            &["3", "orc-new"],
+            &["4", "avro-new"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, renamed_payload FROM paimon.default.schema_evolution_rename_column WHERE renamed_payload LIKE '%new' ORDER BY id",
+        &[&["3", "orc-new"], &["4", "avro-new"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_mixed_format_schema_evolution_drop_column() {
+    assert_sql_rows(
+        "SELECT id, name FROM paimon.default.mixed_format_schema_evolution_drop_column ORDER BY id",
+        &[
+            &["1", "parquet-alice"],
+            &["2", "parquet-bob"],
+            &["3", "orc-carol"],
+            &["4", "orc-dave"],
+            &["5", "avro-eve"],
+            &["6", "avro-frank"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, name FROM paimon.default.mixed_format_schema_evolution_drop_column WHERE name LIKE 'avro-%' ORDER BY id",
+        &[&["5", "avro-eve"], &["6", "avro-frank"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_sql_read_mixed_format_schema_evolution_reorder_move_column() {
+    assert_sql_rows(
+        "SELECT right_value, left_value, id FROM paimon.default.mixed_format_schema_evolution_reorder_move_column ORDER BY id",
+        &[
+            &["parquet-right-1", "parquet-left-1", "1"],
+            &["parquet-right-2", "parquet-left-2", "2"],
+            &["orc-right-3", "orc-left-3", "3"],
+            &["orc-right-4", "orc-left-4", "4"],
+            &["avro-right-5", "avro-left-5", "5"],
+            &["avro-right-6", "avro-left-6", "6"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, right_value FROM paimon.default.mixed_format_schema_evolution_reorder_move_column WHERE right_value LIKE 'orc-%' ORDER BY id",
+        &[&["3", "orc-right-3"], &["4", "orc-right-4"]],
+    )
+    .await;
+}
+
 // ======================= Complex Type Tests =======================
 
 #[tokio::test]
@@ -1017,13 +1156,20 @@ mod fulltext_tests {
 mod vector_search_tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::array::{ArrayRef, Float32Builder, Int32Array, ListBuilder};
+    use datafusion::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use datafusion::arrow::record_batch::RecordBatch;
+    use paimon::catalog::Identifier;
+    use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema};
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_vector_search, SQLContext};
 
-    fn extract_test_warehouse() -> (tempfile::TempDir, String) {
+    fn extract_test_warehouse(archive_name: &str) -> (tempfile::TempDir, String) {
         let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/test_lumina_vector.tar.gz");
+            .join("testdata")
+            .join(archive_name);
         let file = std::fs::File::open(&archive_path)
             .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
         let decoder = flate2::read::GzDecoder::new(file);
@@ -1038,8 +1184,8 @@ mod vector_search_tests {
         (tmp, warehouse)
     }
 
-    async fn create_vector_search_context() -> (SQLContext, tempfile::TempDir) {
-        let (tmp, warehouse) = extract_test_warehouse();
+    async fn create_vector_search_context(archive_name: &str) -> (SQLContext, tempfile::TempDir) {
+        let (tmp, warehouse) = extract_test_warehouse(archive_name);
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
@@ -1051,6 +1197,77 @@ mod vector_search_tests {
             .expect("Failed to register catalog");
         register_vector_search(ctx.ctx(), catalog, "default");
         (ctx, tmp)
+    }
+
+    async fn create_lumina_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+        create_vector_search_context("test_lumina_vector.tar.gz").await
+    }
+
+    async fn create_java_vindex_vector_search_context() -> (SQLContext, tempfile::TempDir) {
+        create_vector_search_context("test_java_vindex_vector.tar.gz").await
+    }
+
+    async fn create_empty_vector_search_context(
+    ) -> (SQLContext, Arc<FileSystemCatalog>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let warehouse = format!("file://{}", tmp.path().display());
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
+
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog.clone())
+            .await
+            .expect("Failed to register catalog");
+        (ctx, catalog, tmp)
+    }
+
+    fn build_lumina_table_schema() -> Schema {
+        let mut options = std::collections::HashMap::new();
+        options.insert("row-tracking.enabled".to_string(), "true".to_string());
+        options.insert("data-evolution.enabled".to_string(), "true".to_string());
+        options.insert("global-index.enabled".to_string(), "true".to_string());
+        options.insert(
+            "global-index.row-count-per-shard".to_string(),
+            "3".to_string(),
+        );
+        options.insert("lumina.index.dimension".to_string(), "2".to_string());
+        options.insert("lumina.encoding.type".to_string(), "rawf32".to_string());
+
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .options(options)
+            .build()
+            .expect("Failed to build table schema")
+    }
+
+    fn build_vector_batch(ids: Vec<i32>, vectors: Vec<Vec<f32>>) -> RecordBatch {
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+        for vector in vectors {
+            for value in vector {
+                vector_builder.values().append_value(value);
+            }
+            vector_builder.append(true);
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(vector_builder.finish()) as ArrayRef,
+            ],
+        )
+        .expect("Failed to build vector batch")
     }
 
     fn extract_ids(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
@@ -1068,9 +1285,64 @@ mod vector_search_tests {
         ids
     }
 
+    fn extract_index_rows(
+        batches: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> Vec<(String, i64, i64, i64, String)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let index_type_array = batch
+                .column_by_name("index_type")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>()
+                })
+                .expect("Expected StringArray for index_type");
+            let row_count_array = batch
+                .column_by_name("row_count")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                })
+                .expect("Expected Int64Array for row_count");
+            let row_range_start_array = batch
+                .column_by_name("row_range_start")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                })
+                .expect("Expected Int64Array for row_range_start");
+            let row_range_end_array = batch
+                .column_by_name("row_range_end")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                })
+                .expect("Expected Int64Array for row_range_end");
+            let index_field_name_array = batch
+                .column_by_name("index_field_name")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>()
+                })
+                .expect("Expected StringArray for index_field_name");
+
+            for row_index in 0..batch.num_rows() {
+                rows.push((
+                    index_type_array.value(row_index).to_string(),
+                    row_count_array.value(row_index),
+                    row_range_start_array.value(row_index),
+                    row_range_end_array.value(row_index),
+                    index_field_name_array.value(row_index).to_string(),
+                ));
+            }
+        }
+        rows.sort_by_key(|row| row.2);
+        rows
+    }
+
     #[tokio::test]
     async fn test_vector_search_top3() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
             .await
@@ -1086,7 +1358,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_top6_returns_all() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 6)")
             .await
@@ -1101,7 +1373,7 @@ mod vector_search_tests {
 
     #[tokio::test]
     async fn test_vector_search_without_matching_index_returns_empty() {
-        let (ctx, _tmp) = create_vector_search_context().await;
+        let (ctx, _tmp) = create_lumina_vector_search_context().await;
         let batches = ctx
             .sql("SELECT id FROM vector_search('paimon.default.test_lumina_vector', 'missing_embedding', '[1.0]', 10)")
             .await
@@ -1114,6 +1386,109 @@ mod vector_search_tests {
         assert_eq!(
             total_rows, 0,
             "vector_search without a matching Lumina index should not fall back to a full table scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_java_vindex_table() {
+        let (ctx, _tmp) = create_java_vindex_vector_search_context().await;
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ids = extract_ids(&batches);
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    // Manual run with a local Lumina native library:
+    // LUMINA_LIB_PATH=/path/to/liblumina_py.so cargo test -p paimon-datafusion \
+    //     vector_search_tests::test_lumina_build_then_vector_search_query \
+    //     -- --ignored --exact
+    #[tokio::test]
+    #[ignore = "requires LUMINA_LIB_PATH"]
+    async fn test_lumina_build_then_vector_search_query() {
+        let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
+        let identifier = Identifier::new("default", "lumina_build_query_e2e");
+        catalog
+            .create_table(&identifier, build_lumina_table_schema(), false)
+            .await
+            .expect("Failed to create table");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to load table");
+
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("Failed to configure write builder");
+        let mut table_write = write_builder
+            .new_write()
+            .expect("Failed to create table write");
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    vec![1.0, 0.0],
+                    vec![0.9, 0.1],
+                    vec![0.0, 1.0],
+                    vec![-1.0, 0.0],
+                    vec![0.0, -1.0],
+                    vec![0.7, 0.3],
+                ],
+            ))
+            .await
+            .expect("Failed to write vector batch");
+        let messages = table_write
+            .prepare_commit()
+            .await
+            .expect("Failed to prepare commit");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("Failed to commit vector data");
+
+        ctx.sql("CALL sys.create_lumina_index(table => 'default.lumina_build_query_e2e', index_column => 'embedding')")
+            .await
+            .expect("Lumina index build SQL should parse")
+            .collect()
+            .await
+            .expect("Lumina index build SQL should execute");
+
+        let index_batches = ctx
+            .sql("SELECT index_type, row_count, row_range_start, row_range_end, index_field_name FROM paimon.default.`lumina_build_query_e2e$table_indexes` WHERE index_type = 'lumina'")
+            .await
+            .expect("index metadata SQL should parse")
+            .collect()
+            .await
+            .expect("index metadata query should execute");
+        let index_rows = extract_index_rows(&index_batches);
+        assert_eq!(
+            index_rows,
+            vec![
+                ("lumina".to_string(), 3, 0, 2, "embedding".to_string()),
+                ("lumina".to_string(), 3, 3, 5, "embedding".to_string()),
+            ]
+        );
+
+        let search_batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.lumina_build_query_e2e', 'embedding', '[1.0, 0.0]', 2)")
+            .await
+            .expect("vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("vector_search query should execute");
+        let ids = extract_ids(&search_batches);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&0), "exact vector match should be returned");
+        assert!(
+            ids.iter().any(|id| matches!(id, 1 | 5)),
+            "one same-direction neighbor should be returned, got {ids:?}"
         );
     }
 }

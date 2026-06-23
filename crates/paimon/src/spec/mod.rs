@@ -36,7 +36,12 @@ mod partial_update;
 pub(crate) use partial_update::PartialUpdateConfig;
 
 mod aggregation;
-pub(crate) use aggregation::AggregationConfig;
+pub(crate) use aggregation::{
+    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig,
+};
+
+mod data_type_casts;
+pub(crate) use data_type_casts::supports_cast;
 
 mod schema;
 pub use schema::*;

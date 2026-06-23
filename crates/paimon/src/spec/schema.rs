@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
+use crate::spec::core_options::{
+    first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION, SEQUENCE_FIELD_OPTION,
+};
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
-use crate::spec::AggregationConfig;
-use crate::spec::PartialUpdateConfig;
+use crate::spec::{
+    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, ColumnMove,
+    ColumnMoveType, PartialUpdateConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -64,9 +68,14 @@ impl TableSchema {
         }
     }
 
-    /// Get the highest field ID from a list of fields.
+    /// Get the highest field ID from a list of fields, including fields nested
+    /// inside row types (mirrors Java `RowType.currentHighestFieldId`).
     pub fn current_highest_field_id(fields: &[DataField]) -> i32 {
-        fields.iter().map(|f| f.id()).max().unwrap_or(-1)
+        fields
+            .iter()
+            .map(|f| f.id().max(highest_nested_field_id(f.data_type())))
+            .max()
+            .unwrap_or(-1)
     }
 
     pub fn version(&self) -> i32 {
@@ -140,32 +149,301 @@ impl TableSchema {
     }
 
     /// Apply a list of schema changes and return a new schema with incremented ID.
+    ///
+    /// Column-level changes operate on **top-level** columns only: a
+    /// `field_names` path with more than one element (a nested struct field) is
+    /// rejected with [`crate::Error::Unsupported`].
+    ///
+    /// Column errors ([`crate::Error::ColumnNotExist`] /
+    /// [`crate::Error::ColumnAlreadyExist`]) are returned with an empty table
+    /// name; the calling catalog fills in the table's full name.
     pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
+        use crate::spec::SchemaChange;
+
+        // Column errors carry no table name here; the catalog layer fills it in.
+        let full_name = "";
+
+        // Both flags are read from the pre-alter options, mirroring Java
+        // `SchemaManager.applySchemaChanges`.
+        let disable_null_to_not_null = self
+            .options
+            .get(crate::spec::DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION)
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let allow_explicit_cast = self
+            .options
+            .get(crate::spec::DISABLE_EXPLICIT_TYPE_CASTING_OPTION)
+            .map(|v| v != "true")
+            .unwrap_or(true);
+
         let mut new_schema = self.clone();
         new_schema.id += 1;
         new_schema.time_millis = chrono::Utc::now().timestamp_millis();
 
+        // Operate on an owned field list, then write it back.
+        let mut fields = std::mem::take(&mut new_schema.fields);
+        let mut highest_field_id = new_schema.highest_field_id;
+
         for change in changes {
             match change {
-                crate::spec::SchemaChange::SetOption { key, value } => {
+                SchemaChange::SetOption { key, value } => {
                     new_schema.options.insert(key, value);
                 }
-                crate::spec::SchemaChange::RemoveOption { key } => {
+                SchemaChange::RemoveOption { key } => {
                     new_schema.options.remove(&key);
                 }
-                other => {
-                    return Err(crate::Error::Unsupported {
-                        message: format!("Schema change not yet supported: {other:?}"),
-                    });
+                SchemaChange::UpdateComment { comment } => {
+                    new_schema.comment = comment;
+                }
+                SchemaChange::AddColumn {
+                    field_names,
+                    data_type,
+                    comment,
+                    column_move,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    if field_index(&fields, name).is_some() {
+                        return Err(crate::Error::ColumnAlreadyExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        });
+                    }
+                    // Mirrors Java: an added column has no value for existing
+                    // rows, so it must be nullable.
+                    if !data_type.is_nullable() {
+                        return Err(crate::Error::ConfigInvalid {
+                            message: format!("Column {name} cannot specify NOT NULL."),
+                        });
+                    }
+                    highest_field_id += 1;
+                    let id = highest_field_id;
+                    let data_type = reassign_field_ids(data_type, &mut highest_field_id);
+                    let field =
+                        DataField::new(id, name.to_string(), data_type).with_description(comment);
+                    insert_field_with_move(&mut fields, field, column_move.as_ref(), full_name)?;
+                }
+                SchemaChange::RenameColumn {
+                    field_names,
+                    new_name,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    // Existing partition data is laid out with the old key name
+                    // in paths and metadata; renaming would break resolution.
+                    if new_schema.partition_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot rename partition column: [{name}]"),
+                        });
+                    }
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    if new_name != name && field_index(&fields, &new_name).is_some() {
+                        return Err(crate::Error::ColumnAlreadyExist {
+                            full_name: full_name.to_string(),
+                            column: new_name,
+                        });
+                    }
+                    fields[idx] = fields[idx].clone().with_name(new_name.clone());
+                    rename_in_keys(&mut new_schema.primary_keys, name, &new_name);
+                    rename_in_option_list(
+                        &mut new_schema.options,
+                        BUCKET_KEY_OPTION,
+                        name,
+                        &new_name,
+                    );
+                    rename_in_option_list(
+                        &mut new_schema.options,
+                        SEQUENCE_FIELD_OPTION,
+                        name,
+                        &new_name,
+                    );
+                    // Field-scoped aggregation options encode the column in the
+                    // key (`fields.<col>.aggregate-function` / `.list-agg-delimiter`),
+                    // so they must be rewritten too, mirroring Java
+                    // `SchemaManager.applyRenameColumnsToOptions`.
+                    rename_field_scoped_options(&mut new_schema.options, name, &new_name);
+                }
+                SchemaChange::DropColumn { field_names } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    if new_schema.partition_keys.iter().any(|k| k == name)
+                        || new_schema.primary_keys.iter().any(|k| k == name)
+                    {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Cannot drop partition or primary key column '{name}' of table {full_name}"
+                            ),
+                        });
+                    }
+                    // Dropping a column referenced by `bucket-key` / `sequence.field`
+                    // would silently break bucket assignment / sequence ordering on
+                    // existing data (e.g. `bucket_key_indices` becomes empty and writes
+                    // fall back to bucket 0), so reject it instead.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        if core_options
+                            .bucket_key()
+                            .is_some_and(|keys| keys.iter().any(|k| k == name))
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop column '{name}' referenced by '{BUCKET_KEY_OPTION}'"
+                                ),
+                            });
+                        }
+                        if core_options.sequence_fields().contains(&name) {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop column '{name}' referenced by '{SEQUENCE_FIELD_OPTION}'"
+                                ),
+                            });
+                        }
+                    }
+                    if fields.len() == 1 {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot drop all fields in table".to_string(),
+                        });
+                    }
+                    fields.remove(idx);
+                    // Drop the column's field-scoped aggregation options so no
+                    // orphaned `fields.<col>.*` keys remain (which would otherwise
+                    // fail the aggregation re-validation below).
+                    remove_field_scoped_options(&mut new_schema.options, name);
+                }
+                SchemaChange::UpdateColumnType {
+                    field_names,
+                    new_data_type,
+                    keep_nullability,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    // Existing partitions, bucket assignment, and key encoding
+                    // were all written with the old key type.
+                    if new_schema.partition_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot update partition column: [{name}]"),
+                        });
+                    }
+                    if new_schema.primary_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot update primary key".to_string(),
+                        });
+                    }
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    let old = &fields[idx];
+                    // Mirrors Java `assertNotChangingBlobColumnType`: BLOB
+                    // columns use a dedicated storage layout that other types
+                    // cannot be converted to or from.
+                    if old.data_type().is_blob_type() || new_data_type.is_blob_type() {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Cannot change column type involving BLOB: [{name}] {:?} -> {new_data_type:?}",
+                                old.data_type()
+                            ),
+                        });
+                    }
+                    let target = if keep_nullability {
+                        new_data_type.copy_with_nullable(old.data_type().is_nullable())?
+                    } else {
+                        assert_nullability_change(
+                            old.data_type().is_nullable(),
+                            new_data_type.is_nullable(),
+                            name,
+                            disable_null_to_not_null,
+                        )?;
+                        new_data_type
+                    };
+                    // Existing data files keep the old schema; the read path
+                    // casts old columns to the new type, so the change must be
+                    // both a supported Paimon cast and executable by arrow.
+                    let arrow_castable = arrow_cast::can_cast_types(
+                        &crate::arrow::paimon_type_to_arrow(old.data_type())?,
+                        &crate::arrow::paimon_type_to_arrow(&target)?,
+                    );
+                    if !crate::spec::supports_cast(old.data_type(), &target, allow_explicit_cast)
+                        || !arrow_castable
+                    {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Column type {name}[{:?}] cannot be converted to {target:?} without losing information.",
+                                old.data_type()
+                            ),
+                        });
+                    }
+                    fields[idx] = DataField::new(old.id(), old.name().to_string(), target)
+                        .with_description(old.description().map(|s| s.to_string()));
+                }
+                SchemaChange::UpdateColumnNullability {
+                    field_names,
+                    new_nullability,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    // Primary keys are normalized to NOT NULL at create time;
+                    // a nullable key column would break key/bucket semantics.
+                    if new_nullability && new_schema.primary_keys.iter().any(|k| k == name) {
+                        return Err(crate::Error::Unsupported {
+                            message: "Cannot change nullability of primary key".to_string(),
+                        });
+                    }
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    let old = &fields[idx];
+                    assert_nullability_change(
+                        old.data_type().is_nullable(),
+                        new_nullability,
+                        name,
+                        disable_null_to_not_null,
+                    )?;
+                    let nt = old.data_type().copy_with_nullable(new_nullability)?;
+                    fields[idx] = DataField::new(old.id(), old.name().to_string(), nt)
+                        .with_description(old.description().map(|s| s.to_string()));
+                }
+                SchemaChange::UpdateColumnComment {
+                    field_names,
+                    new_comment,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    fields[idx] = fields[idx].clone().with_description(Some(new_comment));
+                }
+                SchemaChange::UpdateColumnPosition { column_move } => {
+                    apply_move(&mut fields, &column_move, full_name)?;
                 }
             }
         }
 
-        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        new_schema.fields = fields;
+        new_schema.highest_field_id =
+            highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
+
+        // Re-run create-time validations on the final schema, mirroring Java
+        // `SchemaValidation.validateTableSchema` after applying changes.
+        Schema::validate_blob_fields(
+            &new_schema.fields,
+            &new_schema.partition_keys,
+            &new_schema.options,
+        )?;
         PartialUpdateConfig::new(&new_schema.options)
             .validate_create_mode(!new_schema.primary_keys.is_empty())?;
         AggregationConfig::new(&new_schema.options)
             .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
+        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
         Ok(new_schema)
     }
 
@@ -195,6 +473,205 @@ impl TableSchema {
             .map(|f| f.name().to_string())
             .collect()
     }
+}
+
+/// Extract the single top-level column name from a `field_names` path.
+///
+/// Nested struct field paths (length > 1) are not yet supported.
+fn top_level_field(field_names: &[String]) -> crate::Result<&str> {
+    match field_names {
+        [name] => Ok(name.as_str()),
+        [] => Err(crate::Error::ConfigInvalid {
+            message: "Schema change has empty fieldNames".to_string(),
+        }),
+        _ => Err(crate::Error::Unsupported {
+            message: format!("Altering nested struct fields is not supported yet: {field_names:?}"),
+        }),
+    }
+}
+
+/// Index of the field with the given name, if any.
+fn field_index(fields: &[DataField], name: &str) -> Option<usize> {
+    fields.iter().position(|f| f.name() == name)
+}
+
+/// Mirrors Java `SchemaManager.assertNullabilityChange`: converting a nullable
+/// column to NOT NULL is rejected unless explicitly enabled, because existing
+/// rows may already contain NULLs.
+fn assert_nullability_change(
+    old_nullable: bool,
+    new_nullable: bool,
+    field_name: &str,
+    disable_null_to_not_null: bool,
+) -> crate::Result<()> {
+    if disable_null_to_not_null && old_nullable && !new_nullable {
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "Cannot update column type from nullable to non nullable for {field_name}. \
+                 You can set table configuration option 'alter-column-null-to-not-null.disabled' = 'false' \
+                 to allow converting null columns to not null"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Rename a key in a partition/primary key list, if present.
+fn rename_in_keys(keys: &mut [String], old: &str, new: &str) {
+    for key in keys.iter_mut() {
+        if key == old {
+            *key = new.to_string();
+        }
+    }
+}
+
+/// Rename a column inside a comma-separated column-list option (`bucket-key`,
+/// `sequence.field`), if the option is set and references the column.
+///
+/// Mirrors Java `SchemaManager.applyRenameColumnsToOptions`.
+fn rename_in_option_list(
+    options: &mut HashMap<String, String>,
+    option_key: &str,
+    old: &str,
+    new: &str,
+) {
+    let Some(value) = options.get(option_key) else {
+        return;
+    };
+    let renamed = value
+        .split(',')
+        .map(|col| if col == old { new } else { col })
+        .collect::<Vec<_>>()
+        .join(",");
+    options.insert(option_key.to_string(), renamed);
+}
+
+/// The highest field ID nested inside a data type, or -1 if it contains none.
+fn highest_nested_field_id(data_type: &DataType) -> i32 {
+    match data_type {
+        DataType::Array(t) => highest_nested_field_id(t.element_type()),
+        DataType::Multiset(t) => highest_nested_field_id(t.element_type()),
+        DataType::Map(t) => {
+            highest_nested_field_id(t.key_type()).max(highest_nested_field_id(t.value_type()))
+        }
+        DataType::Row(t) => t
+            .fields()
+            .iter()
+            .map(|f| f.id().max(highest_nested_field_id(f.data_type())))
+            .max()
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
+/// Reassign the IDs of all row fields nested inside a data type from the
+/// table-wide highest field ID, so they cannot collide with existing fields.
+///
+/// Mirrors Java `ReassignFieldId`: IDs nested inside a field's type are
+/// assigned before the field's own ID.
+fn reassign_field_ids(data_type: DataType, next_id: &mut i32) -> DataType {
+    let nullable = data_type.is_nullable();
+    match data_type {
+        DataType::Array(t) => DataType::Array(ArrayType::with_nullable(
+            nullable,
+            reassign_field_ids(t.element_type().clone(), next_id),
+        )),
+        DataType::Multiset(t) => DataType::Multiset(MultisetType::with_nullable(
+            nullable,
+            reassign_field_ids(t.element_type().clone(), next_id),
+        )),
+        DataType::Map(t) => DataType::Map(MapType::with_nullable(
+            nullable,
+            reassign_field_ids(t.key_type().clone(), next_id),
+            reassign_field_ids(t.value_type().clone(), next_id),
+        )),
+        DataType::Row(t) => {
+            let fields = t
+                .fields()
+                .iter()
+                .map(|f| {
+                    let typ = reassign_field_ids(f.data_type().clone(), next_id);
+                    *next_id += 1;
+                    DataField::new(*next_id, f.name().to_string(), typ)
+                        .with_description(f.description().map(|s| s.to_string()))
+                })
+                .collect();
+            DataType::Row(RowType::with_nullable(nullable, fields))
+        }
+        other => other,
+    }
+}
+
+/// Insert a brand-new field according to an optional move (used by `AddColumn`).
+fn insert_field_with_move(
+    fields: &mut Vec<DataField>,
+    field: DataField,
+    column_move: Option<&ColumnMove>,
+    full_name: &str,
+) -> crate::Result<()> {
+    let Some(mv) = column_move else {
+        fields.push(field);
+        return Ok(());
+    };
+    match mv.move_type() {
+        ColumnMoveType::FIRST => fields.insert(0, field),
+        ColumnMoveType::LAST => fields.push(field),
+        ColumnMoveType::AFTER | ColumnMoveType::BEFORE => {
+            let reference = move_reference(mv)?;
+            let ref_idx =
+                field_index(fields, reference).ok_or_else(|| crate::Error::ColumnNotExist {
+                    full_name: full_name.to_string(),
+                    column: reference.to_string(),
+                })?;
+            let at = match mv.move_type() {
+                ColumnMoveType::AFTER => ref_idx + 1,
+                _ => ref_idx,
+            };
+            fields.insert(at, field);
+        }
+    }
+    Ok(())
+}
+
+/// Move an existing field to a new position (used by `UpdateColumnPosition`).
+///
+/// Mirrors Java `SchemaManager.applyMove`: remove the field first, then resolve
+/// the reference index in the reduced list so the offset is already adjusted.
+fn apply_move(fields: &mut Vec<DataField>, mv: &ColumnMove, full_name: &str) -> crate::Result<()> {
+    let idx = field_index(fields, mv.field_name()).ok_or_else(|| crate::Error::ColumnNotExist {
+        full_name: full_name.to_string(),
+        column: mv.field_name().to_string(),
+    })?;
+    let field = fields.remove(idx);
+    match mv.move_type() {
+        ColumnMoveType::FIRST => fields.insert(0, field),
+        ColumnMoveType::LAST => fields.push(field),
+        ColumnMoveType::AFTER | ColumnMoveType::BEFORE => {
+            let reference = move_reference(mv)?;
+            let ref_idx =
+                field_index(fields, reference).ok_or_else(|| crate::Error::ColumnNotExist {
+                    full_name: full_name.to_string(),
+                    column: reference.to_string(),
+                })?;
+            let at = match mv.move_type() {
+                ColumnMoveType::AFTER => ref_idx + 1,
+                _ => ref_idx,
+            };
+            fields.insert(at, field);
+        }
+    }
+    Ok(())
+}
+
+/// The reference (anchor) field name required by `AFTER`/`BEFORE` moves.
+fn move_reference(mv: &ColumnMove) -> crate::Result<&str> {
+    mv.reference_field_name()
+        .ok_or_else(|| crate::Error::ConfigInvalid {
+            message: format!(
+                "Move of type {:?} requires a reference field name",
+                mv.move_type()
+            ),
+        })
 }
 
 pub const ROW_ID_FIELD_NAME: &str = "_ROW_ID";
@@ -790,6 +1267,25 @@ mod tests {
     }
 
     #[test]
+    fn test_current_highest_field_id_includes_nested_fields() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "s".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    7,
+                    "a".to_string(),
+                    DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                        DataField::new(9, "b".to_string(), DataType::Int(IntType::new())),
+                    ])))),
+                )])),
+            ),
+        ];
+        assert_eq!(TableSchema::current_highest_field_id(&fields), 9);
+    }
+
+    #[test]
     fn test_new_id() {
         let d_type = DataType::Int(IntType::new());
         let new_data_field = DataField::new(1, "field1".to_string(), d_type.clone()).with_id(2);
@@ -1285,6 +1781,228 @@ mod tests {
         );
     }
 
+    fn cast_test_schema(options: &[(&str, &str)]) -> TableSchema {
+        let mut builder = Schema::builder()
+            .column("a", DataType::Int(IntType::new()))
+            .column("b", DataType::BigInt(crate::spec::BigIntType::new()))
+            .column(
+                "d",
+                DataType::Timestamp(crate::spec::TimestampType::new(3).unwrap()),
+            );
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        TableSchema::new(0, &builder.build().unwrap())
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_cast_compatibility() {
+        let table_schema = cast_test_schema(&[]);
+
+        // Implicit widening.
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )])
+            .unwrap();
+        assert!(matches!(
+            new_schema.fields()[0].data_type(),
+            DataType::BigInt(_)
+        ));
+
+        // Narrowing is an explicit cast, allowed by default.
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "b".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        assert!(matches!(
+            new_schema.fields()[1].data_type(),
+            DataType::Int(_)
+        ));
+
+        // Unsupported conversions are rejected before committing the schema.
+        for new_type in [
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            DataType::Boolean(crate::spec::BooleanType::new()),
+        ] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                    "d".to_string(),
+                    new_type,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("cannot be converted") && message.contains('d')),
+                "expected cast rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_respects_disable_explicit_casting() {
+        let table_schema = cast_test_schema(&[("disable-explicit-type-casting", "true")]);
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "b".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("cannot be converted")),
+            "narrowing should be rejected when explicit casting is disabled, got {err:?}"
+        );
+
+        // Implicit widening is still allowed.
+        table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_type_rejects_blob() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+
+        for (column, new_type) in [
+            (
+                "payload",
+                DataType::VarChar(crate::spec::VarCharType::new(10).unwrap()),
+            ),
+            ("id", DataType::Blob(BlobType::new())),
+        ] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                    column.to_string(),
+                    new_type,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("involving BLOB") && message.contains(column)),
+                "expected BLOB type-change rejection for {column}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_nullable_to_not_null_guard() {
+        let table_schema = cast_test_schema(&[]);
+        let not_null_int = DataType::Int(IntType::new())
+            .copy_with_nullable(false)
+            .unwrap();
+
+        // Both nullability change paths are rejected by default.
+        let changes: Vec<crate::spec::SchemaChange> = vec![
+            crate::spec::SchemaChange::update_column_nullability("a".to_string(), false),
+            crate::spec::SchemaChange::update_column_type("a".to_string(), not_null_int.clone()),
+        ];
+        for change in changes {
+            let err = table_schema.apply_changes(vec![change]).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("nullable to non nullable")),
+                "expected null-to-not-null rejection, got {err:?}"
+            );
+        }
+
+        // Allowed when explicitly enabled via table option.
+        let table_schema = cast_test_schema(&[("alter-column-null-to-not-null.disabled", "false")]);
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_nullability(
+                "a".to_string(),
+                false,
+            )])
+            .unwrap();
+        assert!(!new_schema.fields()[0].data_type().is_nullable());
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "a".to_string(),
+                not_null_int,
+            )])
+            .unwrap();
+        assert!(!new_schema.fields()[0].data_type().is_nullable());
+    }
+
+    #[test]
+    fn test_apply_changes_revalidates_blob_fields() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "payload".to_string(),
+                DataType::Blob(BlobType::new()),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Data evolution config must enabled")),
+            "adding a BLOB column without data-evolution.enabled should fail, got {err:?}"
+        );
+
+        // Enabling data evolution in the same alter makes the final schema valid.
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "data-evolution.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::add_column(
+                    "payload".to_string(),
+                    DataType::Blob(BlobType::new()),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(new_schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_apply_changes_revalidates_partial_update_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.value.sequence-group".to_string(),
+                "value".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("partial-update") && message.contains("sequence-group")),
+            "unsupported partial-update option should be rejected on alter, got {err:?}"
+        );
+    }
+
     #[test]
     fn test_aggregation_apply_changes_rejects_unknown_field() {
         let table_schema = TableSchema::new(
@@ -1370,6 +2088,150 @@ mod tests {
                 .map(String::as_str),
             Some("max")
         );
+    }
+
+    #[test]
+    fn test_rename_column_rewrites_field_scoped_agg_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("tag", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.tag.aggregate-function", "listagg")
+                .option("fields.tag.list-agg-delimiter", ";")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "tag".to_string(),
+                "label".to_string(),
+            )])
+            .unwrap();
+
+        // Field-scoped option keys follow the column to its new name.
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.label.aggregate-function")
+                .map(String::as_str),
+            Some("listagg")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.label.list-agg-delimiter")
+                .map(String::as_str),
+            Some(";")
+        );
+        // The old keys are gone.
+        assert_eq!(
+            new_schema.options().get("fields.tag.aggregate-function"),
+            None
+        );
+        assert_eq!(
+            new_schema.options().get("fields.tag.list-agg-delimiter"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drop_column_referenced_by_bucket_key_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .option("bucket", "4")
+                .option("bucket-key", "name")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "name".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("bucket-key") && message.contains("name")),
+            "drop of a bucket-key column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_column_referenced_by_sequence_field_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("sequence.field", "ts")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "ts".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("sequence.field") && message.contains("ts")),
+            "drop of a sequence.field column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_column_removes_field_scoped_agg_options() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .column("tag", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .option("fields.tag.aggregate-function", "listagg")
+                .option("fields.tag.list-agg-delimiter", ";")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "tag".to_string(),
+            )])
+            .unwrap();
+
+        // The dropped column's field-scoped options are removed...
+        assert_eq!(
+            new_schema.options().get("fields.tag.aggregate-function"),
+            None
+        );
+        assert_eq!(
+            new_schema.options().get("fields.tag.list-agg-delimiter"),
+            None
+        );
+        // ...while the surviving column's option is untouched.
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.value.aggregate-function")
+                .map(String::as_str),
+            Some("sum")
+        );
+        assert!(new_schema.fields().iter().all(|f| f.name() != "tag"));
     }
 
     #[test]

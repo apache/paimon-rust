@@ -114,7 +114,10 @@ impl CatalogFactory {
 }
 
 #[cfg(test)]
-#[cfg(not(windows))] // Skip on Windows due to path compatibility issues
+// Skip on Windows: these tests use a hardcoded POSIX warehouse
+// (`/tmp/test-warehouse`), which is not a valid absolute Windows path, so
+// `FileIO::from_path` cannot derive a `file://` URL from it. See #397.
+#[cfg(not(windows))]
 mod tests {
     use super::*;
 

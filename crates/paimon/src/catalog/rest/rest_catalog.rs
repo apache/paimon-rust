@@ -330,13 +330,17 @@ impl Catalog for RESTCatalog {
 
     async fn alter_table(
         &self,
-        _identifier: &Identifier,
-        _changes: Vec<SchemaChange>,
-        _ignore_if_not_exists: bool,
+        identifier: &Identifier,
+        changes: Vec<SchemaChange>,
+        ignore_if_not_exists: bool,
     ) -> Result<()> {
-        // TODO: Implement alter_table when RESTApi supports it
-        Err(Error::Unsupported {
-            message: "Alter table is not yet implemented for REST catalog".to_string(),
+        let result = self
+            .api
+            .alter_table(identifier, changes)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, identifier));
+        ignore_error_if(result, |e| {
+            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
         })
     }
 

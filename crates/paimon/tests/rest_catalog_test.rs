@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::Options;
-use paimon::spec::{BigIntType, DataType, Schema, VarCharType};
+use paimon::spec::{BigIntType, DataType, Schema, SchemaChange, VarCharType};
 
 mod mock_server;
 use mock_server::{start_mock_server, RESTServer};
@@ -465,17 +465,35 @@ async fn test_catalog_rename_table_ignore_if_not_exists() {
 // ==================== Alter Table Tests ====================
 
 #[tokio::test]
-async fn test_catalog_alter_table_unsupported() {
+async fn test_catalog_alter_table() {
     let ctx = setup_catalog(vec!["default"]).await;
 
     let identifier = Identifier::new("default", "some_table");
+    ctx.catalog
+        .create_table(&identifier, test_schema(), false)
+        .await
+        .unwrap();
 
-    // alter_table should return Unsupported error
-    let result = ctx.catalog.alter_table(&identifier, vec![], false).await;
-    assert!(
-        result.is_err(),
-        "alter_table should return Unsupported error"
-    );
+    // alter_table on an existing table succeeds (client builds the request and
+    // POSTs it; the mock accepts it).
+    let changes = vec![SchemaChange::update_column_comment(
+        "id".to_string(),
+        "the id".to_string(),
+    )];
+    let result = ctx.catalog.alter_table(&identifier, changes, false).await;
+    assert!(result.is_ok(), "alter_table should succeed: {result:?}");
+
+    // alter_table on a missing table: error, unless ignore_if_not_exists.
+    let missing = Identifier::new("default", "ghost");
+    assert!(ctx
+        .catalog
+        .alter_table(&missing, vec![], false)
+        .await
+        .is_err());
+    ctx.catalog
+        .alter_table(&missing, vec![], true)
+        .await
+        .unwrap();
 }
 
 // ==================== Multiple Databases Tests ====================

@@ -90,7 +90,6 @@ pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestE
 }
 
 #[cfg(test)]
-#[cfg(not(windows))] // Skip on Windows due to path compatibility issues
 mod tests {
     use super::*;
     use crate::io::FileIO;

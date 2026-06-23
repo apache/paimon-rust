@@ -18,8 +18,10 @@
 //! Bucket and partition predicate extraction and bucket hash pruning.
 
 use crate::spec::{
-    field_idx_to_partition_idx, BinaryRow, DataField, DataType, Datum, Predicate, PredicateOperator,
+    field_idx_to_partition_idx, BucketFunctionType, DataField, DataType, Datum, Predicate,
+    PredicateOperator,
 };
+use crate::table::bucket_function::bucket_for_datums;
 use std::collections::HashSet;
 
 pub(super) fn split_partition_and_data_predicates(
@@ -94,6 +96,7 @@ pub(super) fn extract_predicate_for_keys(
 pub(super) fn compute_target_buckets(
     bucket_predicate: &Predicate,
     bucket_key_fields: &[DataField],
+    bucket_function_type: BucketFunctionType,
     total_buckets: i32,
 ) -> Option<HashSet<i32>> {
     if total_buckets <= 0 || bucket_key_fields.is_empty() {
@@ -125,7 +128,7 @@ pub(super) fn compute_target_buckets(
             })
             .collect();
 
-        let bucket = BinaryRow::compute_bucket_from_datums(&datums, total_buckets);
+        let bucket = bucket_for_datums(&datums, bucket_function_type, total_buckets).ok()?;
         buckets.insert(bucket);
 
         // Advance the combination counter (rightmost first).

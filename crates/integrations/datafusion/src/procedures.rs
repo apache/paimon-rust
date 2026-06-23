@@ -23,6 +23,7 @@
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
+//! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -147,6 +148,7 @@ pub async fn execute_call(
         "create_tag_from_timestamp" => {
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
         }
+        "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         _ => Err(DataFusionError::Plan(format!(
             "Unknown procedure: {proc_name}"
         ))),
@@ -503,6 +505,45 @@ async fn proc_create_tag_from_timestamp(
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)
+}
+
+async fn proc_create_lumina_index(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let index_column = require_arg(args, "index_column")?;
+    let mut builder = table.new_lumina_index_build_builder();
+    builder.with_index_column(index_column);
+    if let Some(index_type) = args.get("index_type") {
+        builder.with_index_type(index_type);
+    }
+    if let Some(options) = args.get("options") {
+        builder.with_options(parse_key_value_options(options)?);
+    }
+    builder.execute().await.map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+fn parse_key_value_options(options: &str) -> DFResult<HashMap<String, String>> {
+    let mut parsed = HashMap::new();
+    for entry in options.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Invalid options entry '{entry}'. Expected comma-separated key=value pairs"
+            ))
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(DataFusionError::Plan(
+                "Invalid options entry with empty key".to_string(),
+            ));
+        }
+        parsed.insert(key.to_string(), value.trim().to_string());
+    }
+    Ok(parsed)
 }
 
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {

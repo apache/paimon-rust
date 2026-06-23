@@ -16,9 +16,8 @@
 // under the License.
 
 use crate::lumina::ffi::LuminaSearcher;
-use crate::lumina::{
-    strip_lumina_options, GlobalIndexIOMeta, LuminaIndexMeta, LuminaVectorMetric, VectorSearch,
-};
+use crate::lumina::{strip_lumina_options, LuminaIndexMeta, LuminaVectorMetric};
+use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -146,71 +145,7 @@ impl LuminaVectorGlobalIndexReader {
                     source: None,
                 })?;
 
-        let expected_dim = index_meta.dim()? as usize;
-        if vector_search.vector.len() != expected_dim {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Query vector dimension mismatch: index expects {}, but got {}",
-                    expected_dim,
-                    vector_search.vector.len()
-                ),
-                source: None,
-            });
-        }
-
-        let limit = vector_search.limit;
-        let index_metric = index_meta.metric()?;
-        let count = searcher.get_count()? as usize;
-        let effective_k = std::cmp::min(limit, count);
-        if effective_k == 0 {
-            return Ok(None);
-        }
-
-        let include_row_ids = &vector_search.include_row_ids;
-
-        let (distances, labels) = if let Some(ref include_ids) = include_row_ids {
-            let filter_id_list: Vec<u64> = include_ids.iter().collect();
-            if filter_id_list.is_empty() {
-                return Ok(None);
-            }
-            let ek = std::cmp::min(effective_k, filter_id_list.len());
-            let mut distances = vec![0.0f32; ek];
-            let mut labels = vec![0u64; ek];
-            let mut search_opts: HashMap<String, String> = search_options_base.clone();
-            search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
-            ensure_search_list_size(&mut search_opts, ek);
-            searcher.search_with_filter(
-                &vector_search.vector,
-                1,
-                ek as i32,
-                &mut distances,
-                &mut labels,
-                &filter_id_list,
-                &search_opts,
-            )?;
-            (distances, labels)
-        } else {
-            let mut distances = vec![0.0f32; effective_k];
-            let mut labels = vec![0u64; effective_k];
-            let mut search_opts: HashMap<String, String> = search_options_base.clone();
-            ensure_search_list_size(&mut search_opts, effective_k);
-            searcher.search(
-                &vector_search.vector,
-                1,
-                effective_k as i32,
-                &mut distances,
-                &mut labels,
-                &search_opts,
-            )?;
-            (distances, labels)
-        };
-
-        let id_to_scores = collect_results(&labels, &distances, effective_k, index_metric);
-        if id_to_scores.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(id_to_scores))
+        search_lumina(searcher, index_meta, search_options_base, vector_search)
     }
 
     fn ensure_loaded<S: Read + Seek + Send + 'static>(
@@ -264,6 +199,79 @@ impl LuminaVectorGlobalIndexReader {
     }
 }
 
+fn search_lumina(
+    searcher: &LuminaSearcher,
+    index_meta: &LuminaIndexMeta,
+    search_options_base: &HashMap<String, String>,
+    vector_search: &VectorSearch,
+) -> crate::Result<Option<HashMap<u64, f32>>> {
+    let expected_dim = index_meta.dim()? as usize;
+    if vector_search.vector.len() != expected_dim {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Query vector dimension mismatch: index expects {}, but got {}",
+                expected_dim,
+                vector_search.vector.len()
+            ),
+            source: None,
+        });
+    }
+
+    let limit = vector_search.limit;
+    let index_metric = index_meta.metric()?;
+    let count = searcher.get_count()? as usize;
+    let effective_k = std::cmp::min(limit, count);
+    if effective_k == 0 {
+        return Ok(None);
+    }
+
+    let include_row_ids = &vector_search.include_row_ids;
+
+    let (distances, labels) = if let Some(ref include_ids) = include_row_ids {
+        let filter_id_list: Vec<u64> = include_ids.iter().collect();
+        if filter_id_list.is_empty() {
+            return Ok(None);
+        }
+        let ek = std::cmp::min(effective_k, filter_id_list.len());
+        let mut distances = vec![0.0f32; ek];
+        let mut labels = vec![0u64; ek];
+        let mut search_opts: HashMap<String, String> = search_options_base.clone();
+        search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
+        ensure_search_list_size(&mut search_opts, ek);
+        searcher.search_with_filter(
+            &vector_search.vector,
+            1,
+            ek as i32,
+            &mut distances,
+            &mut labels,
+            &filter_id_list,
+            &search_opts,
+        )?;
+        (distances, labels)
+    } else {
+        let mut distances = vec![0.0f32; effective_k];
+        let mut labels = vec![0u64; effective_k];
+        let mut search_opts: HashMap<String, String> = search_options_base.clone();
+        ensure_search_list_size(&mut search_opts, effective_k);
+        searcher.search(
+            &vector_search.vector,
+            1,
+            effective_k as i32,
+            &mut distances,
+            &mut labels,
+            &search_opts,
+        )?;
+        (distances, labels)
+    };
+
+    let id_to_scores = collect_results(&labels, &distances, effective_k, index_metric);
+    if id_to_scores.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(id_to_scores))
+}
+
 fn write_temp_index_file<S: Read + Seek>(stream: &mut S) -> crate::Result<PathBuf> {
     stream
         .seek(SeekFrom::Start(0))
@@ -312,7 +320,7 @@ impl Drop for LuminaVectorGlobalIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lumina::GlobalIndexIOMeta;
+    use crate::vector_search::GlobalIndexIOMeta;
     use std::io::Cursor;
 
     #[test]

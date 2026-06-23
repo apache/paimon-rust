@@ -690,6 +690,56 @@ def main():
         """
     )
 
+    # ===== Mixed-format Schema Evolution: Reorder/Move Column =====
+    # Old Parquet files use the original order (id, left_value, right_value).
+    # ORC and Avro files are written after moving columns; readers should expose
+    # the current table schema order and map old/new files by field id.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS mixed_format_schema_evolution_reorder_move_column (
+            id INT,
+            left_value STRING,
+            right_value STRING
+        ) USING paimon
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_reorder_move_column VALUES
+            (1, 'parquet-left-1', 'parquet-right-1'),
+            (2, 'parquet-left-2', 'parquet-right-2')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_reorder_move_column ALTER COLUMN right_value FIRST"
+    )
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_reorder_move_column SET TBLPROPERTIES ('file.format' = 'orc')"
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_reorder_move_column VALUES
+            ('orc-right-3', 3, 'orc-left-3'),
+            ('orc-right-4', 4, 'orc-left-4')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_reorder_move_column ALTER COLUMN left_value AFTER right_value"
+    )
+    spark.sql(
+        "ALTER TABLE mixed_format_schema_evolution_reorder_move_column SET TBLPROPERTIES ('file.format' = 'avro')"
+    )
+    spark.sql(
+        """
+        INSERT INTO mixed_format_schema_evolution_reorder_move_column VALUES
+            ('avro-right-5', 'avro-left-5', 5),
+            ('avro-right-6', 'avro-left-6', 6)
+        """
+    )
+
     # ===== Complex Types table: ARRAY, MAP, STRUCT =====
     spark.sql(
         """

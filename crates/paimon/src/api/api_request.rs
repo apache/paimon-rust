@@ -22,7 +22,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{catalog::Identifier, spec::Schema};
+use crate::{
+    catalog::Identifier,
+    spec::{Schema, SchemaChange},
+};
 
 /// Request to create a new database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +95,23 @@ impl CreateTableRequest {
     /// Create a new CreateTableRequest.
     pub fn new(identifier: Identifier, schema: Schema) -> Self {
         Self { identifier, schema }
+    }
+}
+
+/// Request to alter a table's schema.
+///
+/// Wire-compatible with Java Paimon's `AlterTableRequest` (`{"changes": [...]}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlterTableRequest {
+    /// The ordered list of schema changes to apply.
+    pub changes: Vec<SchemaChange>,
+}
+
+impl AlterTableRequest {
+    /// Create a new AlterTableRequest.
+    pub fn new(changes: Vec<SchemaChange>) -> Self {
+        Self { changes }
     }
 }
 

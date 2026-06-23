@@ -97,7 +97,18 @@ async fn scan_and_read_with_filter(
     table: &paimon::Table,
     filter: Predicate,
 ) -> (Plan, Vec<RecordBatch>) {
+    scan_and_read_with_projection_and_filter(table, None, filter).await
+}
+
+async fn scan_and_read_with_projection_and_filter(
+    table: &paimon::Table,
+    projection: Option<&[&str]>,
+    filter: Predicate,
+) -> (Plan, Vec<RecordBatch>) {
     let mut read_builder = table.new_read_builder();
+    if let Some(cols) = projection {
+        read_builder.with_projection(cols);
+    }
     read_builder.with_filter(filter);
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
@@ -131,6 +142,21 @@ fn extract_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
     }
     rows.sort_by_key(|(id, _)| *id);
     rows
+}
+
+fn extract_ids(batches: &[RecordBatch]) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for batch in batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        for i in 0..batch.num_rows() {
+            ids.push(id.value(i));
+        }
+    }
+    ids.sort();
+    ids
 }
 
 fn extract_id_name_dt(batches: &[RecordBatch]) -> Vec<(i32, String, String)> {
@@ -1183,8 +1209,12 @@ fn assert_plan_has_multiple_schema_ids(plan: &Plan, table_name: &str) {
 /// Old Parquet files lack the new column; newer ORC/Avro files contain it.
 #[tokio::test]
 async fn test_read_format_schema_evolution_add_column() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
     let table_name = "format_schema_evolution_add_column";
-    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
     assert_plan_has_multiple_schema_ids(&plan, table_name);
 
@@ -1224,14 +1254,39 @@ async fn test_read_format_schema_evolution_add_column() {
         ],
         "Old Parquet rows should have null age and new ORC/Avro rows should keep age values"
     );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("age", Datum::Int(30))
+        .expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["id", "name"]), filter).await;
+    assert_eq!(
+        extract_id_name(&filtered_batches),
+        vec![(3, "carol".to_string())],
+        "Projection plus age filter should return only the matching row"
+    );
+
+    let filter = pb.is_null("age").expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["id"]), filter).await;
+    assert_eq!(
+        extract_ids(&filtered_batches),
+        vec![1, 2],
+        "Projection plus age IS NULL should return rows with null added-column values"
+    );
 }
 
 /// Test reading mixed-format files after ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
 /// Old Parquet files have INT; newer ORC/Avro files have BIGINT.
 #[tokio::test]
 async fn test_read_format_schema_evolution_type_promotion() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
     let table_name = "format_schema_evolution_type_promotion";
-    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
     assert_plan_has_multiple_schema_ids(&plan, table_name);
 
@@ -1271,6 +1326,18 @@ async fn test_read_format_schema_evolution_type_promotion() {
             (6, 6_000_000_000),
         ],
         "Old Parquet INT rows should be cast to BIGINT and new ORC/Avro BIGINT rows should match"
+    );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .greater_than("value", Datum::Long(250))
+        .expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["id"]), filter).await;
+    assert_eq!(
+        extract_ids(&filtered_batches),
+        vec![3, 4, 5, 6],
+        "Projection plus promoted BIGINT filter should return matching promoted values"
     );
 }
 
@@ -1505,20 +1572,14 @@ async fn test_read_schema_evolution_drop_column() {
 /// Old files have the old physical field name; reader should map by field id.
 #[tokio::test]
 async fn test_read_schema_evolution_rename_column() {
-    let (plan, batches) =
-        scan_and_read_with_fs_catalog("schema_evolution_rename_column", None).await;
+    use paimon::spec::{Datum, PredicateBuilder};
 
-    let formats: HashSet<&str> = plan
-        .splits()
-        .iter()
-        .flat_map(|split| split.data_files())
-        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
-        .collect();
-    assert_eq!(
-        formats,
-        HashSet::from(["avro", "orc", "parquet"]),
-        "schema_evolution_rename_column should scan all provisioned file formats"
-    );
+    let catalog = create_file_system_catalog();
+    let table_name = "schema_evolution_rename_column";
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
+
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
 
     let mut rows: Vec<(i32, String)> = Vec::new();
     for batch in &batches {
@@ -1553,8 +1614,7 @@ async fn test_read_schema_evolution_rename_column() {
     );
 
     let (_, projected_batches) =
-        scan_and_read_with_fs_catalog("schema_evolution_rename_column", Some(&["renamed_payload"]))
-            .await;
+        scan_and_read(&catalog, table_name, Some(&["renamed_payload"])).await;
     let mut projected_values = Vec::new();
     for batch in &projected_batches {
         assert_eq!(
@@ -1581,14 +1641,30 @@ async fn test_read_schema_evolution_rename_column() {
         ],
         "Projection on renamed column should still use field-id mapping"
     );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("renamed_payload", Datum::String("parquet-old".into()))
+        .expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["id"]), filter).await;
+    assert_eq!(
+        extract_ids(&filtered_batches),
+        vec![1],
+        "Projection plus filter on renamed column should map old Parquet field ids"
+    );
 }
 
 /// Test reading a mixed-format table after ALTER TABLE DROP COLUMN.
 /// Old Parquet/ORC data files have the dropped column; new Avro files do not.
 #[tokio::test]
 async fn test_read_mixed_format_schema_evolution_drop_column() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
     let table_name = "mixed_format_schema_evolution_drop_column";
-    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
     assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
 
     for batch in &batches {
@@ -1627,11 +1703,7 @@ async fn test_read_mixed_format_schema_evolution_drop_column() {
         "Mixed-format DROP COLUMN should expose only remaining columns from all file formats"
     );
 
-    let (_, projected_batches) = scan_and_read_with_fs_catalog(
-        "mixed_format_schema_evolution_drop_column",
-        Some(&["name", "id"]),
-    )
-    .await;
+    let (_, projected_batches) = scan_and_read(&catalog, table_name, Some(&["name", "id"])).await;
 
     let mut projected_rows: Vec<(i32, String)> = Vec::new();
     for batch in &projected_batches {
@@ -1672,6 +1744,154 @@ async fn test_read_mixed_format_schema_evolution_drop_column() {
             (6, "avro-frank".into()),
         ],
         "Projection should read remaining columns across old and new file schemas"
+    );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("name", Datum::String("orc-carol".into()))
+        .expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["id"]), filter).await;
+    assert_eq!(
+        extract_ids(&filtered_batches),
+        vec![3],
+        "Projection plus filter should read remaining columns after DROP COLUMN"
+    );
+}
+
+/// Test reading a mixed-format table after ALTER COLUMN ... FIRST/AFTER.
+/// Old files keep the original physical column order; new files use moved columns.
+#[tokio::test]
+async fn test_read_mixed_format_schema_evolution_reorder_move_column() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let table_name = "mixed_format_schema_evolution_reorder_move_column";
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
+
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+
+    for batch in &batches {
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["right_value", "left_value", "id"],
+            "Full read should expose the current table schema order"
+        );
+    }
+
+    let mut rows: Vec<(i32, String, String)> = Vec::new();
+    for batch in &batches {
+        let right_value = batch
+            .column_by_name("right_value")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("right_value");
+        let left_value = batch
+            .column_by_name("left_value")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("left_value");
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                id.value(i),
+                left_value.value(i).to_string(),
+                right_value.value(i).to_string(),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "parquet-left-1".into(), "parquet-right-1".into()),
+            (2, "parquet-left-2".into(), "parquet-right-2".into()),
+            (3, "orc-left-3".into(), "orc-right-3".into()),
+            (4, "orc-left-4".into(), "orc-right-4".into()),
+            (5, "avro-left-5".into(), "avro-right-5".into()),
+            (6, "avro-left-6".into(), "avro-right-6".into()),
+        ],
+        "Mixed-format REORDER/MOVE COLUMN should read values by field id, not physical position"
+    );
+
+    let (_, projected_batches) =
+        scan_and_read(&catalog, table_name, Some(&["id", "right_value"])).await;
+    let mut projected_rows: Vec<(i32, String)> = Vec::new();
+    for batch in &projected_batches {
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["id", "right_value"],
+            "Projection should follow caller-specified order"
+        );
+
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("projected id");
+        let right_value = batch
+            .column_by_name("right_value")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("projected right_value");
+        for i in 0..batch.num_rows() {
+            projected_rows.push((id.value(i), right_value.value(i).to_string()));
+        }
+    }
+    projected_rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        projected_rows,
+        vec![
+            (1, "parquet-right-1".into()),
+            (2, "parquet-right-2".into()),
+            (3, "orc-right-3".into()),
+            (4, "orc-right-4".into()),
+            (5, "avro-right-5".into()),
+            (6, "avro-right-6".into()),
+        ],
+        "Projection should still map reordered old and new files by field id"
+    );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("left_value", Datum::String("orc-left-3".into()))
+        .expect("Failed to build predicate");
+    let (_, filtered_batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["right_value", "id"]), filter)
+            .await;
+
+    let mut filtered_rows: Vec<(i32, String)> = Vec::new();
+    for batch in &filtered_batches {
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["right_value", "id"],
+            "Projection plus filter should preserve caller-specified order"
+        );
+
+        let right_value = batch
+            .column_by_name("right_value")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("filtered right_value");
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("filtered id");
+        for i in 0..batch.num_rows() {
+            filtered_rows.push((id.value(i), right_value.value(i).to_string()));
+        }
+    }
+    filtered_rows.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        filtered_rows,
+        vec![(3, "orc-right-3".into())],
+        "Projection plus filter should map reordered fields by id"
     );
 }
 
@@ -2933,6 +3153,162 @@ async fn test_read_full_types_table() {
     assert_eq!(r.16, vec![6]); // array
     assert_eq!(r.17, vec![("d".into(), 40), ("e".into(), 50)]); // map
     assert_eq!(r.18, ("carol".into(), 300)); // struct
+}
+
+#[tokio::test]
+async fn test_read_orc_with_filter_only_column_projection() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("id", Datum::Int(2))
+        .expect("Failed to build id predicate");
+
+    let (_, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "col_string");
+        let col_string = batch
+            .column_by_name("col_string")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for col_string");
+        values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
+    }
+
+    assert_eq!(values, vec!["orc-world"]);
+}
+
+async fn assert_full_types_orc_filter_matches(
+    filter: Predicate,
+    projected_column: &str,
+    expected_string_values: &[&str],
+) {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+
+    let (_, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&[projected_column]), filter).await;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), projected_column);
+        let column = batch
+            .column_by_name(projected_column)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("Expected StringArray for projected column");
+        values.extend((0..batch.num_rows()).map(|row| column.value(row).to_string()));
+    }
+
+    assert_eq!(values, expected_string_values);
+}
+
+#[tokio::test]
+async fn test_read_orc_with_supported_predicate_pushdown_types() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+
+    let cases = vec![
+        (
+            "col_boolean_eq",
+            pb.equal("col_boolean", Datum::Bool(false))
+                .expect("build boolean predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            "col_tinyint_eq",
+            pb.equal("col_tinyint", Datum::TinyInt(2))
+                .expect("build tinyint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            "col_smallint_eq",
+            pb.equal("col_smallint", Datum::SmallInt(200))
+                .expect("build smallint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            "col_int_eq",
+            pb.equal("col_int", Datum::Int(2000))
+                .expect("build int predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            "col_bigint_eq",
+            pb.equal("col_bigint", Datum::Long(200000))
+                .expect("build bigint predicate"),
+            vec!["orc-world"],
+        ),
+        (
+            "col_string_gte",
+            pb.greater_or_equal("col_string", Datum::String("orc-world".to_string()))
+                .expect("build string lower-bound predicate"),
+            vec!["parquet-hello", "orc-world"],
+        ),
+        (
+            "col_string_lte",
+            pb.less_or_equal("col_string", Datum::String("orc-world".to_string()))
+                .expect("build string upper-bound predicate"),
+            vec!["orc-world", "avro-test"],
+        ),
+    ];
+
+    for (case_name, filter, expected_string_values) in cases {
+        let (_, batches) =
+            scan_and_read_with_projection_and_filter(&table, Some(&["col_string"]), filter).await;
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 1);
+            assert_eq!(batch.schema().field(0).name(), "col_string");
+            let col_string = batch
+                .column_by_name("col_string")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("Expected StringArray for col_string");
+            values.extend((0..batch.num_rows()).map(|row| col_string.value(row).to_string()));
+        }
+
+        assert_eq!(values, expected_string_values, "case {case_name}");
+    }
+}
+
+#[tokio::test]
+async fn test_read_orc_with_unsupported_date_predicate_remains_residual() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .greater_or_equal("col_date", Datum::Date(19889))
+        .expect("build date predicate");
+
+    assert_full_types_orc_filter_matches(filter, "col_string", &["orc-world", "avro-test"]).await;
+}
+
+#[tokio::test]
+async fn test_read_orc_predicate_pushdown_remains_conservative() {
+    use paimon::spec::{Datum, PredicateBuilder};
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "full_types_table").await;
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb.equal("id", Datum::Int(2)).expect("build id predicate");
+
+    assert!(
+        !table.new_read_builder().is_exact_filter_pushdown(&filter),
+        "ORC reader pruning must not make data predicates exact at the table boundary"
+    );
+
+    assert_full_types_orc_filter_matches(filter, "col_string", &["orc-world"]).await;
 }
 
 #[tokio::test]

@@ -70,10 +70,6 @@ pub(super) fn split_scan_predicates(
 
 fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     let core_options = CoreOptions::new(table.schema().options());
-    if !core_options.is_default_bucket_function() {
-        return None;
-    }
-
     let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
         if table.schema().trimmed_primary_keys().is_empty() {
             Vec::new()
@@ -150,10 +146,10 @@ impl<'a> ReadBuilder<'a> {
     /// Stats pruning is per file. Files with a different `schema_id`,
     /// incompatible stats layout, or inconclusive stats are kept.
     ///
-    /// [`TableRead`] may use supported non-partition data predicates only on
-    /// the regular Parquet read path for conservative row-group pruning and
-    /// native Parquet row filtering. Unsupported predicates, non-Parquet
-    /// reads, and data-evolution reads remain residual and should still be
+    /// [`TableRead`] may use supported non-partition data predicates on formats
+    /// with reader pruning for conservative row-group pruning. Parquet may also
+    /// use native row filtering. Unsupported predicates, formats without reader
+    /// pruning, and data-evolution reads remain residual and should still be
     /// applied by the caller if exact filtering semantics are required.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);

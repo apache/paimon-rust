@@ -31,6 +31,18 @@ datafusion = "53"
 tokio = { version = "1", features = ["full"] }
 ```
 
+To query tables with Mosaic data files, enable the `mosaic` feature on both crates:
+
+```toml
+[dependencies]
+paimon = { version = "0.1.0", features = ["mosaic"] }
+paimon-datafusion = { version = "0.1.0", features = ["mosaic"] }
+datafusion = "53"
+tokio = { version = "1", features = ["full"] }
+```
+
+Mosaic support is currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+
 ## Registering Catalog
 
 Register an entire Paimon catalog so all databases and tables are accessible via `paimon.database.table` syntax:
@@ -227,6 +239,21 @@ ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 
 ## DML
 
+The table type determines which row-level DML operations are supported:
+
+| Operation | Append-only table | Primary-key table | Data-evolution row-tracking table (no primary key) |
+|---|---|---|---|
+| `INSERT INTO` | Supported | Supported | Supported |
+| `INSERT OVERWRITE` | Supported | Supported | Supported |
+| `INSERT OVERWRITE ... PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
+| `TRUNCATE TABLE` | Supported | Supported | Supported |
+| `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
+| `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
+| `DELETE` | Supported via Copy-on-Write | Not supported | Not supported |
+| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE` and not-matched `INSERT`; matched `DELETE` is not supported |
+
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+
 ### INSERT INTO
 
 ```sql
@@ -240,6 +267,12 @@ INSERT INTO paimon.my_db.users SELECT * FROM source_table;
 ```
 
 For primary-key tables, records with duplicate keys are deduplicated according to the merge engine (default: Deduplicate engine, where the last written value wins).
+
+### Mosaic Read Scope
+
+The Mosaic reader uses row-group statistics for conservative pruning when they are present. This pruning is not row-level filter enforcement; DataFusion still applies SQL filters above the reader to produce exact query results.
+
+Unsupported or limited Mosaic areas include writing `.mosaic` files, emitting manifest `value_stats` for Mosaic writes, Mosaic bloom filters, and Mosaic-specific performance tuning.
 
 ### INSERT OVERWRITE
 
@@ -279,7 +312,7 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For primary-key tables, `data-evolution.enabled` must be enabled to perform UPDATE.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
 
 ### DELETE
 
@@ -288,6 +321,8 @@ For append-only tables, deletes are executed using Copy-on-Write:
 ```sql
 DELETE FROM paimon.my_db.t WHERE name = 'b';
 ```
+
+`DELETE` is not supported on primary-key tables or data-evolution tables.
 
 ### MERGE INTO
 
@@ -326,7 +361,7 @@ ON target.id = source.id
 WHEN MATCHED THEN UPDATE SET name = source.name;
 ```
 
-For data-evolution tables, MERGE INTO uses the `_ROW_ID` virtual column for row-level tracking. For append-only tables, it uses Copy-on-Write file rewriting.
+For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE` plus not-matched `INSERT`; matched `DELETE` is not yet supported. Primary-key tables are not supported for `MERGE INTO`.
 
 ### TRUNCATE TABLE
 
@@ -400,6 +435,35 @@ Rollback a table to a specific timestamp:
 
 ```sql
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
+```
+
+### create_lumina_index
+
+Build and commit a Lumina global vector index for a table column:
+
+```sql
+CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
+```
+
+The optional `index_type` argument selects the Lumina index identifier. It defaults to
+`lumina`. Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
+
+```sql
+CALL sys.create_lumina_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'embedding',
+  index_type => 'lumina'
+);
+```
+
+Optional Lumina builder settings can be supplied as comma-separated `key=value` pairs:
+
+```sql
+CALL sys.create_lumina_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'embedding',
+  options => 'lumina.index.dimension=128,lumina.encoding.type=pq'
+);
 ```
 
 ## Queries
@@ -886,6 +950,7 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'bucket' = '-1'` | Dynamic bucket mode (HASH index) |
 | `'bucket' = '-2'` | Postpone bucket mode (deferred assignment) |
 | `'bucket-key' = 'col'` | Explicit bucket key column |
+| `'bucket-function.type' = 'default' \| 'mod' \| 'hive'` | Function used to map fixed bucket keys to bucket ids |
 
 ### Merge Engine
 

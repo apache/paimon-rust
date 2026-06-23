@@ -30,14 +30,14 @@ use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
     neq as arrow_neq,
 };
-use arrow_schema::{ArrowError, DataType as ArrowDataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType as ArrowDataType, Field, SchemaRef};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use vortex::array::arrow::{FromArrowArray, IntoArrowArray};
+use vortex::array::arrow::{ArrowSessionExt, FromArrowArray};
 use vortex::array::dtype::arrow::FromArrowType;
 use vortex::array::dtype::DType;
-use vortex::array::ArrayRef;
+use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::buffer::ByteBuffer;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::runtime::current::CurrentThreadRuntime;
@@ -225,7 +225,7 @@ fn read_vortex_batches(
         else {
             continue;
         };
-        let batch = vortex_array_to_record_batch(vortex_array, &scan_schema)?;
+        let batch = vortex_array_to_record_batch(&session, vortex_array, &scan_schema)?;
         batches.push(filter_and_project_batch(
             batch,
             &target_schema,
@@ -840,11 +840,19 @@ fn row_ranges_to_selection(ranges: &[RowRange], total_rows: u64) -> Selection {
 
 /// Convert a Vortex ArrayRef to an Arrow RecordBatch.
 fn vortex_array_to_record_batch(
+    session: &VortexSession,
     vortex_array: ArrayRef,
     schema: &SchemaRef,
 ) -> crate::Result<RecordBatch> {
-    let arrow_array = vortex_array
-        .into_arrow(&ArrowDataType::Struct(schema.fields().clone()))
+    let target_field = Field::new(
+        "",
+        ArrowDataType::Struct(schema.fields().clone()),
+        vortex_array.dtype().is_nullable(),
+    );
+    let mut ctx = session.create_execution_ctx();
+    let arrow_array = session
+        .arrow()
+        .execute_arrow(vortex_array, Some(&target_field), &mut ctx)
         .map_err(|e| Error::DataInvalid {
             message: format!("Failed to convert Vortex array to Arrow: {e}"),
             source: None,
