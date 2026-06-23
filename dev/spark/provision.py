@@ -396,6 +396,52 @@ def main():
         "INSERT INTO format_schema_evolution_add_column VALUES (5, 'eve', 50), (6, 'frank', 60)"
     )
 
+    # ===== Partitioned Mixed-format Schema Evolution: Add Column =====
+    # Old Parquet files lack extra; new ORC/Avro files contain extra across dt partitions.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS partitioned_format_schema_evolution_add_column (
+            id INT,
+            name STRING,
+            dt STRING
+        ) USING paimon
+        PARTITIONED BY (dt)
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column VALUES
+            (1, 'alice', '2024-01-01'),
+            (2, 'bob', '2024-01-02')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column ADD COLUMNS (extra STRING)"
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'orc')"
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column (id, name, extra, dt) VALUES
+            (3, 'carol', 'orc-extra-1', '2024-01-01'),
+            (4, 'dave', 'orc-extra-2', '2024-01-03')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'avro')"
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column (id, name, extra, dt) VALUES
+            (5, 'eve', 'avro-extra-1', '2024-01-02'),
+            (6, 'frank', 'avro-extra-2', '2024-01-03')
+        """
+    )
+
     # ===== Mixed-format Schema Evolution: Type Promotion (INT -> BIGINT) =====
     # Old Parquet files have value as INT; new ORC/Avro files have value as BIGINT.
     spark.sql(

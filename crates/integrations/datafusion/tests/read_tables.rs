@@ -796,6 +796,37 @@ async fn test_sql_read_format_schema_evolution_add_column() {
 }
 
 #[tokio::test]
+async fn test_sql_read_partitioned_format_schema_evolution_add_column() {
+    assert_sql_rows(
+        "SELECT id, name, extra FROM paimon.default.partitioned_format_schema_evolution_add_column WHERE dt = '2024-01-02' ORDER BY id",
+        &[
+            &["2", "bob", "NULL"],
+            &["5", "eve", "avro-extra-1"],
+        ],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT id, name, extra FROM paimon.default.partitioned_format_schema_evolution_add_column WHERE dt = '2024-01-01' AND extra IS NULL ORDER BY id",
+        &[&["1", "alice", "NULL"]],
+    )
+    .await;
+
+    assert_sql_rows(
+        "SELECT dt, id, extra FROM paimon.default.partitioned_format_schema_evolution_add_column ORDER BY id",
+        &[
+            &["2024-01-01", "1", "NULL"],
+            &["2024-01-02", "2", "NULL"],
+            &["2024-01-01", "3", "orc-extra-1"],
+            &["2024-01-03", "4", "orc-extra-2"],
+            &["2024-01-02", "5", "avro-extra-1"],
+            &["2024-01-03", "6", "avro-extra-2"],
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_sql_read_format_schema_evolution_type_promotion() {
     assert_sql_rows(
         "SELECT id, value FROM paimon.default.format_schema_evolution_type_promotion ORDER BY id",
