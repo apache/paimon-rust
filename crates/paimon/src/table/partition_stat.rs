@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use crate::io::FileIO;
 use crate::spec::{
-    avro::from_avro_bytes_fast, BinaryRow, DataField, DataType, FileKind, ManifestEntry,
-    ManifestFileMeta, Snapshot,
+    avro::from_avro_bytes_fast, BinaryRow, CoreOptions, FileKind, ManifestEntry, ManifestFileMeta,
+    PartitionComputer, Snapshot,
 };
 use crate::table::SnapshotManager;
 use crate::table::Table;
@@ -66,10 +66,17 @@ impl Table {
         };
 
         let entries = read_all_manifest_entries(self.file_io(), self.location(), &snapshot).await?;
-        let partition_keys = self.schema().partition_keys();
-        let partition_fields = self.schema().partition_fields();
 
-        aggregate_partition_stats(&entries, partition_keys, &partition_fields)
+        let schema = self.schema();
+        let core = CoreOptions::new(schema.options());
+        let computer = PartitionComputer::new(
+            schema.partition_keys(),
+            schema.fields(),
+            core.partition_default_name(),
+            core.legacy_partition_name(),
+        )?;
+
+        aggregate_partition_stats(&entries, &computer)
     }
 
     /// List all partition values present in the latest snapshot.
@@ -129,19 +136,17 @@ async fn read_all_manifest_entries(
 
 fn aggregate_partition_stats(
     entries: &[ManifestEntry],
-    partition_keys: &[String],
-    partition_fields: &[DataField],
+    computer: &PartitionComputer,
 ) -> crate::Result<Vec<PartitionStat>> {
     let mut grouped: HashMap<Vec<u8>, Accum> = HashMap::new();
     for entry in entries {
         let bucket = grouped.entry(entry.partition().to_vec()).or_default();
         let file = entry.file();
-        let live_rows = file.row_count - file.delete_row_count.unwrap_or(0);
         let sign: i64 = match entry.kind() {
             FileKind::Add => 1,
             FileKind::Delete => -1,
         };
-        bucket.record_count += sign * live_rows;
+        bucket.record_count += sign * file.row_count;
         bucket.file_count += sign;
         bucket.total_size_bytes += sign * file.file_size;
     }
@@ -152,7 +157,12 @@ fn aggregate_partition_stats(
             // Partition has been fully deleted in this snapshot.
             continue;
         }
-        let partition = decode_partition(&partition_bytes, partition_keys, partition_fields)?;
+        let partition = if partition_bytes.is_empty() {
+            HashMap::new()
+        } else {
+            let row = BinaryRow::from_serialized_bytes(&partition_bytes)?;
+            computer.generate_part_values(&row)?.into_iter().collect()
+        };
         out.push(PartitionStat {
             partition,
             record_count: accum.record_count.max(0),
@@ -161,52 +171,4 @@ fn aggregate_partition_stats(
         });
     }
     Ok(out)
-}
-
-fn decode_partition(
-    bytes: &[u8],
-    keys: &[String],
-    fields: &[DataField],
-) -> crate::Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    if keys.is_empty() {
-        return Ok(map);
-    }
-    let row = BinaryRow::from_serialized_bytes(bytes)?;
-    for (i, key) in keys.iter().enumerate() {
-        let dt = fields
-            .iter()
-            .find(|f| f.name() == key)
-            .map(|f| f.data_type());
-        let value = if row.is_null_at(i) {
-            "null".to_string()
-        } else {
-            partition_value_to_string(&row, i, dt)
-        };
-        map.insert(key.clone(), value);
-    }
-    Ok(map)
-}
-
-fn partition_value_to_string(row: &BinaryRow, pos: usize, dt: Option<&DataType>) -> String {
-    let pos_i = pos;
-    match dt {
-        Some(DataType::TinyInt(_)) => row.get_byte(pos_i).map(|v| v.to_string()),
-        Some(DataType::SmallInt(_)) => row.get_short(pos_i).map(|v| v.to_string()),
-        Some(DataType::Int(_)) | Some(DataType::Date(_)) => {
-            row.get_int(pos_i).map(|v| v.to_string())
-        }
-        Some(DataType::BigInt(_)) => row.get_long(pos_i).map(|v| v.to_string()),
-        Some(DataType::Boolean(_)) => row.get_boolean(pos_i).map(|v| v.to_string()),
-        Some(DataType::Float(_)) => row.get_float(pos_i).map(|v| v.to_string()),
-        Some(DataType::Double(_)) => row.get_double(pos_i).map(|v| v.to_string()),
-        Some(DataType::Char(_)) | Some(DataType::VarChar(_)) => {
-            row.get_string(pos_i).map(|v| v.to_string())
-        }
-        Some(DataType::Binary(_)) | Some(DataType::VarBinary(_)) => {
-            row.get_binary(pos_i).map(hex::encode)
-        }
-        _ => row.get_string(pos_i).map(|v| v.to_string()),
-    }
-    .unwrap_or_else(|_| "?".to_string())
 }
