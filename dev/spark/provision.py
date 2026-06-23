@@ -424,6 +424,70 @@ def main():
         "INSERT INTO format_schema_evolution_type_promotion VALUES (5, 5000000000), (6, 6000000000)"
     )
 
+    # ===== Mixed-format Data Evolution: Add Column =====
+    # Combines row-tracking/data-evolution with ADD COLUMN and mixed file formats.
+    # Old Parquet files lack extra; new ORC/Avro files contain extra.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_mixed_format_add_column (
+            id INT,
+            name STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO data_evolution_mixed_format_add_column VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200)
+        """
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column ADD COLUMNS (extra STRING)")
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_add_column VALUES (3, 'carol', 300, 'orc-extra')"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_add_column VALUES (4, 'dave', 400, 'avro-extra')"
+    )
+
+    # ===== Mixed-format Data Evolution: Type Promotion =====
+    # Old Parquet files have INT; new ORC/Avro files have BIGINT.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_mixed_format_type_promotion (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (1, 100), (2, 200)"
+    )
+    spark.sql(
+        "ALTER TABLE data_evolution_mixed_format_type_promotion ALTER COLUMN value TYPE BIGINT"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_type_promotion SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (3, 3000000000)"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_type_promotion SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (4, 4000000000)"
+    )
+
     # ===== Data Evolution + Schema Evolution: Add Column =====
     # Combines data-evolution (row-tracking + MERGE INTO) with ALTER TABLE ADD COLUMNS.
     # Old files lack the new column; MERGE INTO produces partial-column files.
