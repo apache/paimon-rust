@@ -21,6 +21,7 @@
 # for paimon-rust integration tests to read.
 
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -52,10 +53,17 @@ def _reset_warehouse_dir(warehouse_path: Path) -> None:
     warehouse_path.mkdir(parents=True, exist_ok=True)
 
     for child in warehouse_path.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        else:
-            shutil.rmtree(child)
+        for attempt in range(3):
+            try:
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
 
 
 def main():
@@ -329,6 +337,69 @@ def main():
     # Tag 'snapshot2' points to snapshot 2 (alice, bob, carol, dave)
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot1', 1)")
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot2', 2)")
+
+    # ===== Time travel + schema evolution table =====
+    # Each tag points at a stable schema boundary. Tests read by tag name rather
+    # than depending on global warehouse snapshot numbering.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS time_travel_schema_evolution (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (1, 'alice'),
+            (2, 'bob')
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_add_column', 1)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution ADD COLUMNS (age INT)")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (3, 'carol', 30),
+            (4, 'dave', 40)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_add_column', 2)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_rename', 2)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution RENAME COLUMN name TO full_name")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (5, 'erin', 50),
+            (6, 'frank', 60)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_rename', 3)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_drop', 3)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution DROP COLUMN age")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (7, 'grace'),
+            (8, 'hank')
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_drop', 4)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_reorder', 4)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution ALTER COLUMN full_name FIRST")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            ('ivy', 9),
+            ('jane', 10)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_reorder', 5)")
 
     # ===== Schema Evolution: Add Column =====
     # Old files have (id, name); after ALTER TABLE ADD COLUMNS, new files have (id, name, age).

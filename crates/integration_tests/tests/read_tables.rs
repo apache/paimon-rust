@@ -182,6 +182,29 @@ fn extract_id_name_dt(batches: &[RecordBatch]) -> Vec<(i32, String, String)> {
     rows
 }
 
+fn collect_rows_as_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                if column.is_null(row_index) {
+                    row.push("NULL".to_string());
+                } else if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
+                    row.push(values.value(row_index).to_string());
+                } else if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                    row.push(values.value(row_index).to_string());
+                } else {
+                    panic!("unsupported column type for {}", field.name());
+                }
+            }
+            rows.push(row);
+        }
+    }
+    rows.sort();
+    rows
+}
+
 fn extract_plan_partitions(plan: &Plan) -> HashSet<String> {
     plan.splits()
         .iter()
@@ -2370,6 +2393,155 @@ async fn test_time_travel_by_tag_name() {
         ],
         "Tag 'snapshot2' should return all rows"
     );
+}
+
+#[tokio::test]
+async fn time_travel_schema_evolution() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_schema_evolution").await;
+
+    for (tag, expected_fields, expected_rows) in [
+        (
+            "before_add_column",
+            vec!["id", "name"],
+            vec![vec!["1", "alice"], vec!["2", "bob"]],
+        ),
+        (
+            "after_add_column",
+            vec!["id", "name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+            ],
+        ),
+        (
+            "before_rename",
+            vec!["id", "name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+            ],
+        ),
+        (
+            "after_rename",
+            vec!["id", "full_name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+                vec!["5", "erin", "50"],
+                vec!["6", "frank", "60"],
+            ],
+        ),
+        (
+            "before_drop",
+            vec!["id", "full_name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+                vec!["5", "erin", "50"],
+                vec!["6", "frank", "60"],
+            ],
+        ),
+        (
+            "after_drop",
+            vec!["id", "full_name"],
+            vec![
+                vec!["1", "alice"],
+                vec!["2", "bob"],
+                vec!["3", "carol"],
+                vec!["4", "dave"],
+                vec!["5", "erin"],
+                vec!["6", "frank"],
+                vec!["7", "grace"],
+                vec!["8", "hank"],
+            ],
+        ),
+        (
+            "before_reorder",
+            vec!["id", "full_name"],
+            vec![
+                vec!["1", "alice"],
+                vec!["2", "bob"],
+                vec!["3", "carol"],
+                vec!["4", "dave"],
+                vec!["5", "erin"],
+                vec!["6", "frank"],
+                vec!["7", "grace"],
+                vec!["8", "hank"],
+            ],
+        ),
+        (
+            "after_reorder",
+            vec!["full_name", "id"],
+            vec![
+                vec!["alice", "1"],
+                vec!["bob", "2"],
+                vec!["carol", "3"],
+                vec!["dave", "4"],
+                vec!["erin", "5"],
+                vec!["frank", "6"],
+                vec!["grace", "7"],
+                vec!["hank", "8"],
+                vec!["ivy", "9"],
+                vec!["jane", "10"],
+            ],
+        ),
+    ] {
+        let versioned_table = table
+            .copy_with_time_travel(HashMap::from([(
+                "scan.version".to_string(),
+                tag.to_string(),
+            )]))
+            .await
+            .unwrap_or_else(|err| panic!("failed to time travel to tag {tag}: {err}"));
+        let read_builder = versioned_table.new_read_builder();
+        let plan = read_builder
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_or_else(|err| panic!("failed to plan tag {tag}: {err}"));
+        let read = read_builder
+            .new_read()
+            .unwrap_or_else(|err| panic!("failed to create read for tag {tag}: {err}"));
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(plan.splits())
+            .unwrap_or_else(|err| panic!("failed to create stream for tag {tag}: {err}"))
+            .try_collect()
+            .await
+            .unwrap_or_else(|err| panic!("failed to collect tag {tag}: {err}"));
+
+        let schema = batches
+            .first()
+            .expect("time-travel tag should return rows")
+            .schema();
+        let field_names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            field_names, expected_fields,
+            "unexpected schema for tag {tag}"
+        );
+
+        let expected_rows: Vec<Vec<String>> = expected_rows
+            .into_iter()
+            .map(|row| row.into_iter().map(str::to_string).collect())
+            .collect();
+        assert_eq!(
+            collect_rows_as_strings(&batches),
+            expected_rows,
+            "unexpected rows for tag {tag}"
+        );
+    }
 }
 
 #[tokio::test]

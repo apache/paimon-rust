@@ -129,6 +129,23 @@ async fn assert_sql_rows(sql: &str, expected: &[&[&str]]) {
     assert_eq!(actual, expected, "unexpected result for SQL: {sql}");
 }
 
+async fn assert_time_travel_schema_evolution_rows(
+    tag: &str,
+    select_list: &str,
+    where_clause: Option<&str>,
+    expected: &[&[&str]],
+) {
+    let sql = match where_clause {
+        Some(where_clause) => format!(
+            "SELECT {select_list} FROM paimon.default.time_travel_schema_evolution VERSION AS OF '{tag}' WHERE {where_clause} ORDER BY id"
+        ),
+        None => format!(
+            "SELECT {select_list} FROM paimon.default.time_travel_schema_evolution VERSION AS OF '{tag}' ORDER BY id"
+        ),
+    };
+    assert_sql_rows(&sql, expected).await;
+}
+
 async fn create_physical_plan(sql: &str) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let ctx = create_context().await;
     ctx.sql(sql).await?.create_physical_plan().await
@@ -655,6 +672,140 @@ async fn test_time_travel_by_tag_name() {
         ],
         "Tag 'snapshot2' should contain all rows"
     );
+}
+
+#[tokio::test]
+async fn time_travel_schema_evolution() {
+    assert_time_travel_schema_evolution_rows(
+        "before_add_column",
+        "id, name",
+        None,
+        &[&["1", "alice"], &["2", "bob"]],
+    )
+    .await;
+    assert_time_travel_schema_evolution_rows(
+        "before_add_column",
+        "id, name",
+        Some("id = 2"),
+        &[&["2", "bob"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "after_add_column",
+        "id, name, age",
+        None,
+        &[
+            &["1", "alice", "NULL"],
+            &["2", "bob", "NULL"],
+            &["3", "carol", "30"],
+            &["4", "dave", "40"],
+        ],
+    )
+    .await;
+    assert_time_travel_schema_evolution_rows(
+        "after_add_column",
+        "id, name, age",
+        Some("age IS NOT NULL"),
+        &[&["3", "carol", "30"], &["4", "dave", "40"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "before_rename",
+        "id, name, age",
+        Some("id >= 3"),
+        &[&["3", "carol", "30"], &["4", "dave", "40"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "after_rename",
+        "id, full_name, age",
+        None,
+        &[
+            &["1", "alice", "NULL"],
+            &["2", "bob", "NULL"],
+            &["3", "carol", "30"],
+            &["4", "dave", "40"],
+            &["5", "erin", "50"],
+            &["6", "frank", "60"],
+        ],
+    )
+    .await;
+    assert_time_travel_schema_evolution_rows(
+        "after_rename",
+        "id, full_name, age",
+        Some("full_name LIKE 'f%'"),
+        &[&["6", "frank", "60"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "before_drop",
+        "id, full_name, age",
+        Some("age >= 50"),
+        &[&["5", "erin", "50"], &["6", "frank", "60"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "after_drop",
+        "id, full_name",
+        None,
+        &[
+            &["1", "alice"],
+            &["2", "bob"],
+            &["3", "carol"],
+            &["4", "dave"],
+            &["5", "erin"],
+            &["6", "frank"],
+            &["7", "grace"],
+            &["8", "hank"],
+        ],
+    )
+    .await;
+    assert_time_travel_schema_evolution_rows(
+        "after_drop",
+        "id, full_name",
+        Some("id > 6"),
+        &[&["7", "grace"], &["8", "hank"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "before_reorder",
+        "id, full_name",
+        Some("id = 8"),
+        &[&["8", "hank"]],
+    )
+    .await;
+
+    assert_time_travel_schema_evolution_rows(
+        "after_reorder",
+        "id, full_name",
+        None,
+        &[
+            &["1", "alice"],
+            &["2", "bob"],
+            &["3", "carol"],
+            &["4", "dave"],
+            &["5", "erin"],
+            &["6", "frank"],
+            &["7", "grace"],
+            &["8", "hank"],
+            &["9", "ivy"],
+            &["10", "jane"],
+        ],
+    )
+    .await;
+    assert_time_travel_schema_evolution_rows(
+        "after_reorder",
+        "id, full_name",
+        Some("id >= 9"),
+        &[&["9", "ivy"], &["10", "jane"]],
+    )
+    .await;
 }
 
 #[tokio::test]
