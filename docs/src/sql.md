@@ -958,6 +958,19 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 |---|---|
 | `'merge-engine' = 'deduplicate'` | Deduplicate engine (default for PK tables), last write wins |
 | `'merge-engine' = 'first-row'` | Keeps the first written row |
+| `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
+| `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
+
+Rust currently supports `merge-engine=aggregation` in basic mode only. It works
+with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
+primary key includes all partition columns. It supports per-field aggregate
+functions such as `sum`, `min`, `max`, value functions, boolean functions, and
+`listagg`, plus `fields.default-aggregate-function`.
+
+This is not full Java feature parity. Aggregation tables do not support retract
+rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
+bucket writes, or advanced aggregation options such as `ignore-retract`,
+`distinct`, `nested-key`, `count-limit`, and sequence groups.
 
 ### Other Options
 

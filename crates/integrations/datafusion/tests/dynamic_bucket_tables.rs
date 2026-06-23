@@ -121,6 +121,54 @@ async fn collect_partial_update_rows(
     rows
 }
 
+async fn collect_aggregation_rows(
+    sql_context: &paimon_datafusion::SQLContext,
+    sql: &str,
+) -> Vec<(i32, Option<i32>, Option<String>, Option<String>)> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let amounts = batch
+            .column_by_name("amount")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let tags = batch
+            .column_by_name("tag")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let notes = batch
+            .column_by_name("note")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                ids.value(i),
+                if amounts.is_null(i) {
+                    None
+                } else {
+                    Some(amounts.value(i))
+                },
+                if tags.is_null(i) {
+                    None
+                } else {
+                    Some(tags.value(i).to_string())
+                },
+                if notes.is_null(i) {
+                    None
+                } else {
+                    Some(notes.value(i).to_string())
+                },
+            ));
+        }
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
 #[tokio::test]
 async fn test_pk_dynamic_bucket_partial_update() {
     let (_tmp, sql_context) = setup_sql_context().await;
@@ -183,6 +231,138 @@ async fn test_pk_dynamic_bucket_partial_update() {
             (1, Some(111), Some("new-1".to_string())),
             (2, Some(200), Some("old-2".to_string())),
             (3, Some(30), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_pk_dynamic_bucket_aggregation_restores_existing_bucket_after_reload() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA failed");
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dyn_agg (
+                id INT NOT NULL, amount INT, tag STRING, note STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '-1',
+                'dynamic-bucket.target-row-num' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum',
+                'fields.tag.aggregate-function' = 'listagg',
+                'fields.tag.list-agg-delimiter' = '|',
+                'fields.default-aggregate-function' = 'last_non_null_value'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_agg VALUES
+             (2, 20, 'x', 'old-2'),
+             (1, 10, 'a', 'old-1')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_dyn_agg"))
+        .await
+        .unwrap();
+    assert_eq!(
+        index_bucket_count(&table).await,
+        2,
+        "target row number 1 should create one HASH index bucket per new key"
+    );
+    let id1_bucket = bucket_containing_id(&table, 1).await;
+
+    let reloaded_context = create_sql_context(catalog.clone()).await;
+    reloaded_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_agg VALUES
+             (1, 5, 'b', CAST(NULL AS STRING)),
+             (3, 99, 'solo', 'only-3')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_dyn_agg"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bucket_containing_id(&table, 1).await,
+        id1_bucket,
+        "reloaded writer should restore the HASH index and route id=1 to its original bucket"
+    );
+    assert_eq!(
+        index_bucket_count(&table).await,
+        3,
+        "new key id=3 should allocate a third bucket when target row number is 1"
+    );
+
+    let reloaded_context = create_sql_context(catalog.clone()).await;
+    reloaded_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_dyn_agg VALUES
+             (2, 7, CAST(NULL AS STRING), 'new-2'),
+             (1, CAST(NULL AS INT), 'c', 'new-1')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t_dyn_agg"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bucket_containing_id(&table, 1).await,
+        id1_bucket,
+        "a second reload should still keep duplicate PK writes in the existing bucket"
+    );
+
+    let read_context = create_sql_context(catalog).await;
+    let rows = collect_aggregation_rows(
+        &read_context,
+        "SELECT id, amount, tag, note FROM paimon.test_db.t_dyn_agg",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (
+                1,
+                Some(15),
+                Some("a|b|c".to_string()),
+                Some("new-1".to_string())
+            ),
+            (
+                2,
+                Some(27),
+                Some("x".to_string()),
+                Some("new-2".to_string())
+            ),
+            (
+                3,
+                Some(99),
+                Some("solo".to_string()),
+                Some("only-3".to_string())
+            ),
         ]
     );
 }

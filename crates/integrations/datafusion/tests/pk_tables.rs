@@ -2284,7 +2284,7 @@ async fn test_pk_partial_update_merges_across_tiny_splits() {
 /// Basic: aggregation engine sums numeric column and concatenates string
 /// column across overlapping primary keys.
 #[tokio::test]
-async fn test_pk_aggregation_sum_and_listagg_fixed_bucket_e2e() {
+async fn test_pk_aggregation_sum_and_listagg_fixed_multi_bucket_e2e() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
     sql_context
@@ -2293,7 +2293,7 @@ async fn test_pk_aggregation_sum_and_listagg_fixed_bucket_e2e() {
                 id INT NOT NULL, amount INT, tag STRING,
                 PRIMARY KEY (id)
             ) WITH (
-                'bucket' = '1',
+                'bucket' = '4',
                 'merge-engine' = 'aggregation',
                 'fields.amount.aggregate-function' = 'sum',
                 'fields.tag.aggregate-function' = 'listagg',

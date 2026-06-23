@@ -1150,6 +1150,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_allows_aggregation_dynamic_bucket_table() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_aggregation_dynamic_bucket_table";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_aggregation_dynamic_bucket_table"),
+            table_path.to_string(),
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("bucket", "-1")
+                    .option("merge-engine", "aggregation")
+                    .option("fields.value.aggregate-function", "sum")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        assert!(matches!(
+            table_write.bucket_assigner,
+            BucketAssignerEnum::Dynamic(_)
+        ));
+        table_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_rejects_partial_update_with_deletion_vectors_when_creating_writer() {
         let file_io = test_file_io();
         let table_path = "memory:/test_partial_update_dv_table";
