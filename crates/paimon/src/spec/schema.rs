@@ -2091,6 +2091,36 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregation_apply_changes_rejects_sequence_field_function() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("seq", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("sequence.field", "seq")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.seq.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("seq")),
+            "aggregation alter should reject sequence-field aggregate function, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_rename_column_rewrites_field_scoped_agg_options() {
         let table_schema = TableSchema::new(
             0,

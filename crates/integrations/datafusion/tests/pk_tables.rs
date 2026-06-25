@@ -2514,8 +2514,8 @@ async fn test_pk_aggregation_mixed_aggregators() {
     assert_eq!(first_seen.value(0), "a"); // first non-null wins
 }
 
-/// `sequence.field` forces the named column to `last_value`, even when the
-/// user explicitly configures another aggregator for it.
+/// `sequence.field` forces the named column to `last_value`, even when a
+/// table-level default aggregator would otherwise apply.
 #[tokio::test]
 async fn test_pk_aggregation_sequence_field_forced_last_value() {
     let (_tmp, sql_context) = setup_sql_context().await;
@@ -2530,7 +2530,7 @@ async fn test_pk_aggregation_sequence_field_forced_last_value() {
                 'merge-engine' = 'aggregation',
                 'sequence.field' = 'ts',
                 'fields.amount.aggregate-function' = 'sum',
-                'fields.ts.aggregate-function' = 'sum'
+                'fields.default-aggregate-function' = 'sum'
             )",
         )
         .await
@@ -2566,7 +2566,7 @@ async fn test_pk_aggregation_sequence_field_forced_last_value() {
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
         .unwrap();
     assert_eq!(amount.value(0), 30); // sum still applies
-    assert_eq!(ts.value(0), 250); // forced last_value over sum
+    assert_eq!(ts.value(0), 250); // forced last_value over default sum
 }
 
 /// Aggregation engine reads must surface Unsupported when a DELETE/UPDATE
@@ -2778,19 +2778,15 @@ async fn test_pk_aggregation_create_table_rejects_incompatible_type() {
     );
 }
 
-/// CREATE TABLE must accept a function/type pair that the runtime would
-/// ignore: `sequence.field` columns are forced to `last_value` and primary-key
-/// columns get no aggregator, so type compatibility is not checked for them.
+/// CREATE TABLE must reject per-field aggregation on a sequence field,
+/// matching Java schema validation.
 #[tokio::test]
-async fn test_pk_aggregation_create_table_accepts_ignored_function_on_seq_and_pk() {
+async fn test_pk_aggregation_create_table_rejects_sequence_field_function() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
-    // `listagg` is incompatible with INT, but `amount` is the sequence field
-    // (forced to last_value) and `id` is a PK (copied through), so both
-    // configurations are usable at runtime and must pass CREATE TABLE.
-    sql_context
+    let err = sql_context
         .sql(
-            "CREATE TABLE paimon.test_db.t_agg_seq_pk_ok (
+            "CREATE TABLE paimon.test_db.t_agg_seq_bad (
                 id INT NOT NULL, amount INT, v INT,
                 PRIMARY KEY (id)
             ) WITH (
@@ -2798,12 +2794,39 @@ async fn test_pk_aggregation_create_table_accepts_ignored_function_on_seq_and_pk
                 'merge-engine' = 'aggregation',
                 'sequence.field' = 'amount',
                 'fields.amount.aggregate-function' = 'listagg',
+                'fields.v.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with aggregation on sequence.field should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sequence field") && msg.contains("amount"),
+        "expected sequence-field aggregation rejection, got {msg}"
+    );
+}
+
+/// CREATE TABLE must accept a function/type pair that the runtime ignores for
+/// primary-key columns: PK fields are copied through, so type compatibility is
+/// not checked for them.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_accepts_ignored_function_on_pk() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_pk_ok (
+                id INT NOT NULL, v INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
                 'fields.id.aggregate-function' = 'listagg',
                 'fields.v.aggregate-function' = 'sum'
             )",
         )
         .await
-        .expect("CREATE TABLE with runtime-ignored function/type pairs should succeed");
+        .expect("CREATE TABLE with runtime-ignored PK function/type pair should succeed");
 }
 
 /// All-NULL aggregation group on a nullable `sum` column should emit NULL

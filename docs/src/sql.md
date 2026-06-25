@@ -967,6 +967,10 @@ primary key includes all partition columns. It supports per-field aggregate
 functions such as `sum`, `min`, `max`, value functions, boolean functions, and
 `listagg`, plus `fields.default-aggregate-function`.
 
+Sequence fields are always merged with `last_value`. Defining
+`fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
+validation.
+
 This is not full Java feature parity. Aggregation tables do not support retract
 rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
 bucket writes, or advanced aggregation options such as `ignore-retract`,
