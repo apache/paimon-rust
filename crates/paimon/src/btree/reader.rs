@@ -255,6 +255,25 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         }
     }
 
+    pub async fn query_prefix(&self, prefix: &[u8]) -> io::Result<RoaringTreemap> {
+        match Self::prefix_successor(prefix) {
+            Some(upper) => self.range_query(prefix, &upper, true, false).await,
+            None => self.query_greater_or_equal(prefix).await,
+        }
+    }
+
+    fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+        let mut bound = prefix.to_vec();
+        while let Some(&last) = bound.last() {
+            if last != 0xFF {
+                *bound.last_mut().unwrap() = last + 1;
+                return Some(bound);
+            }
+            bound.pop();
+        }
+        None
+    }
+
     /// Between query (inclusive on both ends).
     pub async fn query_between(&self, from: &[u8], to: &[u8]) -> io::Result<RoaringTreemap> {
         self.range_query(from, to, true, true).await
