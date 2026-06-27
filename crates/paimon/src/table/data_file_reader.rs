@@ -543,7 +543,7 @@ mod row_tests {
         let file_name = "part-0.row";
         let file_path = format!("{bucket_path}/{file_name}");
         let output = file_io.new_output(&file_path).unwrap();
-        let mut writer = create_format_writer(&output, schema, "zstd", 1, None)
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None)
             .await
             .unwrap();
         writer.write(&batch).await.unwrap();

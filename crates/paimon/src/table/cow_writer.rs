@@ -226,6 +226,7 @@ impl CopyOnWriteMergeWriter {
         let write_buffer_size = core_options.write_parquet_buffer_size();
         let file_format = core_options.file_format().to_string();
         let schema_id = schema.id();
+        let write_fields = schema.fields().to_vec();
 
         let update_columns = &self.update_columns;
         let update_batches = &self.update_batches;
@@ -233,6 +234,7 @@ impl CopyOnWriteMergeWriter {
         let table = &self.table;
         let partition_keys = &partition_keys;
         let partition_computer = &partition_computer;
+        let write_fields = &write_fields;
         let file_compression = file_compression.as_str();
         let file_format = file_format.as_str();
 
@@ -297,6 +299,7 @@ impl CopyOnWriteMergeWriter {
                         file_compression_zstd_level,
                         write_buffer_size,
                         file_format.to_string(),
+                        write_fields.to_vec(),
                         Some(0),
                         None,
                         None,

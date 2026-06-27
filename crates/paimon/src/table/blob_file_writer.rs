@@ -69,6 +69,7 @@ impl AppendBlobFileWriter {
     ) -> Self {
         let mut normal_column_indices = Vec::new();
         let mut normal_arrow_fields = Vec::new();
+        let mut normal_table_fields = Vec::new();
         let mut blob_writers = Vec::new();
 
         for (idx, field) in table_fields.iter().enumerate() {
@@ -88,6 +89,7 @@ impl AppendBlobFileWriter {
                         0,
                         write_buffer_size,
                         "blob".to_string(),
+                        vec![field.clone()],
                         Some(0),
                         None,
                         Some(vec![field.name().to_string()]),
@@ -98,6 +100,7 @@ impl AppendBlobFileWriter {
             } else {
                 normal_column_indices.push(idx);
                 normal_arrow_fields.push(input_schema.field(idx).clone());
+                normal_table_fields.push(field.clone());
             }
         }
 
@@ -114,6 +117,7 @@ impl AppendBlobFileWriter {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            normal_table_fields,
             Some(0),
             None,
             None,

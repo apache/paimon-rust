@@ -149,6 +149,7 @@ pub(crate) async fn create_format_writer(
     compression: &str,
     zstd_level: i32,
     file_io: Option<crate::io::FileIO>,
+    write_fields: Option<&[DataField]>,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
     let path = output.location();
     let lower = path.to_ascii_lowercase();
@@ -161,8 +162,12 @@ pub(crate) async fn create_format_writer(
             blob::BlobFormatWriter::new(output, file_io).await?,
         ))
     } else if lower.ends_with(".row") {
+        let row_type = match write_fields {
+            Some(fields) => fields.to_vec(),
+            None => row::row_type_from_arrow_schema(&schema)?,
+        };
         Ok(Box::new(
-            row::RowFormatWriter::new(output, schema, zstd_level).await?,
+            row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
         ))
     } else {
         #[cfg(feature = "vortex")]

@@ -655,6 +655,7 @@ impl TableWrite {
                 self.file_compression_zstd_level,
                 self.write_buffer_size,
                 self.file_format.clone(),
+                self.table.schema().fields().to_vec(),
                 Some(0),
                 None,
                 None,

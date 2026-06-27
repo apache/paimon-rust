@@ -72,17 +72,9 @@ impl RowFormatWriter {
     pub(crate) async fn new(
         output: &OutputFile,
         schema: SchemaRef,
+        row_type: Vec<DataField>,
         zstd_level: i32,
     ) -> crate::Result<Self> {
-        let row_type = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| {
-                let data_type = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
-                Ok(DataField::new(idx as i32, field.name().clone(), data_type))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
         validate_supported_types(&row_type)?;
         validate_arrow_schema_for_row(&schema, &row_type)?;
 
@@ -142,6 +134,7 @@ impl FormatFileWriter for RowFormatWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        validate_arrow_schema_for_row(&batch.schema(), &self.row_type)?;
         if batch.num_columns() != self.row_type.len() {
             return Err(Error::DataInvalid {
                 message: format!(
@@ -185,7 +178,7 @@ impl FormatFileWriter for RowFormatWriter {
             self.block_compressed_sizes,
             self.block_uncompressed_sizes,
             self.block_row_starts,
-        )
+        )?
         .to_bytes()?;
         let index_length = index_bytes.len();
         self.writer.write(Bytes::from(index_bytes)).await?;
@@ -212,6 +205,18 @@ impl FormatFileWriter for RowFormatWriter {
         self.writer.close().await?;
         Ok(self.bytes_written)
     }
+}
+
+pub(super) fn row_type_from_arrow_schema(schema: &SchemaRef) -> crate::Result<Vec<DataField>> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let data_type = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            Ok(DataField::new(idx as i32, field.name().clone(), data_type))
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -246,7 +251,12 @@ impl FormatFileReader for RowFormatReader {
             });
         }
         let index_start = footer.index_offset as u64;
-        let index_end = index_start + footer.index_length as u64;
+        let index_end = index_start
+            .checked_add(footer.index_length as u64)
+            .ok_or_else(|| Error::DataInvalid {
+                message: ".row index range overflows u64".to_string(),
+                source: None,
+            })?;
         if index_end > footer_start {
             return Err(Error::DataInvalid {
                 message: format!(
@@ -257,7 +267,12 @@ impl FormatFileReader for RowFormatReader {
         }
         let index_bytes = reader.read(index_start..index_end).await?;
         let index = RowBlockIndex::from_bytes(index_bytes.as_ref())?;
-        if index.block_count() != footer.block_count as usize {
+        let footer_block_count =
+            usize::try_from(footer.block_count).map_err(|e| Error::DataInvalid {
+                message: format!("Invalid .row footer block count {}", footer.block_count),
+                source: Some(Box::new(e)),
+            })?;
+        if index.block_count() != footer_block_count {
             return Err(Error::DataInvalid {
                 message: format!(
                     ".row footer block count {} does not match index block count {}",
@@ -272,6 +287,7 @@ impl FormatFileReader for RowFormatReader {
                 message: format!("Invalid .row total row count {}", footer.total_row_count),
                 source: Some(Box::new(e)),
             })?;
+        index.validate_for_file(total_rows, index_start)?;
         validate_row_selection(total_rows, row_selection.as_deref())?;
 
         let schema = build_target_arrow_schema(read_fields)?;
@@ -320,10 +336,22 @@ async fn read_row_block(
 ) -> crate::Result<RowBlockPayload> {
     let offset = index.block_offset(block_idx);
     let compressed_size = index.block_compressed_size(block_idx);
-    let uncompressed_size = index.block_uncompressed_size(block_idx);
-    let compressed = reader
-        .read(offset as u64..(offset + compressed_size) as u64)
-        .await?;
+    let uncompressed_size = index.block_uncompressed_size(block_idx)?;
+    let offset = u64::try_from(offset).map_err(|e| Error::DataInvalid {
+        message: format!(".row block {block_idx} offset {offset} cannot fit u64"),
+        source: Some(Box::new(e)),
+    })?;
+    let compressed_size = u64::try_from(compressed_size).map_err(|e| Error::DataInvalid {
+        message: format!(".row block {block_idx} compressed size {compressed_size} cannot fit u64"),
+        source: Some(Box::new(e)),
+    })?;
+    let end = offset
+        .checked_add(compressed_size)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(".row block {block_idx} byte range overflows u64"),
+            source: None,
+        })?;
+    let compressed = reader.read(offset..end).await?;
     let data = zstd::bulk::decompress(compressed.as_ref(), uncompressed_size).map_err(|e| {
         Error::DataInvalid {
             message: format!("Failed to decompress .row block {block_idx}: {e}"),
@@ -394,6 +422,15 @@ fn validate_arrow_type_for_row_field(
                 entries.data_type(),
                 m.key_type(),
                 m.value_type(),
+            )?;
+            true
+        }
+        (ArrowDataType::Map(entries, _), DataType::Multiset(m)) => {
+            validate_arrow_map_entries(
+                field_name,
+                entries.data_type(),
+                m.element_type(),
+                &DataType::Int(IntType::new()),
             )?;
             true
         }
@@ -1664,14 +1701,19 @@ impl RowBlockIndex {
         block_compressed_sizes: Vec<i64>,
         block_uncompressed_sizes: Vec<i64>,
         block_row_starts: Vec<i64>,
-    ) -> Self {
-        let block_offsets = compute_offsets(&block_compressed_sizes);
-        Self {
+    ) -> crate::Result<Self> {
+        validate_block_index_arrays(
+            &block_compressed_sizes,
+            &block_uncompressed_sizes,
+            &block_row_starts,
+        )?;
+        let block_offsets = compute_offsets(&block_compressed_sizes)?;
+        Ok(Self {
             block_offsets,
             block_compressed_sizes,
             block_uncompressed_sizes,
             block_row_starts,
-        }
+        })
     }
 
     fn to_bytes(&self) -> crate::Result<Vec<u8>> {
@@ -1701,11 +1743,11 @@ impl RowBlockIndex {
                 source: None,
             });
         }
-        Ok(Self::new(
+        Self::new(
             block_compressed_sizes,
             block_uncompressed_sizes,
             block_row_starts,
-        ))
+        )
     }
 
     fn block_count(&self) -> usize {
@@ -1720,23 +1762,159 @@ impl RowBlockIndex {
         self.block_compressed_sizes[idx]
     }
 
-    fn block_uncompressed_size(&self, idx: usize) -> usize {
-        self.block_uncompressed_sizes[idx] as usize
+    fn block_uncompressed_size(&self, idx: usize) -> crate::Result<usize> {
+        usize::try_from(self.block_uncompressed_sizes[idx]).map_err(|e| Error::DataInvalid {
+            message: format!(
+                ".row block {idx} uncompressed size {} cannot fit usize",
+                self.block_uncompressed_sizes[idx]
+            ),
+            source: Some(Box::new(e)),
+        })
     }
 
     fn block_row_start(&self, idx: usize) -> usize {
         self.block_row_starts[idx] as usize
     }
+
+    fn validate_for_file(&self, total_rows: usize, index_start: u64) -> crate::Result<()> {
+        if self.block_count() == 0 {
+            if total_rows == 0 {
+                return Ok(());
+            }
+            return Err(Error::DataInvalid {
+                message: format!(".row index has no blocks for {total_rows} rows"),
+                source: None,
+            });
+        }
+        if self.block_row_starts[0] != 0 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    ".row first block row start must be 0, got {}",
+                    self.block_row_starts[0]
+                ),
+                source: None,
+            });
+        }
+        for idx in 0..self.block_count() {
+            let row_start =
+                usize::try_from(self.block_row_starts[idx]).map_err(|e| Error::DataInvalid {
+                    message: format!(
+                        ".row block {idx} row start {} cannot fit usize",
+                        self.block_row_starts[idx]
+                    ),
+                    source: Some(Box::new(e)),
+                })?;
+            if row_start >= total_rows {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        ".row block {idx} row start {row_start} exceeds total rows {total_rows}"
+                    ),
+                    source: None,
+                });
+            }
+            let offset =
+                u64::try_from(self.block_offsets[idx]).map_err(|e| Error::DataInvalid {
+                    message: format!(
+                        ".row block {idx} offset {} cannot fit u64",
+                        self.block_offsets[idx]
+                    ),
+                    source: Some(Box::new(e)),
+                })?;
+            let compressed_size = u64::try_from(self.block_compressed_sizes[idx]).map_err(|e| {
+                Error::DataInvalid {
+                    message: format!(
+                        ".row block {idx} compressed size {} cannot fit u64",
+                        self.block_compressed_sizes[idx]
+                    ),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+            let end = offset
+                .checked_add(compressed_size)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(".row block {idx} byte range overflows u64"),
+                    source: None,
+                })?;
+            if end > index_start {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        ".row block {idx} byte range [{offset}, {end}) exceeds index start {index_start}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
-fn compute_offsets(sizes: &[i64]) -> Vec<i64> {
+fn validate_block_index_arrays(
+    compressed_sizes: &[i64],
+    uncompressed_sizes: &[i64],
+    row_starts: &[i64],
+) -> crate::Result<()> {
+    if compressed_sizes.len() != uncompressed_sizes.len()
+        || compressed_sizes.len() != row_starts.len()
+    {
+        return Err(Error::DataInvalid {
+            message: ".row block index arrays have different lengths".to_string(),
+            source: None,
+        });
+    }
+    let mut previous_row_start = None;
+    for idx in 0..compressed_sizes.len() {
+        if compressed_sizes[idx] < 0 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    ".row block {idx} has negative compressed size {}",
+                    compressed_sizes[idx]
+                ),
+                source: None,
+            });
+        }
+        if uncompressed_sizes[idx] < 0 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    ".row block {idx} has negative uncompressed size {}",
+                    uncompressed_sizes[idx]
+                ),
+                source: None,
+            });
+        }
+        let row_start = row_starts[idx];
+        if row_start < 0 {
+            return Err(Error::DataInvalid {
+                message: format!(".row block {idx} has negative row start {row_start}"),
+                source: None,
+            });
+        }
+        if previous_row_start.is_some_and(|previous| row_start <= previous) {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    ".row block row starts must be strictly increasing, got {row_start} after {}",
+                    previous_row_start.unwrap()
+                ),
+                source: None,
+            });
+        }
+        previous_row_start = Some(row_start);
+    }
+    Ok(())
+}
+
+fn compute_offsets(sizes: &[i64]) -> crate::Result<Vec<i64>> {
     let mut offsets = Vec::with_capacity(sizes.len());
-    let mut offset = 0;
+    let mut offset = 0i64;
     for size in sizes {
         offsets.push(offset);
-        offset += size;
+        offset = offset
+            .checked_add(*size)
+            .ok_or_else(|| Error::DataInvalid {
+                message: ".row block offsets overflow i64".to_string(),
+                source: None,
+            })?;
     }
-    offsets
+    Ok(offsets)
 }
 
 fn write_index_array(out: &mut Vec<u8>, values: &[i64]) -> crate::Result<()> {
@@ -2003,6 +2181,61 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    fn expect_data_invalid<T>(result: crate::Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected DataInvalid"),
+            Err(Error::DataInvalid { message, .. }) => message,
+            Err(err) => panic!("expected DataInvalid, got {err:?}"),
+        }
+    }
+
+    fn encoded_index_arrays(
+        compressed_sizes: &[i64],
+        uncompressed_sizes: &[i64],
+        row_starts: &[i64],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_index_array(&mut bytes, compressed_sizes).unwrap();
+        write_index_array(&mut bytes, uncompressed_sizes).unwrap();
+        write_index_array(&mut bytes, row_starts).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn row_block_index_rejects_invalid_values() {
+        let message = expect_data_invalid(RowBlockIndex::from_bytes(&encoded_index_arrays(
+            &[-1],
+            &[1],
+            &[0],
+        )));
+        assert!(message.contains("negative compressed size"));
+
+        let message = expect_data_invalid(RowBlockIndex::from_bytes(&encoded_index_arrays(
+            &[1, 1],
+            &[1, 1],
+            &[0, 0],
+        )));
+        assert!(message.contains("strictly increasing"));
+
+        let message = expect_data_invalid(RowBlockIndex::new(
+            vec![i64::MAX, 1],
+            vec![1, 1],
+            vec![0, 1],
+        ));
+        assert!(message.contains("offsets overflow"));
+    }
+
+    #[test]
+    fn row_block_index_validates_file_bounds() {
+        let index = RowBlockIndex::new(vec![10], vec![20], vec![0]).unwrap();
+        let message = expect_data_invalid(index.validate_for_file(1, 5));
+        assert!(message.contains("exceeds index start"));
+
+        let index = RowBlockIndex::new(vec![1], vec![1], vec![2]).unwrap();
+        let message = expect_data_invalid(index.validate_for_file(3, 10));
+        assert!(message.contains("first block row start must be 0"));
+    }
+
     #[tokio::test]
     async fn row_writer_reader_roundtrip_primitives_and_selection() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
@@ -2035,7 +2268,7 @@ mod tests {
             ),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema.clone(), 1)
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
             .await
             .unwrap();
         let decimal = Decimal128Array::from(vec![Some(12345_i128), None, Some(-42_i128)])
@@ -2124,7 +2357,9 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let path = "memory:/row-block-selection/data.row";
         let output = file_io.new_output(path).unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema, 1).await.unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema, fields.clone(), 1)
+            .await
+            .unwrap();
         writer.write(&batch).await.unwrap();
         Box::new(writer).close().await.unwrap();
 
@@ -2185,7 +2420,9 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let path = "memory:/row-block-prefetch/data.row";
         let output = file_io.new_output(path).unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema, 1).await.unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema, fields.clone(), 1)
+            .await
+            .unwrap();
         writer.write(&batch).await.unwrap();
         Box::new(writer).close().await.unwrap();
 
@@ -2235,8 +2472,37 @@ mod tests {
             .new_output("memory:/row-unsupported/data.row")
             .unwrap();
 
-        let err = match RowFormatWriter::new(&output, schema, 1).await {
+        let row_type = vec![DataField::new(
+            0,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let err = match RowFormatWriter::new(&output, schema, row_type, 1).await {
             Ok(_) => panic!("LargeUtf8 should be rejected at writer creation"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn row_writer_rejects_arrow_schema_that_differs_from_table_schema() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "amount",
+            ArrowDataType::Decimal128(18, 2),
+            true,
+        )]));
+        let row_type = vec![DataField::new(
+            0,
+            "amount".to_string(),
+            DataType::Decimal(DecimalType::new(20, 2).unwrap()),
+        )];
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let output = file_io
+            .new_output("memory:/row-schema-mismatch/data.row")
+            .unwrap();
+
+        let err = match RowFormatWriter::new(&output, schema, row_type, 1).await {
+            Ok(_) => panic!("Mismatched decimal precision should be rejected"),
             Err(err) => err,
         };
         assert!(matches!(err, Error::Unsupported { .. }));
@@ -2334,7 +2600,9 @@ mod tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let path = "memory:/row-nested/data.row";
         let output = file_io.new_output(path).unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema, 1).await.unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema, fields.clone(), 1)
+            .await
+            .unwrap();
         writer.write(&batch).await.unwrap();
         Box::new(writer).close().await.unwrap();
 
@@ -2536,7 +2804,9 @@ mod tests {
         let output = file_io
             .new_output("memory:/row-java-fixture-byte-match/data.row")
             .unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema, 1).await.unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema, fields.clone(), 1)
+            .await
+            .unwrap();
         writer.write(&batch).await.unwrap();
         Box::new(writer).close().await.unwrap();
 
@@ -2761,7 +3031,7 @@ mod tests {
         let schema = build_target_arrow_schema(&fields).unwrap();
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let output = file_io.new_output("memory:/row-empty/data.row").unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema.clone(), 1)
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
             .await
             .unwrap();
         let batch =

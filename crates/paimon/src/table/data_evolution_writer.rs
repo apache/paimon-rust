@@ -27,7 +27,7 @@
 //! similar to Iceberg's Transaction/Action pattern.
 
 use crate::io::FileIO;
-use crate::spec::{BinaryRow, CoreOptions, DataFileMeta, PartitionComputer};
+use crate::spec::{BinaryRow, CoreOptions, DataField, DataFileMeta, PartitionComputer};
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -525,6 +525,7 @@ pub(crate) struct DataEvolutionPartialWriter {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    write_fields: Vec<DataField>,
     write_columns: Vec<String>,
     /// Writers keyed by (partition_bytes, bucket, first_row_id).
     writers: HashMap<WriterKey, DataFileWriter>,
@@ -547,6 +548,19 @@ impl DataEvolutionPartialWriter {
 
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
+        let write_fields = write_columns
+            .iter()
+            .map(|column| {
+                fields
+                    .iter()
+                    .find(|field| field.name() == column)
+                    .cloned()
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Unknown data-evolution write column '{column}'"),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let partition_computer = PartitionComputer::new(
             &partition_keys,
             fields,
@@ -565,6 +579,7 @@ impl DataEvolutionPartialWriter {
             file_compression_zstd_level: core_options.file_compression_zstd_level(),
             write_buffer_size: core_options.write_parquet_buffer_size(),
             file_format: core_options.file_format().to_string(),
+            write_fields,
             write_columns,
             writers: HashMap::new(),
         })
@@ -605,6 +620,7 @@ impl DataEvolutionPartialWriter {
                 self.file_compression_zstd_level,
                 self.write_buffer_size,
                 self.file_format.clone(),
+                self.write_fields.clone(),
                 Some(0), // file_source: APPEND
                 Some(first_row_id),
                 Some(self.write_columns.clone()),
