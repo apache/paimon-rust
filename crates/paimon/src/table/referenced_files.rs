@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use crate::io::FileIO;
 use crate::spec::{
-    bucket_dir_name, BinaryRow, DataField, IndexManifest, Manifest, ManifestEntry,
+    bucket_dir_name, BinaryRow, DataField, DataFileMeta, IndexManifest, Manifest, ManifestEntry,
     ManifestFileMeta, PartitionComputer,
 };
 use crate::table::{BranchManager, SnapshotManager, TagManager};
@@ -117,17 +117,7 @@ impl ExtraFileResolver {
         }
     }
 
-    fn resolve_extra_file_path(
-        &self,
-        partition_bytes: &[u8],
-        bucket: i32,
-        extra_file_name: &str,
-        external_path: Option<&str>,
-    ) -> Option<String> {
-        if let Some(ext_path) = external_path {
-            let dir = parent_path(ext_path)?;
-            return Some(format!("{}/{}", dir, extra_file_name));
-        }
+    fn resolve_bucket_path(&self, partition_bytes: &[u8], bucket: i32) -> Option<String> {
         let partition_path = if let Some(ref computer) = self.partition_computer {
             let row = BinaryRow::from_serialized_bytes(partition_bytes).ok()?;
             computer.generate_partition_path(&row).ok()?
@@ -136,19 +126,20 @@ impl ExtraFileResolver {
         };
         let bucket_dir = bucket_dir_name(bucket);
         Some(format!(
-            "{}/{}{}/{}",
-            self.table_location, partition_path, bucket_dir, extra_file_name
+            "{}/{}{}",
+            self.table_location, partition_path, bucket_dir
         ))
     }
-}
 
-fn parent_path(path: &str) -> Option<&str> {
-    let trimmed = path.trim_end_matches('/');
-    let idx = trimmed.rfind('/')?;
-    if idx == 0 {
-        Some("/")
-    } else {
-        Some(&trimmed[..idx])
+    fn resolve_extra_file_path(
+        &self,
+        partition_bytes: &[u8],
+        bucket: i32,
+        data_file: &DataFileMeta,
+        extra_file_name: &str,
+    ) -> Option<String> {
+        let bucket_path = self.resolve_bucket_path(partition_bytes, bucket)?;
+        Some(data_file.aligned_file_path(&bucket_path, extra_file_name))
     }
 }
 
@@ -443,8 +434,8 @@ async fn collect_snapshot_files(
                     let full_path = extra_resolver.resolve_extra_file_path(
                         e.partition(),
                         e.bucket(),
+                        e.file(),
                         extra,
-                        e.file().external_path.as_deref(),
                     );
                     if let Some(path) = full_path {
                         extra_file_stat_tasks.push((manifest_idx, entry_idx, path));
@@ -858,15 +849,35 @@ mod tests {
 
     #[test]
     fn test_extra_file_resolver_uses_external_path_parent() {
+        use crate::spec::stats::BinaryTableStats;
+
         let resolver = ExtraFileResolver::new("s3://warehouse/table", &[], &[]);
+        let stats = BinaryTableStats::empty();
+        let file = DataFileMeta {
+            file_name: "data-0.row".to_string(),
+            file_size: 1,
+            row_count: 1,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: stats.clone(),
+            value_stats: stats,
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec!["data-0.row.index".to_string()],
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: Some("s3://bucket/external/data-0.row".to_string()),
+            first_row_id: None,
+            write_cols: None,
+        };
 
         assert_eq!(
-            resolver.resolve_extra_file_path(
-                &[],
-                0,
-                "data-0.row.index",
-                Some("s3://bucket/external/data-0.row")
-            ),
+            resolver.resolve_extra_file_path(&[], 0, &file, "data-0.row.index"),
             Some("s3://bucket/external/data-0.row.index".to_string())
         );
     }

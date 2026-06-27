@@ -22,6 +22,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
+/// Suffix for sidecar file-index files, matching Java `DataFilePathFactory.INDEX_PATH_SUFFIX`.
+pub const DATA_FILE_INDEX_SUFFIX: &str = ".index";
+
 /// Metadata of a data file.
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/io/DataFileMeta.java>
@@ -146,17 +149,96 @@ impl DataFileMeta {
     pub fn row_id_range(&self) -> Option<(i64, i64)> {
         self.first_row_id.map(|fid| (fid, fid + self.row_count - 1))
     }
+
+    /// Full path for this data file.
+    ///
+    /// Mirrors Java `DataFilePathFactory#toPath(DataFileMeta)`: use
+    /// `_EXTERNAL_PATH` when present, otherwise align the file name under the
+    /// split/bucket path.
+    pub fn data_file_path(&self, bucket_path: &str) -> String {
+        self.external_path
+            .clone()
+            .unwrap_or_else(|| join_path(bucket_path, &self.file_name))
+    }
+
+    /// Parent directory of `_EXTERNAL_PATH`, if present.
+    ///
+    /// Mirrors Java `DataFileMeta#externalPathDir`.
+    pub fn external_path_dir(&self) -> Option<&str> {
+        self.external_path.as_deref().and_then(parent_path)
+    }
+
+    /// Full path for an extra file whose location should be aligned with this data file.
+    ///
+    /// Mirrors Java `DataFilePathFactory#toAlignedPath`: sidecars live beside
+    /// the external data file when `_EXTERNAL_PATH` is present, otherwise under
+    /// the data file's bucket path.
+    pub fn aligned_file_path(&self, bucket_path: &str, file_name: &str) -> String {
+        let parent = self.external_path_dir().unwrap_or(bucket_path);
+        join_path(parent, file_name)
+    }
+
+    /// File name for the default independent file-index sidecar of this data file.
+    ///
+    /// Mirrors Java `DataFilePathFactory#dataFileToFileIndexPath`, which appends
+    /// `.index` to the full data-file name.
+    pub fn data_file_index_file_name(&self) -> String {
+        data_file_to_file_index_file_name(&self.file_name)
+    }
+
+    /// Full path for the default independent file-index sidecar of this data file.
+    pub fn data_file_index_path(&self, bucket_path: &str) -> String {
+        self.aligned_file_path(bucket_path, &self.data_file_index_file_name())
+    }
+
+    /// Data file plus all extra files as physical paths.
+    ///
+    /// Mirrors Java `DataFileMeta#collectFiles`.
+    pub fn collect_files(&self, bucket_path: &str) -> Vec<String> {
+        let mut files = Vec::with_capacity(1 + self.extra_files.len());
+        files.push(self.data_file_path(bucket_path));
+        files.extend(
+            self.extra_files
+                .iter()
+                .map(|extra| self.aligned_file_path(bucket_path, extra)),
+        );
+        files
+    }
+}
+
+pub fn data_file_to_file_index_file_name(file_name: &str) -> String {
+    format!("{file_name}{DATA_FILE_INDEX_SUFFIX}")
+}
+
+fn join_path(parent: &str, file_name: &str) -> String {
+    let parent = parent.trim_end_matches('/');
+    if parent.is_empty() {
+        file_name.to_string()
+    } else if parent == "/" {
+        format!("/{file_name}")
+    } else {
+        format!("{parent}/{file_name}")
+    }
+}
+
+fn parent_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches('/');
+    let idx = trimmed.rfind('/')?;
+    if idx == 0 {
+        Some("/")
+    } else {
+        Some(&trimmed[..idx])
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn display_includes_all_data_file_meta_fields() {
+    fn data_file(file_name: &str) -> DataFileMeta {
         let stats = BinaryTableStats::empty();
-        let file = DataFileMeta {
-            file_name: "data-1.parquet".to_string(),
+        DataFileMeta {
+            file_name: file_name.to_string(),
             file_size: 42,
             row_count: 7,
             min_key: vec![1],
@@ -167,15 +249,24 @@ mod tests {
             max_sequence_number: 5,
             schema_id: 11,
             level: 2,
-            extra_files: vec!["extra-1".to_string()],
+            extra_files: Vec::new(),
             creation_time: DateTime::from_timestamp_millis(1_234),
             delete_row_count: Some(1),
             embedded_index: Some(vec![4, 5]),
             file_source: Some(6),
             value_stats_cols: Some(vec!["v".to_string()]),
-            external_path: Some("s3://bucket/data-1.parquet".to_string()),
+            external_path: None,
             first_row_id: Some(100),
             write_cols: Some(vec!["k".to_string(), "v".to_string()]),
+        }
+    }
+
+    #[test]
+    fn display_includes_all_data_file_meta_fields() {
+        let file = DataFileMeta {
+            extra_files: vec!["extra-1".to_string()],
+            external_path: Some("s3://bucket/data-1.parquet".to_string()),
+            ..data_file("data-1.parquet")
         };
 
         let display = file.to_string();
@@ -206,5 +297,65 @@ mod tests {
                 "Display output missing `{expected}`: {display}"
             );
         }
+    }
+
+    #[test]
+    fn data_file_paths_align_to_bucket_path() {
+        let mut file = data_file("data-0.row");
+        file.extra_files = vec!["data-0.row.index".to_string(), "data-0.row.dv".to_string()];
+
+        assert_eq!(
+            file.data_file_path("s3://warehouse/table/bucket-0"),
+            "s3://warehouse/table/bucket-0/data-0.row"
+        );
+        assert_eq!(
+            file.aligned_file_path("s3://warehouse/table/bucket-0/", "data-0.row.index"),
+            "s3://warehouse/table/bucket-0/data-0.row.index"
+        );
+        assert_eq!(file.data_file_index_file_name(), "data-0.row.index");
+        assert_eq!(
+            file.data_file_index_path("s3://warehouse/table/bucket-0"),
+            "s3://warehouse/table/bucket-0/data-0.row.index"
+        );
+        assert_eq!(
+            file.collect_files("s3://warehouse/table/bucket-0"),
+            vec![
+                "s3://warehouse/table/bucket-0/data-0.row".to_string(),
+                "s3://warehouse/table/bucket-0/data-0.row.index".to_string(),
+                "s3://warehouse/table/bucket-0/data-0.row.dv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn data_file_paths_align_extra_files_to_external_path_parent() {
+        let mut file = data_file("data-0.row");
+        file.external_path = Some("s3://external/table/data-0.row".to_string());
+        file.extra_files = vec!["data-0.row.index".to_string()];
+
+        assert_eq!(
+            file.data_file_path("s3://warehouse/table/bucket-0"),
+            "s3://external/table/data-0.row"
+        );
+        assert_eq!(file.external_path_dir(), Some("s3://external/table"));
+        assert_eq!(
+            file.data_file_index_path("s3://warehouse/table/bucket-0"),
+            "s3://external/table/data-0.row.index"
+        );
+        assert_eq!(
+            file.collect_files("s3://warehouse/table/bucket-0"),
+            vec![
+                "s3://external/table/data-0.row".to_string(),
+                "s3://external/table/data-0.row.index".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn data_file_to_file_index_file_name_appends_java_suffix() {
+        assert_eq!(
+            data_file_to_file_index_file_name("part-0.row"),
+            "part-0.row.index"
+        );
     }
 }
