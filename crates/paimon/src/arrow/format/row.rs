@@ -465,12 +465,12 @@ fn timestamp_time_unit_for_precision(precision: u32) -> TimeUnit {
 
 fn validate_supported_types(fields: &[DataField]) -> crate::Result<()> {
     for field in fields {
-        validate_supported_type(field.name(), field.data_type())?;
+        validate_supported_type(field.data_type())?;
     }
     Ok(())
 }
 
-fn validate_supported_type(field_name: &str, data_type: &DataType) -> crate::Result<()> {
+fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
     match data_type {
         DataType::Boolean(_)
         | DataType::TinyInt(_)
@@ -489,15 +489,15 @@ fn validate_supported_type(field_name: &str, data_type: &DataType) -> crate::Res
         | DataType::Timestamp(_)
         | DataType::LocalZonedTimestamp(_)
         | DataType::Decimal(_) => Ok(()),
-        DataType::Array(a) => validate_supported_type(field_name, a.element_type()),
+        DataType::Array(a) => validate_supported_type(a.element_type()),
         DataType::Map(m) => {
-            validate_supported_type(field_name, m.key_type())?;
-            validate_supported_type(field_name, m.value_type())
+            validate_supported_type(m.key_type())?;
+            validate_supported_type(m.value_type())
         }
-        DataType::Multiset(m) => validate_supported_type(field_name, m.element_type()),
+        DataType::Multiset(m) => validate_supported_type(m.element_type()),
         DataType::Row(r) => {
             for child in r.fields() {
-                validate_supported_type(child.name(), child.data_type())?;
+                validate_supported_type(child.data_type())?;
             }
             Ok(())
         }
@@ -2065,7 +2065,7 @@ mod tests {
         let bytes = input.read().await.unwrap();
         let batches = RowFormatReader
             .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
+                Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
                 &fields,
                 None,
@@ -2131,7 +2131,7 @@ mod tests {
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let batches = RowFormatReader
             .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
+                Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
                 &fields,
                 None,
@@ -2341,7 +2341,7 @@ mod tests {
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let batches = RowFormatReader
             .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
+                Box::new(BytesFileRead(bytes.clone())),
                 bytes.len() as u64,
                 &fields,
                 None,
