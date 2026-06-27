@@ -538,6 +538,9 @@ fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
             }
             Ok(())
         }
+        DataType::Vector(_) => Err(Error::Unsupported {
+            message: "VectorType is not supported in the .row format".to_string(),
+        }),
     }
 }
 
@@ -699,6 +702,11 @@ fn write_field_value(
         DataType::Row(r) => {
             let row = downcast::<StructArray>(array, data_type)?;
             write_struct_row(out, row, row_idx, r.fields())?;
+        }
+        DataType::Vector(_) => {
+            return Err(Error::Unsupported {
+                message: "VectorType is not supported in .row field serialization".to_string(),
+            });
         }
     }
     Ok(())
@@ -1208,6 +1216,11 @@ impl ColumnBuilder {
                 validities: Vec::with_capacity(capacity),
                 len: 0,
             },
+            DataType::Vector(_) => {
+                return Err(Error::Unsupported {
+                    message: "VectorType is not supported in .row ColumnBuilder".to_string(),
+                });
+            }
         })
     }
 
