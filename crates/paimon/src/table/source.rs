@@ -486,6 +486,9 @@ impl DataSplit {
 
     /// Full path for a single data file in this split (bucket_path + file_name).
     pub fn data_file_path(&self, file: &DataFileMeta) -> String {
+        if let Some(path) = &file.external_path {
+            return path.clone();
+        }
         let base = self.bucket_path.trim_end_matches('/');
         format!("{}/{}", base, file.file_name)
     }
@@ -783,6 +786,17 @@ mod tests {
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    #[test]
+    fn test_data_file_path_prefers_external_path() {
+        let mut f = file("data-0.parquet", 10, None);
+        f.external_path = Some("s3://bucket/table-external/data-0.parquet".to_string());
+        let s = split(vec![f.clone()], true);
+        assert_eq!(
+            s.data_file_path(&f),
+            "s3://bucket/table-external/data-0.parquet"
+        );
     }
 
     /// Merge-needed split (multiple versions of a key may collapse): the

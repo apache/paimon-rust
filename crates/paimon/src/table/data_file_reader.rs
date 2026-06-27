@@ -156,6 +156,7 @@ impl DataFileReader {
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
+        let is_row_file = is_row_file(&file_meta);
 
         // Compute index mapping and determine which columns to read from the file.
         let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
@@ -174,6 +175,11 @@ impl DataFileReader {
             }
         } else {
             (read_type.clone(), None)
+        };
+        let format_read_fields = if is_row_file {
+            file_fields.clone()
+        } else {
+            projected_read_fields
         };
 
         // Remap predicates from table-level to file-level indices.
@@ -211,7 +217,7 @@ impl DataFileReader {
             let mut batch_stream = format_reader.read_batch_stream(
                 Box::new(file_reader),
                 file_meta.file_size as u64,
-                &projected_read_fields,
+                &format_read_fields,
                 file_predicates.as_ref(),
                 None,
                 row_selection,
@@ -294,6 +300,14 @@ impl DataFileReader {
         }
         .boxed())
     }
+}
+
+fn is_row_file(file_meta: &DataFileMeta) -> bool {
+    file_meta.file_name.to_ascii_lowercase().ends_with(".row")
+        || file_meta
+            .external_path
+            .as_deref()
+            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
 }
 
 /// Convert absolute RowRanges to file-local 0-based ranges.
@@ -462,6 +476,116 @@ pub(super) fn append_null_row_id_column(
 ) -> crate::Result<RecordBatch> {
     let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::new_null(batch.num_rows()));
     insert_column_at(batch, array, insert_index, output_schema)
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::create_format_writer;
+    use crate::io::FileIOBuilder;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRow, DataFileMeta, DataType, IntType, VarCharType};
+    use crate::table::source::DataSplitBuilder;
+    use arrow_array::{Int32Array, StringArray};
+    use futures::TryStreamExt;
+
+    fn field(id: i32, name: &str, data_type: DataType) -> DataField {
+        DataField::new(id, name.to_string(), data_type)
+    }
+
+    fn data_file(file_name: &str, file_size: i64, row_count: i64, schema_id: i64) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn row_projection_reads_full_file_schema_before_projecting() {
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "name", DataType::VarChar(VarCharType::string_type())),
+            field(2, "score", DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_projection";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.row";
+        let file_path = format!("{bucket_path}/{file_name}");
+        let output = file_io.new_output(&file_path).unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap() as i64;
+
+        let schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, file_size, 3, schema_id)])
+            .build()
+            .unwrap();
+
+        let read_type = vec![fields[2].clone()];
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            schema_id,
+            fields,
+            read_type,
+            Vec::new(),
+        );
+
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "score");
+        let scores = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[10, 20, 30]);
+    }
 }
 
 #[cfg(all(test, feature = "mosaic"))]

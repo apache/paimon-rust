@@ -1017,6 +1017,62 @@ mod tests {
         assert_eq!(snapshot.total_record_count(), Some(3));
     }
 
+    #[tokio::test]
+    async fn test_table_write_row_format_roundtrip() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_row_format";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("file.format", "row")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_row_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        let data_file = &messages[0].new_files[0];
+        assert!(data_file.file_name.ends_with(".row"));
+
+        let file_path = format!(
+            "{}/{}/{}",
+            table_path,
+            bucket_dir_name(messages[0].bucket),
+            data_file.file_name
+        );
+        let format_reader = create_format_reader(&file_path, false).unwrap();
+        let input = file_io.new_input(&file_path).unwrap();
+        let stream = format_reader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                data_file.file_size as u64,
+                table.schema().fields(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(stream).await.unwrap();
+
+        assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3]);
+        assert_eq!(collect_i32(&batches, 1), vec![10, 20, 30]);
+    }
+
     #[test]
     fn test_allows_append_blob_table() {
         let table = Table::new(

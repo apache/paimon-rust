@@ -21,6 +21,7 @@ pub(crate) mod blob;
 mod mosaic;
 mod orc;
 mod parquet;
+mod row;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -107,6 +108,8 @@ pub(crate) fn create_format_reader(
         Ok(Box::new(orc::OrcFormatReader))
     } else if lower.ends_with(".avro") {
         Ok(Box::new(avro::AvroFormatReader))
+    } else if lower.ends_with(".row") {
+        Ok(Box::new(row::RowFormatReader))
     } else {
         #[cfg(feature = "mosaic")]
         if lower.ends_with(".mosaic") {
@@ -131,6 +134,7 @@ fn supported_read_formats() -> Vec<&'static str> {
         ".blob",
         ".orc",
         ".avro",
+        ".row",
         #[cfg(feature = "mosaic")]
         ".mosaic",
         #[cfg(feature = "vortex")]
@@ -156,6 +160,10 @@ pub(crate) async fn create_format_writer(
         Ok(Box::new(
             blob::BlobFormatWriter::new(output, file_io).await?,
         ))
+    } else if lower.ends_with(".row") {
+        Ok(Box::new(
+            row::RowFormatWriter::new(output, schema, zstd_level).await?,
+        ))
     } else {
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
@@ -164,7 +172,7 @@ pub(crate) async fn create_format_writer(
             ));
         }
         Err(Error::Unsupported {
-            message: format!("unsupported write format: expected .parquet, got: {path}"),
+            message: format!("unsupported write format: expected .parquet, .row, got: {path}"),
         })
     }
 }
