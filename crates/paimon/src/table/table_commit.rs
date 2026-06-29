@@ -41,6 +41,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Batch commit identifier (i64::MAX), same as Python's BATCH_COMMIT_IDENTIFIER.
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
+/// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
+const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
@@ -842,14 +844,19 @@ impl TableCommit {
         let mut result = Vec::new();
         let mut chunk_start = 0usize;
         let schema = Schema::parse_str(MANIFEST_ENTRY_SCHEMA)?;
-        let block_size = target_size.clamp(1, crate::spec::DEFAULT_AVRO_BLOCK_SIZE);
-        let mut writer =
-            crate::spec::new_avro_writer(&schema, &self.manifest_compression, block_size)?;
+        let mut writer = crate::spec::new_avro_writer(
+            &schema,
+            &self.manifest_compression,
+            crate::spec::DEFAULT_AVRO_BLOCK_SIZE,
+        )?;
 
         for (idx, entry) in entries.iter().enumerate() {
             let value = to_value(entry).and_then(|value| value.resolve(&schema))?;
             writer.append(value)?;
-            if writer.get_ref().len() >= target_size {
+            let record_count = idx + 1;
+            if record_count % CHECK_ROLLING_RECORD_COUNT == 0
+                && writer.get_ref().len() >= target_size
+            {
                 let chunk_end = idx + 1;
                 let file_name = format!("{name_prefix}-{}", result.len());
                 let path = format!("{manifest_dir}/{file_name}");
@@ -865,8 +872,11 @@ impl TableCommit {
                     .await?;
                 result.push(meta);
                 chunk_start = chunk_end;
-                writer =
-                    crate::spec::new_avro_writer(&schema, &self.manifest_compression, block_size)?;
+                writer = crate::spec::new_avro_writer(
+                    &schema,
+                    &self.manifest_compression,
+                    crate::spec::DEFAULT_AVRO_BLOCK_SIZE,
+                )?;
             }
         }
 
@@ -4586,10 +4596,10 @@ mod tests {
         );
         let commit = TableCommit::new(table, "test-user".to_string());
 
-        let messages = (0..80)
+        let messages = (0..2500)
             .map(|i| {
-                let mut file = test_data_file(&format!("data-{i:03}.parquet"), 1);
-                file.extra_files = (0..8).map(|j| format!("data-{i:03}-{j}.idx")).collect();
+                let mut file = test_data_file(&format!("data-{i:04}.parquet"), 1);
+                file.extra_files = (0..8).map(|j| format!("data-{i:04}-{j}.idx")).collect();
                 CommitMessage::new(vec![], 0, vec![file])
             })
             .collect::<Vec<_>>();
@@ -4620,8 +4630,14 @@ mod tests {
                 .iter()
                 .map(|meta| meta.num_added_files() + meta.num_deleted_files())
                 .sum::<i64>(),
-            80
+            2500
         );
+        for meta in &delta_metas[..delta_metas.len() - 1] {
+            assert!(
+                meta.file_size() >= 1024,
+                "rolled manifest files should not be smaller than target"
+            );
+        }
 
         let mut file_names = HashSet::new();
         for meta in &delta_metas {
@@ -4649,9 +4665,46 @@ mod tests {
                 file_names.insert(entry.file().file_name.clone());
             }
         }
-        assert_eq!(file_names.len(), 80);
-        assert!(file_names.contains("data-000.parquet"));
-        assert!(file_names.contains("data-079.parquet"));
+        assert_eq!(file_names.len(), 2500);
+        assert!(file_names.contains("data-0000.parquet"));
+        assert!(file_names.contains("data-2499.parquet"));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rolling_waits_for_java_check_cadence() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_manifest_rolling_cadence";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.target-file-size".to_string(), "1 kb".to_string())]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+
+        let messages = (0..80)
+            .map(|i| {
+                let mut file = test_data_file(&format!("data-{i:03}.parquet"), 1);
+                file.extra_files = (0..8).map(|j| format!("data-{i:03}-{j}.idx")).collect();
+                CommitMessage::new(vec![], 0, vec![file])
+            })
+            .collect::<Vec<_>>();
+        commit.commit(messages).await.unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let manifest_dir = format!("{table_path}/manifest");
+        let delta_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            delta_metas.len(),
+            1,
+            "manifest rolling should not check before Java's 1000-record cadence"
+        );
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
