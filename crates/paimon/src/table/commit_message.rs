@@ -33,8 +33,13 @@ pub struct CommitMessage {
     pub new_changelog_files: Vec<DataFileMeta>,
     /// New index files to be added (used by dynamic bucket mode).
     pub new_index_files: Vec<IndexFileMeta>,
+    /// Index files to be removed from the current index manifest.
+    pub deleted_index_files: Vec<IndexFileMeta>,
     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
     pub deleted_files: Vec<DataFileMeta>,
+    /// Snapshot id from which row-id/column conflict checks should start.
+    /// `-1` means no explicit historical check, matching Python CommitMessage.
+    pub check_from_snapshot: i64,
 }
 
 impl CommitMessage {
@@ -45,7 +50,9 @@ impl CommitMessage {
             new_files,
             new_changelog_files: Vec::new(),
             new_index_files: Vec::new(),
+            deleted_index_files: Vec::new(),
             deleted_files: Vec::new(),
+            check_from_snapshot: -1,
         }
     }
 }

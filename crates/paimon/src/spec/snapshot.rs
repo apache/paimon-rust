@@ -64,6 +64,10 @@ pub struct Snapshot {
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
     changelog_manifest_list: Option<String>,
+    /// byte size of changelog manifest list file
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changelog_manifest_list_size: Option<i64>,
     /// a manifest recording all index files of this table
     #[builder(default = None)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,12 @@ impl Snapshot {
     #[inline]
     pub fn changelog_manifest_list(&self) -> Option<&str> {
         self.changelog_manifest_list.as_deref()
+    }
+
+    /// Get the byte size of changelog manifest list of this snapshot.
+    #[inline]
+    pub fn changelog_manifest_list_size(&self) -> Option<i64> {
+        self.changelog_manifest_list_size
     }
 
     /// Get the index manifest of this snapshot.

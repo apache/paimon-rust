@@ -68,6 +68,7 @@ pub use manifest_common::FileKind;
 mod manifest_entry;
 pub use manifest_entry::Identifier;
 pub use manifest_entry::ManifestEntry;
+pub(crate) use manifest_entry::MANIFEST_ENTRY_SCHEMA;
 mod manifest_list;
 pub use manifest_list::ManifestList;
 mod objects_file;
