@@ -74,6 +74,10 @@ pub use manifest_list::ManifestList;
 mod objects_file;
 pub use objects_file::from_avro_bytes;
 pub use objects_file::to_avro_bytes;
+pub(crate) use objects_file::{
+    new_avro_writer, to_avro_bytes_with_compression, DEFAULT_AVRO_BLOCK_SIZE,
+    DEFAULT_AVRO_COMPRESSION,
+};
 pub(crate) mod avro;
 pub(crate) mod stats;
 mod types;

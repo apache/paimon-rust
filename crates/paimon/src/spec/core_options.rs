@@ -47,6 +47,7 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
@@ -66,6 +67,7 @@ pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
+const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
 const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
 const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
@@ -559,6 +561,15 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
     }
 
+    /// Avro compression codec for manifest, manifest-list and index-manifest files.
+    /// Default is `"zstd"`, matching Java Paimon `CoreOptions.MANIFEST_COMPRESSION`.
+    pub fn manifest_compression(&self) -> &str {
+        self.options
+            .get(MANIFEST_COMPRESSION_OPTION)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_MANIFEST_COMPRESSION)
+    }
+
     /// Parquet writer in-progress buffer size limit. Default is 256MB.
     /// When the buffered data exceeds this, the writer flushes the current row group.
     pub fn write_parquet_buffer_size(&self) -> i64 {
@@ -881,6 +892,7 @@ mod tests {
         assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
         assert_eq!(core.commit_max_retry_wait_ms(), 10_000);
         assert!(!core.row_tracking_enabled());
+        assert_eq!(core.manifest_compression(), "zstd");
         assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
         assert_eq!(core.manifest_merge_min_count(), 30);
     }
@@ -898,6 +910,7 @@ mod tests {
                 MANIFEST_TARGET_FILE_SIZE_OPTION.to_string(),
                 "1kb".to_string(),
             ),
+            (MANIFEST_COMPRESSION_OPTION.to_string(), "null".to_string()),
             (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
         ]);
         let core = CoreOptions::new(&options);
@@ -907,6 +920,7 @@ mod tests {
         assert_eq!(core.commit_min_retry_wait_ms(), 500);
         assert_eq!(core.commit_max_retry_wait_ms(), 5_000);
         assert!(core.row_tracking_enabled());
+        assert_eq!(core.manifest_compression(), "null");
         assert_eq!(core.manifest_target_size(), 1024);
         assert_eq!(core.manifest_merge_min_count(), 3);
     }

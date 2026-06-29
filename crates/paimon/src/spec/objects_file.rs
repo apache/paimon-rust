@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use apache_avro::{from_value, to_value, Codec, Reader, Schema, Writer};
+use apache_avro::{from_value, to_value, Codec, Reader, Schema, Writer, ZstandardSettings};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+pub(crate) const DEFAULT_AVRO_BLOCK_SIZE: usize = 16_000;
+pub(crate) const DEFAULT_AVRO_COMPRESSION: &str = "zstd";
 
 pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T>> {
     Reader::new(bytes)?
@@ -33,13 +36,45 @@ pub fn from_avro_bytes<T: DeserializeOwned>(bytes: &[u8]) -> crate::Result<Vec<T
 /// The `schema_json` must be a valid Avro schema JSON string that matches
 /// the serde serialization layout of `T`.
 pub fn to_avro_bytes<T: Serialize>(schema_json: &str, records: &[T]) -> crate::Result<Vec<u8>> {
+    to_avro_bytes_with_compression(schema_json, records, DEFAULT_AVRO_COMPRESSION)
+}
+
+pub(crate) fn to_avro_bytes_with_compression<T: Serialize>(
+    schema_json: &str,
+    records: &[T],
+    compression: &str,
+) -> crate::Result<Vec<u8>> {
     let schema = Schema::parse_str(schema_json)?;
-    let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+    let mut writer = new_avro_writer(&schema, compression, DEFAULT_AVRO_BLOCK_SIZE)?;
     for record in records {
-        let value = to_value(record).and_then(|v| v.resolve(&schema))?;
+        let value = to_value(record).and_then(|value| value.resolve(&schema))?;
         writer.append(value)?;
     }
     Ok(writer.into_inner()?)
+}
+
+pub(crate) fn new_avro_writer<'a>(
+    schema: &'a Schema,
+    compression: &str,
+    block_size: usize,
+) -> crate::Result<Writer<'a, Vec<u8>>> {
+    Ok(Writer::builder()
+        .schema(schema)
+        .writer(Vec::new())
+        .codec(avro_codec(compression)?)
+        .block_size(block_size.max(1))
+        .build())
+}
+
+pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
+    match compression.to_ascii_lowercase().as_str() {
+        "zstd" | "zstandard" => Ok(Codec::Zstandard(ZstandardSettings::default())),
+        "null" | "none" | "uncompressed" => Ok(Codec::Null),
+        "snappy" => Ok(Codec::Snappy),
+        other => Err(crate::Error::Unsupported {
+            message: format!("Unsupported Avro compression: {other}"),
+        }),
+    }
 }
 
 #[cfg(test)]

@@ -141,7 +141,27 @@ impl IndexManifest {
 
     /// Write index manifest entries to a file.
     pub async fn write(file_io: &FileIO, path: &str, entries: &[IndexManifestEntry]) -> Result<()> {
-        let bytes = crate::spec::to_avro_bytes(INDEX_MANIFEST_ENTRY_SCHEMA, entries)?;
+        Self::write_with_compression(
+            file_io,
+            path,
+            entries,
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .await
+    }
+
+    /// Write index manifest entries with the configured Avro compression.
+    pub async fn write_with_compression(
+        file_io: &FileIO,
+        path: &str,
+        entries: &[IndexManifestEntry],
+        compression: &str,
+    ) -> Result<()> {
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            INDEX_MANIFEST_ENTRY_SCHEMA,
+            entries,
+            compression,
+        )?;
         let output = file_io.new_output(path)?;
         output.write(bytes::Bytes::from(bytes)).await
     }

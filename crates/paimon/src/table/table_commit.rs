@@ -34,94 +34,17 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
-use apache_avro::{to_avro_datum, to_value, Schema};
+use apache_avro::{to_value, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Batch commit identifier (i64::MAX), same as Python's BATCH_COMMIT_IDENTIFIER.
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
-// apache-avro's default OCF block size used by Manifest::write.
-const AVRO_OBJECT_CONTAINER_BLOCK_SIZE: usize = 16_000;
-const AVRO_SYNC_MARKER_SIZE: usize = 16;
 
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
-
-struct ManifestRollingSizeEstimator {
-    schema: Schema,
-    header_size: usize,
-    flushed_blocks_size: usize,
-    pending_block_size: usize,
-    pending_block_entries: usize,
-}
-
-impl ManifestRollingSizeEstimator {
-    fn new() -> Result<Self> {
-        let schema = Schema::parse_str(MANIFEST_ENTRY_SCHEMA)?;
-        let header_size =
-            crate::spec::to_avro_bytes::<ManifestEntry>(MANIFEST_ENTRY_SCHEMA, &[])?.len();
-        Ok(Self {
-            schema,
-            header_size,
-            flushed_blocks_size: 0,
-            pending_block_size: 0,
-            pending_block_entries: 0,
-        })
-    }
-
-    fn add_entry(&mut self, entry: &ManifestEntry) -> Result<usize> {
-        let value = to_value(entry).and_then(|value| value.resolve(&self.schema))?;
-        let entry_size = to_avro_datum(&self.schema, value)?.len();
-        self.pending_block_size += entry_size;
-        self.pending_block_entries += 1;
-        if self.pending_block_size >= AVRO_OBJECT_CONTAINER_BLOCK_SIZE {
-            self.flush_pending_block();
-        }
-        Ok(self.estimated_size())
-    }
-
-    fn estimated_size(&self) -> usize {
-        self.header_size + self.flushed_blocks_size + self.pending_block_encoded_size()
-    }
-
-    fn reset(&mut self) {
-        self.flushed_blocks_size = 0;
-        self.pending_block_size = 0;
-        self.pending_block_entries = 0;
-    }
-
-    fn flush_pending_block(&mut self) {
-        self.flushed_blocks_size += self.pending_block_encoded_size();
-        self.pending_block_size = 0;
-        self.pending_block_entries = 0;
-    }
-
-    fn pending_block_encoded_size(&self) -> usize {
-        if self.pending_block_entries == 0 {
-            return 0;
-        }
-        avro_block_encoded_size(self.pending_block_entries, self.pending_block_size)
-    }
-}
-
-fn avro_block_encoded_size(entry_count: usize, data_size: usize) -> usize {
-    avro_non_negative_long_encoded_len(entry_count)
-        + avro_non_negative_long_encoded_len(data_size)
-        + data_size
-        + AVRO_SYNC_MARKER_SIZE
-}
-
-fn avro_non_negative_long_encoded_len(value: usize) -> usize {
-    let mut encoded = (value as u128) << 1;
-    let mut len = 1;
-    while encoded >= 0x80 {
-        len += 1;
-        encoded >>= 7;
-    }
-    len
-}
 
 /// Table commit logic for Paimon write operations.
 ///
@@ -137,6 +60,7 @@ pub struct TableCommit {
     commit_timeout_ms: u64,
     commit_min_retry_wait_ms: u64,
     commit_max_retry_wait_ms: u64,
+    manifest_compression: String,
     manifest_target_size: i64,
     manifest_merge_min_count: usize,
     row_tracking_enabled: bool,
@@ -160,6 +84,7 @@ impl TableCommit {
         let commit_timeout_ms = core_options.commit_timeout_ms();
         let commit_min_retry_wait_ms = core_options.commit_min_retry_wait_ms();
         let commit_max_retry_wait_ms = core_options.commit_max_retry_wait_ms();
+        let manifest_compression = core_options.manifest_compression().to_string();
         let manifest_target_size = core_options.manifest_target_size();
         let manifest_merge_min_count = core_options.manifest_merge_min_count();
         let row_tracking_enabled = core_options.row_tracking_enabled();
@@ -175,6 +100,7 @@ impl TableCommit {
             commit_timeout_ms,
             commit_min_retry_wait_ms,
             commit_max_retry_wait_ms,
+            manifest_compression,
             manifest_target_size,
             manifest_merge_min_count,
             row_tracking_enabled,
@@ -766,7 +692,13 @@ impl TableCommit {
             .await?;
 
         // Write delta manifest list
-        ManifestList::write(file_io, &delta_manifest_list_path, &new_manifest_file_metas).await?;
+        ManifestList::write_with_compression(
+            file_io,
+            &delta_manifest_list_path,
+            &new_manifest_file_metas,
+            &self.manifest_compression,
+        )
+        .await?;
 
         let (changelog_record_count, changelog_manifest_list_size) =
             if resolved.changelog_entries.is_empty() {
@@ -780,10 +712,11 @@ impl TableCommit {
                         &resolved.changelog_entries,
                     )
                     .await?;
-                ManifestList::write(
+                ManifestList::write_with_compression(
                     file_io,
                     &changelog_manifest_list_path,
                     &changelog_manifest_file_metas,
+                    &self.manifest_compression,
                 )
                 .await?;
                 let status = file_io.get_status(&changelog_manifest_list_path).await?;
@@ -820,7 +753,13 @@ impl TableCommit {
             .merge_manifest_files(file_io, &manifest_dir, existing_manifest_files)
             .await?;
 
-        ManifestList::write(file_io, &base_manifest_list_path, &base_manifest_files).await?;
+        ManifestList::write_with_compression(
+            file_io,
+            &base_manifest_list_path,
+            &base_manifest_files,
+            &self.manifest_compression,
+        )
+        .await?;
 
         // Calculate delta record count
         let mut delta_record_count: i64 = 0;
@@ -867,6 +806,7 @@ impl TableCommit {
     ///
     /// Returns `None` if `merged_index_entries` is empty.
     async fn write_index_manifest(
+        &self,
         file_io: &FileIO,
         manifest_dir: &str,
         merged_index_entries: &[IndexManifestEntry],
@@ -876,7 +816,13 @@ impl TableCommit {
         }
         let name = format!("index-manifest-{}-0", uuid::Uuid::new_v4());
         let path = format!("{manifest_dir}/{name}");
-        IndexManifest::write(file_io, &path, merged_index_entries).await?;
+        IndexManifest::write_with_compression(
+            file_io,
+            &path,
+            merged_index_entries,
+            &self.manifest_compression,
+        )
+        .await?;
         Ok(Some(name))
     }
 
@@ -895,32 +841,47 @@ impl TableCommit {
         let target_size = self.manifest_target_size.max(1) as usize;
         let mut result = Vec::new();
         let mut chunk_start = 0usize;
-        let mut size_estimator = ManifestRollingSizeEstimator::new()?;
+        let schema = Schema::parse_str(MANIFEST_ENTRY_SCHEMA)?;
+        let block_size = target_size.clamp(1, crate::spec::DEFAULT_AVRO_BLOCK_SIZE);
+        let mut writer =
+            crate::spec::new_avro_writer(&schema, &self.manifest_compression, block_size)?;
 
         for (idx, entry) in entries.iter().enumerate() {
-            if size_estimator.add_entry(entry)? >= target_size {
+            let value = to_value(entry).and_then(|value| value.resolve(&schema))?;
+            writer.append(value)?;
+            if writer.get_ref().len() >= target_size {
                 let chunk_end = idx + 1;
                 let file_name = format!("{name_prefix}-{}", result.len());
                 let path = format!("{manifest_dir}/{file_name}");
+                let bytes = writer.into_inner()?;
                 let meta = self
-                    .write_manifest_file(
+                    .write_manifest_file_bytes(
                         file_io,
                         &path,
                         &file_name,
                         &entries[chunk_start..chunk_end],
+                        bytes,
                     )
                     .await?;
                 result.push(meta);
                 chunk_start = chunk_end;
-                size_estimator.reset();
+                writer =
+                    crate::spec::new_avro_writer(&schema, &self.manifest_compression, block_size)?;
             }
         }
 
         if chunk_start < entries.len() {
             let file_name = format!("{name_prefix}-{}", result.len());
             let path = format!("{manifest_dir}/{file_name}");
+            let bytes = writer.into_inner()?;
             let meta = self
-                .write_manifest_file(file_io, &path, &file_name, &entries[chunk_start..])
+                .write_manifest_file_bytes(
+                    file_io,
+                    &path,
+                    &file_name,
+                    &entries[chunk_start..],
+                    bytes,
+                )
                 .await?;
             result.push(meta);
         }
@@ -1013,15 +974,18 @@ impl TableCommit {
         Ok(())
     }
 
-    /// Write a manifest file and return its metadata.
-    async fn write_manifest_file(
+    /// Write already-encoded manifest bytes and return metadata for the corresponding entries.
+    async fn write_manifest_file_bytes(
         &self,
         file_io: &FileIO,
         path: &str,
         file_name: &str,
         entries: &[ManifestEntry],
+        bytes: Vec<u8>,
     ) -> Result<ManifestFileMeta> {
-        Manifest::write(file_io, path, entries).await?;
+        let file_size = bytes.len() as i64;
+        let output = file_io.new_output(path)?;
+        output.write(bytes::Bytes::from(bytes)).await?;
 
         let mut added_file_count: i64 = 0;
         let mut deleted_file_count: i64 = 0;
@@ -1060,14 +1024,11 @@ impl TableCommit {
             max_row_id = None;
         }
 
-        // Get file size
-        let status = file_io.get_status(path).await?;
-
         let partition_stats = self.compute_partition_stats(entries)?;
 
         Ok(ManifestFileMeta::new(
             file_name.to_string(),
-            status.size as i64,
+            file_size,
             added_file_count,
             deleted_file_count,
             partition_stats,
@@ -1156,7 +1117,8 @@ impl TableCommit {
                 let all = Self::merge_index_entries(&previous, &index_entries, false)?;
                 let index_manifest_changed = all != previous;
                 let index_manifest_name = if index_manifest_changed {
-                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
+                    self.write_index_manifest(file_io, &manifest_dir, &all)
+                        .await?
                 } else {
                     latest_snapshot
                         .as_ref()
@@ -1212,7 +1174,8 @@ impl TableCommit {
                 let all = Self::merge_index_entries(&all, &new_index_entries, false)?;
                 let index_manifest_changed = all != previous;
                 let index_manifest_name = if index_manifest_changed {
-                    Self::write_index_manifest(file_io, &manifest_dir, &all).await?
+                    self.write_index_manifest(file_io, &manifest_dir, &all)
+                        .await?
                 } else {
                     latest_snapshot
                         .as_ref()
@@ -4634,12 +4597,20 @@ mod tests {
 
         let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
         let manifest_dir = format!("{table_path}/manifest");
-        let delta_metas = ManifestList::read(
-            &file_io,
-            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
-        )
-        .await
-        .unwrap();
+        let delta_manifest_list_path = format!("{manifest_dir}/{}", snapshot.delta_manifest_list());
+        let delta_manifest_list_bytes = file_io
+            .new_input(&delta_manifest_list_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert!(
+            contains_bytes(&delta_manifest_list_bytes, b"zstandard"),
+            "manifest lists should use the default zstd Avro codec"
+        );
+        let delta_metas = ManifestList::read(&file_io, &delta_manifest_list_path)
+            .await
+            .unwrap();
         assert!(
             delta_metas.len() > 1,
             "small manifest target should roll into multiple manifest files"
@@ -4654,9 +4625,22 @@ mod tests {
 
         let mut file_names = HashSet::new();
         for meta in &delta_metas {
-            let entries = Manifest::read(&file_io, &format!("{manifest_dir}/{}", meta.file_name()))
+            let manifest_path = format!("{manifest_dir}/{}", meta.file_name());
+            let manifest_bytes = file_io
+                .new_input(&manifest_path)
+                .unwrap()
+                .read()
                 .await
                 .unwrap();
+            assert!(
+                contains_bytes(&manifest_bytes, b"zstandard"),
+                "manifest files should use the default zstd Avro codec"
+            );
+            assert_eq!(
+                file_io.get_status(&manifest_path).await.unwrap().size as i64,
+                meta.file_size()
+            );
+            let entries = Manifest::read(&file_io, &manifest_path).await.unwrap();
             assert_eq!(
                 entries.len() as i64,
                 meta.num_added_files() + meta.num_deleted_files()
@@ -4670,25 +4654,10 @@ mod tests {
         assert!(file_names.contains("data-079.parquet"));
     }
 
-    #[test]
-    fn test_manifest_rolling_size_estimator_matches_avro_writer_size() {
-        let entries = (0..160)
-            .map(|i| {
-                let mut file = test_data_file(&format!("data-{i:03}.parquet"), 1);
-                file.extra_files = (0..8).map(|j| format!("data-{i:03}-{j}.idx")).collect();
-                ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2)
-            })
-            .collect::<Vec<_>>();
-
-        let mut estimator = ManifestRollingSizeEstimator::new().unwrap();
-        for entry in &entries {
-            estimator.add_entry(entry).unwrap();
-        }
-
-        let actual_size = crate::spec::to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &entries)
-            .unwrap()
-            .len();
-        assert_eq!(estimator.estimated_size(), actual_size);
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[tokio::test]
