@@ -41,6 +41,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Batch commit identifier (i64::MAX), same as Python's BATCH_COMMIT_IDENTIFIER.
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 
+type PartitionBucketKey = (Vec<u8>, i32);
+type RowIdRange = (i64, i64);
+type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
+
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
@@ -559,7 +563,7 @@ impl TableCommit {
     ) -> Result<()> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
-        let mut retry_state: Option<RetryState> = None;
+        let mut retry_state: Option<Box<RetryState>> = None;
         let start_time_ms = current_time_millis();
 
         loop {
@@ -579,7 +583,7 @@ impl TableCommit {
             }
             validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
             let resolved = self
-                .resolve_commit(&mut plan, &latest_snapshot, retry_state.as_ref())
+                .resolve_commit(&mut plan, &latest_snapshot, retry_state.as_deref())
                 .await?;
 
             if resolved.entries.is_empty()
@@ -770,10 +774,10 @@ impl TableCommit {
         if self.snapshot_commit.commit(&snapshot, &statistics).await? {
             Ok(CommitAttemptResult::Success)
         } else {
-            Ok(CommitAttemptResult::Retry(RetryState {
+            Ok(CommitAttemptResult::Retry(Box::new(RetryState {
                 latest_snapshot: latest_snapshot.clone(),
                 base_data_files: resolved.base_data_files.take(),
-            }))
+            })))
         }
     }
 
@@ -905,7 +909,7 @@ impl TableCommit {
             return Ok(());
         }
         if candidates.len() == 1 {
-            result.extend(candidates.drain(..));
+            result.append(candidates);
             return Ok(());
         }
 
@@ -1434,7 +1438,7 @@ impl TableCommit {
                 .await?;
             *full_scan_count += 1;
         }
-        *cached_snapshot = Some(latest.clone());
+        *cached_snapshot = Some(Box::new(latest.clone()));
 
         Ok(Self::build_overwrite_result(cached_entries, new_entries))
     }
@@ -1683,7 +1687,7 @@ impl TableCommit {
         }
 
         let mut existing_index: HashSet<(Vec<u8>, i32, i64, i64)> = HashSet::new();
-        let mut existing_ranges: HashMap<(Vec<u8>, i32), Vec<(i64, i64)>> = HashMap::new();
+        let mut existing_ranges: ExistingRowIdRanges = HashMap::new();
         for base in base_entries {
             if let Some(first_row_id) = base.file().first_row_id {
                 existing_index.insert((
@@ -2276,7 +2280,7 @@ enum CommitEntriesPlan {
         partition_filter: Option<PartitionFilter>,
         new_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
-        cached_snapshot: Option<Snapshot>,
+        cached_snapshot: Option<Box<Snapshot>>,
         cached_entries: Vec<ManifestEntry>,
         full_scan_count: usize,
         delta_probe_count: usize,
@@ -2313,7 +2317,7 @@ struct ResolvedCommit {
 
 enum CommitAttemptResult {
     Success,
-    Retry(RetryState),
+    Retry(Box<RetryState>),
 }
 
 struct RetryState {
