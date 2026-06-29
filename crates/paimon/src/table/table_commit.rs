@@ -127,11 +127,13 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
                 new_index_entries,
+                check_from_snapshot,
             },
             None,
             commit_identifier,
@@ -165,11 +167,13 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
+        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
                 new_index_entries,
+                check_from_snapshot,
             },
             Some(expected_snapshot_id),
             commit_identifier,
@@ -1035,6 +1039,7 @@ impl TableCommit {
                 entries,
                 changelog_entries,
                 new_index_entries,
+                check_from_snapshot,
             } => {
                 // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
                 // This ensures the snapshot correctly reflects file replacements.
@@ -1044,10 +1049,16 @@ impl TableCommit {
                 } else {
                     CommitKind::APPEND
                 };
-                let detect_conflicts = has_delete;
+                let detect_conflicts = has_delete || check_from_snapshot.is_some();
                 let base_data_files = if detect_conflicts {
-                    self.detect_commit_conflicts(latest_snapshot, retry_state, entries, &kind)
-                        .await?
+                    self.detect_commit_conflicts(
+                        latest_snapshot,
+                        retry_state,
+                        entries,
+                        &kind,
+                        *check_from_snapshot,
+                    )
+                    .await?
                 } else {
                     if self.row_tracking_enabled {
                         self.validate_row_id_alignment(entries, latest_snapshot)
@@ -1103,6 +1114,7 @@ impl TableCommit {
                         retry_state,
                         &entries,
                         &CommitKind::OVERWRITE,
+                        None,
                     )
                     .await?;
 
@@ -1495,16 +1507,24 @@ impl TableCommit {
         let Some(snap) = snapshot else {
             return Ok(vec![]);
         };
-        let scan = TableScan::new(
-            &self.table,
-            partition_filter.cloned(),
-            vec![],
-            None,
-            None,
-            None,
-        )
-        .with_scan_all_files();
-        scan.plan_manifest_entries(snap).await
+        let file_io = self.snapshot_manager.file_io();
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let mut entries = Vec::new();
+        for manifest_list in [snap.base_manifest_list(), snap.delta_manifest_list()] {
+            let manifest_list_path = format!("{manifest_dir}/{manifest_list}");
+            for manifest_file in ManifestList::read(file_io, &manifest_list_path).await? {
+                let manifest_path = format!("{manifest_dir}/{}", manifest_file.file_name());
+                for entry in Manifest::read(file_io, &manifest_path).await? {
+                    if let Some(filter) = partition_filter {
+                        if !filter.matches_entry(entry.partition())? {
+                            continue;
+                        }
+                    }
+                    entries.push(entry);
+                }
+            }
+        }
+        Ok(merge_active_entries(entries))
     }
 
     async fn scan_changed_partition_entries(
@@ -1570,6 +1590,7 @@ impl TableCommit {
         retry_state: Option<&RetryState>,
         commit_entries: &[ManifestEntry],
         commit_kind: &CommitKind,
+        check_from_snapshot: Option<i64>,
     ) -> Result<Option<Vec<ManifestEntry>>> {
         let base_data_files = self
             .resolve_conflict_base_entries(latest_snapshot, retry_state, commit_entries)
@@ -1579,6 +1600,7 @@ impl TableCommit {
             &base_data_files,
             commit_entries,
             commit_kind,
+            check_from_snapshot,
         )
         .await?;
         Ok(Some(base_data_files))
@@ -1619,6 +1641,7 @@ impl TableCommit {
         base_entries: &[ManifestEntry],
         delta_entries: &[ManifestEntry],
         commit_kind: &CommitKind,
+        check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
 
@@ -1632,7 +1655,9 @@ impl TableCommit {
         let mut all_entries = base_entries.to_vec();
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
-        self.check_row_id_range_conflicts(commit_kind, &merged_entries)
+        self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
+        self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
+            .await
     }
 
     fn check_delete_entries_against_base(
@@ -1747,9 +1772,10 @@ impl TableCommit {
     fn check_row_id_range_conflicts(
         &self,
         commit_kind: &CommitKind,
+        check_from_snapshot: Option<i64>,
         commit_entries: &[ManifestEntry],
     ) -> Result<()> {
-        if commit_kind != &CommitKind::COMPACT {
+        if check_from_snapshot.is_none() && commit_kind != &CommitKind::COMPACT {
             return Ok(());
         }
 
@@ -1786,6 +1812,146 @@ impl TableCommit {
             }
         }
         Ok(())
+    }
+
+    async fn check_row_id_from_snapshot(
+        &self,
+        latest_snapshot: Option<&Snapshot>,
+        delta_entries: &[ManifestEntry],
+        check_from_snapshot: Option<i64>,
+    ) -> Result<()> {
+        let Some(check_from_snapshot) = check_from_snapshot else {
+            return Ok(());
+        };
+        let Some(latest_snapshot) = latest_snapshot else {
+            return Ok(());
+        };
+
+        let source_snapshot = self
+            .snapshot_manager
+            .get_snapshot(check_from_snapshot)
+            .await?;
+        let check_next_row_id =
+            source_snapshot
+                .next_row_id()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Next row id cannot be null for snapshot {check_from_snapshot}."
+                    ),
+                    source: None,
+                })?;
+
+        let write_ranges = self.build_row_id_write_ranges(delta_entries).await?;
+        if write_ranges.is_empty() {
+            return Ok(());
+        }
+
+        let delta_entry_refs = delta_entries.iter().collect::<Vec<_>>();
+        let partition_filter = self.build_entries_partition_filter(&delta_entry_refs)?;
+        for snapshot_id in check_from_snapshot + 1..=latest_snapshot.id() {
+            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            if snapshot.commit_kind() == &CommitKind::COMPACT {
+                continue;
+            }
+            for entry in self
+                .read_delta_entries(partition_filter.as_ref(), &snapshot)
+                .await?
+                .into_iter()
+                .filter(|entry| *entry.kind() == FileKind::Add)
+            {
+                let Some((start, end)) = entry.file().row_id_range() else {
+                    continue;
+                };
+                if start >= check_next_row_id {
+                    continue;
+                }
+                let committed_field_ids = self.write_field_ids(entry.file()).await?;
+                if write_ranges.iter().any(|range| {
+                    ranges_overlap(range.start, range.end, start, end)
+                        && range
+                            .field_ids
+                            .iter()
+                            .any(|field_id| committed_field_ids.contains(field_id))
+                }) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "For Data Evolution table, multiple MERGE INTO operations have encountered conflicts, updating the same file, which can render some updates ineffective.".to_string(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn build_row_id_write_ranges(
+        &self,
+        delta_entries: &[ManifestEntry],
+    ) -> Result<Vec<RowIdWriteRange>> {
+        let mut ranges = Vec::new();
+        for entry in delta_entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+        {
+            let Some((start, end)) = entry.file().row_id_range() else {
+                continue;
+            };
+            let field_ids = self.write_field_ids(entry.file()).await?;
+            if !field_ids.is_empty() {
+                ranges.push(RowIdWriteRange {
+                    start,
+                    end,
+                    field_ids,
+                });
+            }
+        }
+        Ok(ranges)
+    }
+
+    async fn write_field_ids(&self, file: &DataFileMeta) -> Result<HashSet<i32>> {
+        let fields = if file.schema_id == self.table.schema().id() {
+            self.table.schema().fields().to_vec()
+        } else {
+            self.table
+                .schema_manager()
+                .schema(file.schema_id)
+                .await?
+                .fields()
+                .to_vec()
+        };
+        let field_id_by_name = fields
+            .iter()
+            .map(|field| (field.name().to_string(), field.id()))
+            .collect::<HashMap<_, _>>();
+
+        let mut field_ids = HashSet::new();
+        match file.write_cols.as_ref() {
+            None => {
+                field_ids.extend(
+                    fields
+                        .iter()
+                        .filter(|field| !is_system_field(field.name()))
+                        .map(|field| field.id()),
+                );
+            }
+            Some(write_cols) => {
+                for col in write_cols {
+                    if is_system_field(col) {
+                        continue;
+                    }
+                    let Some(field_id) = field_id_by_name.get(col) else {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Cannot find write column '{}' in schema {}.",
+                                col, file.schema_id
+                            ),
+                            source: None,
+                        });
+                    };
+                    field_ids.insert(*field_id);
+                }
+            }
+        }
+        Ok(field_ids)
     }
 
     /// Assign row tracking metadata: snapshot ID as sequence number, and
@@ -2172,6 +2338,14 @@ impl TableCommit {
         Ok(spec)
     }
 
+    /// Earliest source snapshot requested by row-id conflict checks.
+    fn min_check_from_snapshot(messages: &[CommitMessage]) -> Option<i64> {
+        messages
+            .iter()
+            .filter_map(|message| message.check_from_snapshot)
+            .min()
+    }
+
     /// Convert commit messages to manifest entries (ADD/DELETE kind).
     fn messages_to_entries(&self, messages: &[CommitMessage]) -> Vec<ManifestEntry> {
         messages
@@ -2274,6 +2448,7 @@ enum CommitEntriesPlan {
         entries: Vec<ManifestEntry>,
         changelog_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
+        check_from_snapshot: Option<i64>,
     },
     /// Overwrite with optional partition filter.
     Overwrite {
@@ -2323,6 +2498,12 @@ enum CommitAttemptResult {
 struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
+}
+
+struct RowIdWriteRange {
+    start: i64,
+    end: i64,
+    field_ids: HashSet<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3656,6 +3837,18 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
+    fn test_data_evolution_schema() -> TableSchema {
+        use crate::spec::{DataType, IntType, Schema, VarCharType};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
     fn test_row_tracking_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
@@ -3666,8 +3859,23 @@ mod tests {
         )
     }
 
+    fn test_data_evolution_table(file_io: &FileIO, table_path: &str) -> Table {
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            test_data_evolution_schema(),
+            None,
+        )
+    }
+
     fn setup_row_tracking_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
         let table = test_row_tracking_table(file_io, table_path);
+        TableCommit::new(table, "test-user".to_string())
+    }
+
+    fn setup_data_evolution_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
+        let table = test_data_evolution_table(file_io, table_path);
         TableCommit::new(table, "test-user".to_string())
     }
 
@@ -3834,6 +4042,97 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_check_from_snapshot_rejects_concurrent_same_column_update() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_check_from_snapshot_same_column";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_data_evolution_commit(&file_io, table_path);
+        let partition = EMPTY_SERIALIZED_ROW.clone();
+        let mut initial_file = test_data_file("data-0.parquet", 100);
+        initial_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![initial_file],
+            )])
+            .await
+            .unwrap();
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let entries = active_entries(&file_io, table_path, &snapshot).await;
+        assert_eq!(entries[0].file().first_row_id, Some(0));
+
+        let mut first_partial = test_data_file("partial-name-a.parquet", 100);
+        first_partial.first_row_id = Some(0);
+        first_partial.file_source = Some(0);
+        first_partial.write_cols = Some(vec!["name".to_string()]);
+        let mut first_message = CommitMessage::new(partition.clone(), 0, vec![first_partial]);
+        first_message.check_from_snapshot = Some(1);
+        commit.commit(vec![first_message]).await.unwrap();
+
+        let mut second_partial = test_data_file("partial-name-b.parquet", 100);
+        second_partial.first_row_id = Some(0);
+        second_partial.file_source = Some(0);
+        second_partial.write_cols = Some(vec!["name".to_string()]);
+        let mut second_message = CommitMessage::new(partition, 0, vec![second_partial]);
+        second_message.check_from_snapshot = Some(1);
+
+        let result = commit.commit(vec![second_message]).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("multiple MERGE INTO operations have encountered conflicts"),
+            "expected row-id/column conflict, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_from_snapshot_allows_concurrent_different_column_update() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_check_from_snapshot_different_column";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_data_evolution_commit(&file_io, table_path);
+        let partition = EMPTY_SERIALIZED_ROW.clone();
+        let mut initial_file = test_data_file("data-0.parquet", 100);
+        initial_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![initial_file],
+            )])
+            .await
+            .unwrap();
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let entries = active_entries(&file_io, table_path, &snapshot).await;
+        assert_eq!(entries[0].file().first_row_id, Some(0));
+
+        let mut name_partial = test_data_file("partial-name.parquet", 100);
+        name_partial.first_row_id = Some(0);
+        name_partial.file_source = Some(0);
+        name_partial.write_cols = Some(vec!["name".to_string()]);
+        let mut name_message = CommitMessage::new(partition.clone(), 0, vec![name_partial]);
+        name_message.check_from_snapshot = Some(1);
+        commit.commit(vec![name_message]).await.unwrap();
+
+        let mut id_partial = test_data_file("partial-id.parquet", 100);
+        id_partial.first_row_id = Some(0);
+        id_partial.file_source = Some(0);
+        id_partial.write_cols = Some(vec!["id".to_string()]);
+        let mut id_message = CommitMessage::new(partition, 0, vec![id_partial]);
+        id_message.check_from_snapshot = Some(1);
+
+        commit.commit(vec![id_message]).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 3);
     }
 
     #[tokio::test]

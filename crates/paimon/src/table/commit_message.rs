@@ -29,6 +29,8 @@ pub struct CommitMessage {
     pub bucket: i32,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
+    /// Snapshot id from which row-id/column conflicts should be checked.
+    pub check_from_snapshot: Option<i64>,
     /// New changelog files to be added.
     pub new_changelog_files: Vec<DataFileMeta>,
     /// New index files to be added (used by dynamic bucket mode).
@@ -45,6 +47,7 @@ impl CommitMessage {
             partition,
             bucket,
             new_files,
+            check_from_snapshot: None,
             new_changelog_files: Vec::new(),
             new_index_files: Vec::new(),
             deleted_index_files: Vec::new(),
