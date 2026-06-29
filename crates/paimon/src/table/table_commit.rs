@@ -25,9 +25,9 @@ use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
     bucket_dir_name, extract_datum, merge_active_entries, BinaryRow, BinaryRowBuilder, CommitKind,
-    CoreOptions, DataField, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction,
-    IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList,
-    PartitionComputer, PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW,
+    CoreOptions, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
+    IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
+    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
@@ -123,13 +123,11 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let row_id_check_from_snapshot = Self::row_id_check_from_snapshot(&commit_messages);
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
                 new_index_entries,
-                row_id_check_from_snapshot,
             },
             None,
             commit_identifier,
@@ -163,13 +161,11 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let row_id_check_from_snapshot = Self::row_id_check_from_snapshot(&commit_messages);
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
                 new_index_entries,
-                row_id_check_from_snapshot,
             },
             Some(expected_snapshot_id),
             commit_identifier,
@@ -211,7 +207,6 @@ impl TableCommit {
 
         let new_entries = self.messages_to_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let row_id_check_from_snapshot = Self::row_id_check_from_snapshot(&commit_messages);
         let has_new_data_entries = new_entries
             .iter()
             .any(|entry| *entry.kind() == FileKind::Add);
@@ -238,7 +233,6 @@ impl TableCommit {
                 partition_filter,
                 new_entries,
                 new_index_entries,
-                row_id_check_from_snapshot,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -451,7 +445,6 @@ impl TableCommit {
                 partition_filter: Some(partition_filter),
                 new_entries: vec![],
                 new_index_entries: vec![],
-                row_id_check_from_snapshot: None,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -503,7 +496,6 @@ impl TableCommit {
                 partition_filter: None,
                 new_entries: vec![],
                 new_index_entries: vec![],
-                row_id_check_from_snapshot: None,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -1039,7 +1031,6 @@ impl TableCommit {
                 entries,
                 changelog_entries,
                 new_index_entries,
-                row_id_check_from_snapshot,
             } => {
                 // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
                 // This ensures the snapshot correctly reflects file replacements.
@@ -1049,16 +1040,10 @@ impl TableCommit {
                 } else {
                     CommitKind::APPEND
                 };
-                let detect_conflicts = has_delete || row_id_check_from_snapshot.is_some();
+                let detect_conflicts = has_delete;
                 let base_data_files = if detect_conflicts {
-                    self.detect_commit_conflicts(
-                        latest_snapshot,
-                        retry_state,
-                        entries,
-                        &kind,
-                        *row_id_check_from_snapshot,
-                    )
-                    .await?
+                    self.detect_commit_conflicts(latest_snapshot, retry_state, entries, &kind)
+                        .await?
                 } else {
                     if self.row_tracking_enabled {
                         self.validate_row_id_alignment(entries, latest_snapshot)
@@ -1100,17 +1085,12 @@ impl TableCommit {
                 let entries = self
                     .provide_overwrite_entries(plan, latest_snapshot)
                     .await?;
-                let (partition_filter, new_index_entries, row_id_check_from_snapshot) = match plan {
+                let (partition_filter, new_index_entries) = match plan {
                     CommitEntriesPlan::Overwrite {
                         partition_filter,
                         new_index_entries,
-                        row_id_check_from_snapshot,
                         ..
-                    } => (
-                        partition_filter.clone(),
-                        new_index_entries.clone(),
-                        *row_id_check_from_snapshot,
-                    ),
+                    } => (partition_filter.clone(), new_index_entries.clone()),
                     CommitEntriesPlan::Direct { .. } => unreachable!(),
                 };
                 let base_data_files = self
@@ -1119,7 +1099,6 @@ impl TableCommit {
                         retry_state,
                         &entries,
                         &CommitKind::OVERWRITE,
-                        row_id_check_from_snapshot,
                     )
                     .await?;
 
@@ -1587,7 +1566,6 @@ impl TableCommit {
         retry_state: Option<&RetryState>,
         commit_entries: &[ManifestEntry],
         commit_kind: &CommitKind,
-        row_id_check_from_snapshot: Option<i64>,
     ) -> Result<Option<Vec<ManifestEntry>>> {
         let base_data_files = self
             .resolve_conflict_base_entries(latest_snapshot, retry_state, commit_entries)
@@ -1597,7 +1575,6 @@ impl TableCommit {
             &base_data_files,
             commit_entries,
             commit_kind,
-            row_id_check_from_snapshot,
         )
         .await?;
         Ok(Some(base_data_files))
@@ -1638,7 +1615,6 @@ impl TableCommit {
         base_entries: &[ManifestEntry],
         delta_entries: &[ManifestEntry],
         commit_kind: &CommitKind,
-        row_id_check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
 
@@ -1652,13 +1628,7 @@ impl TableCommit {
         let mut all_entries = base_entries.to_vec();
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
-        self.check_row_id_range_conflicts(
-            commit_kind,
-            &merged_entries,
-            row_id_check_from_snapshot,
-        )?;
-        self.check_row_id_from_snapshot(latest_snapshot, delta_entries, row_id_check_from_snapshot)
-            .await
+        self.check_row_id_range_conflicts(commit_kind, &merged_entries)
     }
 
     fn check_delete_entries_against_base(
@@ -1774,9 +1744,8 @@ impl TableCommit {
         &self,
         commit_kind: &CommitKind,
         commit_entries: &[ManifestEntry],
-        row_id_check_from_snapshot: Option<i64>,
     ) -> Result<()> {
-        if row_id_check_from_snapshot.is_none() && commit_kind != &CommitKind::COMPACT {
+        if commit_kind != &CommitKind::COMPACT {
             return Ok(());
         }
 
@@ -1813,239 +1782,6 @@ impl TableCommit {
             }
         }
         Ok(())
-    }
-
-    async fn check_row_id_from_snapshot(
-        &self,
-        latest_snapshot: Option<&Snapshot>,
-        delta_entries: &[ManifestEntry],
-        row_id_check_from_snapshot: Option<i64>,
-    ) -> Result<()> {
-        let Some(check_from_snapshot) = row_id_check_from_snapshot else {
-            return Ok(());
-        };
-        let Some(latest_snapshot) = latest_snapshot else {
-            return Ok(());
-        };
-
-        let column_checker = self.build_row_id_column_checker(delta_entries).await?;
-        if column_checker.is_empty() {
-            return Ok(());
-        }
-
-        let check_snapshot = self
-            .snapshot_manager
-            .get_snapshot(check_from_snapshot)
-            .await?;
-        let check_next_row_id =
-            check_snapshot
-                .next_row_id()
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "Next row id cannot be null for snapshot {check_from_snapshot}."
-                    ),
-                    source: None,
-                })?;
-
-        let delta_signatures = delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-            .filter_map(|entry| {
-                entry
-                    .file()
-                    .row_id_range()
-                    .map(|(start, end)| (file_storage_kind(entry.file()), start, end))
-            })
-            .collect::<Vec<_>>();
-
-        for snapshot_id in check_from_snapshot + 1..=latest_snapshot.id() {
-            let snapshot = match self.snapshot_manager.get_snapshot(snapshot_id).await {
-                Ok(snapshot) => snapshot,
-                Err(_) => continue,
-            };
-            let incremental_entries = self
-                .read_incremental_entries_from_changed_partitions(&snapshot, delta_entries)
-                .await?;
-            if snapshot.commit_kind() == &CommitKind::COMPACT {
-                self.check_compact_conflicts_with_delta(
-                    &snapshot,
-                    &incremental_entries,
-                    &delta_signatures,
-                    &column_checker,
-                )
-                .await?;
-                continue;
-            }
-
-            for entry in incremental_entries
-                .iter()
-                .filter(|entry| *entry.kind() == FileKind::Add)
-            {
-                let Some((start, _end)) = entry.file().row_id_range() else {
-                    continue;
-                };
-                if start < check_next_row_id
-                    && self
-                        .file_conflicts_with_column_checker(entry.file(), &column_checker)
-                        .await?
-                {
-                    return Err(crate::Error::DataInvalid {
-                        message: "For Data Evolution table, multiple MERGE INTO operations have conflicts updating the same row-id/column range.".to_string(),
-                        source: None,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn read_incremental_entries_from_changed_partitions(
-        &self,
-        snapshot: &Snapshot,
-        commit_entries: &[ManifestEntry],
-    ) -> Result<Vec<ManifestEntry>> {
-        let entry_refs = commit_entries.iter().collect::<Vec<_>>();
-        let partition_filter = self.build_entries_partition_filter(&entry_refs)?;
-        self.read_delta_entries(partition_filter.as_ref(), snapshot)
-            .await
-    }
-
-    async fn check_compact_conflicts_with_delta(
-        &self,
-        snapshot: &Snapshot,
-        incremental_entries: &[ManifestEntry],
-        delta_signatures: &[(FileStorageKind, i64, i64)],
-        column_checker: &[WriteRange],
-    ) -> Result<()> {
-        if delta_signatures.is_empty() {
-            return Ok(());
-        }
-
-        for entry in incremental_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Delete)
-        {
-            let Some((file_start, file_end)) = entry.file().row_id_range() else {
-                continue;
-            };
-            let deleted_storage_kind = file_storage_kind(entry.file());
-            for &(delta_storage_kind, delta_start, delta_end) in delta_signatures {
-                if delta_storage_kind != deleted_storage_kind {
-                    continue;
-                }
-                if !ranges_overlap(file_start, file_end, delta_start, delta_end) {
-                    continue;
-                }
-                if !self
-                    .file_conflicts_with_column_checker(entry.file(), column_checker)
-                    .await?
-                {
-                    continue;
-                }
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Blob/row-id update conflicts with concurrent COMPACT snapshot {}: anchor file {} [{}, {}] was compacted away, overlaps staged delta [{}, {}].",
-                        snapshot.id(),
-                        entry.file().file_name,
-                        file_start,
-                        file_end,
-                        delta_start,
-                        delta_end,
-                    ),
-                    source: None,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn build_row_id_column_checker(
-        &self,
-        delta_entries: &[ManifestEntry],
-    ) -> Result<Vec<WriteRange>> {
-        let mut ranges = Vec::new();
-        for entry in delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-        {
-            let Some((start, end)) = entry.file().row_id_range() else {
-                continue;
-            };
-            let field_ids = self.write_field_ids(entry.file()).await?;
-            if field_ids.is_empty() {
-                continue;
-            }
-            ranges.push(WriteRange {
-                start,
-                end,
-                field_ids,
-            });
-        }
-        Ok(ranges)
-    }
-
-    async fn file_conflicts_with_column_checker(
-        &self,
-        file: &DataFileMeta,
-        column_checker: &[WriteRange],
-    ) -> Result<bool> {
-        let Some((file_start, file_end)) = file.row_id_range() else {
-            return Ok(false);
-        };
-        let file_field_ids = match file.write_cols.as_ref() {
-            None => None,
-            Some(_) => Some(self.write_field_ids(file).await?),
-        };
-
-        for write_range in column_checker {
-            if !ranges_overlap(file_start, file_end, write_range.start, write_range.end) {
-                continue;
-            }
-            match file_field_ids.as_ref() {
-                None => return Ok(true),
-                Some(ids) if ids.iter().any(|id| write_range.field_ids.contains(id)) => {
-                    return Ok(true);
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(false)
-    }
-
-    async fn write_field_ids(&self, file: &DataFileMeta) -> Result<HashSet<i32>> {
-        let schema = self.table.schema_manager().schema(file.schema_id).await?;
-        let fields = schema.fields();
-        let mut ids = HashSet::new();
-        match file.write_cols.as_ref() {
-            None => {
-                ids.extend(
-                    fields
-                        .iter()
-                        .filter(|field| !is_system_field(field.name()))
-                        .map(DataField::id),
-                );
-            }
-            Some(write_cols) => {
-                for col_name in write_cols {
-                    if is_system_field(col_name) {
-                        continue;
-                    }
-                    let field_id = fields
-                        .iter()
-                        .find(|field| field.name() == col_name)
-                        .map(DataField::id)
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!(
-                                "Column '{}' not found in schema {}.",
-                                col_name, file.schema_id
-                            ),
-                            source: None,
-                        })?;
-                    ids.insert(field_id);
-                }
-            }
-        }
-        Ok(ids)
     }
 
     /// Assign row tracking metadata: snapshot ID as sequence number, and
@@ -2510,13 +2246,6 @@ impl TableCommit {
             })
             .collect()
     }
-
-    fn row_id_check_from_snapshot(messages: &[CommitMessage]) -> Option<i64> {
-        messages
-            .iter()
-            .filter_map(|msg| (msg.check_from_snapshot >= 0).then_some(msg.check_from_snapshot))
-            .min()
-    }
 }
 
 /// Serialized BinaryRow for partition stats; unlike `datums_to_binary_row`, returns a
@@ -2541,14 +2270,12 @@ enum CommitEntriesPlan {
         entries: Vec<ManifestEntry>,
         changelog_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
-        row_id_check_from_snapshot: Option<i64>,
     },
     /// Overwrite with optional partition filter.
     Overwrite {
         partition_filter: Option<PartitionFilter>,
         new_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
-        row_id_check_from_snapshot: Option<i64>,
         cached_snapshot: Option<Snapshot>,
         cached_entries: Vec<ManifestEntry>,
         full_scan_count: usize,
@@ -2592,12 +2319,6 @@ enum CommitAttemptResult {
 struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
-}
-
-struct WriteRange {
-    start: i64,
-    end: i64,
-    field_ids: HashSet<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2916,7 +2637,6 @@ mod tests {
             partition_filter,
             new_entries,
             new_index_entries: vec![],
-            row_id_check_from_snapshot: None,
             cached_snapshot: None,
             cached_entries: Vec::new(),
             full_scan_count: 0,
