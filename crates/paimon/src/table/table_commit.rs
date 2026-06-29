@@ -27,23 +27,101 @@ use crate::spec::{
     bucket_dir_name, extract_datum, merge_active_entries, BinaryRow, BinaryRowBuilder, CommitKind,
     CoreOptions, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
     IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
-    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW,
+    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
+use apache_avro::{to_avro_datum, to_value, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Batch commit identifier (i64::MAX), same as Python's BATCH_COMMIT_IDENTIFIER.
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
+// apache-avro's default OCF block size used by Manifest::write.
+const AVRO_OBJECT_CONTAINER_BLOCK_SIZE: usize = 16_000;
+const AVRO_SYNC_MARKER_SIZE: usize = 16;
 
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
+
+struct ManifestRollingSizeEstimator {
+    schema: Schema,
+    header_size: usize,
+    flushed_blocks_size: usize,
+    pending_block_size: usize,
+    pending_block_entries: usize,
+}
+
+impl ManifestRollingSizeEstimator {
+    fn new() -> Result<Self> {
+        let schema = Schema::parse_str(MANIFEST_ENTRY_SCHEMA)?;
+        let header_size =
+            crate::spec::to_avro_bytes::<ManifestEntry>(MANIFEST_ENTRY_SCHEMA, &[])?.len();
+        Ok(Self {
+            schema,
+            header_size,
+            flushed_blocks_size: 0,
+            pending_block_size: 0,
+            pending_block_entries: 0,
+        })
+    }
+
+    fn add_entry(&mut self, entry: &ManifestEntry) -> Result<usize> {
+        let value = to_value(entry).and_then(|value| value.resolve(&self.schema))?;
+        let entry_size = to_avro_datum(&self.schema, value)?.len();
+        self.pending_block_size += entry_size;
+        self.pending_block_entries += 1;
+        if self.pending_block_size >= AVRO_OBJECT_CONTAINER_BLOCK_SIZE {
+            self.flush_pending_block();
+        }
+        Ok(self.estimated_size())
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.header_size + self.flushed_blocks_size + self.pending_block_encoded_size()
+    }
+
+    fn reset(&mut self) {
+        self.flushed_blocks_size = 0;
+        self.pending_block_size = 0;
+        self.pending_block_entries = 0;
+    }
+
+    fn flush_pending_block(&mut self) {
+        self.flushed_blocks_size += self.pending_block_encoded_size();
+        self.pending_block_size = 0;
+        self.pending_block_entries = 0;
+    }
+
+    fn pending_block_encoded_size(&self) -> usize {
+        if self.pending_block_entries == 0 {
+            return 0;
+        }
+        avro_block_encoded_size(self.pending_block_entries, self.pending_block_size)
+    }
+}
+
+fn avro_block_encoded_size(entry_count: usize, data_size: usize) -> usize {
+    avro_non_negative_long_encoded_len(entry_count)
+        + avro_non_negative_long_encoded_len(data_size)
+        + data_size
+        + AVRO_SYNC_MARKER_SIZE
+}
+
+fn avro_non_negative_long_encoded_len(value: usize) -> usize {
+    let mut encoded = (value as u128) << 1;
+    let mut len = 1;
+    while encoded >= 0x80 {
+        len += 1;
+        encoded >>= 7;
+    }
+    len
+}
 
 /// Table commit logic for Paimon write operations.
 ///
@@ -817,13 +895,11 @@ impl TableCommit {
         let target_size = self.manifest_target_size.max(1) as usize;
         let mut result = Vec::new();
         let mut chunk_start = 0usize;
-        let mut chunk_entries = Vec::new();
+        let mut size_estimator = ManifestRollingSizeEstimator::new()?;
 
-        for entry in entries {
-            chunk_entries.push(entry.clone());
-            let bytes =
-                crate::spec::to_avro_bytes(crate::spec::MANIFEST_ENTRY_SCHEMA, &chunk_entries)?;
-            if bytes.len() >= target_size {
+        for (idx, entry) in entries.iter().enumerate() {
+            if size_estimator.add_entry(entry)? >= target_size {
+                let chunk_end = idx + 1;
                 let file_name = format!("{name_prefix}-{}", result.len());
                 let path = format!("{manifest_dir}/{file_name}");
                 let meta = self
@@ -831,16 +907,16 @@ impl TableCommit {
                         file_io,
                         &path,
                         &file_name,
-                        &entries[chunk_start..chunk_start + chunk_entries.len()],
+                        &entries[chunk_start..chunk_end],
                     )
                     .await?;
                 result.push(meta);
-                chunk_start += chunk_entries.len();
-                chunk_entries.clear();
+                chunk_start = chunk_end;
+                size_estimator.reset();
             }
         }
 
-        if !chunk_entries.is_empty() {
+        if chunk_start < entries.len() {
             let file_name = format!("{name_prefix}-{}", result.len());
             let path = format!("{manifest_dir}/{file_name}");
             let meta = self
@@ -4592,6 +4668,27 @@ mod tests {
         assert_eq!(file_names.len(), 80);
         assert!(file_names.contains("data-000.parquet"));
         assert!(file_names.contains("data-079.parquet"));
+    }
+
+    #[test]
+    fn test_manifest_rolling_size_estimator_matches_avro_writer_size() {
+        let entries = (0..160)
+            .map(|i| {
+                let mut file = test_data_file(&format!("data-{i:03}.parquet"), 1);
+                file.extra_files = (0..8).map(|j| format!("data-{i:03}-{j}.idx")).collect();
+                ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2)
+            })
+            .collect::<Vec<_>>();
+
+        let mut estimator = ManifestRollingSizeEstimator::new().unwrap();
+        for entry in &entries {
+            estimator.add_entry(entry).unwrap();
+        }
+
+        let actual_size = crate::spec::to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &entries)
+            .unwrap()
+            .len();
+        assert_eq!(estimator.estimated_size(), actual_size);
     }
 
     #[tokio::test]
