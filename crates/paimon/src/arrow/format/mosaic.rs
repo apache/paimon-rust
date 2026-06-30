@@ -35,6 +35,8 @@ use paimon_mosaic_core::stats::ColumnStats;
 use paimon_mosaic_core::values::Value as MosaicValue;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::ops::Range;
+use std::sync::Arc;
 
 pub(crate) struct MosaicFormatReader;
 
@@ -51,8 +53,11 @@ impl FormatFileReader for MosaicFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let file_bytes = reader.read(0..file_size).await?;
-        let mosaic_reader = MosaicReader::new(MemoryInputFile::new(file_bytes), file_size)
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| Error::UnexpectedError {
+            message: "Mosaic reader requires a Tokio runtime".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+        let mosaic_reader = MosaicReader::new(FileReadInputFile::new(reader, handle), file_size)
             .map_err(mosaic_read_error)?;
 
         let file_column_names = mosaic_reader
@@ -313,36 +318,83 @@ fn micros_to_millis_nanos(micros: i64) -> (i64, i32) {
     )
 }
 
-#[derive(Clone)]
-struct MemoryInputFile {
-    data: Bytes,
+struct FileReadInputFile {
+    reader: Arc<dyn FileRead>,
+    handle: tokio::runtime::Handle,
 }
 
-impl MemoryInputFile {
-    fn new(data: Bytes) -> Self {
-        Self { data }
+impl FileReadInputFile {
+    fn new(reader: Box<dyn FileRead>, handle: tokio::runtime::Handle) -> Self {
+        Self {
+            reader: Arc::from(reader),
+            handle,
+        }
     }
 }
 
-impl InputFile for MemoryInputFile {
+impl InputFile for FileReadInputFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let offset = usize::try_from(offset).map_err(|_| {
+        let len = u64::try_from(buf.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "mosaic read offset exceeds usize",
+                "mosaic read length exceeds u64",
             )
         })?;
-        let end = offset.checked_add(buf.len()).ok_or_else(|| {
+        let end = offset.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "mosaic read range overflows")
         })?;
-        let src = self.data.get(offset..end).ok_or_else(|| {
-            io::Error::new(
+        let bytes = block_on_file_read(&self.reader, &self.handle, offset..end)?;
+        if bytes.len() != buf.len() {
+            return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "mosaic read range exceeds file size",
-            )
-        })?;
-        buf.copy_from_slice(src);
+                format!(
+                    "mosaic read expected {} bytes, got {}",
+                    buf.len(),
+                    bytes.len()
+                ),
+            ));
+        }
+        buf.copy_from_slice(&bytes);
         Ok(())
+    }
+}
+
+fn block_on_file_read(
+    reader: &Arc<dyn FileRead>,
+    handle: &tokio::runtime::Handle,
+    range: Range<u64>,
+) -> io::Result<Bytes> {
+    let do_read = || {
+        handle
+            .block_on(reader.read(range.clone()))
+            .map_err(|e| io::Error::other(e.to_string()))
+    };
+
+    match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+            let in_multi_thread_runtime =
+                tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                });
+            if in_multi_thread_runtime {
+                tokio::task::block_in_place(do_read)
+            } else {
+                do_read()
+            }
+        }
+        _ => {
+            let reader = Arc::clone(reader);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        handle
+                            .block_on(reader.read(range))
+                            .map_err(|e| io::Error::other(e.to_string()))
+                    })
+                    .join()
+                    .map_err(|_| io::Error::other("mosaic reader thread panicked"))?
+            })
+        }
     }
 }
 
@@ -550,7 +602,7 @@ mod tests {
     use paimon_mosaic_core::spec::COMPRESSION_NONE;
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use std::ops::Range;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct TestFileRead {
         data: Bytes,
@@ -559,6 +611,21 @@ mod tests {
     #[async_trait]
     impl FileRead for TestFileRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let start = usize::try_from(range.start).unwrap();
+            let end = usize::try_from(range.end).unwrap();
+            Ok(self.data.slice(start..end))
+        }
+    }
+
+    struct TrackingFileRead {
+        data: Bytes,
+        calls: Arc<Mutex<Vec<Range<u64>>>>,
+    }
+
+    #[async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.calls.lock().unwrap().push(range.clone());
             let start = usize::try_from(range.start).unwrap();
             let end = usize::try_from(range.end).unwrap();
             Ok(self.data.slice(start..end))
@@ -629,6 +696,25 @@ mod tests {
                 Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
                 Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
                 Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn large_batch(row_count: i32) -> RecordBatch {
+        let ids = (0..row_count).collect::<Vec<_>>();
+        let names = ids
+            .iter()
+            .map(|id| format!("name-{id:05}-payload-for-range-read"))
+            .collect::<Vec<_>>();
+        let scores = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            arrow_schema(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int32Array::from(scores)),
             ],
         )
         .unwrap()
@@ -823,6 +909,60 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(scores.value(2), 30);
+    }
+
+    #[tokio::test]
+    async fn test_mosaic_projection_uses_range_reads_for_large_file() {
+        let fields = data_fields();
+        let projected = vec![fields[0].clone()];
+        let row_count = 20_000;
+        let data = write_mosaic(&large_batch(row_count));
+        let file_size = data.len() as u64;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        assert!(file_size > 64 * 1024);
+
+        let batches = MosaicFormatReader
+            .read_batch_stream(
+                Box::new(TrackingFileRead {
+                    data,
+                    calls: Arc::clone(&calls),
+                }),
+                file_size,
+                &projected,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let ids = collect_i32_column(&batches, 0);
+        assert_eq!(ids.len(), row_count as usize);
+        assert_eq!(ids.first(), Some(&0));
+        assert_eq!(ids.last(), Some(&(row_count - 1)));
+
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|range| range.start == 0 && range.end == file_size),
+            "projection should not read the whole Mosaic file, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|range| range.end == file_size && range.start > 0),
+            "expected a tail metadata read, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|range| range.start < range.end && range.end <= file_size),
+            "invalid read ranges: {calls:?}"
+        );
     }
 
     #[tokio::test]
