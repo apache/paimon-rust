@@ -345,6 +345,46 @@ impl SnapshotManager {
         Ok(result)
     }
 
+    pub async fn expire_snapshots(&self, snapshot_ids: &[i64]) -> crate::Result<i64> {
+        let mut deleted_count = 0;
+        for &snapshot_id in snapshot_ids {
+            self.delete_snapshot(snapshot_id).await?;
+            deleted_count += 1;
+        }
+        Ok(deleted_count)
+    }
+
+    // Expires snapshots whose commit time is earlier than target timestamp_millis.
+    // Returns the number of snapshots deleted.
+    pub async fn expire_snapshots_earlier_than(&self, timestamp_millis: i64) -> crate::Result<i64> {
+        let snapshot_ids = self.list_all_ids().await?;
+        let mut to_delete = Vec::new();
+        for snapshot_id in snapshot_ids {
+            let snapshot = self.get_snapshot(snapshot_id).await?;
+            if (snapshot.time_millis() as i64) < timestamp_millis {
+                to_delete.push(snapshot_id);
+            } else {
+                break;
+            }
+        }
+        self.expire_snapshots(&to_delete).await?;
+        Ok(to_delete.len() as i64)
+    }
+
+    // Remove files which are not used by any snapshots and are not referenced by
+    // manifest lists.
+    pub async fn remove_orphan_files(&self) -> crate::Result<()> {
+        let snapshot_ids = self.list_all_ids().await?;
+        let mut manifest_files = std::collections::HashSet::new();
+        for snap_id in snapshot_ids {
+            let snapshot = self.get_snapshot(snap_id).await?;
+            manifest_files.insert(snapshot.base_manifest_list().to_string());
+            manifest_files.insert(snapshot.delta_manifest_list().to_string());
+        }
+
+        Ok(())
+    }
+
     /// Returns the snapshot whose commit time is earlier than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///

@@ -14,10 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-use std::sync::Arc;
-
 use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
@@ -51,5 +50,21 @@ impl PyTable {
     /// Create a [`PyReadBuilder`] for DataFrame-style scan planning.
     fn new_read_builder(&self) -> PyReadBuilder {
         PyReadBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn expire_snapshots(&self, cutoff_time: i64) -> PyResult<i64> {
+        todo!()
+    }
+
+    fn remove_orphan_files(&self, cutoff_time: i64) -> PyResult<i64> {
+        todo!()
+    }
+
+    fn drop_partition(&self, partition: HashMap<String, String>) -> PyResult<()> {
+        todo!()
+    }
+
+    fn trigger_compaction(&self, full_compact: bool) -> PyResult<()> {
+        todo!()
     }
 }
