@@ -16,6 +16,10 @@
 // under the License.
 use pyo3::prelude::*;
 use std::collections::HashMap;
+
+use paimon::spec::Datum;
+use paimon::table::SnapShotManager;
+use paimon_datafusion::runtime::runtime;
 use std::sync::Arc;
 
 use crate::read::PyReadBuilder;
@@ -52,18 +56,56 @@ impl PyTable {
         PyReadBuilder::new(Arc::clone(&self.inner))
     }
 
-    fn expire_snapshots(&self, cutoff_time: i64) -> PyResult<i64> {
-        todo!()
+    fn expire_snapshots(&self, py: Python<'_>, older_than_ms: i64) -> PyResult<i64> {
+        let rt = runtime();
+        py.detach(|| {
+            rt.block_on(async {
+                let snapshot_manager = SnapShotManager::new(Arc::clone(&self.inner));
+                snapshot_manager
+                    .expire_snapshots_earlier_than(older_than_millis)
+                    .await
+                    .map_err(to_py_err)
+            })
+        })
+    }
+    fn remove_orphan_files(&self, py: Python<'_>) -> PyResult<i64> {
+        let rt = runtime();
+        py.detach(|| {
+            rt.block_on(async {
+                let snapshot_manager = SnapshotManager::new(
+                    self.inner.file_io().clone(),
+                    self.inner.location().to_string(),
+                );
+                snapshot_manager
+                    .remove_orphan_files()
+                    .await
+                    .map_err(to_py_err)
+            })
+        })
     }
 
-    fn remove_orphan_files(&self, cutoff_time: i64) -> PyResult<i64> {
-        todo!()
+    fn drop_partition(&self, partition: HashMap<String, Bound<'_, PyAny>>) -> PyResult<()> {
+        let partition_fields = self.inner.schema().partition_fields();
+        let mut spec: HashMap<String, Option<Datum>> = HashMap::with_capacity(partition.len());
+        for (k, v) in &partition {
+            let datum = if v.is_none() {
+                None
+            } else {
+                let field = partition_fields
+                    .iter()
+                    .find(|f| f.name() == k)
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!("Partition field {} not found in schema", k))
+                    })?;
+                Some(py_to_datum(v, field.data_type())?)
+            };
+            spec.insert(k.clone(), datum);
+        }
+        runtime().block_on(async {
+            let commit = self.inner.new_write_builder().new_commit();
+            commit.drop_partitions(vec![spec]).await.map_err(to_py_err)
+        })
     }
-
-    fn drop_partition(&self, partition: HashMap<String, String>) -> PyResult<()> {
-        todo!()
-    }
-
     fn trigger_compaction(&self, full_compact: bool) -> PyResult<()> {
         todo!()
     }

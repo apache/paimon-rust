@@ -381,6 +381,20 @@ impl SnapshotManager {
             manifest_files.insert(snapshot.base_manifest_list().to_string());
             manifest_files.insert(snapshot.delta_manifest_list().to_string());
         }
+        let manifest_dir = self.manifest_dir();
+        let statuses = self.file_io.list_status(&manifest_dir).await?;
+        let mut deleted_count = 0;
+        for status in statuses {
+            if status.is_dir() {
+                continue;
+            }
+            let name = status.path.rsplit('/').next().unwrap_or(&status.path);
+            let manifest_path = format!("{}/{}", manifest_dir, name);
+            if !manifest_files.contains(&manifest_path) {
+                self.file_io.delete_file(&manifest_path).await?;
+                deleted_count += 1;
+            }
+        }
 
         Ok(())
     }
