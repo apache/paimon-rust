@@ -41,7 +41,7 @@ arrow-string = "58.0"
 datafusion = "53.0.0"
 datafusion-ffi = "53.0.0"
 paimon = { version = "0.3.0", path = "crates/paimon" }
-parquet = "58.0"
+parquet = "59.0"
 constant_time_eq = ">=0.4.0, <0.5.0"
 tokio = "1.39.2"
 tokio-util = "0.7"
