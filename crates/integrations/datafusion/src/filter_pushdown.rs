@@ -332,6 +332,9 @@ fn scalar_to_datum(scalar: &ScalarValue, data_type: &DataType) -> Option<Datum> 
             ScalarValue::Date32(Some(value)) => Some(Datum::Date(*value)),
             _ => None,
         },
+        DataType::Time(_) => scalar_to_time_datum(scalar),
+        DataType::Timestamp(_) => scalar_to_timestamp_datum(scalar),
+        DataType::LocalZonedTimestamp(_) => scalar_to_local_zoned_timestamp_datum(scalar),
         DataType::Decimal(decimal) => match scalar {
             ScalarValue::Decimal128(Some(unscaled), precision, scale)
                 if u32::from(*precision) <= decimal.precision() && i32::from(*scale) >= 0 =>
@@ -359,6 +362,53 @@ fn scalar_to_datum(scalar: &ScalarValue, data_type: &DataType) -> Option<Datum> 
     }
 }
 
+fn scalar_to_time_datum(scalar: &ScalarValue) -> Option<Datum> {
+    match scalar {
+        ScalarValue::Time32Millisecond(Some(value)) => Some(Datum::Time(*value)),
+        _ => None,
+    }
+}
+
+fn scalar_to_timestamp_parts(scalar: &ScalarValue) -> Option<(bool, i64, i32)> {
+    match scalar {
+        ScalarValue::TimestampSecond(Some(value), timezone) => {
+            Some((timezone.is_some(), value.checked_mul(1_000)?, 0))
+        }
+        ScalarValue::TimestampMillisecond(Some(value), timezone) => {
+            Some((timezone.is_some(), *value, 0))
+        }
+        ScalarValue::TimestampMicrosecond(Some(value), timezone) => Some((
+            timezone.is_some(),
+            value.div_euclid(1_000),
+            (value.rem_euclid(1_000) * 1_000) as i32,
+        )),
+        ScalarValue::TimestampNanosecond(Some(value), timezone) => Some((
+            timezone.is_some(),
+            value.div_euclid(1_000_000),
+            value.rem_euclid(1_000_000) as i32,
+        )),
+        _ => None,
+    }
+}
+
+fn scalar_to_timestamp_datum(scalar: &ScalarValue) -> Option<Datum> {
+    let (has_timezone, millis, nanos) = scalar_to_timestamp_parts(scalar)?;
+    if has_timezone {
+        None
+    } else {
+        Some(Datum::Timestamp { millis, nanos })
+    }
+}
+
+fn scalar_to_local_zoned_timestamp_datum(scalar: &ScalarValue) -> Option<Datum> {
+    let (has_timezone, millis, nanos) = scalar_to_timestamp_parts(scalar)?;
+    if has_timezone {
+        Some(Datum::LocalZonedTimestamp { millis, nanos })
+    } else {
+        None
+    }
+}
+
 fn scalar_to_i128(scalar: &ScalarValue) -> Option<i128> {
     match scalar {
         ScalarValue::Int8(Some(value)) => Some(i128::from(*value)),
@@ -380,7 +430,9 @@ mod tests {
     use datafusion::logical_expr::{expr::InList, lit, TableProviderFilterPushDown};
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{IntType, Schema, TableSchema, VarCharType};
+    use paimon::spec::{
+        IntType, LocalZonedTimestampType, Schema, TableSchema, TimeType, TimestampType, VarCharType,
+    };
     use paimon::table::Table;
 
     fn test_table() -> Table {
@@ -391,6 +443,15 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("dt", DataType::VarChar(VarCharType::string_type()))
                 .column("hr", DataType::Int(IntType::new()))
+                .column("time_col", DataType::Time(TimeType::new(3).unwrap()))
+                .column(
+                    "ts_col",
+                    DataType::Timestamp(TimestampType::new(9).unwrap()),
+                )
+                .column(
+                    "lzts_col",
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(9).unwrap()),
+                )
                 .partition_keys(["dt", "hr"])
                 .build()
                 .unwrap(),
@@ -412,6 +473,140 @@ mod tests {
         test_table()
             .new_read_builder()
             .is_exact_filter_pushdown(predicate)
+    }
+
+    fn translated_literal(filter: Expr) -> Datum {
+        let fields = test_fields();
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("temporal literal should translate");
+        match predicate {
+            Predicate::Leaf { mut literals, .. } => {
+                assert_eq!(literals.len(), 1);
+                literals.remove(0)
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_time32_millisecond_literal() {
+        let filter = Expr::Column(Column::from_name("time_col")).eq(Expr::Literal(
+            ScalarValue::Time32Millisecond(Some(12_345)),
+            None,
+        ));
+
+        assert_eq!(translated_literal(filter), Datum::Time(12_345));
+    }
+
+    #[test]
+    fn test_translate_timestamp_millisecond_literal() {
+        let filter = Expr::Column(Column::from_name("ts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some(1_234_567), None),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::Timestamp {
+                millis: 1_234_567,
+                nanos: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_timestamp_second_literal() {
+        let filter = Expr::Column(Column::from_name("ts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampSecond(Some(-2), None),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::Timestamp {
+                millis: -2_000,
+                nanos: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_timestamp_microsecond_literal() {
+        let filter = Expr::Column(Column::from_name("ts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(-1_234_567), None),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::Timestamp {
+                millis: -1_235,
+                nanos: 433_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_timestamp_nanosecond_literal() {
+        let filter = Expr::Column(Column::from_name("ts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(-1_234_567_890), None),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::Timestamp {
+                millis: -1_235,
+                nanos: 432_110,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_local_zoned_timestamp_literal() {
+        let filter = Expr::Column(Column::from_name("lzts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampMicrosecond(Some(1_234_567), Some("UTC".into())),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::LocalZonedTimestamp {
+                millis: 1_234,
+                nanos: 567_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_local_zoned_timestamp_nanosecond_literal() {
+        let filter = Expr::Column(Column::from_name("lzts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(-1_234_567_890), Some("UTC".into())),
+            None,
+        ));
+
+        assert_eq!(
+            translated_literal(filter),
+            Datum::LocalZonedTimestamp {
+                millis: -1_235,
+                nanos: 432_110,
+            }
+        );
+    }
+
+    #[test]
+    fn test_translate_timestamp_timezone_mismatch_falls_open() {
+        let fields = test_fields();
+        let timestamp_with_timezone = Expr::Column(Column::from_name("ts_col")).eq(Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some(1_234), Some("UTC".into())),
+            None,
+        ));
+        let local_zoned_without_timezone = Expr::Column(Column::from_name("lzts_col")).eq(
+            Expr::Literal(ScalarValue::TimestampMillisecond(Some(1_234), None), None),
+        );
+
+        assert!(build_pushed_predicate(&[timestamp_with_timezone], &fields).is_none());
+        assert!(build_pushed_predicate(&[local_zoned_without_timezone], &fields).is_none());
     }
 
     #[test]
