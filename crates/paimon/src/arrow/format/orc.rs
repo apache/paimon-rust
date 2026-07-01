@@ -208,10 +208,14 @@ fn build_orc_leaf_predicate(
     let column = file_field.name();
 
     match op {
-        PredicateOperator::IsNotNull
+        PredicateOperator::IsNull | PredicateOperator::IsNotNull
             if data_type_supported_for_orc_predicate(file_field.data_type()) =>
         {
-            Some(orc_rust::predicate::Predicate::is_not_null(column))
+            Some(match op {
+                PredicateOperator::IsNull => orc_rust::predicate::Predicate::is_null(column),
+                PredicateOperator::IsNotNull => orc_rust::predicate::Predicate::is_not_null(column),
+                _ => unreachable!(),
+            })
         }
         PredicateOperator::Eq
         | PredicateOperator::Lt
@@ -250,8 +254,10 @@ fn build_orc_leaf_predicate(
             }
             Some(orc_rust::predicate::Predicate::or(values))
         }
-        PredicateOperator::IsNull | PredicateOperator::NotEq | PredicateOperator::NotIn => None,
-        PredicateOperator::IsNotNull => None,
+        PredicateOperator::IsNull
+        | PredicateOperator::IsNotNull
+        | PredicateOperator::NotEq
+        | PredicateOperator::NotIn => None,
         // String/range ops are not pushed into ORC; returning None falls open to
         // the outer stats-prune + arrow row-filter path.
         PredicateOperator::StartsWith
@@ -560,6 +566,34 @@ mod tests {
 
         assert!(build_orc_predicate(Some(&float_predicates)).is_none());
         assert!(build_orc_predicate(Some(&double_predicates)).is_none());
+    }
+
+    #[test]
+    fn test_build_orc_predicate_is_null_supported_leaf() {
+        let predicates = file_predicates(
+            vec![leaf(0, PredicateOperator::IsNull, vec![])],
+            vec![field(0, "id", DataType::Int(IntType::new()))],
+        );
+
+        let predicate = build_orc_predicate(Some(&predicates)).unwrap();
+        assert_eq!(predicate, orc_rust::predicate::Predicate::is_null("id"));
+    }
+
+    #[test]
+    fn test_build_orc_predicate_is_null_requires_supported_type() {
+        let decimal_type = DataType::Decimal(DecimalType::new(10, 2).unwrap());
+        let predicates = file_predicates(
+            vec![Predicate::Leaf {
+                column: "amount".to_string(),
+                index: 0,
+                data_type: decimal_type.clone(),
+                op: PredicateOperator::IsNull,
+                literals: vec![],
+            }],
+            vec![field(0, "amount", decimal_type)],
+        );
+
+        assert!(build_orc_predicate(Some(&predicates)).is_none());
     }
 
     #[test]
