@@ -752,7 +752,7 @@ async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() 
         Predicate::and(vec![
             pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
             pb.equal("hr", Datum::Int(10)).unwrap(),
-            pb.greater_than("id", Datum::Int(10)).unwrap(),
+            pb.greater_than("id", Datum::Int(0)).unwrap(),
         ]),
         Predicate::and(vec![
             pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
@@ -780,8 +780,9 @@ async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() 
     );
 }
 
-/// A directly mixed OR like `dt = '...' OR id > 10` is still not safely
-/// splittable into a partition predicate, so no partitions should be pruned.
+/// A directly mixed OR like `dt = '...' OR id > 0` is still not safely
+/// splittable into a partition predicate. The data predicate branch may match
+/// all provisioned files, so this isolates partition projection behavior.
 #[tokio::test]
 async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
@@ -793,7 +794,7 @@ async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
 
     let filter = Predicate::or(vec![
         pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
-        pb.greater_than("id", Datum::Int(10)).unwrap(),
+        pb.greater_than("id", Datum::Int(0)).unwrap(),
     ]);
 
     let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
