@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod common;
+
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
@@ -398,6 +400,93 @@ async fn test_partially_translated_filter_keeps_partition_pruning_and_correctnes
         vec![(3, "carol".to_string())],
         "The residual filter should still be enforced above the scan"
     );
+}
+
+#[tokio::test]
+async fn test_temporal_filter_pushdown_via_datafusion_scan() {
+    let (_tmp, sql_context) = common::setup_sql_context().await;
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.temporal_filter_pushdown (
+                id INT,
+                name STRING,
+                ts TIMESTAMP(6),
+                lzts TIMESTAMP(6) WITH TIME ZONE
+            )",
+        )
+        .await
+        .expect("CREATE TABLE should succeed")
+        .collect()
+        .await
+        .expect("CREATE TABLE should collect");
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.temporal_filter_pushdown VALUES
+                (1, 'alice', TIMESTAMP '2024-01-01 00:00:00.123456', TIMESTAMP '2024-01-01 00:00:00.123456+00:00'),
+                (2, 'bob', TIMESTAMP '2024-01-01 00:00:00.654321', TIMESTAMP '2024-01-01 00:00:00.654321+00:00'),
+                (3, 'carol', TIMESTAMP '2024-01-02 00:00:00.123456', TIMESTAMP '2024-01-02 00:00:00.123456+00:00')",
+        )
+        .await
+        .expect("INSERT should succeed")
+        .collect()
+        .await
+        .expect("INSERT should collect");
+
+    let timestamp_sql = "SELECT id, name FROM paimon.test_db.temporal_filter_pushdown \
+        WHERE ts = TIMESTAMP '2024-01-01 00:00:00.123456' AND id + 1 > 1";
+    let plan = sql_context
+        .sql(timestamp_sql)
+        .await
+        .expect("SQL planning should succeed")
+        .create_physical_plan()
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        !scan_lines.is_empty(),
+        "plan should contain a PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("predicate=ts = TS(")),
+        "Temporal predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines.iter().all(|line| !line.contains("limit=")),
+        "Residual filter should keep scan from being marked fully exact, plan:\n{plan_text}"
+    );
+
+    let rows = common::collect_id_name(&sql_context, timestamp_sql).await;
+    assert_eq!(rows, vec![(1, "alice".to_string())]);
+
+    let local_zoned_sql = "SELECT id, name FROM paimon.test_db.temporal_filter_pushdown \
+        WHERE lzts = TIMESTAMP '2024-01-01 00:00:00.654321+00:00' AND id + 1 > 2";
+    let plan = sql_context
+        .sql(local_zoned_sql)
+        .await
+        .expect("SQL planning should succeed")
+        .create_physical_plan()
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+
+    assert!(
+        !scan_lines.is_empty(),
+        "plan should contain a PaimonTableScan, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("predicate=lzts = LZTS(")),
+        "Local zoned timestamp predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
+    );
+
+    let rows = common::collect_id_name(&sql_context, local_zoned_sql).await;
+    assert_eq!(rows, vec![(2, "bob".to_string())]);
 }
 
 #[tokio::test]
