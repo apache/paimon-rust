@@ -139,7 +139,10 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
         Predicate::And(children) => children
             .iter()
             .all(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
-        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Or(children) => children
+            .iter()
+            .any(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
+        Predicate::Not(_) => true,
         Predicate::Leaf {
             index,
             data_type,

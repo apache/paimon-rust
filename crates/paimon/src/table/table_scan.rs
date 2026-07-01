@@ -843,7 +843,10 @@ mod tests {
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
-    use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
+    use crate::table::stats_filter::{
+        data_evolution_group_matches_predicates, data_file_matches_predicates,
+        group_by_overlapping_row_id,
+    };
     use crate::table::Table;
     use crate::Error;
     use chrono::{DateTime, Utc};
@@ -1327,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_file_matches_unsupported_predicate_fails_open() {
+    fn test_data_file_matches_or_prunes_when_no_child_matches() {
         let fields = int_field();
         let file = test_data_file_meta(
             int_stats_row(Some(10)),
@@ -1341,11 +1344,101 @@ mod tests {
             pb.greater_than("id", Datum::Int(25)).unwrap(),
         ]);
 
+        assert!(!data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_or_keeps_when_any_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(15)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
         assert!(data_file_matches_predicates(
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
             &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_not_fails_open() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = Predicate::negate(
+            PredicateBuilder::new(&fields)
+                .less_than("id", Datum::Int(5))
+                .unwrap(),
+        );
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_evolution_group_matches_or_prunes_when_no_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(5)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
+        assert!(!data_evolution_group_matches_predicates(
+            &[file],
+            &[predicate],
+            &fields,
+        ));
+    }
+
+    #[test]
+    fn test_data_evolution_group_matches_or_keeps_when_any_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(15)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
+        assert!(data_evolution_group_matches_predicates(
+            &[file],
+            &[predicate],
+            &fields,
         ));
     }
 
