@@ -177,6 +177,16 @@ impl TableProvider for PaimonTableProvider {
         // Plan splits eagerly so we know partition count upfront.
         let filter_analysis = analyze_filters(filters, self.table.schema().fields());
         let mut read_builder = self.table.new_read_builder();
+        let projected_columns = projection.map(|indices| {
+            indices
+                .iter()
+                .map(|&i| self.schema.field(i).name().clone())
+                .collect::<Vec<_>>()
+        });
+        if let Some(ref columns) = projected_columns {
+            let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
+            read_builder.with_projection(&col_refs);
+        }
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
@@ -365,6 +375,183 @@ mod tests {
             .collect()
     }
 
+    fn empty_binary_stats_json() -> serde_json::Value {
+        let row = paimon::spec::EMPTY_SERIALIZED_ROW.as_slice().to_vec();
+        serde_json::json!({
+            "_MIN_VALUES": row,
+            "_MAX_VALUES": row,
+            "_NULL_COUNTS": [],
+        })
+    }
+
+    fn data_evolution_file(
+        file_name: &str,
+        file_size: i64,
+        row_count: i64,
+        first_row_id: i64,
+        write_cols: &[&str],
+    ) -> paimon::spec::DataFileMeta {
+        serde_json::from_value(serde_json::json!({
+            "_FILE_NAME": file_name,
+            "_FILE_SIZE": file_size,
+            "_ROW_COUNT": row_count,
+            "_MIN_KEY": [],
+            "_MAX_KEY": [],
+            "_KEY_STATS": empty_binary_stats_json(),
+            "_VALUE_STATS": empty_binary_stats_json(),
+            "_MIN_SEQUENCE_NUMBER": 0,
+            "_MAX_SEQUENCE_NUMBER": 0,
+            "_SCHEMA_ID": 0,
+            "_LEVEL": 1,
+            "_EXTRA_FILES": [],
+            "_CREATION_TIME": null,
+            "_DELETE_ROW_COUNT": null,
+            "_EMBEDDED_FILE_INDEX": null,
+            "_FILE_SOURCE": null,
+            "_VALUE_STATS_COLS": null,
+            "_FIRST_ROW_ID": first_row_id,
+            "_WRITE_COLS": write_cols,
+            "_EXTERNAL_PATH": null,
+        }))
+        .expect("test data file should deserialize")
+    }
+
+    fn manifest_file_meta(
+        file_name: &str,
+        file_size: i64,
+        num_added_files: i64,
+    ) -> paimon::spec::ManifestFileMeta {
+        serde_json::from_value(serde_json::json!({
+            "_VERSION": 2,
+            "_FILE_NAME": file_name,
+            "_FILE_SIZE": file_size,
+            "_NUM_ADDED_FILES": num_added_files,
+            "_NUM_DELETED_FILES": 0,
+            "_PARTITION_STATS": empty_binary_stats_json(),
+            "_SCHEMA_ID": 0,
+        }))
+        .expect("test manifest file meta should deserialize")
+    }
+
+    async fn data_evolution_projection_pruning_provider() -> PaimonTableProvider {
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{
+            CommitKind, DataType, FileKind, IntType, Manifest, ManifestEntry, ManifestList,
+            Schema as PaimonSchema, Snapshot, TableSchema,
+        };
+        use paimon::table::{SnapshotManager, Table};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = format!("memory:/df_de_projection_pruning_{}", uuid::Uuid::new_v4());
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "df_de_projection_pruning"),
+            table_path.clone(),
+            table_schema,
+            None,
+        );
+
+        let partition = paimon::spec::EMPTY_SERIALIZED_ROW.as_slice().to_vec();
+        let entries = vec![
+            ManifestEntry::new(
+                FileKind::Add,
+                partition.clone(),
+                0,
+                1,
+                data_evolution_file("id.parquet", 11, 10, 0, &["id"]),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Add,
+                partition,
+                0,
+                1,
+                data_evolution_file("name.parquet", 13, 10, 0, &["name"]),
+                2,
+            ),
+        ];
+
+        let manifest_name = "manifest-de-projection-0";
+        let manifest_path = format!("{table_path}/manifest/{manifest_name}");
+        Manifest::write(&file_io, &manifest_path, &entries)
+            .await
+            .unwrap();
+        let manifest_size = file_io
+            .new_input(&manifest_path)
+            .unwrap()
+            .metadata()
+            .await
+            .unwrap()
+            .size;
+
+        let base_list_name = "base-list-de-projection";
+        let delta_list_name = "delta-list-de-projection";
+        ManifestList::write(
+            &file_io,
+            &format!("{table_path}/manifest/{base_list_name}"),
+            &[manifest_file_meta(
+                manifest_name,
+                manifest_size as i64,
+                entries.len() as i64,
+            )],
+        )
+        .await
+        .unwrap();
+        ManifestList::write(
+            &file_io,
+            &format!("{table_path}/manifest/{delta_list_name}"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list(base_list_name.to_string())
+            .delta_manifest_list(delta_list_name.to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(1)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1)
+            .total_record_count(Some(10))
+            .delta_record_count(Some(10))
+            .build();
+        let snapshot_manager = SnapshotManager::new(file_io, table_path);
+        assert!(snapshot_manager.commit_snapshot(&snapshot).await.unwrap());
+
+        PaimonTableProvider::try_new(table).expect("provider should be created")
+    }
+
+    fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {
+        let mut names = scan
+            .planned_partitions()
+            .iter()
+            .flat_map(|partition| partition.iter())
+            .flat_map(|split| split.data_files().iter())
+            .map(|file| file.file_name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[tokio::test]
     async fn test_scan_partition_filter_plans_matching_partition_set() {
         let provider = create_provider("partitioned_log_table").await;
@@ -473,6 +660,42 @@ mod tests {
             .expect("data filter should translate");
 
         assert_eq!(scan.pushed_predicate(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_scan_applies_projection_to_data_evolution_planning() {
+        let provider = data_evolution_projection_pruning_provider().await;
+        let config = SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        let state = ctx.state();
+
+        let full_plan = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect("full scan should succeed");
+        let full_scan = full_plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+        assert_eq!(
+            planned_file_names(full_scan),
+            vec!["id.parquet".to_string(), "name.parquet".to_string()]
+        );
+
+        let projection = vec![1];
+        let projected_plan = provider
+            .scan(&state, Some(&projection), &[], None)
+            .await
+            .expect("projected scan should succeed");
+        let projected_scan = projected_plan
+            .as_any()
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        assert_eq!(
+            planned_file_names(projected_scan),
+            vec!["name.parquet".to_string()]
+        );
     }
 
     #[tokio::test]
