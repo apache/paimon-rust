@@ -14,14 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::HashMap;
-
-use paimon::spec::Datum;
-use paimon::table::SnapShotManager;
-use paimon_datafusion::runtime::runtime;
 use std::sync::Arc;
 
+use paimon::spec::Datum;
+use paimon::table::SnapshotManager;
+use paimon_datafusion::runtime::runtime;
+
+use crate::error::to_py_err;
+use crate::predicate::py_to_datum;
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 
@@ -55,19 +58,22 @@ impl PyTable {
     fn new_read_builder(&self) -> PyReadBuilder {
         PyReadBuilder::new(Arc::clone(&self.inner))
     }
-
     fn expire_snapshots(&self, py: Python<'_>, older_than_ms: i64) -> PyResult<i64> {
         let rt = runtime();
         py.detach(|| {
             rt.block_on(async {
-                let snapshot_manager = SnapShotManager::new(Arc::clone(&self.inner));
+                let snapshot_manager = SnapshotManager::new(
+                    self.inner.file_io().clone(),
+                    self.inner.location().to_string(),
+                );
                 snapshot_manager
-                    .expire_snapshots_earlier_than(older_than_millis)
+                    .expire_snapshots_earlier_than(older_than_ms)
                     .await
                     .map_err(to_py_err)
             })
         })
     }
+
     fn remove_orphan_files(&self, py: Python<'_>) -> PyResult<i64> {
         let rt = runtime();
         py.detach(|| {
@@ -106,7 +112,8 @@ impl PyTable {
             commit.drop_partitions(vec![spec]).await.map_err(to_py_err)
         })
     }
-    fn trigger_compaction(&self, full_compact: bool) -> PyResult<()> {
+
+    fn trigger_compaction(&self, _full_compact: bool) -> PyResult<()> {
         todo!()
     }
 }

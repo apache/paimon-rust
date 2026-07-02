@@ -373,7 +373,7 @@ impl SnapshotManager {
 
     // Remove files which are not used by any snapshots and are not referenced by
     // manifest lists.
-    pub async fn remove_orphan_files(&self) -> crate::Result<()> {
+    pub async fn remove_orphan_files(&self) -> crate::Result<i64> {
         let snapshot_ids = self.list_all_ids().await?;
         let mut manifest_files = std::collections::HashSet::new();
         for snap_id in snapshot_ids {
@@ -385,7 +385,7 @@ impl SnapshotManager {
         let statuses = self.file_io.list_status(&manifest_dir).await?;
         let mut deleted_count = 0;
         for status in statuses {
-            if status.is_dir() {
+            if status.is_dir {
                 continue;
             }
             let name = status.path.rsplit('/').next().unwrap_or(&status.path);
@@ -396,7 +396,7 @@ impl SnapshotManager {
             }
         }
 
-        Ok(())
+        Ok(deleted_count)
     }
 
     /// Returns the snapshot whose commit time is earlier than or equal to the given
