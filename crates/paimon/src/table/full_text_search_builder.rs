@@ -121,17 +121,17 @@ impl<'a> FullTextSearchBuilder<'a> {
             None => return Ok(Vec::new()),
         };
 
-        let index_manifest_name = match snapshot.index_manifest() {
-            Some(name) => name.to_string(),
-            None => return Ok(Vec::new()),
+        let index_entries = match snapshot.index_manifest() {
+            Some(index_manifest_name) => {
+                let manifest_path = format!(
+                    "{}/manifest/{}",
+                    self.table.location().trim_end_matches('/'),
+                    index_manifest_name
+                );
+                IndexManifest::read(self.table.file_io(), &manifest_path).await?
+            }
+            None => Vec::new(),
         };
-
-        let manifest_path = format!(
-            "{}/manifest/{}",
-            self.table.location().trim_end_matches('/'),
-            index_manifest_name
-        );
-        let index_entries = IndexManifest::read(self.table.file_io(), &manifest_path).await?;
 
         evaluate_full_text_search(
             Some(self.table),
@@ -179,7 +179,7 @@ async fn evaluate_full_text_search(
         })
         .collect();
 
-    if fulltext_entries.is_empty() {
+    if fulltext_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast {
         return Ok(Vec::new());
     }
 
@@ -407,10 +407,16 @@ fn add_raw_full_text_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{DataType, IntType};
+    use crate::catalog::Identifier;
+    use crate::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use crate::table::table_write::TableWrite;
+    use crate::table::TableCommit;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_evaluate_full_mode_without_fulltext_entries_returns_empty() {
+    async fn test_evaluate_full_mode_without_fulltext_entries_uses_raw_path() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![DataField::new(
             1,
@@ -420,7 +426,7 @@ mod tests {
         let search = FullTextSearch::new("hello".to_string(), 10, "body".to_string()).unwrap();
         let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
 
-        let result = evaluate_full_text_search(
+        let err = evaluate_full_text_search(
             None,
             &file_io,
             "memory:///test_table",
@@ -431,7 +437,75 @@ mod tests {
             Some(10),
         )
         .await
-        .unwrap();
-        assert!(result.is_empty());
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Full-text raw search requires table context"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_full_mode_without_index_manifest_searches_raw_rows() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/full_text_raw_no_manifest";
+        setup_dirs(&file_io, table_path).await;
+        let table = full_text_raw_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&text_batch(vec!["hello world", "goodbye"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let mut builder = table.new_full_text_search_builder();
+        builder
+            .with_text_column("body")
+            .with_query_text("hello")
+            .with_limit(10);
+        let row_ranges = builder.execute().await.unwrap();
+
+        assert_eq!(row_ranges, vec![RowRange::new(0, 0)]);
+    }
+
+    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+    }
+
+    fn full_text_raw_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("body", DataType::VarChar(VarCharType::string_type()))
+            .option("row-tracking.enabled", "true")
+            .option("global-index.search-mode", "full")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "full_text_raw_no_manifest"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn text_batch(values: Vec<&str>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "body",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
     }
 }
