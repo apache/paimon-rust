@@ -32,12 +32,14 @@ use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
     DataField, DataFileMeta, FileKind, IndexManifest, ManifestEntry, PartitionComputer, Predicate,
-    Snapshot,
+    Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID,
+    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::split_for_batch;
 use crate::table::merge_tree_split_generator::{
     merge_tree_split_for_batch, KeyComparator, SplitGroup,
 };
+use crate::table::schema_manager::SchemaManager;
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
@@ -358,6 +360,186 @@ fn should_skip_level_zero_for_scan(
     deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
 }
 
+fn is_system_field_id(field_id: i32) -> bool {
+    matches!(
+        field_id,
+        ROW_ID_FIELD_ID | SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID
+    )
+}
+
+fn is_system_field_name(name: &str) -> bool {
+    matches!(
+        name,
+        ROW_ID_FIELD_NAME | SEQUENCE_NUMBER_FIELD_NAME | VALUE_KIND_FIELD_NAME
+    )
+}
+
+fn is_vector_store_file_name(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().contains(".vector.")
+}
+
+fn is_normal_data_file(file: &DataFileMeta) -> bool {
+    !crate::table::blob_file_writer::is_blob_file_name(&file.file_name)
+        && !is_vector_store_file_name(&file.file_name)
+}
+
+type DataFileFieldIdsCache = HashMap<(i64, Option<Vec<String>>), HashSet<i32>>;
+
+fn data_evolution_representative_file(group: &[DataFileMeta]) -> crate::Result<usize> {
+    let mut representative: Option<usize> = None;
+    for (idx, file) in group.iter().enumerate() {
+        if !is_normal_data_file(file) {
+            continue;
+        }
+        let should_replace = match representative {
+            None => true,
+            Some(current_idx) => {
+                let current = &group[current_idx];
+                (file.max_sequence_number, file.file_name.as_str())
+                    < (current.max_sequence_number, current.file_name.as_str())
+            }
+        };
+        if should_replace {
+            representative = Some(idx);
+        }
+    }
+    representative.ok_or_else(|| crate::Error::DataInvalid {
+        message: "Data-evolution row range group requires at least one normal data file."
+            .to_string(),
+        source: None,
+    })
+}
+
+async fn resolve_data_file_field_ids(
+    table_schema_id: i64,
+    table_fields: &[DataField],
+    schema_manager: &SchemaManager,
+    file: &DataFileMeta,
+) -> crate::Result<HashSet<i32>> {
+    let schema;
+    let fields = if file.schema_id == table_schema_id {
+        table_fields
+    } else {
+        schema = schema_manager.schema(file.schema_id).await?;
+        schema.fields()
+    };
+
+    let field_id_by_name = fields
+        .iter()
+        .map(|field| (field.name(), field.id()))
+        .collect::<HashMap<_, _>>();
+
+    let mut field_ids = HashSet::new();
+    match file.write_cols.as_ref() {
+        None => {
+            field_ids.extend(
+                fields
+                    .iter()
+                    .filter(|field| !is_system_field_id(field.id()))
+                    .map(|field| field.id()),
+            );
+        }
+        Some(write_cols) => {
+            for col in write_cols {
+                if is_system_field_name(col) {
+                    continue;
+                }
+                let Some(field_id) = field_id_by_name.get(col.as_str()) else {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Cannot find write column '{}' in schema {}.",
+                            col, file.schema_id
+                        ),
+                        source: None,
+                    });
+                };
+                if !is_system_field_id(*field_id) {
+                    field_ids.insert(*field_id);
+                }
+            }
+        }
+    }
+    Ok(field_ids)
+}
+
+async fn data_file_field_ids(
+    table_schema_id: i64,
+    table_fields: &[DataField],
+    schema_manager: &SchemaManager,
+    file: &DataFileMeta,
+    field_ids_cache: &mut DataFileFieldIdsCache,
+) -> crate::Result<HashSet<i32>> {
+    let key = (file.schema_id, file.write_cols.clone());
+    if let Some(field_ids) = field_ids_cache.get(&key) {
+        return Ok(field_ids.clone());
+    }
+
+    let field_ids =
+        resolve_data_file_field_ids(table_schema_id, table_fields, schema_manager, file).await?;
+    field_ids_cache.insert(key, field_ids.clone());
+    Ok(field_ids)
+}
+
+async fn prune_data_evolution_group_by_read_fields(
+    group: Vec<DataFileMeta>,
+    read_field_ids: &HashSet<i32>,
+    deletion_vectors_enabled: bool,
+    table_schema_id: i64,
+    table_fields: &[DataField],
+    schema_manager: &SchemaManager,
+    field_ids_cache: &mut DataFileFieldIdsCache,
+) -> crate::Result<Vec<DataFileMeta>> {
+    if read_field_ids.is_empty() || group.len() <= 1 {
+        return Ok(group);
+    }
+
+    let anchor_idx = if deletion_vectors_enabled {
+        Some(data_evolution_representative_file(&group)?)
+    } else {
+        None
+    };
+
+    let mut keep = Vec::with_capacity(group.len());
+    for (idx, file) in group.iter().enumerate() {
+        let file_field_ids = data_file_field_ids(
+            table_schema_id,
+            table_fields,
+            schema_manager,
+            file,
+            field_ids_cache,
+        )
+        .await?;
+        if file_field_ids
+            .iter()
+            .any(|field_id| read_field_ids.contains(field_id))
+        {
+            keep.push(idx);
+        }
+    }
+    if let Some(anchor_idx) = anchor_idx {
+        if !keep.contains(&anchor_idx) {
+            keep.push(anchor_idx);
+        }
+    }
+
+    if keep.is_empty() {
+        keep.push(data_evolution_representative_file(&group)?);
+    } else if keep.iter().any(|idx| !is_normal_data_file(&group[*idx]))
+        && !keep.iter().any(|idx| is_normal_data_file(&group[*idx]))
+    {
+        let representative_idx = data_evolution_representative_file(&group)?;
+        if !keep.contains(&representative_idx) {
+            keep.push(representative_idx);
+        }
+    }
+
+    let mut files = group.into_iter().map(Some).collect::<Vec<_>>();
+    Ok(keep
+        .into_iter()
+        .filter_map(|idx| files.get_mut(idx).and_then(Option::take))
+        .collect())
+}
+
 /// TableScan for full table scan (no incremental, no predicate).
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
@@ -375,6 +557,7 @@ pub struct TableScan<'a> {
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
+    projected_fields: Option<Vec<String>>,
 }
 
 impl<'a> TableScan<'a> {
@@ -394,6 +577,7 @@ impl<'a> TableScan<'a> {
             limit,
             row_ranges,
             scan_all_files: false,
+            projected_fields: None,
         }
     }
 
@@ -403,6 +587,7 @@ impl<'a> TableScan<'a> {
     /// the complete file set regardless of merge engine or DV settings.
     pub fn with_scan_all_files(mut self) -> Self {
         self.scan_all_files = true;
+        self.projected_fields = None;
         self
     }
 
@@ -419,6 +604,11 @@ impl<'a> TableScan<'a> {
         self
     }
 
+    pub(crate) fn with_projection(mut self, projected_fields: Option<Vec<String>>) -> Self {
+        self.projected_fields = projected_fields;
+        self
+    }
+
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
@@ -429,15 +619,18 @@ impl<'a> TableScan<'a> {
     ///
     /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
     pub async fn plan(&self) -> crate::Result<Plan> {
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match self.resolve_snapshot().await? {
             Some(snapshot) => snapshot,
             None => return Ok(Plan::new(Vec::new())),
         };
-        self.plan_snapshot(snapshot, None).await
+        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+            .await
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
@@ -447,8 +640,22 @@ impl<'a> TableScan<'a> {
             None => return Ok((Plan::new(Vec::new()), trace)),
         };
         trace.snapshot_id = Some(snapshot.id());
-        let plan = self.plan_snapshot(snapshot, Some(&mut trace)).await?;
+        let plan = self
+            .plan_snapshot(
+                snapshot,
+                data_evolution_read_field_ids.as_ref(),
+                Some(&mut trace),
+            )
+            .await?;
         Ok((plan, trace))
+    }
+
+    fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
+        super::read_builder::projected_read_field_ids(
+            self.table.identifier().full_name(),
+            self.table.schema().fields(),
+            self.projected_fields.as_ref(),
+        )
     }
 
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
@@ -633,12 +840,17 @@ impl<'a> TableScan<'a> {
     async fn plan_snapshot(
         &self,
         snapshot: Snapshot,
+        data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
+        let table_schema_id = self.table.schema().id();
+        let table_fields = self.table.schema().fields();
+        let schema_manager = self.table.schema_manager();
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
@@ -779,12 +991,9 @@ impl<'a> TableScan<'a> {
                 (None, self.row_ranges.clone())
             };
 
+        let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
         for ((partition, bucket), (total_buckets, data_files)) in groups {
-            let partition_row = if partition_computer.is_some() {
-                BinaryRow::from_serialized_bytes(&partition)?
-            } else {
-                BinaryRow::new(0)
-            };
+            let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
             let bucket_path = if let Some(ref computer) = partition_computer {
                 let partition_path = computer.generate_partition_path(&partition_row)?;
                 format!("{base_path}/{partition_path}{}", bucket_dir_name(bucket))
@@ -838,6 +1047,31 @@ impl<'a> TableScan<'a> {
                         trace.data_evolution_groups_pruned_by_row_ranges += before - groups.len();
                     }
                     groups
+                } else {
+                    row_id_groups
+                };
+
+                let row_id_groups = if let Some(read_field_ids) = data_evolution_read_field_ids {
+                    if read_field_ids.is_empty() {
+                        row_id_groups
+                    } else {
+                        let mut pruned = Vec::with_capacity(row_id_groups.len());
+                        for group in row_id_groups {
+                            pruned.push(
+                                prune_data_evolution_group_by_read_fields(
+                                    group,
+                                    read_field_ids,
+                                    deletion_vectors_enabled,
+                                    table_schema_id,
+                                    table_fields,
+                                    schema_manager,
+                                    &mut data_file_field_ids_cache,
+                                )
+                                .await?,
+                            );
+                        }
+                        pruned
+                    }
                 } else {
                     row_id_groups
                 };
@@ -962,7 +1196,9 @@ impl<'a> TableScan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_skip_level_zero_for_scan, TableScan};
+    use super::{
+        prune_data_evolution_group_by_read_fields, should_skip_level_zero_for_scan, TableScan,
+    };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
@@ -974,11 +1210,15 @@ mod tests {
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
-    use crate::table::stats_filter::{data_file_matches_predicates, group_by_overlapping_row_id};
+    use crate::table::stats_filter::{
+        data_evolution_group_matches_predicates, data_file_matches_predicates,
+        group_by_overlapping_row_id,
+    };
     use crate::table::{CommitMessage, Table, TableCommit};
     use crate::Error;
+    use bytes::Bytes;
     use chrono::{DateTime, Utc};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// Helper to build a DataFileMeta with data evolution fields.
     fn make_evo_file(
@@ -1010,6 +1250,62 @@ mod tests {
             file_source: None,
             value_stats_cols: None,
         }
+    }
+
+    fn make_evo_file_with_cols(
+        name: &str,
+        row_count: i64,
+        max_seq: i64,
+        first_row_id: i64,
+        write_cols: &[&str],
+    ) -> DataFileMeta {
+        let mut file = make_evo_file(name, 10, row_count, max_seq, Some(first_row_id));
+        file.write_cols = Some(write_cols.iter().map(|col| (*col).to_string()).collect());
+        file
+    }
+
+    fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let schema = schema.copy_with_options(HashMap::from([(
+            "data-evolution.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "de_table"),
+            table_path.to_string(),
+            schema,
+            None,
+        )
+    }
+
+    fn two_column_schema(id: i64, left: &str, right: &str) -> TableSchema {
+        TableSchema::new(
+            id,
+            &PaimonSchema::builder()
+                .column(left, DataType::Int(IntType::new()))
+                .column(right, DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    async fn write_schema_file(table: &Table, schema: &TableSchema) {
+        let path = table.schema_manager().schema_path(schema.id());
+        let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap();
+        table.file_io().mkdirs(dir).await.unwrap();
+        let json = serde_json::to_vec(schema).unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(json))
+            .await
+            .unwrap();
+    }
+
+    fn file_names_from_files(files: &[DataFileMeta]) -> Vec<&str> {
+        files.iter().map(|file| file.file_name.as_str()).collect()
     }
 
     #[test]
@@ -1394,6 +1690,179 @@ mod tests {
         assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
     }
 
+    #[tokio::test]
+    async fn test_data_evolution_prunes_files_without_projected_columns() {
+        let table =
+            data_evolution_test_table("memory:/de_prune_cols", two_column_schema(0, "id", "name"));
+        let read_field_ids = HashSet::from([1]);
+        let files = vec![
+            make_evo_file_with_cols("id.parquet", 10, 1, 0, &["id"]),
+            make_evo_file_with_cols("name.parquet", 10, 2, 0, &["name"]),
+        ];
+        let mut field_ids_cache = HashMap::new();
+
+        let pruned = prune_data_evolution_group_by_read_fields(
+            files,
+            &read_field_ids,
+            false,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut field_ids_cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_names_from_files(&pruned), vec!["name.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_pruning_keeps_dv_anchor() {
+        let table =
+            data_evolution_test_table("memory:/de_prune_dv", two_column_schema(0, "id", "name"));
+        let read_field_ids = HashSet::from([1]);
+        let files = vec![
+            make_evo_file_with_cols("new-name.parquet", 10, 5, 0, &["name"]),
+            make_evo_file_with_cols("old-id.parquet", 10, 1, 0, &["id"]),
+        ];
+        let mut field_ids_cache = HashMap::new();
+
+        let pruned = prune_data_evolution_group_by_read_fields(
+            files,
+            &read_field_ids,
+            true,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut field_ids_cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_names_from_files(&pruned),
+            vec!["new-name.parquet", "old-id.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_pruning_keeps_row_count_representative() {
+        let table = data_evolution_test_table(
+            "memory:/de_prune_representative",
+            two_column_schema(0, "id", "name"),
+        );
+        let read_field_ids = HashSet::from([2]);
+        let files = vec![
+            make_evo_file_with_cols("new-name.parquet", 10, 5, 0, &["name"]),
+            make_evo_file_with_cols("old-id.parquet", 10, 1, 0, &["id"]),
+        ];
+        let mut field_ids_cache = HashMap::new();
+
+        let pruned = prune_data_evolution_group_by_read_fields(
+            files,
+            &read_field_ids,
+            false,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut field_ids_cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_names_from_files(&pruned), vec!["old-id.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_pruning_matches_renamed_columns_by_field_id() {
+        let schema_v0 = two_column_schema(0, "id", "old_name");
+        let schema_v1 = two_column_schema(1, "id", "new_name");
+        let table = data_evolution_test_table("memory:/de_prune_rename", schema_v1);
+        write_schema_file(&table, &schema_v0).await;
+
+        let read_field_ids = HashSet::from([1]);
+        let mut file = make_evo_file_with_cols("renamed.parquet", 10, 1, 0, &["old_name"]);
+        file.schema_id = 0;
+        let pruned = prune_data_evolution_group_by_read_fields(
+            vec![
+                make_evo_file_with_cols("id.parquet", 10, 2, 0, &["id"]),
+                file,
+            ],
+            &read_field_ids,
+            false,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_names_from_files(&pruned), vec!["renamed.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_pruning_keeps_normal_representative_for_vector_file() {
+        let table =
+            data_evolution_test_table("memory:/de_prune_vector", two_column_schema(0, "id", "emb"));
+        let read_field_ids = HashSet::from([1]);
+        let files = vec![
+            make_evo_file_with_cols("data.parquet", 10, 1, 0, &["id"]),
+            make_evo_file_with_cols("emb.vector.parquet", 10, 2, 0, &["emb"]),
+        ];
+        let mut field_ids_cache = HashMap::new();
+
+        let pruned = prune_data_evolution_group_by_read_fields(
+            files,
+            &read_field_ids,
+            false,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut field_ids_cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            file_names_from_files(&pruned),
+            vec!["emb.vector.parquet", "data.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_pruning_rejects_group_without_normal_representative() {
+        let table = data_evolution_test_table(
+            "memory:/de_prune_no_normal",
+            two_column_schema(0, "id", "emb"),
+        );
+        let read_field_ids = HashSet::from([1]);
+        let files = vec![
+            make_evo_file_with_cols("emb-1.vector.parquet", 10, 1, 0, &["emb"]),
+            make_evo_file_with_cols("emb-2.vector.parquet", 10, 2, 0, &["emb"]),
+        ];
+        let mut field_ids_cache = HashMap::new();
+
+        let err = prune_data_evolution_group_by_read_fields(
+            files,
+            &read_field_ids,
+            false,
+            table.schema().id(),
+            table.schema().fields(),
+            table.schema_manager(),
+            &mut field_ids_cache,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::DataInvalid { message, .. } => {
+                assert!(message.contains("requires at least one normal data file"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_group_by_overlapping_row_id_overlapping_ranges() {
         let files = vec![
@@ -1472,7 +1941,7 @@ mod tests {
 
         TableCommit::new(table.clone(), "scan-trace-test".to_string())
             .commit(vec![CommitMessage::new(
-                Vec::new(),
+                BinaryRowBuilder::new(0).build_serialized(),
                 0,
                 vec![
                     stats_trace_file("stats-1.parquet", 1, 2),
@@ -1537,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_file_matches_unsupported_predicate_fails_open() {
+    fn test_data_file_matches_or_prunes_when_no_child_matches() {
         let fields = int_field();
         let file = test_data_file_meta(
             int_stats_row(Some(10)),
@@ -1551,11 +2020,101 @@ mod tests {
             pb.greater_than("id", Datum::Int(25)).unwrap(),
         ]);
 
+        assert!(!data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_or_keeps_when_any_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(15)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
         assert!(data_file_matches_predicates(
             &file,
             &[predicate],
             TEST_SCHEMA_ID,
             &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_not_fails_open() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = Predicate::negate(
+            PredicateBuilder::new(&fields)
+                .less_than("id", Datum::Int(5))
+                .unwrap(),
+        );
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_evolution_group_matches_or_prunes_when_no_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(5)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
+        assert!(!data_evolution_group_matches_predicates(
+            &[file],
+            &[predicate],
+            &fields,
+        ));
+    }
+
+    #[test]
+    fn test_data_evolution_group_matches_or_keeps_when_any_child_matches() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let pb = PredicateBuilder::new(&fields);
+        let predicate = Predicate::or(vec![
+            pb.less_than("id", Datum::Int(15)).unwrap(),
+            pb.greater_than("id", Datum::Int(25)).unwrap(),
+        ]);
+
+        assert!(data_evolution_group_matches_predicates(
+            &[file],
+            &[predicate],
+            &fields,
         ));
     }
 

@@ -41,7 +41,7 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -68,7 +68,7 @@ jobs:
           - { os: ubuntu-latest, target: "x86_64" }
           - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: PyO3/maturin-action@v1
         with:

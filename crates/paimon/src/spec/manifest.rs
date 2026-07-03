@@ -62,7 +62,27 @@ impl Manifest {
 
     /// Write manifest entries to a file.
     pub async fn write(file_io: &FileIO, path: &str, entries: &[ManifestEntry]) -> Result<()> {
-        let bytes = crate::spec::to_avro_bytes(MANIFEST_ENTRY_SCHEMA, entries)?;
+        Self::write_with_compression(
+            file_io,
+            path,
+            entries,
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .await
+    }
+
+    /// Write manifest entries to a file with the configured Avro compression.
+    pub async fn write_with_compression(
+        file_io: &FileIO,
+        path: &str,
+        entries: &[ManifestEntry],
+        compression: &str,
+    ) -> Result<()> {
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            MANIFEST_ENTRY_SCHEMA,
+            entries,
+            compression,
+        )?;
         let output = file_io.new_output(path)?;
         output.write(bytes::Bytes::from(bytes)).await
     }

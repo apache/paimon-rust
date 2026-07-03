@@ -413,7 +413,7 @@ impl PartitionBucket {
 /// Input split for reading: partition + bucket + list of data files and optional deletion files.
 ///
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataSplit {
     snapshot_id: i64,
     partition: BinaryRow,
@@ -484,10 +484,9 @@ impl DataSplit {
         self.deletion_file_for_data_file_index(index)
     }
 
-    /// Full path for a single data file in this split (bucket_path + file_name).
+    /// Full path for a single data file in this split, respecting `_EXTERNAL_PATH`.
     pub fn data_file_path(&self, file: &DataFileMeta) -> String {
-        let base = self.bucket_path.trim_end_matches('/');
-        format!("{}/{}", base, file.file_name)
+        file.data_file_path(&self.bucket_path)
     }
 
     /// Total row count of all data files in this split.
@@ -778,11 +777,41 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn data_split_serde_json_round_trip() {
+        let split = DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .build()
+            .unwrap();
+
+        let bytes = serde_json::to_vec(&split).expect("serialize");
+        let restored: DataSplit = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.snapshot_id(), split.snapshot_id());
+        assert_eq!(restored.bucket(), split.bucket());
+        assert_eq!(restored.bucket_path(), split.bucket_path());
+    }
+
     /// Raw convertible split without deletion files: physical sum is exact.
     #[test]
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    #[test]
+    fn test_data_file_path_prefers_external_path() {
+        let mut f = file("data-0.parquet", 10, None);
+        f.external_path = Some("s3://bucket/table-external/data-0.parquet".to_string());
+        let s = split(vec![f.clone()], true);
+        assert_eq!(
+            s.data_file_path(&f),
+            "s3://bucket/table-external/data-0.parquet"
+        );
     }
 
     /// Merge-needed split (multiple versions of a key may collapse): the

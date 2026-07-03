@@ -103,6 +103,8 @@ pub enum DataType {
     /// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
     /// description.
     Row(RowType),
+    /// Data type of a fixed-size dense vector `VECTOR<element, length>`.
+    Vector(VectorType),
 }
 
 impl DataType {
@@ -115,6 +117,7 @@ impl DataType {
             DataType::Array(v) => v.element_type.contains_row_type(),
             DataType::Map(v) => v.key_type.contains_row_type() || v.value_type.contains_row_type(),
             DataType::Multiset(v) => v.element_type.contains_row_type(),
+            DataType::Vector(v) => v.element_type.contains_row_type(),
             _ => false,
         }
     }
@@ -147,6 +150,7 @@ impl DataType {
             DataType::Map(v) => v.nullable,
             DataType::Multiset(v) => v.nullable,
             DataType::Row(v) => v.nullable,
+            DataType::Vector(v) => v.nullable,
         }
     }
 
@@ -201,6 +205,11 @@ impl DataType {
             DataType::Row(v) => {
                 DataType::Row(RowType::with_nullable(nullable, v.fields().to_vec()))
             }
+            DataType::Vector(v) => DataType::Vector(VectorType::try_new(
+                nullable,
+                v.length(),
+                v.element_type().clone(),
+            )?),
         })
     }
 }
@@ -238,6 +247,202 @@ impl ArrayType {
 
     pub fn element_type(&self) -> &DataType {
         &self.element_type
+    }
+}
+
+/// VectorType for paimon.
+///
+/// Data type of a fixed-size dense vector `VECTOR<element, length>`. Elements are densely
+/// stored. The element type must be one of BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT,
+/// DOUBLE, and `length` must be between 1 and `i32::MAX` (both inclusive).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/VectorType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VectorType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VECTOR>>")]
+    nullable: bool,
+    #[serde(rename = "element")]
+    element_type: Box<DataType>,
+    length: u32,
+}
+
+impl VectorType {
+    /// Maximum vector length, matching Java `Integer.MAX_VALUE`.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
+    /// Minimum vector length.
+    pub const MIN_LENGTH: u32 = 1;
+
+    pub fn new(length: u32, element_type: DataType) -> Result<Self> {
+        Self::try_new(true, length, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, length: u32, element_type: DataType) -> Result<Self> {
+        Self::try_new(nullable, length, element_type)
+    }
+
+    pub fn try_new(nullable: bool, length: u32, element_type: DataType) -> Result<Self> {
+        if !Self::is_valid_element_type(&element_type) {
+            return Err(Error::DataTypeInvalid {
+                message: format!("Invalid element type for vector: {element_type:?}"),
+            });
+        }
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Vector length must be between {} and {} (both inclusive), got {length}.",
+                    Self::MIN_LENGTH,
+                    Self::MAX_LENGTH
+                ),
+            });
+        }
+        Ok(Self {
+            nullable,
+            element_type: Box::new(element_type),
+            length,
+        })
+    }
+
+    fn is_valid_element_type(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Boolean(_)
+                | DataType::TinyInt(_)
+                | DataType::SmallInt(_)
+                | DataType::Int(_)
+                | DataType::BigInt(_)
+                | DataType::Float(_)
+                | DataType::Double(_)
+        )
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
+    }
+
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// SQL name of a valid vector element type.
+    fn element_sql_name(&self) -> &'static str {
+        match self.element_type.as_ref() {
+            DataType::Boolean(_) => "BOOLEAN",
+            DataType::TinyInt(_) => "TINYINT",
+            DataType::SmallInt(_) => "SMALLINT",
+            DataType::Int(_) => "INT",
+            DataType::BigInt(_) => "BIGINT",
+            DataType::Float(_) => "FLOAT",
+            DataType::Double(_) => "DOUBLE",
+            other => {
+                unreachable!("vector element type validated at construction: {other:?}")
+            }
+        }
+    }
+}
+
+impl Display for VectorType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Match Java VectorType.asSQLString: the element is rendered with its own
+        // SQL string, which includes the element's nullability suffix.
+        write!(f, "VECTOR<{}", self.element_sql_name())?;
+        if !self.element_type.is_nullable() {
+            write!(f, " NOT NULL")?;
+        }
+        write!(f, ", {}>", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+// Hand-written `Deserialize` (rather than `#[derive(Deserialize)]` with
+// `#[serde(try_from = ...)]`): the derive-based `try_from` path does not compose
+// with the untagged `DataType` enum for a struct carrying a numeric (`length`)
+// field — under `#[serde(untagged)]` serde buffers input into a `Content` value
+// and replays it through a `ContentDeserializer`, which mis-handles the
+// `serde_with` layering. This visitor parses the Java JSON shape directly and
+// routes through `VectorType::try_new` so validation still runs on deserialize.
+impl<'de> Deserialize<'de> for VectorType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            #[serde(rename = "type")]
+            Type,
+            Element,
+            Length,
+        }
+
+        struct VectorTypeVisitor;
+
+        impl<'de> Visitor<'de> for VectorTypeVisitor {
+            type Value = VectorType;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a VECTOR data type object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<VectorType, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut nullable: Option<bool> = None;
+                let mut element_type: Option<Box<DataType>> = None;
+                let mut length: Option<u32> = None;
+
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        Field::Type => {
+                            if nullable.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            // Reuse the shared `VECTOR`/`VECTOR NOT NULL` parsing.
+                            let raw: serde_utils::NullableType<serde_utils::VECTOR> =
+                                map.next_value()?;
+                            nullable = Some(raw.into());
+                        }
+                        Field::Element => {
+                            if element_type.is_some() {
+                                return Err(de::Error::duplicate_field("element"));
+                            }
+                            element_type = Some(map.next_value()?);
+                        }
+                        Field::Length => {
+                            if length.is_some() {
+                                return Err(de::Error::duplicate_field("length"));
+                            }
+                            length = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let nullable = nullable.ok_or_else(|| de::Error::missing_field("type"))?;
+                let element_type =
+                    element_type.ok_or_else(|| de::Error::missing_field("element"))?;
+                let length = length.ok_or_else(|| de::Error::missing_field("length"))?;
+
+                VectorType::try_new(nullable, length, *element_type).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "VectorType",
+            &["type", "element", "length"],
+            VectorTypeVisitor,
+        )
     }
 }
 
@@ -1507,6 +1712,11 @@ mod serde_utils {
         const NAME: &'static str = "ARRAY";
     }
 
+    pub struct VECTOR;
+    impl DataTypeName for VECTOR {
+        const NAME: &'static str = "VECTOR";
+    }
+
     pub struct BIGINT;
     impl DataTypeName for BIGINT {
         const NAME: &'static str = "BIGINT";
@@ -2275,5 +2485,151 @@ mod tests {
         length_token
             .parse::<i32>()
             .expect("VARBINARY length must parse as Java int");
+    }
+
+    #[test]
+    fn test_vector_type_construction_valid_elements() {
+        for elem in [
+            DataType::Boolean(BooleanType::new()),
+            DataType::TinyInt(TinyIntType::new()),
+            DataType::SmallInt(SmallIntType::new()),
+            DataType::Int(IntType::new()),
+            DataType::BigInt(BigIntType::new()),
+            DataType::Float(FloatType::new()),
+            DataType::Double(DoubleType::new()),
+        ] {
+            let v = VectorType::try_new(true, 8, elem.clone()).unwrap();
+            assert_eq!(v.length(), 8);
+            assert_eq!(v.element_type(), &elem);
+        }
+    }
+
+    #[test]
+    fn test_vector_type_rejects_invalid_element() {
+        let err = VectorType::try_new(true, 4, DataType::VarChar(VarCharType::new(10).unwrap()));
+        assert!(matches!(err, Err(Error::DataTypeInvalid { .. })));
+        let err = VectorType::try_new(
+            true,
+            4,
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        );
+        assert!(matches!(err, Err(Error::DataTypeInvalid { .. })));
+    }
+
+    #[test]
+    fn test_vector_type_rejects_bad_length() {
+        assert!(matches!(
+            VectorType::try_new(true, 0, DataType::Float(FloatType::new())),
+            Err(Error::DataTypeInvalid { .. })
+        ));
+        assert!(VectorType::try_new(true, 1, DataType::Float(FloatType::new())).is_ok());
+        let too_big = i32::MAX as u32 + 1;
+        assert!(matches!(
+            VectorType::try_new(true, too_big, DataType::Float(FloatType::new())),
+            Err(Error::DataTypeInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_type_display() {
+        let v = VectorType::try_new(true, 128, DataType::Float(FloatType::new())).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT, 128>");
+        let v = VectorType::try_new(false, 128, DataType::Float(FloatType::new())).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT, 128> NOT NULL");
+
+        // The element's own nullability is rendered too (matches Java asSQLString and
+        // is consistent with serde, which preserves the element's "FLOAT NOT NULL").
+        let v =
+            VectorType::try_new(true, 4, DataType::Float(FloatType::with_nullable(false))).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT NOT NULL, 4>");
+        let v = VectorType::try_new(false, 4, DataType::Float(FloatType::with_nullable(false)))
+            .unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT NOT NULL, 4> NOT NULL");
+    }
+
+    #[test]
+    fn test_vector_type_serde_roundtrip() {
+        // Atomic element types serialize as bare strings (e.g. "FLOAT"), matching
+        // the existing ARRAY wire form (see tests/fixtures/array_type.json), not as
+        // nested objects. Pin the exact JSON so the wire shape cannot drift.
+        let v = VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap();
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, r#"{"type":"VECTOR","element":"FLOAT","length":3}"#);
+        let back: VectorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+
+        let nn = VectorType::try_new(false, 2, DataType::Double(DoubleType::new())).unwrap();
+        let json = serde_json::to_string(&nn).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"VECTOR NOT NULL","element":"DOUBLE","length":2}"#
+        );
+        let back: VectorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, nn);
+    }
+
+    #[test]
+    fn test_vector_type_deserialize_rejects_invalid() {
+        // Use the real string-form element so the failure is the vector's own
+        // validation (invalid element type / bad length), not a failure to parse
+        // the element itself.
+        let bad_elem = r#"{"type":"VECTOR","element":"VARCHAR(10)","length":4}"#;
+        let err = serde_json::from_str::<VectorType>(bad_elem).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid element type for vector"),
+            "expected element-type validation error, got: {err}"
+        );
+
+        let bad_len = r#"{"type":"VECTOR","element":"FLOAT","length":0}"#;
+        let err = serde_json::from_str::<VectorType>(bad_len).unwrap_err();
+        assert!(
+            err.to_string().contains("Vector length must be between"),
+            "expected length validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_datatype_vector_untagged_roundtrip() {
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let json = serde_json::to_string(&dt).unwrap();
+        let back: DataType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, dt);
+        assert!(matches!(back, DataType::Vector(_)));
+
+        // ARRAY must still parse as Array, not Vector. Atomic element types are
+        // serialized as bare strings (e.g. "FLOAT") in this codebase, not objects.
+        let arr_json = r#"{"type":"ARRAY","element":"FLOAT"}"#;
+        let arr: DataType = serde_json::from_str(arr_json).unwrap();
+        assert!(matches!(arr, DataType::Array(_)));
+    }
+
+    #[test]
+    fn test_datatype_vector_nullable_and_copy() {
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        assert!(dt.is_nullable());
+        let nn = dt.copy_with_nullable(false).unwrap();
+        assert!(!nn.is_nullable());
+        if let DataType::Vector(v) = &nn {
+            assert_eq!(v.length(), 4);
+            assert_eq!(v.element_type(), &DataType::Float(FloatType::new()));
+        } else {
+            panic!("expected Vector");
+        }
+        assert!(!dt.contains_row_type());
+    }
+
+    #[test]
+    fn test_datatype_vector_arrow_conversion() {
+        // PR 2 lifted the PR 1 boundary: Vector now converts to an Arrow
+        // FixedSizeList (see arrow/mod.rs for the full conversion test matrix).
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let arrow = crate::arrow::paimon_type_to_arrow(&dt).unwrap();
+        assert!(matches!(arrow, arrow_schema::DataType::FixedSizeList(_, 4)));
     }
 }

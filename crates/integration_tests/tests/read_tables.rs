@@ -182,6 +182,29 @@ fn extract_id_name_dt(batches: &[RecordBatch]) -> Vec<(i32, String, String)> {
     rows
 }
 
+fn collect_rows_as_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                if column.is_null(row_index) {
+                    row.push("NULL".to_string());
+                } else if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
+                    row.push(values.value(row_index).to_string());
+                } else if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                    row.push(values.value(row_index).to_string());
+                } else {
+                    panic!("unsupported column type for {}", field.name());
+                }
+            }
+            rows.push(row);
+        }
+    }
+    rows.sort();
+    rows
+}
+
 fn extract_plan_partitions(plan: &Plan) -> HashSet<String> {
     plan.splits()
         .iter()
@@ -729,7 +752,7 @@ async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() 
         Predicate::and(vec![
             pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
             pb.equal("hr", Datum::Int(10)).unwrap(),
-            pb.greater_than("id", Datum::Int(10)).unwrap(),
+            pb.greater_than("id", Datum::Int(0)).unwrap(),
         ]),
         Predicate::and(vec![
             pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
@@ -757,8 +780,9 @@ async fn test_read_multi_partitioned_table_or_of_mixed_ands_prunes_partitions() 
     );
 }
 
-/// A directly mixed OR like `dt = '...' OR id > 10` is still not safely
-/// splittable into a partition predicate, so no partitions should be pruned.
+/// A directly mixed OR like `dt = '...' OR id > 0` is still not safely
+/// splittable into a partition predicate. The data predicate branch may match
+/// all provisioned files, so this isolates partition projection behavior.
 #[tokio::test]
 async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
     use paimon::spec::{Datum, Predicate, PredicateBuilder};
@@ -770,7 +794,7 @@ async fn test_read_partitioned_table_mixed_or_filter_preserves_all() {
 
     let filter = Predicate::or(vec![
         pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
-        pb.greater_than("id", Datum::Int(10)).unwrap(),
+        pb.greater_than("id", Datum::Int(0)).unwrap(),
     ]);
 
     let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
@@ -1277,6 +1301,136 @@ async fn test_read_format_schema_evolution_add_column() {
     );
 }
 
+#[tokio::test]
+async fn test_read_partitioned_format_schema_evolution_add_column() {
+    use paimon::spec::{Datum, Predicate, PredicateBuilder};
+
+    let table_name = "partitioned_format_schema_evolution_add_column";
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, table_name).await;
+    let (plan, batches) = scan_and_read(&catalog, table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+    assert_plan_has_multiple_schema_ids(&plan, table_name);
+    assert_eq!(
+        extract_plan_partitions(&plan),
+        HashSet::from([
+            "2024-01-01".to_string(),
+            "2024-01-02".to_string(),
+            "2024-01-03".to_string(),
+        ]),
+        "Full scan should include all dt partitions"
+    );
+
+    let mut rows: Vec<(String, i32, String, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let dt = batch
+            .column_by_name("dt")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("dt");
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let extra = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("extra");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                dt.value(i).to_string(),
+                id.value(i),
+                name.value(i).to_string(),
+                (!extra.is_null(i)).then(|| extra.value(i).to_string()),
+            ));
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    assert_eq!(
+        rows,
+        vec![
+            ("2024-01-01".into(), 1, "alice".into(), None),
+            (
+                "2024-01-01".into(),
+                3,
+                "carol".into(),
+                Some("orc-extra-1".into()),
+            ),
+            ("2024-01-02".into(), 2, "bob".into(), None),
+            (
+                "2024-01-02".into(),
+                5,
+                "eve".into(),
+                Some("avro-extra-1".into()),
+            ),
+            (
+                "2024-01-03".into(),
+                4,
+                "dave".into(),
+                Some("orc-extra-2".into()),
+            ),
+            (
+                "2024-01-03".into(),
+                6,
+                "frank".into(),
+                Some("avro-extra-2".into()),
+            ),
+        ],
+        "Old partitioned Parquet rows should null-fill extra and new ORC/Avro rows should keep values"
+    );
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let filter = pb
+        .equal("dt", Datum::String("2024-01-02".into()))
+        .expect("Failed to build predicate");
+    let (plan, batches) = scan_and_read_with_filter(&table, filter).await;
+    assert_eq!(
+        extract_plan_partitions(&plan),
+        HashSet::from(["2024-01-02".to_string()]),
+        "dt filter should prune unrelated partitions"
+    );
+    assert_eq!(
+        extract_id_name_dt(&batches),
+        vec![
+            (2, "bob".into(), "2024-01-02".into()),
+            (5, "eve".into(), "2024-01-02".into()),
+        ]
+    );
+
+    let filter = Predicate::and(vec![
+        pb.equal("dt", Datum::String("2024-01-03".into())).unwrap(),
+        pb.equal("extra", Datum::String("avro-extra-2".into()))
+            .unwrap(),
+    ]);
+    let (plan, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["dt", "id", "extra"]), filter)
+            .await;
+    assert_eq!(
+        extract_plan_partitions(&plan),
+        HashSet::from(["2024-01-03".to_string()]),
+        "Partition predicate should still prune when projection includes dt and filter uses extra"
+    );
+    assert_eq!(extract_ids(&batches), vec![6]);
+
+    let filter = Predicate::and(vec![
+        pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+        pb.is_null("extra").unwrap(),
+    ]);
+    let (plan, batches) =
+        scan_and_read_with_projection_and_filter(&table, Some(&["dt", "id", "extra"]), filter)
+            .await;
+    assert_eq!(
+        extract_plan_partitions(&plan),
+        HashSet::from(["2024-01-01".to_string()]),
+        "extra IS NULL with dt filter should retain only the matching old-schema partition file"
+    );
+    assert_eq!(extract_ids(&batches), vec![1]);
+}
+
 /// Test reading mixed-format files after ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
 /// Old Parquet files have INT; newer ORC/Avro files have BIGINT.
 #[tokio::test]
@@ -1523,6 +1677,98 @@ async fn test_read_data_evolution_type_promotion() {
         rows,
         vec![(1, 999i64), (2, 200i64), (3, 3_000_000_000i64)],
         "Data evolution + type promotion: INT should be cast to BIGINT, MERGE INTO updates value"
+    );
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_mixed_format_add_column() {
+    let table_name = "data_evolution_mixed_format_add_column";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+    assert_plan_has_multiple_schema_ids(&plan, table_name);
+
+    let mut rows: Vec<(i32, String, i32, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("value");
+        let extra = batch
+            .column_by_name("extra")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("extra");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                id.value(i),
+                name.value(i).to_string(),
+                value.value(i),
+                (!extra.is_null(i)).then(|| extra.value(i).to_string()),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".into(), 100, None),
+            (2, "bob".into(), 200, None),
+            (3, "carol".into(), 300, Some("orc-extra".into())),
+            (4, "dave".into(), 400, Some("avro-extra".into())),
+        ],
+        "Mixed-format data evolution should null-fill old extra values and preserve new values"
+    );
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_mixed_format_type_promotion() {
+    let table_name = "data_evolution_mixed_format_type_promotion";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+    assert_plan_has_multiple_schema_ids(&plan, table_name);
+
+    for batch in &batches {
+        let value_col = batch.column_by_name("value").expect("value column");
+        assert_eq!(
+            value_col.data_type(),
+            &arrow_array::types::Int64Type::DATA_TYPE,
+            "value column should be Int64 after mixed-format data-evolution type promotion"
+        );
+    }
+
+    let mut rows: Vec<(i32, i64)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("value as Int64Array");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, 100i64),
+            (2, 200i64),
+            (3, 3_000_000_000i64),
+            (4, 4_000_000_000i64),
+        ],
+        "Mixed-format data evolution should promote INT to BIGINT"
     );
 }
 
@@ -2373,6 +2619,155 @@ async fn test_time_travel_by_tag_name() {
 }
 
 #[tokio::test]
+async fn time_travel_schema_evolution() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "time_travel_schema_evolution").await;
+
+    for (tag, expected_fields, expected_rows) in [
+        (
+            "before_add_column",
+            vec!["id", "name"],
+            vec![vec!["1", "alice"], vec!["2", "bob"]],
+        ),
+        (
+            "after_add_column",
+            vec!["id", "name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+            ],
+        ),
+        (
+            "before_rename",
+            vec!["id", "name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+            ],
+        ),
+        (
+            "after_rename",
+            vec!["id", "full_name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+                vec!["5", "erin", "50"],
+                vec!["6", "frank", "60"],
+            ],
+        ),
+        (
+            "before_drop",
+            vec!["id", "full_name", "age"],
+            vec![
+                vec!["1", "alice", "NULL"],
+                vec!["2", "bob", "NULL"],
+                vec!["3", "carol", "30"],
+                vec!["4", "dave", "40"],
+                vec!["5", "erin", "50"],
+                vec!["6", "frank", "60"],
+            ],
+        ),
+        (
+            "after_drop",
+            vec!["id", "full_name"],
+            vec![
+                vec!["1", "alice"],
+                vec!["2", "bob"],
+                vec!["3", "carol"],
+                vec!["4", "dave"],
+                vec!["5", "erin"],
+                vec!["6", "frank"],
+                vec!["7", "grace"],
+                vec!["8", "hank"],
+            ],
+        ),
+        (
+            "before_reorder",
+            vec!["id", "full_name"],
+            vec![
+                vec!["1", "alice"],
+                vec!["2", "bob"],
+                vec!["3", "carol"],
+                vec!["4", "dave"],
+                vec!["5", "erin"],
+                vec!["6", "frank"],
+                vec!["7", "grace"],
+                vec!["8", "hank"],
+            ],
+        ),
+        (
+            "after_reorder",
+            vec!["full_name", "id"],
+            vec![
+                vec!["alice", "1"],
+                vec!["bob", "2"],
+                vec!["carol", "3"],
+                vec!["dave", "4"],
+                vec!["erin", "5"],
+                vec!["frank", "6"],
+                vec!["grace", "7"],
+                vec!["hank", "8"],
+                vec!["ivy", "9"],
+                vec!["jane", "10"],
+            ],
+        ),
+    ] {
+        let versioned_table = table
+            .copy_with_time_travel(HashMap::from([(
+                "scan.version".to_string(),
+                tag.to_string(),
+            )]))
+            .await
+            .unwrap_or_else(|err| panic!("failed to time travel to tag {tag}: {err}"));
+        let read_builder = versioned_table.new_read_builder();
+        let plan = read_builder
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_or_else(|err| panic!("failed to plan tag {tag}: {err}"));
+        let read = read_builder
+            .new_read()
+            .unwrap_or_else(|err| panic!("failed to create read for tag {tag}: {err}"));
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(plan.splits())
+            .unwrap_or_else(|err| panic!("failed to create stream for tag {tag}: {err}"))
+            .try_collect()
+            .await
+            .unwrap_or_else(|err| panic!("failed to collect tag {tag}: {err}"));
+
+        let schema = batches
+            .first()
+            .expect("time-travel tag should return rows")
+            .schema();
+        let field_names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(
+            field_names, expected_fields,
+            "unexpected schema for tag {tag}"
+        );
+
+        let expected_rows: Vec<Vec<String>> = expected_rows
+            .into_iter()
+            .map(|row| row.into_iter().map(str::to_string).collect())
+            .collect();
+        assert_eq!(
+            collect_rows_as_strings(&batches),
+            expected_rows,
+            "unexpected rows for tag {tag}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_time_travel_conflicting_selectors_fail() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
@@ -2863,6 +3258,63 @@ async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
     assert!(
         total_rows <= full_count,
         "Row range filtered count ({total_rows}) should be <= full count ({full_count})"
+    );
+}
+
+#[tokio::test]
+async fn test_read_data_evolution_mixed_format_row_id_projection() {
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_mixed_format_add_column").await;
+
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&["_ROW_ID", "id"]);
+    let scan = read_builder.new_scan();
+    let plan = scan.plan().await.expect("Failed to plan scan");
+
+    assert_plan_file_formats(
+        &plan,
+        &["avro", "orc", "parquet"],
+        "data_evolution_mixed_format_add_column",
+    );
+    assert_plan_has_multiple_schema_ids(&plan, "data_evolution_mixed_format_add_column");
+
+    let read = read_builder.new_read().expect("Failed to create read");
+    let stream = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create arrow stream");
+    let batches: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .expect("Failed to collect batches");
+
+    let mut row_ids = Vec::new();
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let row_id = batch
+            .column_by_name("_ROW_ID")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("_ROW_ID");
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        for i in 0..batch.num_rows() {
+            row_ids.push(row_id.value(i));
+            ids.push(id.value(i));
+        }
+    }
+
+    assert_eq!(row_ids.len(), ids.len());
+    assert_eq!(ids.len(), 4, "Expected all fixture rows to be readable");
+    assert!(
+        row_ids.iter().all(|&row_id| row_id >= 0),
+        "All _ROW_ID values should be non-negative"
+    );
+    let unique: HashSet<i64> = row_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        row_ids.len(),
+        "_ROW_ID values should be unique"
     );
 }
 

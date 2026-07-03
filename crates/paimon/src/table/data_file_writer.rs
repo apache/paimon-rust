@@ -25,7 +25,7 @@
 use crate::arrow::format::{create_format_writer, FormatFileWriter};
 use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_dir_name, DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{bucket_dir_name, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -49,6 +49,7 @@ pub(crate) struct DataFileWriter {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    write_fields: Vec<DataField>,
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
@@ -74,6 +75,7 @@ impl DataFileWriter {
         file_compression_zstd_level: i32,
         write_buffer_size: i64,
         file_format: String,
+        write_fields: Vec<DataField>,
         file_source: Option<i32>,
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
@@ -89,6 +91,7 @@ impl DataFileWriter {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            write_fields,
             file_source,
             first_row_id,
             write_cols,
@@ -156,6 +159,7 @@ impl DataFileWriter {
             &self.file_compression,
             self.file_compression_zstd_level,
             Some(self.file_io.clone()),
+            Some(&self.write_fields),
         )
         .await?;
         self.current_writer = Some(writer);

@@ -21,6 +21,7 @@
 # for paimon-rust integration tests to read.
 
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -52,10 +53,17 @@ def _reset_warehouse_dir(warehouse_path: Path) -> None:
     warehouse_path.mkdir(parents=True, exist_ok=True)
 
     for child in warehouse_path.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        else:
-            shutil.rmtree(child)
+        for attempt in range(3):
+            try:
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
 
 
 def main():
@@ -330,6 +338,69 @@ def main():
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot1', 1)")
     spark.sql("CALL sys.create_tag('default.time_travel_table', 'snapshot2', 2)")
 
+    # ===== Time travel + schema evolution table =====
+    # Each tag points at a stable schema boundary. Tests read by tag name rather
+    # than depending on global warehouse snapshot numbering.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS time_travel_schema_evolution (
+            id INT,
+            name STRING
+        ) USING paimon
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (1, 'alice'),
+            (2, 'bob')
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_add_column', 1)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution ADD COLUMNS (age INT)")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (3, 'carol', 30),
+            (4, 'dave', 40)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_add_column', 2)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_rename', 2)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution RENAME COLUMN name TO full_name")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (5, 'erin', 50),
+            (6, 'frank', 60)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_rename', 3)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_drop', 3)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution DROP COLUMN age")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            (7, 'grace'),
+            (8, 'hank')
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_drop', 4)")
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'before_reorder', 4)")
+
+    spark.sql("ALTER TABLE time_travel_schema_evolution ALTER COLUMN full_name FIRST")
+    spark.sql(
+        """
+        INSERT INTO time_travel_schema_evolution VALUES
+            ('ivy', 9),
+            ('jane', 10)
+        """
+    )
+    spark.sql("CALL sys.create_tag('default.time_travel_schema_evolution', 'after_reorder', 5)")
+
     # ===== Schema Evolution: Add Column =====
     # Old files have (id, name); after ALTER TABLE ADD COLUMNS, new files have (id, name, age).
     # Reader must fill nulls for 'age' when reading old files.
@@ -396,6 +467,52 @@ def main():
         "INSERT INTO format_schema_evolution_add_column VALUES (5, 'eve', 50), (6, 'frank', 60)"
     )
 
+    # ===== Partitioned Mixed-format Schema Evolution: Add Column =====
+    # Old Parquet files lack extra; new ORC/Avro files contain extra across dt partitions.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS partitioned_format_schema_evolution_add_column (
+            id INT,
+            name STRING,
+            dt STRING
+        ) USING paimon
+        PARTITIONED BY (dt)
+        TBLPROPERTIES (
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column VALUES
+            (1, 'alice', '2024-01-01'),
+            (2, 'bob', '2024-01-02')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column ADD COLUMNS (extra STRING)"
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'orc')"
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column (id, name, extra, dt) VALUES
+            (3, 'carol', 'orc-extra-1', '2024-01-01'),
+            (4, 'dave', 'orc-extra-2', '2024-01-03')
+        """
+    )
+    spark.sql(
+        "ALTER TABLE partitioned_format_schema_evolution_add_column SET TBLPROPERTIES ('file.format' = 'avro')"
+    )
+    spark.sql(
+        """
+        INSERT INTO partitioned_format_schema_evolution_add_column (id, name, extra, dt) VALUES
+            (5, 'eve', 'avro-extra-1', '2024-01-02'),
+            (6, 'frank', 'avro-extra-2', '2024-01-03')
+        """
+    )
+
     # ===== Mixed-format Schema Evolution: Type Promotion (INT -> BIGINT) =====
     # Old Parquet files have value as INT; new ORC/Avro files have value as BIGINT.
     spark.sql(
@@ -422,6 +539,70 @@ def main():
     spark.sql("ALTER TABLE format_schema_evolution_type_promotion SET TBLPROPERTIES ('file.format' = 'avro')")
     spark.sql(
         "INSERT INTO format_schema_evolution_type_promotion VALUES (5, 5000000000), (6, 6000000000)"
+    )
+
+    # ===== Mixed-format Data Evolution: Add Column =====
+    # Combines row-tracking/data-evolution with ADD COLUMN and mixed file formats.
+    # Old Parquet files lack extra; new ORC/Avro files contain extra.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_mixed_format_add_column (
+            id INT,
+            name STRING,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        """
+        INSERT INTO data_evolution_mixed_format_add_column VALUES
+            (1, 'alice', 100),
+            (2, 'bob', 200)
+        """
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column ADD COLUMNS (extra STRING)")
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_add_column VALUES (3, 'carol', 300, 'orc-extra')"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_add_column SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_add_column VALUES (4, 'dave', 400, 'avro-extra')"
+    )
+
+    # ===== Mixed-format Data Evolution: Type Promotion =====
+    # Old Parquet files have INT; new ORC/Avro files have BIGINT.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS data_evolution_mixed_format_type_promotion (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'file.format' = 'parquet'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (1, 100), (2, 200)"
+    )
+    spark.sql(
+        "ALTER TABLE data_evolution_mixed_format_type_promotion ALTER COLUMN value TYPE BIGINT"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_type_promotion SET TBLPROPERTIES ('file.format' = 'orc')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (3, 3000000000)"
+    )
+    spark.sql("ALTER TABLE data_evolution_mixed_format_type_promotion SET TBLPROPERTIES ('file.format' = 'avro')")
+    spark.sql(
+        "INSERT INTO data_evolution_mixed_format_type_promotion VALUES (4, 4000000000)"
     )
 
     # ===== Data Evolution + Schema Evolution: Add Column =====

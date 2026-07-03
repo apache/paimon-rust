@@ -96,6 +96,26 @@ where
                 all_non_null -= excluded;
                 Ok(all_non_null)
             }
+            PredicateOperator::Between => {
+                let from = serialize_datum(&literals[0], data_type);
+                let to = serialize_datum(&literals[1], data_type);
+                self.range_query(&from, &to, true, true).await
+            }
+            PredicateOperator::NotBetween => {
+                let mut all_non_null = self.all_non_null_rows().await?;
+                let from = serialize_datum(&literals[0], data_type);
+                let to = serialize_datum(&literals[1], data_type);
+                let inside = self.range_query(&from, &to, true, true).await?;
+                all_non_null -= inside;
+                Ok(all_non_null)
+            }
+            PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
+            | PredicateOperator::Like => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("BTree index does not support op: {op}"),
+            )),
         }
     }
 }
@@ -116,9 +136,36 @@ pub(crate) type ExtractBetweenResult<'a> = (
 
 /// Try to extract a between pattern (lower + upper bound) from predicates.
 /// Returns (between_info, remaining_predicates).
+///
+/// Recognizes two shapes:
+/// 1. A native `Between` leaf with two literals — preferred and emitted by the
+///    DataFusion translator since Stage 3.
+/// 2. A `GtEq` / `Gt` paired with a `LtEq` / `Lt` on the same column —
+///    legacy shape, kept for direct `PredicateBuilder` users that still build
+///    the conjunction explicitly.
 pub(crate) fn extract_between<'a>(
     predicates: &[(PredicateOperator, &'a [Datum], &'a DataType)],
 ) -> ExtractBetweenResult<'a> {
+    // Shape 1: native Between leaf — single tuple is enough.
+    for (i, (op, literals, dt)) in predicates.iter().enumerate() {
+        if matches!(op, PredicateOperator::Between) && literals.len() == 2 {
+            let between = BetweenInfo {
+                from: &literals[0],
+                to: &literals[1],
+                from_inclusive: true,
+                to_inclusive: true,
+                data_type: dt,
+            };
+            let remaining: Vec<_> = predicates
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, p)| *p)
+                .collect();
+            return (Some(between), remaining);
+        }
+    }
+
     if predicates.len() < 2 {
         return (None, predicates.to_vec());
     }

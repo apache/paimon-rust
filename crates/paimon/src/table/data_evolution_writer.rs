@@ -27,7 +27,7 @@
 //! similar to Iceberg's Transaction/Action pattern.
 
 use crate::io::FileIO;
-use crate::spec::{BinaryRow, CoreOptions, DataFileMeta, PartitionComputer};
+use crate::spec::{BinaryRow, CoreOptions, DataField, DataFileMeta, PartitionComputer};
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -358,6 +358,7 @@ impl DataEvolutionWriter {
                     file_range.partition.clone(),
                     file_range.bucket,
                     first_row_id,
+                    file_range.snapshot_id,
                     updated_batch,
                 )
                 .await?;
@@ -504,6 +505,7 @@ struct MatchedRow {
 
 /// Key: (partition_bytes, bucket, first_row_id)
 type WriterKey = (Vec<u8>, i32, i64);
+type PartialCommitGroup = (Option<i64>, Vec<DataFileMeta>);
 
 /// Writer for data evolution partial-column files.
 ///
@@ -525,9 +527,11 @@ pub(crate) struct DataEvolutionPartialWriter {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    write_fields: Vec<DataField>,
     write_columns: Vec<String>,
     /// Writers keyed by (partition_bytes, bucket, first_row_id).
     writers: HashMap<WriterKey, DataFileWriter>,
+    check_from_snapshots: HashMap<WriterKey, i64>,
 }
 
 impl DataEvolutionPartialWriter {
@@ -547,6 +551,19 @@ impl DataEvolutionPartialWriter {
 
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
+        let write_fields = write_columns
+            .iter()
+            .map(|column| {
+                fields
+                    .iter()
+                    .find(|field| field.name() == column)
+                    .cloned()
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Unknown data-evolution write column '{column}'"),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let partition_computer = PartitionComputer::new(
             &partition_keys,
             fields,
@@ -565,8 +582,10 @@ impl DataEvolutionPartialWriter {
             file_compression_zstd_level: core_options.file_compression_zstd_level(),
             write_buffer_size: core_options.write_parquet_buffer_size(),
             file_format: core_options.file_format().to_string(),
+            write_fields,
             write_columns,
             writers: HashMap::new(),
+            check_from_snapshots: HashMap::new(),
         })
     }
 
@@ -579,6 +598,7 @@ impl DataEvolutionPartialWriter {
         partition_bytes: Vec<u8>,
         bucket: i32,
         first_row_id: i64,
+        check_from_snapshot: i64,
         batch: RecordBatch,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
@@ -586,6 +606,10 @@ impl DataEvolutionPartialWriter {
         }
 
         let key = (partition_bytes.clone(), bucket, first_row_id);
+        self.check_from_snapshots
+            .entry(key.clone())
+            .and_modify(|snapshot| *snapshot = (*snapshot).min(check_from_snapshot))
+            .or_insert(check_from_snapshot);
         if !self.writers.contains_key(&key) {
             let partition_path = if self.partition_keys.is_empty() {
                 String::new()
@@ -605,6 +629,7 @@ impl DataEvolutionPartialWriter {
                 self.file_compression_zstd_level,
                 self.write_buffer_size,
                 self.file_format.clone(),
+                self.write_fields.clone(),
                 Some(0), // file_source: APPEND
                 Some(first_row_id),
                 Some(self.write_columns.clone()),
@@ -619,32 +644,42 @@ impl DataEvolutionPartialWriter {
     /// Close all writers and collect CommitMessages for use with TableCommit.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         let writers: Vec<(WriterKey, DataFileWriter)> = self.writers.drain().collect();
+        let mut check_from_snapshots = std::mem::take(&mut self.check_from_snapshots);
 
         let futures: Vec<_> = writers
             .into_iter()
-            .map(
-                |((partition_bytes, bucket, _first_row_id), mut writer)| async move {
+            .map(|(key, mut writer)| {
+                let check_from_snapshot = check_from_snapshots.remove(&key);
+                async move {
                     let files = writer.prepare_commit().await?;
-                    Ok::<_, crate::Error>((partition_bytes, bucket, files))
-                },
-            )
+                    let (partition_bytes, bucket, _first_row_id) = key;
+                    Ok::<_, crate::Error>((partition_bytes, bucket, check_from_snapshot, files))
+                }
+            })
             .collect();
 
         let results = futures::future::try_join_all(futures).await?;
 
         // Group files by (partition, bucket) since multiple first_row_ids may share the same partition/bucket
-        let mut grouped: HashMap<(Vec<u8>, i32), Vec<crate::spec::DataFileMeta>> = HashMap::new();
-        for (partition_bytes, bucket, files) in results {
-            grouped
+        let mut grouped: HashMap<(Vec<u8>, i32), PartialCommitGroup> = HashMap::new();
+        for (partition_bytes, bucket, check_from_snapshot, files) in results {
+            let entry = grouped
                 .entry((partition_bytes, bucket))
-                .or_default()
-                .extend(files);
+                .or_insert_with(|| (None, Vec::new()));
+            if let Some(check_from_snapshot) = check_from_snapshot {
+                entry.0 = Some(entry.0.map_or(check_from_snapshot, |snapshot| {
+                    snapshot.min(check_from_snapshot)
+                }));
+            }
+            entry.1.extend(files);
         }
 
         let mut messages = Vec::new();
-        for ((partition_bytes, bucket), files) in grouped {
+        for ((partition_bytes, bucket), (check_from_snapshot, files)) in grouped {
             if !files.is_empty() {
-                messages.push(CommitMessage::new(partition_bytes, bucket, files));
+                let mut message = CommitMessage::new(partition_bytes, bucket, files);
+                message.check_from_snapshot = check_from_snapshot;
+                messages.push(message);
             }
         }
         Ok(messages)
@@ -787,13 +822,14 @@ mod tests {
 
         let batch = make_partial_batch(vec!["alice", "bob", "charlie"]);
         writer
-            .write_partial_batch(vec![], 0, 0, batch)
+            .write_partial_batch(vec![], 0, 0, 7, batch)
             .await
             .unwrap();
 
         let messages = writer.prepare_commit().await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].check_from_snapshot, Some(7));
 
         let meta = &messages[0].new_files[0];
         assert_eq!(meta.row_count, 3);
@@ -814,19 +850,20 @@ mod tests {
         // Two batches with different first_row_id should produce two files
         let batch1 = make_partial_batch(vec!["alice", "bob"]);
         writer
-            .write_partial_batch(vec![], 0, 0, batch1)
+            .write_partial_batch(vec![], 0, 0, 9, batch1)
             .await
             .unwrap();
 
         let batch2 = make_partial_batch(vec!["charlie"]);
         writer
-            .write_partial_batch(vec![], 0, 100, batch2)
+            .write_partial_batch(vec![], 0, 100, 8, batch2)
             .await
             .unwrap();
 
         let messages = writer.prepare_commit().await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].new_files.len(), 2);
+        assert_eq!(messages[0].check_from_snapshot, Some(8));
 
         let mut files = messages[0].new_files.clone();
         files.sort_by_key(|f| f.first_row_id);

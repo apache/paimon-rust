@@ -21,6 +21,7 @@ const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
+const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
@@ -46,6 +47,10 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
+const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
+const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
+const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
@@ -62,6 +67,9 @@ pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
+const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
+const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
+const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -100,6 +108,13 @@ pub enum ChangelogProducer {
     FullCompaction,
     /// Generate changelog files through lookup compaction.
     Lookup,
+}
+
+/// Action when a partial-column update touches globally indexed columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalIndexColumnUpdateAction {
+    ThrowError,
+    DropPartitionIndex,
 }
 
 /// Bucket function used to map bucket keys to fixed bucket ids.
@@ -263,6 +278,24 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
+    pub fn global_index_column_update_action(
+        &self,
+    ) -> crate::Result<GlobalIndexColumnUpdateAction> {
+        match self
+            .options
+            .get(GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION)
+            .map(|v| v.to_ascii_uppercase())
+            .as_deref()
+            .unwrap_or("THROW_ERROR")
+        {
+            "THROW_ERROR" => Ok(GlobalIndexColumnUpdateAction::ThrowError),
+            "DROP_PARTITION_INDEX" => Ok(GlobalIndexColumnUpdateAction::DropPartitionIndex),
+            other => Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported global-index.column-update-action: {other}"),
+            }),
+        }
+    }
+
     pub fn source_split_target_size(&self) -> i64 {
         self.options
             .get(SOURCE_SPLIT_TARGET_SIZE_OPTION)
@@ -400,6 +433,29 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Suggested target size for a manifest file. Default is 8 MiB.
+    ///
+    /// `manifest.target-file-size` is the Java/Python option. The shorter
+    /// `manifest.target-size` alias is accepted for older Rust callers that
+    /// used the name from early parity discussions.
+    pub fn manifest_target_size(&self) -> i64 {
+        self.options
+            .get(MANIFEST_TARGET_FILE_SIZE_OPTION)
+            .or_else(|| self.options.get(MANIFEST_TARGET_SIZE_OPTION))
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or(DEFAULT_MANIFEST_TARGET_FILE_SIZE)
+    }
+
+    /// Minimum number of small manifest files required before minor manifest
+    /// compaction rewrites them into a new rolling manifest set.
+    pub fn manifest_merge_min_count(&self) -> usize {
+        self.options
+            .get(MANIFEST_MERGE_MIN_COUNT_OPTION)
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
+    }
+
     /// Number of buckets for the table. Default is 1.
     pub fn bucket(&self) -> i32 {
         self.options
@@ -505,6 +561,15 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
     }
 
+    /// Avro compression codec for manifest, manifest-list and index-manifest files.
+    /// Default is `"zstd"`, matching Java Paimon `CoreOptions.MANIFEST_COMPRESSION`.
+    pub fn manifest_compression(&self) -> &str {
+        self.options
+            .get(MANIFEST_COMPRESSION_OPTION)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_MANIFEST_COMPRESSION)
+    }
+
     /// Parquet writer in-progress buffer size limit. Default is 256MB.
     /// When the buffered data exceeds this, the writer flushes the current row group.
     pub fn write_parquet_buffer_size(&self) -> i64 {
@@ -588,6 +653,10 @@ mod tests {
             core_options.global_index_row_count_per_shard().unwrap(),
             100_000
         );
+        assert_eq!(
+            core_options.global_index_column_update_action().unwrap(),
+            GlobalIndexColumnUpdateAction::ThrowError
+        );
     }
 
     #[test]
@@ -605,6 +674,10 @@ mod tests {
                 GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION.to_string(),
                 "2048".to_string(),
             ),
+            (
+                GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION.to_string(),
+                "DROP_PARTITION_INDEX".to_string(),
+            ),
         ]);
         let core_options = CoreOptions::new(&options);
 
@@ -613,6 +686,10 @@ mod tests {
         assert_eq!(
             core_options.global_index_row_count_per_shard().unwrap(),
             2048
+        );
+        assert_eq!(
+            core_options.global_index_column_update_action().unwrap(),
+            GlobalIndexColumnUpdateAction::DropPartitionIndex
         );
     }
 
@@ -815,6 +892,9 @@ mod tests {
         assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
         assert_eq!(core.commit_max_retry_wait_ms(), 10_000);
         assert!(!core.row_tracking_enabled());
+        assert_eq!(core.manifest_compression(), "zstd");
+        assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
+        assert_eq!(core.manifest_merge_min_count(), 30);
     }
 
     #[test]
@@ -826,6 +906,12 @@ mod tests {
             (COMMIT_MIN_RETRY_WAIT_OPTION.to_string(), "500".to_string()),
             (COMMIT_MAX_RETRY_WAIT_OPTION.to_string(), "5000".to_string()),
             (ROW_TRACKING_ENABLED_OPTION.to_string(), "true".to_string()),
+            (
+                MANIFEST_TARGET_FILE_SIZE_OPTION.to_string(),
+                "1kb".to_string(),
+            ),
+            (MANIFEST_COMPRESSION_OPTION.to_string(), "null".to_string()),
+            (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
         ]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), 4);
@@ -834,6 +920,17 @@ mod tests {
         assert_eq!(core.commit_min_retry_wait_ms(), 500);
         assert_eq!(core.commit_max_retry_wait_ms(), 5_000);
         assert!(core.row_tracking_enabled());
+        assert_eq!(core.manifest_compression(), "null");
+        assert_eq!(core.manifest_target_size(), 1024);
+        assert_eq!(core.manifest_merge_min_count(), 3);
+    }
+
+    #[test]
+    fn test_manifest_target_size_accepts_compat_alias() {
+        let options = HashMap::from([(MANIFEST_TARGET_SIZE_OPTION.to_string(), "2kb".into())]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(core.manifest_target_size(), 2 * 1024);
     }
 
     #[test]

@@ -269,7 +269,8 @@ fn format_partition_value(
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)
-        | DataType::Row(_) => {
+        | DataType::Row(_)
+        | DataType::Vector(_) => {
             return Err(Error::Unsupported {
                 message: format!("{data_type:?} type is not supported as partition key"),
             });

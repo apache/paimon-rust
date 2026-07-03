@@ -16,8 +16,10 @@
 // under the License.
 
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::{InList, ScalarFunction};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
+};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
 #[derive(Debug)]
@@ -146,6 +148,8 @@ impl<'a> FilterTranslator<'a> {
             }
             Expr::InList(in_list) => self.translate_in_list(in_list),
             Expr::Between(between) => self.translate_between(between),
+            Expr::ScalarFunction(func) => self.translate_scalar_function(func),
+            Expr::Like(like) => self.translate_like(like),
             _ => None,
         }
     }
@@ -249,22 +253,56 @@ impl<'a> FilterTranslator<'a> {
             field.data_type(),
         )?;
 
-        let predicate = Predicate::and(vec![
-            self.predicate_builder
-                .greater_or_equal(field.name(), low)
-                .ok()?,
-            self.predicate_builder
-                .less_or_equal(field.name(), high)
-                .ok()?,
-        ]);
-
+        // Native Between / NotBetween leaf: lets the planner / b-tree
+        // recognize the range as a single op (see `btree::query::extract_between`).
+        // NotBetween is safe to push because its evaluator, stats prune and
+        // Parquet row filter all treat a NULL operand as non-matching (SQL
+        // three-valued logic), and a data-column range stays Inexact so
+        // DataFusion keeps the residual filter.
         if between.negated {
-            // Same concern as Expr::Not: negation wraps in Predicate::Not
-            // which has incorrect NULL semantics for Exact pushdown.
-            None
+            self.predicate_builder
+                .not_between(field.name(), low, high)
+                .ok()
         } else {
-            Some(predicate)
+            self.predicate_builder.between(field.name(), low, high).ok()
         }
+    }
+
+    fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<Predicate> {
+        // DataFusion built-in UDFs surfaced from `LIKE 'x%' / '%x' / '%x%'`
+        // rewrites and direct `starts_with(col, 'x') / ends_with / contains`
+        // calls. Only `(col, literal)` shapes are handled; anything else
+        // (transform on either side, non-string args) falls open to None.
+        if func.args.len() != 2 {
+            return None;
+        }
+        let field = self.resolve_field(&func.args[0])?;
+        let scalar = extract_scalar_literal(&func.args[1])?;
+        let datum = scalar_to_datum(scalar, field.data_type())?;
+
+        match func.name() {
+            "starts_with" => self.predicate_builder.starts_with(field.name(), datum).ok(),
+            "ends_with" => self.predicate_builder.ends_with(field.name(), datum).ok(),
+            "contains" => self.predicate_builder.contains(field.name(), datum).ok(),
+            _ => None,
+        }
+    }
+
+    fn translate_like(&self, like: &Like) -> Option<Predicate> {
+        // Negated and case-insensitive (ILIKE) variants stay unsupported for
+        // now: NOT-LIKE has the same NULL-semantics concern as `Expr::Not`;
+        // ILIKE has no equivalent in paimon's predicate model.
+        if like.negated || like.case_insensitive {
+            return None;
+        }
+        let field = self.resolve_field(like.expr.as_ref())?;
+        let scalar = extract_scalar_literal(like.pattern.as_ref())?;
+        let datum = scalar_to_datum(scalar, field.data_type())?;
+        // PredicateBuilder::like rejects escape characters other than `\`,
+        // so unsupported escapes naturally fall open via `.ok() -> None`.
+        self.predicate_builder
+            .like(field.name(), datum, like.escape_char)
+            .ok()
     }
 
     fn resolve_field(&self, expr: &Expr) -> Option<&'a DataField> {
@@ -598,22 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_negated_between_is_not_supported() {
-        let fields = test_fields();
-        let filter = Expr::Between(Between::new(
-            Box::new(Expr::Column(Column::from_name("hr"))),
-            true, // negated
-            Box::new(lit(1)),
-            Box::new(lit(20)),
-        ));
-
-        assert!(
-            build_pushed_predicate(&[filter], &fields).is_none(),
-            "Negated BETWEEN should not translate due to NULL semantics"
-        );
-    }
-
-    #[test]
     fn test_translate_boolean_literal_is_not_supported() {
         let fields = test_fields();
 
@@ -623,6 +645,210 @@ mod tests {
                 build_pushed_predicate(&[filter], &fields).is_none(),
                 "Boolean literal ({value}) is not a partition predicate and must not be translated"
             );
+        }
+    }
+
+    #[test]
+    fn test_translate_starts_with_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::starts_with(
+            Expr::Column(Column::from_name("dt")),
+            lit("2024"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("starts_with should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
+                assert_eq!(literals, vec![Datum::String("2024".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_ends_with_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::ends_with(
+            Expr::Column(Column::from_name("dt")),
+            lit("01-01"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("ends_with should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::EndsWith);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_contains_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::contains(
+            Expr::Column(Column::from_name("dt")),
+            lit("01"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("contains should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Contains);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_starts_with_on_non_string_column_falls_open() {
+        let fields = test_fields();
+        // `id` is Int — datum coercion fails and translation returns None.
+        let filter = datafusion::functions::string::expr_fn::starts_with(
+            Expr::Column(Column::from_name("id")),
+            lit("foo"),
+        );
+        assert!(
+            build_pushed_predicate(&[filter], &fields).is_none(),
+            "starts_with on non-string column must not translate"
+        );
+    }
+
+    fn like_filter(pattern: &str, negated: bool, case_insensitive: bool) -> Expr {
+        Expr::Like(Like::new(
+            negated,
+            Box::new(Expr::Column(Column::from_name("dt"))),
+            Box::new(lit(pattern)),
+            None,
+            case_insensitive,
+        ))
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_starts_with() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("2024%", false, false)], &fields)
+            .expect("LIKE prefix% should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
+                assert_eq!(literals, vec![Datum::String("2024".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_ends_with() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("%01-01", false, false)], &fields)
+            .expect("LIKE %suffix should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::EndsWith);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_contains() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("%01%", false, false)], &fields)
+            .expect("LIKE %mid% should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Contains);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_no_wildcards_rewrites_to_eq() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
+            .expect("LIKE without wildcards should translate to Eq");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Eq);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_residual_keeps_like_leaf() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("a%b%c", false, false)], &fields)
+            .expect("complex LIKE should translate as a Like leaf");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Like);
+                assert_eq!(literals, vec![Datum::String("a%b%c".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_negated_like_falls_open() {
+        let fields = test_fields();
+        assert!(
+            build_pushed_predicate(&[like_filter("a%", true, false)], &fields).is_none(),
+            "NOT LIKE must not translate (NULL semantics)"
+        );
+    }
+
+    #[test]
+    fn test_translate_ilike_falls_open() {
+        let fields = test_fields();
+        assert!(
+            build_pushed_predicate(&[like_filter("a%", false, true)], &fields).is_none(),
+            "ILIKE must not translate (case-insensitive not modeled)"
+        );
+    }
+
+    #[test]
+    fn test_translate_between_produces_native_between_leaf() {
+        let fields = test_fields();
+        let filter = Expr::Between(Between::new(
+            Box::new(Expr::Column(Column::from_name("hr"))),
+            false,
+            Box::new(lit(1)),
+            Box::new(lit(20)),
+        ));
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("BETWEEN should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Between);
+                assert_eq!(literals, vec![Datum::Int(1), Datum::Int(20)]);
+            }
+            other => panic!(
+                "expected native Between leaf, got {other:?} (Stage 3 must not produce \
+                 the legacy GtEq+LtEq And shape)"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_translate_not_between_produces_native_not_between_leaf() {
+        let fields = test_fields();
+        let filter = Expr::Between(Between::new(
+            Box::new(Expr::Column(Column::from_name("hr"))),
+            true,
+            Box::new(lit(1)),
+            Box::new(lit(20)),
+        ));
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("NOT BETWEEN should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::NotBetween);
+                assert_eq!(literals, vec![Datum::Int(1), Datum::Int(20)]);
+            }
+            other => panic!("expected native NotBetween leaf, got {other:?}"),
         }
     }
 }

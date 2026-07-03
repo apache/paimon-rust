@@ -434,6 +434,11 @@ impl TableSchema {
 
         // Re-run create-time validations on the final schema, mirroring Java
         // `SchemaValidation.validateTableSchema` after applying changes.
+        Schema::validate_key_field_types(
+            &new_schema.fields,
+            &new_schema.primary_keys,
+            &new_schema.options,
+        )?;
         Schema::validate_blob_fields(
             &new_schema.fields,
             &new_schema.partition_keys,
@@ -785,6 +790,7 @@ impl Schema {
         let primary_keys = Self::normalize_primary_keys(&primary_keys, &mut options)?;
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
+        Self::validate_key_field_types(&fields, &primary_keys, &options)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
@@ -964,6 +970,39 @@ impl Schema {
             });
         }
 
+        Ok(())
+    }
+
+    /// Reject types that cannot serve as a key (primary key or explicit
+    /// `bucket-key`). Currently only `VECTOR` is rejected here: it is densely
+    /// stored and has no key ordering, so it cannot be used as a key column.
+    fn validate_key_field_types(
+        fields: &[DataField],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let reject = |key_kind: &str, name: &str| -> crate::Result<()> {
+            let field = fields.iter().find(|f| f.name() == name);
+            if let Some(field) = field {
+                if matches!(field.data_type(), DataType::Vector(_)) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "The VECTOR type of {key_kind} field '{name}' is unsupported."
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        };
+
+        for pk in primary_keys {
+            reject("primary key", pk)?;
+        }
+        if let Some(bucket_keys) = CoreOptions::new(options).bucket_key() {
+            for bk in &bucket_keys {
+                reject("bucket key", bk)?;
+            }
+        }
         Ok(())
     }
 
@@ -1246,7 +1285,7 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, IntType, VarCharType};
+    use crate::spec::{BlobType, FloatType, IntType, VarCharType, VectorType};
 
     use super::*;
 
@@ -1977,6 +2016,77 @@ mod tests {
         assert_eq!(new_schema.fields().len(), 2);
     }
 
+    fn vector_4f() -> DataType {
+        DataType::Vector(VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap())
+    }
+
+    #[test]
+    fn test_vector_rejected_as_primary_key() {
+        let err = Schema::builder()
+            .column("id", vector_4f())
+            .column("name", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("primary key") && message.contains("VECTOR")),
+            "VECTOR primary key should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_vector_rejected_as_explicit_bucket_key() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_4f())
+            .option(BUCKET_KEY_OPTION, "embedding")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("bucket key") && message.contains("VECTOR")),
+            "VECTOR explicit bucket key should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_vector_allowed_as_non_key_column() {
+        // A VECTOR column that is not a key (no pk, no explicit bucket-key) must
+        // build fine — the implicit "all non-partition fields" bucket-key fallback
+        // must NOT reject it.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_4f())
+            .build()
+            .unwrap();
+        assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_apply_changes_revalidates_vector_bucket_key() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_4f())
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                BUCKET_KEY_OPTION.to_string(),
+                "embedding".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("bucket key") && message.contains("VECTOR")),
+            "altering to a VECTOR bucket key should fail, got {err:?}"
+        );
+    }
+
     #[test]
     fn test_apply_changes_revalidates_partial_update_options() {
         let table_schema = TableSchema::new(
@@ -2087,6 +2197,36 @@ mod tests {
                 .get("fields.value.aggregate-function")
                 .map(String::as_str),
             Some("max")
+        );
+    }
+
+    #[test]
+    fn test_aggregation_apply_changes_rejects_sequence_field_function() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("seq", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("sequence.field", "seq")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.seq.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("seq")),
+            "aggregation alter should reject sequence-field aggregate function, got {err:?}"
         );
     }
 

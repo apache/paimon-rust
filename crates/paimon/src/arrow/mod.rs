@@ -22,7 +22,7 @@ pub(crate) mod schema_evolution;
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
     DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,
-    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
+    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
 };
 use arrow_schema::DataType as ArrowDataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -116,6 +116,20 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
             ArrowDataType::Struct(fields.into())
+        }
+        PaimonDataType::Vector(v) => {
+            let element_type = paimon_type_to_arrow(v.element_type())?;
+            // VectorType::MAX_LENGTH is i32::MAX as u32 (validated at construction),
+            // so the length always fits in the i32 Arrow FixedSizeList size.
+            let length = v.length() as i32;
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "element",
+                    element_type,
+                    v.element_type().is_nullable(),
+                )),
+                length,
+            )
         }
     })
 }
@@ -220,6 +234,17 @@ pub fn arrow_to_paimon_type(
                 nullable,
                 paimon_fields,
             )))
+        }
+        ArrowDataType::FixedSizeList(field, size) => {
+            let element = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            // FixedSizeList size is i32; reject non-positive sizes with a clear error
+            // rather than casting a negative into a huge u32.
+            let length = u32::try_from(*size).map_err(|_| crate::Error::DataTypeInvalid {
+                message: format!("Invalid vector (FixedSizeList) length: {size}"),
+            })?;
+            Ok(PaimonDataType::Vector(VectorType::try_new(
+                nullable, length, element,
+            )?))
         }
         _ => Err(crate::Error::Unsupported {
             message: format!("Unsupported Arrow type for Paimon conversion: {arrow_type:?}"),
@@ -458,6 +483,84 @@ mod tests {
     fn test_unsupported_arrow_type() {
         let result = arrow_to_paimon_type(&ArrowDataType::Duration(TimeUnit::Second), true);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_to_arrow_nullable() {
+        let paimon = PaimonDataType::Vector(
+            VectorType::try_new(true, 128, PaimonDataType::Float(FloatType::new())).unwrap(),
+        );
+        let expected = ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+            128,
+        );
+        assert_paimon_to_arrow(&paimon, &expected);
+    }
+
+    #[test]
+    fn test_vector_to_arrow_not_null_vector_has_float64_child() {
+        // The vector's own non-nullability is not represented in the ArrowDataType;
+        // only the child element type and length are.
+        let paimon = PaimonDataType::Vector(
+            VectorType::try_new(false, 2, PaimonDataType::Double(DoubleType::new())).unwrap(),
+        );
+        let arrow = paimon_type_to_arrow(&paimon).unwrap();
+        match arrow {
+            ArrowDataType::FixedSizeList(field, size) => {
+                assert_eq!(size, 2);
+                assert_eq!(field.data_type(), &ArrowDataType::Float64);
+            }
+            other => panic!("expected FixedSizeList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_fixed_size_list_to_vector() {
+        let arrow = ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+            4,
+        );
+        let paimon = arrow_to_paimon_type(&arrow, true).unwrap();
+        match paimon {
+            PaimonDataType::Vector(v) => {
+                assert_eq!(v.length(), 4);
+                assert_eq!(v.element_type(), &PaimonDataType::Float(FloatType::new()));
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_fixed_size_list_invalid_element_rejected() {
+        let arrow = ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("element", ArrowDataType::Utf8, true)),
+            4,
+        );
+        let err = arrow_to_paimon_type(&arrow, true);
+        assert!(matches!(err, Err(crate::Error::DataTypeInvalid { .. })));
+    }
+
+    #[test]
+    fn test_arrow_fixed_size_list_zero_length_rejected() {
+        let arrow = ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+            0,
+        );
+        let err = arrow_to_paimon_type(&arrow, true);
+        assert!(matches!(err, Err(crate::Error::DataTypeInvalid { .. })));
+    }
+
+    #[test]
+    fn test_arrow_fixed_size_list_negative_length_rejected() {
+        // A negative FixedSizeList size IS directly constructible in Arrow, so it
+        // exercises the `u32::try_from(*size)` negative branch in the conversion
+        // (distinct from the zero case, which `VectorType::try_new` rejects).
+        let arrow = ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+            -1,
+        );
+        let err = arrow_to_paimon_type(&arrow, true);
+        assert!(matches!(err, Err(crate::Error::DataTypeInvalid { .. })));
     }
 
     #[test]

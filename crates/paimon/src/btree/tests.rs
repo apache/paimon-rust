@@ -184,6 +184,40 @@ async fn test_range_queries() {
 }
 
 #[tokio::test]
+async fn test_prefix_query() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None);
+
+    let keys = ["apple", "apply", "apricot", "banana", "band", "bee"];
+    for (i, k) in keys.iter().enumerate() {
+        writer.write(Some(k.as_bytes()), i as i64).await.unwrap();
+    }
+
+    let result = writer.finish().await.unwrap();
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+
+    let bm = reader.query_prefix(b"ap").await.unwrap();
+    assert_eq!(bm.len(), 3);
+    assert!(bm.contains(0) && bm.contains(1) && bm.contains(2));
+
+    let bm = reader.query_prefix(b"app").await.unwrap();
+    assert_eq!(bm.len(), 2);
+    assert!(bm.contains(0) && bm.contains(1));
+
+    let bm = reader.query_prefix(b"ban").await.unwrap();
+    assert_eq!(bm.len(), 2);
+    assert!(bm.contains(3) && bm.contains(4));
+
+    let bm = reader.query_prefix(b"b").await.unwrap();
+    assert_eq!(bm.len(), 3);
+
+    let bm = reader.query_prefix(b"z").await.unwrap();
+    assert_eq!(bm.len(), 0);
+    let bm = reader.query_prefix(b"").await.unwrap();
+    assert_eq!(bm.len(), keys.len() as u64);
+}
+
+#[tokio::test]
 async fn test_not_equal_query() {
     let buf = VecFileWrite::new();
     let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 256, BlockCompressionType::None);

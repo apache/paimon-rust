@@ -62,12 +62,30 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::In | PredicateOperator::NotIn => {
             return true;
         }
+        PredicateOperator::EndsWith | PredicateOperator::Contains => {
+            // String min/max ordering carries no information about suffix /
+            // substring matches, so fail open.
+            return true;
+        }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            return between_may_match(
+                index,
+                stats_data_type,
+                predicate_data_type,
+                op,
+                literals,
+                stats,
+                all_null,
+            );
+        }
         PredicateOperator::Eq
         | PredicateOperator::NotEq
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {}
+        | PredicateOperator::GtEq
+        | PredicateOperator::StartsWith
+        | PredicateOperator::Like => {}
     }
 
     if all_null == Some(true) {
@@ -112,11 +130,100 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
             Some(Ordering::Less | Ordering::Equal)
         ),
         PredicateOperator::GtEq => !matches!(max_value.partial_cmp(literal), Some(Ordering::Less)),
+        PredicateOperator::StartsWith => {
+            // pat lives in [min, max] iff max >= pat AND min < pat_next, where
+            // pat_next is pat with its last codepoint incremented. If we can't
+            // compute pat_next (last char is char::MAX, increments into the
+            // UTF-16 surrogate range, etc.), fail open.
+            let (pat, min_str, max_str) = match (literal, &min_value, &max_value) {
+                (Datum::String(p), Datum::String(lo), Datum::String(hi)) => {
+                    (p.as_str(), lo.as_str(), hi.as_str())
+                }
+                _ => return true,
+            };
+            // If the file's max is below the pattern (lexicographically), no
+            // string in the file can start with `pat`.
+            if max_str < pat {
+                return false;
+            }
+            // Compute pat_next; if we can, use the [pat, pat_next) range to
+            // also rule out files whose min is already past every pat-prefixed
+            // string. Otherwise just trust the upper bound check.
+            match next_string_for_prefix(pat) {
+                Some(pat_next) => min_str.as_bytes() < pat_next.as_slice(),
+                None => true,
+            }
+        }
+        PredicateOperator::Like => {
+            // Try to extract a literal prefix from the LIKE pattern (the
+            // characters before the first unescaped wildcard). If we get one,
+            // prune as if it were StartsWith; otherwise fail open.
+            let (pattern, min_str, max_str) = match (literal, &min_value, &max_value) {
+                (Datum::String(p), Datum::String(lo), Datum::String(hi)) => {
+                    (p.as_str(), lo.as_str(), hi.as_str())
+                }
+                _ => return true,
+            };
+            let Some(pat) = like_pattern_literal_prefix(pattern) else {
+                return true;
+            };
+            if pat.is_empty() {
+                return true;
+            }
+            if max_str < pat.as_str() {
+                return false;
+            }
+            match next_string_for_prefix(&pat) {
+                Some(pat_next) => min_str.as_bytes() < pat_next.as_slice(),
+                None => true,
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => true,
+        | PredicateOperator::NotIn
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => true,
     }
+}
+
+/// Return the literal prefix of a SQL LIKE pattern up to the first unescaped
+/// `%` or `_`. A backslash escapes the next character (which is appended
+/// literally, mirroring arrow's `like` kernel); a trailing backslash is a
+/// literal backslash.
+fn like_pattern_literal_prefix(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' | '_' => return Some(out),
+            '\\' => match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// Compute the smallest string strictly greater than every string with `prefix`
+/// as a prefix, by incrementing the last codepoint. Returns `None` if the last
+/// codepoint cannot be incremented within valid Unicode (e.g. `char::MAX`).
+fn next_string_for_prefix(prefix: &str) -> Option<Vec<u8>> {
+    let last_char = prefix.chars().next_back()?;
+    let mut next_code = last_char as u32 + 1;
+    // Skip over the UTF-16 surrogate range, which is not valid scalar Unicode.
+    if (0xD800..=0xDFFF).contains(&next_code) {
+        next_code = 0xE000;
+    }
+    let next_char = char::from_u32(next_code)?;
+    let mut bytes = prefix.as_bytes()[..prefix.len() - last_char.len_utf8()].to_vec();
+    let mut buf = [0u8; 4];
+    bytes.extend_from_slice(next_char.encode_utf8(&mut buf).as_bytes());
+    Some(bytes)
 }
 
 pub(crate) fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> bool {
@@ -125,6 +232,60 @@ pub(crate) fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> 
     }
 
     matches!(op, PredicateOperator::IsNull)
+}
+
+/// Stats-prune `field BETWEEN low AND high` (and its negation) by treating it
+/// as the conjunction `field >= low AND field <= high`:
+/// * `Between` may match iff the file's `[min, max]` overlaps `[low, high]`.
+/// * `NotBetween` may match iff some row could fall outside `[low, high]`,
+///   i.e. unless the file's `[min, max]` is entirely inside `[low, high]`.
+///
+/// All-null files are pruned for both ops (NULL comparisons resolve to NULL,
+/// which the evaluator treats as false).
+fn between_may_match<T: StatsAccessor>(
+    index: usize,
+    stats_data_type: &DataType,
+    predicate_data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+    stats: &T,
+    all_null: Option<bool>,
+) -> bool {
+    if all_null == Some(true) {
+        return false;
+    }
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        return true;
+    };
+    let min_value = match stats
+        .min_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return true,
+    };
+    let max_value = match stats
+        .max_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return true,
+    };
+
+    let max_ge_low = !matches!(max_value.partial_cmp(low), Some(Ordering::Less));
+    let min_le_high = !matches!(min_value.partial_cmp(high), Some(Ordering::Greater));
+    let overlaps = max_ge_low && min_le_high;
+
+    match op {
+        PredicateOperator::Between => overlaps,
+        PredicateOperator::NotBetween => {
+            // Prune only when [min, max] is entirely inside [low, high].
+            let min_ge_low = !matches!(min_value.partial_cmp(low), Some(Ordering::Less));
+            let max_le_high = !matches!(max_value.partial_cmp(high), Some(Ordering::Greater));
+            !(min_ge_low && max_le_high)
+        }
+        _ => unreachable!("between_may_match is only called for Between/NotBetween"),
+    }
 }
 
 fn predicate_may_match_with_schema<T: StatsAccessor>(
@@ -139,7 +300,10 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
         Predicate::And(children) => children
             .iter()
             .all(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
-        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Or(children) => children
+            .iter()
+            .any(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
+        Predicate::Not(_) => true,
         Predicate::Leaf {
             index,
             data_type,
@@ -191,5 +355,283 @@ fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType
         (Datum::Int(value), DataType::BigInt(_)) => Some(Datum::Long(value as i64)),
         (Datum::Float(value), DataType::Double(_)) => Some(Datum::Double(value as f64)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{IntType, VarCharType};
+
+    struct MockStats {
+        row_count: i64,
+        null_count: Option<i64>,
+        min: Option<Datum>,
+        max: Option<Datum>,
+    }
+
+    impl StatsAccessor for MockStats {
+        fn row_count(&self) -> i64 {
+            self.row_count
+        }
+        fn null_count(&self, _index: usize) -> Option<i64> {
+            self.null_count
+        }
+        fn min_value(&self, _index: usize, _data_type: &DataType) -> Option<Datum> {
+            self.min.clone()
+        }
+        fn max_value(&self, _index: usize, _data_type: &DataType) -> Option<Datum> {
+            self.max.clone()
+        }
+    }
+
+    fn varchar() -> DataType {
+        DataType::VarChar(VarCharType::default())
+    }
+
+    fn string_stats(min: &str, max: &str) -> MockStats {
+        MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::String(min.to_string())),
+            max: Some(Datum::String(max.to_string())),
+        }
+    }
+
+    fn run(op: PredicateOperator, lit: &str, stats: &MockStats) -> bool {
+        let dt = varchar();
+        data_leaf_may_match(0, &dt, &dt, op, &[Datum::String(lit.to_string())], stats)
+    }
+
+    #[test]
+    fn starts_with_prunes_when_max_below_pattern() {
+        let stats = string_stats("aaa", "fooa");
+        assert!(!run(PredicateOperator::StartsWith, "foob", &stats));
+    }
+
+    #[test]
+    fn starts_with_prunes_when_min_past_pattern_range() {
+        // [foo, fop) is the pat range. min "fop" is already past it.
+        let stats = string_stats("fop", "zzz");
+        assert!(!run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_keeps_when_pattern_inside_range() {
+        let stats = string_stats("aaa", "zzz");
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_keeps_when_min_equals_pattern() {
+        let stats = string_stats("foo", "foozzz");
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_falls_open_when_stats_missing() {
+        let stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: None,
+            max: None,
+        };
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn ends_with_and_contains_fall_open() {
+        let stats = string_stats("aaa", "zzz");
+        assert!(run(PredicateOperator::EndsWith, "foo", &stats));
+        assert!(run(PredicateOperator::Contains, "foo", &stats));
+    }
+
+    #[test]
+    fn like_with_literal_prefix_prunes_like_starts_with() {
+        // pattern "foo%" → prefix "foo"; max "fooa" already past pattern end?
+        // No: max = "fooa" >= "foo" and min "aaa" < "fop". So this case keeps.
+        let stats = string_stats("aaa", "fooa");
+        assert!(run(PredicateOperator::Like, "foo%", &stats));
+        // pattern "foo%": [foo, fop). file [zaa, zzz] — max < pat → prune.
+        let stats = string_stats("zaa", "zzz");
+        assert!(!run(PredicateOperator::Like, "foo%", &stats));
+        // file [fop, zzz] — min already past prefix range → prune.
+        let stats = string_stats("fop", "zzz");
+        assert!(!run(PredicateOperator::Like, "foo%", &stats));
+    }
+
+    #[test]
+    fn like_without_literal_prefix_falls_open() {
+        let stats = string_stats("aaa", "ccc");
+        // Leading wildcard → no prefix → fail open.
+        assert!(run(PredicateOperator::Like, "%foo%", &stats));
+        // Leading underscore → no prefix → fail open.
+        assert!(run(PredicateOperator::Like, "_oo", &stats));
+    }
+
+    #[test]
+    fn like_with_escaped_wildcard_in_prefix_is_decoded() {
+        // "100\%foo" → literal prefix "100%foo".
+        let stats = string_stats("100", "100%fzz");
+        assert!(run(PredicateOperator::Like, r"100\%foo", &stats));
+        let stats = string_stats("zzz0", "zzz9");
+        assert!(!run(PredicateOperator::Like, r"100\%foo", &stats));
+    }
+
+    #[test]
+    fn missing_field_returns_false_for_string_ops() {
+        // Only IsNull is allowed when the field is missing.
+        for op in [
+            PredicateOperator::StartsWith,
+            PredicateOperator::EndsWith,
+            PredicateOperator::Contains,
+            PredicateOperator::Like,
+        ] {
+            assert!(!missing_field_may_match(op, 5));
+        }
+    }
+
+    // Sanity check: integer ops keep their existing semantics after the new
+    // string variants are interleaved into the dispatcher.
+    #[test]
+    fn integer_eq_still_prunes_outside_range() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::Int(0)),
+            max: Some(Datum::Int(100)),
+        };
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Eq,
+            &[Datum::Int(500)],
+            &stats,
+        ));
+    }
+
+    fn int_stats(min: i32, max: i32) -> MockStats {
+        MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::Int(min)),
+            max: Some(Datum::Int(max)),
+        }
+    }
+
+    fn run_int(op: PredicateOperator, lits: &[Datum], stats: &MockStats) -> bool {
+        let dt = DataType::Int(IntType::new());
+        data_leaf_may_match(0, &dt, &dt, op, lits, stats)
+    }
+
+    /// Stage 3 invariant: a `Between` leaf and the equivalent `GtEq+LtEq`
+    /// conjunction must produce identical stats-prune verdicts. If they
+    /// diverge, the DataFusion translator switch (And-of-comparisons →
+    /// Between leaf) silently changes pruning behavior in production.
+    #[test]
+    fn between_matches_gteq_lteq_conjunction() {
+        let cases: &[(i32, i32, i32, i32, bool)] = &[
+            // (min, max, low, high, expected_may_match)
+            (0, 100, 50, 60, true),    // overlap inside
+            (0, 100, 200, 300, false), // entirely above
+            (0, 100, -50, -1, false),  // entirely below
+            (0, 100, 100, 100, true),  // boundary high
+            (0, 100, 0, 0, true),      // boundary low
+            (50, 100, 0, 49, false),   // low < min < high < max impossible — fully below
+            (50, 100, 0, 200, true),   // file fully inside [low, high]
+        ];
+        for &(min, max, low, high, expected) in cases {
+            let stats = int_stats(min, max);
+            let between = run_int(
+                PredicateOperator::Between,
+                &[Datum::Int(low), Datum::Int(high)],
+                &stats,
+            );
+            let gteq = run_int(PredicateOperator::GtEq, &[Datum::Int(low)], &stats);
+            let lteq = run_int(PredicateOperator::LtEq, &[Datum::Int(high)], &stats);
+            assert_eq!(
+                between,
+                gteq && lteq,
+                "Between vs GtEq+LtEq divergence at ({min},{max}) ∩ [{low},{high}]"
+            );
+            assert_eq!(
+                between, expected,
+                "Between unexpected at {min},{max} ∩ [{low},{high}]"
+            );
+        }
+    }
+
+    #[test]
+    fn not_between_prunes_only_when_file_fully_inside_range() {
+        // file [10, 20] ⊆ [0, 100] → all rows are within [0, 100], so NOT
+        // BETWEEN can prune.
+        let stats = int_stats(10, 20);
+        assert!(!run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+        // file [0, 100] ⊃ [10, 20] → some rows lie outside, can't prune.
+        let stats = int_stats(0, 100);
+        assert!(run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(10), Datum::Int(20)],
+            &stats,
+        ));
+        // file disjoint with [50, 60] → all rows are outside, can't prune.
+        let stats = int_stats(0, 10);
+        assert!(run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(50), Datum::Int(60)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn between_with_all_null_file_is_pruned() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(10),
+            min: None,
+            max: None,
+        };
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Between,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::NotBetween,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn between_falls_open_when_stats_missing() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: None,
+            max: None,
+        };
+        assert!(data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Between,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
     }
 }

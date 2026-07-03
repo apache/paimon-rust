@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use crate::io::FileIO;
 use crate::spec::{
-    bucket_dir_name, BinaryRow, DataField, IndexManifest, Manifest, ManifestEntry,
+    bucket_dir_name, BinaryRow, DataField, DataFileMeta, IndexManifest, Manifest, ManifestEntry,
     ManifestFileMeta, PartitionComputer,
 };
 use crate::table::{BranchManager, SnapshotManager, TagManager};
@@ -117,17 +117,7 @@ impl ExtraFileResolver {
         }
     }
 
-    fn resolve_extra_file_path(
-        &self,
-        partition_bytes: &[u8],
-        bucket: i32,
-        extra_file_name: &str,
-        external_path: Option<&str>,
-    ) -> Option<String> {
-        if let Some(ext_path) = external_path {
-            let dir = ext_path.trim_end_matches('/');
-            return Some(format!("{}/{}", dir, extra_file_name));
-        }
+    fn resolve_bucket_path(&self, partition_bytes: &[u8], bucket: i32) -> Option<String> {
         let partition_path = if let Some(ref computer) = self.partition_computer {
             let row = BinaryRow::from_serialized_bytes(partition_bytes).ok()?;
             computer.generate_partition_path(&row).ok()?
@@ -136,9 +126,20 @@ impl ExtraFileResolver {
         };
         let bucket_dir = bucket_dir_name(bucket);
         Some(format!(
-            "{}/{}{}/{}",
-            self.table_location, partition_path, bucket_dir, extra_file_name
+            "{}/{}{}",
+            self.table_location, partition_path, bucket_dir
         ))
+    }
+
+    fn resolve_extra_file_path(
+        &self,
+        partition_bytes: &[u8],
+        bucket: i32,
+        data_file: &DataFileMeta,
+        extra_file_name: &str,
+    ) -> Option<String> {
+        let bucket_path = self.resolve_bucket_path(partition_bytes, bucket)?;
+        Some(data_file.aligned_file_path(&bucket_path, extra_file_name))
     }
 }
 
@@ -433,8 +434,8 @@ async fn collect_snapshot_files(
                     let full_path = extra_resolver.resolve_extra_file_path(
                         e.partition(),
                         e.bucket(),
+                        e.file(),
                         extra,
-                        e.file().external_path.as_deref(),
                     );
                     if let Some(path) = full_path {
                         extra_file_stat_tasks.push((manifest_idx, entry_idx, path));
@@ -844,6 +845,138 @@ mod tests {
             .write(Bytes::from(content.to_string()))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_extra_file_resolver_uses_external_path_parent() {
+        use crate::spec::stats::BinaryTableStats;
+
+        let resolver = ExtraFileResolver::new("s3://warehouse/table", &[], &[]);
+        let stats = BinaryTableStats::empty();
+        let file = DataFileMeta {
+            file_name: "data-0.row".to_string(),
+            file_size: 1,
+            row_count: 1,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: stats.clone(),
+            value_stats: stats,
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec!["data-0.row.index".to_string()],
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: Some("s3://bucket/external/data-0.row".to_string()),
+            first_row_id: None,
+            write_cols: None,
+        };
+
+        assert_eq!(
+            resolver.resolve_extra_file_path(&[], 0, &file, "data-0.row.index"),
+            Some("s3://bucket/external/data-0.row.index".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_referenced_files_stats_external_sidecar_from_parent() {
+        use crate::spec::stats::BinaryTableStats;
+        use crate::spec::{DataFileMeta, FileKind, Manifest, ManifestFileMeta, ManifestList};
+
+        let table_path = "memory:/test_external_sidecar_references";
+        let external_dir = "memory:/external_sidecar_references";
+        let sidecar_name = "data-0.row.index";
+        let sidecar_content = "sidecar-bytes";
+        let file_io = test_file_io();
+
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+        write_test_file(
+            &file_io,
+            &format!("{external_dir}/{sidecar_name}"),
+            sidecar_content,
+        )
+        .await;
+
+        let manifest_name = "manifest-external-sidecar-0";
+        let manifest_path = format!("{table_path}/manifest/{manifest_name}");
+        let data_file = DataFileMeta {
+            file_name: "data-0.row".to_string(),
+            file_size: 100,
+            row_count: 10,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: vec![sidecar_name.to_string()],
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: Some(format!("{external_dir}/data-0.row")),
+            first_row_id: None,
+            write_cols: None,
+        };
+        let entry = ManifestEntry::new(FileKind::Add, vec![0u8; 12], 0, 1, data_file, 0);
+        Manifest::write(&file_io, &manifest_path, &[entry])
+            .await
+            .unwrap();
+
+        let manifest_list_name = "manifest-list-external-sidecar";
+        let manifest_list_path = format!("{table_path}/manifest/{manifest_list_name}");
+        let manifest_meta = ManifestFileMeta::new(
+            manifest_name.to_string(),
+            512,
+            1,
+            0,
+            BinaryTableStats::empty(),
+            0,
+        );
+        ManifestList::write(&file_io, &manifest_list_path, &[manifest_meta])
+            .await
+            .unwrap();
+
+        let delta_list_name = "manifest-list-external-sidecar-delta";
+        let delta_list_path = format!("{table_path}/manifest/{delta_list_name}");
+        ManifestList::write(&file_io, &delta_list_path, &[])
+            .await
+            .unwrap();
+
+        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list(manifest_list_name.to_string())
+            .delta_manifest_list(delta_list_name.to_string())
+            .commit_user("test".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000)
+            .build();
+        sm.commit_snapshot(&snapshot).await.unwrap();
+
+        let result = collect_referenced_files_summary(&file_io, table_path, &[], &[])
+            .await
+            .unwrap();
+        let total = result.iter().find(|r| r.source == "total").unwrap();
+        assert_eq!(total.data_file_count, 2);
+        assert_eq!(total.data_file_size, 100 + sidecar_content.len() as i64);
     }
 
     #[tokio::test]

@@ -38,7 +38,22 @@ impl ManifestList {
 
     /// Write manifest file metas to a manifest list file.
     pub async fn write(file_io: &FileIO, path: &str, metas: &[ManifestFileMeta]) -> Result<()> {
-        let bytes = crate::spec::to_avro_bytes(MANIFEST_FILE_META_SCHEMA, metas)?;
+        Self::write_with_compression(file_io, path, metas, crate::spec::DEFAULT_AVRO_COMPRESSION)
+            .await
+    }
+
+    /// Write manifest file metas with the configured Avro compression.
+    pub async fn write_with_compression(
+        file_io: &FileIO,
+        path: &str,
+        metas: &[ManifestFileMeta],
+        compression: &str,
+    ) -> Result<()> {
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            MANIFEST_FILE_META_SCHEMA,
+            metas,
+            compression,
+        )?;
         let output = file_io.new_output(path)?;
         output.write(bytes::Bytes::from(bytes)).await
     }

@@ -143,6 +143,12 @@ fn predicate_supported_for_reader_pruning(predicate: &Predicate) -> bool {
                     | PredicateOperator::GtEq
                     | PredicateOperator::In
                     | PredicateOperator::NotIn
+                    | PredicateOperator::StartsWith
+                    | PredicateOperator::EndsWith
+                    | PredicateOperator::Contains
+                    | PredicateOperator::Like
+                    | PredicateOperator::Between
+                    | PredicateOperator::NotBetween
             )
         }
         Predicate::AlwaysTrue | Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => false,

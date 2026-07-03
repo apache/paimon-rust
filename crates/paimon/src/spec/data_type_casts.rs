@@ -165,7 +165,8 @@ fn explicit_cast_supported(source: &DataType, target: &DataType) -> bool {
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)
-        | DataType::Row(_) => false,
+        | DataType::Row(_)
+        | DataType::Vector(_) => false,
     }
 }
 

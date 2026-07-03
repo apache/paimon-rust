@@ -223,6 +223,12 @@ pub enum PredicateOperator {
     GtEq,
     In,
     NotIn,
+    StartsWith,
+    EndsWith,
+    Contains,
+    Like,
+    Between,
+    NotBetween,
 }
 
 impl fmt::Display for PredicateOperator {
@@ -238,6 +244,12 @@ impl fmt::Display for PredicateOperator {
             Self::GtEq => write!(f, ">="),
             Self::In => write!(f, "IN"),
             Self::NotIn => write!(f, "NOT IN"),
+            Self::StartsWith => write!(f, "STARTS_WITH"),
+            Self::EndsWith => write!(f, "ENDS_WITH"),
+            Self::Contains => write!(f, "CONTAINS"),
+            Self::Like => write!(f, "LIKE"),
+            Self::Between => write!(f, "BETWEEN"),
+            Self::NotBetween => write!(f, "NOT BETWEEN"),
         }
     }
 }
@@ -650,6 +662,113 @@ impl PredicateBuilder {
         self.leaf(field, PredicateOperator::NotIn, literals)
     }
 
+    // -- string operators --
+
+    /// `field LIKE 'pat%'` shape. Empty pattern → `IsNotNull(field)` (every
+    /// non-null string starts with the empty string). Non-string `pattern`
+    /// → [`Error::ConfigInvalid`].
+    pub fn starts_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::StartsWith, pattern)
+    }
+
+    /// `field LIKE '%pat'` shape. Empty pattern → `IsNotNull(field)`.
+    pub fn ends_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::EndsWith, pattern)
+    }
+
+    /// `field LIKE '%pat%'` shape. Empty pattern → `IsNotNull(field)`.
+    pub fn contains(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::Contains, pattern)
+    }
+
+    /// `field LIKE '<pattern>'` with optional `escape` character (default `\`).
+    /// Mirrors Java `LikeOptimization`: rewrites `prefix%` / `%suffix` /
+    /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
+    /// [`PredicateOperator::EndsWith`] / [`PredicateOperator::Contains`] /
+    /// [`PredicateOperator::Eq`]; falls back to a [`PredicateOperator::Like`]
+    /// leaf for anything more complex (`_`, multi-segment `%`, escaped
+    /// wildcards). The `Like` evaluator follows arrow_string `like` kernel
+    /// semantics for the residual cases.
+    ///
+    /// `escape == None` defaults to `\`. Any other ESCAPE character is
+    /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
+    /// that into a fall-open). Empty pattern → [`PredicateOperator::Eq`] of the
+    /// empty string (SQL semantics: only the empty string matches).
+    pub fn like(&self, field: &str, pattern: Datum, escape: Option<char>) -> Result<Predicate> {
+        let pattern_str = match &pattern {
+            Datum::String(s) => s.clone(),
+            other => {
+                return Err(Error::ConfigInvalid {
+                    message: format!("LIKE requires a string pattern, got {other}"),
+                });
+            }
+        };
+        let escape_char = escape.unwrap_or('\\');
+        if escape_char != '\\' {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "LIKE escape character {escape_char:?} is not supported (only '\\\\')"
+                ),
+            });
+        }
+
+        match optimize_like_pattern(&pattern_str) {
+            LikeShape::EmptyOrLiteral(s) => self.equal(field, Datum::String(s)),
+            LikeShape::StartsWith(prefix) => self.starts_with(field, Datum::String(prefix)),
+            LikeShape::EndsWith(suffix) => self.ends_with(field, Datum::String(suffix)),
+            LikeShape::Contains(mid) => self.contains(field, Datum::String(mid)),
+            LikeShape::Residual => self.leaf(field, PredicateOperator::Like, vec![pattern]),
+        }
+    }
+
+    // -- range operators --
+
+    /// `field BETWEEN low AND high`. SQL semantics: inclusive on both ends.
+    /// `low > high` short-circuits to [`Predicate::AlwaysFalse`] (no value can
+    /// be between an empty range).
+    pub fn between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
+        if Self::low_strictly_above_high(&low, &high) {
+            return Ok(Predicate::AlwaysFalse);
+        }
+        self.leaf(field, PredicateOperator::Between, vec![low, high])
+    }
+
+    /// `field NOT BETWEEN low AND high`. SQL three-valued logic: NULL value
+    /// → NULL → treated as false, matching the existing `NotEq` evaluator.
+    /// `low > high` short-circuits to `IsNotNull(field)` (every non-null value
+    /// is "not between" an empty range).
+    pub fn not_between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
+        if Self::low_strictly_above_high(&low, &high) {
+            return self.is_not_null(field);
+        }
+        self.leaf(field, PredicateOperator::NotBetween, vec![low, high])
+    }
+
+    fn low_strictly_above_high(low: &Datum, high: &Datum) -> bool {
+        matches!(datum_cmp(low, high), Some(Ordering::Greater))
+    }
+
+    /// Shared body for the three string operators: empty-string short-circuit
+    /// and literal-type guard ([`leaf`] still cross-checks against the column
+    /// type, so non-string columns are rejected there).
+    fn string_leaf(&self, field: &str, op: PredicateOperator, pattern: Datum) -> Result<Predicate> {
+        match &pattern {
+            // Every non-null string starts with / ends with / contains the
+            // empty string, and a NULL value matches none of them — i.e. the
+            // empty pattern is exactly `IsNotNull`. Folding to `AlwaysTrue`
+            // would wrongly retain NULL rows (and drop the field reference,
+            // keeping the predicate out of the data-pruning path).
+            Datum::String(s) if s.is_empty() => return self.is_not_null(field),
+            Datum::String(_) => {}
+            other => {
+                return Err(Error::ConfigInvalid {
+                    message: format!("{op} requires a string pattern, got {other}"),
+                });
+            }
+        }
+        self.leaf(field, op, vec![pattern])
+    }
+
     // -- internal --
 
     /// Resolve field name to index + type, validate literals, and build a leaf predicate.
@@ -703,6 +822,7 @@ impl PredicateBuilder {
                     message: format!("{op} expects at least 1 literal, got 0"),
                 });
             }
+            PredicateOperator::Between | PredicateOperator::NotBetween => (2, literals.len()),
             _ => (1, literals.len()),
         };
         if actual != expected {
@@ -914,11 +1034,197 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                 ),
                 PredicateOperator::In => literals.iter().any(|lit| datum_eq(val, lit)),
                 PredicateOperator::NotIn => !literals.iter().any(|lit| datum_eq(val, lit)),
+                PredicateOperator::StartsWith => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.starts_with(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "STARTS_WITH must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::EndsWith => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.ends_with(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "ENDS_WITH must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::Contains => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.contains(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "CONTAINS must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::Like => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(pattern))) => {
+                        like_match(haystack, pattern)
+                    }
+                    _ => unreachable!(
+                        "LIKE must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::Between => eval_between(val, literals),
+                PredicateOperator::NotBetween => !eval_between(val, literals),
                 // IsNull/IsNotNull are handled in the outer match above.
                 PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LIKE pattern optimization & evaluation
+// ---------------------------------------------------------------------------
+
+/// Result of LIKE pattern shape analysis. The `String` payloads are the
+/// literal substrings extracted from the pattern (with escape sequences
+/// already decoded).
+enum LikeShape {
+    /// Empty pattern, or a pattern that contains no wildcards / escapes —
+    /// equivalent to `Eq <literal>` (where the literal is the unescaped
+    /// pattern, possibly empty).
+    EmptyOrLiteral(String),
+    /// `prefix%` (exactly one trailing `%`, no other wildcards or escapes).
+    StartsWith(String),
+    /// `%suffix`.
+    EndsWith(String),
+    /// `%mid%` (exactly one leading and one trailing `%`).
+    Contains(String),
+    /// Anything else: `_`, multi-segment `%`, or any escape sequence — must
+    /// fall through to a `Like` leaf evaluator.
+    Residual,
+}
+
+/// Classify a SQL LIKE pattern. The escape character is hardcoded to `\` —
+/// callers wanting any other escape should bypass optimization and surface a
+/// `Like` leaf directly. Any presence of `\` in the pattern forces
+/// [`LikeShape::Residual`] (the simple shape rules don't account for escaped
+/// wildcards).
+fn optimize_like_pattern(pattern: &str) -> LikeShape {
+    if pattern.contains('\\') || pattern.contains('_') {
+        return LikeShape::Residual;
+    }
+    let bytes = pattern.as_bytes();
+    let percent_count = bytes.iter().filter(|b| **b == b'%').count();
+    match percent_count {
+        0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
+        1 => {
+            if let Some(prefix) = pattern.strip_suffix('%') {
+                LikeShape::StartsWith(prefix.to_string())
+            } else if let Some(suffix) = pattern.strip_prefix('%') {
+                LikeShape::EndsWith(suffix.to_string())
+            } else {
+                LikeShape::Residual
+            }
+        }
+        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+            // `%%` reduces to `Contains('')`, which itself short-circuits to
+            // `IsNotNull` at the StartsWith/EndsWith/Contains builder boundary
+            // — so no special-casing here.
+            LikeShape::Contains(pattern[1..pattern.len() - 1].to_string())
+        }
+        _ => LikeShape::Residual,
+    }
+}
+
+/// Evaluate a SQL LIKE pattern against a value. Implements the backtracking
+/// matcher used by `arrow_string::like::like`:
+/// * `%` matches any (possibly empty) substring,
+/// * `_` matches exactly one character,
+/// * `\X` matches the literal `X` for any character `X` (the backslash is
+///   consumed); a trailing `\` matches a literal backslash.
+fn like_match(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    like_match_chars(&value, 0, &pattern, 0)
+}
+
+fn like_match_chars(value: &[char], mut vi: usize, pattern: &[char], mut pi: usize) -> bool {
+    while pi < pattern.len() {
+        match pattern[pi] {
+            '%' => {
+                // Collapse runs of `%` and try every possible suffix.
+                while pi < pattern.len() && pattern[pi] == '%' {
+                    pi += 1;
+                }
+                if pi == pattern.len() {
+                    return true;
+                }
+                while vi <= value.len() {
+                    if like_match_chars(value, vi, pattern, pi) {
+                        return true;
+                    }
+                    if vi == value.len() {
+                        return false;
+                    }
+                    vi += 1;
+                }
+                return false;
+            }
+            '_' => {
+                if vi == value.len() {
+                    return false;
+                }
+                vi += 1;
+                pi += 1;
+            }
+            '\\' => {
+                // Mirror arrow's `like` kernel: a backslash consumes the next
+                // character and matches it literally, whatever it is (`%`, `_`,
+                // `\`, or any other char such as `a`). A trailing backslash
+                // matches a literal backslash.
+                let expected = match pattern.get(pi + 1) {
+                    Some(&next) => {
+                        pi += 2;
+                        next
+                    }
+                    None => {
+                        pi += 1;
+                        '\\'
+                    }
+                };
+                if vi == value.len() || value[vi] != expected {
+                    return false;
+                }
+                vi += 1;
+            }
+            other => {
+                if vi == value.len() || value[vi] != other {
+                    return false;
+                }
+                vi += 1;
+                pi += 1;
+            }
+        }
+    }
+    vi == value.len()
+}
+
+// ---------------------------------------------------------------------------
+// BETWEEN evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate `value BETWEEN low AND high` (inclusive). `NotBetween` is the
+/// boolean complement at the call site, which is correct for non-null
+/// `value` — null handling already short-circuits in the outer `eval_leaf`.
+/// Returns `false` when either comparison is incomparable (defensive: the
+/// builder validates types up front, so this is unreachable in practice).
+fn eval_between(value: &Datum, literals: &[Datum]) -> bool {
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        unreachable!("BETWEEN must have 2 literals (validated by builder)");
+    };
+    let above_low = matches!(
+        datum_cmp(value, low),
+        Some(Ordering::Greater | Ordering::Equal)
+    );
+    let below_high = matches!(
+        datum_cmp(value, high),
+        Some(Ordering::Less | Ordering::Equal)
+    );
+    above_low && below_high
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,5 +2198,322 @@ mod tests {
         assert!(Predicate::negate(inner)
             .project_field_index_inclusive(&mapping)
             .is_none());
+    }
+
+    // ======================== string operators ========================
+
+    #[test]
+    fn test_builder_starts_with() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .starts_with("name", Datum::String("foo".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, PredicateOperator::StartsWith);
+                assert_eq!(literals, &[Datum::String("foo".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_ends_with() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .ends_with("name", Datum::String("bar".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::EndsWith),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_contains() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .contains("name", Datum::String("baz".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::Contains),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_string_ops_empty_pattern_is_not_null() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // An empty pattern matches every non-null string and no NULL, so it is
+        // exactly `IsNotNull` (not `AlwaysTrue`, which would retain NULL rows).
+        for build in [
+            pb.starts_with("name", Datum::String(String::new())),
+            pb.ends_with("name", Datum::String(String::new())),
+            pb.contains("name", Datum::String(String::new())),
+        ] {
+            assert!(matches!(
+                build.unwrap(),
+                Predicate::Leaf {
+                    op: PredicateOperator::IsNotNull,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_builder_string_ops_reject_non_string_pattern() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb.starts_with("name", Datum::Int(1)).is_err());
+        assert!(pb.ends_with("name", Datum::Int(1)).is_err());
+        assert!(pb.contains("name", Datum::Int(1)).is_err());
+    }
+
+    #[test]
+    fn test_builder_string_ops_reject_non_string_column() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `id` is Int, so a String literal fails the cross-check inside leaf().
+        assert!(pb
+            .starts_with("id", Datum::String("x".to_string()))
+            .is_err());
+    }
+
+    #[test]
+    fn test_eval_string_operators() {
+        let lit = Datum::String("oo".to_string());
+        let val = Datum::String("foobar".to_string());
+
+        assert!(eval_leaf(
+            PredicateOperator::Contains,
+            Some(&val),
+            std::slice::from_ref(&lit),
+        ));
+        assert!(!eval_leaf(
+            PredicateOperator::StartsWith,
+            Some(&val),
+            std::slice::from_ref(&lit),
+        ));
+        assert!(eval_leaf(
+            PredicateOperator::StartsWith,
+            Some(&val),
+            &[Datum::String("foo".to_string())],
+        ));
+        assert!(eval_leaf(
+            PredicateOperator::EndsWith,
+            Some(&val),
+            &[Datum::String("bar".to_string())],
+        ));
+        assert!(!eval_leaf(
+            PredicateOperator::EndsWith,
+            Some(&val),
+            &[Datum::String("baz".to_string())],
+        ));
+        // NULL value → false (SQL three-valued logic).
+        assert!(!eval_leaf(
+            PredicateOperator::StartsWith,
+            None,
+            &[Datum::String("foo".to_string())],
+        ));
+    }
+
+    // ======================== LIKE operator ========================
+
+    fn assert_leaf(pred: &Predicate, expected_op: PredicateOperator, expected_lit: &str) {
+        match pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, expected_op, "op mismatch");
+                assert_eq!(literals, &[Datum::String(expected_lit.to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_like_optimization_rewrites() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // No wildcards → Eq.
+        assert_leaf(
+            &pb.like("name", Datum::String("foo".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Eq,
+            "foo",
+        );
+        // Empty pattern → Eq("") (only empty string matches).
+        assert_leaf(
+            &pb.like("name", Datum::String(String::new()), None).unwrap(),
+            PredicateOperator::Eq,
+            "",
+        );
+        // prefix% → StartsWith.
+        assert_leaf(
+            &pb.like("name", Datum::String("foo%".to_string()), None)
+                .unwrap(),
+            PredicateOperator::StartsWith,
+            "foo",
+        );
+        // %suffix → EndsWith.
+        assert_leaf(
+            &pb.like("name", Datum::String("%bar".to_string()), None)
+                .unwrap(),
+            PredicateOperator::EndsWith,
+            "bar",
+        );
+        // %mid% → Contains.
+        assert_leaf(
+            &pb.like("name", Datum::String("%baz%".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Contains,
+            "baz",
+        );
+    }
+
+    #[test]
+    fn test_like_residual_for_non_optimizable_patterns() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `_` keeps Like leaf.
+        assert_leaf(
+            &pb.like("name", Datum::String("f_o".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Like,
+            "f_o",
+        );
+        // Multi-segment % keeps Like leaf.
+        assert_leaf(
+            &pb.like("name", Datum::String("a%b%c".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Like,
+            "a%b%c",
+        );
+        // Escaped wildcards keep Like leaf (optimization is conservative).
+        assert_leaf(
+            &pb.like("name", Datum::String(r"foo\%".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Like,
+            r"foo\%",
+        );
+    }
+
+    #[test]
+    fn test_like_rejects_custom_escape_char() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb
+            .like("name", Datum::String("a$%".to_string()), Some('$'))
+            .is_err());
+    }
+
+    #[test]
+    fn test_like_rejects_non_string_pattern() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb.like("name", Datum::Int(1), None).is_err());
+    }
+
+    #[test]
+    fn test_like_match_evaluator() {
+        // Patterns that fall back to Like leaf must evaluate correctly.
+        assert!(super::like_match("foobar", "f_o%"));
+        assert!(super::like_match("foobar", "%bar"));
+        assert!(super::like_match("foobar", "f%r"));
+        assert!(!super::like_match("foobar", "f_x%"));
+        // `_` requires exactly one character.
+        assert!(super::like_match("ab", "a_"));
+        assert!(!super::like_match("a", "a_"));
+        assert!(!super::like_match("abc", "a_"));
+        // Escape handling.
+        assert!(super::like_match("100%", "100\\%"));
+        assert!(!super::like_match("1000", "100\\%"));
+        assert!(super::like_match("a_b", "a\\_b"));
+        assert!(!super::like_match("axb", "a\\_b"));
+        // Escaped non-wildcard: `\X` matches literal `X`, not `\X` (arrow
+        // semantics, verified against arrow_string's like_escape test).
+        assert!(super::like_match("a", "\\a"));
+        assert!(!super::like_match("\\a", "\\a"));
+        // Trailing backslash matches a literal backslash.
+        assert!(super::like_match("\\", "\\"));
+        // Empty pattern only matches empty value.
+        assert!(super::like_match("", ""));
+        assert!(!super::like_match("a", ""));
+    }
+
+    // ======================== BETWEEN / NOT BETWEEN ========================
+
+    #[test]
+    fn test_builder_between_keeps_inclusive_range() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb.between("id", Datum::Int(1), Datum::Int(10)).unwrap();
+        match &pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, PredicateOperator::Between);
+                assert_eq!(literals, &[Datum::Int(1), Datum::Int(10)]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_between_low_above_high_short_circuits_to_always_false() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb.between("id", Datum::Int(10), Datum::Int(1)).unwrap();
+        assert!(matches!(pred, Predicate::AlwaysFalse));
+    }
+
+    #[test]
+    fn test_builder_not_between_low_above_high_short_circuits_to_is_not_null() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb.not_between("id", Datum::Int(10), Datum::Int(1)).unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::IsNotNull),
+            other => panic!("expected IsNotNull leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_between_rejects_type_mismatch() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `id` is Int — String literal violates leaf() type cross-check.
+        assert!(pb
+            .between("id", Datum::String("a".to_string()), Datum::Int(10))
+            .is_err());
+    }
+
+    #[test]
+    fn test_eval_between_inclusive() {
+        let lits = [Datum::Int(5), Datum::Int(10)];
+        for v in [5, 7, 10] {
+            assert!(eval_leaf(
+                PredicateOperator::Between,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        for v in [4, 11] {
+            assert!(!eval_leaf(
+                PredicateOperator::Between,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        // NULL value → false.
+        assert!(!eval_leaf(PredicateOperator::Between, None, &lits));
+    }
+
+    #[test]
+    fn test_eval_not_between_complement_with_null_false() {
+        let lits = [Datum::Int(5), Datum::Int(10)];
+        for v in [4, 11] {
+            assert!(eval_leaf(
+                PredicateOperator::NotBetween,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        for v in [5, 7, 10] {
+            assert!(!eval_leaf(
+                PredicateOperator::NotBetween,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        // NULL value → false (matches existing NotEq null-semantics).
+        assert!(!eval_leaf(PredicateOperator::NotBetween, None, &lits));
     }
 }

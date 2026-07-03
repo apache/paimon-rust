@@ -2158,13 +2158,13 @@ mod tests {
 
     #[test]
     fn test_aggregate_merge_function_sequence_field_forced_last_value() {
-        // 'tag' is the sequence field; even though user configured listagg,
-        // it should be forced to last_value (so the latest tag survives).
+        // 'tag' is the sequence field; even though the table-level default is
+        // listagg, it should be forced to last_value (so the latest tag survives).
         let schema = aggregation_schema();
         let output_schema = aggregation_output_schema();
         let options = agg_options(&[
             ("fields.amount.aggregate-function", "sum"),
-            ("fields.tag.aggregate-function", "listagg"),
+            ("fields.default-aggregate-function", "listagg"),
             ("sequence.field", "tag"),
         ]);
         let mf = AggregateMergeFunction::new(

@@ -375,7 +375,16 @@ fn data_evolution_predicate_may_match(
                 row_count,
             )
         }),
-        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Or(children) => children.iter().any(|child| {
+            data_evolution_predicate_may_match(
+                child,
+                table_fields,
+                field_sources,
+                file_stats,
+                row_count,
+            )
+        }),
+        Predicate::Not(_) => true,
         Predicate::Leaf {
             index,
             data_type,

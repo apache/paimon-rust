@@ -165,8 +165,9 @@ impl<'a> AggregationConfig<'a> {
     ///
     /// For `aggregate-function` keys additionally:
     /// * the function name must be one of the supported aggregators
+    /// * the field must not be listed in `sequence.field` — Java rejects
+    ///   aggregation definitions on sequence fields during schema validation.
     /// * the function must accept the field's declared data type — except for
-    ///   `sequence.field` columns (forced to `last_value` at runtime) and
     ///   primary-key columns (no aggregator; copied through), where the
     ///   configured function is ignored by the merge function's priority
     ///   order (Java `AggregateMergeFunction#getAggFuncName`), so only the
@@ -199,9 +200,15 @@ impl<'a> AggregationConfig<'a> {
                 });
             };
             if matches!(kind, FieldScopedOptionKind::AggregateFunction) {
-                let runtime_ignores_function =
-                    sequence_fields.contains(&col) || primary_keys.iter().any(|pk| pk == col);
-                if runtime_ignores_function {
+                if sequence_fields.contains(&col) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Should not define aggregation on sequence field: '{col}'."
+                        ),
+                    });
+                }
+
+                if primary_keys.iter().any(|pk| pk == col) {
                     if !is_known_aggregator_name(value) {
                         return Err(crate::Error::ConfigInvalid {
                             message: format!(
@@ -210,9 +217,10 @@ impl<'a> AggregationConfig<'a> {
                             ),
                         });
                     }
-                } else {
-                    validate_aggregator_for_type(value, col, field.data_type())?;
+                    continue;
                 }
+
+                validate_aggregator_for_type(value, col, field.data_type())?;
             }
         }
 
@@ -597,21 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_create_mode_skips_type_check_for_sequence_field() {
-        // `listagg` is incompatible with INT, but `amount` is a sequence
-        // field, so the runtime forces `last_value` and ignores the
-        // configured function — the definition is usable and must be accepted.
+    fn test_validate_create_mode_rejects_aggregation_on_sequence_field() {
+        // Java rejects aggregation definitions on sequence fields during
+        // schema validation; the runtime still forces sequence fields to
+        // last_value when reading old or externally-created metadata.
         let options = aggregation_options(&[
             ("sequence.field", "amount"),
             ("fields.amount.aggregate-function", "listagg"),
         ]);
-        let config = AggregationConfig::new(&options);
-
-        assert_eq!(
-            config
-                .validate_create_mode(&pk(), &sample_fields())
-                .unwrap(),
-            Some(AggregationMode::Basic)
+        let err = AggregationConfig::new(&options)
+            .validate_create_mode(&pk(), &sample_fields())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("amount")),
+            "expected sequence-field aggregation rejection, got {err:?}"
         );
     }
 
@@ -631,20 +639,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_create_mode_still_rejects_unknown_function_on_sequence_field() {
-        // The function name itself must stay valid even when the runtime
-        // would ignore it — typos should fail fast at CREATE TABLE.
-        let options = aggregation_options(&[
-            ("sequence.field", "amount"),
-            ("fields.amount.aggregate-function", "lisstagg"),
-        ]);
+    fn test_validate_create_mode_rejects_unknown_function_on_primary_key() {
+        // Primary-key fields are copied through at runtime, but a configured
+        // aggregation function name still must be valid so typos fail fast.
+        let options = aggregation_options(&[("fields.id.aggregate-function", "lisstagg")]);
         let err = AggregationConfig::new(&options)
             .validate_create_mode(&pk(), &sample_fields())
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("lisstagg") && message.contains("amount")),
-            "expected unknown-function error on sequence field, got {err:?}"
+                if message.contains("lisstagg") && message.contains("id")),
+            "expected unknown-function error on primary-key field, got {err:?}"
         );
     }
 

@@ -227,6 +227,9 @@ pub const KEY_DIMENSION: &str = "index.dimension";
 pub const KEY_DISTANCE_METRIC: &str = "distance.metric";
 pub const KEY_INDEX_TYPE: &str = "index.type";
 
+/// Paimon-prefixed option key for the vector index dimension.
+pub const LUMINA_DIMENSION_OPTION: &str = "lumina.index.dimension";
+
 pub struct LuminaIndexMeta {
     options: HashMap<String, String>,
 }

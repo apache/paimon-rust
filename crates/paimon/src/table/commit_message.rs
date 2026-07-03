@@ -29,10 +29,14 @@ pub struct CommitMessage {
     pub bucket: i32,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
+    /// Snapshot id from which row-id/column conflicts should be checked.
+    pub check_from_snapshot: Option<i64>,
     /// New changelog files to be added.
     pub new_changelog_files: Vec<DataFileMeta>,
     /// New index files to be added (used by dynamic bucket mode).
     pub new_index_files: Vec<IndexFileMeta>,
+    /// Index files to be removed from the current index manifest.
+    pub deleted_index_files: Vec<IndexFileMeta>,
     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
     pub deleted_files: Vec<DataFileMeta>,
 }
@@ -43,8 +47,10 @@ impl CommitMessage {
             partition,
             bucket,
             new_files,
+            check_from_snapshot: None,
             new_changelog_files: Vec::new(),
             new_index_files: Vec::new(),
+            deleted_index_files: Vec::new(),
             deleted_files: Vec::new(),
         }
     }

@@ -22,14 +22,19 @@ use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
+    StringArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
     neq as arrow_neq,
 };
 use arrow_schema::ArrowError;
+use arrow_string::like::{
+    contains as arrow_contains, ends_with as arrow_ends_with, like as arrow_like,
+    starts_with as arrow_starts_with,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -40,8 +45,10 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::metadata::ParquetMetaDataReader;
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::metadata::{
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::collections::HashMap;
@@ -146,8 +153,27 @@ impl FormatFileReader for ParquetFormatReader {
     ) -> crate::Result<ArrowRecordBatchStream> {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
+        let empty_predicates = Vec::new();
+        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
+            Some(fp) => (&fp.predicates, &fp.file_fields),
+            None => (&empty_predicates, &[]),
+        };
+
+        // Only load the Parquet page index (ColumnIndex + OffsetIndex) when a
+        // predicate can use it for page-level pruning — matching Java Paimon,
+        // which gets page-level skipping for free via parquet-mr's
+        // `readNextFilteredRowGroup`. arrow-rs does not do this automatically, so
+        // we build the RowSelection ourselves below. Without a predicate the
+        // index is pure overhead (an extra metadata read with no benefit), so we
+        // skip it. `Optional` lets files without a page index fall through to
+        // row-group-level pruning instead of erroring.
+        let mut arrow_options = ArrowReaderOptions::new();
+        if !preds.is_empty() {
+            arrow_options = arrow_options.with_page_index_policy(PageIndexPolicy::Optional);
+        }
         let mut batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
+            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
+                .await?;
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
         let root_schema = parquet_schema.root_schema();
@@ -164,12 +190,6 @@ impl FormatFileReader for ParquetFormatReader {
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
-        let empty_predicates = Vec::new();
-        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
-            Some(fp) => (&fp.predicates, &fp.file_fields),
-            None => (&empty_predicates, &[]),
-        };
-
         let parquet_row_filter = build_parquet_row_filter(&parquet_schema, preds, file_fields)?;
         if let Some(f) = parquet_row_filter {
             batch_stream_builder = batch_stream_builder.with_row_filter(f);
@@ -181,6 +201,13 @@ impl FormatFileReader for ParquetFormatReader {
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
+
+        // Page-level selection. Returns `None` when ColumnIndex / OffsetIndex are
+        // absent (page index not loaded, older files, writer without page index)
+        // or when no page could be skipped, so intersecting is a no-op then.
+        let page_selection =
+            build_predicate_page_selection(batch_stream_builder.metadata(), preds, file_fields)?;
+        combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
 
         if let Some(ref ranges) = row_selection {
             let range_selection =
@@ -286,6 +313,12 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::GtEq
             | PredicateOperator::In
             | PredicateOperator::NotIn
+            | PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
+            | PredicateOperator::Like
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
     )
 }
 
@@ -308,6 +341,32 @@ fn parquet_row_filter_literals_supported(
             Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
         }
         PredicateOperator::In | PredicateOperator::NotIn => {
+            for literal in literals {
+                if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
+            // Substring kernels only run against string-typed columns; reject
+            // non-string file types early so the filter falls back to stats
+            // pruning + residual evaluation.
+            if !matches!(file_data_type, DataType::Char(_) | DataType::VarChar(_)) {
+                return Ok(false);
+            }
+            let Some(literal) = literals.first() else {
+                return Ok(false);
+            };
+            Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
+        }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            if literals.len() != 2 {
+                return Ok(false);
+            }
             for literal in literals {
                 if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
                     return Ok(false);
@@ -354,7 +413,11 @@ fn evaluate_exact_leaf_predicate(
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {
+        | PredicateOperator::GtEq
+        | PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
             let Some(literal) = literals.first() else {
                 return Ok(BooleanArray::from(vec![true; array.len()]));
             };
@@ -366,7 +429,46 @@ fn evaluate_exact_leaf_predicate(
             let result = evaluate_column_predicate(array, &scalar, op)?;
             Ok(sanitize_filter_mask(result))
         }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            evaluate_between_predicate(array, data_type, op, literals)
+        }
     }
+}
+
+/// `Between` / `NotBetween` translate to `gt_eq(col, low) & lt_eq(col, high)`
+/// (and its negation). `arrow_ord::cmp` produces nullable masks: any null
+/// row makes the comparison null, so a fully-built `Between` mask preserves
+/// nulls. `NotBetween` then negates valid rows and leaves nulls null —
+/// matching SQL three-valued logic; `sanitize_filter_mask` collapses nulls
+/// into `false` to match the predicate evaluator's "NULL → false" rule.
+fn evaluate_between_predicate(
+    array: &ArrayRef,
+    data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> Result<BooleanArray, ArrowError> {
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(low_scalar) = literal_scalar_for_parquet_filter(low, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(high_scalar) = literal_scalar_for_parquet_filter(high, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let lo_mask = arrow_gt_eq(array, &low_scalar)?;
+    let hi_mask = arrow_lt_eq(array, &high_scalar)?;
+    let between = arrow_arith::boolean::and_kleene(&lo_mask, &hi_mask)?;
+    let result = match op {
+        PredicateOperator::Between => between,
+        PredicateOperator::NotBetween => arrow_arith::boolean::not(&between)?,
+        _ => unreachable!(),
+    };
+    Ok(sanitize_filter_mask(result))
 }
 
 fn evaluate_set_membership_predicate(
@@ -423,11 +525,64 @@ fn evaluate_column_predicate(
         PredicateOperator::LtEq => arrow_lt_eq(column, scalar),
         PredicateOperator::Gt => arrow_gt(column, scalar),
         PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
+            let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
+            match op {
+                PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
+                PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
+                PredicateOperator::Contains => arrow_contains(column, &pattern),
+                PredicateOperator::Like => arrow_like(column, &pattern),
+                _ => unreachable!(),
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::NotIn
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
+}
+
+/// `arrow_string::like::*` kernels reject mismatched string types — Utf8 column
+/// against Utf8 pattern is fine, but a LargeUtf8 / Utf8View column needs a
+/// pattern of the same flavour. The shared scalar built upstream is always
+/// `StringArray` (Utf8); promote it to match the column when needed.
+fn pattern_scalar_for_string_kernel(
+    scalar: &Scalar<ArrayRef>,
+    column_type: &arrow_schema::DataType,
+) -> Result<Scalar<ArrayRef>, ArrowError> {
+    use arrow_array::{LargeStringArray, StringArray, StringViewArray};
+    use arrow_schema::DataType as ArrowDataType;
+
+    let arr = scalar.get().0;
+    let value = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .and_then(|s| (s.len() == 1 && s.is_valid(0)).then(|| s.value(0).to_string()));
+    let Some(value) = value else {
+        return Ok(scalar.clone());
+    };
+    Ok(match column_type {
+        ArrowDataType::Utf8 => Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef),
+        ArrowDataType::LargeUtf8 => {
+            Scalar::new(Arc::new(LargeStringArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Utf8View => {
+            Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Dictionary(_, value_type) if value_type.as_ref() == &ArrowDataType::Utf8 => {
+            Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef)
+        }
+        other => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "string predicate against non-string column type {other:?}"
+            )))
+        }
+    })
 }
 
 fn sanitize_filter_mask(mask: BooleanArray) -> BooleanArray {
@@ -557,6 +712,311 @@ fn build_row_group_column_indices(
         .iter()
         .map(|field| by_root_name.get(field.name()).copied().flatten())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Page-index (ColumnIndex / OffsetIndex) pruning
+// ---------------------------------------------------------------------------
+
+/// Stats view over one data page of a **single** column, backed by the Parquet
+/// ColumnIndex. Plugs into the same [`StatsAccessor`] evaluator as row-group
+/// pruning so both layers share identical fail-open semantics.
+///
+/// Only `target_index` is exposed; every other column reports no stats so its
+/// leaves fail open. Parquet pages are laid out per column chunk (different
+/// columns may have different page counts and boundaries), so each column must
+/// be pruned against its own page layout — see [`build_predicate_page_selection`].
+struct ParquetPageStats<'a> {
+    /// File-field index this page belongs to.
+    target_index: usize,
+    /// ColumnIndex of the target column for the current row group.
+    column_index: &'a ColumnIndexMetaData,
+    page_idx: usize,
+    page_row_count: i64,
+}
+
+impl StatsAccessor for ParquetPageStats<'_> {
+    fn row_count(&self) -> i64 {
+        self.page_row_count
+    }
+
+    fn null_count(&self, index: usize) -> Option<i64> {
+        if index != self.target_index {
+            return None;
+        }
+        self.column_index.null_count(self.page_idx)
+    }
+
+    fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        if index != self.target_index {
+            return None;
+        }
+        page_index_value_to_datum(self.column_index, self.page_idx, data_type, true)
+    }
+
+    fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        if index != self.target_index {
+            return None;
+        }
+        page_index_value_to_datum(self.column_index, self.page_idx, data_type, false)
+    }
+}
+
+/// Decode a per-page min/max from a [`ColumnIndexMetaData`] into a [`Datum`].
+///
+/// Returns `None` (fail-open: keep the page) for null pages, missing values, or
+/// any type that the footer-side path also excludes (decimals, sub-millisecond
+/// timestamps).
+fn page_index_value_to_datum(
+    column_index: &ColumnIndexMetaData,
+    page_idx: usize,
+    data_type: &DataType,
+    is_min: bool,
+) -> Option<Datum> {
+    if column_index.is_null_page(page_idx) {
+        return None;
+    }
+    macro_rules! primitive {
+        ($idx:expr) => {
+            if is_min {
+                $idx.min_values().get(page_idx)
+            } else {
+                $idx.max_values().get(page_idx)
+            }
+        };
+    }
+    macro_rules! bytes {
+        ($idx:expr) => {
+            if is_min {
+                $idx.min_value(page_idx)
+            } else {
+                $idx.max_value(page_idx)
+            }
+        };
+    }
+    match (column_index, data_type) {
+        (ColumnIndexMetaData::BOOLEAN(idx), DataType::Boolean(_)) => {
+            primitive!(idx).copied().map(Datum::Bool)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::TinyInt(_)) => primitive!(idx)
+            .and_then(|v| i8::try_from(*v).ok())
+            .map(Datum::TinyInt),
+        (ColumnIndexMetaData::INT32(idx), DataType::SmallInt(_)) => primitive!(idx)
+            .and_then(|v| i16::try_from(*v).ok())
+            .map(Datum::SmallInt),
+        (ColumnIndexMetaData::INT32(idx), DataType::Int(_)) => {
+            primitive!(idx).copied().map(Datum::Int)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Date(_)) => {
+            primitive!(idx).copied().map(Datum::Date)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Time(_)) => {
+            primitive!(idx).copied().map(Datum::Time)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::BigInt(_)) => {
+            primitive!(idx).copied().map(Datum::Long)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::Timestamp(ts)) if ts.precision() <= 3 => {
+            primitive!(idx)
+                .copied()
+                .map(|millis| Datum::Timestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::LocalZonedTimestamp(ts))
+            if ts.precision() <= 3 =>
+        {
+            primitive!(idx)
+                .copied()
+                .map(|millis| Datum::LocalZonedTimestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::FLOAT(idx), DataType::Float(_)) => {
+            primitive!(idx).copied().map(Datum::Float)
+        }
+        (ColumnIndexMetaData::DOUBLE(idx), DataType::Double(_)) => {
+            primitive!(idx).copied().map(Datum::Double)
+        }
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Char(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarChar(_)) => bytes!(idx)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(|s| Datum::String(s.to_string())),
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarBinary(_)) => {
+            bytes!(idx).map(|bytes| Datum::Bytes(bytes.to_vec()))
+        }
+        (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::VarBinary(_)) => {
+            bytes!(idx).map(|bytes| Datum::Bytes(bytes.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Build a page-granular [`RowSelection`] from the Parquet ColumnIndex /
+/// OffsetIndex by pruning each predicate column against **its own** page layout,
+/// then intersecting the per-column selections.
+///
+/// Parquet splits pages per column chunk, so different columns in a row group
+/// may have different page counts and boundaries. Each column is therefore
+/// evaluated over its own `OffsetIndex` pages, exposing only that column to the
+/// stats evaluator (every other column fails open). Because the top-level
+/// predicate list is a conjunction, intersecting the per-column selections is
+/// sound.
+///
+/// Returns `None` when the page index is absent or when no page could be skipped
+/// (so the caller leaves the coarser row-group selection untouched). A page is
+/// kept whenever its stats are unavailable or the predicate cannot be decided
+/// from them — pruning never drops a page it is unsure about.
+fn build_predicate_page_selection(
+    metadata: &ParquetMetaData,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<Option<RowSelection>> {
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    let (Some(column_index), Some(offset_index)) =
+        (metadata.column_index(), metadata.offset_index())
+    else {
+        return Ok(None);
+    };
+    let row_groups = metadata.row_groups();
+    if row_groups.is_empty() {
+        return Ok(None);
+    }
+
+    // Predicates are already remapped to file-level indices by the caller, so an
+    // identity mapping suffices (same convention as row-group pruning).
+    let identity_mapping: Vec<Option<usize>> = (0..file_fields.len()).map(Some).collect();
+    let column_lookup = build_row_group_column_indices(row_groups[0].columns(), file_fields);
+    let total_rows: usize = row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
+
+    let mut referenced_fields = Vec::new();
+    for predicate in predicates {
+        collect_leaf_field_indices(predicate, &mut referenced_fields);
+    }
+    referenced_fields.sort_unstable();
+    referenced_fields.dedup();
+
+    let mut combined: Option<RowSelection> = None;
+    for field_index in referenced_fields {
+        // The column must resolve to a single parquet column present in the file.
+        let Some(parquet_col) = column_lookup.get(field_index).copied().flatten() else {
+            continue;
+        };
+
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        let mut rg_base = 0usize;
+        let mut any_skipped = false;
+
+        for (rg_idx, row_group) in row_groups.iter().enumerate() {
+            let rg_rows = row_group.num_rows() as usize;
+            let base = rg_base;
+            rg_base += rg_rows;
+
+            // Missing page index for this column/row group: keep the whole group
+            // (row-group pruning still applied).
+            let (Some(col_index), Some(col_offset)) = (
+                column_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+                offset_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+            ) else {
+                ranges.push(base..base + rg_rows);
+                continue;
+            };
+            let pages = col_offset.page_locations();
+            // Fail open when the column index is absent for this chunk
+            // (`ColumnIndexMetaData::NONE` — its accessors panic rather than
+            // return `None`), when the two indexes disagree on the page count,
+            // or when the page row boundaries are malformed. Either way we
+            // cannot safely map page stats to row ranges.
+            if pages.is_empty()
+                || matches!(col_index, ColumnIndexMetaData::NONE)
+                || col_index.num_pages() as usize != pages.len()
+                || !page_boundaries_valid(pages, rg_rows)
+            {
+                ranges.push(base..base + rg_rows);
+                continue;
+            }
+
+            for (page_idx, page) in pages.iter().enumerate() {
+                let page_start = page.first_row_index as usize;
+                let page_end = pages
+                    .get(page_idx + 1)
+                    .map_or(rg_rows, |next| next.first_row_index as usize);
+                if page_end <= page_start {
+                    continue;
+                }
+                let stats = ParquetPageStats {
+                    target_index: field_index,
+                    column_index: col_index,
+                    page_idx,
+                    page_row_count: (page_end - page_start) as i64,
+                };
+                if predicates_may_match_with_schema(
+                    predicates,
+                    &stats,
+                    &identity_mapping,
+                    file_fields,
+                ) {
+                    ranges.push(base + page_start..base + page_end);
+                } else {
+                    any_skipped = true;
+                }
+            }
+        }
+
+        if !any_skipped {
+            continue;
+        }
+        let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+        combined = Some(match combined {
+            Some(prev) => prev.intersection(&selection),
+            None => selection,
+        });
+    }
+
+    Ok(combined)
+}
+
+/// Collect the file-field indices referenced by leaf predicates (recursing
+/// through compound nodes). Indices are already file-level (see caller).
+fn collect_leaf_field_indices(predicate: &Predicate, out: &mut Vec<usize>) {
+    match predicate {
+        Predicate::Leaf { index, .. } => out.push(*index),
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                collect_leaf_field_indices(child, out);
+            }
+        }
+        Predicate::Not(child) => collect_leaf_field_indices(child, out),
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+    }
+}
+
+/// Validate that an OffsetIndex's page row boundaries are well-formed for a row
+/// group of `rg_rows` rows: the first page starts at row 0, `first_row_index`
+/// is strictly increasing, and every value stays within `[0, rg_rows]`.
+///
+/// Malformed metadata (negative, non-monotonic, or out-of-range boundaries)
+/// would otherwise produce invalid row ranges — huge values from `i64 as usize`
+/// underflow, or ranges past the row group — that panic
+/// `RowSelection::from_consecutive_ranges`. Callers fail open when this returns
+/// `false`.
+fn page_boundaries_valid(
+    pages: &[parquet::file::page_index::offset_index::PageLocation],
+    rg_rows: usize,
+) -> bool {
+    let rg_rows = rg_rows as i64;
+    let mut prev: i64 = -1;
+    for (page_idx, page) in pages.iter().enumerate() {
+        let first_row = page.first_row_index;
+        if page_idx == 0 && first_row != 0 {
+            return false;
+        }
+        if first_row <= prev || first_row > rg_rows {
+            return false;
+        }
+        prev = first_row;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +1219,8 @@ fn literal_scalar_for_parquet_filter(
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)
-        | DataType::Row(_) => return Ok(None),
+        | DataType::Row(_)
+        | DataType::Vector(_) => return Ok(None),
     };
 
     Ok(Some(Scalar::new(array)))
@@ -1024,14 +1485,26 @@ impl AsyncFileReader for ArrowFileReader {
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let metadata_opts = options.map(|o| o.metadata_options().clone());
+        // The page-index policies live on `ArrowReaderOptions` directly, not
+        // inside `metadata_options`, so they must be forwarded explicitly (the
+        // upstream default `AsyncFileReader::get_metadata` does the same).
+        // Without this, `with_page_index_policy` would silently no-op here and
+        // no page index would ever be loaded.
+        let column_index_policy = options.map(|o| o.column_index_policy());
+        let offset_index_policy = options.map(|o| o.offset_index_policy());
         let prefetch_hint = Some(METADATA_SIZE_HINT);
         Box::pin(async move {
             let file_size = self.file_size;
-            let metadata = ParquetMetaDataReader::new()
+            let mut reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(prefetch_hint)
-                .with_metadata_options(metadata_opts)
-                .load_and_finish(self, file_size)
-                .await?;
+                .with_metadata_options(metadata_opts);
+            if let Some(policy) = column_index_policy {
+                reader = reader.with_column_index_policy(policy);
+            }
+            if let Some(policy) = offset_index_policy {
+                reader = reader.with_offset_index_policy(policy);
+            }
+            let metadata = reader.load_and_finish(self, file_size).await?;
             Ok(Arc::new(metadata))
         })
     }
@@ -1137,6 +1610,10 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::ParquetFormatWriter;
+    use super::{
+        AsyncArrowWriter, PageIndexPolicy, ParquetMetaDataReader, Predicate, PredicateOperator,
+        RowSelection,
+    };
     use crate::arrow::format::FormatFileWriter;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder};
@@ -1186,6 +1663,138 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // String predicate tests (StartsWith / EndsWith / Contains)
+    // -----------------------------------------------------------------------
+
+    fn run_string_op(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        pattern: &str,
+    ) -> arrow_array::BooleanArray {
+        use crate::spec::VarCharType;
+        let dt = DataType::VarChar(VarCharType::default());
+        super::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::String(pattern.to_string())],
+        )
+        .expect("string op should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_starts_with_string_array() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foo"),
+            Some("foobar"),
+            Some("baz"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::StartsWith, arr, "foo");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_ends_with_large_string_array() {
+        use arrow_array::LargeStringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            Some("ello"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::EndsWith, arr, "ello");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_contains_string_view_array() {
+        use arrow_array::StringViewArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("apple pie"),
+            Some("banana"),
+            Some("crab apple"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::Contains, arr, "apple");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_pattern_with_underscore_and_percent() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foobar"),
+            Some("foox"),
+            Some("zoobar"),
+            None,
+        ]));
+        // f_o% matches "foobar" (f-o-o then anything) and "foox" (f-o-o then x)
+        // but not "zoobar".
+        let mask = run_string_op(super::PredicateOperator::Like, arr, "f_o%");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_escaped_percent_treated_literally() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef =
+            Arc::new(StringArray::from(vec![Some("100%"), Some("1000"), None]));
+        let mask = run_string_op(super::PredicateOperator::Like, arr, r"100\%");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // BETWEEN / NOT BETWEEN row-filter tests
+    // -----------------------------------------------------------------------
+
+    fn run_between(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        low: i32,
+        high: i32,
+    ) -> arrow_array::BooleanArray {
+        let dt = DataType::Int(IntType::new());
+        super::evaluate_exact_leaf_predicate(&column, &dt, op, &[Datum::Int(low), Datum::Int(high)])
+            .expect("BETWEEN should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_between_int_array() {
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
+        let mask = run_between(super::PredicateOperator::Between, arr, 5, 10);
+        let expected = arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_not_between_treats_null_as_false() {
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
+        let mask = run_between(super::PredicateOperator::NotBetween, arr, 5, 10);
+        // NULL → false (residual filter convention; matches sanitize_filter_mask).
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
+        assert_eq!(mask, expected);
     }
 
     // -----------------------------------------------------------------------
@@ -1408,5 +2017,354 @@ mod tests {
             parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
         let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_inline_fixed_size_list_roundtrip() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        // Build a FixedSizeList<Float32, 2> column: row 0 = [1.0, 2.0], row 1 = null.
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.append(true);
+        builder.values().append_value(0.0);
+        builder.values().append_value(0.0);
+        builder.append(false); // null vector row
+        let vec_array = builder.finish();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "embedding",
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                2,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vec_array)]).unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_inline_vector.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+                .await
+                .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let batches: Vec<RecordBatch> = reader.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        let col = batches[0].column(0);
+        let fsl = col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("column should be FixedSizeListArray");
+        assert_eq!(fsl.value_length(), 2);
+        assert!(fsl.is_valid(0));
+        assert!(fsl.is_null(1)); // null vector row preserved
+
+        let row0 = fsl.value(0);
+        let floats = row0
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("child should be Float32Array");
+        assert_eq!(floats.values(), &[1.0, 2.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Page-index (ColumnIndex / OffsetIndex) pruning
+    // -----------------------------------------------------------------------
+
+    /// Write a single row group split into `total_rows / page_row_limit` data
+    /// pages. `id` runs 0..total_rows so page `p` covers ids
+    /// `[p*page_row_limit, (p+1)*page_row_limit)`.
+    async fn write_multi_page_parquet(page_row_limit: usize, total_rows: i32) -> Vec<u8> {
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(page_row_limit)
+            .set_write_batch_size(page_row_limit)
+            .set_max_row_group_row_count(Some(total_rows as usize))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..total_rows).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    /// Parse metadata from in-memory parquet bytes, optionally loading the page
+    /// index — mirrors what the reader does via `with_page_index_policy`.
+    fn load_metadata_with_page_index(
+        bytes: &[u8],
+        page_index: bool,
+    ) -> Arc<parquet::file::metadata::ParquetMetaData> {
+        let mut reader = ParquetMetaDataReader::new();
+        if page_index {
+            reader = reader
+                .with_column_index_policy(PageIndexPolicy::Optional)
+                .with_offset_index_policy(PageIndexPolicy::Optional);
+        }
+        let owned: bytes::Bytes = bytes.to_vec().into();
+        Arc::new(reader.parse_and_finish(&owned).unwrap())
+    }
+
+    fn int_field(name: &str) -> DataField {
+        DataField::new(0, name.to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn id_leaf(op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
+        Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op,
+            literals,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_keeps_only_matching_page() {
+        // 80 rows / 10 per page = 8 pages; page p covers ids [p*10, p*10+10).
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Eq(35) falls only in page 3 ([30, 40)).
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("a page should be skipped");
+        assert_eq!(sel.row_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_outside_all_pages_skips_everything() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // 1000 is past every page's max (79).
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(1000)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("all pages should be skipped");
+        assert_eq!(sel.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_range_keeps_overlapping_pages() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Lt(25) overlaps pages 0 ([0,10)), 1 ([10,20)), 2 ([20,30)) — 30 rows.
+        let predicates = vec![id_leaf(PredicateOperator::Lt, vec![Datum::Int(25)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("some pages should be skipped");
+        assert_eq!(sel.row_count(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_neq_falls_open() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // NotEq is conservative under stats: every page holds other values, so
+        // no page can be excluded → helper returns None (selection unchanged).
+        let predicates = vec![id_leaf(PredicateOperator::NotEq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(sel.is_none(), "NotEq must not skip any page (got {sel:?})");
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_returns_none_without_page_index() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        // Metadata parsed without the page index → helper must fall open.
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(
+            sel.is_none(),
+            "missing page index must fall open (got {sel:?})"
+        );
+    }
+
+    /// Expand a [`RowSelection`] into the set of selected 0-based row indices.
+    fn selected_rows(sel: &RowSelection) -> Vec<usize> {
+        let mut rows = Vec::new();
+        let mut pos = 0usize;
+        for selector in sel.iter() {
+            if !selector.skip {
+                rows.extend(pos..pos + selector.row_count);
+            }
+            pos += selector.row_count;
+        }
+        rows
+    }
+
+    /// Write two columns whose page layouts differ: `id` is a single page while
+    /// `value` is forced into ~10-row pages via a per-column byte-size limit.
+    /// This is the layout that exposes the "borrow another column's page rows"
+    /// bug — the driver column's pages must not be reused for `value`'s stats.
+    async fn write_divergent_page_layout_parquet(total_rows: i32) -> Vec<u8> {
+        use parquet::schema::types::ColumnPath;
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            // `value` (4 bytes/row): ~40-byte pages ≈ 10 rows per page.
+            .set_column_data_page_size_limit(ColumnPath::from("value"), 40)
+            .set_write_batch_size(10)
+            // `id` keeps the default large page limit → a single page.
+            .set_max_row_group_row_count(Some(total_rows as usize))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..total_rows).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_predicate_on_non_driver_column() {
+        // Regression: pruning must use each column's own page boundaries. Here
+        // `value` has many pages while `id` has one; a predicate on `value`
+        // must never drop rows that actually match.
+        let bytes = write_divergent_page_layout_parquet(80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // value == 350 (i.e. id == 35). Predicate is on the second field.
+        let predicates = vec![Predicate::Leaf {
+            column: "value".to_string(),
+            index: 1,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(350)],
+        }];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("value pages should be prunable");
+
+        // The matching row (index 35) must survive; pruning is still effective
+        // (not every row is kept).
+        let rows = selected_rows(&sel);
+        assert!(rows.contains(&35), "matching row 35 must be kept: {rows:?}");
+        assert!(
+            sel.row_count() < 80,
+            "some non-matching pages should be skipped (kept {} rows)",
+            sel.row_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_fails_open_on_missing_column_index() {
+        // A column with only chunk-level statistics has no ColumnIndex
+        // (`ColumnIndexMetaData::NONE`) but still gets an OffsetIndex. Its
+        // accessors panic rather than return None, so pruning must fail open
+        // for that column instead of touching the index.
+        use parquet::file::properties::EnabledStatistics;
+        use parquet::schema::types::ColumnPath;
+
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .set_max_row_group_row_count(Some(80))
+            // `value` keeps chunk stats only → no column index, but an offset
+            // index is still written.
+            .set_column_statistics_enabled(ColumnPath::from("value"), EnabledStatistics::Chunk)
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..80).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        let metadata = load_metadata_with_page_index(&buf, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Predicate on the column without a column index must not panic; it
+        // falls open (kept whole), so no page is skipped for it.
+        let predicates = vec![Predicate::Leaf {
+            column: "value".to_string(),
+            index: 1,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(350)],
+        }];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(
+            sel.is_none(),
+            "column without a ColumnIndex must fall open (got {sel:?})"
+        );
+    }
+
+    #[test]
+    fn test_page_boundaries_valid() {
+        use parquet::file::page_index::offset_index::PageLocation;
+        let page = |first_row_index: i64| PageLocation {
+            offset: 0,
+            compressed_page_size: 0,
+            first_row_index,
+        };
+
+        // Well-formed: starts at 0, strictly increasing, within [0, rg_rows].
+        assert!(super::page_boundaries_valid(
+            &[page(0), page(10), page(20)],
+            30
+        ));
+        // Single page starting at 0.
+        assert!(super::page_boundaries_valid(&[page(0)], 10));
+
+        // First page not at row 0.
+        assert!(!super::page_boundaries_valid(&[page(5), page(10)], 30));
+        // Negative first_row_index (would cast to a huge usize).
+        assert!(!super::page_boundaries_valid(&[page(0), page(-1)], 30));
+        // Non-monotonic.
+        assert!(!super::page_boundaries_valid(
+            &[page(0), page(20), page(10)],
+            30
+        ));
+        // Duplicate (not strictly increasing).
+        assert!(!super::page_boundaries_valid(
+            &[page(0), page(10), page(10)],
+            30
+        ));
+        // Beyond the row group.
+        assert!(!super::page_boundaries_valid(&[page(0), page(40)], 30));
     }
 }

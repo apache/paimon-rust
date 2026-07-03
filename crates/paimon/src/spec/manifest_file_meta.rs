@@ -205,6 +205,15 @@ impl ManifestFileMeta {
         self
     }
 
+    /// Attach row-id range statistics aggregated from manifest entries.
+    #[inline]
+    #[must_use]
+    pub fn with_row_id_stats(mut self, min_row_id: Option<i64>, max_row_id: Option<i64>) -> Self {
+        self.min_row_id = min_row_id;
+        self.max_row_id = max_row_id;
+        self
+    }
+
     #[inline]
     pub fn new(
         file_name: String,

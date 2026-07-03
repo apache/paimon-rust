@@ -545,6 +545,15 @@ fn evaluate_arrow_leaf_predicate(
                 })?;
             Ok(Some(sanitize_filter_mask(mask)))
         }
+        // Vortex's scalar comparators don't cover substring/range predicates, so
+        // fall open: returning None defers them to the outer stats-prune + arrow
+        // row-filter path, which evaluates them with full NULL (Kleene) semantics.
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(None),
     }
 }
 
@@ -609,7 +618,16 @@ fn evaluate_column_predicate(
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::NotIn
+        // String/range ops never reach the scalar comparator: the leaf
+        // dispatcher falls open (returns None) for them, so the value here is
+        // unused. Listed only to keep the match exhaustive.
+        | PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
 }
 
@@ -745,7 +763,11 @@ fn literal_scalar_for_arrow_filter(
             }
             _ => return Ok(None),
         },
-        DataType::Array(_) | DataType::Map(_) | DataType::Multiset(_) | DataType::Row(_) => {
+        DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Multiset(_)
+        | DataType::Row(_)
+        | DataType::Vector(_) => {
             return Ok(None);
         }
     };
