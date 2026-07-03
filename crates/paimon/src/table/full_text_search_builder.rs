@@ -134,34 +134,40 @@ impl<'a> FullTextSearchBuilder<'a> {
         };
 
         evaluate_full_text_search(
-            Some(self.table),
-            self.table.file_io(),
-            self.table.location(),
-            self.table.schema().options(),
+            FullTextSearchEvaluation {
+                table: Some(self.table),
+                file_io: self.table.file_io(),
+                table_path: self.table.location(),
+                table_options: self.table.schema().options(),
+                schema_fields: self.table.schema().fields(),
+                next_row_id: snapshot.next_row_id(),
+            },
             &index_entries,
             &search,
-            self.table.schema().fields(),
-            snapshot.next_row_id(),
         )
         .await
     }
 }
 
 /// Evaluate a full-text search query against Tantivy indexes found in the index manifest.
+struct FullTextSearchEvaluation<'a> {
+    table: Option<&'a Table>,
+    file_io: &'a FileIO,
+    table_path: &'a str,
+    table_options: &'a HashMap<String, String>,
+    schema_fields: &'a [DataField],
+    next_row_id: Option<i64>,
+}
+
 async fn evaluate_full_text_search(
-    table: Option<&Table>,
-    file_io: &FileIO,
-    table_path: &str,
-    table_options: &HashMap<String, String>,
+    evaluation: FullTextSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     search: &FullTextSearch,
-    schema_fields: &[DataField],
-    next_row_id: Option<i64>,
 ) -> crate::Result<Vec<RowRange>> {
-    let table_path = table_path.trim_end_matches('/');
-    let search_mode = CoreOptions::new(table_options).global_index_search_mode()?;
+    let table_path = evaluation.table_path.trim_end_matches('/');
+    let search_mode = CoreOptions::new(evaluation.table_options).global_index_search_mode()?;
 
-    let field_id = match find_field_id_by_name(schema_fields, &search.field_name) {
+    let field_id = match find_field_id_by_name(evaluation.schema_fields, &search.field_name) {
         Some(id) => id,
         None => return Ok(Vec::new()),
     };
@@ -194,7 +200,7 @@ async fn evaluate_full_text_search(
                 let query_text = search.query_text.clone();
                 let limit = search.limit;
                 let row_range_start = global_meta.row_range_start;
-                let input = file_io.new_input(&path);
+                let input = evaluation.file_io.new_input(&path);
                 async move {
                     let input = input?;
                     let reader = TantivyFullTextReader::from_input_file(&input)
@@ -220,7 +226,7 @@ async fn evaluate_full_text_search(
 
     if search_mode != GlobalIndexSearchMode::Fast {
         let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
-            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search in detail mode requires table context".to_string(),
                 source: None,
             })?;
@@ -233,12 +239,12 @@ async fn evaluate_full_text_search(
             index_entries,
             &field_ids,
             search_mode,
-            next_row_id,
+            evaluation.next_row_id,
             &detail_ranges,
             is_tantivy_fulltext_index_file,
         );
         if !raw_ranges.is_empty() {
-            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Full-text raw search requires table context".to_string(),
                 source: None,
             })?;
@@ -427,14 +433,16 @@ mod tests {
         let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
 
         let err = evaluate_full_text_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &options,
+            FullTextSearchEvaluation {
+                table: None,
+                file_io: &file_io,
+                table_path: "memory:///test_table",
+                table_options: &options,
+                schema_fields: &fields,
+                next_row_id: Some(10),
+            },
             &[],
             &search,
-            &fields,
-            Some(10),
         )
         .await
         .unwrap_err();

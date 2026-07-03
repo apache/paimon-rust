@@ -287,9 +287,9 @@ pub(super) fn can_push_down_limit_hint_for_scan(
     data_predicates.is_empty() && row_ranges.is_none()
 }
 
-fn global_index_detail_data_ranges(
-    groups: &HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>,
-) -> Vec<RowRange> {
+type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
+
+fn global_index_detail_data_ranges(groups: &BucketDataFileGroups) -> Vec<RowRange> {
     let mut ranges = Vec::new();
     for (_, data_files) in groups.values() {
         for file in data_files {
@@ -817,8 +817,7 @@ impl<'a> TableScan<'a> {
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
-        let mut groups: HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)> =
-            HashMap::with_capacity(entries.len());
+        let mut groups: BucketDataFileGroups = HashMap::with_capacity(entries.len());
         for e in entries {
             let (partition, bucket, total_buckets, file) = e.into_parts();
             let entry = groups
@@ -890,14 +889,16 @@ impl<'a> TableScan<'a> {
                     self.row_ranges.clone()
                 } else if let Some(search_mode) = global_index_search_mode {
                     super::global_index_scanner::evaluate_global_index(
-                        file_io,
-                        base_path,
-                        &index_entries,
-                        &self.data_predicates,
-                        self.table.schema().fields(),
-                        search_mode,
-                        snapshot.next_row_id(),
-                        &global_index_detail_data_ranges,
+                        super::global_index_scanner::GlobalIndexEvaluation {
+                            file_io,
+                            table_path: base_path,
+                            index_entries: &index_entries,
+                            predicates: &self.data_predicates,
+                            schema_fields: self.table.schema().fields(),
+                            search_mode,
+                            next_row_id: snapshot.next_row_id(),
+                            data_ranges: &global_index_detail_data_ranges,
+                        },
                     )
                     .await?
                 } else {

@@ -758,23 +758,31 @@ fn lower_bound(sorted: &[i64], target: i64) -> usize {
 /// This is the main entry point for the table scan integration.
 ///
 /// Returns `None` if global index is not available or predicates can't be evaluated.
-pub(crate) async fn evaluate_global_index(
-    file_io: &FileIO,
-    table_path: &str,
-    index_entries: &[IndexManifestEntry],
-    predicates: &[Predicate],
-    schema_fields: &[DataField],
-    search_mode: GlobalIndexSearchMode,
-    next_row_id: Option<i64>,
-    data_ranges: &[RowRange],
-) -> Result<Option<Vec<RowRange>>> {
-    let scanner =
-        match GlobalIndexScanner::create(file_io, table_path, index_entries, schema_fields) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+pub(crate) struct GlobalIndexEvaluation<'a> {
+    pub(crate) file_io: &'a FileIO,
+    pub(crate) table_path: &'a str,
+    pub(crate) index_entries: &'a [IndexManifestEntry],
+    pub(crate) predicates: &'a [Predicate],
+    pub(crate) schema_fields: &'a [DataField],
+    pub(crate) search_mode: GlobalIndexSearchMode,
+    pub(crate) next_row_id: Option<i64>,
+    pub(crate) data_ranges: &'a [RowRange],
+}
 
-    let combined = Predicate::and(predicates.to_vec());
+pub(crate) async fn evaluate_global_index(
+    evaluation: GlobalIndexEvaluation<'_>,
+) -> Result<Option<Vec<RowRange>>> {
+    let scanner = match GlobalIndexScanner::create(
+        evaluation.file_io,
+        evaluation.table_path,
+        evaluation.index_entries,
+        evaluation.schema_fields,
+    ) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let combined = Predicate::and(evaluation.predicates.to_vec());
 
     let mut row_ranges = match scanner.evaluate(&combined).await? {
         Some(row_ranges) => row_ranges,
@@ -782,9 +790,9 @@ pub(crate) async fn evaluate_global_index(
     };
     row_ranges.extend(scanner.unindexed_ranges(
         &combined,
-        search_mode,
-        next_row_id,
-        data_ranges,
+        evaluation.search_mode,
+        evaluation.next_row_id,
+        evaluation.data_ranges,
     )?);
     Ok(Some(super::merge_row_ranges(row_ranges)))
 }
@@ -969,16 +977,16 @@ mod tests {
         predicates: &[Predicate],
         fields: &[DataField],
     ) -> Result<Option<Vec<RowRange>>> {
-        super::evaluate_global_index(
+        super::evaluate_global_index(super::GlobalIndexEvaluation {
             file_io,
             table_path,
-            entries,
+            index_entries: entries,
             predicates,
-            fields,
-            GlobalIndexSearchMode::Fast,
-            None,
-            &[],
-        )
+            schema_fields: fields,
+            search_mode: GlobalIndexSearchMode::Fast,
+            next_row_id: None,
+            data_ranges: &[],
+        })
         .await
     }
 
@@ -1166,16 +1174,16 @@ mod tests {
         let fields = int_schema_fields();
         let predicates = vec![int_eq("id", 0, 50)];
 
-        let result = super::evaluate_global_index(
-            &file_io,
-            &table_path,
-            &entries,
-            &predicates,
-            &fields,
-            GlobalIndexSearchMode::Full,
-            Some(150),
-            &[],
-        )
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            next_row_id: Some(150),
+            data_ranges: &[],
+        })
         .await
         .unwrap();
 
@@ -1194,16 +1202,17 @@ mod tests {
         let fields = int_schema_fields();
         let predicates = vec![int_eq("id", 0, 50)];
 
-        let result = super::evaluate_global_index(
-            &file_io,
-            &table_path,
-            &entries,
-            &predicates,
-            &fields,
-            GlobalIndexSearchMode::Detail,
-            Some(150),
-            &[RowRange::new(90, 120), RowRange::new(140, 145)],
-        )
+        let data_ranges = [RowRange::new(90, 120), RowRange::new(140, 145)];
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Detail,
+            next_row_id: Some(150),
+            data_ranges: &data_ranges,
+        })
         .await
         .unwrap();
 

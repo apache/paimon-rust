@@ -137,33 +137,40 @@ impl<'a> VectorSearchBuilder<'a> {
         };
 
         evaluate_vector_search(
-            Some(self.table),
-            self.table.file_io(),
-            self.table.location(),
-            self.table.schema().options(),
+            VectorSearchEvaluation {
+                table: Some(self.table),
+                file_io: self.table.file_io(),
+                table_path: self.table.location(),
+                table_options: self.table.schema().options(),
+                schema_fields: self.table.schema().fields(),
+                next_row_id: snapshot.next_row_id(),
+            },
             &index_entries,
             &vector_search,
-            self.table.schema().fields(),
-            snapshot.next_row_id(),
         )
         .await
     }
 }
 
+struct VectorSearchEvaluation<'a> {
+    table: Option<&'a Table>,
+    file_io: &'a FileIO,
+    table_path: &'a str,
+    table_options: &'a HashMap<String, String>,
+    schema_fields: &'a [DataField],
+    next_row_id: Option<i64>,
+}
+
 async fn evaluate_vector_search(
-    table: Option<&Table>,
-    file_io: &FileIO,
-    table_path: &str,
-    table_options: &HashMap<String, String>,
+    evaluation: VectorSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     vector_search: &VectorSearch,
-    schema_fields: &[DataField],
-    next_row_id: Option<i64>,
 ) -> crate::Result<Vec<RowRange>> {
-    let table_path = table_path.trim_end_matches('/');
-    let search_mode = CoreOptions::new(table_options).global_index_search_mode()?;
+    let table_path = evaluation.table_path.trim_end_matches('/');
+    let search_mode = CoreOptions::new(evaluation.table_options).global_index_search_mode()?;
 
-    let field_id = match find_field_id_by_name(schema_fields, &vector_search.field_name) {
+    let field_id = match find_field_id_by_name(evaluation.schema_fields, &vector_search.field_name)
+    {
         Some(id) => id,
         None => return Ok(Vec::new()),
     };
@@ -198,8 +205,8 @@ async fn evaluate_vector_search(
                 let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
                 let row_range_start = global_meta.row_range_start;
                 let vector_search_clone = vector_search.clone();
-                let options = table_options.clone();
-                let input = file_io.new_input(&path);
+                let options = evaluation.table_options.clone();
+                let input = evaluation.file_io.new_input(&path);
                 async move {
                     let input = input?;
                     let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
@@ -248,7 +255,7 @@ async fn evaluate_vector_search(
 
     if search_mode != GlobalIndexSearchMode::Fast {
         let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
-            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search in detail mode requires table context".to_string(),
                 source: None,
             })?;
@@ -261,19 +268,19 @@ async fn evaluate_vector_search(
             index_entries,
             &field_ids,
             search_mode,
-            next_row_id,
+            evaluation.next_row_id,
             &detail_ranges,
             is_vector_global_index_file,
         );
         if !raw_ranges.is_empty() {
-            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+            let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search requires table context".to_string(),
                 source: None,
             })?;
             let metric = resolve_raw_vector_metric(
-                file_io,
+                evaluation.file_io,
                 table_path,
-                table_options,
+                evaluation.table_options,
                 index_entries,
                 field_id,
                 &vector_search.field_name,
@@ -660,6 +667,22 @@ mod tests {
         DataField::new(id, name.to_string(), DataType::Int(IntType::default()))
     }
 
+    fn eval_context<'a>(
+        file_io: &'a FileIO,
+        options: &'a HashMap<String, String>,
+        fields: &'a [DataField],
+        next_row_id: Option<i64>,
+    ) -> VectorSearchEvaluation<'a> {
+        VectorSearchEvaluation {
+            table: None,
+            file_io,
+            table_path: "memory:///test_table",
+            table_options: options,
+            schema_fields: fields,
+            next_row_id,
+        }
+    }
+
     #[test]
     fn test_find_field_id_by_name() {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
@@ -710,6 +733,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0, 2.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = IndexManifestEntry {
             kind: FileKind::Add,
@@ -727,14 +751,9 @@ mod tests {
         };
 
         let result = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap();
@@ -746,18 +765,14 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry("test.idx", "btree", FileKind::Add, 2);
 
         let result = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap();
@@ -772,14 +787,9 @@ mod tests {
         let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
 
         let err = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &options,
+            eval_context(&file_io, &options, &fields, Some(10)),
             &[],
             &vs,
-            &fields,
-            Some(10),
         )
         .await
         .unwrap_err();
@@ -795,6 +805,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(1, "id")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry(
             "test.idx",
@@ -804,14 +815,9 @@ mod tests {
         );
 
         let result = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap();
@@ -823,6 +829,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry(
             "test.idx",
@@ -832,14 +839,9 @@ mod tests {
         );
 
         let result = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap();
@@ -851,18 +853,14 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry("missing.idx", LUMINA_IDENTIFIER, FileKind::Add, 2);
 
         let err = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap_err();
@@ -878,6 +876,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry(
             "missing.idx",
@@ -887,14 +886,9 @@ mod tests {
         );
 
         let err = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap_err();
@@ -910,18 +904,14 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::new();
 
         let entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
 
         let err = evaluate_vector_search(
-            None,
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
+            eval_context(&file_io, &options, &fields, None),
             &[entry],
             &vs,
-            &fields,
-            None,
         )
         .await
         .unwrap_err();
