@@ -32,6 +32,7 @@ pub(super) struct FileStatsRows {
     min_values: Option<BinaryRow>,
     max_values: Option<BinaryRow>,
     null_counts: Vec<Option<i64>>,
+    supports_in_min_max_pruning: bool,
     /// Maps schema field index → stats index. `None` means identity mapping
     /// (stats cover all schema fields in order). `Some` is used when
     /// `value_stats_cols` or `write_cols` is present (dense mode).
@@ -51,6 +52,7 @@ impl FileStatsRows {
             min_values,
             max_values,
             null_counts,
+            supports_in_min_max_pruning: false,
             stats_col_mapping: None,
         }
     }
@@ -92,6 +94,7 @@ impl FileStatsRows {
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
+            supports_in_min_max_pruning: true,
             stats_col_mapping,
         }
     }
@@ -131,6 +134,10 @@ impl StatsAccessor for FileStatsRows {
         self.max_values
             .as_ref()
             .and_then(|row| extract_stats_datum(row, stats_index, data_type))
+    }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        self.supports_in_min_max_pruning
     }
 }
 

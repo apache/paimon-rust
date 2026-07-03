@@ -2080,6 +2080,48 @@ mod tests {
     }
 
     #[test]
+    fn test_data_file_matches_in_with_inverted_stats_fails_open() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(20)),
+            int_stats_row(Some(10)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in("id", vec![Datum::Int(15)])
+            .unwrap();
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_not_in_fails_open() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = PredicateBuilder::new(&fields)
+            .is_not_in("id", vec![Datum::Int(10), Datum::Int(20)])
+            .unwrap();
+
+        assert!(data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
     fn test_data_file_matches_is_null_prunes_when_null_count_is_zero() {
         let fields = int_field();
         let file = test_data_file_meta(
