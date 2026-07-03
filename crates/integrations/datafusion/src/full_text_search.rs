@@ -32,9 +32,11 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
+use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use paimon::catalog::Catalog;
@@ -169,16 +171,17 @@ impl TableProvider for FullTextSearchTableProvider {
         })
         .await?;
 
+        if row_ranges.is_empty() {
+            let schema = project_schema(&self.schema(), projection)?;
+            return Ok(Arc::new(EmptyExec::new(schema)));
+        }
+
         // Convert search results to row ranges and inject into the scan.
         let mut read_builder = table.new_read_builder();
         if let Some(limit) = limit {
             read_builder.with_limit(limit);
         }
-        let scan = if row_ranges.is_empty() {
-            read_builder.new_scan()
-        } else {
-            read_builder.new_scan().with_row_ranges(row_ranges)
-        };
+        let scan = read_builder.new_scan().with_row_ranges(row_ranges);
         let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;

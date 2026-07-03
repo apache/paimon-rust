@@ -15,15 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::lumina::is_lumina_index_type;
+use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::spec::{DataField, FileKind, IndexManifest};
+use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
+use crate::spec::{
+    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
+    IndexManifestEntry, ROW_ID_FIELD_NAME,
+};
+use crate::table::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use crate::table::snapshot_manager::SnapshotManager;
-use crate::table::{find_field_id_by_name, RowRange, Table};
+use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
-use std::collections::HashMap;
+use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
+use futures::TryStreamExt;
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 const INDEX_DIR: &str = "index";
@@ -115,39 +124,44 @@ impl<'a> VectorSearchBuilder<'a> {
             None => return Ok(Vec::new()),
         };
 
-        let index_manifest_name = match snapshot.index_manifest() {
-            Some(name) => name.to_string(),
-            None => return Ok(Vec::new()),
+        let index_entries = match snapshot.index_manifest() {
+            Some(index_manifest_name) => {
+                let manifest_path = format!(
+                    "{}/manifest/{}",
+                    self.table.location().trim_end_matches('/'),
+                    index_manifest_name
+                );
+                IndexManifest::read(self.table.file_io(), &manifest_path).await?
+            }
+            None => Vec::new(),
         };
 
-        let manifest_path = format!(
-            "{}/manifest/{}",
-            self.table.location().trim_end_matches('/'),
-            index_manifest_name
-        );
-        let index_entries = IndexManifest::read(self.table.file_io(), &manifest_path).await?;
-
         evaluate_vector_search(
+            Some(self.table),
             self.table.file_io(),
             self.table.location(),
             self.table.schema().options(),
             &index_entries,
             &vector_search,
             self.table.schema().fields(),
+            snapshot.next_row_id(),
         )
         .await
     }
 }
 
 async fn evaluate_vector_search(
-    file_io: &crate::io::FileIO,
+    table: Option<&Table>,
+    file_io: &FileIO,
     table_path: &str,
     table_options: &HashMap<String, String>,
-    index_entries: &[crate::spec::IndexManifestEntry],
+    index_entries: &[IndexManifestEntry],
     vector_search: &VectorSearch,
     schema_fields: &[DataField],
+    next_row_id: Option<i64>,
 ) -> crate::Result<Vec<RowRange>> {
     let table_path = table_path.trim_end_matches('/');
+    let search_mode = CoreOptions::new(table_options).global_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(schema_fields, &vector_search.field_name) {
         Some(id) => id,
@@ -166,69 +180,473 @@ async fn evaluate_vector_search(
         })
         .collect();
 
-    if vector_entries.is_empty() {
+    if vector_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast {
         return Ok(Vec::new());
     }
 
-    let futures: Vec<_> = vector_entries
-        .into_iter()
-        .map(|entry| {
-            let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
-            let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
-                .expect("filtered vector index type");
-            let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
-            let file_name = entry.index_file.file_name.clone();
-            let file_size = entry.index_file.file_size as u64;
-            let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
-            let row_range_start = global_meta.row_range_start;
-            let vector_search_clone = vector_search.clone();
-            let options = table_options.clone();
-            let input = file_io.new_input(&path);
-            async move {
-                let input = input?;
-                let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                    message: format!(
-                        "Failed to read {} index file '{}': {}",
-                        backend.error_name(),
-                        file_name,
-                        e
-                    ),
-                    source: None,
-                })?;
-
-                let io_meta =
-                    GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
-                let data = bytes.to_vec();
-                let result = match backend {
-                    VectorIndexBackend::Lumina => {
-                        let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
-                        reader
-                            .visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?
-                    }
-                    VectorIndexBackend::Vindex => {
-                        let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
-                        reader
-                            .visit_vector_search(&vector_search_clone, |_| Ok(Cursor::new(data)))?
-                    }
-                };
-
-                match result {
-                    Some(scored_map) => Ok::<_, crate::Error>(
-                        SearchResult::from_scored_map(scored_map).offset(row_range_start),
-                    ),
-                    None => Ok(SearchResult::empty()),
-                }
-            }
-        })
-        .collect();
-
-    let results = futures::future::try_join_all(futures).await?;
     let mut merged = SearchResult::empty();
-    for r in &results {
-        merged = merged.or(r);
+    if !vector_entries.is_empty() {
+        let futures: Vec<_> = vector_entries
+            .into_iter()
+            .map(|entry| {
+                let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
+                    .expect("filtered vector index type");
+                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let file_name = entry.index_file.file_name.clone();
+                let file_size = entry.index_file.file_size as u64;
+                let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
+                let row_range_start = global_meta.row_range_start;
+                let vector_search_clone = vector_search.clone();
+                let options = table_options.clone();
+                let input = file_io.new_input(&path);
+                async move {
+                    let input = input?;
+                    let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
+                        message: format!(
+                            "Failed to read {} index file '{}': {}",
+                            backend.error_name(),
+                            file_name,
+                            e
+                        ),
+                        source: None,
+                    })?;
+
+                    let io_meta =
+                        GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
+                    let data = bytes.to_vec();
+                    let result = match backend {
+                        VectorIndexBackend::Lumina => {
+                            let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
+                            reader.visit_vector_search(&vector_search_clone, |_| {
+                                Ok(Cursor::new(data))
+                            })?
+                        }
+                        VectorIndexBackend::Vindex => {
+                            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+                            reader.visit_vector_search(&vector_search_clone, |_| {
+                                Ok(Cursor::new(data))
+                            })?
+                        }
+                    };
+
+                    match result {
+                        Some(scored_map) => Ok::<_, crate::Error>(
+                            SearchResult::from_scored_map(scored_map).offset(row_range_start),
+                        ),
+                        None => Ok(SearchResult::empty()),
+                    }
+                }
+            })
+            .collect();
+
+        let results = futures::future::try_join_all(futures).await?;
+        for r in &results {
+            merged = merged.or(r);
+        }
+    }
+
+    if search_mode != GlobalIndexSearchMode::Fast {
+        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
+            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Vector raw search in detail mode requires table context".to_string(),
+                source: None,
+            })?;
+            detail_data_ranges_for_table(table).await?
+        } else {
+            Vec::new()
+        };
+        let field_ids = HashSet::from([field_id]);
+        let raw_ranges = unindexed_ranges_for_global_index_entries(
+            index_entries,
+            &field_ids,
+            search_mode,
+            next_row_id,
+            &detail_ranges,
+            is_vector_global_index_file,
+        );
+        if !raw_ranges.is_empty() {
+            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Vector raw search requires table context".to_string(),
+                source: None,
+            })?;
+            let metric = resolve_raw_vector_metric(
+                file_io,
+                table_path,
+                table_options,
+                index_entries,
+                field_id,
+                &vector_search.field_name,
+            )
+            .await?;
+            let raw_result =
+                read_raw_vector_search(table, vector_search, &raw_ranges, metric).await?;
+            merged = merged.or(&raw_result);
+        }
     }
 
     merged.top_k(vector_search.limit).to_row_ranges()
+}
+
+fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
+    VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+}
+
+async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await?;
+    let mut ranges = Vec::new();
+    for split in plan.splits() {
+        for file in split.data_files() {
+            if let Some((from, to)) = file.row_id_range() {
+                ranges.push(RowRange::new(from, to));
+            }
+        }
+    }
+    Ok(merge_row_ranges(ranges))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawVectorMetric {
+    L2,
+    Cosine,
+    InnerProduct,
+}
+
+impl RawVectorMetric {
+    fn parse(value: &str) -> crate::Result<Self> {
+        Self::parse_normalized(&normalize_metric(value)).ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("Unknown vector search metric: {value}"),
+            source: None,
+        })
+    }
+
+    fn parse_normalized(value: &str) -> Option<Self> {
+        match value {
+            "l2" => Some(Self::L2),
+            "cosine" => Some(Self::Cosine),
+            "inner_product" => Some(Self::InnerProduct),
+            _ => None,
+        }
+    }
+
+    fn from_lumina(metric: LuminaVectorMetric) -> Self {
+        match metric {
+            LuminaVectorMetric::L2 => Self::L2,
+            LuminaVectorMetric::Cosine => Self::Cosine,
+            LuminaVectorMetric::InnerProduct => Self::InnerProduct,
+        }
+    }
+
+    fn from_vindex(metric: MetricType) -> Self {
+        match metric {
+            MetricType::L2 => Self::L2,
+            MetricType::Cosine => Self::Cosine,
+            MetricType::InnerProduct => Self::InnerProduct,
+        }
+    }
+}
+
+fn normalize_metric(metric: &str) -> String {
+    metric.to_ascii_lowercase().replace('-', "_")
+}
+
+async fn resolve_raw_vector_metric(
+    file_io: &FileIO,
+    table_path: &str,
+    table_options: &HashMap<String, String>,
+    index_entries: &[IndexManifestEntry],
+    field_id: i32,
+    field_name: &str,
+) -> crate::Result<RawVectorMetric> {
+    for entry in index_entries {
+        if entry.kind != FileKind::Add {
+            continue;
+        }
+        let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
+            continue;
+        };
+        if global_meta.index_field_id != field_id {
+            continue;
+        }
+        let Some(backend) = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
+        else {
+            continue;
+        };
+        match backend {
+            VectorIndexBackend::Lumina => {
+                if let Some(index_meta) = global_meta.index_meta.as_ref() {
+                    if !index_meta.is_empty() {
+                        let metric = LuminaIndexMeta::deserialize(index_meta)?.metric()?;
+                        return Ok(RawVectorMetric::from_lumina(metric));
+                    }
+                }
+            }
+            VectorIndexBackend::Vindex => {
+                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let input = file_io.new_input(&path)?;
+                let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to read vindex index file '{}' for raw search metric: {}",
+                        entry.index_file.file_name, e
+                    ),
+                    source: None,
+                })?;
+                let reader = VIndexReader::open(Cursor::new(bytes.to_vec())).map_err(|e| {
+                    crate::Error::DataInvalid {
+                        message: format!(
+                            "Failed to open paimon-vindex-core reader for raw search metric: {}",
+                            e
+                        ),
+                        source: Some(Box::new(e)),
+                    }
+                })?;
+                return Ok(RawVectorMetric::from_vindex(reader.metadata().metric));
+            }
+        }
+    }
+
+    configured_raw_vector_metric(table_options, field_name)
+}
+
+fn configured_raw_vector_metric(
+    options: &HashMap<String, String>,
+    field_name: &str,
+) -> crate::Result<RawVectorMetric> {
+    let direct_keys = [
+        format!("fields.{field_name}.distance.metric"),
+        format!("fields.{field_name}.metric"),
+        "test.vector.metric".to_string(),
+        "lumina.distance.metric".to_string(),
+        "distance.metric".to_string(),
+        "metric".to_string(),
+    ];
+    for key in direct_keys {
+        if let Some(value) = options.get(&key) {
+            return RawVectorMetric::parse(value);
+        }
+    }
+
+    let mut inferred = None;
+    for (key, value) in options {
+        if !(key.ends_with(".distance.metric") || key.ends_with(".metric")) {
+            continue;
+        }
+        let normalized = normalize_metric(value);
+        let Some(metric) = RawVectorMetric::parse_normalized(&normalized) else {
+            continue;
+        };
+        if let Some(existing) = inferred {
+            if existing != metric {
+                return Ok(RawVectorMetric::L2);
+            }
+        } else {
+            inferred = Some(metric);
+        }
+    }
+    Ok(inferred.unwrap_or(RawVectorMetric::L2))
+}
+
+async fn read_raw_vector_search(
+    table: &Table,
+    vector_search: &VectorSearch,
+    raw_ranges: &[RowRange],
+    metric: RawVectorMetric,
+) -> crate::Result<SearchResult> {
+    if raw_ranges.is_empty() {
+        return Ok(SearchResult::empty());
+    }
+
+    let mut read_builder = table.new_read_builder();
+    read_builder
+        .with_projection(&[vector_search.field_name.as_str(), ROW_ID_FIELD_NAME])
+        .with_row_ranges(raw_ranges.to_vec());
+    let plan = read_builder.new_scan().plan().await?;
+    if plan.splits().is_empty() {
+        return Ok(SearchResult::empty());
+    }
+    let read = read_builder.new_read()?;
+    let mut stream = read.to_arrow(plan.splits())?;
+
+    let mut row_ids = Vec::new();
+    let mut scores = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        collect_raw_vector_batch(&batch, vector_search, metric, &mut row_ids, &mut scores)?;
+    }
+
+    Ok(SearchResult::new(row_ids, scores).top_k(vector_search.limit))
+}
+
+fn collect_raw_vector_batch(
+    batch: &RecordBatch,
+    vector_search: &VectorSearch,
+    metric: RawVectorMetric,
+    row_ids_out: &mut Vec<u64>,
+    scores_out: &mut Vec<f32>,
+) -> crate::Result<()> {
+    let vector_index = batch
+        .schema()
+        .index_of(&vector_search.field_name)
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!(
+                "Vector column '{}' not found in raw search batch: {}",
+                vector_search.field_name, e
+            ),
+            source: None,
+        })?;
+    let row_id_index =
+        batch
+            .schema()
+            .index_of(ROW_ID_FIELD_NAME)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("_ROW_ID column not found in raw search batch: {e}"),
+                source: None,
+            })?;
+
+    let row_ids = batch
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Vector raw search requires non-null Int64 _ROW_ID".to_string(),
+            source: None,
+        })?;
+
+    let column = batch.column(vector_index);
+    enum VectorLayout<'a> {
+        List(&'a ListArray),
+        Fixed(&'a FixedSizeListArray),
+    }
+    let layout = if let Some(a) = column.as_any().downcast_ref::<ListArray>() {
+        VectorLayout::List(a)
+    } else if let Some(a) = column.as_any().downcast_ref::<FixedSizeListArray>() {
+        VectorLayout::Fixed(a)
+    } else {
+        return Err(crate::Error::DataInvalid {
+            message: "Vector raw search requires Arrow List<Float32> or FixedSizeList<Float32>"
+                .to_string(),
+            source: None,
+        });
+    };
+    let values = match layout {
+        VectorLayout::List(a) => a.values(),
+        VectorLayout::Fixed(a) => a.values(),
+    }
+    .as_any()
+    .downcast_ref::<Float32Array>()
+    .ok_or_else(|| crate::Error::DataInvalid {
+        message: "Vector raw search requires Float32 vector elements".to_string(),
+        source: None,
+    })?;
+
+    for row in 0..batch.num_rows() {
+        if row_ids.is_null(row) {
+            return Err(crate::Error::DataInvalid {
+                message: "Vector raw search found null _ROW_ID".to_string(),
+                source: None,
+            });
+        }
+        let row_id = row_id_to_u64(row_ids.value(row))?;
+        if vector_search
+            .include_row_ids
+            .as_ref()
+            .is_some_and(|include_row_ids| !include_row_ids.contains(row_id))
+        {
+            continue;
+        }
+
+        let is_null = match layout {
+            VectorLayout::List(a) => a.is_null(row),
+            VectorLayout::Fixed(a) => a.is_null(row),
+        };
+        if is_null {
+            continue;
+        }
+
+        let (start, end) = match layout {
+            VectorLayout::List(a) => {
+                let offsets = a.value_offsets();
+                (offsets[row] as usize, offsets[row + 1] as usize)
+            }
+            VectorLayout::Fixed(a) => {
+                let len = a.value_length() as usize;
+                (row * len, (row + 1) * len)
+            }
+        };
+        if end - start != vector_search.vector.len() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Query vector dimension mismatch: raw row has {}, but query has {}",
+                    end - start,
+                    vector_search.vector.len()
+                ),
+                source: None,
+            });
+        }
+
+        let mut stored = Vec::with_capacity(vector_search.vector.len());
+        for value_index in start..end {
+            if values.is_null(value_index) {
+                return Err(crate::Error::DataInvalid {
+                    message: "Vector raw search found null vector element".to_string(),
+                    source: None,
+                });
+            }
+            stored.push(values.value(value_index));
+        }
+        row_ids_out.push(row_id);
+        scores_out.push(compute_raw_vector_score(
+            &vector_search.vector,
+            &stored,
+            metric,
+        ));
+    }
+
+    Ok(())
+}
+
+fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
+    u64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+        message: format!("Negative _ROW_ID {row_id} cannot be used for global index search"),
+        source: None,
+    })
+}
+
+fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetric) -> f32 {
+    match metric {
+        RawVectorMetric::L2 => {
+            let sum_sq = query
+                .iter()
+                .zip(stored.iter())
+                .map(|(q, s)| {
+                    let diff = q - s;
+                    diff * diff
+                })
+                .sum::<f32>();
+            1.0 / (1.0 + sum_sq)
+        }
+        RawVectorMetric::Cosine => {
+            let mut dot = 0.0;
+            let mut norm_a = 0.0;
+            let mut norm_b = 0.0;
+            for (q, s) in query.iter().zip(stored.iter()) {
+                dot += q * s;
+                norm_a += q * q;
+                norm_b += s * s;
+            }
+            let denominator = norm_a.sqrt() * norm_b.sqrt();
+            if denominator == 0.0 {
+                0.0
+            } else {
+                dot / denominator
+            }
+        }
+        RawVectorMetric::InnerProduct => query.iter().zip(stored.iter()).map(|(q, s)| q * s).sum(),
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +665,44 @@ mod tests {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         assert_eq!(find_field_id_by_name(&fields, "embedding"), Some(2));
         assert_eq!(find_field_id_by_name(&fields, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_raw_vector_score_matches_java_metric_semantics() {
+        let l2 = compute_raw_vector_score(&[1.0, 2.0], &[1.0, 4.0], RawVectorMetric::L2);
+        assert!((l2 - 0.2).abs() < 1e-6);
+        assert_eq!(
+            compute_raw_vector_score(&[1.0, 2.0], &[3.0, 4.0], RawVectorMetric::InnerProduct),
+            11.0
+        );
+        let cosine = compute_raw_vector_score(&[1.0, 0.0], &[1.0, 1.0], RawVectorMetric::Cosine);
+        assert!((cosine - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert_eq!(
+            compute_raw_vector_score(&[0.0, 0.0], &[1.0, 1.0], RawVectorMetric::Cosine),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_configured_raw_vector_metric_precedence_and_conflict_default() {
+        let mut options = HashMap::new();
+        options.insert(
+            "fields.embedding.distance.metric".to_string(),
+            "inner-product".to_string(),
+        );
+        options.insert("metric".to_string(), "cosine".to_string());
+        assert_eq!(
+            configured_raw_vector_metric(&options, "embedding").unwrap(),
+            RawVectorMetric::InnerProduct
+        );
+
+        options.clear();
+        options.insert("foo.metric".to_string(), "cosine".to_string());
+        options.insert("bar.distance.metric".to_string(), "l2".to_string());
+        assert_eq!(
+            configured_raw_vector_metric(&options, "embedding").unwrap(),
+            RawVectorMetric::L2
+        );
     }
 
     #[tokio::test]
@@ -271,12 +727,14 @@ mod tests {
         };
 
         let result = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap();
@@ -292,16 +750,44 @@ mod tests {
         let entry = make_lumina_entry("test.idx", "btree", FileKind::Add, 2);
 
         let result = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_full_mode_without_vector_entries_uses_raw_path() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(2, "embedding")];
+        let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+        let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
+
+        let err = evaluate_vector_search(
+            None,
+            &file_io,
+            "memory:///test_table",
+            &options,
+            &[],
+            &vs,
+            &fields,
+            Some(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Vector raw search requires table context"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -318,12 +804,14 @@ mod tests {
         );
 
         let result = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap();
@@ -344,12 +832,14 @@ mod tests {
         );
 
         let result = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap();
@@ -365,12 +855,14 @@ mod tests {
         let entry = make_lumina_entry("missing.idx", LUMINA_IDENTIFIER, FileKind::Add, 2);
 
         let err = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap_err();
@@ -395,12 +887,14 @@ mod tests {
         );
 
         let err = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap_err();
@@ -420,12 +914,14 @@ mod tests {
         let entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
 
         let err = evaluate_vector_search(
+            None,
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
             &[entry],
             &vs,
             &fields,
+            None,
         )
         .await
         .unwrap_err();

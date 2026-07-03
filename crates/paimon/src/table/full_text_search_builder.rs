@@ -19,11 +19,21 @@
 //!
 //! Reference: [FullTextSearchBuilderImpl.java](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
 
-use crate::spec::{DataField, FileKind, IndexManifest};
+use crate::io::{FileIO, FileIOBuilder};
+use crate::spec::{
+    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
+    IndexManifestEntry, ROW_ID_FIELD_NAME,
+};
+use crate::table::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use crate::table::snapshot_manager::SnapshotManager;
-use crate::table::{find_field_id_by_name, RowRange, Table};
+use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::tantivy::full_text_search::{FullTextSearch, SearchResult};
 use crate::tantivy::reader::TantivyFullTextReader;
+use crate::tantivy::writer::TantivyFullTextWriter;
+use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+use futures::TryStreamExt;
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 const INDEX_DIR: &str = "index";
 const TANTIVY_FULLTEXT_INDEX_TYPE: &str = "tantivy-fulltext";
@@ -124,11 +134,14 @@ impl<'a> FullTextSearchBuilder<'a> {
         let index_entries = IndexManifest::read(self.table.file_io(), &manifest_path).await?;
 
         evaluate_full_text_search(
+            Some(self.table),
             self.table.file_io(),
             self.table.location(),
+            self.table.schema().options(),
             &index_entries,
             &search,
             self.table.schema().fields(),
+            snapshot.next_row_id(),
         )
         .await
     }
@@ -136,13 +149,17 @@ impl<'a> FullTextSearchBuilder<'a> {
 
 /// Evaluate a full-text search query against Tantivy indexes found in the index manifest.
 async fn evaluate_full_text_search(
-    file_io: &crate::io::FileIO,
+    table: Option<&Table>,
+    file_io: &FileIO,
     table_path: &str,
-    index_entries: &[crate::spec::IndexManifestEntry],
+    table_options: &HashMap<String, String>,
+    index_entries: &[IndexManifestEntry],
     search: &FullTextSearch,
     schema_fields: &[DataField],
+    next_row_id: Option<i64>,
 ) -> crate::Result<Vec<RowRange>> {
     let table_path = table_path.trim_end_matches('/');
+    let search_mode = CoreOptions::new(table_options).global_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(schema_fields, &search.field_name) {
         Some(id) => id,
@@ -166,38 +183,255 @@ async fn evaluate_full_text_search(
         return Ok(Vec::new());
     }
 
-    let futures: Vec<_> = fulltext_entries
-        .into_iter()
-        .map(|entry| {
-            let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
-            let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
-            let file_name = entry.index_file.file_name.clone();
-            let query_text = search.query_text.clone();
-            let limit = search.limit;
-            let row_range_start = global_meta.row_range_start;
-            let input = file_io.new_input(&path);
-            async move {
-                let input = input?;
-                let reader = TantivyFullTextReader::from_input_file(&input)
-                    .await
-                    .map_err(|e| crate::Error::UnexpectedError {
-                        message: format!(
-                            "Failed to open Tantivy full-text index '{}': {}",
-                            file_name, e
-                        ),
-                        source: None,
-                    })?;
-                let result = reader.search(&query_text, limit)?;
-                Ok::<_, crate::Error>(result.offset(row_range_start))
-            }
-        })
-        .collect();
-
-    let results = futures::future::try_join_all(futures).await?;
     let mut merged = SearchResult::empty();
-    for r in &results {
-        merged = merged.or(r);
+    if !fulltext_entries.is_empty() {
+        let futures: Vec<_> = fulltext_entries
+            .into_iter()
+            .map(|entry| {
+                let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let file_name = entry.index_file.file_name.clone();
+                let query_text = search.query_text.clone();
+                let limit = search.limit;
+                let row_range_start = global_meta.row_range_start;
+                let input = file_io.new_input(&path);
+                async move {
+                    let input = input?;
+                    let reader = TantivyFullTextReader::from_input_file(&input)
+                        .await
+                        .map_err(|e| crate::Error::UnexpectedError {
+                            message: format!(
+                                "Failed to open Tantivy full-text index '{}': {}",
+                                file_name, e
+                            ),
+                            source: None,
+                        })?;
+                    let result = reader.search(&query_text, limit)?;
+                    Ok::<_, crate::Error>(result.offset(row_range_start))
+                }
+            })
+            .collect();
+
+        let results = futures::future::try_join_all(futures).await?;
+        for r in &results {
+            merged = merged.or(r);
+        }
+    }
+
+    if search_mode != GlobalIndexSearchMode::Fast {
+        let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
+            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Full-text raw search in detail mode requires table context".to_string(),
+                source: None,
+            })?;
+            detail_data_ranges_for_table(table).await?
+        } else {
+            Vec::new()
+        };
+        let field_ids = HashSet::from([field_id]);
+        let raw_ranges = unindexed_ranges_for_global_index_entries(
+            index_entries,
+            &field_ids,
+            search_mode,
+            next_row_id,
+            &detail_ranges,
+            is_tantivy_fulltext_index_file,
+        );
+        if !raw_ranges.is_empty() {
+            let table = table.ok_or_else(|| crate::Error::DataInvalid {
+                message: "Full-text raw search requires table context".to_string(),
+                source: None,
+            })?;
+            let raw_result = read_raw_full_text_search(table, search, &raw_ranges).await?;
+            merged = merged.or(&raw_result);
+        }
     }
 
     Ok(merged.top_k(search.limit).to_row_ranges())
+}
+
+fn is_tantivy_fulltext_index_file(index_file: &IndexFileMeta) -> bool {
+    index_file.index_type == TANTIVY_FULLTEXT_INDEX_TYPE
+}
+
+async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await?;
+    let mut ranges = Vec::new();
+    for split in plan.splits() {
+        for file in split.data_files() {
+            if let Some((from, to)) = file.row_id_range() {
+                ranges.push(RowRange::new(from, to));
+            }
+        }
+    }
+    Ok(merge_row_ranges(ranges))
+}
+
+async fn read_raw_full_text_search(
+    table: &Table,
+    search: &FullTextSearch,
+    raw_ranges: &[RowRange],
+) -> crate::Result<SearchResult> {
+    if raw_ranges.is_empty() {
+        return Ok(SearchResult::empty());
+    }
+
+    let mut read_builder = table.new_read_builder();
+    read_builder
+        .with_projection(&[search.field_name.as_str(), ROW_ID_FIELD_NAME])
+        .with_row_ranges(raw_ranges.to_vec());
+    let plan = read_builder.new_scan().plan().await?;
+    if plan.splits().is_empty() {
+        return Ok(SearchResult::empty());
+    }
+    let read = read_builder.new_read()?;
+    let mut stream = read.to_arrow(plan.splits())?;
+
+    let mut writer = TantivyFullTextWriter::new()?;
+    while let Some(batch) = stream.try_next().await? {
+        add_raw_full_text_batch(&batch, search, &mut writer)?;
+    }
+
+    let memory_io = FileIOBuilder::new("memory").build()?;
+    let output = memory_io.new_output(&format!("/raw-fulltext-{}.archive", Uuid::new_v4()))?;
+    if !writer.finish(&output).await? {
+        return Ok(SearchResult::empty());
+    }
+    let input = output.to_input_file();
+    let reader = TantivyFullTextReader::from_input_file(&input)
+        .await
+        .map_err(|e| crate::Error::UnexpectedError {
+            message: format!("Failed to open raw Tantivy full-text index: {e}"),
+            source: None,
+        })?;
+    reader.search(&search.query_text, search.limit)
+}
+
+fn add_raw_full_text_batch(
+    batch: &RecordBatch,
+    search: &FullTextSearch,
+    writer: &mut TantivyFullTextWriter,
+) -> crate::Result<()> {
+    let text_index =
+        batch
+            .schema()
+            .index_of(&search.field_name)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!(
+                    "Full-text column '{}' not found in raw search batch: {}",
+                    search.field_name, e
+                ),
+                source: None,
+            })?;
+    let row_id_index =
+        batch
+            .schema()
+            .index_of(ROW_ID_FIELD_NAME)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("_ROW_ID column not found in raw search batch: {e}"),
+                source: None,
+            })?;
+    let row_ids = batch
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Full-text raw search requires non-null Int64 _ROW_ID".to_string(),
+            source: None,
+        })?;
+    let column = batch.column(text_index);
+
+    if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+        for row in 0..batch.num_rows() {
+            add_raw_full_text_row(row_ids, row, get_string_value(strings, row), writer)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(strings) = column.as_any().downcast_ref::<LargeStringArray>() {
+        for row in 0..batch.num_rows() {
+            add_raw_full_text_row(row_ids, row, get_large_string_value(strings, row), writer)?;
+        }
+        return Ok(());
+    }
+
+    Err(crate::Error::DataInvalid {
+        message: "Full-text raw search requires Utf8 or LargeUtf8 text column".to_string(),
+        source: None,
+    })
+}
+
+fn get_string_value(strings: &StringArray, row: usize) -> Option<&str> {
+    if strings.is_null(row) {
+        None
+    } else {
+        Some(strings.value(row))
+    }
+}
+
+fn get_large_string_value(strings: &LargeStringArray, row: usize) -> Option<&str> {
+    if strings.is_null(row) {
+        None
+    } else {
+        Some(strings.value(row))
+    }
+}
+
+fn add_raw_full_text_row(
+    row_ids: &Int64Array,
+    row: usize,
+    text: Option<&str>,
+    writer: &mut TantivyFullTextWriter,
+) -> crate::Result<()> {
+    if row_ids.is_null(row) {
+        return Err(crate::Error::DataInvalid {
+            message: "Full-text raw search found null _ROW_ID".to_string(),
+            source: None,
+        });
+    }
+    let row_id = u64::try_from(row_ids.value(row)).map_err(|_| crate::Error::DataInvalid {
+        message: format!(
+            "Negative _ROW_ID {} cannot be used for global index search",
+            row_ids.value(row)
+        ),
+        source: None,
+    })?;
+    writer.add_document(row_id, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataType, IntType};
+
+    #[tokio::test]
+    async fn test_evaluate_full_mode_without_fulltext_entries_returns_empty() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![DataField::new(
+            1,
+            "body".to_string(),
+            DataType::Int(IntType::default()),
+        )];
+        let search = FullTextSearch::new("hello".to_string(), 10, "body".to_string()).unwrap();
+        let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
+
+        let result = evaluate_full_text_search(
+            None,
+            &file_io,
+            "memory:///test_table",
+            &options,
+            &[],
+            &search,
+            &fields,
+            Some(10),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+    }
 }

@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
+const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -115,6 +116,19 @@ pub enum ChangelogProducer {
 pub enum GlobalIndexColumnUpdateAction {
     ThrowError,
     DropPartitionIndex,
+}
+
+/// Search mode for global index queries.
+///
+/// Reference: Java `CoreOptions.GlobalIndexSearchMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalIndexSearchMode {
+    /// Only search indexed data.
+    Fast,
+    /// Use snapshot `next_row_id` and global index coverage to detect missing row IDs.
+    Full,
+    /// Use actual data-file row ID ranges to detect exact missing row IDs.
+    Detail,
 }
 
 /// Bucket function used to map bucket keys to fixed bucket ids.
@@ -260,6 +274,23 @@ impl<'a> CoreOptions<'a> {
             .get(GLOBAL_INDEX_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        match self
+            .options
+            .get(GLOBAL_INDEX_SEARCH_MODE_OPTION)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref()
+            .unwrap_or("fast")
+        {
+            "fast" => Ok(GlobalIndexSearchMode::Fast),
+            "full" => Ok(GlobalIndexSearchMode::Full),
+            "detail" => Ok(GlobalIndexSearchMode::Detail),
+            other => Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported global-index.search-mode: {other}"),
+            }),
+        }
     }
 
     pub fn global_index_row_count_per_shard(&self) -> crate::Result<i64> {
@@ -657,6 +688,10 @@ mod tests {
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::ThrowError
         );
+        assert_eq!(
+            core_options.global_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
     }
 
     #[test]
@@ -678,6 +713,10 @@ mod tests {
                 GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION.to_string(),
                 "DROP_PARTITION_INDEX".to_string(),
             ),
+            (
+                GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "detail".to_string(),
+            ),
         ]);
         let core_options = CoreOptions::new(&options);
 
@@ -691,6 +730,38 @@ mod tests {
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::DropPartitionIndex
         );
+        assert_eq!(
+            core_options.global_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Detail
+        );
+    }
+
+    #[test]
+    fn test_global_index_search_mode_values() {
+        for (raw, expected) in [
+            ("fast", GlobalIndexSearchMode::Fast),
+            ("FAST", GlobalIndexSearchMode::Fast),
+            ("full", GlobalIndexSearchMode::Full),
+            ("detail", GlobalIndexSearchMode::Detail),
+        ] {
+            let options =
+                HashMap::from([(GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(), raw.to_string())]);
+            let core = CoreOptions::new(&options);
+            assert_eq!(core.global_index_search_mode().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_global_index_search_mode_rejects_invalid_value() {
+        let options = HashMap::from([(
+            GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+            "slow".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+
+        let err = core.global_index_search_mode().expect_err("invalid mode");
+        assert!(matches!(err, crate::Error::ConfigInvalid { message }
+                if message.contains(GLOBAL_INDEX_SEARCH_MODE_OPTION)));
     }
 
     #[test]
