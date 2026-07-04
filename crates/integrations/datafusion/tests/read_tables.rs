@@ -1343,6 +1343,7 @@ mod vector_search_tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema};
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -1467,6 +1468,27 @@ mod vector_search_tests {
         ids
     }
 
+    fn extract_query_result_ids(
+        batches: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> Vec<(i32, i32)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let query_id_array = batch
+                .column_by_name("query_id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for query_id");
+            let result_id_array = batch
+                .column_by_name("result_id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for result_id");
+            for i in 0..batch.num_rows() {
+                rows.push((query_id_array.value(i), result_id_array.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
     fn extract_index_rows(
         batches: &[datafusion::arrow::record_batch::RecordBatch],
     ) -> Vec<(String, i64, i64, i64, String)> {
@@ -1584,6 +1606,35 @@ mod vector_search_tests {
 
         let ids = extract_ids(&batches);
         assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_lateral_join_uses_query_vectors() {
+        let (ctx, _tmp) = create_java_vindex_vector_search_context().await;
+        let query_batch = build_vector_batch(
+            vec![10, 20],
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        );
+        let query_table = MemTable::try_new(query_batch.schema(), vec![vec![query_batch]])
+            .expect("Failed to create query vector table");
+        ctx.register_temp_table("paimon.default.queries", Arc::new(query_table))
+            .expect("Failed to register query vector table");
+
+        let batches = ctx
+            .sql(
+                "SELECT q.id AS query_id, r.id AS result_id \
+                 FROM paimon.default.queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 2) AS r \
+                 ORDER BY query_id, result_id",
+            )
+            .await
+            .expect("lateral vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("lateral vector_search query should execute");
+
+        let rows = extract_query_result_ids(&batches);
+        assert_eq!(rows, vec![(10, 0), (10, 1), (20, 1), (20, 2)]);
     }
 
     // Manual run with a local Lumina native library:

@@ -43,6 +43,7 @@ mod error;
 mod filter_pushdown;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
+mod lateral_vector_search;
 mod merge_into;
 mod physical_plan;
 mod procedures;

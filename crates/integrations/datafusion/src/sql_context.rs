@@ -46,7 +46,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, CreateView, Delete,
     Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
@@ -93,12 +94,18 @@ impl Default for SQLContext {
 impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
-        let ctx =
-            SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
-        ctx.register_relation_planner(Arc::new(
-            crate::relation_planner::PaimonRelationPlanner::new(),
-        ))
-        .expect("failed to register relation planner");
+        let state = SessionStateBuilder::new()
+            .with_config(crate::lateral_vector_search::session_config())
+            .with_default_features()
+            .with_relation_planners(vec![Arc::new(
+                crate::relation_planner::PaimonRelationPlanner::new(),
+            )])
+            .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
+            .with_query_planner(Arc::new(
+                crate::lateral_vector_search::PaimonQueryPlanner::new(),
+            ))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         Self {
             ctx,
             catalogs: HashMap::new(),
