@@ -433,7 +433,7 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
         .expect("INSERT should collect");
 
     let timestamp_sql = "SELECT id, name FROM paimon.test_db.temporal_filter_pushdown \
-        WHERE ts = TIMESTAMP '2024-01-01 00:00:00.123456' AND id + 1 > 1";
+        WHERE ts = TIMESTAMP '2024-01-01 00:00:00.123456' AND id + 1 > 2";
     let plan = sql_context
         .sql(timestamp_sql)
         .await
@@ -455,15 +455,18 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
         "Temporal predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
     );
     assert!(
-        scan_lines.iter().all(|line| !line.contains("limit=")),
-        "Residual filter should keep scan from being marked fully exact, plan:\n{plan_text}"
+        plan_text.contains("FilterExec"),
+        "Residual filter should remain above PaimonTableScan, plan:\n{plan_text}"
     );
 
     let rows = common::collect_id_name(&sql_context, timestamp_sql).await;
-    assert_eq!(rows, vec![(1, "alice".to_string())]);
+    assert!(
+        rows.is_empty(),
+        "Residual filter should remove the row matched by the pushed temporal predicate"
+    );
 
     let local_zoned_sql = "SELECT id, name FROM paimon.test_db.temporal_filter_pushdown \
-        WHERE lzts = TIMESTAMP '2024-01-01 00:00:00.654321+00:00' AND id + 1 > 2";
+        WHERE lzts = TIMESTAMP '2024-01-01 00:00:00.654321+00:00' AND id + 1 > 3";
     let plan = sql_context
         .sql(local_zoned_sql)
         .await
@@ -484,9 +487,16 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
             .any(|line| line.contains("predicate=lzts = LZTS(")),
         "Local zoned timestamp predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
     );
+    assert!(
+        plan_text.contains("FilterExec"),
+        "Residual filter should remain above PaimonTableScan, plan:\n{plan_text}"
+    );
 
     let rows = common::collect_id_name(&sql_context, local_zoned_sql).await;
-    assert_eq!(rows, vec![(2, "bob".to_string())]);
+    assert!(
+        rows.is_empty(),
+        "Residual filter should remove the row matched by the pushed local zoned timestamp predicate"
+    );
 }
 
 #[tokio::test]
