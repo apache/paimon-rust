@@ -26,19 +26,34 @@
 //! This separation allows callers to compose multiple operations into a single commit,
 //! similar to Iceberg's Transaction/Action pattern.
 
+use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{BinaryRow, CoreOptions, DataField, DataFileMeta, PartitionComputer};
+use crate::spec::{
+    BinaryRow, CoreOptions, DataField, DataFileMeta, DeletionVectorMeta, FileKind, IndexFileMeta,
+    IndexManifest, PartitionComputer,
+};
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
+use crate::table::source::data_evolution_anchor_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::DataSplitBuilder;
+use crate::table::SnapshotManager;
 use crate::table::Table;
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow_select::concat::concat_batches;
 use arrow_select::interleave::interleave;
+use bytes::Bytes;
 use futures::TryStreamExt;
+use indexmap::IndexMap;
+use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
+const DELETION_VECTORS_INDEX_VERSION_V1: u8 = 1;
+const INDEX_DIR: &str = "index";
+const MANIFEST_DIR: &str = "manifest";
 
 /// Engine-agnostic writer for partial-column updates via `_ROW_ID`.
 ///
@@ -367,6 +382,371 @@ impl DataEvolutionWriter {
         // 4. Collect commit messages (caller is responsible for committing)
         writer.prepare_commit().await
     }
+}
+
+/// Engine-agnostic DELETE writer for data evolution tables.
+///
+/// DELETE is represented by a deletion-vector index file keyed by the normal
+/// anchor file of each data-evolution row-id group. The data files themselves
+/// are not rewritten.
+#[must_use = "writer must be used to call prepare_commit()"]
+pub struct DataEvolutionDeleteWriter {
+    table: Table,
+    row_ids: Vec<i64>,
+}
+
+impl DataEvolutionDeleteWriter {
+    pub fn new(table: &Table) -> Result<Self> {
+        let schema = table.schema();
+        let core_options = CoreOptions::new(schema.options());
+
+        if !core_options.data_evolution_enabled() {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "DELETE is only supported for tables with 'data-evolution.enabled' = 'true'"
+                        .to_string(),
+            });
+        }
+        if !core_options.row_tracking_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "DELETE requires 'row-tracking.enabled' = 'true'".to_string(),
+            });
+        }
+        if !core_options.deletion_vectors_enabled() {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "DELETE on data evolution tables requires 'deletion-vectors.enabled' = 'true'"
+                        .to_string(),
+            });
+        }
+        if !schema.trimmed_primary_keys().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "DELETE on data evolution tables does not support primary keys"
+                    .to_string(),
+            });
+        }
+
+        Ok(Self {
+            table: table.clone(),
+            row_ids: Vec::new(),
+        })
+    }
+
+    pub fn add_row_ids<I>(&mut self, row_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        self.row_ids.extend(row_ids);
+        Ok(())
+    }
+
+    pub fn add_matched_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let row_id_col = row_id_column(&batch)?;
+        validate_row_id_not_null(row_id_col)?;
+        self.row_ids
+            .extend((0..row_id_col.len()).map(|row_idx| row_id_col.value(row_idx)));
+        Ok(())
+    }
+
+    #[must_use = "commit messages must be passed to TableCommit"]
+    pub async fn prepare_commit(mut self) -> Result<Vec<CommitMessage>> {
+        dedup_i64_in_place(&mut self.row_ids);
+        if self.row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let scan = self
+            .table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files();
+        let plan = scan.plan().await?;
+        let mut file_index = Vec::new();
+
+        for split in plan.splits() {
+            let partition = split.partition().to_serialized_bytes();
+            let bucket = split.bucket();
+            let snapshot_id = split.snapshot_id();
+            let files = split
+                .data_files()
+                .iter()
+                .filter(|file| file.first_row_id.is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for group in group_by_overlapping_row_id(files) {
+                let anchor = data_evolution_anchor_file(&group)?;
+                let first_row_id =
+                    anchor
+                        .first_row_id
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Data-evolution anchor file '{}' is missing first_row_id",
+                                anchor.file_name
+                            ),
+                            source: None,
+                        })?;
+                let last_row_id = first_row_id + anchor.row_count - 1;
+                file_index.push(DeleteFileRowRange {
+                    first_row_id,
+                    last_row_id,
+                    partition: partition.clone(),
+                    bucket,
+                    snapshot_id,
+                    anchor_file_name: anchor.file_name.clone(),
+                });
+            }
+        }
+        file_index.sort_by_key(|range| range.first_row_id);
+
+        if file_index.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "No files with row tracking found in target table".to_string(),
+                source: None,
+            });
+        }
+
+        let mut deletes_by_bucket: HashMap<(Vec<u8>, i32), BucketDeletePlan> = HashMap::new();
+        for row_id in &self.row_ids {
+            let (file_pos, file_range) =
+                find_delete_owning_file(&file_index, *row_id).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: format!("No file found for _ROW_ID {row_id}"),
+                        source: None,
+                    }
+                })?;
+            let local_position = u32::try_from(row_id - file_range.first_row_id).map_err(|_| {
+                crate::Error::DataInvalid {
+                    message: format!(
+                        "_ROW_ID {row_id} is too large to encode in a deletion vector"
+                    ),
+                    source: None,
+                }
+            })?;
+
+            let key = (file_range.partition.clone(), file_range.bucket);
+            let entry = deletes_by_bucket
+                .entry(key)
+                .or_insert_with(|| BucketDeletePlan {
+                    check_from_snapshot: file_range.snapshot_id,
+                    deletes_by_anchor: HashMap::new(),
+                });
+            entry.check_from_snapshot = entry.check_from_snapshot.min(file_range.snapshot_id);
+            entry
+                .deletes_by_anchor
+                .entry(file_index[file_pos].anchor_file_name.clone())
+                .or_default()
+                .insert(local_position);
+        }
+
+        let mut messages = Vec::new();
+        for ((partition, bucket), delete_plan) in deletes_by_bucket {
+            if let Some(message) = self
+                .prepare_bucket_delete_message(partition, bucket, delete_plan)
+                .await?
+            {
+                messages.push(message);
+            }
+        }
+
+        Ok(messages)
+    }
+
+    async fn prepare_bucket_delete_message(
+        &self,
+        partition: Vec<u8>,
+        bucket: i32,
+        delete_plan: BucketDeletePlan,
+    ) -> Result<Option<CommitMessage>> {
+        let (mut bitmaps, deleted_index_files) = self
+            .read_existing_bucket_deletion_vectors(
+                &partition,
+                bucket,
+                delete_plan.check_from_snapshot,
+            )
+            .await?;
+        let mut changed = false;
+
+        for (anchor_file_name, positions) in delete_plan.deletes_by_anchor {
+            let bitmap = bitmaps.entry(anchor_file_name).or_default();
+            for position in positions {
+                changed |= bitmap.insert(position);
+            }
+        }
+
+        if !changed {
+            return Ok(None);
+        }
+
+        let new_index_file = self.write_deletion_vector_index_file(bitmaps).await?;
+        let mut message = CommitMessage::new(partition, bucket, vec![]);
+        message.check_from_snapshot = Some(delete_plan.check_from_snapshot);
+        message.new_index_files = vec![new_index_file];
+        message.deleted_index_files = deleted_index_files;
+        Ok(Some(message))
+    }
+
+    async fn read_existing_bucket_deletion_vectors(
+        &self,
+        partition: &[u8],
+        bucket: i32,
+        snapshot_id: i64,
+    ) -> Result<(IndexMap<String, RoaringBitmap>, Vec<IndexFileMeta>)> {
+        let snapshot_manager = SnapshotManager::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+        );
+        let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
+        let Some(index_manifest_name) = snapshot.index_manifest() else {
+            return Ok((IndexMap::new(), Vec::new()));
+        };
+
+        let manifest_path = format!(
+            "{}/{MANIFEST_DIR}/{}",
+            self.table.location().trim_end_matches('/'),
+            index_manifest_name
+        );
+        let index_entries = IndexManifest::read(self.table.file_io(), &manifest_path).await?;
+        let mut bitmaps = IndexMap::new();
+        let mut deleted_index_files = Vec::new();
+
+        for entry in index_entries {
+            if entry.kind != FileKind::Add
+                || entry.bucket != bucket
+                || entry.partition != partition
+                || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
+            {
+                continue;
+            }
+            deleted_index_files.push(entry.index_file.clone());
+            let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
+                continue;
+            };
+            let index_path = format!(
+                "{}/{INDEX_DIR}/{}",
+                self.table.location().trim_end_matches('/'),
+                entry.index_file.file_name
+            );
+            for (data_file_name, meta) in ranges {
+                let deletion_file = crate::DeletionFile::new(
+                    index_path.clone(),
+                    meta.offset as i64,
+                    meta.length as i64,
+                    meta.cardinality,
+                );
+                let bitmap = DeletionVectorFactory::read(self.table.file_io(), &deletion_file)
+                    .await?
+                    .to_bitmap();
+                bitmaps.insert(data_file_name.clone(), bitmap);
+            }
+        }
+
+        Ok((bitmaps, deleted_index_files))
+    }
+
+    async fn write_deletion_vector_index_file(
+        &self,
+        mut bitmaps: IndexMap<String, RoaringBitmap>,
+    ) -> Result<IndexFileMeta> {
+        bitmaps.sort_keys();
+
+        let file_name = format!("index-{}-1", Uuid::new_v4());
+        let table_path = self.table.location().trim_end_matches('/');
+        let index_dir = format!("{table_path}/{INDEX_DIR}");
+        self.table.file_io().mkdirs(&index_dir).await?;
+        let path = format!("{index_dir}/{file_name}");
+
+        let mut bytes = vec![DELETION_VECTORS_INDEX_VERSION_V1];
+        let mut ranges = IndexMap::new();
+        for (data_file_name, bitmap) in bitmaps {
+            if bitmap.is_empty() {
+                continue;
+            }
+            let offset = i32::try_from(bytes.len()).map_err(|_| crate::Error::DataInvalid {
+                message: "Deletion-vector index file is too large".to_string(),
+                source: None,
+            })?;
+            let deletion_vector = DeletionVector::from_bitmap(bitmap);
+            let serialized = deletion_vector.serialize_to_bytes()?;
+            let length = i32::from_be_bytes(
+                serialized[0..4]
+                    .try_into()
+                    .expect("serialized deletion vector has length prefix"),
+            );
+            ranges.insert(
+                data_file_name,
+                DeletionVectorMeta {
+                    offset,
+                    length,
+                    cardinality: Some(deletion_vector.cardinality() as i64),
+                },
+            );
+            bytes.extend_from_slice(&serialized);
+        }
+
+        let file_size = i32::try_from(bytes.len()).map_err(|_| crate::Error::DataInvalid {
+            message: "Deletion-vector index file is too large".to_string(),
+            source: None,
+        })?;
+        let row_count = i32::try_from(ranges.len()).map_err(|_| crate::Error::DataInvalid {
+            message: "Deletion-vector index file has too many entries".to_string(),
+            source: None,
+        })?;
+        self.table
+            .file_io()
+            .new_output(&path)?
+            .write(Bytes::from(bytes))
+            .await?;
+
+        Ok(IndexFileMeta {
+            index_type: DELETION_VECTORS_INDEX_TYPE.to_string(),
+            file_name,
+            file_size,
+            row_count,
+            deletion_vectors_ranges: Some(ranges),
+            global_index_meta: None,
+        })
+    }
+}
+
+struct DeleteFileRowRange {
+    first_row_id: i64,
+    last_row_id: i64,
+    partition: Vec<u8>,
+    bucket: i32,
+    snapshot_id: i64,
+    anchor_file_name: String,
+}
+
+struct BucketDeletePlan {
+    check_from_snapshot: i64,
+    deletes_by_anchor: HashMap<String, HashSet<u32>>,
+}
+
+fn find_delete_owning_file(
+    file_index: &[DeleteFileRowRange],
+    row_id: i64,
+) -> Option<(usize, &DeleteFileRowRange)> {
+    let pos = file_index.partition_point(|f| f.first_row_id <= row_id);
+    if pos == 0 {
+        return None;
+    }
+    let idx = pos - 1;
+    let candidate = &file_index[idx];
+    if row_id <= candidate.last_row_id {
+        Some((idx, candidate))
+    } else {
+        None
+    }
+}
+
+fn dedup_i64_in_place(values: &mut Vec<i64>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(*value));
 }
 
 /// Binary search for the file that owns a given row_id.

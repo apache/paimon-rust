@@ -130,6 +130,31 @@ impl SearchResult {
         Self { row_ids, scores }
     }
 
+    pub(crate) fn without_deleted_row_ranges(
+        &self,
+        deleted_rows: Option<&crate::table::global_index_scanner::RowRangeIndex>,
+    ) -> crate::Result<Self> {
+        let Some(deleted_rows) = deleted_rows else {
+            return Ok(self.clone());
+        };
+
+        let mut row_ids = Vec::with_capacity(self.row_ids.len());
+        let mut scores = Vec::with_capacity(self.scores.len());
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let row_id_i64 = i64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+                message: format!(
+                    "Full-text search row id {row_id} exceeds i64::MAX and cannot be checked against deletion vectors"
+                ),
+                source: None,
+            })?;
+            if !deleted_rows.intersects(row_id_i64, row_id_i64) {
+                row_ids.push(row_id);
+                scores.push(score);
+            }
+        }
+        Ok(Self { row_ids, scores })
+    }
+
     /// Convert to sorted, merged row ranges.
     pub fn to_row_ranges(&self) -> Vec<crate::table::RowRange> {
         if self.row_ids.is_empty() {
@@ -172,5 +197,20 @@ mod tests {
     fn test_full_text_search_empty_query() {
         let result = FullTextSearch::new("".into(), 10, "text".into());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_result_filters_deleted_row_ranges() {
+        let result = SearchResult::new(vec![1, 2, 3, 4], vec![0.1, 0.9, 0.8, 0.2]);
+        let deleted = crate::table::global_index_scanner::RowRangeIndex::create(vec![
+            crate::table::RowRange::new(2, 3),
+        ]);
+
+        let filtered = result
+            .without_deleted_row_ranges(Some(&deleted))
+            .unwrap()
+            .top_k(10);
+        assert_eq!(filtered.row_ids, vec![1, 4]);
+        assert_eq!(filtered.scores, vec![0.1, 0.2]);
     }
 }

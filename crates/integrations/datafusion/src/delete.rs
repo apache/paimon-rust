@@ -29,8 +29,8 @@ use paimon::table::{CopyOnWriteMergeWriter, Table};
 use crate::error::to_datafusion_error;
 use crate::merge_into::TempTableTracker;
 use crate::merge_into::{
-    build_partition_set_from_where, extract_tracking_columns, is_delete_conflict, ok_result,
-    register_cow_target_table, retry_on_conflict,
+    build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
+    is_row_id_conflict, ok_result, register_cow_target_table, retry_on_conflict,
 };
 use crate::sql_context::SQLContext;
 
@@ -60,9 +60,7 @@ pub(crate) async fn execute_delete(
     let core_options = CoreOptions::new(schema.options());
 
     if core_options.data_evolution_enabled() {
-        return Err(DataFusionError::Plan(
-            "DELETE on data-evolution tables is not yet supported".to_string(),
-        ));
+        return execute_data_evolution_delete(ctx, delete, &table, table_ref).await;
     }
     if !schema.trimmed_primary_keys().is_empty() {
         return Err(DataFusionError::Plan(
@@ -71,6 +69,58 @@ pub(crate) async fn execute_delete(
     }
 
     execute_cow_delete(ctx, delete, &table, table_ref).await
+}
+
+/// Execute DELETE on a data-evolution table with retry on row ID conflict.
+async fn execute_data_evolution_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    retry_on_conflict("Data-evolution DELETE", is_row_id_conflict, || {
+        execute_data_evolution_delete_once(ctx, delete, table, table_ref)
+    })
+    .await
+}
+
+/// Single attempt of data-evolution DELETE execution.
+async fn execute_data_evolution_delete_once(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    let wb = table.new_write_builder();
+    let mut writer = wb.new_delete().map_err(to_datafusion_error)?;
+
+    let where_clause = match &delete.selection {
+        Some(expr) => format!(" WHERE {expr}"),
+        None => String::new(),
+    };
+    let query_sql = format!("SELECT \"_ROW_ID\" FROM {table_ref}{where_clause}");
+    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
+
+    let total_count: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+    if total_count == 0 {
+        return ok_result(ctx.ctx(), 0);
+    }
+
+    for batch in batches {
+        writer
+            .add_matched_batch(batch)
+            .map_err(to_datafusion_error)?;
+    }
+
+    let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
+    if !messages.is_empty() {
+        wb.new_commit()
+            .commit(messages)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
+
+    ok_result(ctx.ctx(), total_count)
 }
 
 /// Execute DELETE on an append-only table with retry on delete conflict.

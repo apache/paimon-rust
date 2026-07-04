@@ -22,7 +22,10 @@ use crate::spec::{
     CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
     IndexManifestEntry, ROW_ID_FIELD_NAME,
 };
-use crate::table::global_index_scanner::unindexed_ranges_for_global_index_entries;
+use crate::table::global_index_scanner::{
+    deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
+    unindexed_ranges_for_global_index_entries, RowRangeIndex,
+};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
@@ -264,7 +267,8 @@ async fn evaluate_batch_vector_search(
     }
 
     let table_path = evaluation.table_path.trim_end_matches('/');
-    let search_mode = CoreOptions::new(evaluation.table_options).global_index_search_mode()?;
+    let core_options = CoreOptions::new(evaluation.table_options);
+    let search_mode = core_options.global_index_search_mode()?;
     let field_name = &vector_searches[0].field_name;
     if vector_searches
         .iter()
@@ -298,6 +302,19 @@ async fn evaluate_batch_vector_search(
         return Ok(vec![SearchResult::empty(); vector_searches.len()]);
     }
 
+    let deleted_row_index = if core_options.data_evolution_enabled() {
+        match evaluation.table {
+            Some(table) => {
+                let ranges =
+                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?;
+                (!ranges.is_empty()).then(|| RowRangeIndex::create(ranges))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let mut merged = vec![SearchResult::empty(); vector_searches.len()];
     if !vector_entries.is_empty() {
         let futures: Vec<_> = vector_entries
@@ -311,7 +328,22 @@ async fn evaluate_batch_vector_search(
                 let file_size = entry.index_file.file_size as u64;
                 let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
                 let row_range_start = global_meta.row_range_start;
-                let vector_searches = vector_searches.to_vec();
+                let row_range_end = global_meta.row_range_end;
+                let max_limit = vector_searches
+                    .iter()
+                    .map(|vector_search| vector_search.limit)
+                    .max()
+                    .unwrap_or(0);
+                let index_limit = search_limit_with_deleted_rows(
+                    max_limit,
+                    row_range_start,
+                    row_range_end,
+                    deleted_row_index.as_ref(),
+                );
+                let mut vector_searches = vector_searches.to_vec();
+                for vector_search in &mut vector_searches {
+                    vector_search.limit = index_limit;
+                }
                 let options = evaluation.table_options.clone();
                 let input = evaluation.file_io.new_input(&path);
                 async move {
@@ -417,11 +449,15 @@ async fn evaluate_batch_vector_search(
         }
     }
 
-    Ok(merged
+    merged
         .into_iter()
         .zip(vector_searches)
-        .map(|(result, vector_search)| result.top_k(vector_search.limit))
-        .collect())
+        .map(|(result, vector_search)| {
+            Ok(result
+                .without_deleted_row_ranges(deleted_row_index.as_ref())?
+                .top_k(vector_search.limit))
+        })
+        .collect()
 }
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {

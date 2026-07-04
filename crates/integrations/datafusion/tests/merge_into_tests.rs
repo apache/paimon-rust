@@ -827,20 +827,31 @@ async fn test_merge_into_rejects_duplicate_matched_updates() {
 }
 
 #[tokio::test]
-async fn test_rejects_when_matched_delete() {
+async fn test_when_matched_delete_with_deletion_vectors() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
     setup_data_evolution_table(&sql_context).await;
 
     sql_context
-        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10)")
+        .sql("INSERT INTO paimon.test_db.target (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20)")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
 
-    enable_data_evolution(&sql_context).await;
+    sql_context
+        .sql(
+            "ALTER TABLE paimon.test_db.target SET TBLPROPERTIES(\
+                'data-evolution.enabled' = 'true',\
+                'deletion-vectors.enabled' = 'true'\
+            )",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     register_source(
         &sql_context,
@@ -848,13 +859,23 @@ async fn test_rejects_when_matched_delete() {
     )
     .await;
 
-    assert_merge_error(
+    sql_context
+        .sql(
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_del s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_rows_3col(
         &sql_context,
-        "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_del s ON t.id = s.id \
-         WHEN MATCHED THEN DELETE",
-        "WHEN MATCHED THEN DELETE is not supported",
+        "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
     )
     .await;
+    assert_eq!(rows, vec![(2, "bob".to_string(), 20)]);
 }
 
 #[tokio::test]

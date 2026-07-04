@@ -22,6 +22,26 @@
 use crate::spec::{BinaryRow, DataFileMeta};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
+
+fn is_vector_store_file_name(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().contains(".vector.")
+}
+
+pub(crate) fn is_data_evolution_normal_file(file: &DataFileMeta) -> bool {
+    !crate::table::blob_file_writer::is_blob_file_name(&file.file_name)
+        && !is_vector_store_file_name(&file.file_name)
+}
+
+pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Result<&DataFileMeta> {
+    files
+        .iter()
+        .filter(|file| is_data_evolution_normal_file(file))
+        .min_by_key(|file| (file.max_sequence_number, file.file_name.as_str()))
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Data-evolution deletion vectors require a normal anchor file in each row range group.".to_string(),
+            source: None,
+        })
+}
 // ======================= RowRange ===============================
 
 /// An inclusive row ID range `[from, to]` for filtering reads in data evolution mode.
@@ -560,10 +580,16 @@ impl DataSplit {
 
         // Merge overlapping row ID ranges and compute max row_count per group
         let groups = group_by_overlapping_row_id(self.data_files.to_vec());
-        let sum: i64 = groups
+        let mut sum: i64 = groups
             .iter()
             .map(|group| group.iter().map(|f| f.row_count).max().unwrap_or(0))
             .sum();
+        if let Some(deletion_files) = &self.data_deletion_files {
+            for deletion_file in deletion_files.iter().flatten() {
+                sum -= deletion_file.cardinality()?;
+            }
+        }
+
         Some(sum)
     }
 

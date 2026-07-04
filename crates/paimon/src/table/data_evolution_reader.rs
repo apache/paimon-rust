@@ -20,6 +20,7 @@ use super::data_file_reader::{
     DataFileReader,
 };
 use crate::arrow::build_target_arrow_schema;
+use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{DataField, DataFileMeta, DataType, ROW_ID_FIELD_NAME};
 use crate::table::blob_file_writer::is_blob_file_name;
@@ -30,6 +31,7 @@ use crate::{DataSplit, Error};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
+use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -140,6 +142,12 @@ impl DataEvolutionReader {
 
                 if is_raw_convertible(split.data_files()) {
                     for file_meta in split.data_files().to_vec() {
+                        let deletion_vector = read_file_deletion_vector(
+                            &self.file_io,
+                            &split,
+                            &file_meta,
+                        )
+                        .await?;
                         let data_fields: Option<Vec<DataField>> =
                             if file_meta.schema_id != self.table_schema_id {
                                 let data_schema =
@@ -153,11 +161,17 @@ impl DataEvolutionReader {
                         let effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
 
                         let selected_row_ids = if self.row_id_index.is_some() && has_row_id {
-                            effective_row_ranges.as_ref().map(|ranges| {
+                            selected_absolute_row_ranges_for_file(
+                                file_meta.first_row_id.unwrap(),
+                                file_meta.row_count,
+                                effective_row_ranges.as_deref(),
+                                deletion_vector.as_deref(),
+                            )?
+                            .map(|ranges| {
                                 expand_selected_row_ids(
                                     file_meta.first_row_id.unwrap(),
                                     file_meta.row_count,
-                                    ranges,
+                                    &ranges,
                                 )
                             })
                         } else {
@@ -171,7 +185,7 @@ impl DataEvolutionReader {
                             &split,
                             file_meta,
                             data_fields,
-                            None,
+                            deletion_vector,
                             effective_row_ranges,
                         )?;
                         while let Some(batch) = stream.next().await {
@@ -200,15 +214,28 @@ impl DataEvolutionReader {
                     }
                 } else {
                     let prepared_group = PreparedMergeGroup::new(split.data_files())?;
+                    let anchor_deletion_vector = read_anchor_deletion_vector(
+                        &self.file_io,
+                        &split,
+                        &prepared_group.files,
+                    )
+                    .await?;
                     let effective_row_ranges = row_ranges.clone();
-                    let expected_output_rows = count_selected_rows(
+                    let selected_ranges = selected_absolute_row_ranges_for_file(
                         prepared_group.first_row_id,
                         prepared_group.logical_row_count,
                         effective_row_ranges.as_deref(),
+                        anchor_deletion_vector
+                            .as_ref()
+                            .map(|ctx| ctx.deletion_vector.as_ref()),
                     )?;
+                    let expected_output_rows = match selected_ranges.as_ref() {
+                        Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
+                        None => prepared_group.logical_row_count as usize,
+                    };
 
                     let selected_row_ids = if self.row_id_index.is_some() {
-                        effective_row_ranges.as_ref().map(|ranges| {
+                        selected_ranges.as_ref().map(|ranges| {
                             expand_selected_row_ids(
                                 prepared_group.first_row_id,
                                 prepared_group.logical_row_count,
@@ -226,6 +253,7 @@ impl DataEvolutionReader {
                         &prepared_group,
                         effective_row_ranges,
                         expected_output_rows,
+                        anchor_deletion_vector,
                     )?;
                     while let Some(batch) = merge_stream.next().await {
                         let batch = batch?;
@@ -260,6 +288,7 @@ impl DataEvolutionReader {
         prepared_group: &PreparedMergeGroup,
         row_ranges: Option<Vec<RowRange>>,
         expected_output_rows: usize,
+        anchor_deletion_vector: Option<DeletionVectorContext>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         if prepared_group.files.is_empty() {
             return Ok(futures::stream::empty().boxed());
@@ -274,6 +303,7 @@ impl DataEvolutionReader {
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
         const MERGE_BATCH_SIZE: usize = 1024;
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -340,6 +370,7 @@ impl DataEvolutionReader {
                             table_schema_id,
                             table_fields.clone(),
                             blob_as_descriptor,
+                            anchor_deletion_vector.as_ref(),
                         )
                         .map(Some)
                     }
@@ -501,6 +532,7 @@ fn open_source_stream(
     table_schema_id: i64,
     table_fields: Vec<DataField>,
     blob_as_descriptor: bool,
+    anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let file_reader = DataFileReader::new(
         file_io,
@@ -515,13 +547,16 @@ fn open_source_stream(
     match source {
         FieldSource::DataFile {
             file, data_fields, ..
-        } => file_reader.read_single_file_stream(
-            split,
-            file.as_ref().clone(),
-            data_fields.clone(),
-            None,
-            row_ranges,
-        ),
+        } => {
+            let deletion_vector = shifted_deletion_vector_for_file(file, anchor_deletion_vector)?;
+            file_reader.read_single_file_stream(
+                split,
+                file.as_ref().clone(),
+                data_fields.clone(),
+                deletion_vector,
+                row_ranges,
+            )
+        }
         FieldSource::BlobBunch {
             bunch, data_fields, ..
         } => read_bunch_files_stream(
@@ -530,6 +565,7 @@ fn open_source_stream(
             bunch.files.clone(),
             data_fields.clone(),
             row_ranges,
+            anchor_deletion_vector.cloned(),
         ),
         FieldSource::VectorBunch {
             bunch, data_fields, ..
@@ -539,6 +575,7 @@ fn open_source_stream(
             bunch.files.clone(),
             data_fields.clone(),
             row_ranges,
+            anchor_deletion_vector.cloned(),
         ),
     }
 }
@@ -549,15 +586,18 @@ fn read_bunch_files_stream(
     files: Vec<DataFileMeta>,
     data_fields: Option<Vec<DataField>>,
     row_ranges: Option<Vec<RowRange>>,
+    anchor_deletion_vector: Option<DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let split = split.clone();
     Ok(try_stream! {
         for file in files {
+            let deletion_vector =
+                shifted_deletion_vector_for_file(&file, anchor_deletion_vector.as_ref())?;
             let mut stream = file_reader.read_single_file_stream(
                 &split,
                 file,
                 data_fields.clone(),
-                None,
+                deletion_vector,
                 row_ranges.clone(),
             )?;
             while let Some(batch) = stream.next().await {
@@ -566,6 +606,165 @@ fn read_bunch_files_stream(
         }
     }
     .boxed())
+}
+
+#[derive(Debug, Clone)]
+struct DeletionVectorContext {
+    first_row_id: i64,
+    deletion_vector: Arc<DeletionVector>,
+}
+
+async fn read_file_deletion_vector(
+    file_io: &FileIO,
+    split: &DataSplit,
+    file: &DataFileMeta,
+) -> crate::Result<Option<Arc<DeletionVector>>> {
+    let Some(deletion_file) = split.deletion_file_for_data_file(file) else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(
+        DeletionVectorFactory::read(file_io, deletion_file).await?,
+    )))
+}
+
+async fn read_anchor_deletion_vector(
+    file_io: &FileIO,
+    split: &DataSplit,
+    files: &[DataFileMeta],
+) -> crate::Result<Option<DeletionVectorContext>> {
+    let anchor = crate::table::source::data_evolution_anchor_file(files)?;
+    let Some(deletion_file) = split.deletion_file_for_data_file(anchor) else {
+        return Ok(None);
+    };
+    let first_row_id = anchor.first_row_id.ok_or_else(|| Error::DataInvalid {
+        message: format!(
+            "Data-evolution anchor file '{}' is missing first_row_id",
+            anchor.file_name
+        ),
+        source: None,
+    })?;
+    Ok(Some(DeletionVectorContext {
+        first_row_id,
+        deletion_vector: Arc::new(DeletionVectorFactory::read(file_io, deletion_file).await?),
+    }))
+}
+
+fn shifted_deletion_vector_for_file(
+    file: &DataFileMeta,
+    context: Option<&DeletionVectorContext>,
+) -> crate::Result<Option<Arc<DeletionVector>>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let Some(file_first_row_id) = file.first_row_id else {
+        return Ok(None);
+    };
+
+    if file_first_row_id == context.first_row_id {
+        return Ok(Some(context.deletion_vector.clone()));
+    }
+
+    let file_end = file_first_row_id + file.row_count - 1;
+    let mut bitmap = RoaringBitmap::new();
+    for deleted in context.deletion_vector.iter() {
+        let row_id = context.first_row_id + deleted as i64;
+        if row_id < file_first_row_id || row_id > file_end {
+            continue;
+        }
+        let local = u32::try_from(row_id - file_first_row_id).map_err(|_| Error::DataInvalid {
+            message: format!(
+                "Deleted row id {row_id} cannot be represented as a local deletion-vector position for file '{}'",
+                file.file_name
+            ),
+            source: None,
+        })?;
+        bitmap.insert(local);
+    }
+
+    if bitmap.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(DeletionVector::from_bitmap(bitmap))))
+    }
+}
+
+fn selected_absolute_row_ranges_for_file(
+    first_row_id: i64,
+    row_count: i64,
+    row_ranges: Option<&[RowRange]>,
+    deletion_vector: Option<&DeletionVector>,
+) -> crate::Result<Option<Vec<RowRange>>> {
+    let has_ranges = row_ranges.is_some();
+    let has_deletion_vector = deletion_vector.is_some_and(|dv| !dv.is_empty());
+    if !has_ranges && !has_deletion_vector {
+        return Ok(None);
+    }
+    if row_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut local_ranges = if let Some(dv) = deletion_vector {
+        non_deleted_local_ranges(row_count, dv)
+    } else {
+        vec![RowRange::new(0, row_count - 1)]
+    };
+
+    if let Some(ranges) = row_ranges {
+        let selected = ranges
+            .iter()
+            .filter_map(|range| {
+                range
+                    .intersect_inclusive(first_row_id, first_row_id + row_count - 1)
+                    .map(|range| {
+                        RowRange::new(range.from() - first_row_id, range.to() - first_row_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        local_ranges = intersect_local_ranges(&local_ranges, &selected);
+    }
+
+    let absolute = local_ranges
+        .into_iter()
+        .map(|range| RowRange::new(first_row_id + range.from(), first_row_id + range.to()))
+        .collect::<Vec<_>>();
+    Ok(Some(absolute))
+}
+
+fn non_deleted_local_ranges(row_count: i64, deletion_vector: &DeletionVector) -> Vec<RowRange> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0i64;
+    for deleted in deletion_vector.iter() {
+        let deleted = deleted as i64;
+        if deleted >= row_count {
+            break;
+        }
+        if deleted > cursor {
+            ranges.push(RowRange::new(cursor, deleted - 1));
+        }
+        cursor = deleted + 1;
+    }
+    if cursor < row_count {
+        ranges.push(RowRange::new(cursor, row_count - 1));
+    }
+    ranges
+}
+
+fn intersect_local_ranges(left: &[RowRange], right: &[RowRange]) -> Vec<RowRange> {
+    let mut result = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        let from = left[i].from().max(right[j].from());
+        let to = left[i].to().min(right[j].to());
+        if from <= to {
+            result.push(RowRange::new(from, to));
+        }
+        if left[i].to() < right[j].to() {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -1315,20 +1514,6 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
     out.extend(vector_files);
     out.extend(blob_files);
     Ok(out)
-}
-
-fn count_selected_rows(
-    first_row_id: i64,
-    row_count: i64,
-    row_ranges: Option<&[RowRange]>,
-) -> crate::Result<usize> {
-    match row_ranges {
-        Some(ranges) => Ok(expand_selected_row_ids(first_row_id, row_count, ranges).len()),
-        None => usize::try_from(row_count).map_err(|e| Error::DataInvalid {
-            message: format!("Invalid logical row count {row_count}"),
-            source: Some(Box::new(e)),
-        }),
-    }
 }
 
 #[cfg(test)]

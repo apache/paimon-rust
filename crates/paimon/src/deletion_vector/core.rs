@@ -49,6 +49,16 @@ impl DeletionVector {
         }
     }
 
+    /// Clone the underlying bitmap for mutation by writers.
+    pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
+        (*self.bitmap).clone()
+    }
+
+    /// Number of deleted positions in this vector.
+    pub fn cardinality(&self) -> u64 {
+        self.bitmap.len()
+    }
+
     /// Returns an iterator over deleted positions that supports [DeletionVectorIterator::advance_to].
     /// Required for efficient row selection building when skipping row groups (avoid re-scanning
     /// deletes in skipped ranges).
@@ -64,6 +74,36 @@ impl DeletionVector {
     /// Check if the deletion vector is empty (no deleted rows)
     pub fn is_empty(&self) -> bool {
         self.bitmap.is_empty()
+    }
+
+    /// Serialize using Java `BitmapDeletionVector` format:
+    /// `i32 bitmapLength | i32 magic | roaring bitmap bytes | i32 crc`.
+    pub(crate) fn serialize_to_bytes(&self) -> crate::Result<Vec<u8>> {
+        let mut bitmap_bytes = Vec::new();
+        self.bitmap
+            .serialize_into(&mut bitmap_bytes)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to serialize RoaringBitmap: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+
+        let bitmap_length =
+            i32::try_from(MAGIC_NUMBER_SIZE_BYTES + bitmap_bytes.len()).map_err(|_| {
+                crate::Error::DataInvalid {
+                    message: "Deletion vector bitmap is too large to serialize".to_string(),
+                    source: None,
+                }
+            })?;
+
+        let mut payload = Vec::with_capacity(8 + bitmap_bytes.len() + 4);
+        payload.extend_from_slice(&bitmap_length.to_be_bytes());
+        payload.extend_from_slice(&(MAGIC_NUMBER as i32).to_be_bytes());
+        payload.extend_from_slice(&bitmap_bytes);
+
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&payload[4..]);
+        payload.extend_from_slice(&(crc.finalize() as i32).to_be_bytes());
+        Ok(payload)
     }
 
     /// Get the underlying bitmap (read-only)

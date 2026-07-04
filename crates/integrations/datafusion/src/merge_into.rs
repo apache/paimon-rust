@@ -640,6 +640,11 @@ async fn execute_merge_into_once(
     } else {
         None
     };
+    let delete_writer = if parsed.delete {
+        Some(wb.new_delete().map_err(to_datafusion_error)?)
+    } else {
+        None
+    };
 
     let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
     let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
@@ -685,7 +690,7 @@ async fn execute_merge_into_once(
     // Separate matched and not-matched rows
     let (matched_batches, not_matched_batches) = split_by_row_id(&join_result)?;
 
-    // 4. Handle matched rows (UPDATE)
+    // 4. Handle matched rows (UPDATE or DELETE)
     if let Some(mut writer) = update_writer {
         let upd = parsed.update.as_ref().unwrap();
         let matched_count: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
@@ -699,6 +704,19 @@ async fn execute_merge_into_once(
             }
             let update_messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
             all_messages.extend(update_messages);
+            total_count += matched_count as u64;
+        }
+    }
+    if let Some(mut writer) = delete_writer {
+        let matched_count: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
+        if matched_count > 0 {
+            for batch in &matched_batches {
+                writer
+                    .add_matched_batch(batch.clone())
+                    .map_err(to_datafusion_error)?;
+            }
+            let delete_messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
+            all_messages.extend(delete_messages);
             total_count += matched_count as u64;
         }
     }
@@ -970,18 +988,20 @@ struct MergeUpdateClause {
 /// Parsed merge clauses.
 struct ParsedMergeClauses {
     update: Option<MergeUpdateClause>,
+    delete: bool,
     inserts: Vec<MergeInsertClause>,
 }
 
 /// Extract UPDATE and INSERT clauses from the MERGE AST.
 fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
     let mut update: Option<MergeUpdateClause> = None;
+    let mut delete = false;
     let mut inserts: Vec<MergeInsertClause> = Vec::new();
 
     for clause in &merge.clauses {
         match clause.clause_kind {
             MergeClauseKind::Matched => {
-                if update.is_some() {
+                if update.is_some() || delete {
                     return Err(DataFusionError::Plan(
                         "Multiple WHEN MATCHED clauses are not yet supported".to_string(),
                     ));
@@ -1020,10 +1040,7 @@ fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
                         update = Some(MergeUpdateClause { columns, exprs });
                     }
                     MergeAction::Delete { .. } => {
-                        return Err(DataFusionError::Plan(
-                            "WHEN MATCHED THEN DELETE is not supported for data evolution tables"
-                                .to_string(),
-                        ));
+                        delete = true;
                     }
                     MergeAction::Insert(_) => {
                         return Err(DataFusionError::Plan(
@@ -1077,13 +1094,17 @@ fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
         }
     }
 
-    if update.is_none() && inserts.is_empty() {
+    if update.is_none() && !delete && inserts.is_empty() {
         return Err(DataFusionError::Plan(
             "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".to_string(),
         ));
     }
 
-    Ok(ParsedMergeClauses { update, inserts })
+    Ok(ParsedMergeClauses {
+        update,
+        delete,
+        inserts,
+    })
 }
 
 /// Extract table name and optional alias from a TableFactor.

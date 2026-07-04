@@ -24,7 +24,10 @@ use crate::spec::{
     CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
     IndexManifestEntry, ROW_ID_FIELD_NAME,
 };
-use crate::table::global_index_scanner::unindexed_ranges_for_global_index_entries;
+use crate::table::global_index_scanner::{
+    deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
+    unindexed_ranges_for_global_index_entries, RowRangeIndex,
+};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::tantivy::full_text_search::{FullTextSearch, SearchResult};
@@ -165,7 +168,8 @@ async fn evaluate_full_text_search(
     search: &FullTextSearch,
 ) -> crate::Result<Vec<RowRange>> {
     let table_path = evaluation.table_path.trim_end_matches('/');
-    let search_mode = CoreOptions::new(evaluation.table_options).global_index_search_mode()?;
+    let core_options = CoreOptions::new(evaluation.table_options);
+    let search_mode = core_options.global_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(evaluation.schema_fields, &search.field_name) {
         Some(id) => id,
@@ -189,6 +193,19 @@ async fn evaluate_full_text_search(
         return Ok(Vec::new());
     }
 
+    let deleted_row_index = if core_options.data_evolution_enabled() {
+        match evaluation.table {
+            Some(table) => {
+                let ranges =
+                    deleted_row_ranges_for_data_evolution_dvs(table, index_entries).await?;
+                (!ranges.is_empty()).then(|| RowRangeIndex::create(ranges))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let mut merged = SearchResult::empty();
     if !fulltext_entries.is_empty() {
         let futures: Vec<_> = fulltext_entries
@@ -198,8 +215,14 @@ async fn evaluate_full_text_search(
                 let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
                 let file_name = entry.index_file.file_name.clone();
                 let query_text = search.query_text.clone();
-                let limit = search.limit;
                 let row_range_start = global_meta.row_range_start;
+                let row_range_end = global_meta.row_range_end;
+                let limit = search_limit_with_deleted_rows(
+                    search.limit,
+                    row_range_start,
+                    row_range_end,
+                    deleted_row_index.as_ref(),
+                );
                 let input = evaluation.file_io.new_input(&path);
                 async move {
                     let input = input?;
@@ -253,7 +276,10 @@ async fn evaluate_full_text_search(
         }
     }
 
-    Ok(merged.top_k(search.limit).to_row_ranges())
+    Ok(merged
+        .without_deleted_row_ranges(deleted_row_index.as_ref())?
+        .top_k(search.limit)
+        .to_row_ranges())
 }
 
 fn is_tantivy_fulltext_index_file(index_file: &IndexFileMeta) -> bool {

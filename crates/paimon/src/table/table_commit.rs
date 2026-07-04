@@ -43,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
+const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
@@ -1098,6 +1099,12 @@ impl TableCommit {
                 };
                 let detect_conflicts = has_delete || check_from_snapshot.is_some();
                 let base_data_files = if detect_conflicts {
+                    self.check_deletion_vector_index_only_conflict(
+                        latest_snapshot.as_ref(),
+                        entries,
+                        new_index_entries,
+                        *check_from_snapshot,
+                    )?;
                     self.detect_commit_conflicts(
                         latest_snapshot,
                         retry_state,
@@ -1707,6 +1714,43 @@ impl TableCommit {
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
             .await
+    }
+
+    fn check_deletion_vector_index_only_conflict(
+        &self,
+        latest_snapshot: Option<&Snapshot>,
+        data_entries: &[ManifestEntry],
+        index_entries: &[IndexManifestEntry],
+        check_from_snapshot: Option<i64>,
+    ) -> Result<()> {
+        if !self.data_evolution_enabled || !data_entries.is_empty() {
+            return Ok(());
+        }
+        let Some(check_from_snapshot) = check_from_snapshot else {
+            return Ok(());
+        };
+        let has_deletion_vector_index_change = index_entries
+            .iter()
+            .any(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE);
+        if !has_deletion_vector_index_change {
+            return Ok(());
+        }
+        let Some(latest_snapshot) = latest_snapshot else {
+            return Ok(());
+        };
+        if latest_snapshot.id() <= check_from_snapshot {
+            return Ok(());
+        }
+
+        Err(crate::Error::DataInvalid {
+            message: format!(
+                "Row ID conflict: deletion-vector DELETE was prepared from snapshot \
+                 {check_from_snapshot}, but latest snapshot is {}. Retry with the latest \
+                 deletion vectors.",
+                latest_snapshot.id()
+            ),
+            source: None,
+        })
     }
 
     fn check_delete_entries_against_base(
@@ -2705,7 +2749,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryRowBuilder, DataFileMeta, GlobalIndexMeta, IndexFileMeta, ManifestList, TableSchema,
+        BinaryRowBuilder, DataFileMeta, DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta,
+        ManifestList, TableSchema,
     };
     use chrono::{DateTime, Utc};
 
@@ -2832,6 +2877,24 @@ mod tests {
             .expect("global index meta")
             .extra_field_ids = Some(extra_field_ids);
         file
+    }
+
+    fn test_deletion_vector_index_file(name: &str, data_file_name: &str) -> IndexFileMeta {
+        IndexFileMeta {
+            index_type: DELETION_VECTORS_INDEX_TYPE.to_string(),
+            file_name: name.to_string(),
+            file_size: 128,
+            row_count: 1,
+            deletion_vectors_ranges: Some(indexmap::IndexMap::from([(
+                data_file_name.to_string(),
+                DeletionVectorMeta {
+                    offset: 1,
+                    length: 16,
+                    cardinality: Some(1),
+                },
+            )])),
+            global_index_meta: None,
+        }
     }
 
     fn setup_commit(file_io: &FileIO, table_path: &str) -> TableCommit {
@@ -3141,6 +3204,52 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_deletion_vector_index_only_commit_rejects_stale_snapshot() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_dv_index_only_stale_snapshot";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_data_evolution_commit(&file_io, table_path);
+        let partition = EMPTY_SERIALIZED_ROW.clone();
+        let mut data_file = test_data_file("data-0.parquet", 10);
+        data_file.file_source = Some(0);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![data_file],
+            )])
+            .await
+            .unwrap();
+
+        let mut first_delete = CommitMessage::new(partition.clone(), 0, vec![]);
+        first_delete.check_from_snapshot = Some(1);
+        first_delete.new_index_files = vec![test_deletion_vector_index_file(
+            "dv-0.index",
+            "data-0.parquet",
+        )];
+        commit.commit(vec![first_delete]).await.unwrap();
+
+        let mut stale_delete = CommitMessage::new(partition, 0, vec![]);
+        stale_delete.check_from_snapshot = Some(1);
+        stale_delete.new_index_files = vec![test_deletion_vector_index_file(
+            "dv-1.index",
+            "data-0.parquet",
+        )];
+        let result = commit.commit(vec![stale_delete]).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Row ID conflict"),
+            "expected row-id conflict for stale DV commit, got: {err_msg}"
+        );
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(snapshot.id(), 2);
     }
 
     #[tokio::test]

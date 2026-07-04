@@ -70,7 +70,7 @@ use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
-pub use data_evolution_writer::DataEvolutionWriter;
+pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;

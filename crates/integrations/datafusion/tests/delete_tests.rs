@@ -481,7 +481,7 @@ async fn test_delete_rejects_primary_key_table() {
 }
 
 #[tokio::test]
-async fn test_delete_rejects_data_evolution_table() {
+async fn test_delete_rejects_data_evolution_table_without_deletion_vectors() {
     let (tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;
     sql_context
@@ -503,9 +503,52 @@ async fn test_delete_rejects_data_evolution_table() {
     assert_sql_error(
         &sql_context,
         "DELETE FROM paimon.test_db.de_t WHERE id = 1",
-        "DELETE on data-evolution tables is not yet supported",
+        "deletion-vectors.enabled",
     )
     .await;
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn test_delete_data_evolution_table_with_deletion_vectors() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.de_t (\
+                id INT NOT NULL, name VARCHAR, age INT\
+            ) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'deletion-vectors.enabled' = 'true'\
+            )",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.de_t (id, name, age) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+    )
+    .await;
+
+    let cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.de_t WHERE id = 2").await;
+    assert_eq!(cnt, 1);
+
+    assert_eq!(
+        query_int_str_int(
+            &sql_context,
+            "SELECT id, name, age FROM paimon.test_db.de_t ORDER BY id",
+        )
+        .await,
+        vec![(1, "a".into(), 10), (3, "c".into(), 30)]
+    );
+
+    let second_cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.de_t WHERE id = 2").await;
+    assert_eq!(second_cnt, 0);
     drop(tmp);
 }
 

@@ -19,7 +19,7 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
-use crate::table::{Table, TableCommit, TableUpdate, TableWrite};
+use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -108,6 +108,11 @@ impl<'a> WriteBuilder<'a> {
     /// Create a new TableUpdate for data-evolution row-id updates.
     pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
         TableUpdate::new(self.table, update_columns)
+    }
+
+    /// Create a new writer for data-evolution row-id deletes.
+    pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        DataEvolutionDeleteWriter::new(self.table)
     }
 }
 
