@@ -69,6 +69,13 @@ pub struct VectorSearchBuilder<'a> {
     limit: Option<usize>,
 }
 
+pub struct BatchVectorSearchBuilder<'a> {
+    table: &'a Table,
+    vector_column: Option<String>,
+    query_vectors: Option<Vec<Vec<f32>>>,
+    limit: Option<usize>,
+}
+
 impl<'a> VectorSearchBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
@@ -111,8 +118,77 @@ impl<'a> VectorSearchBuilder<'a> {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
 
-        let vector_search =
-            VectorSearch::new(query_vector.clone(), limit, vector_column.to_string())?;
+        let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
+        let mut results = batch_builder
+            .with_vector_column(vector_column)
+            .with_query_vectors(vec![query_vector.clone()])
+            .with_limit(limit)
+            .execute()
+            .await?;
+
+        debug_assert_eq!(results.len(), 1);
+        results.remove(0).to_row_ranges()
+    }
+}
+
+impl<'a> BatchVectorSearchBuilder<'a> {
+    pub(crate) fn new(table: &'a Table) -> Self {
+        Self {
+            table,
+            vector_column: None,
+            query_vectors: None,
+            limit: None,
+        }
+    }
+
+    pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
+        self.vector_column = Some(name.to_string());
+        self
+    }
+
+    pub fn with_query_vectors(&mut self, vectors: Vec<Vec<f32>>) -> &mut Self {
+        self.query_vectors = Some(vectors);
+        self
+    }
+
+    pub fn with_limit(&mut self, limit: usize) -> &mut Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        if vector_column.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Vector column must be set via with_vector_column()".to_string(),
+            });
+        }
+
+        let query_vectors =
+            self.query_vectors
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vectors must be set via with_query_vectors()".to_string(),
+                })?;
+        if query_vectors.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Query vectors must be set via with_query_vectors()".to_string(),
+            });
+        }
+
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        let vector_searches = query_vectors
+            .iter()
+            .map(|vector| VectorSearch::new(vector.clone(), limit, vector_column.to_string()))
+            .collect::<crate::Result<Vec<_>>>()?;
 
         let snapshot_manager = SnapshotManager::new(
             self.table.file_io().clone(),
@@ -121,7 +197,7 @@ impl<'a> VectorSearchBuilder<'a> {
 
         let snapshot = match snapshot_manager.get_latest_snapshot().await? {
             Some(s) => s,
-            None => return Ok(Vec::new()),
+            None => return Ok(vec![SearchResult::empty(); vector_searches.len()]),
         };
 
         let index_entries = match snapshot.index_manifest() {
@@ -136,7 +212,7 @@ impl<'a> VectorSearchBuilder<'a> {
             None => Vec::new(),
         };
 
-        evaluate_vector_search(
+        evaluate_batch_vector_search(
             VectorSearchEvaluation {
                 table: Some(self.table),
                 file_io: self.table.file_io(),
@@ -146,12 +222,13 @@ impl<'a> VectorSearchBuilder<'a> {
                 next_row_id: snapshot.next_row_id(),
             },
             &index_entries,
-            &vector_search,
+            &vector_searches,
         )
         .await
     }
 }
 
+#[derive(Clone, Copy)]
 struct VectorSearchEvaluation<'a> {
     table: Option<&'a Table>,
     file_io: &'a FileIO,
@@ -161,18 +238,48 @@ struct VectorSearchEvaluation<'a> {
     next_row_id: Option<i64>,
 }
 
+#[cfg(test)]
 async fn evaluate_vector_search(
     evaluation: VectorSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     vector_search: &VectorSearch,
 ) -> crate::Result<Vec<RowRange>> {
+    let mut results = evaluate_batch_vector_search(
+        evaluation,
+        index_entries,
+        std::slice::from_ref(vector_search),
+    )
+    .await?;
+    debug_assert_eq!(results.len(), 1);
+    results.remove(0).to_row_ranges()
+}
+
+async fn evaluate_batch_vector_search(
+    evaluation: VectorSearchEvaluation<'_>,
+    index_entries: &[IndexManifestEntry],
+    vector_searches: &[VectorSearch],
+) -> crate::Result<Vec<SearchResult>> {
+    if vector_searches.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let table_path = evaluation.table_path.trim_end_matches('/');
     let search_mode = CoreOptions::new(evaluation.table_options).global_index_search_mode()?;
-
-    let field_id = match find_field_id_by_name(evaluation.schema_fields, &vector_search.field_name)
+    let field_name = &vector_searches[0].field_name;
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.field_name != *field_name)
     {
+        return Err(crate::Error::DataInvalid {
+            message: "Batch vector search requires all query vectors to use the same field"
+                .to_string(),
+            source: None,
+        });
+    }
+
+    let field_id = match find_field_id_by_name(evaluation.schema_fields, field_name) {
         Some(id) => id,
-        None => return Ok(Vec::new()),
+        None => return Ok(vec![SearchResult::empty(); vector_searches.len()]),
     };
 
     let vector_entries: Vec<_> = index_entries
@@ -188,10 +295,10 @@ async fn evaluate_vector_search(
         .collect();
 
     if vector_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast {
-        return Ok(Vec::new());
+        return Ok(vec![SearchResult::empty(); vector_searches.len()]);
     }
 
-    let mut merged = SearchResult::empty();
+    let mut merged = vec![SearchResult::empty(); vector_searches.len()];
     if !vector_entries.is_empty() {
         let futures: Vec<_> = vector_entries
             .into_iter()
@@ -204,7 +311,7 @@ async fn evaluate_vector_search(
                 let file_size = entry.index_file.file_size as u64;
                 let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
                 let row_range_start = global_meta.row_range_start;
-                let vector_search_clone = vector_search.clone();
+                let vector_searches = vector_searches.to_vec();
                 let options = evaluation.table_options.clone();
                 let input = evaluation.file_io.new_input(&path);
                 async move {
@@ -222,34 +329,50 @@ async fn evaluate_vector_search(
                     let io_meta =
                         GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
                     let data = bytes.to_vec();
-                    let result = match backend {
+                    let results = match backend {
                         VectorIndexBackend::Lumina => {
                             let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
-                            reader.visit_vector_search(&vector_search_clone, |_| {
+                            reader.visit_batch_vector_search(&vector_searches, |_| {
                                 Ok(Cursor::new(data))
                             })?
                         }
                         VectorIndexBackend::Vindex => {
                             let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
-                            reader.visit_vector_search(&vector_search_clone, |_| {
+                            reader.visit_batch_vector_search(&vector_searches, |_| {
                                 Ok(Cursor::new(data))
                             })?
                         }
                     };
-
-                    match result {
-                        Some(scored_map) => Ok::<_, crate::Error>(
-                            SearchResult::from_scored_map(scored_map).offset(row_range_start),
-                        ),
-                        None => Ok(SearchResult::empty()),
+                    if results.len() != vector_searches.len() {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Batch vector search backend returned {} results for {} query vectors",
+                                results.len(),
+                                vector_searches.len()
+                            ),
+                            source: None,
+                        });
                     }
+
+                    Ok::<_, crate::Error>(
+                        results
+                            .into_iter()
+                            .map(|result| match result {
+                                Some(scored_map) => SearchResult::from_scored_map(scored_map)
+                                    .offset(row_range_start),
+                                None => SearchResult::empty(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 }
             })
             .collect();
 
         let results = futures::future::try_join_all(futures).await?;
-        for r in &results {
-            merged = merged.or(r);
+        for per_entry in &results {
+            for (query_index, result) in per_entry.iter().enumerate() {
+                merged[query_index] = merged[query_index].or(result);
+            }
         }
     }
 
@@ -283,16 +406,22 @@ async fn evaluate_vector_search(
                 evaluation.table_options,
                 index_entries,
                 field_id,
-                &vector_search.field_name,
+                field_name,
             )
             .await?;
-            let raw_result =
-                read_raw_vector_search(table, vector_search, &raw_ranges, metric).await?;
-            merged = merged.or(&raw_result);
+            let raw_results =
+                read_raw_batch_vector_search(table, vector_searches, &raw_ranges, metric).await?;
+            for (query_index, result) in raw_results.iter().enumerate() {
+                merged[query_index] = merged[query_index].or(result);
+            }
         }
     }
 
-    merged.top_k(vector_search.limit).to_row_ranges()
+    Ok(merged
+        .into_iter()
+        .zip(vector_searches)
+        .map(|(result, vector_search)| result.top_k(vector_search.limit))
+        .collect())
 }
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
@@ -458,53 +587,99 @@ fn configured_raw_vector_metric(
     Ok(inferred.unwrap_or(RawVectorMetric::L2))
 }
 
-async fn read_raw_vector_search(
+async fn read_raw_batch_vector_search(
     table: &Table,
-    vector_search: &VectorSearch,
+    vector_searches: &[VectorSearch],
     raw_ranges: &[RowRange],
     metric: RawVectorMetric,
-) -> crate::Result<SearchResult> {
+) -> crate::Result<Vec<SearchResult>> {
+    if vector_searches.is_empty() {
+        return Ok(Vec::new());
+    }
     if raw_ranges.is_empty() {
-        return Ok(SearchResult::empty());
+        return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+    }
+
+    let field_name = &vector_searches[0].field_name;
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.field_name != *field_name)
+    {
+        return Err(crate::Error::DataInvalid {
+            message: "Batch vector raw search requires all query vectors to use the same field"
+                .to_string(),
+            source: None,
+        });
     }
 
     let mut read_builder = table.new_read_builder();
     read_builder
-        .with_projection(&[vector_search.field_name.as_str(), ROW_ID_FIELD_NAME])
+        .with_projection(&[field_name.as_str(), ROW_ID_FIELD_NAME])
         .with_row_ranges(raw_ranges.to_vec());
     let plan = read_builder.new_scan().plan().await?;
     if plan.splits().is_empty() {
-        return Ok(SearchResult::empty());
+        return Ok(vec![SearchResult::empty(); vector_searches.len()]);
     }
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
 
-    let mut row_ids = Vec::new();
-    let mut scores = Vec::new();
+    let mut row_ids = vec![Vec::new(); vector_searches.len()];
+    let mut scores = vec![Vec::new(); vector_searches.len()];
     while let Some(batch) = stream.try_next().await? {
-        collect_raw_vector_batch(&batch, vector_search, metric, &mut row_ids, &mut scores)?;
+        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &mut row_ids, &mut scores)?;
     }
 
-    Ok(SearchResult::new(row_ids, scores).top_k(vector_search.limit))
+    Ok(row_ids
+        .into_iter()
+        .zip(scores)
+        .zip(vector_searches)
+        .map(|((row_ids, scores), vector_search)| {
+            SearchResult::new(row_ids, scores).top_k(vector_search.limit)
+        })
+        .collect())
 }
 
-fn collect_raw_vector_batch(
+fn collect_raw_batch_vector_batch(
     batch: &RecordBatch,
-    vector_search: &VectorSearch,
+    vector_searches: &[VectorSearch],
     metric: RawVectorMetric,
-    row_ids_out: &mut Vec<u64>,
-    scores_out: &mut Vec<f32>,
+    row_ids_out: &mut [Vec<u64>],
+    scores_out: &mut [Vec<f32>],
 ) -> crate::Result<()> {
-    let vector_index = batch
-        .schema()
-        .index_of(&vector_search.field_name)
-        .map_err(|e| crate::Error::DataInvalid {
-            message: format!(
-                "Vector column '{}' not found in raw search batch: {}",
-                vector_search.field_name, e
-            ),
+    if vector_searches.is_empty() {
+        return Ok(());
+    }
+    if row_ids_out.len() != vector_searches.len() || scores_out.len() != vector_searches.len() {
+        return Err(crate::Error::DataInvalid {
+            message: "Raw batch vector search output buffers must match query vector count"
+                .to_string(),
             source: None,
-        })?;
+        });
+    }
+
+    let field_name = &vector_searches[0].field_name;
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.field_name != *field_name)
+    {
+        return Err(crate::Error::DataInvalid {
+            message: "Batch vector raw search requires all query vectors to use the same field"
+                .to_string(),
+            source: None,
+        });
+    }
+
+    let vector_index =
+        batch
+            .schema()
+            .index_of(field_name)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!(
+                    "Vector column '{}' not found in raw search batch: {}",
+                    field_name, e
+                ),
+                source: None,
+            })?;
     let row_id_index =
         batch
             .schema()
@@ -558,14 +733,6 @@ fn collect_raw_vector_batch(
             });
         }
         let row_id = row_id_to_u64(row_ids.value(row))?;
-        if vector_search
-            .include_row_ids
-            .as_ref()
-            .is_some_and(|include_row_ids| !include_row_ids.contains(row_id))
-        {
-            continue;
-        }
-
         let is_null = match layout {
             VectorLayout::List(a) => a.is_null(row),
             VectorLayout::Fixed(a) => a.is_null(row),
@@ -584,18 +751,8 @@ fn collect_raw_vector_batch(
                 (row * len, (row + 1) * len)
             }
         };
-        if end - start != vector_search.vector.len() {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Query vector dimension mismatch: raw row has {}, but query has {}",
-                    end - start,
-                    vector_search.vector.len()
-                ),
-                source: None,
-            });
-        }
 
-        let mut stored = Vec::with_capacity(vector_search.vector.len());
+        let mut stored = Vec::with_capacity(end - start);
         for value_index in start..end {
             if values.is_null(value_index) {
                 return Err(crate::Error::DataInvalid {
@@ -605,12 +762,32 @@ fn collect_raw_vector_batch(
             }
             stored.push(values.value(value_index));
         }
-        row_ids_out.push(row_id);
-        scores_out.push(compute_raw_vector_score(
-            &vector_search.vector,
-            &stored,
-            metric,
-        ));
+
+        for (query_index, vector_search) in vector_searches.iter().enumerate() {
+            if vector_search
+                .include_row_ids
+                .as_ref()
+                .is_some_and(|include_row_ids| !include_row_ids.contains(row_id))
+            {
+                continue;
+            }
+            if stored.len() != vector_search.vector.len() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Query vector dimension mismatch: raw row has {}, but query has {}",
+                        stored.len(),
+                        vector_search.vector.len()
+                    ),
+                    source: None,
+                });
+            }
+            row_ids_out[query_index].push(row_id);
+            scores_out[query_index].push(compute_raw_vector_score(
+                &vector_search.vector,
+                &stored,
+                metric,
+            ));
+        }
     }
 
     Ok(())
@@ -659,12 +836,39 @@ fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
     use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
-    use crate::spec::{DataType, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType};
+    use crate::spec::{
+        ArrayType, DataType, FloatType, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry,
+        IntType, Schema, TableSchema,
+    };
     use crate::vindex::IVF_FLAT_IDENTIFIER;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::ArrayRef;
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
 
     fn make_field(id: i32, name: &str) -> DataField {
         DataField::new(id, name.to_string(), DataType::Int(IntType::default()))
+    }
+
+    fn vector_test_table() -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .build()
+            .unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "vector_test"),
+            "memory:/vector_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
     }
 
     fn eval_context<'a>(
@@ -726,6 +930,126 @@ mod tests {
             configured_raw_vector_metric(&options, "embedding").unwrap(),
             RawVectorMetric::L2
         );
+    }
+
+    #[test]
+    fn test_collect_raw_batch_vector_batch_preserves_query_order() {
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
+        for vector in [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]] {
+            builder.values().append_value(vector[0]);
+            builder.values().append_value(vector[1]);
+            builder.append(true);
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(builder.finish()) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let searches = vec![
+            VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap(),
+            VectorSearch::new(vec![0.0, 1.0], 1, "embedding".to_string()).unwrap(),
+        ];
+        let mut row_ids = vec![Vec::new(); searches.len()];
+        let mut scores = vec![Vec::new(); searches.len()];
+
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &mut row_ids,
+            &mut scores,
+        )
+        .unwrap();
+        let results = row_ids
+            .into_iter()
+            .zip(scores)
+            .map(|(row_ids, scores)| SearchResult::new(row_ids, scores).top_k(1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results[0].row_ids, vec![10]);
+        assert_eq!(results[1].row_ids, vec![11]);
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_requires_vectors() {
+        let table = vector_test_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(Vec::new())
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Query vectors must be set via with_query_vectors()"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_rejects_zero_limit() {
+        let table = vector_test_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0]])
+            .with_limit(0)
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Limit must be between 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_evaluate_no_matching_field_returns_empty_per_query() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![make_field(1, "id")];
+        let searches = vec![
+            VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap(),
+            VectorSearch::new(vec![0.0], 10, "embedding".to_string()).unwrap(),
+        ];
+        let options = HashMap::new();
+
+        let entry = make_lumina_entry(
+            "test.idx",
+            LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER,
+            FileKind::Add,
+            99,
+        );
+
+        let results = evaluate_batch_vector_search(
+            eval_context(&file_io, &options, &fields, None),
+            &[entry],
+            &searches,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), searches.len());
+        assert!(results.iter().all(SearchResult::is_empty));
     }
 
     #[tokio::test]

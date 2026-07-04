@@ -122,6 +122,15 @@ impl LuminaVectorGlobalIndexReader {
         self.search(vector_search)
     }
 
+    pub fn visit_batch_vector_search<S: Read + Seek + Send + 'static>(
+        &mut self,
+        vector_searches: &[VectorSearch],
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        self.ensure_loaded(stream_fn)?;
+        self.search_batch(vector_searches)
+    }
+
     fn search(&self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
         let index_meta = self
             .index_meta
@@ -146,6 +155,35 @@ impl LuminaVectorGlobalIndexReader {
                 })?;
 
         search_lumina(searcher, index_meta, search_options_base, vector_search)
+    }
+
+    fn search_batch(
+        &self,
+        vector_searches: &[VectorSearch],
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        let index_meta = self
+            .index_meta
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "index_meta not initialized".to_string(),
+                source: None,
+            })?;
+        let searcher = self
+            .searcher
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "searcher not initialized".to_string(),
+                source: None,
+            })?;
+        let search_options_base =
+            self.search_options
+                .as_ref()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "search_options not initialized".to_string(),
+                    source: None,
+                })?;
+
+        search_lumina_batch(searcher, index_meta, search_options_base, vector_searches)
     }
 
     fn ensure_loaded<S: Read + Seek + Send + 'static>(
@@ -270,6 +308,98 @@ fn search_lumina(
     }
 
     Ok(Some(id_to_scores))
+}
+
+fn search_lumina_batch(
+    searcher: &LuminaSearcher,
+    index_meta: &LuminaIndexMeta,
+    search_options_base: &HashMap<String, String>,
+    vector_searches: &[VectorSearch],
+) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+    if vector_searches.is_empty() {
+        return Ok(Vec::new());
+    }
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.include_row_ids.is_some())
+    {
+        return vector_searches
+            .iter()
+            .map(|vector_search| {
+                search_lumina(searcher, index_meta, search_options_base, vector_search)
+            })
+            .collect();
+    }
+
+    let limit = vector_searches[0].limit;
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.limit != limit)
+    {
+        return vector_searches
+            .iter()
+            .map(|vector_search| {
+                search_lumina(searcher, index_meta, search_options_base, vector_search)
+            })
+            .collect();
+    }
+
+    let expected_dim = index_meta.dim()? as usize;
+    for vector_search in vector_searches {
+        if vector_search.vector.len() != expected_dim {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Query vector dimension mismatch: index expects {}, but got {}",
+                    expected_dim,
+                    vector_search.vector.len()
+                ),
+                source: None,
+            });
+        }
+    }
+
+    let index_metric = index_meta.metric()?;
+    let count = searcher.get_count()? as usize;
+    let effective_k = std::cmp::min(limit, count);
+    if effective_k == 0 {
+        return Ok(vec![None; vector_searches.len()]);
+    }
+
+    let mut query = Vec::with_capacity(vector_searches.len() * expected_dim);
+    for vector_search in vector_searches {
+        query.extend_from_slice(&vector_search.vector);
+    }
+
+    let mut distances = vec![0.0f32; vector_searches.len() * effective_k];
+    let mut labels = vec![0u64; vector_searches.len() * effective_k];
+    let mut search_opts: HashMap<String, String> = search_options_base.clone();
+    ensure_search_list_size(&mut search_opts, effective_k);
+    searcher.search(
+        &query,
+        vector_searches.len() as i32,
+        effective_k as i32,
+        &mut distances,
+        &mut labels,
+        &search_opts,
+    )?;
+
+    let mut results = Vec::with_capacity(vector_searches.len());
+    for query_index in 0..vector_searches.len() {
+        let start = query_index * effective_k;
+        let end = start + effective_k;
+        let id_to_scores = collect_results(
+            &labels[start..end],
+            &distances[start..end],
+            effective_k,
+            index_metric,
+        );
+        if id_to_scores.is_empty() {
+            results.push(None);
+        } else {
+            results.push(Some(id_to_scores));
+        }
+    }
+    Ok(results)
 }
 
 fn write_temp_index_file<S: Read + Seek>(stream: &mut S) -> crate::Result<PathBuf> {

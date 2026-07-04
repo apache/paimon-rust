@@ -55,6 +55,18 @@ impl VindexVectorGlobalIndexReader {
         self.search(vector_search)
     }
 
+    pub fn visit_batch_vector_search<S: Read + Seek + Send + 'static>(
+        &mut self,
+        vector_searches: &[VectorSearch],
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        self.ensure_loaded(stream_fn)?;
+        vector_searches
+            .iter()
+            .map(|vector_search| self.search(vector_search))
+            .collect()
+    }
+
     fn search(&mut self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
         let reader = self
             .reader
