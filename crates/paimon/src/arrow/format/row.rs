@@ -2316,6 +2316,7 @@ mod tests {
         IntType, MapType, MultisetType, RowType, TimeType, TimestampType, VarBinaryType,
         VarCharType, VariantType,
     };
+    use crate::variant::GenericVariant;
     use futures::TryStreamExt;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2487,16 +2488,18 @@ mod tests {
             ArrowDataType::Struct(fields) => fields,
             other => panic!("expected variant Struct, got {other:?}"),
         };
+        let first_variant = GenericVariant::parse_json("2").unwrap();
+        let second_variant = GenericVariant::parse_json(r#"{"a":3}"#).unwrap();
         let variant_array = StructArray::try_new(
             variant_fields,
             vec![
                 Arc::new(BinaryArray::from(vec![
-                    Some(b"\x01\x02".as_slice()),
-                    Some(b"\x03\x04\x05".as_slice()),
+                    Some(first_variant.value()),
+                    Some(second_variant.value()),
                 ])) as ArrayRef,
                 Arc::new(BinaryArray::from(vec![
-                    Some(b"\x01".as_slice()),
-                    Some(b"\x21\x22".as_slice()),
+                    Some(first_variant.metadata()),
+                    Some(second_variant.metadata()),
                 ])) as ArrayRef,
             ],
             None,
@@ -2548,10 +2551,10 @@ mod tests {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .unwrap();
-        assert_eq!(value.value(0), b"\x01\x02");
-        assert_eq!(metadata.value(0), b"\x01");
-        assert_eq!(value.value(1), b"\x03\x04\x05");
-        assert_eq!(metadata.value(1), b"\x21\x22");
+        assert_eq!(value.value(0), first_variant.value());
+        assert_eq!(metadata.value(0), first_variant.metadata());
+        assert_eq!(value.value(1), second_variant.value());
+        assert_eq!(metadata.value(1), second_variant.metadata());
     }
 
     #[test]
@@ -2560,11 +2563,12 @@ mod tests {
             ArrowDataType::Struct(fields) => fields,
             other => panic!("expected variant Struct, got {other:?}"),
         };
+        let variant = GenericVariant::parse_json("2").unwrap();
         let variant_array = StructArray::try_new(
             fields,
             vec![
-                Arc::new(BinaryArray::from(vec![Some(b"\x01\x02".as_slice())])) as ArrayRef,
-                Arc::new(BinaryArray::from(vec![Some(b"\x01".as_slice())])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![Some(variant.value())])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![Some(variant.metadata())])) as ArrayRef,
             ],
             None,
         )
@@ -2580,8 +2584,8 @@ mod tests {
         .unwrap();
 
         let mut expected = Vec::new();
-        write_bytes(&mut expected, b"\x01\x02");
-        write_bytes(&mut expected, b"\x01");
+        write_bytes(&mut expected, variant.value());
+        write_bytes(&mut expected, variant.metadata());
         assert_eq!(encoded, expected);
     }
 

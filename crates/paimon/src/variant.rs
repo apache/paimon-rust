@@ -59,6 +59,7 @@ const U16_MAX: usize = 0xffff;
 const U24_MAX: usize = 0xff_ffff;
 const U32_SIZE: usize = 4;
 const SIZE_LIMIT: usize = 128 * 1024 * 1024;
+const MAX_NESTING_DEPTH: usize = 1000;
 
 const MAX_DECIMAL4_PRECISION: u8 = 9;
 const MAX_DECIMAL8_PRECISION: u8 = 18;
@@ -120,6 +121,10 @@ pub struct VariantRef<'a> {
 impl<'a> VariantRef<'a> {
     pub fn new(value: &'a [u8], metadata: &'a [u8], pos: usize) -> Result<Self> {
         validate_payload(value, metadata)?;
+        Self::new_at(value, metadata, pos)
+    }
+
+    fn new_at(value: &'a [u8], metadata: &'a [u8], pos: usize) -> Result<Self> {
         check_index(value, pos)?;
         Ok(Self {
             value,
@@ -220,8 +225,12 @@ impl<'a> VariantRef<'a> {
                         layout.offset_start + layout.offset_size * i,
                         layout.offset_size,
                     )?;
-                    return VariantRef::new(self.value, self.metadata, layout.data_start + offset)
-                        .map(Some);
+                    return VariantRef::new_at(
+                        self.value,
+                        self.metadata,
+                        layout.data_start + offset,
+                    )
+                    .map(Some);
                 }
             }
         } else {
@@ -243,7 +252,7 @@ impl<'a> VariantRef<'a> {
                             layout.offset_start + layout.offset_size * mid,
                             layout.offset_size,
                         )?;
-                        return VariantRef::new(
+                        return VariantRef::new_at(
                             self.value,
                             self.metadata,
                             layout.data_start + offset,
@@ -266,7 +275,7 @@ impl<'a> VariantRef<'a> {
             layout.offset_start + layout.offset_size * index,
             layout.offset_size,
         )?;
-        VariantRef::new(self.value, self.metadata, layout.data_start + offset).map(Some)
+        VariantRef::new_at(self.value, self.metadata, layout.data_start + offset).map(Some)
     }
 }
 
@@ -308,7 +317,294 @@ pub fn validate_payload(value: &[u8], metadata: &[u8]) -> Result<()> {
     if value.len() > SIZE_LIMIT || metadata.len() > SIZE_LIMIT {
         return data_invalid("Variant value or metadata exceeds constructor size limit");
     }
+    validate_metadata(metadata)?;
+    let root_size = validate_value(value, metadata, 0, 0)?;
+    if root_size != value.len() {
+        return data_invalid("Malformed Variant root size");
+    }
     Ok(())
+}
+
+fn validate_metadata(metadata: &[u8]) -> Result<()> {
+    let offset_size = metadata_offset_size(metadata)?;
+    let dict_size = read_unsigned(metadata, 1, offset_size)?;
+    let offset_start = 1 + offset_size;
+    let string_start = offset_start + (dict_size + 1) * offset_size;
+    check_range(metadata, offset_start, (dict_size + 1) * offset_size)?;
+    let string_size = read_unsigned(
+        metadata,
+        offset_start + dict_size * offset_size,
+        offset_size,
+    )?;
+    if string_start.checked_add(string_size) != Some(metadata.len()) {
+        return data_invalid("Malformed Variant metadata size");
+    }
+
+    let mut previous_offset = 0usize;
+    let mut seen = HashSet::with_capacity(dict_size);
+    for id in 0..dict_size {
+        let offset = read_unsigned(metadata, offset_start + id * offset_size, offset_size)?;
+        let next_offset =
+            read_unsigned(metadata, offset_start + (id + 1) * offset_size, offset_size)?;
+        if offset != previous_offset || offset > next_offset || next_offset > string_size {
+            return data_invalid("Malformed Variant metadata offsets");
+        }
+        previous_offset = next_offset;
+        let bytes = &metadata[string_start + offset..string_start + next_offset];
+        let key = std::str::from_utf8(bytes).map_err(|e| Error::DataInvalid {
+            message: "Malformed Variant metadata UTF-8".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+        if !seen.insert(key) {
+            return data_invalid("Malformed Variant metadata duplicate key");
+        }
+    }
+    Ok(())
+}
+
+fn validate_value(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+    if depth > MAX_NESTING_DEPTH {
+        return data_invalid("Malformed Variant nesting depth");
+    }
+
+    match value_kind(value, pos)? {
+        VariantKind::Object => validate_object(value, metadata, pos, depth),
+        VariantKind::Array => validate_array(value, metadata, pos, depth),
+        VariantKind::Null => validate_sized_value(value, pos, value_size(value, pos)?),
+        VariantKind::Boolean => {
+            get_boolean(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Long
+        | VariantKind::Date
+        | VariantKind::Timestamp
+        | VariantKind::TimestampNtz => {
+            get_long(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::String => {
+            get_string(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Double => {
+            get_double(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Decimal => {
+            get_decimal(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Float => {
+            get_float(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Binary => {
+            get_binary(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+        VariantKind::Uuid => {
+            get_uuid(value, pos)?;
+            validate_sized_value(value, pos, value_size(value, pos)?)
+        }
+    }
+}
+
+fn validate_sized_value(value: &[u8], pos: usize, size: usize) -> Result<usize> {
+    check_range(value, pos, size)?;
+    Ok(size)
+}
+
+fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+    let layout = object_layout(value, pos)?;
+    let data_size = read_unsigned(
+        value,
+        layout.offset_start + layout.size * layout.offset_size,
+        layout.offset_size,
+    )?;
+    let data_end = layout
+        .data_start
+        .checked_add(data_size)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Malformed Variant object offsets".to_string(),
+            source: None,
+        })?;
+    if data_end > value.len() {
+        return data_invalid("Malformed Variant object offsets");
+    }
+
+    let mut ranges = Vec::with_capacity(layout.size);
+    let mut previous_key: Option<String> = None;
+    for i in 0..layout.size {
+        let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
+        let key = get_metadata_key(metadata, id)?;
+        if previous_key
+            .as_deref()
+            .is_some_and(|previous| java_string_cmp(previous, &key) != std::cmp::Ordering::Less)
+        {
+            return data_invalid("Malformed Variant object key order");
+        }
+        previous_key = Some(key);
+
+        let offset = read_unsigned(
+            value,
+            layout.offset_start + layout.offset_size * i,
+            layout.offset_size,
+        )?;
+        ranges.push(validate_child_range(
+            value,
+            metadata,
+            layout.data_start,
+            data_size,
+            offset,
+            depth + 1,
+        )?);
+    }
+
+    let final_offset = read_unsigned(
+        value,
+        layout.offset_start + layout.offset_size * layout.size,
+        layout.offset_size,
+    )?;
+    if final_offset != data_size {
+        return data_invalid("Malformed Variant object offsets");
+    }
+    validate_ranges_cover_data(&mut ranges, data_size)?;
+    Ok(layout.data_start - pos + data_size)
+}
+
+fn validate_array(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+    let layout = array_layout(value, pos)?;
+    let data_size = read_unsigned(
+        value,
+        layout.offset_start + layout.size * layout.offset_size,
+        layout.offset_size,
+    )?;
+    let data_end = layout
+        .data_start
+        .checked_add(data_size)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Malformed Variant array offsets".to_string(),
+            source: None,
+        })?;
+    if data_end > value.len() {
+        return data_invalid("Malformed Variant array offsets");
+    }
+
+    let mut previous_offset = 0usize;
+    for i in 0..layout.size {
+        let offset = read_unsigned(
+            value,
+            layout.offset_start + layout.offset_size * i,
+            layout.offset_size,
+        )?;
+        let next_offset = read_unsigned(
+            value,
+            layout.offset_start + layout.offset_size * (i + 1),
+            layout.offset_size,
+        )?;
+        validate_child_value(
+            value,
+            metadata,
+            layout.data_start,
+            data_size,
+            offset,
+            next_offset,
+            depth + 1,
+        )?;
+        previous_offset = validate_offset_order(previous_offset, offset, next_offset, data_size)?;
+    }
+
+    let final_offset = read_unsigned(
+        value,
+        layout.offset_start + layout.offset_size * layout.size,
+        layout.offset_size,
+    )?;
+    if final_offset != data_size || final_offset < previous_offset {
+        return data_invalid("Malformed Variant array offsets");
+    }
+    Ok(layout.data_start - pos + data_size)
+}
+
+fn validate_child_value(
+    value: &[u8],
+    metadata: &[u8],
+    data_start: usize,
+    data_size: usize,
+    offset: usize,
+    next_offset: usize,
+    depth: usize,
+) -> Result<()> {
+    if offset > next_offset || next_offset > data_size {
+        return data_invalid("Malformed Variant offsets");
+    }
+    let child_pos = data_start
+        .checked_add(offset)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Malformed Variant offsets".to_string(),
+            source: None,
+        })?;
+    let child_size = validate_value(value, metadata, child_pos, depth)?;
+    if child_size != next_offset - offset {
+        return data_invalid("Malformed Variant child size");
+    }
+    Ok(())
+}
+
+fn validate_child_range(
+    value: &[u8],
+    metadata: &[u8],
+    data_start: usize,
+    data_size: usize,
+    offset: usize,
+    depth: usize,
+) -> Result<(usize, usize)> {
+    if offset > data_size {
+        return data_invalid("Malformed Variant offsets");
+    }
+    let child_pos = data_start
+        .checked_add(offset)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Malformed Variant offsets".to_string(),
+            source: None,
+        })?;
+    let child_size = validate_value(value, metadata, child_pos, depth)?;
+    let end = offset
+        .checked_add(child_size)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Malformed Variant offsets".to_string(),
+            source: None,
+        })?;
+    if end > data_size {
+        return data_invalid("Malformed Variant offsets");
+    }
+    Ok((offset, end))
+}
+
+fn validate_ranges_cover_data(ranges: &mut [(usize, usize)], data_size: usize) -> Result<()> {
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut expected_start = 0usize;
+    for (start, end) in ranges {
+        if *start != expected_start || *end < *start {
+            return data_invalid("Malformed Variant offsets");
+        }
+        expected_start = *end;
+    }
+    if expected_start != data_size {
+        return data_invalid("Malformed Variant offsets");
+    }
+    Ok(())
+}
+
+fn validate_offset_order(
+    previous_offset: usize,
+    offset: usize,
+    next_offset: usize,
+    data_size: usize,
+) -> Result<usize> {
+    if offset != previous_offset || offset > next_offset || next_offset > data_size {
+        return data_invalid("Malformed Variant offsets");
+    }
+    Ok(next_offset)
 }
 
 fn data_invalid<T>(message: impl Into<String>) -> Result<T> {
@@ -539,9 +835,16 @@ fn array_layout(value: &[u8], pos: usize) -> Result<ArrayLayout> {
     })
 }
 
-fn get_metadata_key(metadata: &[u8], id: usize) -> Result<String> {
+fn metadata_offset_size(metadata: &[u8]) -> Result<usize> {
     check_index(metadata, 0)?;
-    let offset_size = ((metadata[0] >> 6) & 0x3) as usize + 1;
+    if (metadata[0] & VERSION_MASK) != VERSION {
+        return data_invalid("Malformed Variant metadata version");
+    }
+    Ok(((metadata[0] >> 6) & 0x3) as usize + 1)
+}
+
+fn get_metadata_key(metadata: &[u8], id: usize) -> Result<String> {
+    let offset_size = metadata_offset_size(metadata)?;
     let dict_size = read_unsigned(metadata, 1, offset_size)?;
     if id >= dict_size {
         return data_invalid("Malformed Variant metadata dictionary id");
@@ -1395,6 +1698,10 @@ fn java_string_cmp(left: &str, right: &str) -> std::cmp::Ordering {
 mod tests {
     use super::*;
 
+    fn empty_metadata() -> Vec<u8> {
+        vec![VERSION, 0, 0]
+    }
+
     #[test]
     fn parse_json_matches_java_basic_object_layout() {
         let variant = GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap();
@@ -1447,6 +1754,41 @@ mod tests {
     fn parse_json_rejects_duplicate_object_keys() {
         let err = GenericVariant::parse_json(r#"{"a":1,"a":2}"#).unwrap_err();
         assert!(err.to_string().contains("VARIANT_DUPLICATE_KEY"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_malformed_root_value() {
+        let metadata = empty_metadata();
+        assert!(validate_payload(&[], &metadata).is_err());
+
+        let truncated_short_string = [short_str_header(3), b'a'];
+        assert!(validate_payload(&truncated_short_string, &metadata).is_err());
+    }
+
+    #[test]
+    fn validate_payload_rejects_bad_object_metadata_ids() {
+        let variant = GenericVariant::parse_json(r#"{"a":1}"#).unwrap();
+        let mut value = variant.value().to_vec();
+        let layout = object_layout(&value, 0).unwrap();
+        write_le_at(&mut value, layout.id_start, 1, layout.id_size);
+
+        assert!(validate_payload(&value, variant.metadata()).is_err());
+    }
+
+    #[test]
+    fn validate_payload_rejects_bad_object_offsets() {
+        let variant = GenericVariant::parse_json(r#"{"a":1}"#).unwrap();
+        let mut value = variant.value().to_vec();
+        let layout = object_layout(&value, 0).unwrap();
+        let data_size = value.len() - layout.data_start;
+        write_le_at(
+            &mut value,
+            layout.offset_start + layout.size * layout.offset_size,
+            data_size + 1,
+            layout.offset_size,
+        );
+
+        assert!(validate_payload(&value, variant.metadata()).is_err());
     }
 
     #[test]

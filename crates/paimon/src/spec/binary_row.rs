@@ -1324,6 +1324,7 @@ pub fn batch_hash_codes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::variant::GenericVariant;
 
     #[test]
     fn test_empty_binary_row() {
@@ -1485,9 +1486,10 @@ mod tests {
     #[test]
     fn test_variant_datum_roundtrip() {
         let data_type = DataType::Variant(crate::spec::VariantType::new());
+        let variant = GenericVariant::parse_json(r#"{"a":1}"#).unwrap();
         let datum = Datum::Variant {
-            value: vec![1, 2, 3],
-            metadata: vec![1, 5],
+            value: variant.value().to_vec(),
+            metadata: variant.metadata().to_vec(),
         };
         let row = BinaryRow::from_datums(&[(Some(&datum), &data_type)]);
 

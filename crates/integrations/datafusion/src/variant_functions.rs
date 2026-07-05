@@ -201,7 +201,16 @@ impl ScalarUDFImpl for VariantGetFunc {
         if args.arg_fields.len() != 2 && args.arg_fields.len() != 3 {
             return plan_err(format!("{} expects 2 or 3 arguments", self.name()));
         }
-        let output = variant_get_output_type(args.scalar_arguments.get(2).and_then(|v| *v))?;
+        let output = match args.arg_fields.len() {
+            2 => variant_get_output_type(None)?,
+            3 => {
+                let Some(type_arg) = args.scalar_arguments.get(2).and_then(|v| *v) else {
+                    return plan_err("variant_get type argument must be a string literal");
+                };
+                variant_get_output_type(Some(type_arg))?
+            }
+            _ => unreachable!("argument count checked above"),
+        };
         Ok(Arc::new(Field::new(
             self.name(),
             output.arrow_type().clone(),
@@ -847,5 +856,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Invalid Variant cast"));
+    }
+
+    #[tokio::test]
+    async fn variant_get_rejects_non_literal_type_argument() {
+        let ctx = SessionContext::new();
+        register_variant_functions(&ctx);
+        let sql = r#"
+            SELECT variant_get(parse_json('{"age":26}'), '$.age', type_name)
+            FROM (VALUES ('int')) AS t(type_name)
+        "#;
+        let err = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await.unwrap_err(),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("variant_get type argument must be a string literal"));
     }
 }
