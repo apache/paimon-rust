@@ -20,7 +20,7 @@
 //! Reference: [org.apache.paimon.globalindex.btree.KeySerializer](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/globalindex/btree/KeySerializer.java)
 
 use crate::btree::var_len::{decode_var_int_from_slice, encode_var_int};
-use crate::spec::{DataType, Datum};
+use crate::spec::{DataType, Datum, VariantType};
 use std::cmp::Ordering;
 
 /// Timestamp precision <= 3 is compact (millis only).
@@ -149,5 +149,14 @@ pub fn serialize_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             }
         }
         Datum::Bytes(v) => v.clone(),
+        Datum::Variant { value, metadata } => {
+            VariantType::validate_payload(value, metadata)
+                .expect("invalid Variant payload for BTree key");
+            let mut bytes = Vec::with_capacity(4 + value.len() + metadata.len());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+            bytes.extend_from_slice(metadata);
+            bytes
+        }
     }
 }

@@ -76,6 +76,10 @@ pub enum Datum {
         scale: u32,
     },
     Bytes(Vec<u8>),
+    Variant {
+        value: Vec<u8>,
+        metadata: Vec<u8>,
+    },
 }
 
 impl fmt::Display for Datum {
@@ -97,6 +101,14 @@ impl fmt::Display for Datum {
                 unscaled, scale, ..
             } => write!(f, "DEC({unscaled},s{scale})"),
             Self::Bytes(v) => write!(f, "BYTES(len={})", v.len()),
+            Self::Variant { value, metadata } => {
+                write!(
+                    f,
+                    "VARIANT(value_len={},metadata_len={})",
+                    value.len(),
+                    metadata.len()
+                )
+            }
         }
     }
 }
@@ -162,6 +174,22 @@ pub(crate) fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
             },
         ) => decimal_cmp(*ua, *sa, *ub, *sb),
         (Datum::Bytes(a), Datum::Bytes(b)) => Some(java_bytes_cmp(a, b)),
+        (
+            Datum::Variant {
+                value: va,
+                metadata: ma,
+            },
+            Datum::Variant {
+                value: vb,
+                metadata: mb,
+            },
+        ) => {
+            if va == vb && ma == mb {
+                Some(Ordering::Equal)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -864,6 +892,7 @@ fn validate_datum_matches_type(datum: &Datum, data_type: &DataType) -> Result<()
             | (Datum::Decimal { .. }, DataType::Decimal(_))
             | (Datum::Bytes(_), DataType::Binary(_))
             | (Datum::Bytes(_), DataType::VarBinary(_))
+            | (Datum::Variant { .. }, DataType::Variant(_))
     );
     if !ok {
         return Err(Error::ConfigInvalid {

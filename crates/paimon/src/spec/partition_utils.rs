@@ -265,6 +265,7 @@ fn format_partition_value(
         | DataType::Double(_)
         | DataType::Binary(_)
         | DataType::VarBinary(_)
+        | DataType::Variant(_)
         | DataType::Blob(_)
         | DataType::Array(_)
         | DataType::Map(_)

@@ -22,11 +22,15 @@ pub(crate) mod schema_evolution;
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
     DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,
-    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
+    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
+    VectorType,
 };
 use arrow_schema::DataType as ArrowDataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 /// Converts a Paimon [`DataType`](PaimonDataType) to an Arrow [`DataType`](ArrowDataType).
 pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
@@ -42,6 +46,7 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
         PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) | PaimonDataType::Blob(_) => {
             ArrowDataType::Binary
         }
+        PaimonDataType::Variant(_) => variant_arrow_type(),
         PaimonDataType::Date(_) => ArrowDataType::Date32,
         PaimonDataType::Time(_) => ArrowDataType::Time32(TimeUnit::Millisecond),
         PaimonDataType::Timestamp(t) => {
@@ -228,6 +233,11 @@ pub fn arrow_to_paimon_type(
             })
         }
         ArrowDataType::Struct(fields) => {
+            if is_variant_arrow_fields(fields) && has_variant_arrow_field_ids(fields) {
+                return Ok(PaimonDataType::Variant(VariantType::with_nullable(
+                    nullable,
+                )));
+            }
             let field_slice: Vec<ArrowField> = fields.iter().map(|f| f.as_ref().clone()).collect();
             let paimon_fields = arrow_fields_to_paimon(&field_slice)?;
             Ok(PaimonDataType::Row(RowType::with_nullable(
@@ -252,6 +262,51 @@ pub fn arrow_to_paimon_type(
     }
 }
 
+pub fn variant_arrow_type() -> ArrowDataType {
+    ArrowDataType::Struct(
+        vec![
+            arrow_field_with_paimon_id("value", ArrowDataType::Binary, false, 0),
+            arrow_field_with_paimon_id("metadata", ArrowDataType::Binary, false, 1),
+        ]
+        .into(),
+    )
+}
+
+pub(crate) fn is_variant_arrow_fields(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2
+        && fields[0].name() == "value"
+        && fields[0].data_type() == &ArrowDataType::Binary
+        && !fields[0].is_nullable()
+        && fields[1].name() == "metadata"
+        && fields[1].data_type() == &ArrowDataType::Binary
+        && !fields[1].is_nullable()
+}
+
+fn has_variant_arrow_field_ids(fields: &arrow_schema::Fields) -> bool {
+    fields.len() == 2
+        && arrow_field_id(&fields[0]) == Some(0)
+        && arrow_field_id(&fields[1]) == Some(1)
+}
+
+fn arrow_field_id(field: &ArrowField) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)?
+        .parse()
+        .ok()
+}
+
+fn arrow_field_with_paimon_id(
+    name: impl Into<String>,
+    data_type: ArrowDataType,
+    nullable: bool,
+    id: i32,
+) -> ArrowField {
+    let mut metadata = HashMap::new();
+    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+    ArrowField::new(name, data_type, nullable).with_metadata(metadata)
+}
+
 /// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
 pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> crate::Result<Vec<DataField>> {
     fields
@@ -270,10 +325,11 @@ pub fn build_target_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<Arro
         .iter()
         .map(|f| {
             let arrow_type = paimon_type_to_arrow(f.data_type())?;
-            Ok(ArrowField::new(
+            Ok(arrow_field_with_paimon_id(
                 f.name(),
                 arrow_type,
                 f.data_type().is_nullable(),
+                f.id(),
             ))
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -377,6 +433,54 @@ mod tests {
 
         assert_paimon_to_arrow(&blob, &ArrowDataType::Binary);
         assert_arrow_to_paimon(&ArrowDataType::Binary, true, &varbinary);
+    }
+
+    #[test]
+    fn test_variant_roundtrip() {
+        let variant = PaimonDataType::Variant(VariantType::new());
+        let arrow = variant_arrow_type();
+        assert_paimon_to_arrow(&variant, &arrow);
+        assert_arrow_to_paimon(&arrow, true, &variant);
+    }
+
+    #[test]
+    fn test_plain_value_metadata_struct_stays_row() {
+        let arrow = ArrowDataType::Struct(
+            vec![
+                ArrowField::new("value", ArrowDataType::Binary, false),
+                ArrowField::new("metadata", ArrowDataType::Binary, false),
+            ]
+            .into(),
+        );
+        let paimon = arrow_to_paimon_type(&arrow, true).unwrap();
+
+        assert!(matches!(paimon, PaimonDataType::Row(_)));
+    }
+
+    #[test]
+    fn test_variant_arrow_field_ids_for_parquet() {
+        let schema = build_target_arrow_schema(&[DataField::new(
+            7,
+            "payload".to_string(),
+            PaimonDataType::Variant(VariantType::new()),
+        )])
+        .unwrap();
+        let field = schema.field(0);
+        assert_eq!(
+            field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"7".to_string())
+        );
+        let ArrowDataType::Struct(fields) = field.data_type() else {
+            panic!("expected variant Struct");
+        };
+        assert_eq!(
+            fields[0].metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"0".to_string())
+        );
+        assert_eq!(
+            fields[1].metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".to_string())
+        );
     }
 
     #[test]

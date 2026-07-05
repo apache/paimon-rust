@@ -62,7 +62,7 @@ use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
     DataType as PaimonDataType, DateType, Datum, DecimalType, DoubleType, FloatType, IntType,
     LocalZonedTimestampType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
-    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
+    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
 };
 
 use crate::error::to_datafusion_error;
@@ -106,6 +106,7 @@ impl SQLContext {
             ))
             .build();
         let ctx = SessionContext::new_with_state(state);
+        crate::variant_functions::register_variant_functions(&ctx);
         Self {
             ctx,
             catalogs: HashMap::new(),
@@ -1683,6 +1684,13 @@ fn sql_data_type_to_paimon_type(
             ))
         }
         SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
+        SqlType::Custom(name, modifiers)
+            if name.to_string().eq_ignore_ascii_case("VARIANT") && modifiers.is_empty() =>
+        {
+            Ok(PaimonDataType::Variant(VariantType::with_nullable(
+                nullable,
+            )))
+        }
         SqlType::Date => Ok(PaimonDataType::Date(DateType::with_nullable(nullable))),
         SqlType::Timestamp(precision, tz_info) => {
             let precision = match precision {
@@ -2122,7 +2130,8 @@ fn datum_to_constant_array(
             | Datum::Timestamp { .. }
             | Datum::LocalZonedTimestamp { .. }
             | Datum::Decimal { .. }
-            | Datum::Bytes(_) => Err(DataFusionError::Plan(format!(
+            | Datum::Bytes(_)
+            | Datum::Variant { .. } => Err(DataFusionError::Plan(format!(
                 "Unsupported datum type for partition column: {d}"
             ))),
         },
@@ -2832,6 +2841,15 @@ mod tests {
             PaimonDataType::VarBinary(
                 VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_sql_type_variant() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, Ident, ObjectName};
+        assert_sql_type_to_paimon(
+            SqlType::Custom(ObjectName::from(Ident::new("VARIANT")), vec![]),
+            PaimonDataType::Variant(VariantType::new()),
         );
     }
 

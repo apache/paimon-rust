@@ -162,6 +162,7 @@ fn explicit_cast_supported(source: &DataType, target: &DataType) -> bool {
             is_datetime(source) || is_character_string(source) || is_numeric(source)
         }
         DataType::Blob(_)
+        | DataType::Variant(_)
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)

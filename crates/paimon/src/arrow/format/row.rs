@@ -21,9 +21,12 @@
 //! `org.apache.paimon.format.row.RowFormatWriter` in paimon-java.
 
 use super::{FilePredicates, FormatFileReader, FormatFileWriter};
-use crate::arrow::{arrow_to_paimon_type, build_target_arrow_schema, paimon_type_to_arrow};
+use crate::arrow::{
+    arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
+    variant_arrow_type,
+};
 use crate::io::{FileRead, FileWrite, OutputFile};
-use crate::spec::{DataField, DataType, IntType};
+use crate::spec::{DataField, DataType, IntType, VarBinaryType, VariantType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::{
@@ -403,6 +406,7 @@ fn validate_arrow_type_for_row_field(
         )
         | (ArrowDataType::Date32, DataType::Date(_))
         | (ArrowDataType::Time32(TimeUnit::Millisecond), DataType::Time(_)) => true,
+        (ArrowDataType::Struct(fields), DataType::Variant(_)) => is_variant_arrow_fields(fields),
         (ArrowDataType::Timestamp(unit, tz), DataType::Timestamp(t)) => {
             *unit == timestamp_time_unit_for_precision(t.precision()) && tz.is_none()
         }
@@ -520,6 +524,7 @@ fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
         | DataType::VarChar(_)
         | DataType::Binary(_)
         | DataType::VarBinary(_)
+        | DataType::Variant(_)
         | DataType::Blob(_)
         | DataType::Date(_)
         | DataType::Time(_)
@@ -659,6 +664,10 @@ fn write_field_value(
             out,
             downcast::<BinaryArray>(array, data_type)?.value(row_idx),
         ),
+        DataType::Variant(_) => {
+            let row = downcast::<StructArray>(array, data_type)?;
+            write_variant_struct(out, row, row_idx)?;
+        }
         DataType::Date(_) => out.extend_from_slice(
             &downcast::<Date32Array>(array, data_type)?
                 .value(row_idx)
@@ -709,6 +718,50 @@ fn write_field_value(
             });
         }
     }
+    Ok(())
+}
+
+fn write_variant_struct(out: &mut Vec<u8>, row: &StructArray, row_idx: usize) -> crate::Result<()> {
+    if row.num_columns() != 2 {
+        return Err(Error::DataInvalid {
+            message: format!(".row variant expected 2 columns, got {}", row.num_columns()),
+            source: None,
+        });
+    }
+    let value = row.column(0);
+    let metadata = row.column(1);
+    if value.is_null(row_idx) || metadata.is_null(row_idx) {
+        return Err(Error::DataInvalid {
+            message: ".row variant value/metadata children must be non-null".to_string(),
+            source: None,
+        });
+    }
+    let value = value
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                ".row variant value must be BinaryArray, got {:?}",
+                value.data_type()
+            ),
+            source: None,
+        })?;
+    let metadata = metadata
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                ".row variant metadata must be BinaryArray, got {:?}",
+                metadata.data_type()
+            ),
+            source: None,
+        })?;
+
+    let value = value.value(row_idx);
+    let metadata = metadata.value(row_idx);
+    VariantType::validate_payload(value, metadata)?;
+    write_bytes(out, value);
+    write_bytes(out, metadata);
     Ok(())
 }
 
@@ -1146,6 +1199,15 @@ impl ColumnBuilder {
             DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
                 Self::Binary(BinaryBuilder::new())
             }
+            DataType::Variant(_) => Self::Row {
+                fields: variant_arrow_fields(),
+                columns: vec![
+                    ColumnBuilder::new(&variant_binary_type(), capacity)?,
+                    ColumnBuilder::new(&variant_binary_type(), capacity)?,
+                ],
+                validities: Vec::with_capacity(capacity),
+                len: 0,
+            },
             DataType::Date(_) => Self::Date(Date32Builder::with_capacity(capacity)),
             DataType::Time(_) => Self::Time(Time32MillisecondBuilder::with_capacity(capacity)),
             DataType::Timestamp(t) => timestamp_builder(t.precision(), false, capacity),
@@ -1379,6 +1441,19 @@ impl ColumnBuilder {
                     len,
                     ..
                 },
+                DataType::Variant(_),
+            ) => {
+                read_variant_into(input, columns)?;
+                *len += 1;
+                validities.push(true);
+            }
+            (
+                Self::Row {
+                    columns,
+                    validities,
+                    len,
+                    ..
+                },
                 DataType::Row(r),
             ) => {
                 read_struct_into(input, r.fields(), columns)?;
@@ -1565,6 +1640,44 @@ fn read_struct_into(
     Ok(())
 }
 
+fn read_variant_into(
+    input: &mut BlockInput<'_>,
+    builders: &mut [ColumnBuilder],
+) -> crate::Result<()> {
+    if builders.len() != 2 {
+        return Err(Error::DataInvalid {
+            message: format!(
+                ".row variant reader expected 2 builders, got {}",
+                builders.len()
+            ),
+            source: None,
+        });
+    }
+    let value = input.read_bytes()?;
+    let metadata = input.read_bytes()?;
+    VariantType::validate_payload(&value, &metadata)?;
+    append_binary_value(&mut builders[0], value, "Variant.value")?;
+    append_binary_value(&mut builders[1], metadata, "Variant.metadata")?;
+    Ok(())
+}
+
+fn append_binary_value(
+    builder: &mut ColumnBuilder,
+    value: Vec<u8>,
+    label: &str,
+) -> crate::Result<()> {
+    match builder {
+        ColumnBuilder::Binary(b) => {
+            b.append_value(value);
+            Ok(())
+        }
+        _ => Err(Error::DataInvalid {
+            message: format!(".row {label} builder must be Binary"),
+            source: None,
+        }),
+    }
+}
+
 fn arrow_fields_for_row(fields: &[DataField]) -> crate::Result<Fields> {
     let fields = fields
         .iter()
@@ -1577,6 +1690,20 @@ fn arrow_fields_for_row(fields: &[DataField]) -> crate::Result<Fields> {
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(fields.into())
+}
+
+fn variant_arrow_fields() -> Fields {
+    match variant_arrow_type() {
+        ArrowDataType::Struct(fields) => fields,
+        _ => unreachable!("variant_arrow_type always returns a Struct"),
+    }
+}
+
+fn variant_binary_type() -> DataType {
+    DataType::VarBinary(
+        VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH)
+            .expect("variant binary child length is valid"),
+    )
 }
 
 fn map_entries_field(
@@ -2187,7 +2314,7 @@ mod tests {
     use crate::spec::{
         ArrayType, BigIntType, BooleanType, DataType, DateType, DecimalType, DoubleType, FloatType,
         IntType, MapType, MultisetType, RowType, TimeType, TimestampType, VarBinaryType,
-        VarCharType,
+        VarCharType, VariantType,
     };
     use futures::TryStreamExt;
     use std::ops::Range;
@@ -2340,6 +2467,122 @@ mod tests {
             .unwrap();
         assert!(names.is_null(0));
         assert_eq!(names.value(1), "ccc");
+    }
+
+    #[tokio::test]
+    async fn row_writer_reader_roundtrip_variant() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-variant/data.row";
+        let output = file_io.new_output(path).unwrap();
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "payload".to_string(),
+                DataType::Variant(VariantType::new()),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let variant_fields = match variant_arrow_type() {
+            ArrowDataType::Struct(fields) => fields,
+            other => panic!("expected variant Struct, got {other:?}"),
+        };
+        let variant_array = StructArray::try_new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"\x01\x02".as_slice()),
+                    Some(b"\x03\x04\x05".as_slice()),
+                ])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"\x01".as_slice()),
+                    Some(b"\x21\x22".as_slice()),
+                ])) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(variant_array),
+            ],
+        )
+        .unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema, fields.clone(), 1)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let batches = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let payload = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let value = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = payload
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(value.value(0), b"\x01\x02");
+        assert_eq!(metadata.value(0), b"\x01");
+        assert_eq!(value.value(1), b"\x03\x04\x05");
+        assert_eq!(metadata.value(1), b"\x21\x22");
+    }
+
+    #[test]
+    fn row_variant_field_encoding_matches_java() {
+        let fields = match variant_arrow_type() {
+            ArrowDataType::Struct(fields) => fields,
+            other => panic!("expected variant Struct, got {other:?}"),
+        };
+        let variant_array = StructArray::try_new(
+            fields,
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(b"\x01\x02".as_slice())])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![Some(b"\x01".as_slice())])) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let array = Arc::new(variant_array) as ArrayRef;
+        let mut encoded = Vec::new();
+        write_field_value(
+            &mut encoded,
+            &array,
+            0,
+            &DataType::Variant(VariantType::new()),
+        )
+        .unwrap();
+
+        let mut expected = Vec::new();
+        write_bytes(&mut expected, b"\x01\x02");
+        write_bytes(&mut expected, b"\x01");
+        assert_eq!(encoded, expected);
     }
 
     #[tokio::test]

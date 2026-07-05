@@ -76,6 +76,8 @@ pub enum DataType {
     Binary(BinaryType),
     /// Data type of a variable-length binary string (=a sequence of bytes).
     VarBinary(VarBinaryType),
+    /// Data type of semi-structured values encoded as Variant value + metadata.
+    Variant(VariantType),
     /// Data type of binary large object.
     Blob(BlobType),
     /// Data type of a fixed-length character string.
@@ -139,6 +141,7 @@ impl DataType {
             DataType::Float(v) => v.nullable,
             DataType::Binary(v) => v.nullable,
             DataType::VarBinary(v) => v.nullable,
+            DataType::Variant(v) => v.nullable,
             DataType::Blob(v) => v.nullable,
             DataType::Char(v) => v.nullable,
             DataType::VarChar(v) => v.nullable,
@@ -176,6 +179,7 @@ impl DataType {
             DataType::VarBinary(v) => {
                 DataType::VarBinary(VarBinaryType::try_new(nullable, v.length())?)
             }
+            DataType::Variant(_) => DataType::Variant(VariantType::with_nullable(nullable)),
             DataType::Blob(_) => DataType::Blob(BlobType::with_nullable(nullable)),
             DataType::Char(v) => DataType::Char(CharType::with_nullable(nullable, v.length())?),
             DataType::VarChar(v) => {
@@ -629,6 +633,44 @@ impl BlobType {
 
     pub fn family(&self) -> DataTypeFamily {
         DataTypeFamily::PREDEFINED
+    }
+}
+
+/// VariantType for paimon.
+///
+/// Data type of semi-structured values encoded as two binary buffers: `value`
+/// and `metadata`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/VariantType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VariantType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VARIANT>>")]
+    nullable: bool,
+}
+
+impl Default for VariantType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VariantType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+
+    pub(crate) fn validate_payload(value: &[u8], metadata: &[u8]) -> crate::Result<()> {
+        crate::variant::validate_payload(value, metadata)
     }
 }
 
@@ -1732,6 +1774,11 @@ mod serde_utils {
         const NAME: &'static str = "BLOB";
     }
 
+    pub struct VARIANT;
+    impl DataTypeName for VARIANT {
+        const NAME: &'static str = "VARIANT";
+    }
+
     pub struct BINARY;
     impl DataTypeName for BINARY {
         const NAME: &'static str = "BINARY";
@@ -2170,6 +2217,14 @@ mod tests {
                     nullable: true,
                     length: 233,
                 }),
+            ),
+            (
+                "variant_type",
+                DataType::Variant(VariantType { nullable: false }),
+            ),
+            (
+                "variant_type_nullable",
+                DataType::Variant(VariantType { nullable: true }),
             ),
             (
                 "varchar_type",

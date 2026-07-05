@@ -95,6 +95,7 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `DOUBLE` / `DOUBLE PRECISION` | DoubleType | |
 | `VARCHAR` / `TEXT` / `STRING` / `CHAR` | VarCharType | |
 | `BINARY` / `VARBINARY` / `BYTEA` | VarBinaryType | |
+| `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
 | `DATE` | DateType | |
 | `TIMESTAMP[(p)]` | TimestampType | Precision p: 0/3/6/9, default 3 |
@@ -103,6 +104,123 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `ARRAY<element>` | ArrayType | e.g. `ARRAY<INT>` |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
+
+### Variant Usage
+
+`VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
+
+Create `VARIANT` columns like ordinary table columns:
+
+```sql
+CREATE TABLE paimon.my_db.user_events (
+    user_id BIGINT NOT NULL,
+    event_time TIMESTAMP,
+    payload VARIANT,
+    attributes VARIANT,
+    dt STRING,
+    PRIMARY KEY (user_id, dt)
+) PARTITIONED BY (dt)
+WITH ('bucket' = '4');
+```
+
+`VARIANT` columns can be nullable or `NOT NULL`:
+
+```sql
+CREATE TABLE paimon.my_db.variant_examples (
+    id INT NOT NULL,
+    payload VARIANT NOT NULL,
+    optional_payload VARIANT
+);
+```
+
+Do not use `VARIANT` as a partition column. Partition values must be scalar strings, numbers, dates, or timestamps that can be encoded as stable partition names.
+
+Use `parse_json` when inserting JSON text into a `VARIANT` column:
+
+```sql
+INSERT INTO paimon.my_db.user_events VALUES
+(
+    1,
+    TIMESTAMP '2024-01-01 10:00:00',
+    parse_json('{"event":"login","device":{"os":"ios","version":17},"score":98.5}'),
+    parse_json('{"city":"Beijing","tags":["new","mobile"],"vip":true}'),
+    '2024-01-01'
+);
+```
+
+`parse_json` rejects invalid JSON and duplicate object keys. Use `try_parse_json` when malformed JSON should become SQL `NULL` instead of failing the query:
+
+```sql
+INSERT INTO paimon.my_db.user_events
+SELECT
+    user_id,
+    event_time,
+    try_parse_json(raw_payload),
+    try_parse_json(raw_attributes),
+    dt
+FROM staging_events;
+```
+
+`SQLContext::new` registers Spark-compatible scalar functions for common `VARIANT` workflows:
+
+```sql
+SELECT
+    user_id,
+    variant_get(payload, '$.event', 'string') AS event_name,
+    variant_get(payload, '$.device.os', 'string') AS os,
+    variant_get(payload, '$.score', 'double') AS score,
+    variant_get(attributes, '$.tags[0]', 'string') AS first_tag
+FROM paimon.my_db.user_events
+WHERE variant_get(attributes, '$.vip', 'boolean') = true;
+```
+
+Supported functions:
+
+| Function | Notes |
+|---|---|
+| `parse_json(json)` | Parses a JSON string into `VARIANT`; invalid JSON returns an error |
+| `try_parse_json(json)` | Parses a JSON string into `VARIANT`; invalid JSON returns `NULL` |
+| `variant_get(v, path[, type])` | Extracts a path; missing paths return `NULL`; invalid casts return an error |
+| `try_variant_get(v, path[, type])` | Extracts a path; missing paths, invalid paths, and invalid casts return `NULL` |
+| `is_variant_null(v)` | Returns true for JSON `null` inside `VARIANT`; SQL `NULL` returns false |
+
+Path syntax supports the root path `$`, object access (`$.field`), quoted object access (`$["field"]` or `$['field']`), array indexes (`$[0]`), and nested combinations such as `$.items[0].price`.
+
+The optional `type` argument is a string literal. Supported result types are `variant` (or omitted), `boolean`, `byte` / `tinyint`, `short` / `smallint`, `int` / `integer`, `long` / `bigint`, `float`, `double`, `decimal(p, s)`, and `string`.
+
+When `type` is omitted or set to `variant`, `variant_get` returns a nested `VARIANT` value that can be passed to another `variant_get` call:
+
+```sql
+SELECT
+    variant_get(
+        variant_get(payload, '$.device'),
+        '$.os',
+        'string'
+    ) AS os
+FROM paimon.my_db.user_events;
+```
+
+Missing paths return SQL `NULL`. JSON `null` is represented as a non-SQL-null Variant value, so use `is_variant_null` when you need to distinguish it:
+
+```sql
+SELECT
+    is_variant_null(parse_json('null')) AS json_null,
+    is_variant_null(NULL) AS sql_null;
+```
+
+Current limitations:
+
+- `schema_of_variant`, `schema_of_variant_agg`, `to_variant_object`, `variant_explode`, and `variant_explode_outer` are not implemented yet.
+- `variant_get` currently casts to scalar types and `VARIANT`. It does not yet cast directly to `ARRAY`, `MAP`, or `STRUCT`.
+- Predicate pushdown is not applied through `variant_get`; DataFusion evaluates Variant filters after reading rows.
+
+With a raw DataFusion `SessionContext`, register these scalar functions explicitly:
+
+```rust
+use paimon_datafusion::register_variant_functions;
+
+register_variant_functions(&ctx);
+```
 
 ## DDL
 
@@ -278,6 +396,19 @@ INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
 
 ```sql
 INSERT INTO paimon.my_db.users SELECT * FROM source_table;
+```
+
+For `VARIANT` columns, convert JSON text with `parse_json` or `try_parse_json`:
+
+```sql
+INSERT INTO paimon.my_db.user_events (user_id, event_time, payload, attributes, dt)
+VALUES (
+    1,
+    TIMESTAMP '2024-01-01 10:00:00',
+    parse_json('{"event":"login","device":{"os":"ios"}}'),
+    try_parse_json('{"vip":true,"tags":["mobile"]}'),
+    '2024-01-01'
+);
 ```
 
 For primary-key tables, records with duplicate keys are deduplicated according to the merge engine (default: Deduplicate engine, where the last written value wins).
@@ -490,6 +621,29 @@ All DataFusion query capabilities are supported (JOINs, aggregations, subqueries
 
 ```sql
 SELECT id, name FROM paimon.my_db.users WHERE id > 10 ORDER BY id LIMIT 100;
+```
+
+### Variant Queries
+
+Use `variant_get` to extract fields from `VARIANT` columns. Provide a target type string when the query needs a scalar result:
+
+```sql
+SELECT
+    user_id,
+    variant_get(payload, '$.event', 'string') AS event_name,
+    variant_get(payload, '$.device.os', 'string') AS device_os,
+    variant_get(attributes, '$.vip', 'boolean') AS is_vip
+FROM paimon.my_db.user_events
+WHERE variant_get(payload, '$.event', 'string') = 'login';
+```
+
+Use `try_variant_get` when incompatible values should return `NULL`:
+
+```sql
+SELECT
+    user_id,
+    try_variant_get(payload, '$.score', 'double') AS score
+FROM paimon.my_db.user_events;
 ```
 
 ### Column Projection

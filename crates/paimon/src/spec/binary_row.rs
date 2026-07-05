@@ -19,7 +19,7 @@
 //! and BinaryRowBuilder for constructing BinaryRow instances.
 
 use crate::spec::murmur_hash::hash_by_words;
-use crate::spec::{DataType, Datum};
+use crate::spec::{DataType, Datum, VariantType};
 use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -343,6 +343,10 @@ impl BinaryRow {
             DataType::Binary(_) | DataType::VarBinary(_) => {
                 Datum::Bytes(self.get_binary(pos)?.to_vec())
             }
+            DataType::Variant(_) => {
+                let (value, metadata) = decode_variant_bytes(self.get_binary(pos)?)?;
+                Datum::Variant { value, metadata }
+            }
             DataType::Decimal(dt) => {
                 let unscaled = self.get_decimal_unscaled(pos, dt.precision())?;
                 Datum::Decimal {
@@ -647,6 +651,11 @@ impl BinaryRowBuilder {
                     self.write_binary(pos, b);
                 }
             }
+            Datum::Variant { value, metadata } => {
+                let bytes = encode_variant_bytes(value, metadata)
+                    .expect("invalid Variant payload for BinaryRow");
+                self.write_binary(pos, &bytes);
+            }
         }
     }
 }
@@ -772,6 +781,7 @@ pub fn extract_datum_from_arrow(
                 .ok_or_else(|| type_mismatch_err("Binary", col_idx))?;
             Datum::Bytes(arr.value(row_idx).to_vec())
         }
+        DataType::Variant(_) => extract_variant_datum_from_arrow(col, row_idx, col_idx)?,
         DataType::Timestamp(ts) => {
             if ts.precision() <= 3 {
                 let arr = col
@@ -829,6 +839,104 @@ pub fn extract_datum_from_arrow(
     Ok(Some(datum))
 }
 
+fn encode_variant_bytes(value: &[u8], metadata: &[u8]) -> crate::Result<Vec<u8>> {
+    VariantType::validate_payload(value, metadata)?;
+    let mut bytes = Vec::with_capacity(4 + value.len() + metadata.len());
+    bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(value);
+    bytes.extend_from_slice(metadata);
+    Ok(bytes)
+}
+
+fn decode_variant_bytes(bytes: &[u8]) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+    if bytes.len() < 4 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Variant bytes too short: {} bytes", bytes.len()),
+            source: None,
+        });
+    }
+    let value_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let value_end = 4usize
+        .checked_add(value_len)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Variant value length overflows".to_string(),
+            source: None,
+        })?;
+    if value_end > bytes.len() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Variant value length {value_len} exceeds payload length {}",
+                bytes.len()
+            ),
+            source: None,
+        });
+    }
+    let value = bytes[4..value_end].to_vec();
+    let metadata = bytes[value_end..].to_vec();
+    VariantType::validate_payload(&value, &metadata)?;
+    Ok((value, metadata))
+}
+
+fn extract_variant_datum_from_arrow(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+) -> crate::Result<Datum> {
+    use arrow_array::Array;
+
+    let arr = col
+        .as_any()
+        .downcast_ref::<arrow_array::StructArray>()
+        .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
+    validate_variant_struct_array(arr, col_idx)?;
+    let value = arr.column(0);
+    let metadata = arr.column(1);
+    if value.is_null(row_idx) || metadata.is_null(row_idx) {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Variant Arrow struct at column {col_idx} has null child value"),
+            source: None,
+        });
+    }
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.value", col_idx))?
+        .value(row_idx)
+        .to_vec();
+    let metadata = metadata
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.metadata", col_idx))?
+        .value(row_idx)
+        .to_vec();
+    VariantType::validate_payload(&value, &metadata)?;
+    Ok(Datum::Variant { value, metadata })
+}
+
+fn validate_variant_struct_array(
+    arr: &arrow_array::StructArray,
+    col_idx: usize,
+) -> crate::Result<()> {
+    if arr.num_columns() != 2 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Variant Arrow struct at column {col_idx} must have 2 fields, got {}",
+                arr.num_columns()
+            ),
+            source: None,
+        });
+    }
+    arr.column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.value", col_idx))?;
+    arr.column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.metadata", col_idx))?;
+    Ok(())
+}
+
 fn type_mismatch_err(expected: &str, col_idx: usize) -> crate::Error {
     crate::Error::DataInvalid {
         message: format!(
@@ -858,6 +966,7 @@ enum TypedColumn<'a> {
     Date32(&'a arrow_array::Date32Array),
     Decimal128(&'a arrow_array::Decimal128Array, u32, u32), // (array, precision, scale)
     Binary(&'a arrow_array::BinaryArray),
+    Variant(&'a arrow_array::StructArray),
     TimestampMs(&'a arrow_array::TimestampMillisecondArray),
     TimestampUs(&'a arrow_array::TimestampMicrosecondArray),
 }
@@ -943,6 +1052,14 @@ fn downcast_columns<'a>(
                             .downcast_ref()
                             .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,
                     ),
+                    DataType::Variant(_) => {
+                        let arr = col
+                            .as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
+                        validate_variant_struct_array(arr, col_idx)?;
+                        TypedColumn::Variant(arr)
+                    }
                     DataType::Timestamp(ts) => {
                         if ts.precision() <= 3 {
                             TypedColumn::TimestampMs(
@@ -990,7 +1107,7 @@ fn write_typed_value(
     row_idx: usize,
     typed_col: &TypedColumn,
     _data_type: &DataType,
-) {
+) -> crate::Result<()> {
     use arrow_array::Array;
     match typed_col {
         TypedColumn::Boolean(arr) => {
@@ -1109,6 +1226,32 @@ fn write_typed_value(
                 }
             }
         }
+        TypedColumn::Variant(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let value = arr.column(0);
+                let metadata = arr.column(1);
+                if value.is_null(row_idx) || metadata.is_null(row_idx) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Variant Arrow struct has null child value".to_string(),
+                        source: None,
+                    });
+                } else if let (Some(value), Some(metadata)) = (
+                    value.as_any().downcast_ref::<arrow_array::BinaryArray>(),
+                    metadata.as_any().downcast_ref::<arrow_array::BinaryArray>(),
+                ) {
+                    let bytes =
+                        encode_variant_bytes(value.value(row_idx), metadata.value(row_idx))?;
+                    builder.write_binary(pos, &bytes);
+                } else {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Variant Arrow struct children must be BinaryArray".to_string(),
+                        source: None,
+                    });
+                }
+            }
+        }
         TypedColumn::TimestampMs(arr) => {
             if arr.is_null(row_idx) {
                 builder.set_null_at(pos);
@@ -1127,6 +1270,7 @@ fn write_typed_value(
             }
         }
     }
+    Ok(())
 }
 
 /// Build BinaryRows for all rows in the batch for the given field indices.
@@ -1144,7 +1288,7 @@ pub(crate) fn batch_build_binary_rows(
     for row_idx in 0..num_rows {
         let mut builder = BinaryRowBuilder::new(arity);
         for (pos, (typed_col, field)) in typed_columns.iter().enumerate() {
-            write_typed_value(&mut builder, pos, row_idx, typed_col, field.data_type());
+            write_typed_value(&mut builder, pos, row_idx, typed_col, field.data_type())?;
         }
         rows.push(builder.build());
     }
@@ -1336,6 +1480,18 @@ mod tests {
         let row = builder.build();
 
         assert_eq!(row.get_binary(0).unwrap(), &[0x00, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_variant_datum_roundtrip() {
+        let data_type = DataType::Variant(crate::spec::VariantType::new());
+        let datum = Datum::Variant {
+            value: vec![1, 2, 3],
+            metadata: vec![1, 5],
+        };
+        let row = BinaryRow::from_datums(&[(Some(&datum), &data_type)]);
+
+        assert_eq!(row.get_datum(0, &data_type).unwrap(), Some(datum));
     }
 
     #[test]
