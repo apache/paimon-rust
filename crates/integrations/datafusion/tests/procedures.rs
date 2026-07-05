@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{assert_sql_error, exec, row_count, setup_sql_context};
+use common::{assert_sql_error, collect_id_name, exec, row_count, setup_sql_context};
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -119,6 +119,150 @@ async fn test_create_lumina_index_rejects_invalid_options() {
         "Expected comma-separated key=value pairs",
     )
     .await;
+}
+
+async fn setup_btree_global_index_table(
+    table_name: &str,
+) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.{table_name} (id INT, name VARCHAR(100)) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'global-index.enabled' = 'true',\
+                'sorted-index.records-per-range' = '10'\
+            )"
+        ),
+    )
+    .await;
+    (tmp, sql_context)
+}
+
+#[tokio::test]
+async fn test_create_global_index_requires_index_column() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_missing_col").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_missing_col')",
+        "Missing required argument: 'index_column'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_global_index_rejects_non_btree() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_bad_type").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_bad_type', index_column => 'id', index_type => 'bitmap')",
+        "only supports index_type => 'btree'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_global_index_rejects_options() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_options").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_options', index_column => 'id', options => 'x=y')",
+        "options are not supported",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_global_index_builds_btree_and_filter_reads() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_build").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_build (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_build', index_column => 'id', index_type => 'btree')",
+    )
+    .await;
+
+    let index_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_build$table_indexes` \
+         WHERE index_type = 'btree' AND row_range_start = 0 AND row_range_end = 2 \
+         AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(index_count, 1);
+
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_build WHERE id = 2",
+    )
+    .await;
+    assert_eq!(rows, vec![(2, "bob".to_string())]);
+}
+
+#[tokio::test]
+async fn test_create_global_index_fast_full_detail_after_append() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_coverage").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_coverage (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_coverage', index_column => 'id')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_coverage (id, name) VALUES (3, 'carol')",
+    )
+    .await;
+
+    let fast_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_coverage WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(fast_rows, vec![(2, "bob".to_string())]);
+
+    exec(
+        &sql_context,
+        "SET 'paimon.global-index.search-mode' = 'full'",
+    )
+    .await;
+    let full_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_coverage WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(
+        full_rows,
+        vec![(2, "bob".to_string()), (3, "carol".to_string())]
+    );
+
+    exec(
+        &sql_context,
+        "SET 'paimon.global-index.search-mode' = 'detail'",
+    )
+    .await;
+    let detail_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_coverage WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(
+        detail_rows,
+        vec![(2, "bob".to_string()), (3, "carol".to_string())]
+    );
 }
 
 #[tokio::test]

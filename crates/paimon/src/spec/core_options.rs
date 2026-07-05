@@ -24,6 +24,7 @@ const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
+const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
@@ -410,6 +411,22 @@ impl<'a> CoreOptions<'a> {
                 message: format!(
                     "Option '{}' must be greater than 0, got: {}",
                     GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
+        let value = self
+            .parse_i64_option(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than 0, got: {}",
+                    SORTED_INDEX_RECORDS_PER_RANGE_OPTION, value
                 ),
                 source: None,
             });
@@ -816,6 +833,10 @@ mod tests {
             100_000
         );
         assert_eq!(
+            core_options.sorted_index_records_per_range().unwrap(),
+            100_000
+        );
+        assert_eq!(
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::ThrowError
         );
@@ -841,6 +862,10 @@ mod tests {
                 "2048".to_string(),
             ),
             (
+                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                "4096".to_string(),
+            ),
+            (
                 GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION.to_string(),
                 "DROP_PARTITION_INDEX".to_string(),
             ),
@@ -857,6 +882,7 @@ mod tests {
             core_options.global_index_row_count_per_shard().unwrap(),
             2048
         );
+        assert_eq!(core_options.sorted_index_records_per_range().unwrap(), 4096);
         assert_eq!(
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::DropPartitionIndex
@@ -909,6 +935,23 @@ mod tests {
                 .expect_err("invalid rows-per-shard should fail");
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION)));
+        }
+    }
+
+    #[test]
+    fn test_sorted_index_records_per_range_rejects_invalid_values() {
+        for value in ["0", "-1", "abc"] {
+            let options = HashMap::from([(
+                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            let core = CoreOptions::new(&options);
+
+            let err = core
+                .sorted_index_records_per_range()
+                .expect_err("invalid records-per-range should fail");
+            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                    if message.contains(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)));
         }
     }
 

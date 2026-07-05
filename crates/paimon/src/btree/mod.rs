@@ -46,6 +46,7 @@ mod sst_file;
 mod var_len;
 mod writer;
 
+pub use block::BlockCompressionType;
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};
 pub use meta::BTreeIndexMeta;

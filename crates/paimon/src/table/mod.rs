@@ -21,6 +21,7 @@ pub(crate) mod aggregator;
 pub(crate) mod bin_pack;
 mod blob_file_writer;
 mod branch_manager;
+mod btree_global_index_build_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -68,6 +69,7 @@ mod write_builder;
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
+pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -193,6 +195,10 @@ impl Table {
 
     pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
         LuminaIndexBuildBuilder::new(self)
+    }
+
+    pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
+        BTreeGlobalIndexBuildBuilder::new(self)
     }
 
     /// Create a write builder for write/commit.
