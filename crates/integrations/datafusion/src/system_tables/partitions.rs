@@ -17,7 +17,6 @@
 
 //! Mirrors Java [PartitionsTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system/PartitionsTable.java).
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -102,10 +101,6 @@ impl std::fmt::Debug for PartitionsTable {
 
 #[async_trait]
 impl TableProvider for PartitionsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         partitions_schema()
     }

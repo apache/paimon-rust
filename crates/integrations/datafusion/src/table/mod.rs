@@ -17,7 +17,6 @@
 
 //! Paimon table provider for DataFusion.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -157,10 +156,6 @@ impl PaimonScanBuilder<'_> {
 
 #[async_trait]
 impl TableProvider for PaimonTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -324,7 +319,6 @@ mod tests {
     ) -> Vec<Arc<[DataSplit]>> {
         let plan = plan_scan(provider, filters, limit).await;
         let scan = plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
@@ -618,7 +612,6 @@ mod tests {
         let full_plan = plan_partitions(&provider, vec![filter.clone()], None).await;
         let plan = plan_scan(&provider, vec![filter], Some(1)).await;
         let scan = plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
@@ -655,7 +648,6 @@ mod tests {
             .await
             .expect("scan() should succeed");
         let scan = plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
@@ -677,7 +669,6 @@ mod tests {
             .await
             .expect("full scan should succeed");
         let full_scan = full_plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
         assert_eq!(
@@ -691,7 +682,6 @@ mod tests {
             .await
             .expect("projected scan should succeed");
         let projected_scan = projected_plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
@@ -707,7 +697,6 @@ mod tests {
         let full_plan = plan_partitions(&provider, vec![], None).await;
         let plan = plan_scan(&provider, vec![], Some(1)).await;
         let scan = plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
@@ -731,7 +720,6 @@ mod tests {
         let full_plan = plan_partitions(&provider, vec![filter.clone()], None).await;
         let plan = plan_scan(&provider, vec![filter], Some(1)).await;
         let scan = plan
-            .as_any()
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 

@@ -17,7 +17,6 @@
 
 //! Mirrors Java [PhysicalFilesSizeTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system).
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -61,10 +60,6 @@ struct PhysicalFilesSizeTable {
 
 #[async_trait]
 impl TableProvider for PhysicalFilesSizeTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         output_schema()
     }

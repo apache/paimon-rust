@@ -84,7 +84,7 @@ impl RelationPlanner for PaimonRelationPlanner {
         let provider = source_as_provider(&source)?;
 
         // Check if this is a Paimon table.
-        let Some(paimon_provider) = provider.as_any().downcast_ref::<PaimonTableProvider>() else {
+        let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 

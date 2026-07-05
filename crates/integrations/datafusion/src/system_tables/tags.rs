@@ -17,7 +17,6 @@
 
 //! Mirrors Java [TagsTable](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/system/TagsTable.java).
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -71,10 +70,6 @@ struct TagsTable {
 
 #[async_trait]
 impl TableProvider for TagsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         tags_schema()
     }

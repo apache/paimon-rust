@@ -17,7 +17,6 @@
 
 //! Mirrors Java [FilesTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system/FilesTable.java).
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -91,10 +90,6 @@ struct FilesTable {
 
 #[async_trait]
 impl TableProvider for FilesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         files_schema()
     }

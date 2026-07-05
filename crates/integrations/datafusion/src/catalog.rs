@@ -17,7 +17,6 @@
 
 //! Paimon catalog integration for DataFusion.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -93,10 +92,6 @@ impl PaimonCatalogProvider {
 }
 
 impl CatalogProvider for PaimonCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
@@ -333,10 +328,6 @@ impl PaimonSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for PaimonSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();

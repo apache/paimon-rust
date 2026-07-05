@@ -24,7 +24,6 @@
 //!
 //! Reference: [PaimonTableValuedFunctions.scala](https://github.com/apache/paimon/blob/master/paimon-spark/paimon-spark-common/src/main/scala/org/apache/paimon/spark/PaimonTableValuedFunctions.scala)
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -139,10 +138,6 @@ struct FullTextSearchTableProvider {
 
 #[async_trait]
 impl TableProvider for FullTextSearchTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.inner.schema()
     }

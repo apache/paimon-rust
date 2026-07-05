@@ -144,10 +144,7 @@ fn find_lateral_vector_search_provider(
     match plan {
         LogicalPlan::TableScan(TableScan { source, .. }) => {
             let provider = source_as_provider(source)?;
-            let Some(provider) = provider
-                .as_any()
-                .downcast_ref::<LateralVectorSearchTableProvider>()
-            else {
+            let Some(provider) = provider.downcast_ref::<LateralVectorSearchTableProvider>() else {
                 return Ok(None);
             };
             Ok(Some(LateralVectorSearchSpec {
@@ -463,10 +460,6 @@ impl ExecutionPlan for LateralVectorSearchExec {
         "LateralVectorSearchExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -513,12 +506,12 @@ impl ExecutionPlan for LateralVectorSearchExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(&self.output_schema),
-        })
+        }))
     }
 }
 

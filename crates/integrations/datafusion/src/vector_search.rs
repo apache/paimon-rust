@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -167,10 +166,6 @@ impl LateralVectorSearchTableProvider {
 
 #[async_trait]
 impl TableProvider for LateralVectorSearchTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.inner.schema()
     }
@@ -202,10 +197,6 @@ struct VectorSearchTableProvider {
 
 #[async_trait]
 impl TableProvider for VectorSearchTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.inner.schema()
     }

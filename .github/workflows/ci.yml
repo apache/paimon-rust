@@ -101,7 +101,35 @@ jobs:
           RUST_BACKTRACE: full
 
   integration:
+    name: integration (${{ matrix.suite }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: rust
+            needs_docker: true
+            needs_lumina: false
+            needs_uv: false
+          - suite: datafusion
+            needs_docker: true
+            needs_lumina: true
+            needs_uv: false
+          - suite: lumina
+            needs_docker: false
+            needs_lumina: true
+            needs_uv: false
+          - suite: python
+            needs_docker: true
+            needs_lumina: false
+            needs_uv: true
+          - suite: go
+            needs_docker: true
+            needs_lumina: false
+            needs_uv: false
+    env:
+      RUST_LOG: DEBUG
+      RUST_BACKTRACE: full
     steps:
       - uses: actions/checkout@v7
 
@@ -117,65 +145,60 @@ jobs:
             integration-${{ runner.os }}-
 
       - name: Start Docker containers
+        if: matrix.needs_docker == true
         run: make docker-up
 
       - name: Rust Integration Test
+        if: matrix.suite == 'rust'
         run: cargo test -p paimon-integration-tests --all-targets
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
 
       - name: Install lumina native library
+        if: matrix.needs_lumina == true
         run: |
           pip install lumina-data
           echo "LUMINA_LIB_PATH=$(python3 -c 'import lumina_data; print(lumina_data.__path__[0])')/lib/liblumina_py.so" >> $GITHUB_ENV
 
       - name: Core Lumina Native Build Test
+        if: matrix.suite == 'lumina'
         run: >
           cargo test -p paimon
           table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
           --features fulltext,vortex
           -- --ignored --exact
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
 
       - name: DataFusion Lumina Build Query E2E Test
+        if: matrix.suite == 'lumina'
         run: >
           cargo test -p paimon-datafusion
           --features vortex
           vector_search_tests::test_lumina_build_then_vector_search_query
           -- --ignored --exact
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
 
       - name: DataFusion Integration Test
+        if: matrix.suite == 'datafusion'
         run: cargo test -p paimon-datafusion --all-targets
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
 
       - name: DataFusion Vortex Integration Test
+        if: matrix.suite == 'datafusion'
         run: cargo test -p paimon-datafusion --features vortex --test vortex_tables
-        env:
-          RUST_LOG: DEBUG
-          RUST_BACKTRACE: full
 
       - name: Install uv
+        if: matrix.needs_uv == true
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
           version: "0.9.3"
           enable-cache: true
 
       - name: Python Binding Integration Test
+        if: matrix.suite == 'python'
         working-directory: bindings/python
         run: make install && make test
 
       - name: Go Integration Test
+        if: matrix.suite == 'go'
         working-directory: bindings/go
         run: make test
 
       - name: Stop Docker containers
-        if: always()
+        if: ${{ always() && matrix.needs_docker }}
         run: make docker-down

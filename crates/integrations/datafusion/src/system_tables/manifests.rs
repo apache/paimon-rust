@@ -17,7 +17,6 @@
 
 //! Mirrors Java [ManifestsTable](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/table/system/ManifestsTable.java).
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -68,10 +67,6 @@ struct ManifestsTable {
 
 #[async_trait]
 impl TableProvider for ManifestsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         manifests_schema()
     }

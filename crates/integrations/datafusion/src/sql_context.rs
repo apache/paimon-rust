@@ -252,7 +252,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -275,7 +274,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -295,7 +293,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -1094,14 +1091,26 @@ impl SQLContext {
 
         // Resolve target column mapping from the explicit column list.
         // `columns` = before PARTITION, `after_columns` = after PARTITION (Hive-style).
-        let target_columns = if !insert.columns.is_empty() {
-            Some(&insert.columns)
+        let target_columns: Option<Vec<String>> = if !insert.columns.is_empty() {
+            Some(
+                insert
+                    .columns
+                    .iter()
+                    .map(object_name_to_single_identifier)
+                    .collect::<DFResult<_>>()?,
+            )
         } else if !insert.after_columns.is_empty() {
-            Some(&insert.after_columns)
+            Some(
+                insert
+                    .after_columns
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect(),
+            )
         } else {
             None
         };
-        let column_reorder: Option<Vec<usize>> = if let Some(cols) = target_columns {
+        let column_reorder: Option<Vec<usize>> = if let Some(cols) = target_columns.as_ref() {
             if cols.len() != expected_source_cols {
                 return Err(DataFusionError::Plan(format!(
                     "Column list has {} columns, but expected {} non-partition columns",
@@ -1109,7 +1118,7 @@ impl SQLContext {
                     expected_source_cols
                 )));
             }
-            let col_names: Vec<&str> = cols.iter().map(|id| id.value.as_str()).collect();
+            let col_names: Vec<&str> = cols.iter().map(String::as_str).collect();
             let mut reorder = Vec::with_capacity(expected_source_cols);
             for field in &non_static_fields {
                 let pos = col_names
@@ -1762,6 +1771,18 @@ fn object_name_to_string(name: &ObjectName) -> String {
         .filter_map(|p| p.as_ident().map(|id| id.value.clone()))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn object_name_to_single_identifier(name: &ObjectName) -> DFResult<String> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(|id| id.value.clone())
+            .ok_or_else(|| DataFusionError::Plan(format!("Invalid column name: {name}"))),
+        _ => Err(DataFusionError::Plan(format!(
+            "Expected a simple column name, got: {name}"
+        ))),
+    }
 }
 
 /// Extract key-value pairs from [`CreateTableOptions`].

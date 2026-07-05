@@ -25,9 +25,9 @@ under the License.
 
 ```toml
 [dependencies]
-paimon = "0.1.0"
-paimon-datafusion = "0.1.0"
-datafusion = "53"
+paimon = "0.3.0"
+paimon-datafusion = "0.3.0"
+datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -35,13 +35,26 @@ To query tables with Mosaic data files, enable the `mosaic` feature on both crat
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["mosaic"] }
-paimon-datafusion = { version = "0.1.0", features = ["mosaic"] }
-datafusion = "53"
+paimon = { version = "0.3.0", features = ["mosaic"] }
+paimon-datafusion = { version = "0.3.0", features = ["mosaic"] }
+datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
 Mosaic support is currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+
+## SQL Support Scope
+
+`paimon-datafusion` currently targets Apache DataFusion 54.x. The workspace pins `datafusion = "54.0.0"`.
+
+SQL support has two layers:
+
+- DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+
+Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, persistent `CREATE VIEW`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
+
+For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
 ## Registering Catalog
 
@@ -58,14 +71,14 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
     let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)?;
+    ctx.register_catalog("paimon", catalog).await?;
     let df = ctx.sql("SELECT * FROM paimon.default.my_table").await?;
     df.show().await?;
     Ok(())
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog(...).await` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -93,10 +106,11 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 
 ## DDL
 
-### CREATE SCHEMA / DROP SCHEMA
+### CREATE DATABASE / CREATE SCHEMA / DROP SCHEMA
 
 ```sql
 CREATE SCHEMA paimon.my_db;
+CREATE DATABASE paimon.my_db;
 DROP SCHEMA paimon.my_db CASCADE;
 ```
 
@@ -249,10 +263,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Not supported |
-| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE` and not-matched `INSERT`; matched `DELETE` is not supported |
+| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
 
 ### INSERT INTO
 
@@ -322,7 +336,9 @@ For append-only tables, deletes are executed using Copy-on-Write:
 DELETE FROM paimon.my_db.t WHERE name = 'b';
 ```
 
-`DELETE` is not supported on primary-key tables or data-evolution tables.
+For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
+
+`DELETE` is not supported on primary-key tables.
 
 ### MERGE INTO
 
@@ -361,7 +377,7 @@ ON target.id = source.id
 WHEN MATCHED THEN UPDATE SET name = source.name;
 ```
 
-For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE` plus not-matched `INSERT`; matched `DELETE` is not yet supported. Primary-key tables are not supported for `MERGE INTO`.
+For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE`, matched `DELETE` when deletion vectors are enabled, and not-matched `INSERT`. Primary-key tables are not supported for `MERGE INTO`.
 
 ### TRUNCATE TABLE
 
@@ -492,6 +508,7 @@ The following filter predicates are pushed down to the Paimon storage layer:
 - Logical: `AND`, `OR`
 - Null checks: `IS NULL`, `IS NOT NULL`
 - Range: `IN`, `NOT IN`, `BETWEEN`
+- String predicates: positive `LIKE`, including no-wildcard, prefix, suffix, contains, and more complex patterns. `NOT LIKE` and `ILIKE` are evaluated by DataFusion as residual filters.
 
 Filters on partition columns enable exact partition pruning, avoiding scans of irrelevant data.
 
@@ -540,6 +557,24 @@ SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 
 
 The function performs ANN search across all Lumina vector index files for the target column, merges results, and returns the top-k rows ordered by relevance score. If no matching index is found, an empty result is returned.
 
+### Lateral Joins
+
+Use `CROSS JOIN LATERAL` when query vectors come from another relation. In this mode, the third `vector_search` argument is a column reference from the left side of the join instead of a JSON literal:
+
+```sql
+SELECT q.id AS query_id, r.id AS result_id
+FROM paimon.my_db.queries q
+CROSS JOIN LATERAL vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    q.embedding,
+    10
+) AS r
+ORDER BY query_id, result_id;
+```
+
+The query-vector column must have Arrow type `List<Float32>` or `FixedSizeList<Float32>`. Null query-vector rows produce no joined results, and null elements inside a vector are rejected. The lateral form returns the left row joined with the top-k matching rows from the target Paimon table for that row's query vector.
+
 ### Supported Metrics
 
 The distance metric is configured at index creation time via table options:
@@ -572,8 +607,8 @@ Paimon supports full-text search via the Tantivy search engine. The `full_text_s
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["fulltext"] }
-paimon-datafusion = { version = "0.1.0", features = ["fulltext"] }
+paimon = { version = "0.3.0", features = ["fulltext"] }
+paimon-datafusion = { version = "0.3.0", features = ["fulltext"] }
 ```
 
 ### Registration
@@ -723,7 +758,7 @@ CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.us
 
 ### Deregister
 
-Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table--drop-temporary-view)):
+Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table-drop-temporary-view)):
 
 ```rust
 ctx.deregister_temp_table("paimon.my_db.users")?;
@@ -981,7 +1016,7 @@ bucket writes, or advanced aggregation options such as `ignore-retract`,
 | Option | Description |
 |---|---|
 | `'sequence.field' = 'col'` | Sequence field used to determine which record wins during deduplication |
-| `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE) |
+| `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'cross-partition-update.enabled' = 'true'` | Allow cross-partition updates |
 | `'changelog-producer' = 'input'` | Changelog producer (PK tables with input mode reject writes) |
@@ -1002,7 +1037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create SQL context and register catalog
     let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)?;
+    ctx.register_catalog("paimon", catalog).await?;
 
     // Create database and table
     ctx.sql("CREATE SCHEMA paimon.my_db").await?;

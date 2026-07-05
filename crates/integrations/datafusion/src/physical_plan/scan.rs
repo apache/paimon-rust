@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -115,10 +114,6 @@ impl ExecutionPlan for PaimonTableScan {
         "PaimonTableScan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -178,7 +173,7 @@ impl ExecutionPlan for PaimonTableScan {
         )))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         let partitions: &[Arc<[DataSplit]>] = match partition {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
@@ -212,11 +207,11 @@ impl ExecutionPlan for PaimonTableScan {
                 Precision::Inexact(total_rows)
             };
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: num_rows_precision,
             total_byte_size: Precision::Inexact(total_bytes),
             column_statistics: Statistics::unknown_column(&self.schema()),
-        })
+        }))
     }
 }
 

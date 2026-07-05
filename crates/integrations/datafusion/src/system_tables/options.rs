@@ -17,7 +17,6 @@
 
 //! Mirrors Java [OptionsTable](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/system/OptionsTable.java).
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -54,10 +53,6 @@ struct OptionsTable {
 
 #[async_trait]
 impl TableProvider for OptionsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         options_schema()
     }

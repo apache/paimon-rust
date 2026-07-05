@@ -17,7 +17,6 @@
 
 //! Mirrors Java [TableIndexesTable](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/system/TableIndexesTable.java).
 
-use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -90,10 +89,6 @@ struct TableIndexesTable {
 
 #[async_trait]
 impl TableProvider for TableIndexesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         table_indexes_schema()
     }

@@ -17,7 +17,6 @@
 
 //! DataSink implementation for writing to Paimon tables via DataFusion.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -67,10 +66,6 @@ impl DisplayAs for PaimonDataSink {
 
 #[async_trait]
 impl DataSink for PaimonDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> &ArrowSchemaRef {
         &self.schema
     }
