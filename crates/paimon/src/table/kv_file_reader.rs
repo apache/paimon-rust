@@ -20,6 +20,8 @@
 //! Each data file in a split is read as a separate sorted stream. The streams
 //! are merged by primary key using a LoserTree, and rows with the same key are
 //! deduplicated by keeping the one with the highest `_SEQUENCE_NUMBER`.
+//! Non-primary-key predicate conjuncts are enforced by an exact post-merge
+//! residual filter; only primary-key conjuncts are pushed below the merge.
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
@@ -48,6 +50,11 @@ use std::collections::HashMap;
 pub(crate) struct KeyValueFileReader {
     file_io: FileIO,
     config: KeyValueReadConfig,
+    /// PK-only conjuncts pushed down to the per-file readers before merge.
+    /// Non-PK conjuncts must not run pre-merge (they can change which version
+    /// of a key survives); they are enforced by the post-merge residual
+    /// filter using the full `config.predicates` instead.
+    pushdown_predicates: Vec<Predicate>,
 }
 
 /// Configuration for [`KeyValueFileReader`], grouping table schema and
@@ -65,37 +72,49 @@ pub(crate) struct KeyValueReadConfig {
     pub sequence_fields: Vec<String>,
 }
 
+/// Keep only the conjuncts of `predicates` that reference primary-key columns,
+/// preserving table-schema field indices. Mixed `AND`s keep their PK children;
+/// `OR`/`NOT` require every child to be PK-only (see
+/// [`Predicate::project_field_index_inclusive`]).
+///
+/// Used for pre-merge pushdown in [`KeyValueFileReader`] and for per-file
+/// stats pruning of primary-key tables in scan planning: a key's versions all
+/// share the key columns, so key conjuncts can never drop one version of a
+/// key while keeping another — non-key conjuncts can, which corrupts merge.
+pub(super) fn retain_primary_key_conjuncts(
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+    primary_keys: &[String],
+) -> Vec<Predicate> {
+    let pk_set: std::collections::HashSet<&str> = primary_keys.iter().map(|s| s.as_str()).collect();
+    let mapping: Vec<Option<usize>> = table_fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if pk_set.contains(f.name()) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    predicates
+        .iter()
+        .filter_map(|p| p.project_field_index_inclusive(&mapping))
+        .collect()
+}
+
 impl KeyValueFileReader {
     pub(crate) fn new(file_io: FileIO, config: KeyValueReadConfig) -> Self {
-        // Only keep predicates that reference primary key columns.
-        // Non-PK predicates applied before merge can cause incorrect results.
-        // Use project_field_index_inclusive: AND keeps PK children, OR requires all PK.
-        let pk_set: std::collections::HashSet<&str> =
-            config.primary_keys.iter().map(|s| s.as_str()).collect();
-        let mapping: Vec<Option<usize>> = config
-            .table_fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                if pk_set.contains(f.name()) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let pk_predicates = config
-            .predicates
-            .into_iter()
-            .filter_map(|p| p.project_field_index_inclusive(&mapping))
-            .collect();
-
+        let pushdown_predicates = retain_primary_key_conjuncts(
+            &config.predicates,
+            &config.table_fields,
+            &config.primary_keys,
+        );
         Self {
             file_io,
-            config: KeyValueReadConfig {
-                predicates: pk_predicates,
-                ..config
-            },
+            config,
+            pushdown_predicates,
         }
     }
 
@@ -193,6 +212,22 @@ impl KeyValueFileReader {
             }
         }
 
+        // Widen with predicate columns not already read so the post-merge
+        // residual filter can evaluate every leaf (predicate leaf indices are
+        // table-schema positions). Extras ride through the merge as ordinary
+        // value columns — partial-update/aggregation apply their configured
+        // per-field semantics to them, so the residual sees properly MERGED
+        // values — and the read_type reorder below drops them from the output.
+        let residual_file_predicates =
+            (!self.config.predicates.is_empty()).then(|| crate::arrow::format::FilePredicates {
+                predicates: self.config.predicates.clone(),
+                file_fields: self.config.table_fields.clone(),
+            });
+        let user_fields = crate::arrow::residual::widen_scan_fields(
+            &user_fields,
+            residual_file_predicates.as_ref(),
+        );
+
         // Internal read type: [_SEQ, _VK, user_fields...]
         let mut internal_read_type: Vec<DataField> = Vec::new();
         internal_read_type.push(seq_field);
@@ -274,7 +309,8 @@ impl KeyValueFileReader {
         let table_fields = self.config.table_fields;
         let table_name = self.config.table_name;
         let table_options = self.config.table_options;
-        let predicates = self.config.predicates;
+        let pushdown_predicates = self.pushdown_predicates;
+        let residual_predicates = self.config.predicates;
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
 
@@ -313,7 +349,7 @@ impl KeyValueFileReader {
                         table_schema_id,
                         table_fields.clone(),
                         internal_read_type.clone(),
-                        predicates.clone(),
+                        pushdown_predicates.clone(),
                     );
 
                     let stream = reader.read_single_file_stream(
@@ -355,6 +391,36 @@ impl KeyValueFileReader {
 
                 while let Some(batch) = merge_stream.next().await {
                     let batch = batch?;
+                    // Post-merge residual: enforce the FULL data predicate on
+                    // merged rows. PK conjuncts are also in this set (they were
+                    // already pushed down pre-merge); re-evaluating them on
+                    // already-matching rows is a no-op and keeps one shared
+                    // evaluator instead of deriving a non-PK subset. Runs on
+                    // the merge-output batch (keys + values, including widened
+                    // predicate columns); the reorder below projects the
+                    // output back to read_type.
+                    let batch = if residual_predicates.is_empty() {
+                        batch
+                    } else {
+                        match crate::arrow::residual::evaluate_predicates_mask(
+                            &batch,
+                            &residual_predicates,
+                            &table_fields,
+                            &merge_output_fields,
+                        )? {
+                            Some(mask) => {
+                                arrow_select::filter::filter_record_batch(&batch, &mask).map_err(
+                                    |e| Error::DataInvalid {
+                                        message: format!(
+                                            "Failed to filter merged batch by predicates: {e}"
+                                        ),
+                                        source: Some(Box::new(e)),
+                                    },
+                                )?
+                            }
+                            None => batch,
+                        }
+                    };
                     // Reorder columns from [keys..., values...] to read_type order.
                     let columns: Vec<_> = reorder_map
                         .iter()
@@ -375,5 +441,207 @@ impl KeyValueFileReader {
             }
         }
         .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema};
+    use crate::table::table_commit::TableCommit;
+    use crate::table::{Table, TableWrite};
+    use arrow_array::{Array, Int32Array};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    fn pk_table(file_io: &FileIO, table_path: &str, options: &[(&str, &str)]) -> Table {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1");
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_residual_t"),
+            table_path.to_string(),
+            TableSchema::new(0, &builder.build().unwrap()),
+            None,
+        )
+    }
+
+    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+    }
+
+    fn int_batch(ids: Vec<i32>, values: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn write_commit(table: &Table, batch: &RecordBatch) {
+        let mut tw = TableWrite::new(table, "test-user".to_string()).unwrap();
+        tw.write_arrow_batch(batch).await.unwrap();
+        let msgs = tw.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(msgs)
+            .await
+            .unwrap();
+    }
+
+    async fn read_rows(
+        table: &Table,
+        projection: Option<&[&str]>,
+        filter: Option<Predicate>,
+    ) -> Vec<RecordBatch> {
+        let mut rb = table.new_read_builder();
+        if let Some(cols) = projection {
+            rb.with_projection(cols);
+        }
+        if let Some(f) = filter {
+            rb.with_filter(f);
+        }
+        let plan = rb.new_scan().plan().await.unwrap();
+        let read = rb.new_read().unwrap();
+        futures::TryStreamExt::try_collect(read.to_arrow(plan.splits()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn int_column(batches: &[RecordBatch], name: &str) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let idx = b.schema().index_of(name).unwrap();
+                let arr = b.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Non-PK equality filter on a dedup PK table read through the sort-merge
+    /// path must return only matching rows. Before the post-merge residual,
+    /// the non-PK conjunct was silently dropped and all rows came back.
+    #[tokio::test]
+    async fn kv_read_applies_non_pk_filter_exactly() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_eq";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        // Overlapping keys across two commits -> split is not raw convertible
+        // -> forced through KeyValueFileReader.
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(21))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        assert_eq!(int_column(&batches, "id"), vec![2]);
+        assert_eq!(int_column(&batches, "value"), vec![21]);
+    }
+
+    /// Gap-A: the predicate column is NOT in the projection. The merge read
+    /// must widen internally, filter, then project back — output schema must
+    /// contain only the projected column.
+    #[tokio::test]
+    async fn kv_read_filters_on_unprojected_column() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_gap_a";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(21))
+            .unwrap();
+        let batches = read_rows(&table, Some(&["id"]), Some(filter)).await;
+
+        assert_eq!(int_column(&batches, "id"), vec![2]);
+        for batch in &batches {
+            assert_eq!(
+                batch.num_columns(),
+                1,
+                "widened predicate column must not leak into the output"
+            );
+            assert_eq!(batch.schema().field(0).name(), "id");
+        }
+    }
+
+    /// Regression: PK-column filters were already exact (pushed down pre-merge
+    /// AND now re-checked in the residual). Must stay exact.
+    #[tokio::test]
+    async fn kv_read_pk_filter_still_exact() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_pk";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(2))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        assert_eq!(int_column(&batches, "id"), vec![2]);
+        assert_eq!(int_column(&batches, "value"), vec![21]);
     }
 }
