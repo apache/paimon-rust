@@ -644,4 +644,308 @@ mod tests {
         assert_eq!(int_column(&batches, "id"), vec![2]);
         assert_eq!(int_column(&batches, "value"), vec![21]);
     }
+
+    /// A filter matching only a superseded version must return nothing: the
+    /// newer version wins the merge first, THEN the filter runs. If the full
+    /// predicate leaked below the merge, the stale (2, 20) row would survive
+    /// its file's scan, win against nothing, and leak into the output.
+    #[tokio::test]
+    async fn kv_read_filter_on_superseded_value_returns_nothing() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_superseded";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(20))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "superseded value must not resurrect through the filter"
+        );
+    }
+
+    /// Compound residual `value > 15 AND value < 25` on merged values.
+    #[tokio::test]
+    async fn kv_read_applies_compound_range_filter() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_range";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let pb = PredicateBuilder::new(&fields);
+        let filter = Predicate::and(vec![
+            pb.greater_than("value", Datum::Int(15)).unwrap(),
+            pb.less_than("value", Datum::Int(25)).unwrap(),
+        ]);
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        assert_eq!(int_column(&batches, "id"), vec![2]);
+        assert_eq!(int_column(&batches, "value"), vec![21]);
+    }
+
+    /// COUNT(*)-style read: empty projection + non-PK filter. The residual
+    /// runs on the pre-reorder merge batch (which still has columns), and the
+    /// zero-column output batch must carry the filtered row count.
+    #[tokio::test]
+    async fn kv_read_empty_projection_with_filter_keeps_row_count() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_count";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .greater_than("value", Datum::Int(15))
+            .unwrap();
+        let batches = read_rows(&table, Some(&[] as &[&str]), Some(filter)).await;
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "only merged rows with value > 15 (21, 31) count");
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 0);
+        }
+    }
+
+    /// String residual op (starts_with) on a value column — exercises the
+    /// residual string kernel on the KV path.
+    #[tokio::test]
+    async fn kv_read_applies_string_starts_with_filter() {
+        use crate::spec::VarCharType;
+        use arrow_array::StringArray;
+
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_string";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_residual_string_t"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let make = |ids: Vec<i32>, names: Vec<&str>| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(names)),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(
+            &table,
+            &make(vec![1, 2, 3], vec!["apple", "banana", "apricot"]),
+        )
+        .await;
+        write_commit(&table, &make(vec![2], vec!["avocado"])).await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .starts_with("name", Datum::String("a".to_string()))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        // Merged rows: (1, apple), (2, avocado), (3, apricot) — all start with 'a'.
+        // The overwritten (2, banana) must not resurrect; if the filter ran
+        // pre-merge it would also be wrong the other way (banana dropped, but
+        // then avocado wins anyway — so also assert the merged VALUE).
+        let mut ids = int_column(&batches, "id");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let idx = b.schema().index_of("name").unwrap();
+                let arr = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(names.contains(&"avocado".to_string()));
+        assert!(!names.contains(&"banana".to_string()));
+    }
+
+    /// Aggregation (sum): inputs 10 + 20 merge to 30. `value = 30` must match
+    /// the merged row (a pre-merge filter would drop both inputs);
+    /// `value = 10` must match nothing (a pre-merge filter would keep the
+    /// 10-input and leak it).
+    #[tokio::test]
+    async fn kv_read_aggregation_filters_on_merged_value() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_agg";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+
+        write_commit(&table, &int_batch(vec![1], vec![Some(10)])).await;
+        write_commit(&table, &int_batch(vec![1], vec![Some(20)])).await;
+
+        let fields = table.schema().fields().to_vec();
+
+        let match_merged = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(30))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(match_merged)).await;
+        assert_eq!(int_column(&batches, "id"), vec![1]);
+        assert_eq!(int_column(&batches, "value"), vec![30]);
+
+        let match_input = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(10))
+            .unwrap();
+        let batches = read_rows(&table, None, Some(match_input)).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "pre-merge input value must not leak through");
+    }
+
+    /// Aggregation + Gap-A: the aggregated predicate column is unprojected.
+    /// The widened column must be aggregated with its configured function
+    /// (sum), not treated as a plain latest-value column.
+    #[tokio::test]
+    async fn kv_read_aggregation_filters_merged_value_unprojected() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_agg_gap_a";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+
+        write_commit(&table, &int_batch(vec![1], vec![Some(10)])).await;
+        write_commit(&table, &int_batch(vec![1], vec![Some(20)])).await;
+
+        let fields = table.schema().fields().to_vec();
+        let filter = PredicateBuilder::new(&fields)
+            .equal("value", Datum::Int(30))
+            .unwrap();
+        let batches = read_rows(&table, Some(&["id"]), Some(filter)).await;
+        assert_eq!(int_column(&batches, "id"), vec![1]);
+    }
+
+    /// Partial-update: (1, a=5, b=NULL) then (1, a=NULL, b=7) merge to
+    /// (1, 5, 7). A conjunction over both columns only matches the MERGED row
+    /// — no single input row satisfies it.
+    #[tokio::test]
+    async fn kv_read_partial_update_filters_on_merged_row() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_pu";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("a", DataType::Int(IntType::new()))
+            .column("b", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_residual_pu_t"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]));
+        let make = |ids: Vec<i32>, a: Vec<Option<i32>>, b: Vec<Option<i32>>| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(Int32Array::from(b)),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(vec![1], vec![Some(5)], vec![None])).await;
+        write_commit(&table, &make(vec![1], vec![None], vec![Some(7)])).await;
+
+        let fields = table.schema().fields().to_vec();
+        let pb = PredicateBuilder::new(&fields);
+        let filter = Predicate::and(vec![
+            pb.equal("a", Datum::Int(5)).unwrap(),
+            pb.equal("b", Datum::Int(7)).unwrap(),
+        ]);
+        let batches = read_rows(&table, None, Some(filter)).await;
+
+        assert_eq!(int_column(&batches, "id"), vec![1]);
+        assert_eq!(int_column(&batches, "a"), vec![5]);
+        assert_eq!(int_column(&batches, "b"), vec![7]);
+    }
 }
