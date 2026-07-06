@@ -63,10 +63,10 @@ impl<'a> TableRead<'a> {
     }
 
     /// Set a filter predicate. Used conservatively for read-side pruning and
-    /// enforced exactly by the residual filter on append and data-evolution
-    /// read paths (see [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
+    /// enforced exactly by residual filtering on append, data-evolution, and
+    /// primary-key merge read paths (see
+    /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
-    /// Primary-key merge reads currently apply only primary-key conjuncts.
     pub fn with_filter(mut self, filter: Predicate) -> Self {
         let (_, data_predicates) = split_scan_predicates(self.table, filter);
         // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
