@@ -300,6 +300,7 @@ impl CopyOnWriteMergeWriter {
                         write_buffer_size,
                         file_format.to_string(),
                         write_fields.to_vec(),
+                        schema.options().clone(),
                         Some(0),
                         None,
                         None,

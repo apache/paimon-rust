@@ -18,6 +18,7 @@
 pub(crate) mod filtering;
 pub(crate) mod format;
 pub(crate) mod schema_evolution;
+pub(crate) mod shredding;
 
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,

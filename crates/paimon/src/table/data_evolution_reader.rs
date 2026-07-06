@@ -2735,9 +2735,10 @@ mod tests {
             )]));
             let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
             let output = file_io.new_output(&local_file_path(&vector_path)).unwrap();
-            let mut writer = create_format_writer(&output, arrow_schema, "zstd", 1, None, None)
-                .await
-                .unwrap();
+            let mut writer =
+                create_format_writer(&output, arrow_schema, "zstd", 1, None, None, None)
+                    .await
+                    .unwrap();
             writer.write(&batch).await.unwrap();
             writer.close().await.unwrap();
         }

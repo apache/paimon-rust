@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::shredding::PhysicalFormatWriterFactory;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::io::{FileRead, OutputFile};
@@ -63,6 +64,36 @@ pub(crate) struct ParquetFormatWriter {
     inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
 }
 
+pub(crate) struct ParquetPhysicalWriterFactory {
+    output: OutputFile,
+    compression: String,
+    zstd_level: i32,
+}
+
+impl ParquetPhysicalWriterFactory {
+    pub(crate) fn new(output: &OutputFile, compression: &str, zstd_level: i32) -> Self {
+        Self {
+            output: output.clone(),
+            compression: compression.to_string(),
+            zstd_level,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalFormatWriterFactory for ParquetPhysicalWriterFactory {
+    async fn create_writer(
+        &mut self,
+        schema: arrow_schema::SchemaRef,
+        _write_fields: Option<&[DataField]>,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        Ok(Box::new(
+            ParquetFormatWriter::new(&self.output, schema, &self.compression, self.zstd_level)
+                .await?,
+        ))
+    }
+}
+
 impl ParquetFormatWriter {
     pub(crate) async fn new(
         output: &OutputFile,
@@ -72,15 +103,23 @@ impl ParquetFormatWriter {
     ) -> crate::Result<Self> {
         let async_write = output.async_writer().await?;
         let codec = parse_compression(compression, zstd_level);
-        let props = WriterProperties::builder().set_compression(codec).build();
-        let inner = AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
-            crate::Error::DataInvalid {
-                message: format!("Failed to create parquet writer: {e}"),
-                source: None,
-            }
-        })?;
+        let inner = create_parquet_arrow_writer(async_write, schema, codec)?;
         Ok(Self { inner })
     }
+}
+
+fn create_parquet_arrow_writer(
+    async_write: Box<dyn crate::io::AsyncFileWrite>,
+    schema: arrow_schema::SchemaRef,
+    codec: Compression,
+) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
+    let props = WriterProperties::builder().set_compression(codec).build();
+    AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
+        crate::Error::DataInvalid {
+            message: format!("Failed to create parquet writer: {e}"),
+            source: None,
+        }
+    })
 }
 
 /// Map Paimon `file.compression` value to parquet [`Compression`].
@@ -222,8 +261,7 @@ impl FormatFileReader for ParquetFormatReader {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
         }
 
-        let batch_stream = batch_stream_builder.build()?;
-        Ok(batch_stream.map(|r| r.map_err(Error::from)).boxed())
+        Ok(batch_stream_builder.build()?.map_err(Error::from).boxed())
     }
 }
 
@@ -1615,12 +1653,16 @@ mod tests {
         AsyncArrowWriter, PageIndexPolicy, ParquetMetaDataReader, Predicate, PredicateOperator,
         RowSelection,
     };
-    use crate::arrow::format::FormatFileWriter;
+    use crate::arrow::format::{create_format_reader, create_format_writer, FormatFileWriter};
+    use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder};
-    use arrow_array::{Int32Array, RecordBatch};
+    use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder, VariantType};
+    use crate::variant::GenericVariant;
+    use arrow_array::{BinaryArray, Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn test_fields() -> Vec<DataField> {
@@ -2079,6 +2121,261 @@ mod tests {
             .downcast_ref::<Float32Array>()
             .expect("child should be Float32Array");
         assert_eq!(floats.values(), &[1.0, 2.0]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_variant_shredding_write_read_roundtrip() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+        ];
+        let options = HashMap::from([(
+            "parquet.variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"},{"name":"city","type":"STRING"}]}}]}"#.to_string(),
+        )]);
+        let variants = [
+            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":27}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"city":"Beijing","other":"xxx"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":"27"}"#).unwrap(),
+        ];
+        let value_items = variants
+            .iter()
+            .map(|variant| Some(variant.value()))
+            .collect::<Vec<_>>();
+        let metadata_items = variants
+            .iter()
+            .map(|variant| Some(variant.metadata()))
+            .collect::<Vec<_>>();
+        let variant_fields = match variant_arrow_type() {
+            arrow_schema::DataType::Struct(fields) => fields,
+            _ => unreachable!("variant_arrow_type is a struct"),
+        };
+        let variant_column = StructArray::try_new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from(value_items)),
+                Arc::new(BinaryArray::from(metadata_items)),
+            ],
+            None,
+        )
+        .unwrap();
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(variant_column),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/variant_shredding_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap();
+
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(raw_bytes, 1024)
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        let raw_variant_column = raw_batches[0].column_by_name("v").unwrap();
+        let arrow_schema::DataType::Struct(raw_variant_fields) = raw_variant_column.data_type()
+        else {
+            panic!("expected physical variant column to be a struct");
+        };
+        assert!(raw_variant_fields
+            .iter()
+            .any(|field| field.name() == "typed_value"));
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let payload = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let values = payload
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = payload
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for (idx, expected) in variants.iter().enumerate() {
+            let actual = GenericVariant::from_parts(
+                values.value(idx).to_vec(),
+                metadata.value(idx).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_variant_infer_shredding_write_read_roundtrip() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+        ];
+        let options = HashMap::from([
+            (
+                "variant.inferShreddingSchema".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "variant.shredding.maxInferBufferRow".to_string(),
+                "2".to_string(),
+            ),
+        ]);
+        let first_variants = vec![
+            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":28,"city":"Hangzhou"}"#).unwrap(),
+        ];
+        let late_variants =
+            vec![GenericVariant::parse_json(r#"{"age":"old","city":"Shanghai"}"#).unwrap()];
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let make_batch = |ids: Vec<i32>, variants: &[GenericVariant]| {
+            let value_items = variants
+                .iter()
+                .map(|variant| Some(variant.value()))
+                .collect::<Vec<_>>();
+            let metadata_items = variants
+                .iter()
+                .map(|variant| Some(variant.metadata()))
+                .collect::<Vec<_>>();
+            let variant_fields = match variant_arrow_type() {
+                arrow_schema::DataType::Struct(fields) => fields,
+                _ => unreachable!("variant_arrow_type is a struct"),
+            };
+            let variant_column = StructArray::try_new(
+                variant_fields,
+                vec![
+                    Arc::new(BinaryArray::from(value_items)),
+                    Arc::new(BinaryArray::from(metadata_items)),
+                ],
+                None,
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                logical_schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(variant_column)],
+            )
+            .unwrap()
+        };
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!(
+            "memory:/variant_infer_shredding_{}.parquet",
+            uuid::Uuid::new_v4()
+        );
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema.clone(),
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer
+            .write(&make_batch(vec![1, 2], &first_variants))
+            .await
+            .unwrap();
+        writer
+            .write(&make_batch(vec![3], &late_variants))
+            .await
+            .unwrap();
+        let file_size = writer.close().await.unwrap();
+
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(raw_bytes, 1024)
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        let raw_variant_column = raw_batches[0].column_by_name("v").unwrap();
+        let arrow_schema::DataType::Struct(raw_variant_fields) = raw_variant_column.data_type()
+        else {
+            panic!("expected physical variant column to be a struct");
+        };
+        assert!(raw_variant_fields
+            .iter()
+            .any(|field| field.name() == "typed_value"));
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let payload = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let values = payload
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = payload
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let expected = first_variants
+            .iter()
+            .chain(late_variants.iter())
+            .collect::<Vec<_>>();
+        for (idx, expected) in expected.iter().enumerate() {
+            let actual = GenericVariant::from_parts(
+                values.value(idx).to_vec(),
+                metadata.value(idx).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
+        }
     }
 
     // -----------------------------------------------------------------------

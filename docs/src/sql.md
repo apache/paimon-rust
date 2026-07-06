@@ -208,6 +208,54 @@ SELECT
     is_variant_null(NULL) AS sql_null;
 ```
 
+### Variant Shredding
+
+Variant shredding stores selected fields from a `VARIANT` column as typed
+physical fields in Parquet files while keeping the logical table schema as
+`VARIANT`. Reads are automatic: when a projected `VARIANT` column is stored in
+shredded physical form, Paimon Rust assembles it back into the normal
+value + metadata representation before returning the batch.
+
+Use a configured shredding schema when the hot fields are known in advance:
+
+```sql
+CREATE TABLE paimon.my_db.shredded_events (
+    user_id BIGINT,
+    payload VARIANT
+) WITH (
+    'file.format' = 'parquet',
+    'variant.shreddingSchema' =
+        '{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"event","type":"STRING"},{"name":"score","type":"DOUBLE"},{"name":"city","type":"STRING"}]}}]}'
+);
+```
+
+The configured schema is a Paimon `ROW` type encoded as JSON. Field IDs may be
+omitted; Paimon Rust assigns them by position. Each top-level field name must
+match a `VARIANT` column to shred. The field's type describes the typed fields
+to extract from that Variant value; values that do not match the typed field
+still remain in the Variant payload so the logical value can be rebuilt on read.
+
+Use inferred shredding when the hot fields should be discovered from the first
+rows written by each data-file writer:
+
+```sql
+CREATE TABLE paimon.my_db.inferred_events (
+    user_id BIGINT,
+    payload VARIANT
+) WITH (
+    'file.format' = 'parquet',
+    'variant.inferShreddingSchema' = 'true',
+    'variant.shredding.maxInferBufferRow' = '4096',
+    'variant.shredding.maxSchemaDepth' = '50',
+    'variant.shredding.maxSchemaWidth' = '300',
+    'variant.shredding.minFieldCardinalityRatio' = '0.1'
+);
+```
+
+When both configured and inferred shredding are set, the configured schema takes
+precedence. Shredding currently applies to Parquet data-file writes; ordinary
+non-shredded `VARIANT` files continue to read normally.
+
 Current limitations:
 
 - `schema_of_variant`, `schema_of_variant_agg`, `to_variant_object`, `variant_explode`, and `variant_explode_outer` are not implemented yet.
@@ -1164,6 +1212,27 @@ This is not full Java feature parity. Aggregation tables do not support retract
 rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
 bucket writes, or advanced aggregation options such as `ignore-retract`,
 `distinct`, `nested-key`, `count-limit`, and sequence groups.
+
+### Variant Shredding Options
+
+Set these as table options when writing `VARIANT` columns to Parquet. The
+logical table schema remains `VARIANT`; the options only affect the physical
+file layout and automatic read-time assembly.
+
+| Option | Default | Description |
+|---|---:|---|
+| `variant.shreddingSchema` | unset | Configured shredding schema as a Paimon `ROW` type JSON string. Top-level field names match `VARIANT` column names, and their nested types describe the typed fields to extract. |
+| `parquet.variant.shreddingSchema` | unset | Parquet-scoped alias for `variant.shreddingSchema`. |
+| `variant.inferShreddingSchema` | `false` | Enables per-writer schema inference for `VARIANT` columns when no configured shredding schema is set. |
+| `parquet.variant.inferShreddingSchema` | `false` | Parquet-scoped alias for `variant.inferShreddingSchema`. |
+| `variant.shredding.maxInferBufferRow` | `4096` | Number of initial rows buffered per data-file writer before inferring the shredding schema. If fewer rows are written, inference runs when the writer is flushed or closed. |
+| `variant.shredding.maxSchemaDepth` | `50` | Maximum nested depth considered by inference. |
+| `variant.shredding.maxSchemaWidth` | `300` | Maximum number of inferred typed fields across inferred Variant schemas. |
+| `variant.shredding.minFieldCardinalityRatio` | `0.1` | Minimum ratio of sampled non-null Variant values that must contain a field before inference keeps it as a typed field. |
+
+Configured shredding takes precedence over inferred shredding. If a table has no
+`VARIANT` columns, or none of these options enable shredding, Paimon Rust writes
+the normal physical format without wrapping the writer.
 
 ### Other Options
 

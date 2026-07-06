@@ -208,7 +208,8 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader(&path_to_read, blob_as_descriptor)?;
+            let format_reader =
+                create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
             let local_ranges = row_ranges.as_ref().map(|ranges| {
@@ -614,7 +615,7 @@ mod row_tests {
         let file_name = "part-0.row";
         let file_path = format!("{bucket_path}/{file_name}");
         let output = file_io.new_output(&file_path).unwrap();
-        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None)
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
             .await
             .unwrap();
         writer.write(&batch).await.unwrap();

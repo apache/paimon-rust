@@ -641,6 +641,7 @@ impl TableWrite {
                 self.file_format.clone(),
                 &input_schema,
                 fields,
+                self.table.schema().options(),
                 &self.blob_descriptor_fields,
             )))
         } else {
@@ -656,6 +657,7 @@ impl TableWrite {
                 self.write_buffer_size,
                 self.file_format.clone(),
                 self.table.schema().fields().to_vec(),
+                self.table.schema().options().clone(),
                 Some(0),
                 None,
                 None,
@@ -909,10 +911,10 @@ mod tests {
         file_path: &str,
         file_size: i64,
     ) -> Vec<RecordBatch> {
-        let format_reader = create_format_reader(file_path, false).unwrap();
+        let read_fields = physical_key_value_fields();
+        let format_reader = create_format_reader(file_path, false, &read_fields).unwrap();
         let input = file_io.new_input(file_path).unwrap();
         let file_reader = input.reader().await.unwrap();
-        let read_fields = physical_key_value_fields();
         let stream = format_reader
             .read_batch_stream(
                 Box::new(file_reader),
@@ -1055,7 +1057,8 @@ mod tests {
             bucket_dir_name(messages[0].bucket),
             data_file.file_name
         );
-        let format_reader = create_format_reader(&file_path, false).unwrap();
+        let format_reader =
+            create_format_reader(&file_path, false, table.schema().fields()).unwrap();
         let input = file_io.new_input(&file_path).unwrap();
         let stream = format_reader
             .read_batch_stream(

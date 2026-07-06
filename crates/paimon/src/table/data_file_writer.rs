@@ -29,6 +29,7 @@ use crate::spec::{bucket_dir_name, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
+use std::collections::HashMap;
 use tokio::task::JoinSet;
 
 /// Low-level writer that produces Parquet data files for a single (partition, bucket).
@@ -50,6 +51,7 @@ pub(crate) struct DataFileWriter {
     write_buffer_size: i64,
     file_format: String,
     write_fields: Vec<DataField>,
+    format_options: HashMap<String, String>,
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
@@ -76,6 +78,7 @@ impl DataFileWriter {
         write_buffer_size: i64,
         file_format: String,
         write_fields: Vec<DataField>,
+        format_options: HashMap<String, String>,
         file_source: Option<i32>,
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
@@ -92,6 +95,7 @@ impl DataFileWriter {
             write_buffer_size,
             file_format,
             write_fields,
+            format_options,
             file_source,
             first_row_id,
             write_cols,
@@ -160,6 +164,7 @@ impl DataFileWriter {
             self.file_compression_zstd_level,
             Some(self.file_io.clone()),
             Some(&self.write_fields),
+            Some(&self.format_options),
         )
         .await?;
         self.current_writer = Some(writer);

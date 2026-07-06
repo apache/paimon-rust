@@ -22,6 +22,7 @@ mod mosaic;
 mod orc;
 mod parquet;
 mod row;
+mod shredding;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -35,6 +36,7 @@ use crate::Error;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 /// Predicates with the file-level field context needed for pushdown.
 /// Only used by formats that support predicate pushdown (e.g. Parquet).
@@ -98,37 +100,45 @@ pub(crate) trait FormatFileWriter: Send {
 pub(crate) fn create_format_reader(
     path: &str,
     blob_as_descriptor: bool,
+    read_fields: &[DataField],
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".parquet") {
-        Ok(Box::new(parquet::ParquetFormatReader))
+    let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
+        Box::new(parquet::ParquetFormatReader)
     } else if lower.ends_with(".blob") {
-        Ok(Box::new(blob::BlobFormatReader::new(
+        Box::new(blob::BlobFormatReader::new(
             path.to_string(),
             blob_as_descriptor,
-        )))
+        ))
     } else if lower.ends_with(".orc") {
-        Ok(Box::new(orc::OrcFormatReader))
+        Box::new(orc::OrcFormatReader)
     } else if lower.ends_with(".avro") {
-        Ok(Box::new(avro::AvroFormatReader))
+        Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
-        Ok(Box::new(row::RowFormatReader))
+        Box::new(row::RowFormatReader)
     } else {
         #[cfg(feature = "mosaic")]
         if lower.ends_with(".mosaic") {
-            return Ok(Box::new(mosaic::MosaicFormatReader));
+            return Ok(shredding::maybe_wrap_reader(
+                Box::new(mosaic::MosaicFormatReader),
+                read_fields,
+            ));
         }
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
-            return Ok(Box::new(vortex::VortexFormatReader));
+            return Ok(shredding::maybe_wrap_reader(
+                Box::new(vortex::VortexFormatReader),
+                read_fields,
+            ));
         }
-        Err(Error::Unsupported {
+        return Err(Error::Unsupported {
             message: format!(
                 "unsupported file format: expected {}, got: {path}",
                 supported_read_formats().join(", ")
             ),
-        })
-    }
+        });
+    };
+    Ok(shredding::maybe_wrap_reader(reader, read_fields))
 }
 
 fn supported_read_formats() -> Vec<&'static str> {
@@ -153,13 +163,23 @@ pub(crate) async fn create_format_writer(
     zstd_level: i32,
     file_io: Option<crate::io::FileIO>,
     write_fields: Option<&[DataField]>,
+    format_options: Option<&HashMap<String, String>>,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
     let path = output.location();
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
-        Ok(Box::new(
-            parquet::ParquetFormatWriter::new(output, schema, compression, zstd_level).await?,
-        ))
+        let writer_factory = Box::new(parquet::ParquetPhysicalWriterFactory::new(
+            output,
+            compression,
+            zstd_level,
+        ));
+        shredding::ShreddingFormatWriter::create(
+            writer_factory,
+            schema,
+            write_fields,
+            format_options,
+        )
+        .await
     } else if lower.ends_with(".blob") {
         Ok(Box::new(
             blob::BlobFormatWriter::new(output, file_io).await?,

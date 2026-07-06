@@ -21,7 +21,7 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) fn is_blob_file_name(file_name: &str) -> bool {
@@ -65,6 +65,7 @@ impl AppendBlobFileWriter {
         file_format: String,
         input_schema: &arrow_schema::Schema,
         table_fields: &[crate::spec::DataField],
+        format_options: &HashMap<String, String>,
         blob_descriptor_fields: &HashSet<String>,
     ) -> Self {
         let mut normal_column_indices = Vec::new();
@@ -90,6 +91,7 @@ impl AppendBlobFileWriter {
                         write_buffer_size,
                         "blob".to_string(),
                         vec![field.clone()],
+                        HashMap::new(),
                         Some(0),
                         None,
                         Some(vec![field.name().to_string()]),
@@ -118,6 +120,7 @@ impl AppendBlobFileWriter {
             write_buffer_size,
             file_format,
             normal_table_fields,
+            format_options.clone(),
             Some(0),
             None,
             None,
