@@ -634,9 +634,10 @@ mod tests {
         assert!(retain_primary_key_conjuncts(&[or], &fields, &pks).is_empty());
 
         // Constant predicates reference no columns and must survive the PK
-        // trim verbatim. Dropping AlwaysFalse here would be catastrophic:
-        // scan-side stats pruning treats it as prune-everything, so losing it
-        // would flip "return no rows" into "return every row".
+        // trim verbatim. The post-merge residual (full predicate set) would
+        // still mask every row to false if AlwaysFalse were dropped here, but
+        // the scan/pushdown layers would lose their prune-everything fast
+        // path (stats_filter treats any AlwaysFalse as prune-all).
         let kept = retain_primary_key_conjuncts(&[Predicate::AlwaysFalse], &fields, &pks);
         assert_eq!(kept.len(), 1);
         assert!(matches!(&kept[0], Predicate::AlwaysFalse));
@@ -1050,11 +1051,11 @@ mod tests {
         assert_eq!(int_column(&batches, "b"), vec![7]);
     }
 
-    /// An AlwaysFalse filter on a PK table must return nothing. AlwaysFalse
-    /// references no columns, so a PK-conjunct trim that dropped it (instead
-    /// of preserving it verbatim) would remove the only thing stopping the
-    /// read — stats pruning treats AlwaysFalse as prune-everything, and the
-    /// residual masks every row to false — and every row would come back.
+    /// An AlwaysFalse filter on a PK table must return nothing, end to end.
+    /// Two layers enforce it: scan-side stats pruning treats AlwaysFalse as
+    /// prune-everything (plans no files), and the post-merge residual masks
+    /// every row to false. This locks the composed contract regardless of
+    /// which layer short-circuits first.
     #[tokio::test]
     async fn kv_read_always_false_filter_returns_nothing() {
         let file_io = test_file_io();
