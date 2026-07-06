@@ -345,6 +345,66 @@ pub(super) fn can_push_down_limit_hint_for_scan(
     data_predicates.is_empty() && row_ranges.is_none()
 }
 
+#[derive(Debug)]
+struct LimitPushdownResult {
+    splits: Vec<DataSplit>,
+    split_candidates_built: usize,
+    limit_early_stopped: bool,
+}
+
+#[derive(Debug)]
+struct LimitPushdownAccumulator {
+    limit: usize,
+    fallback_splits: Vec<DataSplit>,
+    limited_splits: Vec<DataSplit>,
+    scanned_row_count: i64,
+    limit_early_stopped: bool,
+}
+
+impl LimitPushdownAccumulator {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            fallback_splits: Vec::new(),
+            limited_splits: Vec::new(),
+            scanned_row_count: 0,
+            limit_early_stopped: limit == 0,
+        }
+    }
+
+    fn push(&mut self, split: DataSplit) -> bool {
+        if self.limit_early_stopped {
+            return true;
+        }
+
+        if let Some(merged_count) = split.merged_row_count() {
+            self.fallback_splits.push(split.clone());
+            self.limited_splits.push(split);
+            self.scanned_row_count += merged_count;
+            self.limit_early_stopped = self.scanned_row_count >= self.limit as i64;
+        } else {
+            self.fallback_splits.push(split);
+        }
+
+        self.limit_early_stopped
+    }
+
+    fn finish(self) -> LimitPushdownResult {
+        let split_candidates_built = self.fallback_splits.len();
+        let splits = if self.limit_early_stopped {
+            self.limited_splits
+        } else {
+            self.fallback_splits
+        };
+
+        LimitPushdownResult {
+            splits,
+            split_candidates_built,
+            limit_early_stopped: self.limit_early_stopped,
+        }
+    }
+}
+
 type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
 
 fn global_index_detail_data_ranges(groups: &BucketDataFileGroups) -> Vec<RowRange> {
@@ -735,33 +795,21 @@ impl<'a> TableScan<'a> {
     /// committed only once the accumulated known row count reaches the limit;
     /// if it never does, the original split list is returned unchanged. The
     /// caller or query engine must still enforce the final LIMIT.
+    #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         let limit = match self.limit {
             Some(l) => l,
             None => return splits,
         };
-        if limit == 0 {
-            return Vec::new();
-        }
+        let mut accumulator = LimitPushdownAccumulator::new(limit);
 
-        if splits.is_empty() {
-            return splits;
-        }
-
-        let mut limited_splits = Vec::new();
-        let mut scanned_row_count: i64 = 0;
-
-        for split in &splits {
-            if let Some(merged_count) = split.merged_row_count() {
-                limited_splits.push(split.clone());
-                scanned_row_count += merged_count;
-                if scanned_row_count >= limit as i64 {
-                    return limited_splits;
-                }
+        for split in splits {
+            if accumulator.push(split) {
+                break;
             }
         }
 
-        splits
+        accumulator.finish().splits
     }
 
     /// Read all manifest entries from a snapshot, applying filters and merging.
@@ -944,6 +992,13 @@ impl<'a> TableScan<'a> {
             }
         }
 
+        if matches!(self.limit, Some(0)) {
+            if let Some(trace) = trace {
+                trace.record_final_plan_with_limit(0, 0, 0, 0, true);
+            }
+            return Ok(Plan::new(Vec::new()));
+        }
+
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
         let mut groups: BucketDataFileGroups = HashMap::with_capacity(entries.len());
         for e in entries {
@@ -1039,7 +1094,15 @@ impl<'a> TableScan<'a> {
             };
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
-        for ((partition, bucket), (total_buckets, data_files)) in groups {
+        let can_push_down_limit = self.can_push_down_limit_hint(effective_row_ranges.as_deref());
+        let mut limit_accumulator = match self.limit {
+            Some(limit) if limit > 0 && can_push_down_limit => {
+                Some(LimitPushdownAccumulator::new(limit))
+            }
+            _ => None,
+        };
+
+        'groups: for ((partition, bucket), (total_buckets, data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
             let bucket_path = if let Some(ref computer) = partition_computer {
                 let partition_path = computer.generate_partition_path(&partition_row)?;
@@ -1220,21 +1283,39 @@ impl<'a> TableScan<'a> {
                 if let Some(row_ranges) = split_row_ranges {
                     builder = builder.with_row_ranges(row_ranges);
                 }
-                splits.push(builder.build()?);
+                let split = builder.build()?;
+                if let Some(accumulator) = limit_accumulator.as_mut() {
+                    if accumulator.push(split) {
+                        break 'groups;
+                    }
+                } else {
+                    splits.push(split);
+                }
             }
         }
 
-        // With data predicates or row_ranges, merged_row_count() reflects pre-filter
-        // row counts, so stopping early could return fewer rows than the limit.
-        let splits_before_limit = splits.len();
-        let splits = if self.can_push_down_limit_hint(effective_row_ranges.as_deref()) {
-            self.apply_limit_pushdown(splits)
-        } else {
-            splits
-        };
+        let (splits, split_candidates_built, limit_early_stopped) =
+            if let Some(accumulator) = limit_accumulator {
+                let result = accumulator.finish();
+                (
+                    result.splits,
+                    result.split_candidates_built,
+                    result.limit_early_stopped,
+                )
+            } else {
+                let split_candidates_built = splits.len();
+                (splits, split_candidates_built, false)
+            };
+        let splits_before_limit = split_candidates_built;
         if let Some(trace) = trace {
             let final_files = splits.iter().map(|split| split.data_files().len()).sum();
-            trace.record_final_plan(splits_before_limit, splits.len(), final_files);
+            trace.record_final_plan_with_limit(
+                split_candidates_built,
+                splits_before_limit,
+                splits.len(),
+                final_files,
+                limit_early_stopped,
+            );
         }
 
         Ok(Plan::new(splits))
@@ -1244,7 +1325,8 @@ impl<'a> TableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        prune_data_evolution_group_by_read_fields, should_skip_level_zero_for_scan, TableScan,
+        prune_data_evolution_group_by_read_fields, should_skip_level_zero_for_scan,
+        LimitPushdownAccumulator, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -1484,6 +1566,13 @@ mod tests {
         )
     }
 
+    fn scan_trace_small_split_table(table_path: &str) -> Table {
+        scan_trace_test_table(table_path).copy_with_options(HashMap::from([
+            ("source.split.target-size".to_string(), "1b".to_string()),
+            ("source.split.open-file-cost".to_string(), "1b".to_string()),
+        ]))
+    }
+
     async fn setup_scan_trace_dirs(table: &Table) {
         table
             .file_io()
@@ -1646,6 +1735,50 @@ mod tests {
 
         // The merge split is skipped; only the counted split commits pruning.
         assert_eq!(split_file_names(&pruned), vec!["a.parquet"]);
+    }
+
+    #[test]
+    fn test_incremental_limit_accumulator_stops_after_known_count_reaches_limit() {
+        let mut accumulator = LimitPushdownAccumulator::new(3);
+
+        assert!(!accumulator.push(limit_test_split("a.parquet", 2)));
+        assert!(
+            !accumulator.push(limit_test_split_with_unknown_merged_row_count(
+                "b.parquet",
+                4
+            ))
+        );
+        assert!(accumulator.push(limit_test_split("c.parquet", 3)));
+
+        let result = accumulator.finish();
+        assert!(result.limit_early_stopped);
+        assert_eq!(result.split_candidates_built, 3);
+        assert_eq!(
+            split_file_names(&result.splits),
+            vec!["a.parquet", "c.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_incremental_limit_accumulator_returns_fallback_when_limit_not_reached() {
+        let mut accumulator = LimitPushdownAccumulator::new(100);
+
+        assert!(!accumulator.push(limit_test_split("a.parquet", 2)));
+        assert!(
+            !accumulator.push(limit_test_split_with_unknown_merged_row_count(
+                "b.parquet",
+                4
+            ))
+        );
+        assert!(!accumulator.push(limit_test_split("c.parquet", 3)));
+
+        let result = accumulator.finish();
+        assert!(!result.limit_early_stopped);
+        assert_eq!(result.split_candidates_built, 3);
+        assert_eq!(
+            split_file_names(&result.splits),
+            vec!["a.parquet", "b.parquet", "c.parquet"]
+        );
     }
 
     #[test]
@@ -2017,6 +2150,79 @@ mod tests {
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "BETWEEN should prune files outside the min/max range: {trace:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_trace_records_limit_early_stop_during_split_construction() {
+        let table_path =
+            "memory:/test_plan_with_trace_records_limit_early_stop_during_split_construction";
+        let table = scan_trace_small_split_table(table_path);
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "scan-trace-limit-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    stats_trace_file("limit-1.parquet", 1, 1),
+                    stats_trace_file("limit-2.parquet", 2, 2),
+                    stats_trace_file("limit-3.parquet", 3, 3),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let (_full_plan, full_trace) = table
+            .new_read_builder()
+            .new_scan()
+            .plan_with_trace()
+            .await
+            .unwrap();
+        let mut limited_reader = table.new_read_builder();
+        limited_reader.with_limit(2);
+        let (_limited_plan, limited_trace) =
+            limited_reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(
+            full_trace.final_splits, 3,
+            "fixture should build three splits: {full_trace:?}"
+        );
+        assert!(!full_trace.limit_early_stopped);
+        assert_eq!(full_trace.split_candidates_built, full_trace.final_splits);
+        assert!(limited_trace.limit_early_stopped);
+        assert!(
+            limited_trace.split_candidates_built < full_trace.split_candidates_built,
+            "limited trace should show construction-time stop: full={full_trace:?}, limited={limited_trace:?}"
+        );
+        assert_eq!(limited_trace.final_splits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_trace_zero_limit_records_no_split_candidates() {
+        let table_path = "memory:/test_plan_with_trace_zero_limit_records_no_split_candidates";
+        let table = scan_trace_small_split_table(table_path);
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "scan-trace-zero-limit-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    stats_trace_file("zero-1.parquet", 1, 1),
+                    stats_trace_file("zero-2.parquet", 2, 2),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let mut reader = table.new_read_builder();
+        reader.with_limit(0);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert!(plan.splits().is_empty());
+        assert!(trace.limit_early_stopped);
+        assert_eq!(trace.split_candidates_built, 0);
+        assert_eq!(trace.final_splits, 0);
     }
 
     #[test]

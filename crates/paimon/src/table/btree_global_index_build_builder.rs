@@ -559,7 +559,7 @@ async fn extract_index_rows(
     let splits = build_read_splits_for_shard(shard)?;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME]);
+    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
     let read = read_builder.new_read()?;
     let batches = read.to_arrow(&splits)?.try_collect::<Vec<_>>().await?;
     extract_index_rows_from_batches(

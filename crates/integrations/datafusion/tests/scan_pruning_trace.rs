@@ -238,12 +238,22 @@ async fn test_scan_trace_records_bucket_limit_and_time_travel() {
         "bucket-key predicate should prune manifest entries by bucket: {bucket_trace:?}"
     );
 
+    let (_full_plan, full_trace) = table
+        .new_read_builder()
+        .new_scan()
+        .plan_with_trace()
+        .await
+        .unwrap();
     let mut limit_reader = table.new_read_builder();
     limit_reader.with_limit(1);
     let (_limit_plan, limit_trace) = limit_reader.new_scan().plan_with_trace().await.unwrap();
     assert!(
-        limit_trace.splits_after_limit < limit_trace.splits_before_limit,
-        "LIMIT should reduce planned splits when no data residual exists: {limit_trace:?}"
+        limit_trace.limit_early_stopped,
+        "LIMIT should stop split construction early when no data residual exists: {limit_trace:?}"
+    );
+    assert!(
+        limit_trace.split_candidates_built < full_trace.split_candidates_built,
+        "LIMIT should build fewer split candidates: limited={limit_trace:?}, full={full_trace:?}"
     );
 
     let snapshot_one_table = table.copy_with_options(HashMap::from([(
