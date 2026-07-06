@@ -44,20 +44,27 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
-| `storage-cos`    | Tencent Cloud COS|
-| `storage-azdls`  | Azure Data Lake Storage Gen2 |
-| `storage-obs`    | Huawei Cloud OBS |
-| `storage-gcs`    | Google Cloud Storage |
+| `storage-cos`    | Tencent Cloud COS <sup>[1]</sup> |
+| `storage-azdls`  | Azure Data Lake Storage Gen2 <sup>[1]</sup> |
+| `storage-obs`    | Huawei Cloud OBS <sup>[1]</sup> |
+| `storage-gcs`    | Google Cloud Storage <sup>[1]</sup> |
 | `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
 
-## Optional File Formats
-
-Mosaic data files can be read by enabling the `mosaic` feature:
+<sup>[1]</sup> Not in the latest release yet; available on the `main` branch. To use it now, depend on the git repository instead of a published version:
 
 ```toml
 [dependencies]
-paimon = { version = "0.2.0", features = ["mosaic"] }
+paimon = { git = "https://github.com/apache/paimon-rust", features = ["storage-cos"] }
+```
+
+## Optional File Formats
+
+Mosaic data files can be read by enabling the `mosaic` feature. This feature is not in the latest release yet; it is available on the `main` branch:
+
+```toml
+[dependencies]
+paimon = { git = "https://github.com/apache/paimon-rust", features = ["mosaic"] }
 ```
 
 The current Mosaic support is read-only. Paimon Rust can read existing `.mosaic` data files in a Paimon table, but it does not write Mosaic data files yet.
