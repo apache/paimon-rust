@@ -46,7 +46,9 @@ async fn scan_and_read<C: Catalog + ?Sized>(
 
     let mut read_builder = table.new_read_builder();
     if let Some(cols) = projection {
-        read_builder.with_projection(cols);
+        read_builder
+            .with_projection(cols)
+            .expect("Invalid projection");
     }
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
@@ -107,7 +109,9 @@ async fn scan_and_read_with_projection_and_filter(
 ) -> (Plan, Vec<RecordBatch>) {
     let mut read_builder = table.new_read_builder();
     if let Some(cols) = projection {
-        read_builder.with_projection(cols);
+        read_builder
+            .with_projection(cols)
+            .expect("Invalid projection");
     }
     read_builder.with_filter(filter);
     let scan = read_builder.new_scan();
@@ -486,7 +490,9 @@ async fn test_read_projection_empty() {
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&[]);
+    read_builder
+        .with_projection(&[])
+        .expect("Empty projection should succeed");
     let read = read_builder
         .new_read()
         .expect("Empty projection should succeed");
@@ -528,9 +534,8 @@ async fn test_read_projection_unknown_column() {
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["id", "nonexistent_column"]);
     let err = read_builder
-        .new_read()
+        .with_projection(&["id", "nonexistent_column"])
         .expect_err("Unknown columns should fail");
 
     assert!(
@@ -551,9 +556,8 @@ async fn test_read_projection_all_invalid() {
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["nonexistent_a", "nonexistent_b"]);
     let err = read_builder
-        .new_read()
+        .with_projection(&["nonexistent_a", "nonexistent_b"])
         .expect_err("All-invalid projection should fail");
 
     assert!(
@@ -574,9 +578,8 @@ async fn test_read_projection_duplicate_column() {
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["id", "id"]);
     let err = read_builder
-        .new_read()
+        .with_projection(&["id", "id"])
         .expect_err("Duplicate projection should fail");
 
     assert!(
@@ -3164,7 +3167,9 @@ async fn test_read_data_evolution_table_with_row_id_projection() {
 
     // Project _ROW_ID along with regular columns
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["_ROW_ID", "id", "name"]);
+    read_builder
+        .with_projection(&["_ROW_ID", "id", "name"])
+        .expect("Row ID projection should succeed");
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
 
@@ -3233,7 +3238,9 @@ async fn test_read_data_evolution_table_only_row_id_with_row_ranges() {
     // Project only _ROW_ID with a partial row range
     let mid = min_row_id + (max_row_id - min_row_id) / 2;
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["_ROW_ID"]);
+    read_builder
+        .with_projection(&["_ROW_ID"])
+        .expect("Row ID projection should succeed");
     read_builder.with_row_ranges(vec![RowRange::new(min_row_id, mid)]);
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("plan");
@@ -3267,7 +3274,9 @@ async fn test_read_data_evolution_mixed_format_row_id_projection() {
     let table = get_table_from_catalog(&catalog, "data_evolution_mixed_format_add_column").await;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&["_ROW_ID", "id"]);
+    read_builder
+        .with_projection(&["_ROW_ID", "id"])
+        .expect("Row ID projection should succeed");
     let scan = read_builder.new_scan();
     let plan = scan.plan().await.expect("Failed to plan scan");
 

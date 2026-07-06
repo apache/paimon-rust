@@ -28,6 +28,9 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use paimon::spec::{
+    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+};
 use paimon::table::Table;
 
 use crate::physical_plan::PaimonDataSink;
@@ -39,6 +42,18 @@ use crate::filter_pushdown::build_pushed_predicate;
 use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
+
+pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
+    let mut fields = table.schema().fields().to_vec();
+    if CoreOptions::new(table.schema().options()).data_evolution_enabled() {
+        fields.push(DataField::new(
+            ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::with_nullable(true)),
+        ));
+    }
+    fields
+}
 
 /// Read-only table provider for a Paimon table.
 ///
@@ -60,15 +75,7 @@ impl PaimonTableProvider {
     ///
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
-        let mut fields = table.schema().fields().to_vec();
-        let core_options = paimon::spec::CoreOptions::new(table.schema().options());
-        if core_options.data_evolution_enabled() {
-            fields.push(paimon::spec::DataField::new(
-                paimon::spec::ROW_ID_FIELD_ID,
-                paimon::spec::ROW_ID_FIELD_NAME.to_string(),
-                paimon::spec::DataType::BigInt(paimon::spec::BigIntType::with_nullable(true)),
-            ));
-        }
+        let fields = datafusion_read_fields(&table);
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
         Ok(Self { table, schema })
@@ -113,21 +120,19 @@ pub(crate) struct PaimonScanBuilder<'a> {
 impl PaimonScanBuilder<'_> {
     /// Build a [`PaimonTableScan`] from the configured parameters.
     pub(crate) fn build(self) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (projected_schema, projected_columns) = if let Some(indices) = self.projection {
+        let read_fields = datafusion_read_fields(self.table);
+        let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
                 .map(|&i| self.schema.field(i).clone())
                 .collect();
-            let column_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
-            (Arc::new(Schema::new(fields)), Some(column_names))
-        } else {
-            let column_names: Vec<String> = self
-                .schema
-                .fields()
+            let read_type = indices
                 .iter()
-                .map(|f| f.name().clone())
-                .collect();
-            (self.schema.clone(), Some(column_names))
+                .map(|&i| read_fields[i].clone())
+                .collect::<Vec<_>>();
+            (Arc::new(Schema::new(fields)), read_type)
+        } else {
+            (self.schema.clone(), read_fields)
         };
 
         let splits = self.plan.splits().to_vec();
@@ -144,12 +149,13 @@ impl PaimonScanBuilder<'_> {
         Ok(Arc::new(PaimonTableScan::new(
             projected_schema,
             self.table.clone(),
-            projected_columns,
+            read_type,
             self.pushed_predicate,
             planned_partitions,
             self.limit,
             self.filter_exact,
             self.scan_trace,
+            None,
         )))
     }
 }
@@ -174,15 +180,13 @@ impl TableProvider for PaimonTableProvider {
         // Plan splits eagerly so we know partition count upfront.
         let filter_analysis = analyze_filters(filters, self.table.schema().fields());
         let mut read_builder = self.table.new_read_builder();
-        let projected_columns = projection.map(|indices| {
-            indices
+        if let Some(indices) = projection {
+            let read_fields = datafusion_read_fields(&self.table);
+            let read_type = indices
                 .iter()
-                .map(|&i| self.schema.field(i).name().clone())
-                .collect::<Vec<_>>()
-        });
-        if let Some(ref columns) = projected_columns {
-            let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-            read_builder.with_projection(&col_refs);
+                .map(|&i| read_fields[i].clone())
+                .collect::<Vec<_>>();
+            read_builder.with_read_type(read_type);
         }
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);

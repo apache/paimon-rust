@@ -112,8 +112,7 @@ pub unsafe extern "C" fn paimon_read_builder_free(rb: *mut paimon_read_builder) 
 ///
 /// The `columns` parameter is a null-terminated array of null-terminated C strings.
 /// Output order follows the caller-specified order. Unknown or duplicate names
-/// cause `paimon_read_builder_new_read()` to fail; an empty list is a valid
-/// zero-column projection.
+/// are validated immediately; an empty list is a valid zero-column projection.
 ///
 /// # Safety
 /// `rb` must be a valid pointer from `paimon_table_new_read_builder`, or null (returns error).
@@ -147,6 +146,11 @@ pub unsafe extern "C" fn paimon_read_builder_with_projection(
             }
         }
         ptr = ptr.add(1);
+    }
+
+    let col_refs: Vec<&str> = col_names.iter().map(String::as_str).collect();
+    if let Err(e) = state.table.new_read_builder().with_projection(&col_refs) {
+        return paimon_error::from_paimon(e);
     }
 
     state.projected_columns = Some(col_names);
@@ -229,7 +233,12 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
     // Apply projection if set
     if let Some(ref columns) = state.projected_columns {
         let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        rb_rust.with_projection(&col_refs);
+        if let Err(e) = rb_rust.with_projection(&col_refs) {
+            return paimon_result_new_read {
+                read: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            };
+        }
     }
 
     // Apply filter if set

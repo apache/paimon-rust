@@ -27,7 +27,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::Predicate;
+use paimon::spec::{DataField, Predicate};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
@@ -41,8 +41,8 @@ use crate::error::to_datafusion_error;
 #[derive(Debug)]
 pub struct PaimonTableScan {
     table: Table,
-    /// Projected column names (if None, reads all columns).
-    projected_columns: Option<Vec<String>>,
+    /// Full Paimon read type for nested or connector-defined projections.
+    read_type: Vec<DataField>,
     /// Filter translated from DataFusion expressions and reused during execute()
     /// so reader-side pruning reaches the actual read path.
     pushed_predicate: Option<Predicate>,
@@ -58,6 +58,8 @@ pub struct PaimonTableScan {
     filter_exact: bool,
     /// Metadata-pruning trace captured during eager scan planning.
     scan_trace: Option<ScanTrace>,
+    /// Human-readable Variant extraction summary for explain output.
+    pushed_variants: Option<String>,
 }
 
 impl PaimonTableScan {
@@ -65,12 +67,13 @@ impl PaimonTableScan {
     pub(crate) fn new(
         schema: ArrowSchemaRef,
         table: Table,
-        projected_columns: Option<Vec<String>>,
+        read_type: Vec<DataField>,
         pushed_predicate: Option<Predicate>,
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
         scan_trace: Option<ScanTrace>,
+        pushed_variants: Option<String>,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -80,13 +83,14 @@ impl PaimonTableScan {
         ));
         Self {
             table,
-            projected_columns,
+            read_type,
             pushed_predicate,
             planned_partitions,
             plan_properties,
             limit,
             filter_exact,
             scan_trace,
+            pushed_variants,
         }
     }
 
@@ -143,16 +147,13 @@ impl ExecutionPlan for PaimonTableScan {
 
         let table = self.table.clone();
         let schema = self.schema();
-        let projected_columns = self.projected_columns.clone();
+        let read_type = self.read_type.clone();
         let pushed_predicate = self.pushed_predicate.clone();
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
 
-            if let Some(ref columns) = projected_columns {
-                let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-                read_builder.with_projection(&col_refs);
-            }
+            read_builder.with_read_type(read_type);
             if let Some(filter) = pushed_predicate {
                 read_builder.with_filter(filter);
             }
@@ -236,9 +237,12 @@ impl DisplayAs for PaimonTableScan {
             self.planned_partitions.len()
         )?;
 
-        if let Some(ref columns) = self.projected_columns {
-            write!(f, ", projection=[{}]", columns.join(", "))?;
-        }
+        let columns = self
+            .read_type
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>();
+        write!(f, ", projection=[{}]", columns.join(", "))?;
         if let Some(ref predicate) = self.pushed_predicate {
             write!(f, ", predicate={predicate}")?;
         }
@@ -247,6 +251,9 @@ impl DisplayAs for PaimonTableScan {
         }
         if let Some(ref trace) = self.scan_trace {
             write!(f, ", trace={trace}")?;
+        }
+        if let Some(ref pushed_variants) = self.pushed_variants {
+            write!(f, ", PushedVariants=[{pushed_variants}]")?;
         }
         Ok(())
     }
@@ -282,17 +289,26 @@ mod tests {
         )]))
     }
 
+    fn test_read_type() -> Vec<DataField> {
+        vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )]
+    }
+
     #[test]
     fn test_partition_count_empty_plan() {
         let schema = test_schema();
         let scan = PaimonTableScan::new(
             schema,
             dummy_table(),
-            None,
+            test_read_type(),
             None,
             vec![Arc::from(Vec::new())],
             None,
             false,
+            None,
             None,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
@@ -309,11 +325,12 @@ mod tests {
         let scan = PaimonTableScan::new(
             schema,
             dummy_table(),
-            None,
+            test_read_type(),
             None,
             planned_partitions,
             None,
             false,
+            None,
             None,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
@@ -387,11 +404,16 @@ mod tests {
         let scan = PaimonTableScan::new(
             schema,
             table,
-            Some(vec!["id".to_string()]),
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
             Some(pushed_predicate),
             vec![Arc::from(vec![split])],
             None,
             false,
+            None,
             None,
         );
 

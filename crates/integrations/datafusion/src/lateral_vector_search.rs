@@ -72,9 +72,10 @@ impl QueryPlanner for PaimonQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-            LateralVectorSearchExtensionPlanner,
-        )]);
+        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(LateralVectorSearchExtensionPlanner),
+            Arc::new(crate::variant_pushdown::VariantExtractionExtensionPlanner),
+        ]);
         planner
             .create_physical_plan(logical_plan, session_state)
             .await
@@ -91,8 +92,10 @@ impl RewriteLateralVectorSearch {
 }
 
 pub(crate) fn optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
-        vec![Arc::new(RewriteLateralVectorSearch::new())];
+    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+        Arc::new(crate::variant_pushdown::RewriteVariantExtractions::new()),
+        Arc::new(RewriteLateralVectorSearch::new()),
+    ];
     rules.extend(Optimizer::default().rules);
     rules
 }
@@ -611,6 +614,7 @@ async fn read_target_rows(
     let mut read_builder = table.new_read_builder();
     read_builder
         .with_projection(&projection_refs)
+        .map_err(to_datafusion_error)?
         .with_row_ranges(row_ranges);
     let plan = read_builder
         .new_scan()

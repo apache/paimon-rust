@@ -317,7 +317,7 @@ async fn read_raw_full_text_search(
 
     let mut read_builder = table.new_read_builder();
     read_builder
-        .with_projection(&[search.field_name.as_str(), ROW_ID_FIELD_NAME])
+        .with_projection(&[search.field_name.as_str(), ROW_ID_FIELD_NAME])?
         .with_row_ranges(raw_ranges.to_vec());
     let plan = read_builder.new_scan().plan().await?;
     if plan.splits().is_empty() {

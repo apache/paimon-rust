@@ -49,6 +49,9 @@ pub use schema::*;
 mod schema_change;
 pub use schema_change::*;
 
+mod variant_metadata;
+pub use variant_metadata::*;
+
 mod snapshot;
 pub use snapshot::*;
 

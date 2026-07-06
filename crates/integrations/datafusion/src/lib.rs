@@ -55,6 +55,7 @@ mod table;
 mod table_function_args;
 mod update;
 mod variant_functions;
+mod variant_pushdown;
 mod vector_search;
 
 use std::collections::HashMap;

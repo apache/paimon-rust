@@ -572,7 +572,7 @@ pub struct TableScan<'a> {
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
-    projected_fields: Option<Vec<String>>,
+    projected_read_field_ids: Option<HashSet<i32>>,
 }
 
 impl<'a> TableScan<'a> {
@@ -592,7 +592,7 @@ impl<'a> TableScan<'a> {
             limit,
             row_ranges,
             scan_all_files: false,
-            projected_fields: None,
+            projected_read_field_ids: None,
         }
     }
 
@@ -602,7 +602,7 @@ impl<'a> TableScan<'a> {
     /// the complete file set regardless of merge engine or DV settings.
     pub fn with_scan_all_files(mut self) -> Self {
         self.scan_all_files = true;
-        self.projected_fields = None;
+        self.projected_read_field_ids = None;
         self
     }
 
@@ -619,8 +619,11 @@ impl<'a> TableScan<'a> {
         self
     }
 
-    pub(crate) fn with_projection(mut self, projected_fields: Option<Vec<String>>) -> Self {
-        self.projected_fields = projected_fields;
+    pub(super) fn with_projected_read_field_ids(
+        mut self,
+        projected_read_field_ids: Option<HashSet<i32>>,
+    ) -> Self {
+        self.projected_read_field_ids = projected_read_field_ids;
         self
     }
 
@@ -681,11 +684,7 @@ impl<'a> TableScan<'a> {
     }
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
-        super::read_builder::projected_read_field_ids(
-            self.table.identifier().full_name(),
-            self.table.schema().fields(),
-            self.projected_fields.as_ref(),
-        )
+        Ok(self.projected_read_field_ids.clone())
     }
 
     async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {

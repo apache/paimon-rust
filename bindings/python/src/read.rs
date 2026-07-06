@@ -69,10 +69,10 @@ fn apply_read_config(
     projection: &Option<Vec<String>>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
-) {
+) -> PyResult<()> {
     if let Some(projection) = projection {
         let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
-        builder.with_projection(&cols);
+        builder.with_projection(&cols).map_err(to_py_err)?;
     }
     if let Some(limit) = limit {
         builder.with_limit(limit);
@@ -80,6 +80,7 @@ fn apply_read_config(
     if let Some(filter) = filter {
         builder.with_filter(filter.clone());
     }
+    Ok(())
 }
 
 /// Extract a sequence of Python `Split` objects into core `DataSplit`s. Accepts
@@ -220,7 +221,7 @@ impl PyTableScan {
         let splits = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
-                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter);
+                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter)?;
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())
             })
@@ -246,7 +247,7 @@ impl PyTableRead {
         let batches = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
-                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter);
+                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter)?;
                 // Validate config (e.g. projection) before the empty-splits fast
                 // path so an invalid projection fails consistently regardless of
                 // how many splits are passed.

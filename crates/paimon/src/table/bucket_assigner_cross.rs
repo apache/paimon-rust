@@ -86,7 +86,7 @@ impl GlobalPartitionIndex {
         let projected_pk_indices: Vec<usize> = (0..pk_fields.len()).collect();
 
         let mut rb = table.new_read_builder();
-        rb.with_projection(&pk_field_names);
+        rb.with_projection(&pk_field_names)?;
         let scan = rb.new_scan().with_scan_all_files();
         let plan = scan.plan().await?;
         let read = rb.new_read()?;

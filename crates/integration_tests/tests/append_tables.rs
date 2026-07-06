@@ -253,7 +253,8 @@ async fn test_unpartitioned_projection() {
 
     // Read with projection
     let mut rb = table.new_read_builder();
-    rb.with_projection(&["value"]);
+    rb.with_projection(&["value"])
+        .expect("Projection should succeed");
     let plan = rb.new_scan().plan().await.unwrap();
     let read = rb.new_read().unwrap();
     let result: Vec<RecordBatch> = read

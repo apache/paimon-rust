@@ -2601,6 +2601,184 @@ pub(crate) fn rebuild_shredded(
     builder.result()
 }
 
+pub(crate) fn cast_variant_to_shredded_value(
+    variant: VariantRef<'_>,
+    data_type: &DataType,
+    fail_on_error: bool,
+) -> Result<Option<ShreddedValue>> {
+    if variant.is_null()? {
+        return Ok(None);
+    }
+    let Some(scalar) = scalar_schema_for_type(data_type)? else {
+        return Err(Error::Unsupported {
+            message: format!("Unsupported Variant extraction target type: {data_type:?}"),
+        });
+    };
+    match cast_variant_to_extraction_value(variant, &scalar) {
+        Some(value) => Ok(Some(value)),
+        None if fail_on_error => Err(Error::DataInvalid {
+            message: format!("Cannot cast Variant value to {data_type:?}"),
+            source: None,
+        }),
+        None => Ok(None),
+    }
+}
+
+fn cast_variant_to_extraction_value(
+    variant: VariantRef<'_>,
+    scalar: &VariantScalarSchema,
+) -> Option<ShreddedValue> {
+    match scalar {
+        VariantScalarSchema::Boolean => cast_variant_to_bool(variant).map(ShreddedValue::Boolean),
+        VariantScalarSchema::Int8 => cast_variant_to_i64(variant)
+            .and_then(|value| i8::try_from(value).ok())
+            .map(ShreddedValue::Int8),
+        VariantScalarSchema::Int16 => cast_variant_to_i64(variant)
+            .and_then(|value| i16::try_from(value).ok())
+            .map(ShreddedValue::Int16),
+        VariantScalarSchema::Int32 => cast_variant_to_i64(variant)
+            .and_then(|value| i32::try_from(value).ok())
+            .map(ShreddedValue::Int32),
+        VariantScalarSchema::Int64 => cast_variant_to_i64(variant).map(ShreddedValue::Int64),
+        VariantScalarSchema::Float32 => {
+            cast_variant_to_f64(variant).map(|value| ShreddedValue::Float32(value as f32))
+        }
+        VariantScalarSchema::Float64 => cast_variant_to_f64(variant).map(ShreddedValue::Float64),
+        VariantScalarSchema::Decimal { precision, scale } => {
+            cast_variant_to_decimal(variant, *precision, *scale).map(ShreddedValue::Decimal128)
+        }
+        VariantScalarSchema::String => cast_variant_to_string(variant).map(ShreddedValue::String),
+        VariantScalarSchema::Binary
+        | VariantScalarSchema::Date32
+        | VariantScalarSchema::Timestamp
+        | VariantScalarSchema::TimestampNtz => try_typed_shred(variant, scalar).ok().flatten(),
+    }
+}
+
+fn cast_variant_to_bool(variant: VariantRef<'_>) -> Option<bool> {
+    match variant.kind().ok()? {
+        VariantKind::Boolean => variant.get_boolean().ok(),
+        VariantKind::String => match variant.get_string().ok()?.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn cast_variant_to_i64(variant: VariantRef<'_>) -> Option<i64> {
+    match variant.kind().ok()? {
+        VariantKind::Long
+        | VariantKind::Date
+        | VariantKind::Timestamp
+        | VariantKind::TimestampNtz => variant.get_long().ok(),
+        VariantKind::String => variant.get_string().ok()?.parse::<i64>().ok(),
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            rescale_decimal_exact(decimal.unscaled, decimal.scale, 0)
+                .and_then(|value| i64::try_from(value).ok())
+        }
+        _ => None,
+    }
+}
+
+fn cast_variant_to_f64(variant: VariantRef<'_>) -> Option<f64> {
+    match variant.kind().ok()? {
+        VariantKind::Long
+        | VariantKind::Date
+        | VariantKind::Timestamp
+        | VariantKind::TimestampNtz => Some(variant.get_long().ok()? as f64),
+        VariantKind::Double => variant.get_double().ok(),
+        VariantKind::Float => Some(variant.get_float().ok()? as f64),
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            Some(decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32))
+        }
+        VariantKind::String => variant.get_string().ok()?.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn cast_variant_to_string(variant: VariantRef<'_>) -> Option<String> {
+    match variant.kind().ok()? {
+        VariantKind::Object | VariantKind::Array => variant.to_json().ok(),
+        VariantKind::Boolean => Some(variant.get_boolean().ok()?.to_string()),
+        VariantKind::Long
+        | VariantKind::Date
+        | VariantKind::Timestamp
+        | VariantKind::TimestampNtz => Some(variant.get_long().ok()?.to_string()),
+        VariantKind::String => variant.get_string().ok(),
+        VariantKind::Double => Some(variant.get_double().ok()?.to_string()),
+        VariantKind::Decimal => Some(variant.get_decimal().ok()?.to_plain_string()),
+        VariantKind::Float => Some(variant.get_float().ok()?.to_string()),
+        _ => variant.to_json().ok(),
+    }
+}
+
+fn cast_variant_to_decimal(variant: VariantRef<'_>, precision: u8, scale: i8) -> Option<i128> {
+    let unscaled = match variant.kind().ok()? {
+        VariantKind::Long
+        | VariantKind::Date
+        | VariantKind::Timestamp
+        | VariantKind::TimestampNtz => {
+            rescale_decimal_exact(variant.get_long().ok()? as i128, 0, scale)?
+        }
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            rescale_decimal_exact(decimal.unscaled, decimal.scale, scale)?
+        }
+        VariantKind::String => {
+            let parsed = parse_decimal_string(&variant.get_string().ok()?)?;
+            rescale_decimal_exact(parsed.unscaled, parsed.scale, scale)?
+        }
+        _ => return None,
+    };
+    (decimal_precision(unscaled) <= precision).then_some(unscaled)
+}
+
+fn parse_decimal_string(input: &str) -> Option<VariantDecimal> {
+    let input = input.trim();
+    if input.is_empty() || input.contains(['e', 'E']) {
+        return None;
+    }
+    let negative = input.starts_with('-');
+    let unsigned = input.strip_prefix('-').unwrap_or(input);
+    if unsigned.is_empty()
+        || unsigned.matches('.').count() > 1
+        || !unsigned.bytes().all(|ch| ch == b'.' || ch.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = unsigned
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0);
+    let digits: String = unsigned
+        .bytes()
+        .filter(|ch| *ch != b'.')
+        .map(char::from)
+        .collect();
+    let significant = digits.trim_start_matches('0');
+    let precision = if significant.is_empty() {
+        1
+    } else {
+        significant.len()
+    };
+    if precision > 38 || scale > 38 {
+        return None;
+    }
+    let mut unscaled = digits.parse::<i128>().ok()?;
+    if negative {
+        unscaled = -unscaled;
+    }
+    Some(VariantDecimal {
+        unscaled,
+        precision: precision as u8,
+        scale: scale as i8,
+    })
+}
+
 fn rebuild_shredded_into(
     row: &ShreddedRow,
     metadata: &[u8],

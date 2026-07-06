@@ -18,12 +18,14 @@
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
 };
-use crate::spec::{ArrayType, DataField, DataType, RowType};
+use crate::spec::{
+    is_variant_extraction_row, parse_variant_metadata, ArrayType, DataField, DataType, RowType,
+};
 use crate::variant::{
-    build_variant_schema, cast_shredded, infer_variant_shredding_schema, rebuild_shredded,
-    variant_shredding_type, GenericVariant, ShreddedRow, ShreddedValue,
-    VariantShreddingInferConfig, VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME,
-    VARIANT_VALUE_FIELD_NAME,
+    build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
+    infer_variant_shredding_schema, rebuild_shredded, variant_shredding_type, GenericVariant,
+    ShreddedRow, ShreddedValue, VariantShreddingInferConfig, VARIANT_METADATA_FIELD_NAME,
+    VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
 };
 use crate::{Error, Result};
 use arrow_array::{
@@ -254,6 +256,15 @@ pub(crate) fn contains_variant_fields(fields: &[DataField]) -> bool {
     fields.iter().any(|field| match field.data_type() {
         DataType::Variant(_) => true,
         DataType::Row(row_type) => contains_variant_fields(row_type.fields()),
+        _ => false,
+    })
+}
+
+pub(crate) fn contains_variant_read_fields(fields: &[DataField]) -> bool {
+    fields.iter().any(|field| match field.data_type() {
+        DataType::Variant(_) => true,
+        DataType::Row(row_type) if is_variant_extraction_row(row_type) => true,
+        DataType::Row(row_type) => contains_variant_read_fields(row_type.fields()),
         _ => false,
     })
 }
@@ -680,9 +691,128 @@ fn assemble_array_to_logical(
         DataType::Variant(_) if is_variant_storage_array(array) => {
             Ok(Some(assemble_shredded_variant_array(array)?))
         }
+        DataType::Row(row_type)
+            if is_variant_extraction_row(row_type)
+                && (is_variant_storage_array(array) || is_plain_variant_array(array)) =>
+        {
+            Ok(Some(assemble_variant_extraction_array(array, row_type)?))
+        }
         DataType::Row(row_type) => assemble_row_array_to_logical(array, row_type),
         _ => Ok(None),
     }
+}
+
+fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> Result<ArrayRef> {
+    let input = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Variant extraction column must be StructArray".to_string(),
+            source: None,
+        })?;
+    let fields = row_type.fields();
+    let metadata = fields
+        .iter()
+        .map(|field| {
+            let Some(description) = field.description() else {
+                return Err(Error::DataInvalid {
+                    message: "Variant extraction field is missing metadata".to_string(),
+                    source: None,
+                });
+            };
+            parse_variant_metadata(description)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
+    let mut validities = Vec::with_capacity(input.len());
+    for row in 0..input.len() {
+        if input.is_null(row) {
+            validities.push(false);
+            for values in &mut values_by_field {
+                values.push(None);
+            }
+            continue;
+        }
+
+        validities.push(true);
+        let variant = variant_from_storage_row(input, row)?;
+        for (field_idx, field) in fields.iter().enumerate() {
+            let field_metadata = &metadata[field_idx];
+            let value = match &variant {
+                Some(variant) => match variant.get_path(field_metadata.path()) {
+                    Ok(Some(extracted)) => cast_variant_to_shredded_value(
+                        extracted,
+                        field.data_type(),
+                        field_metadata.fail_on_error(),
+                    )?,
+                    Ok(None) => None,
+                    Err(e) if !field_metadata.fail_on_error() => {
+                        let _ = e;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+                None => None,
+            };
+            values_by_field[field_idx].push(value);
+        }
+    }
+
+    let arrow_fields: Fields = fields
+        .iter()
+        .map(|field| {
+            Ok(ArrowField::new(
+                field.name(),
+                paimon_type_to_arrow(field.data_type())?,
+                field.data_type().is_nullable(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into();
+    let columns = values_by_field
+        .iter()
+        .zip(fields)
+        .map(|(values, field)| array_from_values(values, field.data_type()))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Arc::new(
+        StructArray::try_new(arrow_fields, columns, Some(null_buffer(validities))).map_err(
+            |e| Error::UnexpectedError {
+                message: format!("Failed to build Variant extraction StructArray: {e}"),
+                source: Some(Box::new(e)),
+            },
+        )?,
+    ))
+}
+
+fn variant_from_storage_row(input: &StructArray, row: usize) -> Result<Option<GenericVariant>> {
+    if input.is_null(row) {
+        return Ok(None);
+    }
+    if input
+        .column_by_name(VARIANT_TYPED_VALUE_FIELD_NAME)
+        .is_none()
+    {
+        return variant_from_array(input, row);
+    }
+
+    let row_type = match arrow_to_paimon_type(input.data_type(), true)? {
+        DataType::Row(row_type) => row_type,
+        DataType::Variant(_) => return variant_from_array(input, row),
+        other => {
+            return Err(Error::DataInvalid {
+                message: format!("Variant storage physical type must be ROW, got {other:?}"),
+                source: None,
+            })
+        }
+    };
+    let schema = build_variant_schema(&row_type)?;
+    let shredded = struct_row_at(input, row, &row_type)?.ok_or_else(|| Error::DataInvalid {
+        message: "Variant extraction storage row is null".to_string(),
+        source: None,
+    })?;
+    rebuild_shredded(&shredded, &schema).map(Some)
 }
 
 fn assemble_row_array_to_logical(
@@ -761,6 +891,13 @@ fn is_variant_storage_array(array: &dyn Array) -> bool {
     has_binary(VARIANT_VALUE_FIELD_NAME)
         && has_binary(VARIANT_METADATA_FIELD_NAME)
         && (!is_variant_arrow_fields(fields) || is_shredded_variant_array(array))
+}
+
+fn is_plain_variant_array(array: &dyn Array) -> bool {
+    let ArrowDataType::Struct(fields) = array.data_type() else {
+        return false;
+    };
+    is_variant_arrow_fields(fields)
 }
 
 fn shredded_rows_to_struct_array(
@@ -1186,7 +1323,7 @@ fn null_buffer(validities: Vec<bool>) -> NullBuffer {
 mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
-    use crate::spec::{IntType, VariantType};
+    use crate::spec::{variant_extraction_row, IntType, VarCharType, VariantType};
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
         let value_items = values
@@ -1287,6 +1424,128 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn variant_extraction_row_reads_plain_variant_array() {
+        let variants = vec![
+            GenericVariant::parse_json(r#"{"age":27,"name":"Alice"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":"old"}"#).unwrap(),
+        ];
+        let array = variant_array_for_test(&variants);
+        let row_type = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Int(IntType::new()),
+                    "$.age".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+                (
+                    DataType::VarChar(VarCharType::string_type()),
+                    "$.name".to_string(),
+                    true,
+                    "UTC".to_string(),
+                ),
+            ],
+        );
+
+        let extracted = assemble_array_to_logical(array.as_ref(), &DataType::Row(row_type))
+            .unwrap()
+            .expect("extracted");
+        let extracted = extracted.as_any().downcast_ref::<StructArray>().unwrap();
+        let ages = extracted
+            .column_by_name("0")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = extracted
+            .column_by_name("1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(ages.value(0), 27);
+        assert!(ages.is_null(1));
+        assert_eq!(names.value(0), "Alice");
+        assert!(names.is_null(1));
+    }
+
+    #[test]
+    fn variant_extraction_row_reads_shredded_variant_array() {
+        let logical_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"INT"},{"name":"name","type":"STRING"}]}}]}"#.to_string(),
+        )]);
+        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
+            .unwrap()
+            .expect("shredding fields");
+        let variants = vec![
+            GenericVariant::parse_json(r#"{"age":27,"name":"Alice"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":"old","name":"Bob"}"#).unwrap(),
+        ];
+        let batch = RecordBatch::try_new(
+            build_target_arrow_schema(&logical_fields).unwrap(),
+            vec![variant_array_for_test(&variants)],
+        )
+        .unwrap();
+        let physical =
+            batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
+        let extraction_row_type = variant_extraction_row(
+            true,
+            vec![
+                (
+                    DataType::Int(IntType::new()),
+                    "$.age".to_string(),
+                    false,
+                    "UTC".to_string(),
+                ),
+                (
+                    DataType::VarChar(VarCharType::string_type()),
+                    "$.name".to_string(),
+                    true,
+                    "UTC".to_string(),
+                ),
+            ],
+        );
+        let read_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Row(extraction_row_type),
+        )];
+
+        let extracted_batch = assemble_shredded_variant_batch(physical, &read_fields).unwrap();
+        let extracted = extracted_batch
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let ages = extracted
+            .column_by_name("0")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = extracted
+            .column_by_name("1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(ages.value(0), 27);
+        assert!(ages.is_null(1));
+        assert_eq!(names.value(0), "Alice");
+        assert_eq!(names.value(1), "Bob");
     }
 
     #[test]

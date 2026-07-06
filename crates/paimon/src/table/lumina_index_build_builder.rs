@@ -600,7 +600,7 @@ async fn extract_vectors(
         .build()?;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME]);
+    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
     let read = read_builder.new_read()?;
     let batches = read.to_arrow(&[split])?.try_collect::<Vec<_>>().await?;
     extract_vectors_from_batches(

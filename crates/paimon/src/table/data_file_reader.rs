@@ -20,7 +20,9 @@ use crate::arrow::format::create_format_reader;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{
+    is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
+};
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
@@ -199,18 +201,8 @@ impl DataFileReader {
         // Compute index mapping and determine which columns to read from the file.
         let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
             let mapping = create_index_mapping(&read_type, df);
-            match mapping {
-                Some(ref idx_map) => {
-                    let mut seen = std::collections::HashSet::new();
-                    let fields_to_read: Vec<DataField> = idx_map
-                        .iter()
-                        .filter(|&&idx| idx != NULL_FIELD_INDEX && seen.insert(idx))
-                        .map(|&idx| df[idx as usize].clone())
-                        .collect();
-                    (fields_to_read, Some(idx_map.clone()))
-                }
-                None => (df.clone(), None),
-            }
+            let fields_to_read = read_data_fields(df, &read_type)?;
+            (fields_to_read, mapping)
         } else {
             (
                 read_type
@@ -365,6 +357,67 @@ impl DataFileReader {
         }
         .boxed())
     }
+}
+
+fn read_data_fields(
+    all_data_fields: &[DataField],
+    expected_fields: &[DataField],
+) -> crate::Result<Vec<DataField>> {
+    let mut read_fields = Vec::new();
+    for data_field in all_data_fields {
+        if let Some(expected) = expected_fields
+            .iter()
+            .find(|field| field.id() == data_field.id())
+        {
+            if let Some(pruned_type) =
+                prune_data_type(expected.data_type(), data_field.data_type())?
+            {
+                read_fields.push(data_field_with_type(data_field, pruned_type));
+            }
+        }
+    }
+    Ok(read_fields)
+}
+
+fn prune_data_type(read_type: &DataType, data_type: &DataType) -> crate::Result<Option<DataType>> {
+    match read_type {
+        DataType::Row(read_row) if is_variant_extraction_row_type(read_type) => {
+            Ok(Some(DataType::Row(read_row.clone())))
+        }
+        DataType::Row(read_row) => {
+            let DataType::Row(data_row) = data_type else {
+                return Ok(Some(data_type.clone()));
+            };
+            let mut fields = Vec::new();
+            for read_field in read_row.fields() {
+                if let Some(data_field) = data_row
+                    .fields()
+                    .iter()
+                    .find(|field| field.id() == read_field.id())
+                {
+                    if let Some(pruned_type) =
+                        prune_data_type(read_field.data_type(), data_field.data_type())?
+                    {
+                        fields.push(data_field_with_type(data_field, pruned_type));
+                    }
+                }
+            }
+            if fields.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(DataType::Row(crate::spec::RowType::with_nullable(
+                    read_type.is_nullable(),
+                    fields,
+                ))))
+            }
+        }
+        _ => Ok(Some(data_type.clone())),
+    }
+}
+
+fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
+    DataField::new(field.id(), field.name().to_string(), data_type)
+        .with_description(field.description().map(ToString::to_string))
 }
 
 fn is_row_file(file_meta: &DataFileMeta) -> bool {
@@ -596,9 +649,11 @@ mod row_tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryRow, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, VarCharType,
+        is_variant_extraction_row_type, variant_extraction_row, BigIntType, BinaryRow,
+        DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, RowType, VarCharType,
     };
     use crate::table::source::DataSplitBuilder;
+    use crate::variant::variant_shredding_type;
     use arrow_array::{Int32Array, StringArray};
     use futures::TryStreamExt;
 
@@ -629,6 +684,44 @@ mod row_tests {
             first_row_id: None,
             write_cols: None,
         }
+    }
+
+    #[test]
+    fn read_data_fields_preserves_variant_extraction_row_type() {
+        let configured = DataType::Row(RowType::new(vec![field(
+            0,
+            "age",
+            DataType::Int(IntType::new()),
+        )]));
+        let physical_type = variant_shredding_type(&configured).unwrap();
+        let data_field = field(1, "v", physical_type);
+        let extraction_type = DataType::Row(variant_extraction_row(
+            true,
+            vec![(
+                DataType::Int(IntType::new()),
+                "$.age".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        ));
+        let expected_field = field(1, "v", extraction_type.clone());
+
+        let read_fields = read_data_fields(&[data_field], &[expected_field]).unwrap();
+
+        assert_eq!(read_fields.len(), 1);
+        assert!(is_variant_extraction_row_type(read_fields[0].data_type()));
+        assert_eq!(read_fields[0].data_type(), &extraction_type);
+    }
+
+    #[test]
+    fn read_data_fields_uses_physical_type_for_castable_field() {
+        let data_field = field(1, "n", DataType::Int(IntType::new()));
+        let expected_field = field(1, "n", DataType::BigInt(BigIntType::new()));
+
+        let read_fields = read_data_fields(&[data_field], &[expected_field]).unwrap();
+
+        assert_eq!(read_fields.len(), 1);
+        assert_eq!(read_fields[0].data_type(), &DataType::Int(IntType::new()));
     }
 
     #[tokio::test]

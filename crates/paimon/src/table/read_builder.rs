@@ -110,7 +110,7 @@ fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
 #[derive(Debug, Clone)]
 pub struct ReadBuilder<'a> {
     table: &'a Table,
-    projected_fields: Option<Vec<String>>,
+    read_type: Option<Vec<DataField>>,
     filter: NormalizedFilter,
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
@@ -120,7 +120,7 @@ impl<'a> ReadBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
             table,
-            projected_fields: None,
+            read_type: None,
             filter: NormalizedFilter::default(),
             limit: None,
             row_ranges: None,
@@ -128,10 +128,18 @@ impl<'a> ReadBuilder<'a> {
     }
 
     /// Set column projection by name. Output order follows the caller-specified order.
-    /// Unknown or duplicate names cause `new_read()` to fail; an empty list is a valid
+    /// Unknown or duplicate names cause this method to fail; an empty list is a valid
     /// zero-column projection.
-    pub fn with_projection(&mut self, columns: &[&str]) -> &mut Self {
-        self.projected_fields = Some(columns.iter().map(|c| (*c).to_string()).collect());
+    pub fn with_projection(&mut self, columns: &[&str]) -> Result<&mut Self> {
+        let projection_names = columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>();
+        self.read_type = Some(self.resolve_projected_fields(&projection_names)?);
+        Ok(self)
+    }
+
+    /// Set the full read type, including nested field pruning or connector-defined
+    /// logical read types such as Variant extractions.
+    pub fn with_read_type(&mut self, read_type: Vec<DataField>) -> &mut Self {
+        self.read_type = Some(read_type);
         self
     }
 
@@ -224,7 +232,7 @@ impl<'a> ReadBuilder<'a> {
             self.limit,
             self.row_ranges.clone(),
         )
-        .with_projection(self.projected_fields.clone())
+        .with_projected_read_field_ids(projected_read_field_ids(&self.read_type))
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
@@ -232,9 +240,9 @@ impl<'a> ReadBuilder<'a> {
         // Fail closed at read construction so bindings that short-circuit before
         // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
         CoreOptions::new(self.table.schema.options()).ensure_read_authorized()?;
-        let read_type = match &self.projected_fields {
+        let read_type = match &self.read_type {
             None => self.table.schema.fields().to_vec(),
-            Some(projected) => self.resolve_projected_fields(projected)?,
+            Some(fields) => fields.clone(),
         };
 
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
@@ -249,12 +257,12 @@ impl<'a> ReadBuilder<'a> {
 
     pub(super) fn resolve_projected_fields(
         &self,
-        projected_fields: &[String],
+        projection_names: &[String],
     ) -> Result<Vec<DataField>> {
         resolve_projected_fields(
             self.table.identifier().full_name(),
             self.table.schema.fields(),
-            projected_fields,
+            projection_names,
         )
     }
 }
@@ -262,19 +270,19 @@ impl<'a> ReadBuilder<'a> {
 pub(super) fn resolve_projected_fields(
     full_name: String,
     fields: &[DataField],
-    projected_fields: &[String],
+    projection_names: &[String],
 ) -> Result<Vec<DataField>> {
-    if projected_fields.is_empty() {
+    if projection_names.is_empty() {
         return Ok(Vec::new());
     }
 
     let field_map: HashMap<&str, &DataField> =
         fields.iter().map(|field| (field.name(), field)).collect();
 
-    let mut seen = HashSet::with_capacity(projected_fields.len());
-    let mut resolved = Vec::with_capacity(projected_fields.len());
+    let mut seen = HashSet::with_capacity(projection_names.len());
+    let mut resolved = Vec::with_capacity(projection_names.len());
 
-    for name in projected_fields {
+    for name in projection_names {
         if !seen.insert(name.as_str()) {
             return Err(Error::ConfigInvalid {
                 message: format!("Duplicate projection column '{name}' for table {full_name}"),
@@ -302,21 +310,18 @@ pub(super) fn resolve_projected_fields(
     Ok(resolved)
 }
 
-pub(super) fn projected_read_field_ids(
-    full_name: String,
-    fields: &[DataField],
-    projected_fields: Option<&Vec<String>>,
-) -> Result<Option<HashSet<i32>>> {
-    let Some(projected) = projected_fields else {
-        return Ok(None);
-    };
-    let fields = resolve_projected_fields(full_name, fields, projected)?;
-    let field_ids = fields
-        .into_iter()
+pub(super) fn projected_read_field_ids_from_fields(fields: &[DataField]) -> HashSet<i32> {
+    fields
+        .iter()
         .filter(|field| !is_system_projection_field(field.id()))
         .map(|field| field.id())
-        .collect::<HashSet<_>>();
-    Ok(Some(field_ids))
+        .collect::<HashSet<_>>()
+}
+
+fn projected_read_field_ids(read_type: &Option<Vec<DataField>>) -> Option<HashSet<i32>> {
+    read_type
+        .as_ref()
+        .map(|fields| projected_read_field_ids_from_fields(fields))
 }
 
 pub(super) fn is_system_projection_field(field_id: i32) -> bool {
@@ -339,7 +344,8 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        BinaryRow, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema, VarCharType,
+        BinaryRow, DataField, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema,
+        VarCharType,
     };
     use crate::table::{query_auth_table, DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
@@ -432,43 +438,37 @@ mod tests {
 
     #[test]
     fn test_projected_read_field_ids_uses_projection_ids() {
-        let table = simple_table();
-        let projected = vec!["id".to_string()];
+        let read_type = vec![DataField::new(
+            1,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
 
         assert_eq!(
-            super::projected_read_field_ids(
-                table.identifier().full_name(),
-                table.schema().fields(),
-                Some(&projected),
-            )
-            .unwrap(),
-            Some(HashSet::from([1]))
+            super::projected_read_field_ids_from_fields(&read_type),
+            HashSet::from([1])
         );
     }
 
     #[test]
     fn test_projected_read_field_ids_ignores_system_only_projection() {
-        let table = simple_table();
-        let projected = vec![crate::spec::ROW_ID_FIELD_NAME.to_string()];
+        let read_type = vec![DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            DataType::Int(IntType::new()),
+        )];
 
         assert_eq!(
-            super::projected_read_field_ids(
-                table.identifier().full_name(),
-                table.schema().fields(),
-                Some(&projected),
-            )
-            .unwrap(),
-            Some(HashSet::new())
+            super::projected_read_field_ids_from_fields(&read_type),
+            HashSet::new()
         );
     }
 
-    #[tokio::test]
-    async fn test_new_scan_validates_unknown_projection() {
+    #[test]
+    fn test_with_projection_validates_unknown_projection() {
         let table = simple_table();
         let mut builder = ReadBuilder::new(&table);
-        builder.with_projection(&["missing"]);
-
-        let err = builder.new_scan().plan().await.unwrap_err();
+        let err = builder.with_projection(&["missing"]).unwrap_err();
 
         assert!(matches!(
             err,
@@ -479,13 +479,11 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_new_scan_validates_duplicate_projection() {
+    #[test]
+    fn test_with_projection_validates_duplicate_projection() {
         let table = simple_table();
         let mut builder = ReadBuilder::new(&table);
-        builder.with_projection(&["id", "id"]);
-
-        let err = builder.new_scan().plan().await.unwrap_err();
+        let err = builder.with_projection(&["id", "id"]).unwrap_err();
 
         assert!(matches!(
             err,
@@ -565,7 +563,10 @@ mod tests {
             .unwrap();
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])
@@ -681,7 +682,10 @@ mod tests {
             .unwrap();
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])
@@ -747,7 +751,10 @@ mod tests {
         ]);
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])
@@ -812,7 +819,10 @@ mod tests {
         ]);
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])

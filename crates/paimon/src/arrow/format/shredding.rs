@@ -19,8 +19,9 @@ use super::{FilePredicates, FormatFileReader, FormatFileWriter};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::shredding::{
     assemble_shredded_variant_batch, batch_to_shredded_physical,
-    configured_variant_shredding_fields, contains_variant_fields, infer_variant_shredding_fields,
-    should_infer_variant_shredding_fields, variant_shredding_infer_buffer_row_count,
+    configured_variant_shredding_fields, contains_variant_fields, contains_variant_read_fields,
+    infer_variant_shredding_fields, should_infer_variant_shredding_fields,
+    variant_shredding_infer_buffer_row_count,
 };
 use crate::io::FileRead;
 use crate::spec::DataField;
@@ -48,7 +49,7 @@ pub(crate) fn maybe_wrap_reader(
     reader: Box<dyn FormatFileReader>,
     read_fields: &[DataField],
 ) -> Box<dyn FormatFileReader> {
-    if contains_variant_fields(read_fields) {
+    if contains_variant_read_fields(read_fields) {
         Box::new(ShreddingFormatReader::new(reader))
     } else {
         reader
@@ -83,7 +84,7 @@ impl FormatFileReader for ShreddingFormatReader {
                 row_selection,
             )
             .await?;
-        if !contains_variant_fields(read_fields) {
+        if !contains_variant_read_fields(read_fields) {
             return Ok(stream);
         }
         let read_fields = read_fields.to_vec();

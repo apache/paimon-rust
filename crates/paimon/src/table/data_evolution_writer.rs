@@ -234,7 +234,7 @@ impl DataEvolutionWriter {
             // Read original columns from the entire file group (base + partial-column files).
             let col_refs: Vec<&str> = self.update_columns.iter().map(|s| s.as_str()).collect();
             let mut rb = self.table.new_read_builder();
-            rb.with_projection(&col_refs);
+            rb.with_projection(&col_refs)?;
             let read = rb.new_read()?;
 
             // Base + partial-column files share row-id ranges, so physical

@@ -260,7 +260,7 @@ Current limitations:
 
 - `schema_of_variant`, `schema_of_variant_agg`, `to_variant_object`, `variant_explode`, and `variant_explode_outer` are not implemented yet.
 - `variant_get` currently casts to scalar types and `VARIANT`. It does not yet cast directly to `ARRAY`, `MAP`, or `STRUCT`.
-- Predicate pushdown is not applied through `variant_get`; DataFusion evaluates Variant filters after reading rows.
+- Simple `variant_get` and `try_variant_get` expressions over a `VARIANT` column, a literal path, and a scalar literal type can be pushed into scans as Variant extraction fields for projections and filters. Predicate translation through `variant_get` is still not applied to Paimon/Parquet statistics; DataFusion evaluates those filters after reading the extracted field.
 
 With a raw DataFusion `SessionContext`, register these scalar functions explicitly:
 

@@ -3799,7 +3799,10 @@ mod tests {
         ]);
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])
@@ -3864,7 +3867,10 @@ mod tests {
         let predicate = pb.equal("value", Datum::Int(20)).unwrap();
 
         let mut builder = table.new_read_builder();
-        builder.with_projection(&["id"]).with_filter(predicate);
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
             .to_arrow(&[split])
@@ -3917,6 +3923,7 @@ mod tests {
         let mut builder = table.new_read_builder();
         builder
             .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
+            .unwrap()
             .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
@@ -3981,6 +3988,7 @@ mod tests {
         let mut builder = table.new_read_builder();
         builder
             .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
+            .unwrap()
             .with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
@@ -4066,6 +4074,7 @@ mod tests {
         let mut builder = table.new_read_builder();
         builder
             .with_projection(&["id"])
+            .unwrap()
             .with_filter(pb.equal("value", Datum::Int(10)).unwrap());
         let read = builder.new_read().unwrap();
         let batches = read
@@ -4080,6 +4089,7 @@ mod tests {
         let mut builder = table.new_read_builder();
         builder
             .with_projection(&["id"])
+            .unwrap()
             .with_filter(pb.is_null("value").unwrap());
         let read = builder.new_read().unwrap();
         let batches = read
