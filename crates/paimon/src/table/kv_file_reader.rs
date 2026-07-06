@@ -504,6 +504,59 @@ mod tests {
         .unwrap()
     }
 
+    fn evo_batch(ids: Vec<i32>, values: Vec<Option<i32>>, scores: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new("score", ArrowDataType::Int32, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(Int32Array::from(scores)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// User schema for the evolution fixture: `id INT pk, value INT` at
+    /// version 0, plus `score INT` (new field id 2) at version 1. Field ids
+    /// line up across versions exactly as a real ADD COLUMN produces.
+    fn evo_user_schema(with_score: bool) -> Schema {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()));
+        if with_score {
+            builder = builder.column("score", DataType::Int(IntType::new()));
+        }
+        builder
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap()
+    }
+
+    /// Persist a schema version as `{table_path}/schema/schema-{id}` JSON so
+    /// `SchemaManager::schema` can resolve old-file schemas at read time. The
+    /// write path only stamps `DataFileMeta.schema_id`; schema files are
+    /// normally written by the catalog, which these fixtures bypass. Follows
+    /// the `write_schema_file` pattern from the table_scan tests.
+    async fn write_schema_file(table: &Table, schema: &TableSchema) {
+        let path = table.schema_manager().schema_path(schema.id());
+        let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap();
+        table.file_io().mkdirs(dir).await.unwrap();
+        let json = serde_json::to_vec(schema).unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(bytes::Bytes::from(json))
+            .await
+            .unwrap();
+    }
+
     async fn write_commit(table: &Table, batch: &RecordBatch) {
         let mut tw = TableWrite::new(table, "test-user".to_string()).unwrap();
         tw.write_arrow_batch(batch).await.unwrap();
@@ -579,6 +632,17 @@ mod tests {
             pb.equal("value", Datum::Int(2)).unwrap(),
         ]);
         assert!(retain_primary_key_conjuncts(&[or], &fields, &pks).is_empty());
+
+        // Constant predicates reference no columns and must survive the PK
+        // trim verbatim. Dropping AlwaysFalse here would be catastrophic:
+        // scan-side stats pruning treats it as prune-everything, so losing it
+        // would flip "return no rows" into "return every row".
+        let kept = retain_primary_key_conjuncts(&[Predicate::AlwaysFalse], &fields, &pks);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(&kept[0], Predicate::AlwaysFalse));
+        let kept = retain_primary_key_conjuncts(&[Predicate::AlwaysTrue], &fields, &pks);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(&kept[0], Predicate::AlwaysTrue));
     }
 
     /// Non-PK equality filter on a dedup PK table read through the sort-merge
@@ -984,5 +1048,125 @@ mod tests {
         assert_eq!(int_column(&batches, "id"), vec![1]);
         assert_eq!(int_column(&batches, "a"), vec![5]);
         assert_eq!(int_column(&batches, "b"), vec![7]);
+    }
+
+    /// An AlwaysFalse filter on a PK table must return nothing. AlwaysFalse
+    /// references no columns, so a PK-conjunct trim that dropped it (instead
+    /// of preserving it verbatim) would remove the only thing stopping the
+    /// read — stats pruning treats AlwaysFalse as prune-everything, and the
+    /// residual masks every row to false — and every row would come back.
+    #[tokio::test]
+    async fn kv_read_always_false_filter_returns_nothing() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_always_false";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        // Overlapping keys across two commits -> split is not raw convertible
+        // -> forced through KeyValueFileReader.
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let batches = read_rows(&table, None, Some(Predicate::AlwaysFalse)).await;
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "AlwaysFalse must return no rows on a PK table");
+    }
+
+    /// Schema evolution on the KV residual path: a predicate column that is
+    /// MISSING from an old-schema file is null-filled pre-merge by
+    /// DataFileReader; the post-merge residual must treat those NULLs as
+    /// non-matching (comparison mask NULL -> false), and `is_null` must match
+    /// exactly them. Locks the null-fill -> merge -> residual composition; the
+    /// shared evaluator's semantics are already locked on the data-evolution
+    /// path (`test_evolution_read_null_filled_predicate_column_semantics`).
+    ///
+    /// Setup: commit 1 goes through a Table at schema 0 (id, value), stamping
+    /// schema_id 0 into its files; commit 2 goes through a Table at the same
+    /// path at schema 1 (id, value, score — new field id). Both schema JSONs
+    /// are persisted so `SchemaManager::schema(0)` resolves at read time. Keys
+    /// overlap across commits so the split is not raw convertible and routes
+    /// through the KV merge reader.
+    #[tokio::test]
+    async fn kv_read_schema_evolution_null_filled_predicate_semantics() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_residual_schema_evolution";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema0 = TableSchema::new(0, &evo_user_schema(false));
+        let schema1 = TableSchema::new(1, &evo_user_schema(true));
+        let table_v0 = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_residual_evo_t"),
+            table_path.to_string(),
+            schema0.clone(),
+            None,
+        );
+        let table_v1 = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_residual_evo_t"),
+            table_path.to_string(),
+            schema1.clone(),
+            None,
+        );
+        write_schema_file(&table_v1, &schema0).await;
+        write_schema_file(&table_v1, &schema1).await;
+
+        // Commit 1 at schema 0: files carry schema_id 0. Commit 2 at schema 1
+        // overwrites key 3, so file_meta.schema_id != table_schema_id holds for
+        // the old files when reading through table_v1, forcing the null-fill
+        // remap in read() -> DataFileReader::read_single_file_stream.
+        write_commit(
+            &table_v0,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table_v1,
+            &evo_batch(vec![3], vec![Some(31)], vec![Some(300)]),
+        )
+        .await;
+
+        // Merged rows: (1, 10, NULL), (2, 20, NULL), (3, 31, 300).
+        let fields = table_v1.schema().fields().to_vec();
+        let pb = PredicateBuilder::new(&fields);
+
+        // Comparison: score = 300 matches only id 3; old rows' null-filled
+        // score must collapse to false, not match or error.
+        let filter = pb.equal("score", Datum::Int(300)).unwrap();
+        let batches = read_rows(&table_v1, None, Some(filter)).await;
+        assert_eq!(int_column(&batches, "id"), vec![3]);
+        assert_eq!(int_column(&batches, "value"), vec![31]);
+        assert_eq!(int_column(&batches, "score"), vec![300]);
+
+        // IS NULL: matches exactly the null-filled old rows (ids 1, 2).
+        let filter = pb.is_null("score").unwrap();
+        let batches = read_rows(&table_v1, None, Some(filter)).await;
+        let mut ids = int_column(&batches, "id");
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+
+        // Gap-A on an evolution column: score is filtered but not projected.
+        // The merge read must widen internally (null-filling score for the old
+        // files), filter, then project back to just "id".
+        let filter = pb.equal("score", Datum::Int(300)).unwrap();
+        let batches = read_rows(&table_v1, Some(&["id"]), Some(filter)).await;
+        assert_eq!(int_column(&batches, "id"), vec![3]);
+        for batch in &batches {
+            assert_eq!(
+                batch.num_columns(),
+                1,
+                "widened evolution column must not leak into the output"
+            );
+            assert_eq!(batch.schema().field(0).name(), "id");
+        }
     }
 }
