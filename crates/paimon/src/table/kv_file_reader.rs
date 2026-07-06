@@ -574,7 +574,7 @@ mod tests {
     ) -> Vec<RecordBatch> {
         let mut rb = table.new_read_builder();
         if let Some(cols) = projection {
-            rb.with_projection(cols);
+            rb.with_projection(cols).unwrap();
         }
         if let Some(f) = filter {
             rb.with_filter(f);
