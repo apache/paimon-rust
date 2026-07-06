@@ -544,6 +544,43 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn retain_primary_key_conjuncts_semantics() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), PaimonDataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), PaimonDataType::Int(IntType::new())),
+        ];
+        let pks = vec!["id".to_string()];
+        let pb = PredicateBuilder::new(&fields);
+
+        // Plain PK leaf: kept. Plain non-PK leaf: dropped.
+        let kept =
+            retain_primary_key_conjuncts(&[pb.equal("id", Datum::Int(1)).unwrap()], &fields, &pks);
+        assert_eq!(kept.len(), 1);
+        let dropped = retain_primary_key_conjuncts(
+            &[pb.equal("value", Datum::Int(1)).unwrap()],
+            &fields,
+            &pks,
+        );
+        assert!(dropped.is_empty());
+
+        // Mixed AND keeps the PK child only.
+        let mixed = Predicate::and(vec![
+            pb.equal("id", Datum::Int(1)).unwrap(),
+            pb.equal("value", Datum::Int(2)).unwrap(),
+        ]);
+        let kept = retain_primary_key_conjuncts(&[mixed], &fields, &pks);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(&kept[0], Predicate::Leaf { index: 0, .. }));
+
+        // OR with a non-PK child: dropped entirely (cannot be tightened).
+        let or = Predicate::or(vec![
+            pb.equal("id", Datum::Int(1)).unwrap(),
+            pb.equal("value", Datum::Int(2)).unwrap(),
+        ]);
+        assert!(retain_primary_key_conjuncts(&[or], &fields, &pks).is_empty());
+    }
+
     /// Non-PK equality filter on a dedup PK table read through the sort-merge
     /// path must return only matching rows. Before the post-merge residual,
     /// the non-PK conjunct was silently dropped and all rows came back.

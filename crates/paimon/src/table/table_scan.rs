@@ -21,6 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::bucket_filter::compute_target_buckets;
+use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
     data_evolution_group_matches_predicates, data_file_matches_predicates,
@@ -808,9 +809,9 @@ impl<'a> TableScan<'a> {
         let partition_fields = self.table.schema().partition_fields();
 
         let pushdown_data_predicates = if data_evolution_enabled {
-            &[][..]
+            Vec::new()
         } else {
-            self.data_predicates.as_slice()
+            self.stats_pruning_predicates()
         };
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
@@ -846,7 +847,7 @@ impl<'a> TableScan<'a> {
             has_primary_keys,
             self.partition_filter.as_ref(),
             &partition_fields,
-            pushdown_data_predicates,
+            &pushdown_data_predicates,
             self.table.schema().id(),
             self.table.schema().fields(),
             self.bucket_predicate.as_ref(),
@@ -864,6 +865,30 @@ impl<'a> TableScan<'a> {
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
         can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+    }
+
+    /// The predicate set that may prune WHOLE FILES by their stats.
+    ///
+    /// For primary-key tables read by merging (everything except DV tables,
+    /// which read raw with per-row deletion masks), only key conjuncts are
+    /// safe: a key's versions agree on the key columns but not on value
+    /// columns, so a value conjunct could prune the file holding the newest
+    /// version and resurrect an older one from a surviving file. The dropped
+    /// conjuncts are still enforced exactly by the post-merge residual filter
+    /// in `KeyValueFileReader`.
+    fn stats_pruning_predicates(&self) -> Vec<Predicate> {
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let deletion_vectors_enabled =
+            CoreOptions::new(self.table.schema().options()).deletion_vectors_enabled();
+        if has_primary_keys && !deletion_vectors_enabled {
+            retain_primary_key_conjuncts(
+                &self.data_predicates,
+                self.table.schema().fields(),
+                &self.table.schema().trimmed_primary_keys(),
+            )
+        } else {
+            self.data_predicates.clone()
+        }
     }
 
     async fn plan_snapshot(
@@ -896,7 +921,8 @@ impl<'a> TableScan<'a> {
 
         // For non-data-evolution tables, cross-schema files were kept (fail-open)
         // by the pushdown. Apply the full schema-aware filter for those files.
-        let entries = if self.data_predicates.is_empty() || data_evolution_enabled {
+        let stats_pruning_predicates = self.stats_pruning_predicates();
+        let entries = if stats_pruning_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
             let current_schema_id = self.table.schema().id();
@@ -918,7 +944,7 @@ impl<'a> TableScan<'a> {
                         || data_file_matches_predicates_for_table(
                             self.table,
                             entry.file(),
-                            &self.data_predicates,
+                            &stats_pruning_predicates,
                             &mut schema_cache,
                         )
                         .await
@@ -2016,6 +2042,106 @@ mod tests {
         assert!(
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "BETWEEN should prune files outside the min/max range: {trace:?}"
+        );
+    }
+
+    fn pk_stats_gate_table(table_path: &str) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "pk_stats_gate"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn two_int_stats_row(id: Option<i32>, value: Option<i32>) -> Vec<u8> {
+        let mut builder = BinaryRowBuilder::new(2);
+        match id {
+            Some(id) => builder.write_int(0, id),
+            None => builder.set_null_at(0),
+        }
+        match value {
+            Some(value) => builder.write_int(1, value),
+            None => builder.set_null_at(1),
+        }
+        builder.build_serialized()
+    }
+
+    fn pk_stats_file(name: &str, id_range: (i32, i32), value_range: (i32, i32)) -> DataFileMeta {
+        let mut file = test_data_file_meta(
+            two_int_stats_row(Some(id_range.0), Some(value_range.0)),
+            two_int_stats_row(Some(id_range.1), Some(value_range.1)),
+            vec![Some(0), Some(0)],
+            2,
+        );
+        file.file_name = name.to_string();
+        file
+    }
+
+    /// Merge reads combine versions of a key across files, so scan planning
+    /// must not prune a PK table's files by NON-key conjuncts: dropping the
+    /// file that holds the newest version resurrects an older version from a
+    /// surviving file — an error no post-merge residual can repair. Key
+    /// conjuncts stay safe (every version of a key shares the key columns)
+    /// and must still prune.
+    #[tokio::test]
+    async fn test_pk_table_stats_pruning_ignores_non_key_conjuncts() {
+        let table_path = "memory:/test_pk_stats_gate";
+        let table = pk_stats_gate_table(table_path);
+        setup_scan_trace_dirs(&table).await;
+
+        // Both files cover key id=1; the newer version's value (50) falls
+        // outside the value predicate while the older one (150) matches.
+        TableCommit::new(table.clone(), "pk-gate-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    pk_stats_file("old-version.parquet", (1, 5), (100, 200)),
+                    pk_stats_file("new-version.parquet", (1, 5), (10, 60)),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let pb = PredicateBuilder::new(&fields);
+
+        // Non-key conjunct: must NOT prune any file of a PK table.
+        let value_filter = pb.greater_than("value", Datum::Int(90)).unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(value_filter);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        assert_eq!(
+            trace.manifest_entries_pruned_by_data_stats, 0,
+            "non-key conjuncts must not file-prune a PK table: {trace:?}"
+        );
+        let planned_files: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+        assert_eq!(
+            planned_files, 2,
+            "both versions must reach the merge reader"
+        );
+
+        // Key conjunct: still prunes (id=9 outside both files' key range).
+        let key_filter = pb.equal("id", Datum::Int(9)).unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(key_filter);
+        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        assert!(
+            trace.manifest_entries_pruned_by_data_stats >= 2,
+            "key conjuncts must still prune PK-table files: {trace:?}"
         );
     }
 
