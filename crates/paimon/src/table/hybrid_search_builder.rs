@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Hybrid search builder for combining vector and full-text search routes.
+//! Hybrid search builder for combining multiple search routes.
 //!
 //! Reference: `org.apache.paimon.table.source.HybridSearchBuilder`.
 
@@ -288,18 +288,7 @@ impl<'a> HybridSearchBuilder<'a> {
                     builder.execute_scored().await?
                 }
                 HybridSearchRouteKind::FullText => {
-                    let mut builder = self.table.new_full_text_search_builder();
-                    builder
-                        .with_text_column(&route.field_name)
-                        .with_query_text(
-                            route
-                                .full_text_query
-                                .as_deref()
-                                .expect("validated full-text route"),
-                        )
-                        .with_limit(route.limit);
-                    let result = builder.execute_scored().await?;
-                    SearchResult::new(result.row_ids, result.scores)
+                    execute_full_text_route(self.table, route).await?
                 }
             };
             if !result.is_empty() {
@@ -312,6 +301,35 @@ impl<'a> HybridSearchBuilder<'a> {
 
         Ok(rank_results(self.ranker, &route_results, limit))
     }
+}
+
+#[cfg(feature = "fulltext")]
+async fn execute_full_text_route(
+    table: &Table,
+    route: &HybridSearchRoute,
+) -> crate::Result<SearchResult> {
+    let mut builder = table.new_full_text_search_builder();
+    builder
+        .with_text_column(&route.field_name)
+        .with_query_text(
+            route
+                .full_text_query
+                .as_deref()
+                .expect("validated full-text route"),
+        )
+        .with_limit(route.limit);
+    let result = builder.execute_scored().await?;
+    Ok(SearchResult::new(result.row_ids, result.scores))
+}
+
+#[cfg(not(feature = "fulltext"))]
+async fn execute_full_text_route(
+    _table: &Table,
+    _route: &HybridSearchRoute,
+) -> crate::Result<SearchResult> {
+    Err(crate::Error::ConfigInvalid {
+        message: "Full-text hybrid routes require the fulltext feature".to_string(),
+    })
 }
 
 struct WeightedRouteResult {

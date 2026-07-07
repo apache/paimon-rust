@@ -52,7 +52,6 @@ pub use table::{
     TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
 };
 
-#[cfg(feature = "fulltext")]
 pub use table::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };

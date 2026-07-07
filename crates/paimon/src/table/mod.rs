@@ -38,7 +38,6 @@ mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
-#[cfg(feature = "fulltext")]
 mod hybrid_search_builder;
 mod kv_file_reader;
 mod kv_file_writer;
@@ -78,7 +77,6 @@ pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
-#[cfg(feature = "fulltext")]
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
 };
@@ -194,7 +192,6 @@ impl Table {
     /// Create a hybrid search builder.
     ///
     /// Reference: [HybridSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/HybridSearchBuilderImpl.java)
-    #[cfg(feature = "fulltext")]
     pub fn new_hybrid_search_builder(&self) -> HybridSearchBuilder<'_> {
         HybridSearchBuilder::new(self)
     }

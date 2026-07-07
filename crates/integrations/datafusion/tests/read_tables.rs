@@ -1827,13 +1827,12 @@ mod vector_search_tests {
 
 // ======================= Hybrid Search Tests =======================
 
-#[cfg(feature = "fulltext")]
 mod hybrid_search_tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::Int32Array;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-    use paimon_datafusion::{register_hybrid_search, SQLContext};
+    use paimon_datafusion::SQLContext;
 
     fn extract_test_warehouse(archive_name: &str) -> (tempfile::TempDir, String) {
         let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1864,7 +1863,6 @@ mod hybrid_search_tests {
         ctx.register_catalog("paimon", catalog.clone())
             .await
             .expect("Failed to register catalog");
-        register_hybrid_search(ctx.ctx(), catalog, "default");
         (ctx, tmp)
     }
 
@@ -1884,7 +1882,7 @@ mod hybrid_search_tests {
     }
 
     #[tokio::test]
-    async fn test_hybrid_search_vector_route_spark_shape() {
+    async fn test_hybrid_search_multiple_vector_routes_spark_shape() {
         let (ctx, _tmp) = create_hybrid_search_context().await;
         let batches = ctx
             .sql(
@@ -1893,6 +1891,11 @@ mod hybrid_search_tests {
                  array(named_struct( \
                    'field', 'embedding', \
                    'query_vector', array(1.0, 0.0, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0), \
+                 named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(0.9, 0.1, 0.0, 0.0), \
                    'limit', 3, \
                    'weight', 1.0)), \
                  array(), \
