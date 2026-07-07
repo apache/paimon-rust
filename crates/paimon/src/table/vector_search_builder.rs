@@ -70,6 +70,7 @@ pub struct VectorSearchBuilder<'a> {
     vector_column: Option<String>,
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
+    options: HashMap<String, String>,
 }
 
 pub struct BatchVectorSearchBuilder<'a> {
@@ -77,6 +78,7 @@ pub struct BatchVectorSearchBuilder<'a> {
     vector_column: Option<String>,
     query_vectors: Option<Vec<Vec<f32>>>,
     limit: Option<usize>,
+    options: HashMap<String, String>,
 }
 
 impl<'a> VectorSearchBuilder<'a> {
@@ -86,6 +88,7 @@ impl<'a> VectorSearchBuilder<'a> {
             vector_column: None,
             query_vector: None,
             limit: None,
+            options: HashMap::new(),
         }
     }
 
@@ -104,7 +107,16 @@ impl<'a> VectorSearchBuilder<'a> {
         self
     }
 
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
+        self
+    }
+
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
+        self.execute_scored().await?.to_row_ranges()
+    }
+
+    pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let vector_column =
@@ -128,11 +140,12 @@ impl<'a> VectorSearchBuilder<'a> {
             .with_vector_column(vector_column)
             .with_query_vectors(vec![query_vector.clone()])
             .with_limit(limit)
+            .with_options(self.options.clone())
             .execute()
             .await?;
 
         debug_assert_eq!(results.len(), 1);
-        results.remove(0).to_row_ranges()
+        Ok(results.remove(0))
     }
 }
 
@@ -143,6 +156,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             vector_column: None,
             query_vectors: None,
             limit: None,
+            options: HashMap::new(),
         }
     }
 
@@ -158,6 +172,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
         self
     }
 
@@ -192,7 +211,10 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
         let vector_searches = query_vectors
             .iter()
-            .map(|vector| VectorSearch::new(vector.clone(), limit, vector_column.to_string()))
+            .map(|vector| {
+                VectorSearch::new(vector.clone(), limit, vector_column.to_string())
+                    .map(|search| search.with_options(self.options.clone()))
+            })
             .collect::<crate::Result<Vec<_>>>()?;
 
         let snapshot_manager = SnapshotManager::new(
@@ -282,6 +304,17 @@ async fn evaluate_batch_vector_search(
             source: None,
         });
     }
+    let search_options = vector_searches[0].options.clone();
+    if vector_searches
+        .iter()
+        .any(|vector_search| vector_search.options != search_options)
+    {
+        return Err(crate::Error::DataInvalid {
+            message: "Batch vector search requires all query vectors to use the same options"
+                .to_string(),
+            source: None,
+        });
+    }
 
     let field_id = match find_field_id_by_name(evaluation.schema_fields, field_name) {
         Some(id) => id,
@@ -346,7 +379,8 @@ async fn evaluate_batch_vector_search(
                 for vector_search in &mut vector_searches {
                     vector_search.limit = index_limit;
                 }
-                let options = evaluation.table_options.clone();
+                let mut options = evaluation.table_options.clone();
+                options.extend(search_options.clone());
                 let input = evaluation.file_io.new_input(&path);
                 async move {
                     let input = input?;

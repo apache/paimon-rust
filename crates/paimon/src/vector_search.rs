@@ -22,6 +22,7 @@ pub struct VectorSearch {
     pub vector: Vec<f32>,
     pub limit: usize,
     pub field_name: String,
+    pub options: HashMap<String, String>,
     pub include_row_ids: Option<roaring::RoaringTreemap>,
 }
 
@@ -49,8 +50,14 @@ impl VectorSearch {
             vector,
             limit,
             field_name,
+            options: HashMap::new(),
             include_row_ids: None,
         })
+    }
+
+    pub fn with_options(mut self, options: HashMap<String, String>) -> Self {
+        self.options = options;
+        self
     }
 
     pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
@@ -248,6 +255,7 @@ mod tests {
         assert_eq!(cloned.vector, vector_search.vector);
         assert_eq!(cloned.limit, vector_search.limit);
         assert_eq!(cloned.field_name, vector_search.field_name);
+        assert_eq!(cloned.options, vector_search.options);
         assert_eq!(cloned.include_row_ids.as_ref(), Some(&include_row_ids));
     }
 

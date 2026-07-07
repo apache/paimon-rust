@@ -22,6 +22,7 @@ pub(crate) mod bin_pack;
 mod blob_file_writer;
 mod branch_manager;
 mod btree_global_index_build_builder;
+mod btree_global_index_drop_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -38,6 +39,7 @@ mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_scanner;
+mod hybrid_search_builder;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -70,12 +72,16 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
+pub use btree_global_index_drop_builder::BTreeGlobalIndexDropBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
+pub use hybrid_search_builder::{
+    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+};
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
@@ -185,6 +191,13 @@ impl Table {
         FullTextSearchBuilder::new(self)
     }
 
+    /// Create a hybrid search builder.
+    ///
+    /// Reference: [HybridSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/HybridSearchBuilderImpl.java)
+    pub fn new_hybrid_search_builder(&self) -> HybridSearchBuilder<'_> {
+        HybridSearchBuilder::new(self)
+    }
+
     pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
         VectorSearchBuilder::new(self)
     }
@@ -199,6 +212,10 @@ impl Table {
 
     pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
         BTreeGlobalIndexBuildBuilder::new(self)
+    }
+
+    pub fn new_btree_global_index_drop_builder(&self) -> BTreeGlobalIndexDropBuilder<'_> {
+        BTreeGlobalIndexDropBuilder::new(self)
     }
 
     /// Create a write builder for write/commit.

@@ -96,6 +96,10 @@ impl<'a> FullTextSearchBuilder<'a> {
     ///
     /// Reference: `FullTextSearchBuilder.executeLocal()`
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
+        Ok(self.execute_scored().await?.to_row_ranges())
+    }
+
+    pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let text_column =
@@ -123,7 +127,7 @@ impl<'a> FullTextSearchBuilder<'a> {
 
         let snapshot = match snapshot_manager.get_latest_snapshot().await? {
             Some(s) => s,
-            None => return Ok(Vec::new()),
+            None => return Ok(SearchResult::empty()),
         };
 
         let index_entries = match snapshot.index_manifest() {
@@ -168,14 +172,14 @@ async fn evaluate_full_text_search(
     evaluation: FullTextSearchEvaluation<'_>,
     index_entries: &[IndexManifestEntry],
     search: &FullTextSearch,
-) -> crate::Result<Vec<RowRange>> {
+) -> crate::Result<SearchResult> {
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
     let search_mode = core_options.global_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(evaluation.schema_fields, &search.field_name) {
         Some(id) => id,
-        None => return Ok(Vec::new()),
+        None => return Ok(SearchResult::empty()),
     };
 
     // Collect tantivy fulltext entries for the target field.
@@ -192,7 +196,7 @@ async fn evaluate_full_text_search(
         .collect();
 
     if fulltext_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast {
-        return Ok(Vec::new());
+        return Ok(SearchResult::empty());
     }
 
     let deleted_row_index = if core_options.data_evolution_enabled() {
@@ -280,8 +284,7 @@ async fn evaluate_full_text_search(
 
     Ok(merged
         .without_deleted_row_ranges(deleted_row_index.as_ref())?
-        .top_k(search.limit)
-        .to_row_ranges())
+        .top_k(search.limit))
 }
 
 fn is_tantivy_fulltext_index_file(index_file: &IndexFileMeta) -> bool {

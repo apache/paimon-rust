@@ -21,13 +21,15 @@ use arrow_array::{
     Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, PrimitiveArray,
     RecordBatch, StringArray, StructArray,
 };
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::spec::{DataType, IntType, Predicate, Schema, VarCharType};
-use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan};
+use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Plan, ScanTrace};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 #[path = "../../paimon/tests/mock_server.rs"]
 mod mock_server;
@@ -74,10 +76,158 @@ async fn get_table_from_catalog<C: Catalog + ?Sized>(
     table_name: &str,
 ) -> paimon::Table {
     let identifier = Identifier::new("default", table_name);
+    match catalog.get_table(&identifier).await {
+        Ok(table) => table,
+        Err(Error::TableNotExist { .. }) if table_name == "data_evolution_table" => {
+            ensure_data_evolution_table(catalog).await;
+            catalog
+                .get_table(&identifier)
+                .await
+                .expect("Failed to get generated data_evolution_table")
+        }
+        Err(err) => panic!("Failed to get table: {err:?}"),
+    }
+}
+
+const DATA_EVOLUTION_FIXTURE_MARKER: &str = "paimon-rust.integration-fixture";
+const DATA_EVOLUTION_FIXTURE_VERSION: &str = "data-evolution-limit-v2";
+
+static DATA_EVOLUTION_FIXTURE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn ensure_data_evolution_table<C: Catalog + ?Sized>(catalog: &C) {
+    let lock = DATA_EVOLUTION_FIXTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = lock.lock().await;
+
+    let identifier = Identifier::new("default", "data_evolution_table");
+    if let Ok(table) = catalog.get_table(&identifier).await {
+        let options = table.schema().options();
+        let fixture_marker = options
+            .get(DATA_EVOLUTION_FIXTURE_MARKER)
+            .map(String::as_str);
+        if fixture_marker == Some(DATA_EVOLUTION_FIXTURE_VERSION) || fixture_marker.is_none() {
+            return;
+        }
+        catalog
+            .drop_table(&identifier, true)
+            .await
+            .expect("Failed to replace stale generated data_evolution_table fixture");
+    }
+
     catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .expect("Failed to create default database for data_evolution_table fixture");
+    catalog
+        .create_table(&identifier, data_evolution_fixture_schema(), true)
+        .await
+        .expect("Failed to create data_evolution_table fixture");
+
+    let table = catalog
         .get_table(&identifier)
         .await
-        .expect("Failed to get table")
+        .expect("Failed to load data_evolution_table fixture");
+
+    append_data_evolution_batch(
+        &table,
+        data_evolution_fixture_batch(
+            vec![1, 2, 3],
+            vec!["alice", "bob", "carol"],
+            vec![100, 200, 300],
+        ),
+    )
+    .await;
+    append_data_evolution_batch(
+        &table,
+        data_evolution_fixture_batch(vec![4, 5], vec!["dave", "eve"], vec![400, 500]),
+    )
+    .await;
+
+    let wb = table.new_write_builder();
+    let mut update = wb
+        .new_update(vec!["name".to_string()])
+        .expect("Failed to create data-evolution update writer");
+    update
+        .add_matched_batch(data_evolution_update_batch())
+        .expect("Failed to add data-evolution update batch");
+    wb.new_commit()
+        .commit(
+            update
+                .prepare_commit()
+                .await
+                .expect("Failed to prepare data-evolution update commit"),
+        )
+        .await
+        .expect("Failed to commit data-evolution update fixture");
+}
+
+fn data_evolution_fixture_schema() -> Schema {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "name",
+            DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+        )
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("source.split.target-size", "1b")
+        .option("source.split.open-file-cost", "1b")
+        .option(
+            DATA_EVOLUTION_FIXTURE_MARKER,
+            DATA_EVOLUTION_FIXTURE_VERSION,
+        )
+        .build()
+        .unwrap()
+}
+
+fn data_evolution_fixture_batch(ids: Vec<i32>, names: Vec<&str>, values: Vec<i32>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, false),
+        ArrowField::new("value", ArrowDataType::Int32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int32Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+fn data_evolution_update_batch() -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![0, 2, 3])),
+            Arc::new(StringArray::from(vec!["alice-v2", "carol-v2", "dave"])),
+        ],
+    )
+    .unwrap()
+}
+
+async fn append_data_evolution_batch(table: &paimon::Table, batch: RecordBatch) {
+    let wb = table.new_write_builder();
+    let mut write = wb.new_write().expect("Failed to create fixture writer");
+    write
+        .write_arrow_batch(&batch)
+        .await
+        .expect("Failed to write fixture batch");
+    wb.new_commit()
+        .commit(
+            write
+                .prepare_commit()
+                .await
+                .expect("Failed to prepare fixture commit"),
+        )
+        .await
+        .expect("Failed to commit fixture batch");
 }
 
 fn create_file_system_catalog() -> FileSystemCatalog {
@@ -1081,6 +1231,17 @@ async fn plan_table(table: &paimon::Table, limit: Option<usize>) -> Plan {
     scan.plan().await.expect("Failed to plan scan")
 }
 
+async fn plan_table_with_trace(table: &paimon::Table, limit: Option<usize>) -> (Plan, ScanTrace) {
+    let mut read_builder = table.new_read_builder();
+    if let Some(limit) = limit {
+        read_builder.with_limit(limit);
+    }
+    let scan = read_builder.new_scan();
+    scan.plan_with_trace()
+        .await
+        .expect("Failed to plan scan with trace")
+}
+
 /// Test limit pushdown: when limit is smaller than total rows, fewer data files may be generated.
 #[tokio::test]
 async fn test_limit_pushdown() {
@@ -1090,11 +1251,11 @@ async fn test_limit_pushdown() {
     let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
 
     // Get full plan without limit
-    let full_plan = plan_table(&table, None).await;
+    let (full_plan, full_trace) = plan_table_with_trace(&table, None).await;
     let full_data_split_count: usize = full_plan.splits().iter().count();
 
     // Get the plan with limit = 2
-    let limited_plan = plan_table(&table, Some(2)).await;
+    let (limited_plan, limited_trace) = plan_table_with_trace(&table, Some(2)).await;
     let limited_data_split_count: usize = limited_plan.splits().iter().count();
 
     // For data evolution tables, limit pushdown at split level uses merged_row_count
@@ -1103,20 +1264,35 @@ async fn test_limit_pushdown() {
         limited_data_split_count < full_data_split_count,
         "Limit pushdown should reduce data split count for data evolution table: limited={limited_data_split_count}, full={full_data_split_count}"
     );
+    assert!(
+        limited_trace.limit_early_stopped,
+        "Limit pushdown should stop split construction early: {limited_trace:?}"
+    );
+    assert!(
+        limited_trace.split_candidates_built < full_trace.split_candidates_built,
+        "Limit pushdown should build fewer split candidates: limited={limited_trace:?}, full={full_trace:?}"
+    );
 
-    // Verify data evolution splits have merged_row_count
+    // Verify data evolution splits have merged_row_count. Overlapping row-id
+    // groups reduce the physical row count, while non-overlapping groups can
+    // have equal physical and merged counts.
+    let mut saw_overlapping_group = false;
     for split in full_plan.splits() {
         let merged_count = split.merged_row_count().expect(
             "Data evolution table should have merged_row_count (all files should have first_row_id)",
         );
-        // merged_row_count should be < row_count (overlapping ranges reduce count)
         assert!(
-            merged_count < split.row_count(),
-            "merged_row_count ({}) should be < row_count ({})",
+            merged_count <= split.row_count(),
+            "merged_row_count ({}) should be <= row_count ({})",
             merged_count,
             split.row_count()
         );
+        saw_overlapping_group |= merged_count < split.row_count();
     }
+    assert!(
+        saw_overlapping_group,
+        "Expected at least one overlapping data-evolution split with merged_row_count < row_count"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3158,6 +3334,45 @@ async fn test_read_data_evolution_table_with_full_row_ranges() {
     let filtered_rows = extract_id_name_value(&filtered_batches);
 
     assert_eq!(filtered_rows, full_rows);
+}
+
+#[tokio::test]
+async fn test_limit_pushdown_disabled_with_row_ranges() {
+    use paimon::RowRange;
+
+    let catalog = create_file_system_catalog();
+    let table = get_table_from_catalog(&catalog, "data_evolution_table").await;
+
+    let mut row_range_reader = table.new_read_builder();
+    row_range_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
+    let (row_range_plan, row_range_trace) = row_range_reader
+        .new_scan()
+        .plan_with_trace()
+        .await
+        .expect("Failed to plan row-range scan");
+
+    let mut limited_reader = table.new_read_builder();
+    limited_reader.with_row_ranges(vec![RowRange::new(0, i64::MAX)]);
+    limited_reader.with_limit(2);
+    let (limited_plan, limited_trace) = limited_reader
+        .new_scan()
+        .plan_with_trace()
+        .await
+        .expect("Failed to plan limited row-range scan");
+
+    assert_eq!(
+        limited_plan.splits().len(),
+        row_range_plan.splits().len(),
+        "Positive limit pushdown should be disabled when effective row_ranges exist"
+    );
+    assert!(
+        !limited_trace.limit_early_stopped,
+        "Row ranges should disable limit early stop: {limited_trace:?}"
+    );
+    assert_eq!(
+        limited_trace.split_candidates_built, row_range_trace.split_candidates_built,
+        "Row-range limited scan should build the same split candidates as row-range scan"
+    );
 }
 
 #[tokio::test]

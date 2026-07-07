@@ -1824,3 +1824,90 @@ mod vector_search_tests {
         );
     }
 }
+
+// ======================= Hybrid Search Tests =======================
+
+mod hybrid_search_tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int32Array;
+    use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+    use paimon_datafusion::SQLContext;
+
+    fn extract_test_warehouse(archive_name: &str) -> (tempfile::TempDir, String) {
+        let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(archive_name);
+        let file = std::fs::File::open(&archive_path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", archive_path.display()));
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_dir = tmp.path().join("default.db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        archive.unpack(&db_dir).unwrap();
+
+        let warehouse = format!("file://{}", tmp.path().display());
+        (tmp, warehouse)
+    }
+
+    async fn create_hybrid_search_context() -> (SQLContext, tempfile::TempDir) {
+        let (tmp, warehouse) = extract_test_warehouse("test_java_vindex_vector.tar.gz");
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, warehouse);
+        let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog.clone())
+            .await
+            .expect("Failed to register catalog");
+        (ctx, tmp)
+    }
+
+    fn extract_ids(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            for i in 0..batch.num_rows() {
+                ids.push(id_array.value(i));
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_multiple_vector_routes_spark_shape() {
+        let (ctx, _tmp) = create_hybrid_search_context().await;
+        let batches = ctx
+            .sql(
+                "SELECT id FROM hybrid_search( \
+                 'paimon.default.test_java_vindex_vector', \
+                 array(named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(1.0, 0.0, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0), \
+                 named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(0.9, 0.1, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0)), \
+                 array(), \
+                 3, \
+                 'rrf')",
+            )
+            .await
+            .expect("hybrid_search SQL should parse")
+            .collect()
+            .await
+            .expect("hybrid_search query should execute");
+
+        assert_eq!(extract_ids(&batches), vec![0, 1, 2]);
+    }
+}

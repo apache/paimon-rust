@@ -78,7 +78,7 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog(...).await` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog(...).await` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `hybrid_search`, and `full_text_search` when the `fulltext` feature is enabled) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -851,6 +851,99 @@ Vector index behavior is configured via table options prefixed with `lumina.`:
 ### Environment
 
 The Lumina native library must be available at runtime. Set the `LUMINA_LIB_PATH` environment variable to the path of the shared library, or place it in the platform default location.
+
+## Hybrid Search
+
+Paimon supports hybrid search by combining multiple search routes and ranking the merged results. The `hybrid_search` table-valued function is registered as a UDTF on the DataFusion session context.
+
+Hybrid search does not require the `fulltext` feature when all routes are vector routes. Enable `fulltext` only when you include full-text routes.
+
+### Registration
+
+When you use a `SQLContext`, `hybrid_search` is registered automatically for every catalog you register — no extra setup is needed.
+
+With a raw DataFusion `SessionContext`, register it explicitly:
+
+```rust
+use paimon_datafusion::register_hybrid_search;
+
+register_hybrid_search(&ctx, catalog.clone(), "default");
+```
+
+### Usage
+
+```sql
+SELECT * FROM hybrid_search(
+    'table_name',
+    vector_routes,
+    full_text_routes,
+    limit,
+    'ranker'
+)
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form |
+| `vector_routes` | ARRAY | Vector route definitions; use `array()` when no vector route is needed |
+| `full_text_routes` | ARRAY | Full-text route definitions; use `array()` for vector-only hybrid search |
+| `limit` | INT | Maximum number of merged results (top-k) |
+| `ranker` | STRING | Optional ranker: `rrf` (default), `weighted_score`, or `mrr` |
+
+Route definitions use Spark-compatible `array(named_struct(...))` syntax. A vector route accepts `field` (or `vector_column`), `query_vector`, optional `limit`, optional `weight`, and optional `options`:
+
+```sql
+SELECT *
+FROM hybrid_search(
+    'paimon.my_db.items',
+    array(
+        named_struct(
+            'field', 'title_embedding',
+            'query_vector', array(1.0, 0.0, 0.0, 0.0),
+            'limit', 20,
+            'weight', 1.0
+        ),
+        named_struct(
+            'field', 'body_embedding',
+            'query_vector', array(0.9, 0.1, 0.0, 0.0),
+            'limit', 20,
+            'weight', 0.7
+        )
+    ),
+    array(),
+    10,
+    'rrf'
+);
+```
+
+A full-text route accepts `column`, `query`, optional `limit`, and optional `weight`. Full-text routes require the `fulltext` feature:
+
+```sql
+SELECT *
+FROM hybrid_search(
+    'paimon.my_db.docs',
+    array(
+        named_struct(
+            'field', 'embedding',
+            'query_vector', array(1.0, 0.0, 0.0, 0.0),
+            'limit', 20,
+            'weight', 1.0
+        )
+    ),
+    array(
+        named_struct(
+            'column', 'content',
+            'query', 'paimon search',
+            'limit', 20,
+            'weight', 0.8
+        )
+    ),
+    10,
+    'weighted_score'
+);
+```
+
+The function searches each route independently, merges route results with the selected ranker, and returns the top-k matching rows from the target table. The current DataFusion table function returns table rows only; it does not expose a metadata score column.
 
 ## Full-Text Search
 

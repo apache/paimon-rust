@@ -45,6 +45,8 @@ pub struct ScanTrace {
     pub data_evolution_groups_before_stats: usize,
     pub data_evolution_groups_pruned_by_stats: usize,
     pub data_evolution_groups_pruned_by_row_ranges: usize,
+    pub split_candidates_built: usize,
+    pub limit_early_stopped: bool,
     pub splits_before_limit: usize,
     pub splits_after_limit: usize,
     pub final_splits: usize,
@@ -65,6 +67,25 @@ impl ScanTrace {
         splits: usize,
         files: usize,
     ) {
+        self.record_final_plan_with_limit(
+            splits_before_limit,
+            splits_before_limit,
+            splits,
+            files,
+            false,
+        );
+    }
+
+    pub(crate) fn record_final_plan_with_limit(
+        &mut self,
+        split_candidates_built: usize,
+        splits_before_limit: usize,
+        splits: usize,
+        files: usize,
+        limit_early_stopped: bool,
+    ) {
+        self.split_candidates_built = split_candidates_built;
+        self.limit_early_stopped = limit_early_stopped;
         self.splits_before_limit = splits_before_limit;
         self.splits_after_limit = splits;
         self.final_splits = splits;
@@ -76,7 +97,7 @@ impl fmt::Display for ScanTrace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "snapshot={:?}, manifests={}/{}, entries_read={}, bucket_pruned={}, partition_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, splits_before_limit={}, splits_after_limit={}, files={}",
+            "snapshot={:?}, manifests={}/{}, entries_read={}, bucket_pruned={}, partition_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}",
             self.snapshot_id,
             self.manifest_files_after_partition_pruning,
             self.manifest_files_before_partition_pruning,
@@ -85,6 +106,8 @@ impl fmt::Display for ScanTrace {
             self.manifest_entries_pruned_by_partition,
             self.manifest_entries_pruned_by_data_stats,
             self.manifest_entries_pruned_by_cross_schema_stats,
+            self.split_candidates_built,
+            self.limit_early_stopped,
             self.splits_before_limit,
             self.splits_after_limit,
             self.final_files
