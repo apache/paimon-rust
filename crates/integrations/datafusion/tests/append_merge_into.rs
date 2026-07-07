@@ -1133,6 +1133,34 @@ async fn test_partitioned_update_and_insert() {
 }
 
 #[tokio::test]
+async fn test_partitioned_merge_without_partition_equality_does_not_prune_target() {
+    let (_tmp, sql_context) =
+        setup("CREATE TABLE paimon.test_db.target (a INT, b INT, pt INT) PARTITIONED BY (pt)")
+            .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.target VALUES (1, 10, 2)",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, b INT, pt INT) AS SELECT * FROM (VALUES (1, 100, 1)) AS t(a, b, pt)",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET b = s.b \
+         WHEN NOT MATCHED THEN INSERT (a, b, pt) VALUES (s.a, s.b, s.pt)",
+    )
+    .await;
+
+    assert_eq!(query_a_b_pt(&sql_context).await, vec![(1, 100, 2),]);
+}
+
+#[tokio::test]
 async fn test_partitioned_successive_merges() {
     let (_tmp, sql_context) = setup_partitioned().await;
 

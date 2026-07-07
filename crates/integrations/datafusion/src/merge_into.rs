@@ -32,7 +32,8 @@ use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AssignmentTarget, Merge, MergeAction, MergeClauseKind, MergeInsertKind, TableFactor,
+    AssignmentTarget, BinaryOperator, Expr as SqlExpr, Ident, Merge, MergeAction, MergeClauseKind,
+    MergeInsertKind, TableFactor,
 };
 use futures::TryStreamExt;
 
@@ -325,12 +326,14 @@ async fn execute_cow_merge_once(
 
     let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
     let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
-    let on_condition = merge.on.to_string();
+    let on_expr = &merge.on;
+    let on_condition = on_expr.to_string();
     let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
     let t_alias = target_alias.as_deref().unwrap_or("__cow_t");
 
     // Build partition filter from source data to avoid scanning all partitions
-    let partition_set = build_source_partition_set(ctx, table, &source_ref, s_alias).await?;
+    let partition_set =
+        build_source_partition_set(ctx, table, &source_ref, s_alias, t_alias, on_expr).await?;
 
     let mut writer = CopyOnWriteMergeWriter::new(table, update_columns.clone(), partition_set)
         .await
@@ -1365,15 +1368,22 @@ pub(crate) async fn build_partition_set_from_where(
 /// Query source table for distinct partition values and build a partition set.
 ///
 /// Returns `None` for non-partitioned tables or when the source lacks matching
-/// partition key columns (falls back to full-partition scan).
+/// partition key columns (falls back to full-partition scan). The source values
+/// are only safe to apply to the target when the MERGE condition equates every
+/// target partition column with the same source column.
 async fn build_source_partition_set(
     ctx: &SQLContext,
     table: &Table,
     source_ref: &str,
     s_alias: &str,
+    t_alias: &str,
+    on_expr: &SqlExpr,
 ) -> DFResult<Option<HashSet<Vec<u8>>>> {
     let partition_keys = table.schema().partition_keys();
     if partition_keys.is_empty() {
+        return Ok(None);
+    }
+    if !can_prune_target_by_source_partitions(partition_keys, t_alias, s_alias, on_expr) {
         return Ok(None);
     }
 
@@ -1390,6 +1400,71 @@ async fn build_source_partition_set(
         }
         Err(_) => Ok(None),
     }
+}
+
+fn can_prune_target_by_source_partitions(
+    partition_keys: &[String],
+    t_alias: &str,
+    s_alias: &str,
+    on_expr: &SqlExpr,
+) -> bool {
+    partition_keys
+        .iter()
+        .all(|key| on_expr_contains_alias_column_eq(on_expr, t_alias, key, s_alias, key))
+}
+
+fn on_expr_contains_alias_column_eq(
+    expr: &SqlExpr,
+    left_alias: &str,
+    left_column: &str,
+    right_alias: &str,
+    right_column: &str,
+) -> bool {
+    match expr {
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            on_expr_contains_alias_column_eq(
+                left,
+                left_alias,
+                left_column,
+                right_alias,
+                right_column,
+            ) || on_expr_contains_alias_column_eq(
+                right,
+                left_alias,
+                left_column,
+                right_alias,
+                right_column,
+            )
+        }
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            is_alias_column(left, left_alias, left_column)
+                && is_alias_column(right, right_alias, right_column)
+                || is_alias_column(left, right_alias, right_column)
+                    && is_alias_column(right, left_alias, left_column)
+        }
+        _ => false,
+    }
+}
+
+fn is_alias_column(expr: &SqlExpr, alias: &str, column: &str) -> bool {
+    match expr {
+        SqlExpr::CompoundIdentifier(parts) => is_qualified_column(parts, alias, column),
+        _ => false,
+    }
+}
+
+fn is_qualified_column(parts: &[Ident], alias: &str, column: &str) -> bool {
+    parts.len() == 2
+        && parts[0].value.eq_ignore_ascii_case(alias)
+        && parts[1].value.eq_ignore_ascii_case(column)
 }
 
 /// Rewrite SQL expressions by replacing original table references with aliases.
@@ -1534,6 +1609,54 @@ mod tests {
             datafusion::sql::sqlparser::ast::Statement::Merge(m) => m,
             _ => panic!("Expected MERGE statement"),
         }
+    }
+
+    #[test]
+    fn test_source_partition_pruning_requires_partition_equality() {
+        let merge = parse_merge(
+            "MERGE INTO target t USING source s ON t.a = s.a \
+             WHEN MATCHED THEN UPDATE SET b = s.b",
+        );
+        let partition_keys = vec!["pt".to_string()];
+
+        assert!(!can_prune_target_by_source_partitions(
+            &partition_keys,
+            "t",
+            "s",
+            &merge.on,
+        ));
+    }
+
+    #[test]
+    fn test_source_partition_pruning_accepts_partition_equality() {
+        let merge = parse_merge(
+            "MERGE INTO target t USING source s ON t.a = s.a AND t.pt = s.pt \
+             WHEN MATCHED THEN UPDATE SET b = s.b",
+        );
+        let partition_keys = vec!["pt".to_string()];
+
+        assert!(can_prune_target_by_source_partitions(
+            &partition_keys,
+            "t",
+            "s",
+            &merge.on,
+        ));
+    }
+
+    #[test]
+    fn test_source_partition_pruning_accepts_reversed_partition_equality() {
+        let merge = parse_merge(
+            "MERGE INTO target t USING source s ON s.pt = t.pt AND t.a = s.a \
+             WHEN MATCHED THEN UPDATE SET b = s.b",
+        );
+        let partition_keys = vec!["pt".to_string()];
+
+        assert!(can_prune_target_by_source_partitions(
+            &partition_keys,
+            "t",
+            "s",
+            &merge.on,
+        ));
     }
 
     #[tokio::test]
