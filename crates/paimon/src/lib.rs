@@ -51,3 +51,8 @@ pub use table::{
     RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager, Table,
     TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
 };
+
+#[cfg(feature = "fulltext")]
+pub use table::{
+    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+};
