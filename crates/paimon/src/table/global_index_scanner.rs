@@ -82,7 +82,6 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
-    row_range_end: i64,
     meta: BTreeIndexMeta,
 }
 
@@ -95,6 +94,23 @@ enum GlobalIndexFileKind {
 enum OpenedGlobalIndexReader {
     BTree(BTreeIndexReader<BoxedCmp>),
     Bitmap(BitmapGlobalIndexReader),
+}
+
+#[derive(Clone, Copy, Default)]
+struct FallbackScanPlan {
+    selected_btree: usize,
+    selected_bitmap: usize,
+    allow_btree: bool,
+    allow_bitmap: bool,
+}
+
+impl FallbackScanPlan {
+    fn allowed(self, kind: GlobalIndexFileKind) -> bool {
+        match kind {
+            GlobalIndexFileKind::BTree => self.allow_btree,
+            GlobalIndexFileKind::Bitmap => self.allow_bitmap,
+        }
+    }
 }
 
 impl OpenedGlobalIndexReader {
@@ -176,7 +192,6 @@ impl GlobalIndexScanner {
                 },
                 file_size: i64::from(entry.index_file.file_size),
                 row_range_start: global_meta.row_range_start,
-                row_range_end: global_meta.row_range_end,
                 meta: sorted_meta,
             };
 
@@ -373,22 +388,47 @@ impl GlobalIndexScanner {
             })
             .collect();
 
-        for entry in entries {
-            // Check if any predicate may match this file (use effective_predicates for pruning)
-            let matching_predicates: Vec<usize> = (0..effective_predicates.len())
-                .filter(|&i| {
-                    entry
-                        .meta
-                        .may_match(pruning_info[i].0, &pruning_info[i].2, &pruning_info[i].1)
-                })
-                .collect();
+        let predicate_matches: Vec<Vec<bool>> = pruning_info
+            .iter()
+            .map(|(op, cmp, serialized)| {
+                entries
+                    .iter()
+                    .map(|entry| entry.meta.may_match(*op, serialized, cmp))
+                    .collect()
+            })
+            .collect();
+        let predicate_fallback_plans: Vec<Option<FallbackScanPlan>> = effective_predicates
+            .iter()
+            .enumerate()
+            .map(|(i, (op, _, _))| {
+                requires_fallback_scan(*op)
+                    .then(|| self.fallback_scan_plan(entries, &predicate_matches[i]))
+            })
+            .collect();
 
-            // Also check if between range may match
-            let between_matches = between.as_ref().is_some_and(|b| {
+        let between_matches_by_entry: Vec<bool> = match between.as_ref() {
+            Some(b) => {
                 let cmp = make_key_comparator(b.data_type);
                 let from_key = serialize_datum(b.from, b.data_type);
                 let to_key = serialize_datum(b.to, b.data_type);
-                entry.meta.may_match_between(&from_key, &to_key, &cmp)
+                entries
+                    .iter()
+                    .map(|entry| entry.meta.may_match_between(&from_key, &to_key, &cmp))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let between_fallback_plan = between
+            .as_ref()
+            .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
+
+        for (entry_idx, entry) in entries.iter().enumerate() {
+            // Also check if between range may match
+            let between_matches = between
+                .as_ref()
+                .is_some_and(|_| between_matches_by_entry[entry_idx]);
+            let between_evaluated_for_entry = between_fallback_plan.is_some_and(|plan| {
+                fallback_plan_evaluates_entry(plan, entry.index_type, between_matches)
             });
 
             // When a Between conjunct exists but the file does not overlap its
@@ -398,48 +438,64 @@ impl GlobalIndexScanner {
             // (e.g. `BETWEEN 10 AND 20 AND id >= 0` on a file [30, 40]) would
             // be retained because `file_result` is initialized from the
             // remaining bitmap, silently dropping the Between conjunct.
-            if between.is_some() && !between_matches {
+            if between_evaluated_for_entry && !between_matches {
                 continue;
             }
 
-            if matching_predicates.is_empty() && !between_matches {
-                continue;
-            }
-
-            let mut skipped_fallback_scan = false;
-            let matching_predicates: Vec<usize> = matching_predicates
-                .into_iter()
+            let mut file_evaluated = between_evaluated_for_entry;
+            let mut file_cannot_match = false;
+            let mut file_has_unsupported_match =
+                between_matches && !between_evaluated_for_entry && between_fallback_plan.is_some();
+            let matching_predicates: Vec<usize> = (0..effective_predicates.len())
                 .filter(|&i| {
-                    if is_fallback_scan_op(effective_predicates[i].0)
-                        && !self.can_fallback_scan(entry)
-                    {
-                        skipped_fallback_scan = true;
-                        false
-                    } else {
-                        true
+                    let predicate_matches_entry = predicate_matches[i][entry_idx];
+                    let predicate_evaluated_for_entry =
+                        predicate_fallback_plans[i].map_or(true, |plan| {
+                            fallback_plan_evaluates_entry(
+                                plan,
+                                entry.index_type,
+                                predicate_matches_entry,
+                            )
+                        });
+                    if !predicate_evaluated_for_entry {
+                        file_has_unsupported_match |= predicate_matches_entry;
+                        return false;
                     }
+                    file_evaluated = true;
+                    if !predicate_matches_entry {
+                        file_cannot_match = true;
+                        return false;
+                    }
+                    true
                 })
                 .collect();
+            if file_cannot_match {
+                continue;
+            }
+            if !file_evaluated {
+                if file_has_unsupported_match {
+                    return Ok(None);
+                }
+                continue;
+            }
 
             let data_type = between
                 .as_ref()
                 .map(|b| b.data_type)
                 .or_else(|| effective_predicates.first().map(|p| p.2))
                 .unwrap_or(predicates[0].2);
-            let mut reader = if between_matches || !matching_predicates.is_empty() {
+            let mut reader = if (between_matches && between_evaluated_for_entry)
+                || !matching_predicates.is_empty()
+            {
                 Some(self.open_reader_for_entry(entry, data_type).await?)
             } else {
                 None
             };
 
-            let mut file_result = if skipped_fallback_scan {
-                Some(entry_row_bitmap(entry))
-            } else {
-                None
-            };
+            let mut file_result = None;
 
             // Execute between query first if applicable
-            if between_matches {
+            if between_matches && between_evaluated_for_entry {
                 if let Some(b) = &between {
                     let from_key = serialize_datum(b.from, b.data_type);
                     let to_key = serialize_datum(b.to, b.data_type);
@@ -575,12 +631,42 @@ impl GlobalIndexScanner {
         BitmapGlobalIndexReader::open(Box::new(file_reader), file_size).await
     }
 
-    fn can_fallback_scan(&self, entry: &GlobalIndexEntry) -> bool {
-        let max_size = match entry.index_type {
-            GlobalIndexFileKind::BTree => self.btree_fallback_scan_max_size,
-            GlobalIndexFileKind::Bitmap => self.bitmap_fallback_scan_max_size,
-        };
-        max_size > 0 && entry.file_size >= 0 && entry.file_size <= max_size
+    fn fallback_scan_plan(
+        &self,
+        entries: &[GlobalIndexEntry],
+        selected: &[bool],
+    ) -> FallbackScanPlan {
+        let mut plan = FallbackScanPlan::default();
+        let mut btree_total = 0i64;
+        let mut bitmap_total = 0i64;
+        let mut btree_valid = true;
+        let mut bitmap_valid = true;
+
+        for (entry, selected) in entries.iter().zip(selected) {
+            if !selected {
+                continue;
+            }
+            match entry.index_type {
+                GlobalIndexFileKind::BTree => {
+                    plan.selected_btree += 1;
+                    btree_valid &= add_file_size(&mut btree_total, entry.file_size);
+                }
+                GlobalIndexFileKind::Bitmap => {
+                    plan.selected_bitmap += 1;
+                    bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
+                }
+            }
+        }
+
+        plan.allow_btree = plan.selected_btree > 0
+            && btree_valid
+            && self.btree_fallback_scan_max_size > 0
+            && btree_total <= self.btree_fallback_scan_max_size;
+        plan.allow_bitmap = plan.selected_bitmap > 0
+            && bitmap_valid
+            && self.bitmap_fallback_scan_max_size > 0
+            && bitmap_total <= self.bitmap_fallback_scan_max_size;
+        plan
     }
 
     /// Return a reader to the cache for future reuse.
@@ -693,20 +779,40 @@ fn is_sorted_global_index_supported_op(op: PredicateOperator) -> bool {
     )
 }
 
-fn is_fallback_scan_op(op: PredicateOperator) -> bool {
+fn requires_fallback_scan(op: PredicateOperator) -> bool {
     matches!(
         op,
-        PredicateOperator::EndsWith | PredicateOperator::Contains | PredicateOperator::Like
+        PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
+            | PredicateOperator::Like
     )
 }
 
-fn entry_row_bitmap(entry: &GlobalIndexEntry) -> RoaringTreemap {
-    let mut bitmap = RoaringTreemap::new();
-    let count = entry.row_range_end - entry.row_range_start + 1;
-    if count > 0 {
-        bitmap.insert_range(0..count as u64);
+fn fallback_plan_evaluates_entry(
+    plan: FallbackScanPlan,
+    kind: GlobalIndexFileKind,
+    selected: bool,
+) -> bool {
+    !selected || plan.allowed(kind)
+}
+
+fn add_file_size(total: &mut i64, file_size: i64) -> bool {
+    if file_size < 0 {
+        return false;
     }
-    bitmap
+    match total.checked_add(file_size) {
+        Some(next) => {
+            *total = next;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).
@@ -1820,10 +1926,26 @@ mod tests {
             &meta,
         )];
         over_limit_entries[0].index_file.file_size = 2;
+        let over_limit_less_than = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &over_limit_entries,
+            &less_than_predicates,
+            &fields,
+            i64::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            over_limit_less_than.is_none(),
+            "range predicates require fallback dictionary scans and should be unsupported over budget"
+        );
+
         let no_match_contains = vec![Predicate::Leaf {
             column: "name".to_string(),
             index: 0,
-            data_type,
+            data_type: data_type.clone(),
             op: PredicateOperator::Contains,
             literals: vec![Datum::String("zz".to_string())],
         }];
@@ -1838,12 +1960,44 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(over_limit_result.unwrap(), vec![RowRange::new(100, 109)]);
+        assert!(
+            over_limit_result.is_none(),
+            "fallback scans over budget should be unsupported instead of returning full coverage"
+        );
+
+        let direct_with_over_limit_fallback = vec![Predicate::and(vec![
+            Predicate::Leaf {
+                column: "name".to_string(),
+                index: 0,
+                data_type: data_type.clone(),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::String("k2".to_string())],
+            },
+            Predicate::Leaf {
+                column: "name".to_string(),
+                index: 0,
+                data_type,
+                op: PredicateOperator::Contains,
+                literals: vec![Datum::String("zz".to_string())],
+            },
+        ])];
+        let direct_result = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &over_limit_entries,
+            &direct_with_over_limit_fallback,
+            &fields,
+            i64::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(direct_result.unwrap(), vec![RowRange::new(105, 106)]);
     }
 
     #[tokio::test]
-    async fn test_btree_fallback_scan_over_limit_returns_index_coverage() {
-        let (file_io, table_path, file_name, _tmp) =
+    async fn test_btree_fallback_scan_over_limit_is_unsupported() {
+        let (file_io, table_path, file_name, tmp) =
             setup_testdata_table("btree_varchar_100_no_compress.bin");
         let meta = BTreeIndexMeta::new(Some(b"a".to_vec()), Some(b"yyyy".to_vec()), false);
         let fields = string_schema_fields();
@@ -1883,7 +2037,87 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(over_limit_result.unwrap(), vec![RowRange::new(0, 99)]);
+        assert!(
+            over_limit_result.is_none(),
+            "fallback scans over budget should be unsupported instead of returning full coverage"
+        );
+
+        let second_file_name = "btree_varchar_100_no_compress_2.bin";
+        std::fs::copy(
+            tmp.path().join("index").join(&file_name),
+            tmp.path().join("index").join(second_file_name),
+        )
+        .unwrap();
+        let mut first = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        first.index_file.file_size = 1;
+        let mut second = make_global_index_entry(second_file_name, 1, 100, 199, &meta);
+        second.index_file.file_size = 1;
+        let total_over_limit_result = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &[first, second],
+            &predicates,
+            &fields,
+            1,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            total_over_limit_result.is_none(),
+            "fallback budget should use selected files' total size, not per-file size"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_scan_over_limit_with_mixed_index_kinds_is_unsupported() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_varchar_100_no_compress.bin");
+        let btree_meta = BTreeIndexMeta::new(Some(b"a".to_vec()), Some(b"yyyy".to_vec()), false);
+        let bitmap_meta = BTreeIndexMeta::new(Some(b"m".to_vec()), Some(b"z".to_vec()), false);
+        let fields = string_schema_fields();
+        let predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: DataType::VarChar(crate::spec::VarCharType::string_type()),
+            op: PredicateOperator::Lt,
+            literals: vec![Datum::String("delta".to_string())],
+        }];
+
+        let mut btree = make_global_index_entry_with_type(
+            BTREE_GLOBAL_INDEX_TYPE,
+            &file_name,
+            1,
+            0,
+            99,
+            &btree_meta,
+        );
+        btree.index_file.file_size = 2;
+        let mut bitmap = make_global_index_entry_with_type(
+            BITMAP_GLOBAL_INDEX_TYPE,
+            "bitmap-no-match.index",
+            1,
+            100,
+            199,
+            &bitmap_meta,
+        );
+        bitmap.index_file.file_size = 1;
+
+        let result = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &[btree, bitmap],
+            &predicates,
+            &fields,
+            1,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "an over-budget selected BTree file must stay unsupported even if bitmap files are pruned by metadata"
+        );
     }
 
     #[tokio::test]
@@ -2037,6 +2271,24 @@ mod tests {
                 .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(5, 10)]);
+
+        let mut over_limit_entries = vec![make_global_index_entry(&file_name, 1, 0, 99, &meta)];
+        over_limit_entries[0].index_file.file_size = 2;
+        let over_limit_result = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &over_limit_entries,
+            &predicates,
+            &fields,
+            1,
+            i64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            over_limit_result.is_none(),
+            "between/range predicates require fallback scans and should be unsupported over budget"
+        );
     }
 
     #[tokio::test]

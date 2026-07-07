@@ -1524,8 +1524,8 @@ deletion vectors enabled.
 | `global-index.enabled` | `false` | Enables global index metadata and global-index-aware reads. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree range. |
-| `btree-index.fallback-scan-max-size` | `256mb` | Maximum BTree global-index file size for fallback scans used by suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
-| `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum bitmap global-index file size for fallback scans used by suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
+| `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
+| `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
 
 ### Variant Shredding Options
