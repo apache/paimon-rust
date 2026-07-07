@@ -662,54 +662,6 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-#[cfg(test)]
-pub(crate) fn write_test_bitmap_index(
-    entries: &[(Option<Vec<u8>>, u64)],
-) -> io::Result<(Vec<u8>, BTreeIndexMeta)> {
-    let mut null_rows = RoaringTreemap::new();
-    let mut non_null_rows = RoaringTreemap::new();
-    let mut bitmaps: BTreeMap<Vec<u8>, RoaringTreemap> = BTreeMap::new();
-    let mut first_key: Option<Vec<u8>> = None;
-    let mut last_key: Option<Vec<u8>> = None;
-
-    for (key, row_id) in entries {
-        match key {
-            Some(key) => {
-                non_null_rows.insert(*row_id);
-                bitmaps.entry(key.clone()).or_default().insert(*row_id);
-                if first_key
-                    .as_ref()
-                    .is_none_or(|existing| compare_unsigned(key, existing).is_lt())
-                {
-                    first_key = Some(key.clone());
-                }
-                if last_key
-                    .as_ref()
-                    .is_none_or(|existing| compare_unsigned(key, existing).is_gt())
-                {
-                    last_key = Some(key.clone());
-                }
-            }
-            None => {
-                null_rows.insert(*row_id);
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    write_bitmap_index_bytes(
-        &mut out,
-        &null_rows,
-        &non_null_rows,
-        &bitmaps,
-        usize::MAX,
-        BlockCompressionType::None,
-    )?;
-
-    let meta = BTreeIndexMeta::new(first_key, last_key, !null_rows.is_empty());
-    Ok((out, meta))
-}
-
 fn write_bitmap_index_bytes(
     out: &mut Vec<u8>,
     null_rows: &RoaringTreemap,

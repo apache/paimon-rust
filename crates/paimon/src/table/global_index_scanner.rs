@@ -1308,18 +1308,24 @@ mod tests {
         (file_io, table_path, testdata_name.to_string(), tmp)
     }
 
-    fn setup_index_bytes_table(
-        file_name: &str,
-        bytes: &[u8],
-    ) -> (FileIO, String, String, tempfile::TempDir) {
+    type JavaBitmapTestdataTable = (FileIO, String, String, BTreeIndexMeta, tempfile::TempDir);
+
+    fn setup_java_bitmap_testdata_table() -> JavaBitmapTestdataTable {
+        const FILE_NAME: &str = "bitmap_varchar_java.index";
+        let src = format!("{}/testdata/bitmap/{FILE_NAME}", env!("CARGO_MANIFEST_DIR"));
+        let meta_src = format!(
+            "{}/testdata/bitmap/{FILE_NAME}.meta",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let tmp = tempfile::tempdir().unwrap();
         let index_dir = tmp.path().join("index");
         std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::write(index_dir.join(file_name), bytes).unwrap();
+        std::fs::copy(&src, index_dir.join(FILE_NAME)).unwrap();
+        let meta = BTreeIndexMeta::deserialize(&std::fs::read(meta_src).unwrap()).unwrap();
 
         let table_path = format!("file://{}", tmp.path().display());
         let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
-        (file_io, table_path, file_name.to_string(), tmp)
+        (file_io, table_path, FILE_NAME.to_string(), meta, tmp)
     }
 
     fn make_global_index_entry(
@@ -1672,53 +1678,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evaluate_java_bitmap_global_index_eq_and_null() {
+    async fn test_evaluate_java_bitmap_golden_index_eq_and_null() {
         let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
-        let bitmap_rows = vec![
-            (
-                Some(serialize_datum(
-                    &Datum::String("k1".to_string()),
-                    &data_type,
-                )),
-                0,
-            ),
-            (
-                Some(serialize_datum(
-                    &Datum::String("k2".to_string()),
-                    &data_type,
-                )),
-                1,
-            ),
-            (None, 2),
-            (
-                Some(serialize_datum(
-                    &Datum::String("k2".to_string()),
-                    &data_type,
-                )),
-                3,
-            ),
-            (
-                Some(serialize_datum(
-                    &Datum::String("k3".to_string()),
-                    &data_type,
-                )),
-                4,
-            ),
-        ];
-        let (index_bytes, meta) =
-            crate::table::bitmap_global_index_reader::write_test_bitmap_index(&bitmap_rows)
-                .unwrap();
-        let (file_io, table_path, file_name, _tmp) =
-            setup_index_bytes_table("bitmap-global-index-test.index", &index_bytes);
+        let (file_io, table_path, file_name, meta, _tmp) = setup_java_bitmap_testdata_table();
         let entries = vec![make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
-            104,
+            109,
             &meta,
         )];
         let fields = string_schema_fields();
+        assert_eq!(meta.first_key, Some(b"alpha".to_vec()));
+        assert_eq!(meta.last_key, Some(b"office".to_vec()));
+        assert!(meta.has_nulls);
 
         let eq_predicates = vec![Predicate::Leaf {
             column: "name".to_string(),
@@ -1731,10 +1705,7 @@ mod tests {
             evaluate_global_index_fast(&file_io, &table_path, &entries, &eq_predicates, &fields)
                 .await
                 .unwrap();
-        assert_eq!(
-            eq_result.unwrap(),
-            vec![RowRange::new(101, 101), RowRange::new(103, 103)]
-        );
+        assert_eq!(eq_result.unwrap(), vec![RowRange::new(105, 106)]);
 
         let null_predicates = vec![Predicate::Leaf {
             column: "name".to_string(),
@@ -1747,54 +1718,19 @@ mod tests {
             evaluate_global_index_fast(&file_io, &table_path, &entries, &null_predicates, &fields)
                 .await
                 .unwrap();
-        assert_eq!(null_result.unwrap(), vec![RowRange::new(102, 102)]);
+        assert_eq!(null_result.unwrap(), vec![RowRange::new(104, 104)]);
     }
 
     #[tokio::test]
-    async fn test_evaluate_java_bitmap_global_index_string_fallback_scan() {
+    async fn test_evaluate_java_bitmap_golden_index_string_fallback_scan() {
         let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
-        let bitmap_rows = vec![
-            (
-                Some(serialize_datum(
-                    &Datum::String("alice".to_string()),
-                    &data_type,
-                )),
-                0,
-            ),
-            (
-                Some(serialize_datum(
-                    &Datum::String("bob".to_string()),
-                    &data_type,
-                )),
-                1,
-            ),
-            (None, 2),
-            (
-                Some(serialize_datum(
-                    &Datum::String("malice".to_string()),
-                    &data_type,
-                )),
-                3,
-            ),
-            (
-                Some(serialize_datum(
-                    &Datum::String("office".to_string()),
-                    &data_type,
-                )),
-                4,
-            ),
-        ];
-        let (index_bytes, meta) =
-            crate::table::bitmap_global_index_reader::write_test_bitmap_index(&bitmap_rows)
-                .unwrap();
-        let (file_io, table_path, file_name, _tmp) =
-            setup_index_bytes_table("bitmap-global-index-fallback.index", &index_bytes);
+        let (file_io, table_path, file_name, meta, _tmp) = setup_java_bitmap_testdata_table();
         let entries = vec![make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
-            104,
+            109,
             &meta,
         )];
         let fields = string_schema_fields();
@@ -1804,7 +1740,7 @@ mod tests {
             index: 0,
             data_type: data_type.clone(),
             op: PredicateOperator::EndsWith,
-            literals: vec![Datum::String("ice".to_string())],
+            literals: vec![Datum::String("ta".to_string())],
         }];
         let ends_with_result = evaluate_global_index_fast(
             &file_io,
@@ -1817,7 +1753,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             ends_with_result.unwrap(),
-            vec![RowRange::new(100, 100), RowRange::new(103, 104)]
+            vec![RowRange::new(101, 101), RowRange::new(103, 103)]
         );
 
         let contains_predicates = vec![Predicate::Leaf {
@@ -1825,7 +1761,7 @@ mod tests {
             index: 0,
             data_type: data_type.clone(),
             op: PredicateOperator::Contains,
-            literals: vec![Datum::String("o".to_string())],
+            literals: vec![Datum::String("ph".to_string())],
         }];
         let contains_result = evaluate_global_index_fast(
             &file_io,
@@ -1838,7 +1774,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             contains_result.unwrap(),
-            vec![RowRange::new(101, 101), RowRange::new(104, 104)]
+            vec![RowRange::new(100, 100), RowRange::new(102, 102)]
         );
 
         let like_predicates = vec![Predicate::Leaf {
@@ -1846,20 +1782,41 @@ mod tests {
             index: 0,
             data_type: data_type.clone(),
             op: PredicateOperator::Like,
-            literals: vec![Datum::String("a%c_".to_string())],
+            literals: vec![Datum::String("%ha%".to_string())],
         }];
         let like_result =
             evaluate_global_index_fast(&file_io, &table_path, &entries, &like_predicates, &fields)
                 .await
                 .unwrap();
-        assert_eq!(like_result.unwrap(), vec![RowRange::new(100, 100)]);
+        assert_eq!(
+            like_result.unwrap(),
+            vec![RowRange::new(100, 100), RowRange::new(102, 102)]
+        );
+
+        let less_than_predicates = vec![Predicate::Leaf {
+            column: "name".to_string(),
+            index: 0,
+            data_type: data_type.clone(),
+            op: PredicateOperator::Lt,
+            literals: vec![Datum::String("delta".to_string())],
+        }];
+        let less_than_result = evaluate_global_index_fast(
+            &file_io,
+            &table_path,
+            &entries,
+            &less_than_predicates,
+            &fields,
+        )
+        .await
+        .unwrap();
+        assert_eq!(less_than_result.unwrap(), vec![RowRange::new(100, 102)]);
 
         let mut over_limit_entries = vec![make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
-            104,
+            109,
             &meta,
         )];
         over_limit_entries[0].index_file.file_size = 2;
@@ -1881,7 +1838,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(over_limit_result.unwrap(), vec![RowRange::new(100, 104)]);
+        assert_eq!(over_limit_result.unwrap(), vec![RowRange::new(100, 109)]);
     }
 
     #[tokio::test]
