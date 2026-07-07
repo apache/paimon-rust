@@ -1501,6 +1501,7 @@ mod vector_search_tests {
         ctx.register_catalog("paimon", catalog.clone())
             .await
             .expect("Failed to register catalog");
+        register_vector_search(ctx.ctx(), catalog.clone(), "default");
         (ctx, catalog, tmp)
     }
 
@@ -1515,6 +1516,27 @@ mod vector_search_tests {
         );
         options.insert("lumina.index.dimension".to_string(), "2".to_string());
         options.insert("lumina.encoding.type".to_string(), "rawf32".to_string());
+
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .options(options)
+            .build()
+            .expect("Failed to build table schema")
+    }
+
+    fn build_vindex_table_schema() -> Schema {
+        let mut options = std::collections::HashMap::new();
+        options.insert("row-tracking.enabled".to_string(), "true".to_string());
+        options.insert("data-evolution.enabled".to_string(), "true".to_string());
+        options.insert("global-index.enabled".to_string(), "true".to_string());
+        options.insert(
+            "global-index.row-count-per-shard".to_string(),
+            "3".to_string(),
+        );
 
         Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -1822,6 +1844,90 @@ mod vector_search_tests {
             ids.iter().any(|id| matches!(id, 1 | 5)),
             "one same-direction neighbor should be returned, got {ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vindex_build_then_vector_search_query() {
+        let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
+        let identifier = Identifier::new("default", "vindex_build_query_e2e");
+        catalog
+            .create_table(&identifier, build_vindex_table_schema(), false)
+            .await
+            .expect("Failed to create table");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to load table");
+
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("Failed to configure write builder");
+        let mut table_write = write_builder
+            .new_write()
+            .expect("Failed to create table write");
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    vec![1.0, 0.0],
+                    vec![0.9, 0.1],
+                    vec![0.0, 1.0],
+                    vec![-1.0, 0.0],
+                    vec![0.0, -1.0],
+                    vec![0.7, 0.3],
+                ],
+            ))
+            .await
+            .expect("Failed to write vector batch");
+        let messages = table_write
+            .prepare_commit()
+            .await
+            .expect("Failed to prepare commit");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("Failed to commit vector data");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.vindex_build_query_e2e', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("vindex index build SQL should parse")
+        .collect()
+        .await
+        .expect("vindex index build SQL should execute");
+
+        let index_batches = ctx
+            .sql("SELECT index_type, row_count, row_range_start, row_range_end, index_field_name FROM paimon.default.`vindex_build_query_e2e$table_indexes` WHERE index_type = 'ivf-flat'")
+            .await
+            .expect("index metadata SQL should parse")
+            .collect()
+            .await
+            .expect("index metadata query should execute");
+        let index_rows = extract_index_rows(&index_batches);
+        assert_eq!(
+            index_rows,
+            vec![
+                ("ivf-flat".to_string(), 3, 0, 2, "embedding".to_string()),
+                ("ivf-flat".to_string(), 3, 3, 5, "embedding".to_string()),
+            ]
+        );
+
+        let search_batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_build_query_e2e', 'embedding', '[1.0, 0.0]', 2)")
+            .await
+            .expect("vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("vector_search query should execute");
+        let ids = extract_ids(&search_batches);
+        assert_eq!(ids, vec![0, 1]);
     }
 }
 

@@ -105,6 +105,12 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
+For vector search tables created from SQL, use `ARRAY<FLOAT>` for embedding
+columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
+columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
+index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
+does not round-trip `VECTOR` columns.
+
 ### Variant Usage
 
 `VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
@@ -632,6 +638,106 @@ Rollback a table to a specific timestamp:
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
 
+### create_global_index
+
+Build and commit a global index for a table column:
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree'
+);
+```
+
+`index_type` defaults to `btree`. BTree indexes support scalar columns and do
+not accept the `options` argument yet.
+
+The current global-index builders require a row-tracking data-evolution table
+with global indexes enabled. They do not support primary-key tables or tables
+with deletion vectors enabled:
+
+```sql
+CREATE TABLE paimon.my_db.items (
+  id INT,
+  embedding ARRAY<FLOAT>
+) WITH (
+  'bucket' = '1',
+  'row-tracking.enabled' = 'true',
+  'data-evolution.enabled' = 'true',
+  'global-index.enabled' = 'true',
+  'global-index.row-count-per-shard' = '100000'
+);
+```
+
+For vector indexes backed by vindex, set `index_type` to one of `ivf-flat`,
+`ivf-pq`, `ivf-hnsw-flat`, or `ivf-hnsw-sq`:
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.items',
+  index_column => 'embedding',
+  index_type => 'ivf-flat',
+  options => 'ivf-flat.dimension=4,ivf-flat.nlist=256,ivf-flat.distance.metric=inner_product'
+);
+```
+
+The `options` argument is a comma-separated `key=value` string. User options
+override table options. Use keys prefixed by the selected index type, or set
+field-level table options with `fields.<column>.<option>`:
+
+```sql
+CREATE TABLE paimon.my_db.image_items (
+  id INT,
+  embedding ARRAY<FLOAT>
+) WITH (
+  'bucket' = '1',
+  'row-tracking.enabled' = 'true',
+  'data-evolution.enabled' = 'true',
+  'global-index.enabled' = 'true',
+  'fields.embedding.dimension' = '768',
+  'fields.embedding.distance.metric' = 'cosine',
+  'fields.embedding.nlist' = '1024'
+);
+```
+
+Supported vindex options:
+
+| Option | Default | Applies To | Description |
+|---|---:|---|---|
+| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
+| `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
+| `<index-type>.nlist` | `256` | all vindex types | Number of IVF lists. |
+| `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
+| `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
+| `<index-type>.hnsw.m` | native default | HNSW vindex types | HNSW graph connectivity. |
+| `<index-type>.hnsw.ef-construction` | native default | HNSW vindex types | HNSW construction beam width. |
+| `<index-type>.hnsw.max-level` | native default | HNSW vindex types | Maximum HNSW graph level. |
+
+Native vindex aliases are also accepted in the `options` string: `dimension`,
+`metric`, `nlist`, `pq.m`, `use-opq`, and `hnsw.*`.
+
+Inspect committed index files with the `$table_indexes` system table:
+
+```sql
+SELECT index_type, index_field_name, row_count, row_range_start, row_range_end
+FROM paimon.my_db.items$table_indexes;
+```
+
+### drop_global_index
+
+Drop a committed BTree global index:
+
+```sql
+CALL sys.drop_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree'
+);
+```
+
+Only BTree indexes can be dropped through this procedure currently.
+
 ### create_lumina_index
 
 Build and commit a Lumina global vector index for a table column:
@@ -775,7 +881,11 @@ CROSS JOIN LATERAL vector_search(
 
 ## Vector Search
 
-Paimon supports approximate nearest neighbor (ANN) vector search via the Lumina vector index. The `vector_search` table-valued function is registered as a UDTF on the DataFusion session context.
+Paimon supports approximate nearest neighbor (ANN) vector search through global
+vector indexes. DataFusion can search vindex indexes created by
+`CALL sys.create_global_index` and Lumina indexes created by
+`CALL sys.create_lumina_index`. The `vector_search` table-valued function is
+registered as a UDTF on the DataFusion session context.
 
 ### Registration
 
@@ -808,7 +918,9 @@ Example:
 SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
 ```
 
-The function performs ANN search across all Lumina vector index files for the target column, merges results, and returns the top-k rows ordered by relevance score. If no matching index is found, an empty result is returned.
+The function performs ANN search across all matching vector index files for the
+target column, merges results, and returns the top-k rows ordered by relevance
+score. If no matching index is found, an empty result is returned.
 
 ### Lateral Joins
 
@@ -838,17 +950,25 @@ The distance metric is configured at index creation time via table options:
 | `cosine` | Cosine similarity |
 | `l2` | Euclidean (L2) distance |
 
-### Vector Index Options
+### Vindex Index Options
 
-Vector index behavior is configured via table options prefixed with `lumina.`:
+For vindex-backed search, build the index with
+`CALL sys.create_global_index` and an index type such as `ivf-flat` or
+`ivf-pq`. See [create_global_index](#create_global_index) for the supported
+index types, table requirements, and option keys.
+
+### Lumina Index Options
+
+Lumina index behavior is configured via table options prefixed with `lumina.`:
 
 | Option | Description |
 |---|---|
-| `lumina.dimension` | Vector dimension |
-| `lumina.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
-| `lumina.index-type` | Index type (default: `diskann`) |
+| `lumina.index.dimension` | Vector dimension |
+| `lumina.distance.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
+| `lumina.index.type` | Index type (default: `diskann`) |
+| `lumina.encoding.type` | Encoding type (default: `pq`) |
 
-### Environment
+### Lumina Environment
 
 The Lumina native library must be available at runtime. Set the `LUMINA_LIB_PATH` environment variable to the path of the shared library, or place it in the platform default location.
 
@@ -1249,6 +1369,31 @@ Columns:
 | `total_buckets` | INT | Total bucket count for the partition (0 unless catalog-tracked) |
 | `done` | BOOLEAN | Whether the partition is marked done (false unless catalog-tracked) |
 
+### $table_indexes
+
+View committed global index files, including BTree indexes, vector indexes, and
+deletion-vector metadata:
+
+```sql
+SELECT * FROM paimon.default.my_table$table_indexes;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `partition` | STRING | Partition spec for the indexed data, or `NULL` for unpartitioned tables |
+| `bucket` | INT | Bucket id covered by the index file |
+| `index_type` | STRING | Index type, such as `btree`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `file_name` | STRING | Index file name under the table index directory |
+| `file_size` | BIGINT | Index file size in bytes |
+| `row_count` | BIGINT | Number of rows covered by the index file |
+| `dv_ranges` | ARRAY | Deletion-vector ranges, only populated for deletion-vector metadata |
+| `row_range_start` | BIGINT | First row id covered by the index file |
+| `row_range_end` | BIGINT | Last row id covered by the index file |
+| `index_field_id` | INT | Field id of the indexed column |
+| `index_field_name` | STRING | Name of the indexed column |
+
 ### $physical_files_size
 
 Scan the table directory recursively and compute the total size of recognized physical files on disk, categorized by file type. This table is a diagnostic size summary; orphan cleanup needs file-level candidates and retention checks, not just aggregate size differences.
@@ -1357,6 +1502,22 @@ rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
 bucket writes, or advanced aggregation options such as `ignore-retract`,
 `distinct`, `nested-key`, `count-limit`, and sequence groups.
 
+### Global Index Options
+
+Set these options when building global indexes with
+`CALL sys.create_global_index`. The current DataFusion builders require
+row-tracking and data evolution, and reject primary-key tables and tables with
+deletion vectors enabled.
+
+| Option | Default | Description |
+|---|---:|---|
+| `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
+| `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
+| `global-index.enabled` | `false` | Enables global index metadata and global-index-aware reads. |
+| `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree range. |
+| `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
+
 ### Variant Shredding Options
 
 Set these as table options when writing `VARIANT` columns to Parquet. The
@@ -1383,7 +1544,9 @@ the normal physical format without wrapping the writer.
 | Option | Description |
 |---|---|
 | `'sequence.field' = 'col'` | Sequence field used to determine which record wins during deduplication |
+| `'row-tracking.enabled' = 'true'` | Enable stable row ids |
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
+| `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'cross-partition-update.enabled' = 'true'` | Allow cross-partition updates |
 | `'changelog-producer' = 'input'` | Changelog producer (PK tables with input mode reject writes) |

@@ -285,7 +285,7 @@ ordered-float@2.10.1												X
 ownedbytes@0.7.0												X							
 paimon@0.3.0		X																	
 paimon-datafusion@0.3.0		X																	
-paimon-vindex-core@0.1.0		X																	
+paimon-vindex-core@0.2.0		X																	
 parking_lot@0.12.5		X										X							
 parking_lot_core@0.9.12		X										X							
 parquet@58.3.0		X																	

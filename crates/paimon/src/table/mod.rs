@@ -66,6 +66,7 @@ pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
 mod vector_search_builder;
+mod vindex_index_build_builder;
 mod write_builder;
 
 use crate::Result;
@@ -99,6 +100,7 @@ pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
+pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
@@ -216,6 +218,10 @@ impl Table {
 
     pub fn new_btree_global_index_drop_builder(&self) -> BTreeGlobalIndexDropBuilder<'_> {
         BTreeGlobalIndexDropBuilder::new(self)
+    }
+
+    pub fn new_vindex_index_build_builder(&self, index_type: &str) -> VindexIndexBuildBuilder<'_> {
+        VindexIndexBuildBuilder::new(self, index_type)
     }
 
     /// Create a write builder for write/commit.

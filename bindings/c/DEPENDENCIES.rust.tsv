@@ -173,7 +173,7 @@ orc-rust@0.8.0		X
 ordered-float@2.10.1											X			
 paimon@0.3.0		X												
 paimon-c@0.3.0		X												
-paimon-vindex-core@0.1.0		X												
+paimon-vindex-core@0.2.0		X												
 parquet@58.3.0		X												
 paste@1.0.15		X									X			
 percent-encoding@2.3.2		X									X			
