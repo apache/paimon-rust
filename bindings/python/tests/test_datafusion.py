@@ -16,6 +16,7 @@
 # under the License.
 
 import io
+import json
 import os
 import struct
 import sys
@@ -65,11 +66,14 @@ def write_sample_video(
             container.mux(packet)
 
 
-def sample_image_bytes() -> bytes:
+def sample_image_bytes(
+    size: tuple[int, int] = (32, 32),
+    color: tuple[int, int, int] = (40, 120, 220),
+) -> bytes:
     image_module = pytest.importorskip("PIL.Image")
 
     output = io.BytesIO()
-    image = image_module.new("RGB", (32, 32), color=(40, 120, 220))
+    image = image_module.new("RGB", size, color=color)
     image.save(output, format="PNG")
     return output.getvalue()
 
@@ -86,16 +90,24 @@ def test_video_snapshot_builtin_registered_on_context_init():
         """
         SELECT
             video_snapshot(CAST(NULL AS BYTEA)) AS cover_png,
-            video_frame(CAST(NULL AS BYTEA), 0) AS frame_png
+            video_frame(CAST(NULL AS BYTEA), 0) AS frame_png,
+            media_info(CAST(NULL AS BYTEA)) AS media_info_json,
+            media_thumbnail(CAST(NULL AS BYTEA)) AS thumbnail_png,
+            vector_from_json(CAST(NULL AS STRING)) AS vector_value,
+            vector_to_json(vector_from_json('[1.0, 2.5]')) AS vector_json
         """
     )
     table = pa.Table.from_batches(batches)
 
     assert table["cover_png"].to_pylist() == [None]
     assert table["frame_png"].to_pylist() == [None]
+    assert table["media_info_json"].to_pylist() == [None]
+    assert table["thumbnail_png"].to_pylist() == [None]
+    assert table["vector_value"].to_pylist() == [None]
+    assert json.loads(table["vector_json"].to_pylist()[0]) == [1.0, 2.5]
 
 
-def test_sql_context_survives_video_builtins_registration_failure(monkeypatch):
+def test_sql_context_survives_multimodal_builtins_registration_failure(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "pypaimon_rust.functions",
@@ -104,7 +116,7 @@ def test_sql_context_survives_video_builtins_registration_failure(monkeypatch):
 
     with pytest.warns(
         RuntimeWarning,
-        match="video built-ins could not be registered",
+        match="multimodal built-ins could not be registered",
     ):
         ctx = SQLContext()
 
@@ -334,6 +346,122 @@ def test_video_frame_accepts_frame_index():
         assert second_image.getpixel((16, 16)) != third_image.getpixel((16, 16))
 
         ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
+
+
+def test_media_info_returns_json_for_image_and_video():
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(video_path)
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.media",
+            pa.record_batch(
+                [
+                    [1, 2],
+                    pa.array(
+                        [
+                            sample_image_bytes(size=(48, 24)),
+                            video_path.read_bytes(),
+                        ],
+                        type=pa.binary(),
+                    ),
+                ],
+                names=["id", "content"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT id, media_info(content) AS info_json
+            FROM paimon.default.media
+            ORDER BY id
+            """
+        )
+        rows = pa.Table.from_batches(batches).to_pylist()
+        image_info = json.loads(rows[0]["info_json"])
+        video_info = json.loads(rows[1]["info_json"])
+
+        assert image_info["media_type"] == "image"
+        assert image_info["format"] == "png"
+        assert image_info["width"] == 48
+        assert image_info["height"] == 24
+
+        assert video_info["media_type"] == "video"
+        assert video_info["width"] == 32
+        assert video_info["height"] == 32
+        assert video_info["has_audio"] is False
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.media")
+
+
+def test_media_thumbnail_handles_image_and_video():
+    image_module = pytest.importorskip("PIL.Image")
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(video_path)
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.media",
+            pa.record_batch(
+                [
+                    [1, 2],
+                    pa.array(
+                        [
+                            sample_image_bytes(size=(64, 32)),
+                            video_path.read_bytes(),
+                        ],
+                        type=pa.binary(),
+                    ),
+                ],
+                names=["id", "content"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT
+                id,
+                media_thumbnail(content, 16, 16) AS thumbnail_png,
+                media_thumbnail(content, -1, 16) AS invalid_thumbnail_png
+            FROM paimon.default.media
+            ORDER BY id
+            """
+        )
+        rows = pa.Table.from_batches(batches).to_pylist()
+
+        for row in rows:
+            assert row["thumbnail_png"].startswith(PNG_SIGNATURE)
+            thumbnail = image_module.open(io.BytesIO(row["thumbnail_png"]))
+            assert thumbnail.width <= 16
+            assert thumbnail.height <= 16
+            assert row["invalid_thumbnail_png"] is None
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.media")
+
+
+def test_vector_json_bridge_functions():
+    ctx = SQLContext()
+
+    batches = ctx.sql(
+        """
+        SELECT
+            vector_from_json('[1.0, 2.5, -3]') AS vector_value,
+            vector_from_json('not json') AS invalid_json,
+            vector_from_json('[true]') AS invalid_value,
+            vector_to_json(vector_from_json('[1, 2.5]')) AS vector_json
+        """
+    )
+    row = pa.Table.from_batches(batches).to_pylist()[0]
+
+    assert row["vector_value"] == [1.0, 2.5, -3.0]
+    assert row["invalid_json"] is None
+    assert row["invalid_value"] is None
+    assert json.loads(row["vector_json"]) == [1.0, 2.5]
 
 
 def test_query_simple_table_via_catalog_provider():

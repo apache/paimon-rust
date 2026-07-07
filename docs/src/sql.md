@@ -722,6 +722,57 @@ When the following conditions are met, `COUNT(*)` retrieves exact row counts dir
 - No LIMIT clause
 - Filter predicates only involve partition columns (Exact level)
 
+## Python Multimodal Helper Functions
+
+When you use `pypaimon_rust.datafusion.SQLContext`, the Python binding registers a small set of scalar helper functions for BLOB-backed media and vector workflows. These helpers are Python-binding built-ins; they are not registered by the Rust `paimon_datafusion::SQLContext`.
+
+Media helpers require the optional Python media dependencies:
+
+```shell
+pip install "pypaimon-rust[video]"
+```
+
+| Function | Return Type | Description |
+|---|---|---|
+| `media_info(blob)` | STRING | JSON metadata for image, video, or audio input |
+| `media_thumbnail(blob)` | BINARY | PNG thumbnail, using a default 320x320 bounding box |
+| `media_thumbnail(blob, max_width, max_height)` | BINARY | PNG thumbnail constrained to the given dimensions |
+| `video_snapshot(blob)` | BINARY | PNG frame near timestamp 0ms |
+| `video_snapshot(blob, timestamp_ms)` | BINARY | PNG frame near the given timestamp |
+| `video_frame(blob, frame_index)` | BINARY | PNG frame by zero-based decoded frame index |
+| `vector_from_json(json)` | `List<Float32>` | Converts a JSON float array string into an Arrow float vector |
+| `vector_to_json(vector)` | STRING | Converts an Arrow float vector back to a JSON array string |
+
+Invalid, NULL, unsupported, or undecodable media inputs return SQL `NULL`. Media functions read either inline bytes or BLOB descriptor bytes when the `SQLContext` has a registered Paimon catalog that can resolve the descriptor.
+
+Example:
+
+```sql
+SELECT
+    id,
+    media_info(content) AS info_json,
+    media_thumbnail(content, 160, 90) AS preview_png,
+    video_frame(content, 10) AS frame_png
+FROM paimon.my_db.assets;
+```
+
+Use `vector_from_json` to bridge JSON-encoded embeddings into lateral vector search queries:
+
+```sql
+WITH queries AS (
+    SELECT id, vector_from_json(embedding_json) AS embedding
+    FROM paimon.my_db.query_embeddings
+)
+SELECT q.id AS query_id, r.id AS result_id
+FROM queries q
+CROSS JOIN LATERAL vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    q.embedding,
+    10
+) AS r;
+```
+
 ## Vector Search
 
 Paimon supports approximate nearest neighbor (ANN) vector search via the Lumina vector index. The `vector_search` table-valued function is registered as a UDTF on the DataFusion session context.

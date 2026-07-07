@@ -53,6 +53,47 @@ ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
 batches = ctx.sql("SELECT * FROM paimon.my_db.users")
 ```
 
+### Multimodal SQL Helpers
+
+`SQLContext` also registers Python scalar UDFs for common BLOB media and vector
+workflows. Install the optional media dependencies when you need image or video
+decoding:
+
+```shell
+pip install "pypaimon-rust[video]"
+```
+
+```python
+batches = ctx.sql("""
+    SELECT
+        id,
+        media_info(content) AS info_json,
+        media_thumbnail(content, 160, 90) AS preview_png,
+        video_snapshot(content, 1000) AS frame_png
+    FROM paimon.my_db.assets
+""")
+```
+
+For vector search, `vector_from_json` converts JSON-encoded embeddings into
+Arrow `List<Float32>` values that can be used from a temporary table or subquery:
+
+```python
+batches = ctx.sql("""
+    WITH queries AS (
+        SELECT id, vector_from_json(embedding_json) AS embedding
+        FROM paimon.my_db.query_embeddings
+    )
+    SELECT q.id AS query_id, r.id AS result_id
+    FROM queries q
+    CROSS JOIN LATERAL vector_search(
+        'paimon.my_db.items',
+        'embedding',
+        q.embedding,
+        10
+    ) AS r
+""")
+```
+
 ### Temporary Tables
 
 You can register temporary in-memory tables programmatically. Names support the same resolution rules as SQL: bare names use the current catalog and database, partially qualified names use the current catalog, and fully qualified names specify catalog.database.table.

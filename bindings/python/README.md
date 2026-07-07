@@ -39,6 +39,12 @@ ctx.sql("INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob')")
 # Query data
 batches = ctx.sql("SELECT id, name FROM paimon.my_db.users ORDER BY id")
 
+# Inspect BLOB media or build thumbnails when installed with pypaimon-rust[video]
+batches = ctx.sql(
+    "SELECT id, media_info(content), media_thumbnail(content, 160, 90) "
+    "FROM paimon.my_db.assets"
+)
+
 # Register a temporary table from a PyArrow RecordBatch
 batch = pa.record_batch([[1, 2], ["alice", "bob"]], names=["id", "name"])
 ctx.register_batch("paimon.default.my_temp", batch)

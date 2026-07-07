@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::DataType as ArrowDataType;
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use datafusion::catalog::CatalogProvider;
 use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
@@ -129,12 +129,63 @@ pub struct PySQLContext {
 }
 
 impl PySQLContext {
-    fn register_video_builtins(&self, py: Python<'_>) -> PyResult<()> {
+    fn vector_float32_type() -> ArrowDataType {
+        ArrowDataType::List(Arc::new(ArrowField::new(
+            "item",
+            ArrowDataType::Float32,
+            true,
+        )))
+    }
+
+    fn register_multimodal_builtins(&self, py: Python<'_>) -> PyResult<()> {
         let functions = py.import("pypaimon_rust.functions")?;
         let blob_reader_registry = Py::new(
             py,
             PyBlobReaderRegistry::new(self.inner.blob_reader_registry()),
         )?;
+
+        let media_info_blob_reader_registry = blob_reader_registry.clone_ref(py);
+        let media_info_func = functions
+            .getattr("_make_media_info")?
+            .call1((media_info_blob_reader_registry,))?
+            .unbind();
+        let media_info_udf = build_python_scalar_udf(
+            "media_info".to_string(),
+            media_info_func,
+            ArrowDataType::Utf8,
+            Signature::exact(vec![ArrowDataType::Binary], Volatility::Volatile),
+        );
+        self.inner.ctx().register_udf(media_info_udf);
+
+        let thumbnail_blob_reader_registry = blob_reader_registry.clone_ref(py);
+        let thumbnail_func = functions
+            .getattr("_make_media_thumbnail")?
+            .call1(("PNG", thumbnail_blob_reader_registry))?
+            .unbind();
+        let thumbnail_signature = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![ArrowDataType::Binary]),
+                TypeSignature::Exact(vec![
+                    ArrowDataType::Binary,
+                    ArrowDataType::Int32,
+                    ArrowDataType::Int32,
+                ]),
+                TypeSignature::Exact(vec![
+                    ArrowDataType::Binary,
+                    ArrowDataType::Int64,
+                    ArrowDataType::Int64,
+                ]),
+            ],
+            Volatility::Volatile,
+        );
+        let thumbnail_udf = build_python_scalar_udf(
+            "media_thumbnail".to_string(),
+            thumbnail_func,
+            ArrowDataType::Binary,
+            thumbnail_signature,
+        );
+        self.inner.ctx().register_udf(thumbnail_udf);
+
         let snapshot_blob_reader_registry = blob_reader_registry.clone_ref(py);
         let snapshot_func = functions
             .getattr("_make_video_snapshot")?
@@ -174,16 +225,44 @@ impl PySQLContext {
             frame_signature,
         );
         self.inner.ctx().register_udf(frame_udf);
+
+        let vector_from_json_func = functions
+            .getattr("_make_vector_from_json")?
+            .call0()?
+            .unbind();
+        let vector_from_json_signature = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![ArrowDataType::Utf8]),
+                TypeSignature::Exact(vec![ArrowDataType::LargeUtf8]),
+            ],
+            Volatility::Immutable,
+        );
+        let vector_from_json_udf = build_python_scalar_udf(
+            "vector_from_json".to_string(),
+            vector_from_json_func,
+            Self::vector_float32_type(),
+            vector_from_json_signature,
+        );
+        self.inner.ctx().register_udf(vector_from_json_udf);
+
+        let vector_to_json_func = functions.getattr("_make_vector_to_json")?.call0()?.unbind();
+        let vector_to_json_udf = build_python_scalar_udf(
+            "vector_to_json".to_string(),
+            vector_to_json_func,
+            ArrowDataType::Utf8,
+            Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        );
+        self.inner.ctx().register_udf(vector_to_json_udf);
         Ok(())
     }
 
-    fn warn_video_builtin_registration_failure(py: Python<'_>, err: PyErr) {
+    fn warn_multimodal_builtin_registration_failure(py: Python<'_>, err: PyErr) {
         if let Ok(warnings) = py.import("warnings") {
             let category = py.get_type::<PyRuntimeWarning>();
             let _ = warnings.call_method1(
                 "warn",
                 (
-                    format!("video built-ins could not be registered: {err}"),
+                    format!("multimodal built-ins could not be registered: {err}"),
                     category,
                 ),
             );
@@ -198,8 +277,8 @@ impl PySQLContext {
         let ctx = Self {
             inner: SQLContext::new(),
         };
-        if let Err(err) = ctx.register_video_builtins(py) {
-            Self::warn_video_builtin_registration_failure(py, err);
+        if let Err(err) = ctx.register_multimodal_builtins(py) {
+            Self::warn_multimodal_builtin_registration_failure(py, err);
         }
         Ok(ctx)
     }

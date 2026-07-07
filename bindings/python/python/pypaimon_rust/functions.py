@@ -16,7 +16,9 @@
 # under the License.
 
 import io
+import json
 import logging
+import math
 import struct
 from typing import Any, BinaryIO
 
@@ -126,9 +128,217 @@ def _encode_video_frame(frame, image_format: str) -> bytes:
         image = frame.to_image()
     except ImportError as e:
         raise ImportError("Pillow is required to encode video frame images") from e
+    return _encode_image(image, image_format)
+
+
+def _encode_image(image, image_format: str) -> bytes:
     output = io.BytesIO()
     image.save(output, format=image_format)
     return output.getvalue()
+
+
+def _rewind_stream(stream: BinaryIO) -> None:
+    try:
+        stream.seek(0)
+    except Exception:
+        pass
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _drop_none(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None}
+
+
+def _duration_millis(container, stream=None) -> int | None:
+    duration = getattr(container, "duration", None)
+    if duration is not None and duration >= 0:
+        return int(round(duration / 1000))
+
+    if stream is not None:
+        stream_duration = getattr(stream, "duration", None)
+        time_base = getattr(stream, "time_base", None)
+        if stream_duration is not None and stream_duration >= 0 and time_base is not None:
+            return int(round(float(stream_duration * time_base) * 1000))
+    return None
+
+
+def _codec_name(stream) -> str | None:
+    codec_context = getattr(stream, "codec_context", None)
+    return getattr(codec_context, "name", None)
+
+
+def _average_rate(stream) -> float | None:
+    rate = getattr(stream, "average_rate", None)
+    if rate is None:
+        return None
+    try:
+        return float(rate)
+    except Exception:
+        return None
+
+
+def _frame_count(stream) -> int | None:
+    frames = getattr(stream, "frames", None)
+    if frames is None or frames <= 0:
+        return None
+    return int(frames)
+
+
+def _decode_image_info(stream: BinaryIO) -> dict[str, Any] | None:
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError("Pillow is required to inspect image media") from e
+
+    with Image.open(stream) as image:
+        image.load()
+        return _drop_none(
+            {
+                "media_type": "image",
+                "format": image.format.lower() if image.format else None,
+                "width": image.width,
+                "height": image.height,
+                "mode": image.mode,
+            }
+        )
+
+
+def _decode_av_media_info(stream: BinaryIO) -> dict[str, Any] | None:
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required to inspect video or audio media") from e
+
+    with av.open(stream, mode="r") as container:
+        format_name = (container.format.name or "").lower() or None
+        format_names = set((container.format.name or "").split(","))
+        video_streams = list(container.streams.video)
+        audio_streams = list(container.streams.audio)
+
+        if video_streams:
+            stream0 = video_streams[0]
+            media_type = "image" if format_names & _STILL_IMAGE_FORMATS else "video"
+            info = {
+                "media_type": media_type,
+                "format": format_name,
+                "duration_ms": _duration_millis(container, stream0),
+                "width": getattr(stream0, "width", None),
+                "height": getattr(stream0, "height", None),
+                "codec": _codec_name(stream0),
+                "frame_count": _frame_count(stream0),
+                "average_rate": _average_rate(stream0),
+                "has_audio": bool(audio_streams),
+            }
+            return _drop_none(info)
+
+        if audio_streams:
+            stream0 = audio_streams[0]
+            info = {
+                "media_type": "audio",
+                "format": format_name,
+                "duration_ms": _duration_millis(container, stream0),
+                "codec": _codec_name(stream0),
+                "has_audio": True,
+            }
+            return _drop_none(info)
+    return None
+
+
+def _decode_media_info(stream: BinaryIO) -> str | None:
+    try:
+        info = _decode_image_info(stream)
+        if info is not None:
+            return _json_dumps(info)
+    except ImportError:
+        raise
+    except Exception:
+        _rewind_stream(stream)
+
+    info = _decode_av_media_info(stream)
+    return _json_dumps(info) if info is not None else None
+
+
+def _positive_dimension(value: Any, default: int) -> int | None:
+    try:
+        dimension = default if value is None else int(value)
+    except Exception:
+        return None
+    return dimension if dimension > 0 else None
+
+
+def _thumbnail_image(image, image_format: str, max_width: int, max_height: int) -> bytes:
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError("Pillow is required to encode media thumbnails") from e
+
+    thumbnail = image.copy()
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", None)
+    if resampling is None:
+        thumbnail.thumbnail((max_width, max_height))
+    else:
+        thumbnail.thumbnail((max_width, max_height), resampling)
+    return _encode_image(thumbnail, image_format)
+
+
+def _decode_image_thumbnail(
+    stream: BinaryIO,
+    image_format: str,
+    max_width: int,
+    max_height: int,
+) -> bytes | None:
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError("Pillow is required to decode image thumbnails") from e
+
+    with Image.open(stream) as image:
+        image.load()
+        return _thumbnail_image(image, image_format, max_width, max_height)
+
+
+def _decode_video_thumbnail(
+    stream: BinaryIO,
+    image_format: str,
+    max_width: int,
+    max_height: int,
+) -> bytes | None:
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required to decode video thumbnails") from e
+
+    with av.open(stream, mode="r") as container:
+        if not container.streams.video:
+            return None
+        for frame in container.decode(video=0):
+            try:
+                image = frame.to_image()
+            except ImportError as e:
+                raise ImportError("Pillow is required to encode video thumbnails") from e
+            return _thumbnail_image(image, image_format, max_width, max_height)
+    return None
+
+
+def _decode_media_thumbnail(
+    stream: BinaryIO,
+    image_format: str,
+    max_width: int,
+    max_height: int,
+) -> bytes | None:
+    try:
+        thumbnail = _decode_image_thumbnail(stream, image_format, max_width, max_height)
+        if thumbnail is not None:
+            return thumbnail
+    except ImportError:
+        raise
+    except Exception:
+        _rewind_stream(stream)
+
+    return _decode_video_thumbnail(stream, image_format, max_width, max_height)
 
 
 def _decode_video_frame(
@@ -247,3 +457,150 @@ def _make_video_frame(image_format: str = "PNG", blob_reader_registry=None):
         return pa.array(frames, type=pa.binary())
 
     return video_frame
+
+
+def _make_media_info(blob_reader_registry=None):
+    def media_info(values):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return media_info results") from e
+
+        infos = []
+        for raw_value in values.to_pylist():
+            if raw_value is None:
+                infos.append(None)
+                continue
+
+            try:
+                stream = open_blob_descriptor_stream(raw_value, blob_reader_registry)
+                try:
+                    infos.append(_decode_media_info(stream))
+                finally:
+                    stream.close()
+            except ImportError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to inspect media: %s", e)
+                infos.append(None)
+
+        return pa.array(infos, type=pa.string())
+
+    return media_info
+
+
+def _make_media_thumbnail(
+    image_format: str = "PNG",
+    blob_reader_registry=None,
+    default_max_width: int = 320,
+    default_max_height: int = 320,
+):
+    image_format = image_format.upper()
+
+    def media_thumbnail(values, max_widths=None, max_heights=None):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return media_thumbnail results") from e
+
+        thumbnails = []
+        raw_values = values.to_pylist()
+        if max_widths is None and max_heights is None:
+            width_values = [default_max_width] * len(raw_values)
+            height_values = [default_max_height] * len(raw_values)
+        elif max_widths is not None and max_heights is not None:
+            width_values = max_widths.to_pylist()
+            height_values = max_heights.to_pylist()
+        else:
+            raise ValueError("media_thumbnail requires both width and height arguments")
+        if len(width_values) != len(raw_values) or len(height_values) != len(raw_values):
+            raise ValueError("media_thumbnail size arguments must have the same row count")
+
+        for raw_value, max_width, max_height in zip(
+            raw_values, width_values, height_values
+        ):
+            if raw_value is None or max_width is None or max_height is None:
+                thumbnails.append(None)
+                continue
+
+            max_width = _positive_dimension(max_width, default_max_width)
+            max_height = _positive_dimension(max_height, default_max_height)
+            if max_width is None or max_height is None:
+                thumbnails.append(None)
+                continue
+
+            try:
+                stream = open_blob_descriptor_stream(raw_value, blob_reader_registry)
+                try:
+                    thumbnails.append(
+                        _decode_media_thumbnail(
+                            stream, image_format, max_width, max_height
+                        )
+                    )
+                finally:
+                    stream.close()
+            except ImportError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to decode media thumbnail: %s", e)
+                thumbnails.append(None)
+
+        return pa.array(thumbnails, type=pa.binary())
+
+    return media_thumbnail
+
+
+def _coerce_vector(value: Any) -> list[float] | None:
+    if value is None or not isinstance(value, list):
+        return None
+
+    vector = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        item = float(item)
+        if not math.isfinite(item):
+            return None
+        vector.append(item)
+    return vector
+
+
+def _make_vector_from_json():
+    def vector_from_json(values):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return vector_from_json results") from e
+
+        vectors = []
+        for raw_value in values.to_pylist():
+            if raw_value is None:
+                vectors.append(None)
+                continue
+
+            try:
+                parsed = json.loads(raw_value)
+                vectors.append(_coerce_vector(parsed))
+            except Exception:
+                vectors.append(None)
+
+        return pa.array(vectors, type=pa.list_(pa.float32()))
+
+    return vector_from_json
+
+
+def _make_vector_to_json():
+    def vector_to_json(values):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return vector_to_json results") from e
+
+        encoded = []
+        for raw_value in values.to_pylist():
+            vector = _coerce_vector(raw_value)
+            encoded.append(_json_dumps(vector) if vector is not None else None)
+
+        return pa.array(encoded, type=pa.string())
+
+    return vector_to_json
