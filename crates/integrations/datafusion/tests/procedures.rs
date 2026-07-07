@@ -209,6 +209,101 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
 }
 
 #[tokio::test]
+async fn test_drop_global_index_removes_btree_and_reads_fallback() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_drop (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_drop', index_column => 'id')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_drop (id, name) VALUES (3, 'carol')",
+    )
+    .await;
+
+    let fast_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_drop WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(fast_rows, vec![(2, "bob".to_string())]);
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_drop', index_column => 'id', index_type => 'btree')",
+    )
+    .await;
+
+    let index_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_drop$table_indexes` \
+         WHERE index_type = 'btree' AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(index_count, 0);
+
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_drop WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(rows, vec![(2, "bob".to_string()), (3, "carol".to_string())]);
+}
+
+#[tokio::test]
+async fn test_drop_global_index_requires_index_column() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop_missing_col").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_drop_missing_col')",
+        "Missing required argument: 'index_column'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_drop_global_index_rejects_non_btree() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop_bad_type").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_drop_bad_type', index_column => 'id', index_type => 'bitmap')",
+        "only supports index_type => 'btree'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_drop_global_index_without_match_succeeds() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop_no_match").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_drop_no_match (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_drop_no_match', index_column => 'id')",
+    )
+    .await;
+
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_drop_no_match WHERE id = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, "alice".to_string())]);
+}
+
+#[tokio::test]
 async fn test_create_global_index_fast_full_detail_after_append() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_coverage").await;
     exec(
