@@ -869,18 +869,32 @@ impl<'a> TableScan<'a> {
 
     /// The predicate set that may prune WHOLE FILES by their stats.
     ///
-    /// For primary-key tables read by merging (everything except DV tables,
-    /// which read raw with per-row deletion masks), only key conjuncts are
-    /// safe: a key's versions agree on the key columns but not on value
-    /// columns, so a value conjunct could prune the file holding the newest
-    /// version and resurrect an older one from a surviving file. The dropped
-    /// conjuncts are still enforced exactly by the post-merge residual filter
-    /// in `KeyValueFileReader`.
+    /// For primary-key tables read by merging, only key conjuncts are safe: a
+    /// key's versions agree on the key columns but not on value columns, so a
+    /// value conjunct could prune the file holding the newest version and
+    /// resurrect an older one from a surviving file. The dropped conjuncts
+    /// are still enforced exactly by the post-merge residual filter in
+    /// `KeyValueFileReader`.
+    ///
+    /// Exempt (full predicates kept):
+    /// - Deletion-vector tables: they read raw with per-row masks, stats are
+    ///   a superset of live rows, full pruning stays safe.
+    /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
+    ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
+    ///   read path — pruning a file drops exactly the rows the raw path's
+    ///   exact residual filter would drop anyway. If first-row ever gains a
+    ///   merge read path, this exemption must be revisited.
     fn stats_pruning_predicates(&self) -> Vec<Predicate> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        let deletion_vectors_enabled =
-            CoreOptions::new(self.table.schema().options()).deletion_vectors_enabled();
-        if has_primary_keys && !deletion_vectors_enabled {
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        // An unknown merge engine stays conservative (key-only pruning); the
+        // read side fails on it anyway before returning rows.
+        let first_row = matches!(
+            core_options.merge_engine(),
+            Ok(crate::spec::MergeEngine::FirstRow)
+        );
+        if has_primary_keys && !deletion_vectors_enabled && !first_row {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
                 self.table.schema().fields(),
@@ -2142,6 +2156,71 @@ mod tests {
         assert!(
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "key conjuncts must still prune PK-table files: {trace:?}"
+        );
+    }
+
+    /// `merge-engine=first-row` PK tables read raw (no merge on the read
+    /// path: planned with `skip_level_zero`, read via `DataFileReader`), so
+    /// pruning a file by a non-key conjunct cannot resurrect anything — it
+    /// drops exactly the rows the raw path's exact residual filter would
+    /// drop. The key-only gate must exempt first-row and keep full-predicate
+    /// stats pruning, matching the split-generation path.
+    #[tokio::test]
+    async fn test_first_row_table_stats_pruning_keeps_non_key_conjuncts() {
+        let table_path = "memory:/test_first_row_stats_gate";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "first-row")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("test_db", "first_row_stats_gate"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_scan_trace_dirs(&table).await;
+
+        // Compacted (level 1) files: first-row planning skips level 0, so the
+        // fixture files must sit above it to be planned at all. Distinct key
+        // ranges; only file A's value range can match `value > 90`.
+        TableCommit::new(table.clone(), "first-row-gate-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    pk_stats_file("file-a.parquet", (1, 5), (100, 200)),
+                    pk_stats_file("file-b.parquet", (6, 9), (10, 60)),
+                ],
+            )])
+            .await
+            .unwrap();
+
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let pb = PredicateBuilder::new(&fields);
+
+        // Non-key conjunct: first-row reads raw, so full-predicate pruning
+        // stays enabled — file-b (value stats [10, 60]) must be pruned.
+        let value_filter = pb.greater_than("value", Datum::Int(90)).unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(value_filter);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        assert!(
+            trace.manifest_entries_pruned_by_data_stats >= 1,
+            "first-row tables must keep full-predicate stats pruning: {trace:?}"
+        );
+        let planned_files: usize = plan.splits().iter().map(|s| s.data_files().len()).sum();
+        assert_eq!(
+            planned_files, 1,
+            "only the value-matching file should be planned on first-row"
         );
     }
 
