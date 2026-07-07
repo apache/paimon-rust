@@ -82,13 +82,20 @@ def extract_rows(batches):
 def test_video_snapshot_builtin_registered_on_context_init():
     ctx = SQLContext()
 
-    batches = ctx.sql("SELECT video_snapshot(CAST(NULL AS BYTEA)) AS cover_png")
+    batches = ctx.sql(
+        """
+        SELECT
+            video_snapshot(CAST(NULL AS BYTEA)) AS cover_png,
+            video_frame(CAST(NULL AS BYTEA), 0) AS frame_png
+        """
+    )
     table = pa.Table.from_batches(batches)
 
     assert table["cover_png"].to_pylist() == [None]
+    assert table["frame_png"].to_pylist() == [None]
 
 
-def test_sql_context_survives_video_snapshot_registration_failure(monkeypatch):
+def test_sql_context_survives_video_builtins_registration_failure(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "pypaimon_rust.functions",
@@ -97,7 +104,7 @@ def test_sql_context_survives_video_snapshot_registration_failure(monkeypatch):
 
     with pytest.warns(
         RuntimeWarning,
-        match="video_snapshot built-in could not be registered",
+        match="video built-ins could not be registered",
     ):
         ctx = SQLContext()
 
@@ -276,6 +283,55 @@ def test_video_snapshot_accepts_timestamp_ms():
             io.BytesIO(row["beyond_duration_png"])
         ).convert("RGB")
         assert beyond_duration_image.getpixel((16, 16)) == second_image.getpixel((16, 16))
+
+        ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
+
+
+def test_video_frame_accepts_frame_index():
+    image_module = pytest.importorskip("PIL.Image")
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        video_path = Path(warehouse) / "sample.mp4"
+        write_sample_video(
+            video_path,
+            colors=((240, 40, 80), (40, 220, 80), (40, 80, 240)),
+        )
+        video_bytes = video_path.read_bytes()
+
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.register_batch(
+            "paimon.default.videos",
+            pa.record_batch(
+                [[1], pa.array([video_bytes], type=pa.binary())],
+                names=["id", "video"],
+            ),
+        )
+
+        batches = ctx.sql(
+            """
+            SELECT
+                video_frame(video, 0) AS first_png,
+                video_frame(video, CAST(1 AS BIGINT)) AS second_png,
+                video_frame(video, CAST(2 AS INT)) AS third_png,
+                video_frame(video, 3) AS beyond_duration_png,
+                video_frame(video, -1) AS negative_png
+            FROM paimon.default.videos
+            """
+        )
+        row = pa.Table.from_batches(batches).to_pylist()[0]
+
+        assert row["first_png"].startswith(PNG_SIGNATURE)
+        assert row["second_png"].startswith(PNG_SIGNATURE)
+        assert row["third_png"].startswith(PNG_SIGNATURE)
+        assert row["beyond_duration_png"] is None
+        assert row["negative_png"] is None
+
+        first_image = image_module.open(io.BytesIO(row["first_png"])).convert("RGB")
+        second_image = image_module.open(io.BytesIO(row["second_png"])).convert("RGB")
+        third_image = image_module.open(io.BytesIO(row["third_png"])).convert("RGB")
+        assert first_image.getpixel((16, 16)) != second_image.getpixel((16, 16))
+        assert second_image.getpixel((16, 16)) != third_image.getpixel((16, 16))
 
         ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
 
@@ -684,4 +740,3 @@ def test_list_databases_and_tables():
     assert "name" in field_names
     # simple_log_table is non-partitioned, so partition keys are empty.
     assert schema.partition_keys() == []
-

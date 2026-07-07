@@ -129,17 +129,18 @@ pub struct PySQLContext {
 }
 
 impl PySQLContext {
-    fn register_video_snapshot_builtin(&self, py: Python<'_>) -> PyResult<()> {
+    fn register_video_builtins(&self, py: Python<'_>) -> PyResult<()> {
         let functions = py.import("pypaimon_rust.functions")?;
         let blob_reader_registry = Py::new(
             py,
             PyBlobReaderRegistry::new(self.inner.blob_reader_registry()),
         )?;
-        let func = functions
+        let snapshot_blob_reader_registry = blob_reader_registry.clone_ref(py);
+        let snapshot_func = functions
             .getattr("_make_video_snapshot")?
-            .call1(("PNG", blob_reader_registry))?
+            .call1(("PNG", snapshot_blob_reader_registry))?
             .unbind();
-        let signature = Signature::one_of(
+        let snapshot_signature = Signature::one_of(
             vec![
                 TypeSignature::Exact(vec![ArrowDataType::Binary]),
                 TypeSignature::Exact(vec![ArrowDataType::Binary, ArrowDataType::Int32]),
@@ -147,23 +148,42 @@ impl PySQLContext {
             ],
             Volatility::Volatile,
         );
-        let udf = build_python_scalar_udf(
+        let snapshot_udf = build_python_scalar_udf(
             "video_snapshot".to_string(),
-            func,
+            snapshot_func,
             ArrowDataType::Binary,
-            signature,
+            snapshot_signature,
         );
-        self.inner.ctx().register_udf(udf);
+        self.inner.ctx().register_udf(snapshot_udf);
+
+        let frame_func = functions
+            .getattr("_make_video_frame")?
+            .call1(("PNG", blob_reader_registry))?
+            .unbind();
+        let frame_signature = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![ArrowDataType::Binary, ArrowDataType::Int32]),
+                TypeSignature::Exact(vec![ArrowDataType::Binary, ArrowDataType::Int64]),
+            ],
+            Volatility::Volatile,
+        );
+        let frame_udf = build_python_scalar_udf(
+            "video_frame".to_string(),
+            frame_func,
+            ArrowDataType::Binary,
+            frame_signature,
+        );
+        self.inner.ctx().register_udf(frame_udf);
         Ok(())
     }
 
-    fn warn_video_snapshot_registration_failure(py: Python<'_>, err: PyErr) {
+    fn warn_video_builtin_registration_failure(py: Python<'_>, err: PyErr) {
         if let Ok(warnings) = py.import("warnings") {
             let category = py.get_type::<PyRuntimeWarning>();
             let _ = warnings.call_method1(
                 "warn",
                 (
-                    format!("video_snapshot built-in could not be registered: {err}"),
+                    format!("video built-ins could not be registered: {err}"),
                     category,
                 ),
             );
@@ -178,8 +198,8 @@ impl PySQLContext {
         let ctx = Self {
             inner: SQLContext::new(),
         };
-        if let Err(err) = ctx.register_video_snapshot_builtin(py) {
-            Self::warn_video_snapshot_registration_failure(py, err);
+        if let Err(err) = ctx.register_video_builtins(py) {
+            Self::warn_video_builtin_registration_failure(py, err);
         }
         Ok(ctx)
     }

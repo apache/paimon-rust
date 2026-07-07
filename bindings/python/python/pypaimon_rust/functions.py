@@ -117,15 +117,44 @@ def _decode_video_snapshot(
             break
 
         if candidate is not None:
-            try:
-                image = candidate.to_image()
-            except ImportError as e:
-                raise ImportError(
-                    "Pillow is required to encode video_snapshot images"
-                ) from e
-            output = io.BytesIO()
-            image.save(output, format=image_format)
-            return output.getvalue()
+            return _encode_video_frame(candidate, image_format)
+    return None
+
+
+def _encode_video_frame(frame, image_format: str) -> bytes:
+    try:
+        image = frame.to_image()
+    except ImportError as e:
+        raise ImportError("Pillow is required to encode video frame images") from e
+    output = io.BytesIO()
+    image.save(output, format=image_format)
+    return output.getvalue()
+
+
+def _decode_video_frame(
+    stream: BinaryIO,
+    image_format: str,
+    frame_index: int,
+) -> bytes | None:
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required to decode video frames") from e
+
+    with av.open(stream, mode="r") as container:
+        format_names = set((container.format.name or "").split(","))
+        if format_names & _STILL_IMAGE_FORMATS:
+            logger.debug(
+                "video_frame input is a still image format: %s",
+                container.format.name,
+            )
+            return None
+        if not container.streams.video:
+            return None
+
+        for index, frame in enumerate(container.decode(video=0)):
+            if index == frame_index:
+                return _encode_video_frame(frame, image_format)
     return None
 
 
@@ -177,3 +206,44 @@ def _make_video_snapshot(image_format: str = "PNG", blob_reader_registry=None):
         return pa.array(frames, type=pa.binary())
 
     return video_snapshot
+
+
+def _make_video_frame(image_format: str = "PNG", blob_reader_registry=None):
+    image_format = image_format.upper()
+
+    def video_frame(values, frame_indices):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return video_frame results") from e
+
+        frames = []
+        raw_values = values.to_pylist()
+        frame_index_values = frame_indices.to_pylist()
+        if len(frame_index_values) != len(raw_values):
+            raise ValueError("video_frame index argument must have the same row count")
+
+        for raw_value, frame_index in zip(raw_values, frame_index_values):
+            if raw_value is None or frame_index is None:
+                frames.append(None)
+                continue
+
+            try:
+                frame_index = int(frame_index)
+                if frame_index < 0:
+                    frames.append(None)
+                    continue
+                stream = open_blob_descriptor_stream(raw_value, blob_reader_registry)
+                try:
+                    frames.append(_decode_video_frame(stream, image_format, frame_index))
+                finally:
+                    stream.close()
+            except ImportError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to decode video frame: %s", e)
+                frames.append(None)
+
+        return pa.array(frames, type=pa.binary())
+
+    return video_frame
