@@ -17,9 +17,11 @@
 
 use crate::btree::block::BlockCompressionType;
 use crate::btree::meta::BTreeIndexMeta;
+use crate::btree::query::IndexQuery;
 use crate::btree::reader::BTreeIndexReader;
 use crate::btree::test_util::{BytesFileRead, VecFileWrite};
 use crate::btree::writer::BTreeIndexWriter;
+use crate::spec::{DataType, Datum, PredicateOperator, VarCharType};
 use bytes::Bytes;
 
 fn int_key(v: i32) -> Vec<u8> {
@@ -215,6 +217,59 @@ async fn test_prefix_query() {
     assert_eq!(bm.len(), 0);
     let bm = reader.query_prefix(b"").await.unwrap();
     assert_eq!(bm.len(), keys.len() as u64);
+}
+
+#[tokio::test]
+async fn test_string_fallback_scan_query() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 32, BlockCompressionType::None);
+
+    writer.write(None, 99).await.unwrap();
+    let keys = [
+        ("alice", 0),
+        ("alpine", 1),
+        ("bob", 2),
+        ("carol", 3),
+        ("malice", 4),
+        ("office", 5),
+    ];
+    for (key, row_id) in keys {
+        writer.write(Some(key.as_bytes()), row_id).await.unwrap();
+    }
+
+    let result = writer.finish().await.unwrap();
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+    let data_type = DataType::VarChar(VarCharType::string_type());
+
+    let ends_with = reader
+        .query(
+            PredicateOperator::EndsWith,
+            &[Datum::String("ice".to_string())],
+            &data_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ends_with.iter().collect::<Vec<_>>(), vec![0, 4, 5]);
+
+    let contains = reader
+        .query(
+            PredicateOperator::Contains,
+            &[Datum::String("o".to_string())],
+            &data_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(contains.iter().collect::<Vec<_>>(), vec![2, 3, 5]);
+
+    let like = reader
+        .query(
+            PredicateOperator::Like,
+            &[Datum::String("a%c_".to_string())],
+            &data_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(like.iter().collect::<Vec<_>>(), vec![0]);
 }
 
 #[tokio::test]

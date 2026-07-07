@@ -153,13 +153,13 @@ async fn test_create_global_index_requires_index_column() {
 }
 
 #[tokio::test]
-async fn test_create_global_index_rejects_non_btree() {
-    let (_tmp, sql_context) = setup_btree_global_index_table("btree_bad_type").await;
+async fn test_create_global_index_rejects_unsupported_index_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("global_index_bad_type").await;
 
     assert_sql_error(
         &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.btree_bad_type', index_column => 'id', index_type => 'bitmap')",
-        "only supports index_type => 'btree'",
+        "CALL sys.create_global_index(table => 'test_db.global_index_bad_type', index_column => 'id', index_type => 'full-text')",
+        "only supports index_type => 'btree', 'bitmap'",
     )
     .await;
 }
@@ -206,6 +206,75 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
     )
     .await;
     assert_eq!(rows, vec![(2, "bob".to_string())]);
+}
+
+#[tokio::test]
+async fn test_create_global_index_btree_string_fallback_scan_reads() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_string_fallback").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_string_fallback (id, name) VALUES \
+         (1, 'alice'), (2, 'alpine'), (3, 'bob'), (4, 'carol'), (5, 'malice')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_string_fallback', index_column => 'name', index_type => 'btree')",
+    )
+    .await;
+
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_string_fallback WHERE name LIKE 'a%c_'",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, "alice".to_string())]);
+}
+
+#[tokio::test]
+async fn test_create_global_index_builds_bitmap_with_java_format() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("bitmap_build").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.bitmap_build (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'alice')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.bitmap_build', index_column => 'name', index_type => 'bitmap')",
+    )
+    .await;
+
+    let index_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`bitmap_build$table_indexes` \
+         WHERE index_type = 'bitmap' AND row_range_start = 0 AND row_range_end = 2 \
+         AND index_field_name = 'name'",
+    )
+    .await;
+    assert_eq!(index_count, 1);
+
+    let rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.bitmap_build WHERE name = 'alice'",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, "alice".to_string()), (3, "alice".to_string())]
+    );
+
+    let contains_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.bitmap_build WHERE name LIKE '%lic%'",
+    )
+    .await;
+    assert_eq!(
+        contains_rows,
+        vec![(1, "alice".to_string()), (3, "alice".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -257,6 +326,35 @@ async fn test_drop_global_index_removes_btree_and_reads_fallback() {
 }
 
 #[tokio::test]
+async fn test_drop_global_index_removes_bitmap() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("bitmap_drop").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.bitmap_drop (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.bitmap_drop', index_column => 'name', index_type => 'bitmap')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.bitmap_drop', index_column => 'name', index_type => 'bitmap')",
+    )
+    .await;
+
+    let index_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`bitmap_drop$table_indexes` \
+         WHERE index_type = 'bitmap' AND index_field_name = 'name'",
+    )
+    .await;
+    assert_eq!(index_count, 0);
+}
+
+#[tokio::test]
 async fn test_drop_global_index_requires_index_column() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop_missing_col").await;
 
@@ -269,13 +367,13 @@ async fn test_drop_global_index_requires_index_column() {
 }
 
 #[tokio::test]
-async fn test_drop_global_index_rejects_non_btree() {
-    let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop_bad_type").await;
+async fn test_drop_global_index_rejects_unsupported_index_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("global_index_drop_bad_type").await;
 
     assert_sql_error(
         &sql_context,
-        "CALL sys.drop_global_index(table => 'test_db.btree_drop_bad_type', index_column => 'id', index_type => 'bitmap')",
-        "only supports index_type => 'btree'",
+        "CALL sys.drop_global_index(table => 'test_db.global_index_drop_bad_type', index_column => 'id', index_type => 'full-text')",
+        "only supports index_type => 'btree' or 'bitmap'",
     )
     .await;
 }

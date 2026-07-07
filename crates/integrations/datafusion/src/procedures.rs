@@ -24,8 +24,10 @@
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
+//! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
 //! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 
 use std::collections::HashMap;
@@ -545,15 +547,17 @@ async fn proc_create_global_index(
         .get("index_type")
         .map(String::as_str)
         .unwrap_or("btree");
-    if index_type.eq_ignore_ascii_case("btree") {
+    if is_sorted_global_index_type(index_type) {
         if args.contains_key("options") {
             return Err(DataFusionError::NotImplemented(
-                "create_global_index options are not supported for btree yet".to_string(),
+                "create_global_index options are not supported for sorted global indexes yet"
+                    .to_string(),
             ));
         }
 
         let mut builder = table.new_btree_global_index_build_builder();
         builder.with_index_column(index_column);
+        builder.with_index_type(index_type);
         builder.execute().await.map_err(to_datafusion_error)?;
     } else if is_vindex_index_type(index_type) {
         let mut builder = table.new_vindex_index_build_builder(index_type);
@@ -564,7 +568,7 @@ async fn proc_create_global_index(
         builder.execute().await.map_err(to_datafusion_error)?;
     } else {
         return Err(DataFusionError::NotImplemented(format!(
-            "create_global_index only supports index_type => 'btree' or vindex types \
+            "create_global_index only supports index_type => 'btree', 'bitmap', or vindex types \
              ('ivf-flat', 'ivf-pq', 'ivf-hnsw-flat', 'ivf-hnsw-sq'), got '{index_type}'"
         )));
     }
@@ -583,9 +587,9 @@ async fn proc_drop_global_index(
         .get("index_type")
         .map(String::as_str)
         .unwrap_or("btree");
-    if !index_type.eq_ignore_ascii_case("btree") {
+    if !is_sorted_global_index_type(index_type) {
         return Err(DataFusionError::NotImplemented(format!(
-            "drop_global_index only supports index_type => 'btree', got '{index_type}'"
+            "drop_global_index only supports index_type => 'btree' or 'bitmap', got '{index_type}'"
         )));
     }
     if args.contains_key("partitions") {
@@ -601,8 +605,13 @@ async fn proc_drop_global_index(
 
     let mut builder = table.new_btree_global_index_drop_builder();
     builder.with_index_column(index_column);
+    builder.with_index_type(index_type);
     builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
+}
+
+fn is_sorted_global_index_type(index_type: &str) -> bool {
+    index_type.eq_ignore_ascii_case("btree") || index_type.eq_ignore_ascii_case("bitmap")
 }
 
 fn parse_key_value_options(options: &str) -> DFResult<HashMap<String, String>> {

@@ -19,13 +19,18 @@
 //!
 //! Serialization format (little-endian):
 //! ```text
-//! | first_key_length (4) | first_key_bytes | last_key_length (4) | last_key_bytes | has_nulls (1) |
+//! | first_key_length (4) | first_key_bytes | last_key_length (4) | last_key_bytes |
+//! | has_nulls (1) | format_version (1) | null_key_flags (1) |
 //! ```
-//! If first_key or last_key is null, their length is written as 0.
+//! Null key flags distinguish empty serialized keys from absent keys.
 
 use crate::spec::PredicateOperator;
 use std::cmp::Ordering;
 use std::io;
+
+const FORMAT_VERSION_WITH_NULL_FLAGS: u8 = 1;
+const FIRST_KEY_IS_NULL: u8 = 1;
+const LAST_KEY_IS_NULL: u8 = 1 << 1;
 
 /// Index meta for each BTree index file.
 #[derive(Debug, Clone)]
@@ -111,11 +116,12 @@ impl BTreeIndexMeta {
         cmp(first_key, to_key) != Ordering::Greater && cmp(last_key, from_key) != Ordering::Less
     }
 
-    /// Serialize to bytes (compatible with Java BTreeIndexMeta.serialize()).
+    /// Serialize to bytes (compatible with Java SortedIndexFileMeta.serialize()).
     pub fn serialize(&self) -> Vec<u8> {
         let fk_len = self.first_key.as_ref().map_or(0, |k| k.len());
         let lk_len = self.last_key.as_ref().map_or(0, |k| k.len());
-        let mut buf = Vec::with_capacity(fk_len + lk_len + 9);
+        let mut buf = Vec::with_capacity(fk_len + lk_len + 11);
+        let mut null_key_flags = 0u8;
 
         // first key
         match &self.first_key {
@@ -125,6 +131,7 @@ impl BTreeIndexMeta {
             }
             None => {
                 buf.extend_from_slice(&0i32.to_le_bytes());
+                null_key_flags |= FIRST_KEY_IS_NULL;
             }
         }
 
@@ -136,16 +143,19 @@ impl BTreeIndexMeta {
             }
             None => {
                 buf.extend_from_slice(&0i32.to_le_bytes());
+                null_key_flags |= LAST_KEY_IS_NULL;
             }
         }
 
         // has_nulls
         buf.push(if self.has_nulls { 1 } else { 0 });
+        buf.push(FORMAT_VERSION_WITH_NULL_FLAGS);
+        buf.push(null_key_flags);
 
         buf
     }
 
-    /// Deserialize from bytes (compatible with Java BTreeIndexMeta.deserialize()).
+    /// Deserialize from bytes (compatible with Java SortedIndexFileMeta.deserialize()).
     pub fn deserialize(data: &[u8]) -> io::Result<Self> {
         if data.len() < 9 {
             return Err(io::Error::new(
@@ -158,9 +168,7 @@ impl BTreeIndexMeta {
 
         let fk_len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        let first_key = if fk_len == 0 {
-            None
-        } else {
+        let mut first_key = {
             let key = data[pos..pos + fk_len].to_vec();
             pos += fk_len;
             Some(key)
@@ -168,15 +176,31 @@ impl BTreeIndexMeta {
 
         let lk_len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        let last_key = if lk_len == 0 {
-            None
-        } else {
+        let mut last_key = {
             let key = data[pos..pos + lk_len].to_vec();
             pos += lk_len;
             Some(key)
         };
 
         let has_nulls = data[pos] == 1;
+        pos += 1;
+
+        if data.len().saturating_sub(pos) >= 2 {
+            let format_version = data[pos];
+            pos += 1;
+            if format_version == FORMAT_VERSION_WITH_NULL_FLAGS {
+                let null_key_flags = data[pos];
+                if null_key_flags & FIRST_KEY_IS_NULL != 0 {
+                    first_key = None;
+                }
+                if null_key_flags & LAST_KEY_IS_NULL != 0 {
+                    last_key = None;
+                }
+            }
+        } else if fk_len == 0 && lk_len == 0 && has_nulls {
+            first_key = None;
+            last_key = None;
+        }
 
         Ok(Self {
             first_key,
@@ -208,6 +232,17 @@ mod tests {
         let decoded = BTreeIndexMeta::deserialize(&encoded).unwrap();
         assert!(decoded.only_nulls());
         assert!(decoded.has_nulls);
+    }
+
+    #[test]
+    fn test_meta_empty_string_keys_are_not_null() {
+        let meta = BTreeIndexMeta::new(Some(Vec::new()), Some(Vec::new()), false);
+        let encoded = meta.serialize();
+        let decoded = BTreeIndexMeta::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.first_key, Some(Vec::new()));
+        assert_eq!(decoded.last_key, Some(Vec::new()));
+        assert!(!decoded.only_nulls());
+        assert!(!decoded.has_nulls);
     }
 
     #[test]

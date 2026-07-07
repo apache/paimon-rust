@@ -1065,6 +1065,10 @@ impl<'a> TableScan<'a> {
         } else {
             Vec::new()
         };
+        let btree_index_fallback_scan_max_size =
+            core_options.btree_index_fallback_scan_max_size()?;
+        let bitmap_index_fallback_scan_max_size =
+            core_options.bitmap_index_fallback_scan_max_size()?;
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
@@ -1119,6 +1123,8 @@ impl<'a> TableScan<'a> {
                             predicates: &self.data_predicates,
                             schema_fields: self.table.schema().fields(),
                             search_mode,
+                            btree_fallback_scan_max_size: btree_index_fallback_scan_max_size,
+                            bitmap_fallback_scan_max_size: bitmap_index_fallback_scan_max_size,
                             next_row_id: snapshot.next_row_id(),
                             data_ranges: &global_index_detail_data_ranges,
                         },

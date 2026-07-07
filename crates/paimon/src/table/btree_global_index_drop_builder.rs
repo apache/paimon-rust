@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::global_index_types::{normalize_sorted_global_index_type, BTREE_GLOBAL_INDEX_TYPE};
 use crate::spec::{DataField, FileKind, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
-const BTREE_INDEX_TYPE: &str = "btree";
-
 pub struct BTreeGlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
+    index_type: String,
 }
 
 impl<'a> BTreeGlobalIndexDropBuilder<'a> {
@@ -32,6 +32,7 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
         Self {
             table,
             index_column: None,
+            index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
         }
     }
 
@@ -40,12 +41,25 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
         self
     }
 
+    pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
+        self.index_type = index_type.to_string();
+        self
+    }
+
     pub async fn execute(&self) -> Result<usize> {
+        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+            Error::Unsupported {
+                message: format!(
+                    "Sorted global index drop only supports index_type => 'btree' or 'bitmap', got '{}'",
+                    self.index_type
+                ),
+            }
+        })?;
         let index_column = self
             .index_column
             .as_deref()
             .ok_or_else(|| Error::DataInvalid {
-                message: "BTree global index column is required".to_string(),
+                message: "Sorted global index column is required".to_string(),
                 source: None,
             })?;
         let index_field = find_index_field(self.table, index_column)?;
@@ -70,7 +84,7 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
             HashMap::new();
         let mut dropped = 0;
         for entry in index_entries {
-            if entry.kind != FileKind::Add || entry.index_file.index_type != BTREE_INDEX_TYPE {
+            if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
                 continue;
             }
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
@@ -110,11 +124,7 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
 
         TableCommit::new(
             self.table.clone(),
-            format!(
-                "global-index-{}-drop-{}",
-                BTREE_INDEX_TYPE,
-                uuid::Uuid::new_v4()
-            ),
+            format!("global-index-{}-drop-{}", index_type, uuid::Uuid::new_v4()),
         )
         .commit_if_latest_snapshot(messages, snapshot.id())
         .await?;
@@ -288,8 +298,8 @@ mod tests {
             vec![data_file("data-0.parquet")],
         );
         message.new_index_files = vec![
-            global_index_file(BTREE_INDEX_TYPE, "btree-id.index", 0, 0, 9),
-            global_index_file(BTREE_INDEX_TYPE, "btree-name.index", 1, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-name.index", 1, 0, 9),
             global_index_file("full-text", "fulltext-id.index", 0, 100, 109),
             hash_index_file("hash.index"),
             deletion_vector_index_file("dv.index"),
@@ -331,7 +341,7 @@ mod tests {
 
         let mut message = CommitMessage::new(vec![], 0, vec![data_file("data-0.parquet")]);
         message.new_index_files = vec![global_index_file(
-            BTREE_INDEX_TYPE,
+            BTREE_GLOBAL_INDEX_TYPE,
             "btree-name.index",
             1,
             0,

@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::bitmap_global_index_reader::{BitmapGlobalIndexWriter, BitmapWriteResult};
+use super::global_index_types::{
+    normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
 use crate::spec::{
     bucket_dir_name, extract_datum_from_arrow, BinaryRow, CoreOptions, DataField, DataFileMeta,
@@ -31,15 +35,16 @@ use futures::TryStreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-const BTREE_INDEX_TYPE: &str = "btree";
 const INDEX_DIR: &str = "index";
 const BTREE_BLOCK_SIZE: usize = 4 * 1024;
+const BITMAP_DICTIONARY_BLOCK_SIZE: usize = 16 * 1024;
 
 type BTreeKeyRow = (Option<Vec<u8>>, i64);
 
 pub struct BTreeGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
+    index_type: String,
 }
 
 impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
@@ -47,6 +52,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         Self {
             table,
             index_column: None,
+            index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
         }
     }
 
@@ -55,12 +61,25 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         self
     }
 
+    pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
+        self.index_type = index_type.to_string();
+        self
+    }
+
     pub async fn execute(&self) -> Result<usize> {
+        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+            Error::Unsupported {
+                message: format!(
+                    "Sorted global index build only supports index_type => 'btree' or 'bitmap', got '{}'",
+                    self.index_type
+                ),
+            }
+        })?;
         let index_column = self
             .index_column
             .as_deref()
             .ok_or_else(|| Error::DataInvalid {
-                message: "BTree global index column is required".to_string(),
+                message: "Sorted global index column is required".to_string(),
                 source: None,
             })?;
 
@@ -79,7 +98,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             .get_latest_snapshot()
             .await?
             .ok_or_else(|| Error::DataInvalid {
-                message: "Cannot build BTree global index without a snapshot".to_string(),
+                message: "Cannot build sorted global index without a snapshot".to_string(),
                 source: None,
             })?;
 
@@ -127,7 +146,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             self.table.clone(),
             format!(
                 "global-index-{}-create-{}",
-                BTREE_INDEX_TYPE,
+                index_type,
                 uuid::Uuid::new_v4()
             ),
         )
@@ -143,6 +162,14 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         index_field: &DataField,
         index_column: &str,
     ) -> Result<IndexFileMeta> {
+        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+            Error::Unsupported {
+                message: format!(
+                    "Sorted global index build only supports index_type => 'btree' or 'bitmap', got '{}'",
+                    self.index_type
+                ),
+            }
+        })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let mut rows = extract_index_rows(self.table, shard, index_column, index_field).await?;
         let cmp = make_key_comparator(index_field.data_type());
@@ -155,7 +182,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 self.table.location().trim_end_matches('/')
             ))
             .await?;
-        let file_name = format!("btree-global-index-{}.index", uuid::Uuid::new_v4());
+        let file_name = format!("{index_type}-global-index-{}.index", uuid::Uuid::new_v4());
         let index_path = format!(
             "{}/{INDEX_DIR}/{}",
             self.table.location().trim_end_matches('/'),
@@ -163,31 +190,64 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         );
         let output = self.table.file_io().new_output(&index_path)?;
         let writer = output.writer().await?;
-        let mut writer = BTreeIndexWriter::with_comparator(
-            writer,
-            BTREE_BLOCK_SIZE,
-            BlockCompressionType::None,
-            cmp,
-        );
-        for (key, local_row_id) in &rows {
-            writer
-                .write(key.as_deref(), *local_row_id)
-                .await
-                .map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to write BTree global index file '{file_name}'"),
+        let (written_row_count, index_meta) = match index_type {
+            BTREE_GLOBAL_INDEX_TYPE => {
+                let mut writer = BTreeIndexWriter::with_comparator(
+                    writer,
+                    BTREE_BLOCK_SIZE,
+                    BlockCompressionType::None,
+                    cmp,
+                );
+                for (key, local_row_id) in &rows {
+                    writer
+                        .write(key.as_deref(), *local_row_id)
+                        .await
+                        .map_err(|e| Error::DataInvalid {
+                            message: format!(
+                                "Failed to write BTree global index file '{file_name}'"
+                            ),
+                            source: Some(Box::new(e)),
+                        })?;
+                }
+                let write_result = writer.finish().await.map_err(|e| Error::DataInvalid {
+                    message: format!("Failed to finish BTree global index file '{file_name}'"),
                     source: Some(Box::new(e)),
                 })?;
-        }
-        let write_result = writer.finish().await.map_err(|e| Error::DataInvalid {
-            message: format!("Failed to finish BTree global index file '{file_name}'"),
-            source: Some(Box::new(e)),
-        })?;
+                (write_result.row_count, write_result.meta)
+            }
+            BITMAP_GLOBAL_INDEX_TYPE => {
+                let cmp = make_key_comparator(index_field.data_type());
+                let mut writer = BitmapGlobalIndexWriter::new(
+                    writer,
+                    BITMAP_DICTIONARY_BLOCK_SIZE,
+                    BlockCompressionType::None,
+                    cmp,
+                );
+                for (key, local_row_id) in &rows {
+                    writer.write(key.as_deref(), *local_row_id).map_err(|e| {
+                        Error::DataInvalid {
+                            message: format!(
+                                "Failed to write bitmap global index file '{file_name}'"
+                            ),
+                            source: Some(Box::new(e)),
+                        }
+                    })?;
+                }
+                let BitmapWriteResult { row_count, meta } =
+                    writer.finish().await.map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to finish bitmap global index file '{file_name}'"),
+                        source: Some(Box::new(e)),
+                    })?;
+                (row_count, meta)
+            }
+            _ => unreachable!("normalized sorted global index type"),
+        };
 
-        if write_result.row_count != u64::try_from(row_count).unwrap() {
+        if written_row_count != u64::try_from(row_count).unwrap() {
             return Err(Error::DataInvalid {
                 message: format!(
-                    "BTree global index expected {} rows, wrote {}",
-                    row_count, write_result.row_count
+                    "Sorted global index expected {} rows, wrote {}",
+                    row_count, written_row_count
                 ),
                 source: None,
             });
@@ -195,7 +255,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 
         let status = self.table.file_io().get_status(&index_path).await?;
         Ok(IndexFileMeta {
-            index_type: BTREE_INDEX_TYPE.to_string(),
+            index_type: index_type.to_string(),
             file_name,
             file_size: checked_i32(
                 status.size,
@@ -208,7 +268,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 row_range_end: shard.row_range_end,
                 index_field_id: index_field.id(),
                 extra_field_ids: None,
-                index_meta: Some(write_result.meta.serialize()),
+                index_meta: Some(index_meta.serialize()),
             }),
         })
     }
@@ -1159,7 +1219,7 @@ mod tests {
         assert_eq!(index_entries.len(), 1);
 
         let index_file = &index_entries[0].index_file;
-        assert_eq!(index_file.index_type, BTREE_INDEX_TYPE);
+        assert_eq!(index_file.index_type, BTREE_GLOBAL_INDEX_TYPE);
         assert!(index_file.file_name.starts_with("btree-global-index-"));
         assert_eq!(index_file.row_count, 3);
         assert!(index_file.file_size > 0);
@@ -1188,6 +1248,109 @@ mod tests {
             predicates: &[predicate],
             schema_fields: table.schema().fields(),
             search_mode: GlobalIndexSearchMode::Fast,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: snapshot.next_row_id(),
+            data_ranges: &[],
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
+        let table_path = "memory:/test_bitmap_global_index_builder_e2e";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let shard_count = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(shard_count, 1);
+
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let index_manifest = snapshot.index_manifest().expect("index manifest");
+        let index_entries = IndexManifest::read(
+            table.file_io(),
+            &format!("{table_path}/manifest/{index_manifest}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(index_entries.len(), 1);
+
+        let index_file = &index_entries[0].index_file;
+        assert_eq!(index_file.index_type, BITMAP_GLOBAL_INDEX_TYPE);
+        assert!(index_file.file_name.starts_with("bitmap-global-index-"));
+        assert_eq!(index_file.row_count, 3);
+        assert!(index_file.file_size > 0);
+
+        let global_meta = index_file
+            .global_index_meta
+            .as_ref()
+            .expect("global index meta");
+        let bitmap_meta =
+            crate::btree::BTreeIndexMeta::deserialize(global_meta.index_meta.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(bitmap_meta.first_key, Some(b"alice".to_vec()));
+        assert_eq!(bitmap_meta.last_key, Some(b"bob".to_vec()));
+        assert!(!bitmap_meta.has_nulls);
+
+        let index_path = format!("{table_path}/index/{}", index_file.file_name);
+        let input = table.file_io().new_input(&index_path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader = input.reader().await.unwrap();
+        let bitmap_reader =
+            crate::table::bitmap_global_index_reader::BitmapGlobalIndexReader::open(
+                Box::new(reader),
+                file_size,
+            )
+            .await
+            .unwrap();
+        let bitmap = bitmap_reader
+            .query(
+                crate::spec::PredicateOperator::Eq,
+                &[crate::spec::Datum::String("alice".to_string())],
+                table.schema().fields()[1].data_type(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), vec![0, 2]);
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", crate::spec::Datum::String("alice".to_string()))
+            .unwrap();
+        let row_ranges = evaluate_global_index(GlobalIndexEvaluation {
+            file_io: table.file_io(),
+            table_path: table.location(),
+            index_entries: &index_entries,
+            predicates: &[predicate],
+            schema_fields: table.schema().fields(),
+            search_mode: GlobalIndexSearchMode::Fast,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
         })

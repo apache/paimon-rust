@@ -113,6 +113,36 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         .await
     }
 
+    /// Scan all non-null entries and collect row ids for keys matching `predicate`.
+    pub async fn scan_entries(
+        &self,
+        predicate: impl Fn(&[u8]) -> bool + Send + Sync,
+    ) -> io::Result<RoaringTreemap> {
+        let Some(min_key) = self.min_key.as_deref() else {
+            return Ok(RoaringTreemap::new());
+        };
+
+        let cmp = &self.key_comparator;
+        let index_block = self.sst_reader.index_block();
+        let (_, mut index_iter) = index_block.seek_and_iter(min_key, cmp);
+        let mut result = RoaringTreemap::new();
+
+        while let Some((_key, handle_bytes)) = index_iter.next() {
+            let handle = BlockHandle::decode(handle_bytes)?;
+            let block = self.read_data_block(&handle).await?;
+            let mut offset = 0;
+            while offset < block.data.len() {
+                let (key, value, next_offset) = block.read_entry_at(offset);
+                offset = next_offset;
+                if predicate(key) {
+                    insert_row_ids_into(value, &mut result)?;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Range query: returns a bitmap of all row ids whose keys fall in [from, to]
     /// with configurable inclusivity. Reads data blocks on demand.
     pub async fn range_query(

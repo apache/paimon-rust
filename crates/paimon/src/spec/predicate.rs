@@ -1165,7 +1165,7 @@ fn optimize_like_pattern(pattern: &str) -> LikeShape {
 /// * `_` matches exactly one character,
 /// * `\X` matches the literal `X` for any character `X` (the backslash is
 ///   consumed); a trailing `\` matches a literal backslash.
-fn like_match(value: &str, pattern: &str) -> bool {
+pub(crate) fn like_match(value: &str, pattern: &str) -> bool {
     let value: Vec<char> = value.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     like_match_chars(&value, 0, &pattern, 0)

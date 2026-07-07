@@ -22,7 +22,7 @@
 
 use crate::btree::key_serde::serialize_datum;
 use crate::btree::reader::BTreeIndexReader;
-use crate::spec::{DataType, Datum, PredicateOperator};
+use crate::spec::{like_match, DataType, Datum, PredicateOperator};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io;
@@ -109,15 +109,69 @@ where
                 all_non_null -= inside;
                 Ok(all_non_null)
             }
-            PredicateOperator::StartsWith
-            | PredicateOperator::EndsWith
-            | PredicateOperator::Contains
-            | PredicateOperator::Like => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("BTree index does not support op: {op}"),
-            )),
+            PredicateOperator::StartsWith => {
+                let key = serialize_datum(&literals[0], data_type);
+                self.query_prefix(&key).await
+            }
+            PredicateOperator::EndsWith => {
+                ensure_character_string(data_type, op)?;
+                let suffix = serialize_datum(&literals[0], data_type);
+                if suffix.is_empty() {
+                    return self.all_non_null_rows().await;
+                }
+                self.scan_entries(move |key| key.ends_with(&suffix)).await
+            }
+            PredicateOperator::Contains => {
+                ensure_character_string(data_type, op)?;
+                let needle = serialize_datum(&literals[0], data_type);
+                if needle.is_empty() {
+                    return self.all_non_null_rows().await;
+                }
+                self.scan_entries(move |key| contains_bytes(key, &needle))
+                    .await
+            }
+            PredicateOperator::Like => {
+                ensure_character_string(data_type, op)?;
+                let pattern = string_literal(literals, op)?.to_string();
+                self.scan_entries(move |key| {
+                    std::str::from_utf8(key).is_ok_and(|value| like_match(value, &pattern))
+                })
+                .await
+            }
         }
     }
+}
+
+fn ensure_character_string(data_type: &DataType, op: PredicateOperator) -> io::Result<()> {
+    if matches!(data_type, DataType::Char(_) | DataType::VarChar(_)) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("BTree index {op} only supports string columns"),
+        ))
+    }
+}
+
+fn string_literal(literals: &[Datum], op: PredicateOperator) -> io::Result<&str> {
+    match literals.first() {
+        Some(Datum::String(value)) => Ok(value),
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("BTree index {op} requires a string literal, got {other}"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("BTree index {op} requires one literal"),
+        )),
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Detected between pattern from predicate pairs.

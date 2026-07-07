@@ -648,10 +648,18 @@ CALL sys.create_global_index(
   index_column => 'id',
   index_type => 'btree'
 );
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'tag',
+  index_type => 'bitmap'
+);
 ```
 
-`index_type` defaults to `btree`. BTree indexes support scalar columns and do
-not accept the `options` argument yet.
+`index_type` defaults to `btree`. BTree and bitmap global indexes support
+scalar columns and do not accept the `options` argument yet. Bitmap global
+indexes use the same on-disk file format as Java Paimon's
+`BitmapGlobalIndexFormat`.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -726,7 +734,7 @@ FROM paimon.my_db.items$table_indexes;
 
 ### drop_global_index
 
-Drop a committed BTree global index:
+Drop a committed sorted global index:
 
 ```sql
 CALL sys.drop_global_index(
@@ -736,7 +744,7 @@ CALL sys.drop_global_index(
 );
 ```
 
-Only BTree indexes can be dropped through this procedure currently.
+BTree and bitmap global indexes can be dropped through this procedure currently.
 
 ### create_lumina_index
 
@@ -1384,7 +1392,7 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, or `NULL` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name under the table index directory |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
@@ -1516,6 +1524,8 @@ deletion vectors enabled.
 | `global-index.enabled` | `false` | Enables global index metadata and global-index-aware reads. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree range. |
+| `btree-index.fallback-scan-max-size` | `256mb` | Maximum BTree global-index file size for fallback scans used by suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
+| `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum bitmap global-index file size for fallback scans used by suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
 
 ### Variant Shredding Options

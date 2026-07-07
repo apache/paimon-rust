@@ -25,6 +25,8 @@ const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
+const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
+const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
@@ -87,6 +89,7 @@ const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
+const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 
@@ -427,6 +430,37 @@ impl<'a> CoreOptions<'a> {
                 message: format!(
                     "Option '{}' must be greater than 0, got: {}",
                     SORTED_INDEX_RECORDS_PER_RANGE_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
+        self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
+    }
+
+    pub fn bitmap_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
+        self.fallback_scan_max_size(BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
+    }
+
+    fn fallback_scan_max_size(&self, option_name: &'static str) -> crate::Result<i64> {
+        let value = match self.options.get(option_name) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be a valid memory size, got: {}",
+                    option_name, raw
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE,
+        };
+        if value < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than or equal to 0, got: {}",
+                    option_name, value
                 ),
                 source: None,
             });
@@ -837,6 +871,14 @@ mod tests {
             100_000
         );
         assert_eq!(
+            core_options.btree_index_fallback_scan_max_size().unwrap(),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            core_options.bitmap_index_fallback_scan_max_size().unwrap(),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::ThrowError
         );
@@ -866,6 +908,14 @@ mod tests {
                 "4096".to_string(),
             ),
             (
+                BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION.to_string(),
+                "4 mb".to_string(),
+            ),
+            (
+                BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION.to_string(),
+                "8 mb".to_string(),
+            ),
+            (
                 GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION.to_string(),
                 "DROP_PARTITION_INDEX".to_string(),
             ),
@@ -883,6 +933,14 @@ mod tests {
             2048
         );
         assert_eq!(core_options.sorted_index_records_per_range().unwrap(), 4096);
+        assert_eq!(
+            core_options.btree_index_fallback_scan_max_size().unwrap(),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            core_options.bitmap_index_fallback_scan_max_size().unwrap(),
+            8 * 1024 * 1024
+        );
         assert_eq!(
             core_options.global_index_column_update_action().unwrap(),
             GlobalIndexColumnUpdateAction::DropPartitionIndex
@@ -952,6 +1010,45 @@ mod tests {
                 .expect_err("invalid records-per-range should fail");
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)));
+        }
+    }
+
+    #[test]
+    fn test_global_index_fallback_scan_max_size_values() {
+        for option_name in [
+            BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION,
+            BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION,
+        ] {
+            let options = HashMap::from([(option_name.to_string(), "0".to_string())]);
+            let core = CoreOptions::new(&options);
+            let value = match option_name {
+                BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION => {
+                    core.btree_index_fallback_scan_max_size()
+                }
+                BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION => {
+                    core.bitmap_index_fallback_scan_max_size()
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(value.unwrap(), 0);
+
+            for value in ["-1", "abc"] {
+                let options = HashMap::from([(option_name.to_string(), value.to_string())]);
+                let core = CoreOptions::new(&options);
+
+                let err = match option_name {
+                    BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION => {
+                        core.btree_index_fallback_scan_max_size()
+                    }
+                    BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION => {
+                        core.bitmap_index_fallback_scan_max_size()
+                    }
+                    _ => unreachable!(),
+                }
+                .expect_err("invalid fallback scan max size should fail");
+                assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                    if message.contains(option_name)));
+            }
         }
     }
 

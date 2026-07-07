@@ -43,7 +43,7 @@ mod meta;
 pub(crate) mod query;
 mod reader;
 mod sst_file;
-mod var_len;
+pub(crate) mod var_len;
 mod writer;
 
 pub use block::BlockCompressionType;

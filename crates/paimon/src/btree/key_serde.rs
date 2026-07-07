@@ -84,15 +84,9 @@ pub fn make_key_comparator(data_type: &DataType) -> KeyComparator {
             })
         }
         DataType::Decimal(d) if d.precision() > DECIMAL_COMPACT_PRECISION => {
-            // Non-compact: raw unscaled bytes, compare as big-endian signed
+            // Non-compact Decimal keys use Java BigInteger.toByteArray() bytes.
             Box::new(|a: &[u8], b: &[u8]| {
-                let a_neg = !a.is_empty() && (a[0] & 0x80) != 0;
-                let b_neg = !b.is_empty() && (b[0] & 0x80) != 0;
-                match (a_neg, b_neg) {
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    _ => a.cmp(b),
-                }
+                decode_java_big_integer_i128(a).cmp(&decode_java_big_integer_i128(b))
             })
         }
         // Compact Timestamp/LocalZonedTimestamp (precision <= 3): millis as i64 LE
@@ -145,7 +139,7 @@ pub fn serialize_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             if *precision <= DECIMAL_COMPACT_PRECISION {
                 (*unscaled as i64).to_le_bytes().to_vec()
             } else {
-                unscaled.to_be_bytes().to_vec()
+                encode_java_big_integer_i128(*unscaled)
             }
         }
         Datum::Bytes(v) => v.clone(),
@@ -158,5 +152,94 @@ pub fn serialize_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             bytes.extend_from_slice(metadata);
             bytes
         }
+    }
+}
+
+fn encode_java_big_integer_i128(value: i128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start < bytes.len() - 1 {
+        let current = bytes[start];
+        let next = bytes[start + 1];
+        if (current == 0x00 && next & 0x80 == 0) || (current == 0xff && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    bytes[start..].to_vec()
+}
+
+fn decode_java_big_integer_i128(bytes: &[u8]) -> i128 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut value = if negative { -1 } else { 0 };
+    for &byte in bytes {
+        value = (value << 8) | i128::from(byte);
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DecimalType, IntType};
+
+    #[test]
+    fn test_serialize_non_compact_decimal_matches_java_big_integer_bytes() {
+        let data_type = DataType::Decimal(DecimalType::new(20, 0).unwrap());
+
+        assert_eq!(
+            serialize_datum(
+                &Datum::Decimal {
+                    unscaled: 127,
+                    precision: 20,
+                    scale: 0,
+                },
+                &data_type,
+            ),
+            vec![0x7f]
+        );
+        assert_eq!(
+            serialize_datum(
+                &Datum::Decimal {
+                    unscaled: 128,
+                    precision: 20,
+                    scale: 0,
+                },
+                &data_type,
+            ),
+            vec![0x00, 0x80]
+        );
+        assert_eq!(
+            serialize_datum(
+                &Datum::Decimal {
+                    unscaled: -129,
+                    precision: 20,
+                    scale: 0,
+                },
+                &data_type,
+            ),
+            vec![0xff, 0x7f]
+        );
+    }
+
+    #[test]
+    fn test_compare_non_compact_decimal_uses_numeric_order() {
+        let cmp = make_key_comparator(&DataType::Decimal(DecimalType::new(20, 0).unwrap()));
+        let key_127 = encode_java_big_integer_i128(127);
+        let key_128 = encode_java_big_integer_i128(128);
+        let key_minus_129 = encode_java_big_integer_i128(-129);
+
+        assert_eq!(cmp(&key_127, &key_128), Ordering::Less);
+        assert_eq!(cmp(&key_minus_129, &key_127), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compact_numeric_still_uses_little_endian() {
+        let key = serialize_datum(&Datum::Int(42), &DataType::Int(IntType::new()));
+        assert_eq!(key, 42i32.to_le_bytes());
     }
 }
