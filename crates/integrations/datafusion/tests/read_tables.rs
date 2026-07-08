@@ -499,6 +499,87 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
     );
 }
 
+/// Regression test for pre-epoch, sub-millisecond timestamps.
+///
+/// The BinaryRow write path and the DataFusion literal pushdown path must
+/// agree on the `(millis, nanos)` representation of a timestamp. Previously the
+/// write path used truncating division while pushdown used euclidean division,
+/// so `1969-12-31 23:59:59.999999` (`-1us`) was stored as `(0, -1000)` but the
+/// pushed literal became `(-1, 999_000)`. A pushed equality/range predicate on
+/// such a value was therefore false-negative and dropped matching rows.
+#[tokio::test]
+async fn test_negative_temporal_filter_pushdown_via_datafusion_scan() {
+    let (_tmp, sql_context) = common::setup_sql_context().await;
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.negative_temporal_pushdown (
+                id INT,
+                name STRING,
+                ts TIMESTAMP(6)
+            )",
+        )
+        .await
+        .expect("CREATE TABLE should succeed")
+        .collect()
+        .await
+        .expect("CREATE TABLE should collect");
+    // id=1 sits 1us before the epoch (negative micros), id=2 sits at the epoch,
+    // id=3 is a normal post-epoch value. Each row is written in its own INSERT so
+    // it lands in a separate data file, forcing per-file min/max stats pruning to
+    // rely on the pushed predicate rather than a range that happens to overlap.
+    for values in [
+        "(1, 'neg_us', TIMESTAMP '1969-12-31 23:59:59.999999')",
+        "(2, 'epoch', TIMESTAMP '1970-01-01 00:00:00.000000')",
+        "(3, 'post', TIMESTAMP '1970-01-01 00:00:00.000001')",
+    ] {
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.negative_temporal_pushdown VALUES {values}"
+            ))
+            .await
+            .expect("INSERT should succeed")
+            .collect()
+            .await
+            .expect("INSERT should collect");
+    }
+
+    // Equality on the pre-epoch fractional timestamp must return exactly id=1.
+    let eq_sql = "SELECT id, name FROM paimon.test_db.negative_temporal_pushdown \
+        WHERE ts = TIMESTAMP '1969-12-31 23:59:59.999999'";
+    let plan = sql_context
+        .sql(eq_sql)
+        .await
+        .expect("SQL planning should succeed")
+        .create_physical_plan()
+        .await
+        .expect("Physical plan creation should succeed");
+    let plan_text = format_physical_plan(&plan);
+    let scan_lines = paimon_scan_lines(&plan_text);
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("predicate=ts = TS(")),
+        "Temporal predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
+    );
+
+    let rows = common::collect_id_name(&sql_context, eq_sql).await;
+    assert_eq!(
+        rows,
+        vec![(1, "neg_us".to_string())],
+        "Pushed equality on a pre-epoch sub-millisecond timestamp must match the stored row"
+    );
+
+    // Range predicate across the epoch boundary must keep only the pre-epoch row.
+    let range_sql = "SELECT id, name FROM paimon.test_db.negative_temporal_pushdown \
+        WHERE ts < TIMESTAMP '1970-01-01 00:00:00.000000'";
+    let rows = common::collect_id_name(&sql_context, range_sql).await;
+    assert_eq!(
+        rows,
+        vec![(1, "neg_us".to_string())],
+        "Pushed range predicate must order pre-epoch fractional timestamps correctly"
+    );
+}
+
 #[tokio::test]
 async fn test_limit_pushdown_on_data_evolution_table_returns_merged_rows() {
     let batches = collect_query("SELECT id, name FROM paimon.default.data_evolution_table LIMIT 3")

@@ -799,8 +799,8 @@ pub fn extract_datum_from_arrow(
                     .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?;
                 let micros = arr.value(row_idx);
                 Datum::Timestamp {
-                    millis: micros / 1000,
-                    nanos: ((micros % 1000) * 1000) as i32,
+                    millis: micros.div_euclid(1_000),
+                    nanos: (micros.rem_euclid(1_000) * 1_000) as i32,
                 }
             }
         }
@@ -821,8 +821,8 @@ pub fn extract_datum_from_arrow(
                     .ok_or_else(|| type_mismatch_err("LocalZonedTimestamp(us)", col_idx))?;
                 let micros = arr.value(row_idx);
                 Datum::LocalZonedTimestamp {
-                    millis: micros / 1000,
-                    nanos: ((micros % 1000) * 1000) as i32,
+                    millis: micros.div_euclid(1_000),
+                    nanos: (micros.rem_euclid(1_000) * 1_000) as i32,
                 }
             }
         }
@@ -1264,8 +1264,8 @@ fn write_typed_value(
                 builder.set_null_at(pos);
             } else {
                 let micros = arr.value(row_idx);
-                let millis = micros / 1000;
-                let nanos = ((micros % 1000) * 1000) as i32;
+                let millis = micros.div_euclid(1_000);
+                let nanos = (micros.rem_euclid(1_000) * 1_000) as i32;
                 builder.write_timestamp_non_compact(pos, millis, nanos);
             }
         }
@@ -1737,5 +1737,60 @@ mod tests {
                 "hash code mismatch at row {row_idx}"
             );
         }
+    }
+
+    #[test]
+    fn test_negative_sub_millisecond_timestamp_uses_euclidean_parts() {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_schema::{DataType as ArrowDT, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        // 1 microsecond before the epoch: 1969-12-31 23:59:59.999999.
+        // Truncating division would store (millis=0, nanos=-1000), which is
+        // inconsistent with the DataFusion literal pushdown path that uses
+        // euclidean division and produces (millis=-1, nanos=999_000). The
+        // mismatch made pushed predicates on pre-epoch fractional timestamps
+        // false-negative, so the write path must normalize the same way.
+        let micros: i64 = -1;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            ArrowDT::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                micros,
+            )]))],
+        )
+        .unwrap();
+
+        let ts_type = DataType::Timestamp(crate::spec::TimestampType::new(6).unwrap());
+        let fields = vec![crate::spec::DataField::new(0, "ts".into(), ts_type.clone())];
+        let indices = vec![0];
+
+        // Single-row extraction path (`extract_datum_from_arrow`).
+        let datum = extract_datum_from_arrow(&batch, 0, 0, &ts_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            datum,
+            Datum::Timestamp {
+                millis: -1,
+                nanos: 999_000,
+            },
+            "extract_datum_from_arrow should normalize negative sub-millisecond timestamps"
+        );
+
+        // Batch write path must persist the same euclidean parts so that a
+        // pushed-down literal compares equal to the stored value.
+        let row = BinaryRow::from_arrow(&batch, 0, &indices, &fields).unwrap();
+        let (millis, nanos) = row.get_timestamp_raw(0, 6).unwrap();
+        assert_eq!(
+            (millis, nanos),
+            (-1, 999_000),
+            "binary-row write path must store euclidean timestamp parts"
+        );
     }
 }
