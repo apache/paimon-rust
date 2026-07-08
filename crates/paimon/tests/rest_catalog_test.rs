@@ -21,11 +21,19 @@
 //! through the Catalog trait interface.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::Options;
-use paimon::spec::{BigIntType, DataType, Schema, SchemaChange, VarCharType};
+use paimon::spec::{
+    BigIntType, BlobType, BlobViewStruct, DataType, Datum, IntType, PredicateBuilder, Schema,
+    SchemaChange, VarCharType,
+};
+use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
 mod mock_server;
 use mock_server::{start_mock_server, RESTServer};
@@ -73,6 +81,89 @@ fn test_schema() -> Schema {
         .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
         .build()
         .expect("Failed to build schema")
+}
+
+fn blob_schema(options: &[(&str, &str)]) -> Schema {
+    let mut builder = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true");
+    for (key, value) in options {
+        builder = builder.option(*key, *value);
+    }
+    builder.build().expect("Failed to build blob schema")
+}
+
+fn blob_batch(ids: Vec<i32>, names: Vec<&str>, pictures: Vec<Vec<u8>>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+        ArrowField::new("picture", ArrowDataType::Binary, true),
+    ]));
+    let picture_refs = pictures
+        .iter()
+        .map(|bytes| Some(bytes.as_slice()))
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(BinaryArray::from(picture_refs)),
+        ],
+    )
+    .unwrap()
+}
+
+async fn write_batch(table: &Table, batch: RecordBatch, commit_user: &str) {
+    let write_builder = table
+        .new_write_builder()
+        .with_commit_user(commit_user)
+        .expect("valid commit user");
+    let mut write = write_builder.new_write().expect("create writer");
+    write.write_arrow_batch(&batch).await.expect("write batch");
+    let messages = write.prepare_commit().await.expect("prepare commit");
+    write_builder
+        .new_commit()
+        .commit(messages)
+        .await
+        .expect("commit batch");
+}
+
+fn collect_blob_rows(batches: &[RecordBatch]) -> Vec<(i32, String, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let pictures = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                names.value(row).to_string(),
+                if pictures.is_null(row) {
+                    None
+                } else {
+                    Some(pictures.value(row).to_vec())
+                },
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+    rows
 }
 
 // ==================== Database Tests ====================
@@ -285,6 +376,113 @@ async fn test_rest_env_get_table_reuses_catalog_environment() {
 
     assert_eq!(upstream.identifier().full_name(), "default.upstream_table");
     assert!(upstream.rest_env().is_some());
+}
+
+#[tokio::test]
+async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+
+    let source_id = Identifier::new("default", "blob_source");
+    let source_schema = blob_schema(&[]);
+    fs_catalog
+        .create_table(&source_id, source_schema.clone(), false)
+        .await
+        .unwrap();
+    let source = fs_catalog.get_table(&source_id).await.unwrap();
+    write_batch(
+        &source,
+        blob_batch(
+            vec![1, 2],
+            vec!["Alice", "Bob"],
+            vec![b"alice".to_vec(), b"bob".to_vec()],
+        ),
+        "source-writer",
+    )
+    .await;
+
+    let view_id = Identifier::new("default", "blob_view_target");
+    let view_schema = blob_schema(&[("blob-view-field", "picture")]);
+    fs_catalog
+        .create_table(&view_id, view_schema.clone(), false)
+        .await
+        .unwrap();
+    let view = fs_catalog.get_table(&view_id).await.unwrap();
+
+    let picture_field_id = source
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "picture")
+        .unwrap()
+        .id();
+    let filtered_out_bad_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 99)
+        .serialize()
+        .unwrap();
+    let kept_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 1)
+        .serialize()
+        .unwrap();
+    write_batch(
+        &view,
+        blob_batch(
+            vec![1, 2],
+            vec!["Filtered", "Kept"],
+            vec![filtered_out_bad_ref, kept_ref],
+        ),
+        "view-writer",
+    )
+    .await;
+
+    let prefix = "mock-test";
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), prefix.to_string());
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        warehouse.clone(),
+        ConfigResponse::new(defaults),
+        vec!["default".to_string()],
+    )
+    .await;
+    server.add_table_with_schema("default", "blob_source", source_schema, source.location());
+    server.add_table_with_schema("default", "blob_view_target", view_schema, view.location());
+
+    let url = server.url().expect("Failed to get server URL");
+    let mut rest_options = Options::new();
+    rest_options.set("uri", &url);
+    rest_options.set("warehouse", "test_warehouse");
+    rest_options.set("token.provider", "bear");
+    rest_options.set("token", "test_token");
+    let rest_catalog = RESTCatalog::new(rest_options, true)
+        .await
+        .expect("create rest catalog");
+
+    let rest_view = rest_catalog.get_table(&view_id).await.unwrap();
+    let predicate = PredicateBuilder::new(rest_view.schema().fields())
+        .equal("id", Datum::Int(2))
+        .unwrap();
+    let mut read_builder = rest_view.new_read_builder();
+    read_builder.with_filter(predicate);
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    let read = read_builder.new_read().unwrap();
+    let batches = read
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_blob_rows(&batches),
+        vec![(2, "Kept".to_string(), Some(b"bob".to_vec()))]
+    );
 }
 
 #[tokio::test]

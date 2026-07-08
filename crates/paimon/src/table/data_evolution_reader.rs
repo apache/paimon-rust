@@ -173,7 +173,13 @@ impl DataEvolutionReader {
         let splits: Vec<DataSplit> = data_splits.to_vec();
 
         Ok(try_stream! {
-            let blob_view_lookup = self.preload_blob_view_lookup(&splits).await?;
+            let resolve_blob_views = !self.blob_view_read_fields().is_empty();
+            let descriptor_fields = self.descriptor_fields_to_resolve(resolve_blob_views);
+            let filter_before_blob_resolution =
+                self.can_filter_before_blob_resolution(resolve_blob_views, &descriptor_fields);
+            let blob_view_lookup = self
+                .preload_blob_view_lookup(&splits, filter_before_blob_resolution)
+                .await?;
             let descriptor_fields = self.descriptor_fields_to_resolve(blob_view_lookup.is_some());
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
@@ -450,6 +456,7 @@ impl DataEvolutionReader {
     async fn preload_blob_view_lookup(
         &self,
         splits: &[DataSplit],
+        filter_before_blob_resolution: bool,
     ) -> crate::Result<Option<BlobViewLookup>> {
         let view_fields = self.blob_view_read_fields();
         if view_fields.is_empty() {
@@ -465,7 +472,11 @@ impl DataEvolutionReader {
             self.table_schema_id,
             self.table_fields.clone(),
             view_fields.clone(),
-            Vec::new(),
+            if filter_before_blob_resolution {
+                self.predicates.clone()
+            } else {
+                Vec::new()
+            },
             true,
             HashSet::new(),
             HashSet::new(),
