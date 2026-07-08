@@ -190,11 +190,8 @@ impl AppendDedicatedFormatFileWriter {
             blob_view_column_indices: table_fields
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, field)| {
-                    blob_view_fields
-                        .contains(field.name())
-                        .then(|| (idx, field.name().to_string()))
-                })
+                .filter(|(_, field)| blob_view_fields.contains(field.name()))
+                .map(|(idx, field)| (idx, field.name().to_string()))
                 .collect(),
         }
     }
