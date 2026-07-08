@@ -113,7 +113,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
             self.table,
             snapshot.index_manifest(),
-            BTREE_INDEX_TYPE,
+            BTREE_GLOBAL_INDEX_TYPE,
             index_field.id(),
             None, // single-column build; no extra fields today
         )
@@ -136,7 +136,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         crate::table::global_index_build_common::validate_existing_index_overlap(
             self.table,
             snapshot.index_manifest(),
-            BTREE_INDEX_TYPE,
+            BTREE_GLOBAL_INDEX_TYPE,
             index_field.id(),
             None,
             &shards
@@ -1359,7 +1359,7 @@ mod tests {
         .unwrap()
         .into_iter()
         .filter(|entry| {
-            entry.kind == FileKind::Add && entry.index_file.index_type == BTREE_INDEX_TYPE
+            entry.kind == FileKind::Add && entry.index_file.index_type == BTREE_GLOBAL_INDEX_TYPE
         })
         .map(|entry| entry.index_file)
         .collect()
@@ -1749,7 +1749,7 @@ mod tests {
         let hole_start = 4;
         let hole_end = 6;
         let synthetic = IndexFileMeta {
-            index_type: BTREE_INDEX_TYPE.to_string(),
+            index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             file_name: "btree-synthetic-hole.index".to_string(),
             file_size: 1,
             row_count: (hole_end - hole_start + 1) as i32,
