@@ -48,7 +48,7 @@ use std::sync::Arc;
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
     Append(DataFileWriter),
-    AppendDedicated(AppendDedicatedFormatFileWriter),
+    AppendDedicated(Box<AppendDedicatedFormatFileWriter>),
     KeyValue(KeyValueFileWriter),
     Postpone(PostponeFileWriter),
 }
@@ -644,7 +644,7 @@ impl TableWrite {
         if self.has_blob_fields || self.has_dedicated_vector_fields {
             let fields = self.table.schema().fields();
             let input_schema = build_target_arrow_schema(fields)?;
-            Ok(FileWriter::AppendDedicated(
+            Ok(FileWriter::AppendDedicated(Box::new(
                 AppendDedicatedFormatFileWriter::new(
                     self.table.file_io().clone(),
                     self.table.location().to_string(),
@@ -664,7 +664,7 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_descriptor_fields,
                 ),
-            ))
+            )))
         } else {
             Ok(FileWriter::Append(DataFileWriter::new(
                 self.table.file_io().clone(),
