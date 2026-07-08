@@ -834,10 +834,11 @@ async fn test_blob_view_without_rest_env_preserves_reference() {
             "CREATE TABLE paimon.test_db.view_t (\
                 id INT, \
                 name STRING, \
-                picture VARBINARY COMMENT '__BLOB_VIEW_FIELD'\
+                picture BLOB\
              ) WITH (\
                 'data-evolution.enabled' = 'true', \
-                'row-tracking.enabled' = 'true'\
+                'row-tracking.enabled' = 'true', \
+                'blob-view-field' = 'picture'\
              )",
         )
         .await

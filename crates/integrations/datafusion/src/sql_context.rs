@@ -69,9 +69,6 @@ use paimon::spec::{
 use crate::error::to_datafusion_error;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
-const BLOB_VIEW_FIELD_DIRECTIVE: &str = "__BLOB_VIEW_FIELD";
-const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
-
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 ///
 /// # Example
@@ -677,18 +674,12 @@ impl SQLContext {
         let identifier = self.resolve_table_name(&ct.name)?;
 
         let mut builder = paimon::spec::Schema::builder();
-        let mut table_options = extract_options(&ct.table_options)?;
+        let table_options = extract_options(&ct.table_options)?;
 
         // Columns
         for col in &ct.columns {
             let paimon_type = column_def_to_paimon_type(col)?;
             let comment = column_def_comment(col);
-            let (paimon_type, comment) = apply_blob_view_column_directive(
-                &col.name.value,
-                paimon_type,
-                comment,
-                &mut table_options,
-            )?;
             builder = builder.column_with_description(col.name.value.clone(), paimon_type, comment);
         }
 
@@ -914,16 +905,11 @@ impl SQLContext {
 
         let mut changes = Vec::new();
         let mut rename_to: Option<Identifier> = None;
-        let mut blob_view_fields_to_add = Vec::new();
 
         for op in operations {
             match op {
                 AlterTableOperation::AddColumn { column_def, .. } => {
-                    let (change, blob_view_field) = column_def_to_add_column(column_def)?;
-                    if let Some(blob_view_field) = blob_view_field {
-                        blob_view_fields_to_add.push(blob_view_field);
-                    }
-                    changes.push(change);
+                    changes.push(column_def_to_add_column(column_def)?);
                 }
                 AlterTableOperation::DropColumn {
                     column_names,
@@ -983,17 +969,6 @@ impl SQLContext {
                     )));
                 }
             }
-        }
-
-        if !blob_view_fields_to_add.is_empty() {
-            merge_blob_view_fields_for_alter(
-                catalog,
-                &identifier,
-                if_exists,
-                &mut changes,
-                blob_view_fields_to_add,
-            )
-            .await?;
         }
 
         if let Some(new_identifier) = rename_to {
@@ -1730,28 +1705,16 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
 }
 
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].
-fn column_def_to_add_column(col: &ColumnDef) -> DFResult<(SchemaChange, Option<String>)> {
+fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
     let paimon_type = column_def_to_paimon_type(col)?;
     let comment = column_def_comment(col);
-    let mut table_options = Vec::new();
-    let (paimon_type, comment) = apply_blob_view_column_directive(
-        &col.name.value,
-        paimon_type,
-        comment,
-        &mut table_options,
-    )?;
-    let blob_view_field = table_options
-        .iter()
-        .find(|(key, _)| key == BLOB_VIEW_FIELD_OPTION)
-        .map(|(_, value)| value.clone());
 
-    let change = SchemaChange::AddColumn {
+    Ok(SchemaChange::AddColumn {
         field_names: vec![col.name.value.clone()],
         data_type: paimon_type,
         comment,
         column_move: None,
-    };
-    Ok((change, blob_view_field))
+    })
 }
 
 fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
@@ -1763,131 +1726,6 @@ fn column_def_comment(col: &ColumnDef) -> Option<String> {
         datafusion::sql::sqlparser::ast::ColumnOption::Comment(comment) => Some(comment.clone()),
         _ => None,
     })
-}
-
-fn apply_blob_view_column_directive(
-    field_name: &str,
-    data_type: PaimonDataType,
-    comment: Option<String>,
-    table_options: &mut Vec<(String, String)>,
-) -> DFResult<(PaimonDataType, Option<String>)> {
-    let Some(comment) = comment else {
-        return Ok((data_type, None));
-    };
-    let Some(real_comment) = strip_blob_view_directive(&comment) else {
-        return Ok((data_type, Some(comment)));
-    };
-
-    let nullable = data_type.is_nullable();
-    let blob_type = match data_type {
-        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) | PaimonDataType::Blob(_) => {
-            PaimonDataType::Blob(BlobType::with_nullable(nullable))
-        }
-        other => {
-            return Err(DataFusionError::Plan(format!(
-                "Column {field_name} declared with {BLOB_VIEW_FIELD_DIRECTIVE} must be BINARY, VARBINARY or BLOB, but was {other:?}"
-            )));
-        }
-    };
-    append_csv_option(table_options, BLOB_VIEW_FIELD_OPTION, field_name);
-    Ok((blob_type, real_comment))
-}
-
-fn strip_blob_view_directive(comment: &str) -> Option<Option<String>> {
-    let trimmed = comment.trim();
-    if trimmed == BLOB_VIEW_FIELD_DIRECTIVE {
-        return Some(None);
-    }
-    let rest = trimmed.strip_prefix(BLOB_VIEW_FIELD_DIRECTIVE)?;
-    let rest = rest.strip_prefix(';')?.trim();
-    if rest.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(rest.to_string()))
-    }
-}
-
-fn append_csv_option(options: &mut Vec<(String, String)>, key: &str, value: &str) {
-    if let Some((_, existing)) = options
-        .iter_mut()
-        .find(|(existing_key, _)| existing_key == key)
-    {
-        if existing.split(',').map(str::trim).any(|v| v == value) {
-            return;
-        }
-        if !existing.trim().is_empty() {
-            existing.push(',');
-        }
-        existing.push_str(value);
-    } else {
-        options.push((key.to_string(), value.to_string()));
-    }
-}
-
-async fn merge_blob_view_fields_for_alter(
-    catalog: &Arc<dyn Catalog>,
-    identifier: &Identifier,
-    if_exists: bool,
-    changes: &mut Vec<SchemaChange>,
-    fields_to_add: Vec<String>,
-) -> DFResult<()> {
-    let mut base_value = None;
-    for change in changes.iter().rev() {
-        if let SchemaChange::SetOption { key, value } = change {
-            if key == BLOB_VIEW_FIELD_OPTION {
-                base_value = Some(value.clone());
-                break;
-            }
-        }
-    }
-
-    let mut value = if let Some(base_value) = base_value {
-        base_value
-    } else {
-        match catalog.get_table(identifier).await {
-            Ok(table) => table
-                .schema()
-                .options()
-                .get(BLOB_VIEW_FIELD_OPTION)
-                .cloned()
-                .unwrap_or_default(),
-            Err(paimon::Error::TableNotExist { .. }) if if_exists => return Ok(()),
-            Err(e) => return Err(to_datafusion_error(e)),
-        }
-    };
-
-    for field in fields_to_add {
-        append_csv_value(&mut value, &field);
-    }
-
-    for change in changes.iter_mut().rev() {
-        if let SchemaChange::SetOption {
-            key,
-            value: existing,
-        } = change
-        {
-            if key == BLOB_VIEW_FIELD_OPTION {
-                *existing = value;
-                return Ok(());
-            }
-        }
-    }
-
-    changes.push(SchemaChange::set_option(
-        BLOB_VIEW_FIELD_OPTION.to_string(),
-        value,
-    ));
-    Ok(())
-}
-
-fn append_csv_value(existing: &mut String, value: &str) {
-    if existing.split(',').map(str::trim).any(|v| v == value) {
-        return;
-    }
-    if !existing.trim().is_empty() {
-        existing.push(',');
-    }
-    existing.push_str(value);
 }
 
 fn primary_key_column_name(expr: &SqlExpr) -> String {
@@ -2768,8 +2606,7 @@ mod tests {
 
     use async_trait::async_trait;
     use paimon::catalog::Database;
-    use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataType as PaimonDataType, IntType, Schema as PaimonSchema, TableSchema};
+    use paimon::spec::{DataType as PaimonDataType, IntType, Schema as PaimonSchema};
     use paimon::table::Table;
 
     // ==================== Mock Catalog ====================
@@ -2804,13 +2641,6 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 existing_table: Mutex::new(None),
-            }
-        }
-
-        fn with_existing_table(table: Table) -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                existing_table: Mutex::new(Some(table)),
             }
         }
 
@@ -2908,24 +2738,6 @@ mod tests {
         let mut ctx = SQLContext::new();
         ctx.register_catalog("paimon", catalog).await.unwrap();
         ctx
-    }
-
-    fn mock_table_with_options(
-        options: impl IntoIterator<Item = (&'static str, &'static str)>,
-    ) -> Table {
-        let mut schema_builder =
-            PaimonSchema::builder().column("id", PaimonDataType::Int(IntType::with_nullable(true)));
-        for (key, value) in options {
-            schema_builder = schema_builder.option(key, value);
-        }
-        let schema = schema_builder.build().unwrap();
-        Table::new(
-            FileIOBuilder::new("memory").build().unwrap(),
-            Identifier::new("mydb", "t1"),
-            "memory:///mock/mydb/t1".to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        )
     }
 
     // ==================== register_catalog_with_default_db tests ====================
@@ -3639,45 +3451,6 @@ mod tests {
                     data_type,
                     ..
                 } if field_names.first().map(String::as_str) == Some("payload") && matches!(data_type, PaimonDataType::Blob(_))
-            ));
-        } else {
-            panic!("expected AlterTable call");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_alter_table_add_blob_view_column_directive() {
-        let table = mock_table_with_options([(BLOB_VIEW_FIELD_OPTION, "old_picture")]);
-        let catalog = Arc::new(MockCatalog::with_existing_table(table));
-        let sql_context = make_sql_context(catalog.clone()).await;
-
-        sql_context
-            .sql(
-                "ALTER TABLE mydb.t1 \
-                 ADD COLUMN new_picture VARBINARY COMMENT '__BLOB_VIEW_FIELD; user photo'",
-            )
-            .await
-            .unwrap();
-
-        let calls = catalog.take_calls();
-        assert_eq!(calls.len(), 1);
-        if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
-            assert_eq!(changes.len(), 2);
-            assert!(matches!(
-                &changes[0],
-                SchemaChange::AddColumn {
-                    field_names,
-                    data_type,
-                    comment,
-                    ..
-                } if field_names.first().map(String::as_str) == Some("new_picture")
-                    && matches!(data_type, PaimonDataType::Blob(_))
-                    && comment.as_deref() == Some("user photo")
-            ));
-            assert!(matches!(
-                &changes[1],
-                SchemaChange::SetOption { key, value }
-                    if key == BLOB_VIEW_FIELD_OPTION && value == "old_picture,new_picture"
             ));
         } else {
             panic!("expected AlterTable call");

@@ -138,24 +138,6 @@ CREATE TABLE paimon.my_db.asset_refs (
 );
 ```
 
-SQL DDL also supports the Java-style `__BLOB_VIEW_FIELD` column comment
-directive. When a `BINARY`, `VARBINARY`, or `BLOB` column uses this directive,
-Paimon Rust stores it as a BLOB column and appends the column name to
-`blob-view-field`. Text after a semicolon is preserved as the column comment:
-
-```sql
-CREATE TABLE paimon.my_db.asset_refs (
-    id INT,
-    picture VARBINARY COMMENT '__BLOB_VIEW_FIELD; shared upstream image'
-) WITH (
-    'data-evolution.enabled' = 'true',
-    'row-tracking.enabled' = 'true'
-);
-
-ALTER TABLE paimon.my_db.asset_refs
-ADD COLUMN thumbnail VARBINARY COMMENT '__BLOB_VIEW_FIELD; generated preview';
-```
-
 Use `blob_view(table, field_name_or_id, row_id)` or `sys.blob_view(...)` to
 create the reference. The table argument may be `table`, `database.table`, or
 `catalog.database.table`; the stored reference contains the resolved
