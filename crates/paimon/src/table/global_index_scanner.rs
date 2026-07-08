@@ -450,7 +450,7 @@ impl GlobalIndexScanner {
                 .filter(|&i| {
                     let predicate_matches_entry = predicate_matches[i][entry_idx];
                     let predicate_evaluated_for_entry =
-                        predicate_fallback_plans[i].map_or(true, |plan| {
+                        predicate_fallback_plans[i].is_none_or(|plan| {
                             fallback_plan_evaluates_entry(
                                 plan,
                                 entry.index_type,
