@@ -65,21 +65,11 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
 ///
 /// DataFusion still treats pushed filters as inexact because unsupported
 /// predicates and non-Parquet reads remain residual filters.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
     table_definition: Option<String>,
-}
-
-impl std::fmt::Debug for PaimonTableProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaimonTableProvider")
-            .field("table", &self.table)
-            .field("schema", &self.schema)
-            .field("table_definition", &self.table_definition)
-            .finish()
-    }
 }
 
 impl PaimonTableProvider {

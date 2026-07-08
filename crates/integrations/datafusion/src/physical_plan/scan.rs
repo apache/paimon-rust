@@ -38,6 +38,7 @@ use crate::error::to_datafusion_error;
 /// Planning is performed eagerly in [`super::super::table::PaimonTableProvider::scan`],
 /// and the resulting splits are distributed across DataFusion execution partitions
 /// so that DataFusion can schedule them in parallel.
+#[derive(Debug)]
 pub struct PaimonTableScan {
     table: Table,
     /// Full Paimon read type for nested or connector-defined projections.
@@ -59,21 +60,6 @@ pub struct PaimonTableScan {
     scan_trace: Option<ScanTrace>,
     /// Human-readable Variant extraction summary for explain output.
     pushed_variants: Option<String>,
-}
-
-impl std::fmt::Debug for PaimonTableScan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaimonTableScan")
-            .field("table", &self.table)
-            .field("read_type", &self.read_type)
-            .field("pushed_predicate", &self.pushed_predicate)
-            .field("planned_partitions", &self.planned_partitions)
-            .field("limit", &self.limit)
-            .field("filter_exact", &self.filter_exact)
-            .field("scan_trace", &self.scan_trace)
-            .field("pushed_variants", &self.pushed_variants)
-            .finish()
-    }
 }
 
 impl PaimonTableScan {
