@@ -727,9 +727,7 @@ async fn resolve_descriptor_columns(
                 .as_any()
                 .downcast_ref::<arrow_array::BinaryArray>()
             {
-                let resolved =
-                    super::dedicated_format_file_writer::resolve_blob_column(bin_col, file_io)
-                        .await?;
+                let resolved = super::blob_resolver::resolve_blob_column(bin_col, file_io).await?;
                 columns.push(Arc::new(resolved));
                 changed = true;
                 continue;

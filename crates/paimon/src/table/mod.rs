@@ -20,6 +20,7 @@
 pub(crate) mod aggregator;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_reader;
+mod blob_resolver;
 mod branch_manager;
 mod btree_global_index_build_builder;
 mod btree_global_index_drop_builder;
