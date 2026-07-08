@@ -249,6 +249,7 @@ impl TableProvider for VectorSearchTableProvider {
             limit,
             target_partitions: target,
             filter_exact: false,
+            blob_view_catalog: None,
         }
         .build()
     }

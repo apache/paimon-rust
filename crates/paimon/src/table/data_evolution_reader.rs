@@ -21,15 +21,19 @@ use super::data_file_reader::{
 };
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::FilePredicates;
+use crate::catalog::Catalog;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{
+    BigIntType, BlobDescriptor, BlobViewStruct, DataField, DataFileMeta, DataType, Predicate,
+    ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+};
 use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
 use crate::{DataSplit, Error};
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
 use roaring::RoaringBitmap;
@@ -101,6 +105,9 @@ pub(crate) struct DataEvolutionReader {
     predicates: Vec<Predicate>,
     blob_as_descriptor: bool,
     blob_descriptor_fields: HashSet<String>,
+    blob_view_fields: HashSet<String>,
+    blob_view_resolve_enabled: bool,
+    blob_view_catalog: Option<Arc<dyn Catalog>>,
 }
 
 impl DataEvolutionReader {
@@ -114,6 +121,9 @@ impl DataEvolutionReader {
         predicates: Vec<Predicate>,
         blob_as_descriptor: bool,
         blob_descriptor_fields: HashSet<String>,
+        blob_view_fields: HashSet<String>,
+        blob_view_resolve_enabled: bool,
+        blob_view_catalog: Option<Arc<dyn Catalog>>,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -125,7 +135,7 @@ impl DataEvolutionReader {
 
         // Widen the file read set with predicate columns not already projected
         // so the residual filter can evaluate every leaf. Extras land strictly
-        // at the END: `filter_and_project_output` relies on that to project the
+        // at the END: `project_output` relies on that to project the
         // final batch back to `read_type` by prefix. Predicate leaf indices
         // point into the table schema, so `file_fields` = `table_fields`.
         let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
@@ -154,6 +164,9 @@ impl DataEvolutionReader {
             predicates,
             blob_as_descriptor,
             blob_descriptor_fields,
+            blob_view_fields,
+            blob_view_resolve_enabled,
+            blob_view_catalog,
         })
     }
 
@@ -162,6 +175,11 @@ impl DataEvolutionReader {
         let splits: Vec<DataSplit> = data_splits.to_vec();
 
         Ok(try_stream! {
+            let blob_view_lookup = self.preload_blob_view_lookup(&splits).await?;
+            let descriptor_fields = self.descriptor_fields_to_resolve(blob_view_lookup.is_some());
+            let filter_before_blob_resolution =
+                self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
+
             let file_reader = DataFileReader::new(
                 self.file_io.clone(),
                 self.schema_manager.clone(),
@@ -224,32 +242,27 @@ impl DataEvolutionReader {
                         )?;
                         while let Some(batch) = stream.next().await {
                             let batch = batch?;
-                            let batch = if !self.blob_as_descriptor && !self.blob_descriptor_fields.is_empty() {
-                                resolve_descriptor_columns(batch, &self.blob_descriptor_fields, &self.file_io).await?
-                            } else {
-                                batch
-                            };
                             let num_rows = batch.num_rows();
-                            if let Some(idx) = self.row_id_index {
+                            let batch = if let Some(idx) = self.row_id_index {
                                 if !has_row_id {
-                                    yield self.filter_and_project_output(
-                                        append_null_row_id_column(batch, idx, &self.wide_output_schema)?,
-                                    )?;
+                                    append_null_row_id_column(batch, idx, &self.wide_output_schema)?
                                 } else if let Some(ref ids) = selected_row_ids {
-                                    yield self.filter_and_project_output(
-                                        attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?,
-                                    )?;
+                                    attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
                                 } else {
                                     let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
                                     row_id_cursor += num_rows as i64;
                                     let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                    yield self.filter_and_project_output(
-                                        insert_column_at(batch, array, idx, &self.wide_output_schema)?,
-                                    )?;
+                                    insert_column_at(batch, array, idx, &self.wide_output_schema)?
                                 }
                             } else {
-                                yield self.filter_and_project_output(batch)?;
-                            }
+                                batch
+                            };
+                            yield self.finish_wide_batch(
+                                batch,
+                                blob_view_lookup.as_ref(),
+                                &descriptor_fields,
+                                filter_before_blob_resolution,
+                            ).await?;
                         }
                     }
                 } else {
@@ -298,22 +311,24 @@ impl DataEvolutionReader {
                     while let Some(batch) = merge_stream.next().await {
                         let batch = batch?;
                         let num_rows = batch.num_rows();
-                        if let Some(idx) = self.row_id_index {
+                        let batch = if let Some(idx) = self.row_id_index {
                             if let Some(ref ids) = selected_row_ids {
-                                yield self.filter_and_project_output(
-                                    attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?,
-                                )?;
+                                attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
                             } else {
                                 let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
                                 row_id_cursor += num_rows as i64;
                                 let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                yield self.filter_and_project_output(
-                                    insert_column_at(batch, array, idx, &self.wide_output_schema)?,
-                                )?;
+                                insert_column_at(batch, array, idx, &self.wide_output_schema)?
                             }
                         } else {
-                            yield self.filter_and_project_output(batch)?;
-                        }
+                            batch
+                        };
+                        yield self.finish_wide_batch(
+                            batch,
+                            blob_view_lookup.as_ref(),
+                            &descriptor_fields,
+                            filter_before_blob_resolution,
+                        ).await?;
                     }
                 }
             }
@@ -321,40 +336,39 @@ impl DataEvolutionReader {
         .boxed())
     }
 
-    /// Apply the residual predicates to a wide batch (post `_ROW_ID` attach)
-    /// and project it back to the caller's read_type.
+    /// Apply the residual predicates to a wide batch (post `_ROW_ID` attach).
+    ///
+    /// `_ROW_ID` correctness: ids are attached before this filter, so surviving
+    /// rows keep their original ids.
+    fn filter_wide_batch(&self, batch: RecordBatch) -> crate::Result<RecordBatch> {
+        if self.predicates.is_empty() {
+            return Ok(batch);
+        }
+
+        let mask = crate::arrow::residual::evaluate_predicates_mask(
+            &batch,
+            &self.predicates,
+            &self.table_fields,
+            &self.wide_file_read_type,
+        )?;
+        match mask {
+            Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask).map_err(|e| {
+                Error::DataInvalid {
+                    message: format!("Failed to filter data-evolution batch by predicates: {e}"),
+                    source: Some(Box::new(e)),
+                }
+            }),
+            None => Ok(batch),
+        }
+    }
+
+    /// Project a wide batch back to the caller's read_type.
     ///
     /// Layout invariant: the first `output_schema.fields().len()` columns of
-    /// `batch` are exactly the original read_type columns — extras were
-    /// appended at the end by `widen_scan_fields`, and `_ROW_ID` insertion at
-    /// `row_id_index` keeps them trailing. `_ROW_ID` correctness: ids are
-    /// attached before this filter, so surviving rows keep their original ids.
-    ///
-    /// No predicates implies no widening (extras only come from predicates),
-    /// so the empty-predicate fast path returns the batch untouched.
-    fn filter_and_project_output(&self, batch: RecordBatch) -> crate::Result<RecordBatch> {
-        let filtered =
-            if self.predicates.is_empty() {
-                batch
-            } else {
-                let mask = crate::arrow::residual::evaluate_predicates_mask(
-                    &batch,
-                    &self.predicates,
-                    &self.table_fields,
-                    &self.wide_file_read_type,
-                )?;
-                match mask {
-                    Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask)
-                        .map_err(|e| Error::DataInvalid {
-                            message: format!(
-                                "Failed to filter data-evolution batch by predicates: {e}"
-                            ),
-                            source: Some(Box::new(e)),
-                        })?,
-                    None => batch,
-                }
-            };
-
+    /// `batch` are exactly the original read_type columns. Extras were appended
+    /// at the end by `widen_scan_fields`, and `_ROW_ID` insertion at
+    /// `row_id_index` keeps them trailing.
+    fn project_output(&self, filtered: RecordBatch) -> crate::Result<RecordBatch> {
         let final_width = self.output_schema.fields().len();
         if filtered.num_columns() == final_width {
             return Ok(filtered);
@@ -373,6 +387,121 @@ impl DataEvolutionReader {
             message: format!("Failed to project data-evolution batch to read_type: {e}"),
             source: Some(Box::new(e)),
         })
+    }
+
+    async fn finish_wide_batch(
+        &self,
+        batch: RecordBatch,
+        blob_view_lookup: Option<&BlobViewLookup>,
+        descriptor_fields: &HashSet<String>,
+        filter_before_blob_resolution: bool,
+    ) -> crate::Result<RecordBatch> {
+        let mut batch = if filter_before_blob_resolution {
+            self.filter_wide_batch(batch)?
+        } else {
+            batch
+        };
+        if filter_before_blob_resolution && batch.num_rows() == 0 {
+            return self.project_output(batch);
+        }
+
+        batch = self.resolve_blob_view_columns(batch, blob_view_lookup)?;
+        let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
+            resolve_descriptor_columns(batch, descriptor_fields, &self.file_io).await?
+        } else {
+            batch
+        };
+
+        if !filter_before_blob_resolution {
+            batch = self.filter_wide_batch(batch)?;
+        }
+        self.project_output(batch)
+    }
+
+    fn can_filter_before_blob_resolution(
+        &self,
+        resolve_blob_views: bool,
+        descriptor_fields: &HashSet<String>,
+    ) -> bool {
+        let mut transformed_fields = HashSet::new();
+        if resolve_blob_views {
+            transformed_fields.extend(self.blob_view_fields.iter().cloned());
+        }
+        if !self.blob_as_descriptor {
+            transformed_fields.extend(descriptor_fields.iter().cloned());
+        }
+        transformed_fields.is_empty()
+            || !predicates_reference_any_field(
+                &self.predicates,
+                &transformed_fields,
+                &self.table_fields,
+            )
+    }
+
+    fn blob_view_read_fields(&self) -> Vec<DataField> {
+        if !self.blob_view_resolve_enabled || self.blob_view_catalog.is_none() {
+            return Vec::new();
+        }
+        self.wide_file_read_type
+            .iter()
+            .filter(|field| self.blob_view_fields.contains(field.name()))
+            .cloned()
+            .collect()
+    }
+
+    async fn preload_blob_view_lookup(
+        &self,
+        splits: &[DataSplit],
+    ) -> crate::Result<Option<BlobViewLookup>> {
+        let view_fields = self.blob_view_read_fields();
+        if view_fields.is_empty() {
+            return Ok(None);
+        }
+        let Some(catalog) = self.blob_view_catalog.clone() else {
+            return Ok(None);
+        };
+
+        let prescan = DataEvolutionReader::new(
+            self.file_io.clone(),
+            self.schema_manager.clone(),
+            self.table_schema_id,
+            self.table_fields.clone(),
+            view_fields.clone(),
+            Vec::new(),
+            true,
+            HashSet::new(),
+            HashSet::new(),
+            false,
+            None,
+        )?;
+        let mut stream = prescan.read(splits)?;
+        let mut view_structs = HashSet::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            collect_blob_view_structs(&batch, &self.blob_view_fields, &mut view_structs)?;
+        }
+
+        BlobViewLookup::load(catalog, view_structs).await.map(Some)
+    }
+
+    fn descriptor_fields_to_resolve(&self, resolve_blob_views: bool) -> HashSet<String> {
+        let mut fields = self.blob_descriptor_fields.clone();
+        if resolve_blob_views {
+            fields.extend(self.blob_view_fields.iter().cloned());
+        }
+        fields
+    }
+
+    fn resolve_blob_view_columns(
+        &self,
+        batch: RecordBatch,
+        lookup: Option<&BlobViewLookup>,
+    ) -> crate::Result<RecordBatch> {
+        let Some(lookup) = lookup else {
+            return Ok(batch);
+        };
+
+        replace_blob_view_columns(batch, &self.blob_view_fields, lookup)
     }
 
     /// Merge multiple logical sources column-wise for data evolution.
@@ -398,13 +527,10 @@ impl DataEvolutionReader {
         let split = split.clone();
         let prepared_group = prepared_group.clone();
         // The merge plan reads the WIDE field set so widened predicate columns
-        // are materialized for the residual filter. Blob-descriptor note: if a
-        // widened predicate column is a blob-descriptor field,
-        // `resolve_descriptor_columns` resolves it by name in the wide batch
-        // before the residual runs, so with `blob_as_descriptor = false` the
-        // residual compares resolved bytes; with `true` it compares descriptor
-        // bytes. Resolution before filtering can do IO for rows the filter then
-        // drops — accepted trade-off.
+        // are materialized for the residual filter. Blob descriptor/view
+        // resolution is intentionally deferred to `finish_wide_batch`, where
+        // the reader can filter first when predicates do not depend on fields
+        // whose values would be transformed by resolution.
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
@@ -580,11 +706,6 @@ impl DataEvolutionReader {
                             source: Some(Box::new(e)),
                         }
                     })?;
-                let merged = if !blob_as_descriptor && !blob_descriptor_fields.is_empty() {
-                    resolve_descriptor_columns(merged, &blob_descriptor_fields, &file_io).await?
-                } else {
-                    merged
-                };
                 yield merged;
             }
         }
@@ -627,6 +748,312 @@ async fn resolve_descriptor_columns(
         message: format!("Failed to rebuild RecordBatch after resolving blob descriptors: {e}"),
         source: Some(Box::new(e)),
     })
+}
+
+fn predicates_reference_any_field(
+    predicates: &[Predicate],
+    field_names: &HashSet<String>,
+    table_fields: &[DataField],
+) -> bool {
+    predicates
+        .iter()
+        .any(|predicate| predicate_references_any_field(predicate, field_names, table_fields))
+}
+
+fn predicate_references_any_field(
+    predicate: &Predicate,
+    field_names: &HashSet<String>,
+    table_fields: &[DataField],
+) -> bool {
+    match predicate {
+        Predicate::Leaf { column, index, .. } => {
+            field_names.contains(column)
+                || table_fields
+                    .get(*index)
+                    .is_some_and(|field| field_names.contains(field.name()))
+        }
+        Predicate::And(children) | Predicate::Or(children) => children
+            .iter()
+            .any(|child| predicate_references_any_field(child, field_names, table_fields)),
+        Predicate::Not(inner) => predicate_references_any_field(inner, field_names, table_fields),
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => false,
+    }
+}
+
+fn collect_blob_view_structs(
+    batch: &RecordBatch,
+    blob_view_fields: &HashSet<String>,
+    view_structs: &mut HashSet<BlobViewStruct>,
+) -> crate::Result<()> {
+    for (idx, field) in batch.schema().fields().iter().enumerate() {
+        if !blob_view_fields.contains(field.name()) {
+            continue;
+        }
+        let col = binary_column(batch, idx, field.name())?;
+        for row in 0..col.len() {
+            if col.is_null(row) {
+                continue;
+            }
+            let value = col.value(row);
+            if !BlobViewStruct::is_blob_view_struct(value) {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "blob-view-field '{}' requires blob field value to be a serialized BlobViewStruct",
+                        field.name()
+                    ),
+                    source: None,
+                });
+            }
+            view_structs.insert(BlobViewStruct::deserialize(value)?);
+        }
+    }
+    Ok(())
+}
+
+fn replace_blob_view_columns(
+    batch: RecordBatch,
+    blob_view_fields: &HashSet<String>,
+    lookup: &BlobViewLookup,
+) -> crate::Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if !blob_view_fields.contains(field.name()) {
+            columns.push(batch.column(idx).clone());
+            continue;
+        }
+
+        let col = binary_column(&batch, idx, field.name())?;
+        let mut builder = arrow_array::builder::BinaryBuilder::new();
+        for row in 0..col.len() {
+            if col.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+
+            let value = col.value(row);
+            if !BlobViewStruct::is_blob_view_struct(value) {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "blob-view-field '{}' requires blob field value to be a serialized BlobViewStruct",
+                        field.name()
+                    ),
+                    source: None,
+                });
+            }
+            let view_struct = BlobViewStruct::deserialize(value)?;
+            match lookup.descriptor(&view_struct)? {
+                None => builder.append_null(),
+                Some(descriptor) => builder.append_value(descriptor.serialize()),
+            }
+        }
+        columns.push(Arc::new(builder.finish()));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(batch);
+    }
+
+    RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to rebuild RecordBatch after resolving blob views: {e}"),
+        source: Some(Box::new(e)),
+    })
+}
+
+fn binary_column<'a>(
+    batch: &'a RecordBatch,
+    idx: usize,
+    field_name: &str,
+) -> crate::Result<&'a BinaryArray> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("blob-view-field '{field_name}' requires a BinaryArray column"),
+            source: None,
+        })
+}
+
+#[derive(Debug, Default)]
+struct BlobViewLookup {
+    descriptors: HashMap<BlobViewStruct, Option<BlobDescriptor>>,
+}
+
+impl BlobViewLookup {
+    async fn load(
+        catalog: Arc<dyn Catalog>,
+        view_structs: HashSet<BlobViewStruct>,
+    ) -> crate::Result<Self> {
+        if view_structs.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut by_table_and_field: HashMap<
+            (crate::catalog::Identifier, i32),
+            Vec<BlobViewStruct>,
+        > = HashMap::new();
+        for view_struct in view_structs {
+            by_table_and_field
+                .entry((view_struct.identifier().clone(), view_struct.field_id()))
+                .or_default()
+                .push(view_struct);
+        }
+
+        let mut lookup = Self::default();
+        for ((identifier, field_id), refs) in by_table_and_field {
+            let table = catalog.get_table(&identifier).await?;
+            let field = table
+                .schema()
+                .fields()
+                .iter()
+                .find(|field| field.id() == field_id)
+                .cloned()
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Cannot find blob field id {field_id} in upstream table {}",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                })?;
+            if !field.data_type().is_blob_type() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Field id {field_id} in upstream table {} is not a BLOB field",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+
+            let mut options = HashMap::new();
+            options.insert("blob-as-descriptor".to_string(), "true".to_string());
+            let table = table.copy_with_options(options);
+            let row_ranges = row_ranges_for_blob_view_refs(&refs);
+            let mut read_builder = table.new_read_builder();
+            read_builder.with_read_type(vec![field.clone(), row_id_field()]);
+            read_builder.with_row_ranges(row_ranges);
+            let plan = read_builder.new_scan().plan().await?;
+            let read = read_builder.new_read()?;
+            let mut stream = read.to_arrow(plan.splits())?;
+
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let blob_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            "Upstream blob field '{}' did not read as BinaryArray",
+                            field.name()
+                        ),
+                        source: None,
+                    })?;
+                let row_id_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Upstream _ROW_ID did not read as Int64Array".to_string(),
+                        source: None,
+                    })?;
+
+                for row in 0..batch.num_rows() {
+                    if row_id_col.is_null(row) {
+                        continue;
+                    }
+                    let view_struct =
+                        BlobViewStruct::new(identifier.clone(), field_id, row_id_col.value(row));
+                    if blob_col.is_null(row) {
+                        lookup.descriptors.insert(view_struct, None);
+                        continue;
+                    }
+                    let value = blob_col.value(row);
+                    if !BlobDescriptor::is_blob_descriptor(value) {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "BlobViewStruct {} field_id={} row_id={} resolved to non-BlobDescriptor bytes",
+                                identifier.full_name(),
+                                field_id,
+                                row_id_col.value(row)
+                            ),
+                            source: None,
+                        });
+                    }
+                    lookup
+                        .descriptors
+                        .insert(view_struct, Some(BlobDescriptor::deserialize(value)?));
+                }
+            }
+
+            for view_struct in refs {
+                if !lookup.descriptors.contains_key(&view_struct) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "BlobViewStruct not found in upstream table: identifier={}, field_id={}, row_id={}",
+                            view_struct.identifier().full_name(),
+                            view_struct.field_id(),
+                            view_struct.row_id()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+
+        Ok(lookup)
+    }
+
+    fn descriptor(&self, view_struct: &BlobViewStruct) -> crate::Result<Option<&BlobDescriptor>> {
+        self.descriptors
+            .get(view_struct)
+            .map(Option::as_ref)
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "BlobViewStruct not found in preloaded cache: identifier={}, field_id={}, row_id={}",
+                    view_struct.identifier().full_name(),
+                    view_struct.field_id(),
+                    view_struct.row_id()
+                ),
+                source: None,
+            })
+    }
+}
+
+fn row_ranges_for_blob_view_refs(refs: &[BlobViewStruct]) -> Vec<RowRange> {
+    let mut row_ids = refs.iter().map(BlobViewStruct::row_id).collect::<Vec<_>>();
+    row_ids.sort_unstable();
+    row_ids.dedup();
+
+    let mut ranges = Vec::new();
+    let mut iter = row_ids.into_iter();
+    let Some(mut start) = iter.next() else {
+        return ranges;
+    };
+    let mut end = start;
+    for row_id in iter {
+        if end.checked_add(1) == Some(row_id) {
+            end = row_id;
+        } else {
+            ranges.push(RowRange::new(start, end));
+            start = row_id;
+            end = row_id;
+        }
+    }
+    ranges.push(RowRange::new(start, end));
+    ranges
+}
+
+fn row_id_field() -> DataField {
+    DataField::new(
+        ROW_ID_FIELD_ID,
+        ROW_ID_FIELD_NAME.to_string(),
+        DataType::BigInt(BigIntType::with_nullable(true)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

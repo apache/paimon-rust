@@ -78,7 +78,13 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog(...).await` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `hybrid_search`, and `full_text_search` when the `fulltext` feature is enabled) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner
+pre-registered. Use `register_catalog(...).await` to add one or more Paimon
+catalogs; registering a catalog also registers the built-in scalar function
+`blob_view` (alias `sys.blob_view`) and the built-in table-valued functions
+(`vector_search`, `hybrid_search`, and `full_text_search` when the `fulltext`
+feature is enabled) against it. It also manages session-scoped dynamic options
+internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -110,6 +116,81 @@ columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
 columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
 index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
 does not round-trip `VECTOR` columns.
+
+### Blob View
+
+Blob View stores an inline reference to a BLOB value in another table, using a
+Java-compatible `BlobViewStruct` payload. It is useful when one table should
+point at media or large binary content owned by an upstream table without
+copying the bytes at write time.
+
+Declare Blob View columns as top-level BLOB columns and list them in the
+`blob-view-field` table option:
+
+```sql
+CREATE TABLE paimon.my_db.asset_refs (
+    id INT,
+    picture BLOB
+) WITH (
+    'data-evolution.enabled' = 'true',
+    'row-tracking.enabled' = 'true',
+    'blob-view-field' = 'picture'
+);
+```
+
+SQL DDL also supports the Java-style `__BLOB_VIEW_FIELD` column comment
+directive. When a `BINARY`, `VARBINARY`, or `BLOB` column uses this directive,
+Paimon Rust stores it as a BLOB column and appends the column name to
+`blob-view-field`. Text after a semicolon is preserved as the column comment:
+
+```sql
+CREATE TABLE paimon.my_db.asset_refs (
+    id INT,
+    picture VARBINARY COMMENT '__BLOB_VIEW_FIELD; shared upstream image'
+) WITH (
+    'data-evolution.enabled' = 'true',
+    'row-tracking.enabled' = 'true'
+);
+
+ALTER TABLE paimon.my_db.asset_refs
+ADD COLUMN thumbnail VARBINARY COMMENT '__BLOB_VIEW_FIELD; generated preview';
+```
+
+Use `blob_view(table, field_name_or_id, row_id)` or `sys.blob_view(...)` to
+create the reference. The table argument may be `table`, `database.table`, or
+`catalog.database.table`; the stored reference contains the resolved
+`database.table`, field id, and row id. In typical SQL, read `_ROW_ID` from a
+row-tracking source table:
+
+```sql
+CREATE TABLE paimon.my_db.assets (
+    id INT,
+    picture BLOB
+) WITH (
+    'data-evolution.enabled' = 'true',
+    'row-tracking.enabled' = 'true'
+);
+
+INSERT INTO paimon.my_db.asset_refs (id, picture)
+SELECT
+    id,
+    sys.blob_view('my_db.assets', 'picture', "_ROW_ID")
+FROM paimon.my_db.assets;
+```
+
+By default, reads resolve Blob View fields to the upstream BLOB value. Set the
+dynamic option `paimon.blob-view.resolve.enabled` to `false` to preserve the raw
+serialized `BlobViewStruct` bytes in query results:
+
+```sql
+SET 'paimon.blob-view.resolve.enabled' = 'false';
+SELECT id, picture FROM paimon.my_db.asset_refs;
+RESET 'paimon.blob-view.resolve.enabled';
+```
+
+Like ordinary BLOB reads, `paimon.blob-as-descriptor = true` makes resolved Blob
+View columns return serialized BLOB descriptors instead of loading the BLOB
+bytes.
 
 ### Variant Usage
 
@@ -1169,6 +1250,15 @@ Example — enable BLOB descriptor mode:
 SET 'paimon.blob-as-descriptor' = 'true';
 SELECT * FROM paimon.my_db.assets;
 RESET 'paimon.blob-as-descriptor';
+```
+
+Example — preserve Blob View references instead of resolving upstream BLOB
+values:
+
+```sql
+SET 'paimon.blob-view.resolve.enabled' = 'false';
+SELECT * FROM paimon.my_db.asset_refs;
+RESET 'paimon.blob-view.resolve.enabled';
 ```
 
 ## Temporary Tables

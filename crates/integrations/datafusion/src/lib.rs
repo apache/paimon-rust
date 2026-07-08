@@ -37,6 +37,7 @@
 //! translatable partition-only conjuncts from DataFusion filters.
 
 mod blob_reader;
+mod blob_view;
 mod catalog;
 mod delete;
 mod error;
@@ -69,6 +70,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) type DynamicOptions = Arc<RwLock<HashMap<String, String>>>;
 
 pub use blob_reader::BlobReaderRegistry;
+pub use blob_view::register_blob_view;
 pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]

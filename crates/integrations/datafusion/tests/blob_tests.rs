@@ -23,7 +23,7 @@ mod common;
 
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
 use common::{create_sql_context, create_test_env, exec};
-use paimon::spec::BlobDescriptor;
+use paimon::spec::{BlobDescriptor, BlobViewStruct};
 use paimon_datafusion::SQLContext;
 
 // ======================= Helpers =======================
@@ -706,6 +706,39 @@ async fn test_blob_descriptor_field_resolve_descriptor_value() {
     );
 }
 
+#[tokio::test]
+async fn test_blob_descriptor_filter_before_resolve_skips_filtered_bad_descriptor() {
+    let (tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.t (\
+            id INT, \
+            name STRING, \
+            picture BLOB \
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true', \
+            'blob-descriptor-field' = 'picture'\
+         )",
+    )
+    .await;
+
+    let missing_uri = format!("file://{}", tmp.path().join("missing_blob.bin").display());
+    let bad_desc = BlobDescriptor::new(missing_uri, 0, 1);
+    let bad_desc_hex = to_hex(&bad_desc.serialize());
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Filtered', X'{bad_desc_hex}'), \
+         (2, 'Kept', X'4F4B')"
+    );
+    exec(&sql_context, &sql).await;
+
+    let rows = query_id_name_picture(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.t WHERE id = 2",
+    )
+    .await;
+    assert_eq!(rows, vec![(2, "Kept".into(), Some(b"OK".to_vec()))]);
+}
+
 /// SET 'paimon.blob-as-descriptor' = 'true' should return serialized BlobDescriptor
 /// bytes instead of the actual blob content.
 #[tokio::test]
@@ -764,4 +797,122 @@ async fn test_blob_as_descriptor_dynamic_option() {
     .await;
     assert_eq!(rows[0].2, Some(b"Hello".to_vec()));
     assert_eq!(rows[1].2, Some(b"World".to_vec()));
+}
+
+#[tokio::test]
+async fn test_blob_view_resolves_upstream_blob() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.src (\
+                id INT, \
+                name STRING, \
+                picture BLOB\
+             ) WITH (\
+                'data-evolution.enabled' = 'true', \
+                'row-tracking.enabled' = 'true'\
+             )",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.src (id, name, picture) VALUES \
+         (1, 'Alice', X'616C696365'), \
+         (2, 'Bob', X'626F62')",
+    )
+    .await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.view_t (\
+                id INT, \
+                name STRING, \
+                picture VARBINARY COMMENT '__BLOB_VIEW_FIELD'\
+             ) WITH (\
+                'data-evolution.enabled' = 'true', \
+                'row-tracking.enabled' = 'true'\
+             )",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.view_t (id, name, picture) \
+         SELECT id, name, sys.blob_view('test_db.src', 'picture', \"_ROW_ID\") \
+         FROM paimon.test_db.src",
+    )
+    .await;
+
+    let rows = query_id_name_picture(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.view_t ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows[0].2, Some(b"alice".to_vec()));
+    assert_eq!(rows[1].2, Some(b"bob".to_vec()));
+
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn test_blob_view_resolve_disabled_preserves_reference() {
+    let (_tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.src (\
+            id INT, \
+            name STRING, \
+            picture BLOB\
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true'\
+         )",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.src (id, name, picture) VALUES (1, 'Alice', X'616C696365')",
+    )
+    .await;
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.view_t (\
+                id INT, \
+                name STRING, \
+                picture BLOB\
+             ) WITH (\
+                'data-evolution.enabled' = 'true', \
+                'row-tracking.enabled' = 'true', \
+                'blob-view-field' = 'picture'\
+             )",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.view_t (id, name, picture) \
+         SELECT id, name, blob_view('test_db.src', 'picture', \"_ROW_ID\") \
+         FROM paimon.test_db.src",
+    )
+    .await;
+
+    sql_context
+        .sql("SET 'paimon.blob-view.resolve.enabled' = 'false'")
+        .await
+        .unwrap();
+    let rows = query_id_name_picture(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.view_t ORDER BY id",
+    )
+    .await;
+    let view_bytes = rows[0].2.as_ref().expect("view bytes should be preserved");
+    assert!(BlobViewStruct::is_blob_view_struct(view_bytes));
+    let view = BlobViewStruct::deserialize(view_bytes).unwrap();
+    assert_eq!(view.identifier().full_name(), "test_db.src");
+    assert_eq!(view.row_id(), 0);
 }

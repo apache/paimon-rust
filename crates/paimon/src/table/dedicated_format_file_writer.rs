@@ -16,17 +16,21 @@
 // under the License.
 
 use crate::io::FileIO;
-use crate::spec::{BlobDescriptor, DataField, DataFileMeta, DataType};
+use crate::spec::{BlobDescriptor, BlobViewStruct, DataField, DataFileMeta, DataType};
 use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch};
+use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) fn is_blob_file_name(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().ends_with(".blob")
 }
+
+const BLOB_RANGE_MERGE_GAP: u64 = 64 * 1024;
+const BLOB_RANGE_MERGE_MAX_SPAN: u64 = 8 * 1024 * 1024;
 
 struct BlobFieldWriter {
     writer: DataFileWriter,
@@ -57,6 +61,7 @@ pub(crate) struct AppendDedicatedFormatFileWriter {
     vector_writer: Option<VectorFieldWriter>,
     normal_column_indices: Vec<usize>,
     normal_schema: Arc<arrow_schema::Schema>,
+    blob_view_column_indices: Vec<(usize, String)>,
 }
 
 impl AppendDedicatedFormatFileWriter {
@@ -78,7 +83,8 @@ impl AppendDedicatedFormatFileWriter {
         input_schema: &arrow_schema::Schema,
         table_fields: &[DataField],
         format_options: &HashMap<String, String>,
-        blob_descriptor_fields: &HashSet<String>,
+        blob_inline_fields: &HashSet<String>,
+        blob_view_fields: &HashSet<String>,
     ) -> Self {
         let mut normal_column_indices = Vec::new();
         let mut normal_arrow_fields = Vec::new();
@@ -91,7 +97,7 @@ impl AppendDedicatedFormatFileWriter {
 
         for (idx, field) in table_fields.iter().enumerate() {
             let is_blob = field.data_type().is_blob_type();
-            let is_descriptor = blob_descriptor_fields.contains(field.name());
+            let is_inline = blob_inline_fields.contains(field.name());
             let is_dedicated_vector =
                 vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_));
 
@@ -100,7 +106,7 @@ impl AppendDedicatedFormatFileWriter {
                 vector_arrow_fields.push(input_schema.field(idx).clone());
                 vector_table_fields.push(field.clone());
                 vector_field_names.push(field.name().to_string());
-            } else if is_blob && !is_descriptor {
+            } else if is_blob && !is_inline {
                 blob_writers.push(BlobFieldWriter {
                     writer: DataFileWriter::new(
                         file_io.clone(),
@@ -186,6 +192,15 @@ impl AppendDedicatedFormatFileWriter {
             vector_writer,
             normal_column_indices,
             normal_schema,
+            blob_view_column_indices: table_fields
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, field)| {
+                    blob_view_fields
+                        .contains(field.name())
+                        .then(|| (idx, field.name().to_string()))
+                })
+                .collect(),
         }
     }
 
@@ -193,6 +208,8 @@ impl AppendDedicatedFormatFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+
+        self.validate_blob_view_columns(batch)?;
 
         // Write normal columns
         let normal_columns: Vec<Arc<dyn arrow_array::Array>> = self
@@ -250,6 +267,47 @@ impl AppendDedicatedFormatFileWriter {
         Ok(())
     }
 
+    fn validate_blob_view_columns(&self, batch: &RecordBatch) -> Result<()> {
+        for (column_index, field_name) in &self.blob_view_column_indices {
+            let Some(col) = batch
+                .column(*column_index)
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+            else {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "blob-view-field '{field_name}' requires a BinaryArray value column"
+                    ),
+                    source: None,
+                });
+            };
+            for row in 0..col.len() {
+                if col.is_null(row) {
+                    continue;
+                }
+                let value = col.value(row);
+                if !BlobViewStruct::is_blob_view_struct(value) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "blob-view-field '{field_name}' requires blob field value to be a serialized BlobViewStruct"
+                        ),
+                        source: None,
+                    });
+                }
+                let view = BlobViewStruct::deserialize(value)?;
+                if view.serialize()?.as_slice() != value {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "blob-view-field '{field_name}' contains a non-canonical BlobViewStruct payload"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         let mut results = self.normal_writer.prepare_commit().await?;
 
@@ -275,7 +333,6 @@ pub(crate) async fn resolve_blob_column(
     file_io: &FileIO,
 ) -> Result<arrow_array::BinaryArray> {
     use crate::io::FileRead;
-    use std::collections::HashMap;
 
     let mut needs_resolve = false;
     for i in 0..col.len() {
@@ -289,30 +346,183 @@ pub(crate) async fn resolve_blob_column(
         return Ok(col.clone());
     }
 
-    let mut readers: HashMap<String, Box<dyn FileRead>> = HashMap::new();
-    let mut builder = BinaryBuilder::with_capacity(col.len(), 0);
-    for i in 0..col.len() {
-        if col.is_null(i) {
-            builder.append_null();
+    let mut cells = Vec::with_capacity(col.len());
+    let mut requests_by_uri: HashMap<String, Vec<BlobReadRequest>> = HashMap::new();
+    let mut value_capacity = 0usize;
+
+    for row in 0..col.len() {
+        if col.is_null(row) {
+            cells.push(ResolvedBlobCell::Null);
+            continue;
+        }
+
+        let value = col.value(row);
+        if BlobDescriptor::is_blob_descriptor(value) {
+            let desc = BlobDescriptor::deserialize(value)?;
+            let offset = u64::try_from(desc.offset()).map_err(|e| crate::Error::DataInvalid {
+                message: format!(
+                    "BlobDescriptor offset must be non-negative: {}",
+                    desc.offset()
+                ),
+                source: Some(Box::new(e)),
+            })?;
+            let length = u64::try_from(desc.length()).map_err(|e| crate::Error::DataInvalid {
+                message: format!(
+                    "BlobDescriptor length must be non-negative: {}",
+                    desc.length()
+                ),
+                source: Some(Box::new(e)),
+            })?;
+            offset
+                .checked_add(length)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "BlobDescriptor range overflows u64: offset={offset}, length={length}"
+                    ),
+                    source: None,
+                })?;
+            value_capacity = value_capacity.saturating_add(length as usize);
+            requests_by_uri
+                .entry(desc.uri().to_string())
+                .or_default()
+                .push(BlobReadRequest {
+                    row,
+                    offset,
+                    length,
+                });
+            cells.push(ResolvedBlobCell::Null);
         } else {
-            let value = col.value(i);
-            if BlobDescriptor::is_blob_descriptor(value) {
-                let desc = BlobDescriptor::deserialize(value)?;
-                let uri = desc.uri().to_string();
-                if !readers.contains_key(&uri) {
-                    let input = file_io.new_input(&uri)?;
-                    let reader = input.reader().await?;
-                    readers.insert(uri.clone(), Box::new(reader));
-                }
-                let reader = readers.get(&uri).unwrap();
-                let start = desc.offset() as u64;
-                let end = start + desc.length() as u64;
-                let data = reader.read(start..end).await?;
-                builder.append_value(&data);
-            } else {
-                builder.append_value(value);
+            value_capacity = value_capacity.saturating_add(value.len());
+            cells.push(ResolvedBlobCell::Value(Bytes::copy_from_slice(value)));
+        }
+    }
+
+    let mut readers: HashMap<String, Box<dyn FileRead>> = HashMap::new();
+    for (uri, requests) in requests_by_uri {
+        if !readers.contains_key(&uri) {
+            let input = file_io.new_input(&uri)?;
+            let reader = input.reader().await?;
+            readers.insert(uri.clone(), Box::new(reader));
+        }
+        let reader = readers.get(&uri).unwrap();
+        for merged in merge_blob_read_requests(requests) {
+            let data = reader.read(merged.start..merged.end).await?;
+            for request in merged.requests {
+                let start = (request.offset - merged.start) as usize;
+                let end = start + request.length as usize;
+                cells[request.row] = ResolvedBlobCell::Value(data.slice(start..end));
             }
         }
     }
+
+    let mut builder = BinaryBuilder::with_capacity(col.len(), value_capacity);
+    for cell in cells {
+        match cell {
+            ResolvedBlobCell::Null => builder.append_null(),
+            ResolvedBlobCell::Value(value) => builder.append_value(value.as_ref()),
+        }
+    }
     Ok(builder.finish())
+}
+
+#[derive(Debug)]
+enum ResolvedBlobCell {
+    Null,
+    Value(Bytes),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlobReadRequest {
+    row: usize,
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MergedBlobRead {
+    start: u64,
+    end: u64,
+    requests: Vec<BlobReadRequest>,
+}
+
+fn merge_blob_read_requests(mut requests: Vec<BlobReadRequest>) -> Vec<MergedBlobRead> {
+    if requests.is_empty() {
+        return Vec::new();
+    }
+
+    requests.sort_by_key(|request| (request.offset, request.length, request.row));
+    let mut merged = Vec::new();
+    let mut current = MergedBlobRead {
+        start: requests[0].offset,
+        end: requests[0].offset + requests[0].length,
+        requests: vec![requests[0].clone()],
+    };
+
+    for request in requests.into_iter().skip(1) {
+        let request_end = request.offset + request.length;
+        let close_enough = current
+            .end
+            .checked_add(BLOB_RANGE_MERGE_GAP)
+            .is_some_and(|merge_limit| request.offset <= merge_limit);
+        let merged_end = current.end.max(request_end);
+        let merged_span = merged_end - current.start;
+        if close_enough && merged_span <= BLOB_RANGE_MERGE_MAX_SPAN {
+            current.end = merged_end;
+            current.requests.push(request);
+        } else {
+            merged.push(current);
+            current = MergedBlobRead {
+                start: request.offset,
+                end: request_end,
+                requests: vec![request],
+            };
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_blob_read_requests_merges_nearby_ranges() {
+        let merged = merge_blob_read_requests(vec![
+            BlobReadRequest {
+                row: 2,
+                offset: 120,
+                length: 5,
+            },
+            BlobReadRequest {
+                row: 0,
+                offset: 0,
+                length: 10,
+            },
+            BlobReadRequest {
+                row: 1,
+                offset: 10,
+                length: 8,
+            },
+            BlobReadRequest {
+                row: 3,
+                offset: BLOB_RANGE_MERGE_MAX_SPAN + 1,
+                length: 4,
+            },
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].start, 0);
+        assert_eq!(merged[0].end, 125);
+        assert_eq!(
+            merged[0]
+                .requests
+                .iter()
+                .map(|request| request.row)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(merged[1].start, BLOB_RANGE_MERGE_MAX_SPAN + 1);
+        assert_eq!(merged[1].end, BLOB_RANGE_MERGE_MAX_SPAN + 5);
+    }
 }

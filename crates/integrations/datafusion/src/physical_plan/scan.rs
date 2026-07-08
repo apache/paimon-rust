@@ -27,6 +27,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
+use paimon::catalog::Catalog;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
@@ -38,7 +39,6 @@ use crate::error::to_datafusion_error;
 /// Planning is performed eagerly in [`super::super::table::PaimonTableProvider::scan`],
 /// and the resulting splits are distributed across DataFusion execution partitions
 /// so that DataFusion can schedule them in parallel.
-#[derive(Debug)]
 pub struct PaimonTableScan {
     table: Table,
     /// Full Paimon read type for nested or connector-defined projections.
@@ -60,6 +60,23 @@ pub struct PaimonTableScan {
     scan_trace: Option<ScanTrace>,
     /// Human-readable Variant extraction summary for explain output.
     pushed_variants: Option<String>,
+    blob_view_catalog: Option<Arc<dyn Catalog>>,
+}
+
+impl std::fmt::Debug for PaimonTableScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaimonTableScan")
+            .field("table", &self.table)
+            .field("read_type", &self.read_type)
+            .field("pushed_predicate", &self.pushed_predicate)
+            .field("planned_partitions", &self.planned_partitions)
+            .field("limit", &self.limit)
+            .field("filter_exact", &self.filter_exact)
+            .field("scan_trace", &self.scan_trace)
+            .field("pushed_variants", &self.pushed_variants)
+            .field("has_blob_view_catalog", &self.blob_view_catalog.is_some())
+            .finish()
+    }
 }
 
 impl PaimonTableScan {
@@ -74,6 +91,7 @@ impl PaimonTableScan {
         filter_exact: bool,
         scan_trace: Option<ScanTrace>,
         pushed_variants: Option<String>,
+        blob_view_catalog: Option<Arc<dyn Catalog>>,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -91,6 +109,7 @@ impl PaimonTableScan {
             filter_exact,
             scan_trace,
             pushed_variants,
+            blob_view_catalog,
         }
     }
 
@@ -149,6 +168,7 @@ impl ExecutionPlan for PaimonTableScan {
         let schema = self.schema();
         let read_type = self.read_type.clone();
         let pushed_predicate = self.pushed_predicate.clone();
+        let blob_view_catalog = self.blob_view_catalog.clone();
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -159,7 +179,9 @@ impl ExecutionPlan for PaimonTableScan {
             }
 
             let read = read_builder.new_read().map_err(to_datafusion_error)?;
-            let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
+            let stream = read
+                .to_arrow_with_blob_view_catalog(&splits, blob_view_catalog)
+                .map_err(to_datafusion_error)?;
             let stream = stream.map(|r| r.map_err(to_datafusion_error));
 
             Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
@@ -310,6 +332,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
@@ -330,6 +353,7 @@ mod tests {
             planned_partitions,
             None,
             false,
+            None,
             None,
             None,
         );
@@ -413,6 +437,7 @@ mod tests {
             vec![Arc::from(vec![split])],
             None,
             false,
+            None,
             None,
             None,
         );

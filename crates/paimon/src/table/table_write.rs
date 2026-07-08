@@ -111,8 +111,10 @@ pub struct TableWrite {
     bucket_assigner: BucketAssignerEnum,
     /// Whether this is an overwrite operation (skip seq/index restore).
     is_overwrite: bool,
-    /// Blob descriptor fields (stored inline in parquet, not as separate .blob files).
-    blob_descriptor_fields: HashSet<String>,
+    /// Blob view fields (stored inline as BlobViewStruct bytes).
+    blob_view_fields: HashSet<String>,
+    /// Descriptor + view inline blob fields.
+    blob_inline_fields: HashSet<String>,
     /// Whether the table has non-descriptor blob fields requiring a dedicated-format writer.
     has_blob_fields: bool,
     /// Dedicated vector-store file format, when configured.
@@ -127,25 +129,39 @@ impl TableWrite {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        let blob_view_fields = core_options.blob_view_fields();
+        let blob_inline_fields = core_options.blob_inline_fields();
 
-        for name in &blob_descriptor_fields {
+        for name in &blob_inline_fields {
             match schema.fields().iter().find(|f| f.name() == name) {
                 None => {
                     return Err(crate::Error::DataInvalid {
-                        message: format!("blob-descriptor-field '{name}' does not exist in schema"),
+                        message: format!("inline blob field '{name}' does not exist in schema"),
                         source: None,
                     });
                 }
                 Some(f) if !f.data_type().is_blob_type() => {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
-                            "blob-descriptor-field '{name}' is not a top-level BLOB field"
+                            "inline blob field '{name}' is not a top-level BLOB field"
                         ),
                         source: None,
                     });
                 }
                 _ => {}
             }
+        }
+        if let Some(name) = blob_descriptor_fields
+            .intersection(&blob_view_fields)
+            .next()
+            .cloned()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Field '{name}' in 'blob-view-field' can not also be in 'blob-descriptor-field'"
+                ),
+                source: None,
+            });
         }
 
         let total_buckets = core_options.bucket();
@@ -313,7 +329,7 @@ impl TableWrite {
         let has_blob_fields = schema
             .fields()
             .iter()
-            .any(|f| f.data_type().is_blob_type() && !blob_descriptor_fields.contains(f.name()));
+            .any(|f| f.data_type().is_blob_type() && !blob_inline_fields.contains(f.name()));
         let has_dedicated_vector_fields = vector_file_format.is_some()
             && schema
                 .fields()
@@ -345,7 +361,8 @@ impl TableWrite {
             commit_user,
             bucket_assigner,
             is_overwrite,
-            blob_descriptor_fields,
+            blob_view_fields,
+            blob_inline_fields,
             has_blob_fields,
             vector_file_format,
             has_dedicated_vector_fields,
@@ -641,7 +658,10 @@ impl TableWrite {
 
     /// Create an append-only writer for non-PK tables.
     fn create_append_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
-        if self.has_blob_fields || self.has_dedicated_vector_fields {
+        if self.has_blob_fields
+            || self.has_dedicated_vector_fields
+            || !self.blob_view_fields.is_empty()
+        {
             let fields = self.table.schema().fields();
             let input_schema = build_target_arrow_schema(fields)?;
             Ok(FileWriter::AppendDedicated(Box::new(
@@ -662,7 +682,8 @@ impl TableWrite {
                     &input_schema,
                     fields,
                     self.table.schema().options(),
-                    &self.blob_descriptor_fields,
+                    &self.blob_inline_fields,
+                    &self.blob_view_fields,
                 ),
             )))
         } else {

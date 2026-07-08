@@ -29,6 +29,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use paimon::catalog::Catalog;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
@@ -65,11 +66,23 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
 ///
 /// DataFusion still treats pushed filters as inexact because unsupported
 /// predicates and non-Parquet reads remain residual filters.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
     table_definition: Option<String>,
+    blob_view_catalog: Option<Arc<dyn Catalog>>,
+}
+
+impl std::fmt::Debug for PaimonTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaimonTableProvider")
+            .field("table", &self.table)
+            .field("schema", &self.schema)
+            .field("table_definition", &self.table_definition)
+            .field("has_blob_view_catalog", &self.blob_view_catalog.is_some())
+            .finish()
+    }
 }
 
 impl PaimonTableProvider {
@@ -92,6 +105,7 @@ impl PaimonTableProvider {
             table,
             schema,
             table_definition,
+            blob_view_catalog: None,
         })
     }
 
@@ -104,6 +118,16 @@ impl PaimonTableProvider {
         Self::try_new(table)
     }
 
+    pub(crate) fn try_new_with_blob_reader_registry_and_catalog(
+        table: Table,
+        blob_reader_registry: BlobReaderRegistry,
+        catalog: Arc<dyn Catalog>,
+    ) -> DFResult<Self> {
+        let mut provider = Self::try_new_with_blob_reader_registry(table, blob_reader_registry)?;
+        provider.blob_view_catalog = Some(catalog);
+        Ok(provider)
+    }
+
     pub(crate) fn try_new_with_blob_reader_registry_and_definition(
         table: Table,
         blob_reader_registry: BlobReaderRegistry,
@@ -112,6 +136,21 @@ impl PaimonTableProvider {
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)
+    }
+
+    pub(crate) fn try_new_with_blob_reader_registry_definition_and_catalog(
+        table: Table,
+        blob_reader_registry: BlobReaderRegistry,
+        table_definition: Option<String>,
+        catalog: Arc<dyn Catalog>,
+    ) -> DFResult<Self> {
+        let mut provider = Self::try_new_with_blob_reader_registry_and_definition(
+            table,
+            blob_reader_registry,
+            table_definition,
+        )?;
+        provider.blob_view_catalog = Some(catalog);
+        Ok(provider)
     }
 
     pub fn table(&self) -> &Table {
@@ -283,6 +322,7 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) target_partitions: usize,
     pub(crate) filter_exact: bool,
+    pub(crate) blob_view_catalog: Option<Arc<dyn Catalog>>,
 }
 
 impl PaimonScanBuilder<'_> {
@@ -324,6 +364,7 @@ impl PaimonScanBuilder<'_> {
             self.filter_exact,
             self.scan_trace,
             None,
+            self.blob_view_catalog,
         )))
     }
 }
@@ -392,6 +433,7 @@ impl TableProvider for PaimonTableProvider {
             limit: pushed_limit,
             target_partitions: target,
             filter_exact,
+            blob_view_catalog: self.blob_view_catalog.clone(),
         }
         .build()
     }

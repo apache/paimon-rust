@@ -20,8 +20,10 @@ use super::data_file_reader::DataFileReader;
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
+use crate::catalog::Catalog;
 use crate::spec::{CoreOptions, DataField, MergeEngine, Predicate};
 use crate::DataSplit;
+use std::sync::Arc;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
 ///
@@ -79,6 +81,14 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.to_arrow_with_blob_view_catalog(data_splits, None)
+    }
+
+    pub fn to_arrow_with_blob_view_catalog(
+        &self,
+        data_splits: &[DataSplit],
+        blob_view_catalog: Option<Arc<dyn Catalog>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
         // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
@@ -102,7 +112,7 @@ impl<'a> TableRead<'a> {
         }
 
         if core_options.data_evolution_enabled() {
-            self.read_with_evolution(data_splits, &core_options)
+            self.read_with_evolution(data_splits, &core_options, blob_view_catalog)
         } else {
             self.read_raw(data_splits)
         }
@@ -190,6 +200,7 @@ impl<'a> TableRead<'a> {
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
+        blob_view_catalog: Option<Arc<dyn Catalog>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let reader = DataEvolutionReader::new(
             self.table.file_io.clone(),
@@ -200,6 +211,9 @@ impl<'a> TableRead<'a> {
             self.data_predicates.clone(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
+            core_options.blob_view_fields(),
+            core_options.blob_view_resolve_enabled(),
+            blob_view_catalog,
         )?;
         reader.read(data_splits)
     }
