@@ -47,6 +47,8 @@ const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
+const VECTOR_FILE_FORMAT_OPTION: &str = "vector.file.format";
+const VECTOR_TARGET_FILE_SIZE_OPTION: &str = "vector.target-file-size";
 const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
 const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
@@ -710,6 +712,24 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_else(|| self.target_file_size())
     }
 
+    /// Dedicated vector-store file format, if configured.
+    ///
+    /// Java leaves this unset by default. When present, vector columns are
+    /// written to files named `*.vector.<format>`.
+    pub fn vector_file_format(&self) -> Option<&str> {
+        self.options
+            .get(VECTOR_FILE_FORMAT_OPTION)
+            .map(String::as_str)
+            .filter(|format| !format.trim().is_empty())
+    }
+
+    pub fn vector_target_file_size(&self) -> i64 {
+        self.options
+            .get(VECTOR_TARGET_FILE_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or_else(|| self.target_file_size())
+    }
+
     /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
     /// Default is "parquet".
     pub fn file_format(&self) -> &str {
@@ -1222,6 +1242,26 @@ mod tests {
         assert_eq!(custom_core.changelog_file_format(), "parquet");
         assert_eq!(custom_core.changelog_file_compression(), "zstd");
         assert_eq!(custom_core.changelog_file_stats_mode(), Some("counts"));
+    }
+
+    #[test]
+    fn test_vector_file_options_defaults_and_overrides() {
+        let default_options =
+            HashMap::from([("target-file-size".to_string(), "32 mb".to_string())]);
+        let default_core = CoreOptions::new(&default_options);
+        assert_eq!(default_core.vector_file_format(), None);
+        assert_eq!(default_core.vector_target_file_size(), 32 * 1024 * 1024);
+
+        let custom_options = HashMap::from([
+            (VECTOR_FILE_FORMAT_OPTION.to_string(), "vortex".to_string()),
+            (
+                VECTOR_TARGET_FILE_SIZE_OPTION.to_string(),
+                "64 mb".to_string(),
+            ),
+        ]);
+        let custom_core = CoreOptions::new(&custom_options);
+        assert_eq!(custom_core.vector_file_format(), Some("vortex"));
+        assert_eq!(custom_core.vector_target_file_size(), 64 * 1024 * 1024);
     }
 
     #[test]

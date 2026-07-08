@@ -29,8 +29,8 @@
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataField, DataFileMeta, DeletionVectorMeta, FileKind, IndexFileMeta,
-    IndexManifest, PartitionComputer,
+    BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, DeletionVectorMeta, FileKind,
+    IndexFileMeta, IndexManifest, PartitionComputer,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
@@ -48,6 +48,7 @@ use futures::TryStreamExt;
 use indexmap::IndexMap;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
@@ -884,7 +885,9 @@ struct MatchedRow {
 // ---------------------------------------------------------------------------
 
 /// Key: (partition_bytes, bucket, first_row_id)
-type WriterKey = (Vec<u8>, i32, i64);
+type WriterBaseKey = (Vec<u8>, i32, i64);
+/// Key: (partition_bytes, bucket, first_row_id, file kind)
+type WriterKey = (Vec<u8>, i32, i64, PartialFileKind);
 type PartialCommitGroup = (Option<i64>, Vec<DataFileMeta>);
 
 /// Writer for data evolution partial-column files.
@@ -894,25 +897,41 @@ type PartialCommitGroup = (Option<i64>, Vec<DataFileMeta>);
 /// Each output file contains only the updated columns and shares the same `first_row_id` range
 /// as the original file, allowing the reader to merge columns at read time.
 ///
-/// Produces parquet files containing only the specified `write_columns`, with
+/// Produces files containing only the specified `write_columns`, with
 /// `file_source = APPEND (0)`, caller-supplied `first_row_id`, and `write_cols`.
+/// VECTOR columns use dedicated `*.vector.<format>` files when `vector.file.format`
+/// is configured.
 pub(crate) struct DataEvolutionPartialWriter {
     file_io: FileIO,
     table_location: String,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
     schema_id: i64,
-    target_file_size: i64,
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
-    file_format: String,
     format_options: HashMap<String, String>,
+    write_sets: Vec<PartialWriteSet>,
+    /// Writers keyed by (partition_bytes, bucket, first_row_id, file kind).
+    writers: HashMap<WriterKey, DataFileWriter>,
+    check_from_snapshots: HashMap<WriterBaseKey, i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PartialFileKind {
+    Normal,
+    Vector,
+}
+
+#[derive(Clone)]
+struct PartialWriteSet {
+    kind: PartialFileKind,
+    target_file_size: i64,
+    file_format: String,
     write_fields: Vec<DataField>,
     write_columns: Vec<String>,
-    /// Writers keyed by (partition_bytes, bucket, first_row_id).
-    writers: HashMap<WriterKey, DataFileWriter>,
-    check_from_snapshots: HashMap<WriterKey, i64>,
+    column_indices: Vec<usize>,
+    schema: Arc<arrow_schema::Schema>,
 }
 
 impl DataEvolutionPartialWriter {
@@ -932,19 +951,7 @@ impl DataEvolutionPartialWriter {
 
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
-        let write_fields = write_columns
-            .iter()
-            .map(|column| {
-                fields
-                    .iter()
-                    .find(|field| field.name() == column)
-                    .cloned()
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: format!("Unknown data-evolution write column '{column}'"),
-                        source: None,
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let write_sets = Self::build_write_sets(&write_columns, fields, &core_options)?;
         let partition_computer = PartitionComputer::new(
             &partition_keys,
             fields,
@@ -958,17 +965,81 @@ impl DataEvolutionPartialWriter {
             partition_computer,
             partition_keys,
             schema_id: schema.id(),
-            target_file_size: core_options.target_file_size(),
             file_compression: core_options.file_compression().to_string(),
             file_compression_zstd_level: core_options.file_compression_zstd_level(),
             write_buffer_size: core_options.write_parquet_buffer_size(),
-            file_format: core_options.file_format().to_string(),
             format_options: schema.options().clone(),
-            write_fields,
-            write_columns,
+            write_sets,
             writers: HashMap::new(),
             check_from_snapshots: HashMap::new(),
         })
+    }
+
+    fn build_write_sets(
+        write_columns: &[String],
+        fields: &[DataField],
+        core_options: &CoreOptions<'_>,
+    ) -> Result<Vec<PartialWriteSet>> {
+        let vector_file_format = core_options
+            .vector_file_format()
+            .map(|format| format.trim().to_ascii_lowercase());
+        let mut normal_fields = Vec::new();
+        let mut normal_columns = Vec::new();
+        let mut normal_indices = Vec::new();
+        let mut vector_fields = Vec::new();
+        let mut vector_columns = Vec::new();
+        let mut vector_indices = Vec::new();
+
+        for (idx, column) in write_columns.iter().enumerate() {
+            let field = fields
+                .iter()
+                .find(|field| field.name() == column)
+                .cloned()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!("Unknown data-evolution write column '{column}'"),
+                    source: None,
+                })?;
+
+            if vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_)) {
+                vector_fields.push(field);
+                vector_columns.push(column.clone());
+                vector_indices.push(idx);
+            } else {
+                normal_fields.push(field);
+                normal_columns.push(column.clone());
+                normal_indices.push(idx);
+            }
+        }
+
+        let mut write_sets = Vec::new();
+        if !normal_fields.is_empty() {
+            let schema = crate::arrow::build_target_arrow_schema(&normal_fields)?;
+            write_sets.push(PartialWriteSet {
+                kind: PartialFileKind::Normal,
+                target_file_size: core_options.target_file_size(),
+                file_format: core_options.file_format().to_string(),
+                write_fields: normal_fields,
+                write_columns: normal_columns,
+                column_indices: normal_indices,
+                schema,
+            });
+        }
+
+        if !vector_fields.is_empty() {
+            let schema = crate::arrow::build_target_arrow_schema(&vector_fields)?;
+            let vector_file_format = vector_file_format.expect("vector fields require a format");
+            write_sets.push(PartialWriteSet {
+                kind: PartialFileKind::Vector,
+                target_file_size: core_options.vector_target_file_size(),
+                file_format: format!("vector.{vector_file_format}"),
+                write_fields: vector_fields,
+                write_columns: vector_columns,
+                column_indices: vector_indices,
+                schema,
+            });
+        }
+
+        Ok(write_sets)
     }
 
     /// Write a partial-column batch for a specific partition, bucket, and row ID range.
@@ -987,55 +1058,85 @@ impl DataEvolutionPartialWriter {
             return Ok(());
         }
 
-        let key = (partition_bytes.clone(), bucket, first_row_id);
+        let base_key = (partition_bytes.clone(), bucket, first_row_id);
         self.check_from_snapshots
-            .entry(key.clone())
+            .entry(base_key.clone())
             .and_modify(|snapshot| *snapshot = (*snapshot).min(check_from_snapshot))
             .or_insert(check_from_snapshot);
-        if !self.writers.contains_key(&key) {
-            let partition_path = if self.partition_keys.is_empty() {
-                String::new()
-            } else {
-                let row = BinaryRow::from_serialized_bytes(&partition_bytes)?;
-                self.partition_computer.generate_partition_path(&row)?
-            };
 
-            let writer = DataFileWriter::new(
-                self.file_io.clone(),
-                self.table_location.clone(),
-                partition_path,
+        let partition_path = if self.partition_keys.is_empty() {
+            String::new()
+        } else {
+            let row = BinaryRow::from_serialized_bytes(&partition_bytes)?;
+            self.partition_computer.generate_partition_path(&row)?
+        };
+
+        for write_set in self.write_sets.clone() {
+            let key = (
+                partition_bytes.clone(),
                 bucket,
-                self.schema_id,
-                self.target_file_size,
-                self.file_compression.clone(),
-                self.file_compression_zstd_level,
-                self.write_buffer_size,
-                self.file_format.clone(),
-                self.write_fields.clone(),
-                self.format_options.clone(),
-                Some(0), // file_source: APPEND
-                Some(first_row_id),
-                Some(self.write_columns.clone()),
+                first_row_id,
+                write_set.kind,
             );
-            self.writers.insert(key.clone(), writer);
+            if !self.writers.contains_key(&key) {
+                let writer = DataFileWriter::new(
+                    self.file_io.clone(),
+                    self.table_location.clone(),
+                    partition_path.clone(),
+                    bucket,
+                    self.schema_id,
+                    write_set.target_file_size,
+                    self.file_compression.clone(),
+                    self.file_compression_zstd_level,
+                    self.write_buffer_size,
+                    write_set.file_format.clone(),
+                    write_set.write_fields.clone(),
+                    self.format_options.clone(),
+                    Some(0), // file_source: APPEND
+                    Some(first_row_id),
+                    Some(write_set.write_columns.clone()),
+                );
+                self.writers.insert(key.clone(), writer);
+            }
+
+            let projected_batch = Self::project_batch(&batch, &write_set)?;
+            let writer = self.writers.get_mut(&key).unwrap();
+            writer.write(&projected_batch).await?;
         }
 
-        let writer = self.writers.get_mut(&key).unwrap();
-        writer.write(&batch).await
+        Ok(())
+    }
+
+    fn project_batch(batch: &RecordBatch, write_set: &PartialWriteSet) -> Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = write_set
+            .column_indices
+            .iter()
+            .map(|&idx| batch.column(idx).clone())
+            .collect();
+        RecordBatch::try_new(write_set.schema.clone(), columns).map_err(|e| {
+            crate::Error::DataInvalid {
+                message: format!(
+                    "Failed to project data-evolution columns {:?}: {e}",
+                    write_set.write_columns
+                ),
+                source: None,
+            }
+        })
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         let writers: Vec<(WriterKey, DataFileWriter)> = self.writers.drain().collect();
-        let mut check_from_snapshots = std::mem::take(&mut self.check_from_snapshots);
+        let check_from_snapshots = std::mem::take(&mut self.check_from_snapshots);
 
         let futures: Vec<_> = writers
             .into_iter()
             .map(|(key, mut writer)| {
-                let check_from_snapshot = check_from_snapshots.remove(&key);
+                let base_key = (key.0.clone(), key.1, key.2);
+                let check_from_snapshot = check_from_snapshots.get(&base_key).copied();
                 async move {
                     let files = writer.prepare_commit().await?;
-                    let (partition_bytes, bucket, _first_row_id) = key;
+                    let (partition_bytes, bucket, _first_row_id, _kind) = key;
                     Ok::<_, crate::Error>((partition_bytes, bucket, check_from_snapshot, files))
                 }
             })
@@ -1074,7 +1175,7 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use crate::spec::{DataType, FloatType, IntType, Schema, TableSchema, VarCharType, VectorType};
     use arrow_array::StringArray;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
@@ -1128,6 +1229,22 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
+    fn test_vector_data_evolution_schema(vector_file_format: &str) -> TableSchema {
+        let vector_type = DataType::Vector(
+            VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("embedding", vector_type)
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("vector.file.format", vector_file_format)
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
@@ -1156,6 +1273,36 @@ mod tests {
             true,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap()
+    }
+
+    fn make_partial_name_vector_batch(names: Vec<&str>, vectors: Vec<Vec<f32>>) -> RecordBatch {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field.clone());
+        for vector in vectors {
+            assert_eq!(vector.len(), 2);
+            for value in vector {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        let embedding = builder.finish();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(element_field, 2),
+                true,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(names)), Arc::new(embedding)],
+        )
+        .unwrap()
     }
 
     fn make_matched_batch(row_ids: Vec<Option<i64>>, names: Vec<&str>) -> RecordBatch {
@@ -1219,6 +1366,56 @@ mod tests {
         assert_eq!(meta.first_row_id, Some(0));
         assert_eq!(meta.write_cols, Some(vec!["name".to_string()]));
         assert_eq!(meta.file_source, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_write_partial_vector_column_uses_dedicated_file() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_de_write_vector";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_de_vector_table"),
+            table_path.to_string(),
+            test_vector_data_evolution_schema("parquet"),
+            None,
+        );
+        let mut writer = DataEvolutionPartialWriter::new(
+            &table,
+            vec!["name".to_string(), "embedding".to_string()],
+        )
+        .unwrap();
+
+        let batch = make_partial_name_vector_batch(
+            vec!["alice", "bob"],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        );
+        writer
+            .write_partial_batch(vec![], 0, 42, 7, batch)
+            .await
+            .unwrap();
+
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 2);
+        assert_eq!(messages[0].check_from_snapshot, Some(7));
+
+        let normal_file = messages[0]
+            .new_files
+            .iter()
+            .find(|file| !file.file_name.contains(".vector."))
+            .unwrap();
+        let vector_file = messages[0]
+            .new_files
+            .iter()
+            .find(|file| file.file_name.ends_with(".vector.parquet"))
+            .unwrap();
+
+        assert_eq!(normal_file.first_row_id, Some(42));
+        assert_eq!(normal_file.write_cols, Some(vec!["name".to_string()]));
+        assert_eq!(vector_file.first_row_id, Some(42));
+        assert_eq!(vector_file.write_cols, Some(vec!["embedding".to_string()]));
     }
 
     #[tokio::test]

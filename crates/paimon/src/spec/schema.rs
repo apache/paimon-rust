@@ -450,6 +450,11 @@ impl TableSchema {
             &new_schema.partition_keys,
             &new_schema.options,
         )?;
+        Schema::validate_vector_store_fields(
+            &new_schema.fields,
+            &new_schema.partition_keys,
+            &new_schema.options,
+        )?;
         PartialUpdateConfig::new(&new_schema.options)
             .validate_create_mode(!new_schema.primary_keys.is_empty())?;
         AggregationConfig::new(&new_schema.options)
@@ -798,6 +803,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_key_field_types(&fields, &primary_keys, &options)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
+        Self::validate_vector_store_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
@@ -1049,6 +1055,52 @@ impl Schema {
         Ok(())
     }
 
+    fn validate_vector_store_fields(
+        fields: &[DataField],
+        partition_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let vector_field_names = Self::top_level_vector_field_names(fields);
+        let core_options = CoreOptions::new(options);
+        if vector_field_names.is_empty() || core_options.vector_file_format().is_none() {
+            return Ok(());
+        }
+
+        if !core_options.data_evolution_enabled() {
+            return Err(crate::Error::ConfigInvalid {
+                message:
+                    "Data evolution config must enabled for table with dedicated VECTOR storage."
+                        .to_string(),
+            });
+        }
+        if !core_options.row_tracking_enabled() {
+            return Err(crate::Error::ConfigInvalid {
+                message:
+                    "Row tracking config must enabled for table with dedicated VECTOR storage."
+                        .to_string(),
+            });
+        }
+
+        if fields.len() == vector_field_names.len() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Table with dedicated VECTOR storage must have other normal columns."
+                    .to_string(),
+            });
+        }
+
+        let partition_key_set: HashSet<&str> = partition_keys.iter().map(String::as_str).collect();
+        if vector_field_names
+            .iter()
+            .any(|name| partition_key_set.contains(name))
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: "The VECTOR type column can not be part of partition keys.".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     fn validate_first_row_changelog_producer(
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
@@ -1089,6 +1141,17 @@ impl Schema {
             .iter()
             .filter_map(|field| match field.data_type() {
                 DataType::Blob(_) => Some(field.name()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns top-level Vector field names for dedicated vector-store checks.
+    fn top_level_vector_field_names(fields: &[DataField]) -> Vec<&str> {
+        fields
+            .iter()
+            .filter_map(|field| match field.data_type() {
+                DataType::Vector(_) => Some(field.name()),
                 _ => None,
             })
             .collect()
@@ -2067,6 +2130,50 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_vector_store_requires_data_evolution_and_row_tracking() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_4f())
+            .option("vector.file.format", "vortex")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Data evolution config must enabled")),
+            "dedicated VECTOR storage should require data-evolution.enabled, got {err:?}"
+        );
+
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_4f())
+            .option("vector.file.format", "vortex")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Row tracking config must enabled")),
+            "dedicated VECTOR storage should require row-tracking.enabled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_vector_store_rejects_vector_only_table() {
+        let err = Schema::builder()
+            .column("embedding", vector_4f())
+            .option("vector.file.format", "vortex")
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("must have other normal columns")),
+            "dedicated VECTOR storage should require a normal anchor file, got {err:?}"
+        );
     }
 
     #[test]

@@ -2622,7 +2622,7 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 }
 
 fn is_blob_data_file(file: &DataFileMeta) -> bool {
-    crate::table::blob_file_writer::is_blob_file_name(&file.file_name)
+    crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
 }
 
 fn is_vector_store_file(file: &DataFileMeta) -> bool {

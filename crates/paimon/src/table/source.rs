@@ -28,7 +28,7 @@ fn is_vector_store_file_name(file_name: &str) -> bool {
 }
 
 pub(crate) fn is_data_evolution_normal_file(file: &DataFileMeta) -> bool {
-    !crate::table::blob_file_writer::is_blob_file_name(&file.file_name)
+    !crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
         && !is_vector_store_file_name(&file.file_name)
 }
 

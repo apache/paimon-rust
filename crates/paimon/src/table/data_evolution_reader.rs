@@ -24,7 +24,7 @@ use crate::arrow::format::FilePredicates;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME};
-use crate::table::blob_file_writer::is_blob_file_name;
+use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
@@ -609,7 +609,8 @@ async fn resolve_descriptor_columns(
                 .downcast_ref::<arrow_array::BinaryArray>()
             {
                 let resolved =
-                    super::blob_file_writer::resolve_blob_column(bin_col, file_io).await?;
+                    super::dedicated_format_file_writer::resolve_blob_column(bin_col, file_io)
+                        .await?;
                 columns.push(Arc::new(resolved));
                 changed = true;
                 continue;

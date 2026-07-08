@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::io::FileIO;
-use crate::spec::{BlobDescriptor, DataFileMeta};
+use crate::spec::{BlobDescriptor, DataField, DataFileMeta, DataType};
 use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
 use arrow_array::builder::BinaryBuilder;
@@ -34,22 +34,32 @@ struct BlobFieldWriter {
     column_index: usize,
 }
 
-/// Writes append-only data with blob columns split into separate `.blob` files.
+struct VectorFieldWriter {
+    writer: DataFileWriter,
+    field_names: Vec<String>,
+    column_indices: Vec<usize>,
+    schema: Arc<arrow_schema::Schema>,
+}
+
+/// Writes append-only data with columns split into dedicated file formats.
 ///
-/// Normal (non-blob) columns go to a parquet `DataFileWriter`.
-/// Each blob column (not in `blob_descriptor_fields`) gets its own `DataFileWriter`
-/// with `file_format = "blob"` and `write_cols = Some(vec![field_name])`.
+/// Remaining columns go to the table's normal append `DataFileWriter`.
+/// Each non-descriptor blob column gets its own `DataFileWriter` with
+/// `file_format = "blob"` and `write_cols = Some(vec![field_name])`.
+/// When `vector.file.format` is configured, all VECTOR columns are written
+/// together to a dedicated `*.vector.<format>` file.
 ///
 /// If a blob value is already a serialized `BlobDescriptor`, the actual data is
 /// resolved from the referenced URI and written to the `.blob` file.
-pub(crate) struct AppendBlobFileWriter {
+pub(crate) struct AppendDedicatedFormatFileWriter {
     normal_writer: DataFileWriter,
     blob_writers: Vec<BlobFieldWriter>,
+    vector_writer: Option<VectorFieldWriter>,
     normal_column_indices: Vec<usize>,
     normal_schema: Arc<arrow_schema::Schema>,
 }
 
-impl AppendBlobFileWriter {
+impl AppendDedicatedFormatFileWriter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_io: FileIO,
@@ -63,8 +73,10 @@ impl AppendBlobFileWriter {
         file_compression_zstd_level: i32,
         write_buffer_size: i64,
         file_format: String,
+        vector_target_file_size: i64,
+        vector_file_format: Option<&str>,
         input_schema: &arrow_schema::Schema,
-        table_fields: &[crate::spec::DataField],
+        table_fields: &[DataField],
         format_options: &HashMap<String, String>,
         blob_descriptor_fields: &HashSet<String>,
     ) -> Self {
@@ -72,12 +84,23 @@ impl AppendBlobFileWriter {
         let mut normal_arrow_fields = Vec::new();
         let mut normal_table_fields = Vec::new();
         let mut blob_writers = Vec::new();
+        let mut vector_column_indices = Vec::new();
+        let mut vector_arrow_fields = Vec::new();
+        let mut vector_table_fields = Vec::new();
+        let mut vector_field_names = Vec::new();
 
         for (idx, field) in table_fields.iter().enumerate() {
             let is_blob = field.data_type().is_blob_type();
             let is_descriptor = blob_descriptor_fields.contains(field.name());
+            let is_dedicated_vector =
+                vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_));
 
-            if is_blob && !is_descriptor {
+            if is_dedicated_vector {
+                vector_column_indices.push(idx);
+                vector_arrow_fields.push(input_schema.field(idx).clone());
+                vector_table_fields.push(field.clone());
+                vector_field_names.push(field.name().to_string());
+            } else if is_blob && !is_descriptor {
                 blob_writers.push(BlobFieldWriter {
                     writer: DataFileWriter::new(
                         file_io.clone(),
@@ -107,6 +130,37 @@ impl AppendBlobFileWriter {
         }
 
         let normal_schema = Arc::new(arrow_schema::Schema::new(normal_arrow_fields));
+        let vector_writer = if let Some(vector_file_format) = vector_file_format {
+            if vector_table_fields.is_empty() {
+                None
+            } else {
+                let vector_schema = Arc::new(arrow_schema::Schema::new(vector_arrow_fields));
+                Some(VectorFieldWriter {
+                    writer: DataFileWriter::new(
+                        file_io.clone(),
+                        table_location.clone(),
+                        partition_path.clone(),
+                        bucket,
+                        schema_id,
+                        vector_target_file_size,
+                        file_compression.clone(),
+                        file_compression_zstd_level,
+                        write_buffer_size,
+                        format!("vector.{}", vector_file_format.trim().to_ascii_lowercase()),
+                        vector_table_fields,
+                        format_options.clone(),
+                        Some(0),
+                        None,
+                        Some(vector_field_names.clone()),
+                    ),
+                    field_names: vector_field_names,
+                    column_indices: vector_column_indices,
+                    schema: vector_schema,
+                })
+            }
+        } else {
+            None
+        };
 
         let normal_writer = DataFileWriter::new(
             file_io.clone(),
@@ -129,6 +183,7 @@ impl AppendBlobFileWriter {
         Self {
             normal_writer,
             blob_writers,
+            vector_writer,
             normal_column_indices,
             normal_schema,
         }
@@ -170,6 +225,28 @@ impl AppendBlobFileWriter {
             blob_writer.writer.write(&blob_batch).await?;
         }
 
+        if let Some(vector_writer) = &mut self.vector_writer {
+            let vector_columns: Vec<Arc<dyn arrow_array::Array>> = vector_writer
+                .column_indices
+                .iter()
+                .map(|&idx| batch.column(idx).clone())
+                .collect();
+            let vector_batch =
+                match RecordBatch::try_new(vector_writer.schema.clone(), vector_columns) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Failed to project vector columns {:?}: {e}",
+                                vector_writer.field_names
+                            ),
+                            source: None,
+                        });
+                    }
+                };
+            vector_writer.writer.write(&vector_batch).await?;
+        }
+
         Ok(())
     }
 
@@ -179,6 +256,11 @@ impl AppendBlobFileWriter {
         for blob_writer in &mut self.blob_writers {
             let blob_metas = blob_writer.writer.prepare_commit().await?;
             results.extend(blob_metas);
+        }
+
+        if let Some(vector_writer) = &mut self.vector_writer {
+            let vector_metas = vector_writer.writer.prepare_commit().await?;
+            results.extend(vector_metas);
         }
 
         Ok(results)

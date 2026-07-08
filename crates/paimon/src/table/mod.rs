@@ -20,7 +20,6 @@
 pub(crate) mod aggregator;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_reader;
-mod blob_file_writer;
 mod branch_manager;
 mod btree_global_index_build_builder;
 mod btree_global_index_drop_builder;
@@ -37,6 +36,7 @@ mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_reader;
 mod data_file_writer;
+mod dedicated_format_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;

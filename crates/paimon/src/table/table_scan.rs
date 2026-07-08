@@ -455,7 +455,7 @@ fn is_vector_store_file_name(file_name: &str) -> bool {
 }
 
 fn is_normal_data_file(file: &DataFileMeta) -> bool {
-    !crate::table::blob_file_writer::is_blob_file_name(&file.file_name)
+    !crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name)
         && !is_vector_store_file_name(&file.file_name)
 }
 
