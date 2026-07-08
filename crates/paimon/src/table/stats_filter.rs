@@ -20,7 +20,8 @@
 use super::Table;
 use crate::arrow::schema_evolution::create_index_mapping;
 use crate::predicate_stats::{
-    data_leaf_may_match, missing_field_may_match, predicates_may_match_with_schema, StatsAccessor,
+    data_leaf_may_match, data_leaf_must_match, missing_field_may_match, missing_field_must_match,
+    predicates_may_match_with_schema, StatsAccessor,
 };
 use crate::spec::{extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate};
 use std::collections::HashMap;
@@ -391,7 +392,13 @@ fn data_evolution_predicate_may_match(
                 row_count,
             )
         }),
-        Predicate::Not(_) => true,
+        Predicate::Not(inner) => !data_evolution_predicate_must_match(
+            inner,
+            table_fields,
+            field_sources,
+            file_stats,
+            row_count,
+        ),
         Predicate::Leaf {
             index,
             data_type,
@@ -409,6 +416,69 @@ fn data_evolution_predicate_may_match(
                 .map(|f| f.data_type())
                 .unwrap_or(data_type);
             data_leaf_may_match(
+                field_index,
+                stats_data_type,
+                data_type,
+                *op,
+                literals,
+                stats,
+            )
+        }
+    }
+}
+
+fn data_evolution_predicate_must_match(
+    predicate: &Predicate,
+    table_fields: &[DataField],
+    field_sources: &[Option<(usize, usize)>],
+    file_stats: &[FileStatsRows],
+    row_count: i64,
+) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue => row_count > 0,
+        Predicate::AlwaysFalse => false,
+        Predicate::And(children) => children.iter().all(|child| {
+            data_evolution_predicate_must_match(
+                child,
+                table_fields,
+                field_sources,
+                file_stats,
+                row_count,
+            )
+        }),
+        Predicate::Or(children) => children.iter().any(|child| {
+            data_evolution_predicate_must_match(
+                child,
+                table_fields,
+                field_sources,
+                file_stats,
+                row_count,
+            )
+        }),
+        Predicate::Not(inner) => !data_evolution_predicate_may_match(
+            inner,
+            table_fields,
+            field_sources,
+            file_stats,
+            row_count,
+        ),
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => {
+            let Some(source) = field_sources.get(*index).copied().flatten() else {
+                return missing_field_must_match(*op, row_count);
+            };
+            let (file_idx, field_index) = source;
+            let stats = &file_stats[file_idx];
+            let stats_data_type = table_fields
+                .get(*index)
+                .map(|f| f.data_type())
+                .unwrap_or(data_type);
+            data_leaf_must_match(
                 field_index,
                 stats_data_type,
                 data_type,

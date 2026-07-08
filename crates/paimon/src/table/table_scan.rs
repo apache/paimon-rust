@@ -2632,7 +2632,30 @@ mod tests {
     }
 
     #[test]
-    fn test_data_file_matches_not_fails_open() {
+    fn test_data_file_matches_not_prunes_when_inner_must_match() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(10)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = Predicate::negate(
+            PredicateBuilder::new(&fields)
+                .equal("id", Datum::Int(10))
+                .unwrap(),
+        );
+
+        assert!(!data_file_matches_predicates(
+            &file,
+            &[predicate],
+            TEST_SCHEMA_ID,
+            &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_not_fails_open_when_inner_not_certain() {
         let fields = int_field();
         let file = test_data_file_meta(
             int_stats_row(Some(10)),
@@ -2642,7 +2665,7 @@ mod tests {
         );
         let predicate = Predicate::negate(
             PredicateBuilder::new(&fields)
-                .less_than("id", Datum::Int(5))
+                .equal("id", Datum::Int(10))
                 .unwrap(),
         );
 
@@ -2692,6 +2715,28 @@ mod tests {
         ]);
 
         assert!(data_evolution_group_matches_predicates(
+            &[file],
+            &[predicate],
+            &fields,
+        ));
+    }
+
+    #[test]
+    fn test_data_evolution_group_matches_not_prunes_when_inner_must_match() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(10)),
+            vec![Some(0)],
+            5,
+        );
+        let predicate = Predicate::negate(
+            PredicateBuilder::new(&fields)
+                .equal("id", Datum::Int(10))
+                .unwrap(),
+        );
+
+        assert!(!data_evolution_group_matches_predicates(
             &[file],
             &[predicate],
             &fields,

@@ -108,6 +108,11 @@ impl PaimonTableScan {
         self.pushed_predicate.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn filter_exact(&self) -> bool {
+        self.filter_exact
+    }
+
     pub fn limit(&self) -> Option<usize> {
         self.limit
     }

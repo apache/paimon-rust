@@ -214,9 +214,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
-        let pushed_limit = node
-            .fetch
-            .filter(|_| !filter_analysis.has_untranslated_residual);
+        let pushed_limit = node.fetch.filter(|_| !filter_analysis.requires_residual);
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
@@ -236,7 +234,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
                 .map(Arc::from)
                 .collect()
         };
-        let filter_exact = !filter_analysis.has_untranslated_residual
+        let filter_exact = !filter_analysis.requires_residual
             && filter_analysis
                 .pushed_predicate
                 .as_ref()

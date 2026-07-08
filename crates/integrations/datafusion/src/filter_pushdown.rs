@@ -25,41 +25,48 @@ use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 #[derive(Debug)]
 struct SingleFilterAnalysis {
     translated_predicates: Vec<Predicate>,
-    has_untranslated_residual: bool,
+    requires_residual: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct FilterPushdownAnalysis {
     pub(crate) pushed_predicate: Option<Predicate>,
-    pub(crate) has_untranslated_residual: bool,
+    pub(crate) requires_residual: bool,
+}
+
+#[derive(Debug)]
+struct TranslatedPredicate {
+    predicate: Predicate,
+    requires_residual: bool,
 }
 
 fn analyze_filter(filter: &Expr, fields: &[DataField]) -> SingleFilterAnalysis {
     let translator = FilterTranslator::new(fields);
-    if let Some(predicate) = translator.translate(filter) {
+    if let Some(translated) = translator.translate(filter) {
         return SingleFilterAnalysis {
-            translated_predicates: vec![predicate],
-            has_untranslated_residual: false,
+            translated_predicates: vec![translated.predicate],
+            requires_residual: translated.requires_residual,
         };
     }
 
+    let translated = split_conjunction(filter)
+        .into_iter()
+        .filter_map(|expr| translator.translate(expr))
+        .collect::<Vec<_>>();
     SingleFilterAnalysis {
-        translated_predicates: split_conjunction(filter)
-            .into_iter()
-            .filter_map(|expr| translator.translate(expr))
-            .collect(),
-        has_untranslated_residual: true,
+        translated_predicates: translated.iter().map(|t| t.predicate.clone()).collect(),
+        requires_residual: true,
     }
 }
 
 pub(crate) fn analyze_filters(filters: &[Expr], fields: &[DataField]) -> FilterPushdownAnalysis {
     let mut translated_predicates = Vec::new();
-    let mut has_untranslated_residual = false;
+    let mut requires_residual = false;
 
     for filter in filters {
         let analysis = analyze_filter(filter, fields);
         translated_predicates.extend(analysis.translated_predicates);
-        has_untranslated_residual |= analysis.has_untranslated_residual;
+        requires_residual |= analysis.requires_residual;
     }
 
     FilterPushdownAnalysis {
@@ -68,7 +75,7 @@ pub(crate) fn analyze_filters(filters: &[Expr], fields: &[DataField]) -> FilterP
         } else {
             Some(Predicate::and(translated_predicates))
         },
-        has_untranslated_residual,
+        requires_residual,
     }
 }
 
@@ -86,8 +93,10 @@ where
     F: Fn(&Predicate) -> bool,
 {
     let translator = FilterTranslator::new(fields);
-    if let Some(predicate) = translator.translate(filter) {
-        if is_exact_filter_pushdown(&predicate) {
+    if let Some(translated) = translator.translate(filter) {
+        if translated.requires_residual {
+            TableProviderFilterPushDown::Inexact
+        } else if is_exact_filter_pushdown(&translated.predicate) {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Inexact
@@ -130,21 +139,26 @@ impl<'a> FilterTranslator<'a> {
         }
     }
 
-    fn translate(&self, expr: &Expr) -> Option<Predicate> {
+    fn translate(&self, expr: &Expr) -> Option<TranslatedPredicate> {
         match expr {
             Expr::BinaryExpr(binary) => self.translate_binary(binary),
-            // NOT is intentionally not translated: Predicate::Not uses two-valued
-            // logic (!bool), which incorrectly returns true when the inner predicate
-            // evaluates NULL to false. Combined with Exact pushdown precision,
-            // DataFusion would remove the residual filter, producing wrong results.
-            Expr::Not(_) => None,
+            // Predicate::Not uses Paimon's two-valued predicate semantics, so
+            // translating SQL NOT is only safe as Inexact pushdown: DataFusion
+            // must keep its residual filter for NULL / three-valued semantics.
+            Expr::Not(inner) => {
+                let inner = self.translate(inner.as_ref())?;
+                Some(TranslatedPredicate {
+                    predicate: Predicate::negate(inner.predicate),
+                    requires_residual: true,
+                })
+            }
             Expr::IsNull(inner) => {
                 let field = self.resolve_field(inner.as_ref())?;
-                self.predicate_builder.is_null(field.name()).ok()
+                self.exact(self.predicate_builder.is_null(field.name()).ok()?)
             }
             Expr::IsNotNull(inner) => {
                 let field = self.resolve_field(inner.as_ref())?;
-                self.predicate_builder.is_not_null(field.name()).ok()
+                self.exact(self.predicate_builder.is_not_null(field.name()).ok()?)
             }
             Expr::InList(in_list) => self.translate_in_list(in_list),
             Expr::Between(between) => self.translate_between(between),
@@ -154,16 +168,21 @@ impl<'a> FilterTranslator<'a> {
         }
     }
 
-    fn translate_binary(&self, binary: &BinaryExpr) -> Option<Predicate> {
+    fn translate_binary(&self, binary: &BinaryExpr) -> Option<TranslatedPredicate> {
         match binary.op {
-            Operator::And => Some(Predicate::and(vec![
-                self.translate(binary.left.as_ref())?,
-                self.translate(binary.right.as_ref())?,
-            ])),
-            Operator::Or => Some(Predicate::or(vec![
-                self.translate(binary.left.as_ref())?,
-                self.translate(binary.right.as_ref())?,
-            ])),
+            Operator::And | Operator::Or => {
+                let left = self.translate(binary.left.as_ref())?;
+                let right = self.translate(binary.right.as_ref())?;
+                let predicate = if binary.op == Operator::And {
+                    Predicate::and(vec![left.predicate, right.predicate])
+                } else {
+                    Predicate::or(vec![left.predicate, right.predicate])
+                };
+                Some(TranslatedPredicate {
+                    predicate,
+                    requires_residual: left.requires_residual || right.requires_residual,
+                })
+            }
             Operator::Eq
             | Operator::NotEq
             | Operator::Lt
@@ -174,21 +193,21 @@ impl<'a> FilterTranslator<'a> {
         }
     }
 
-    fn translate_comparison(&self, binary: &BinaryExpr) -> Option<Predicate> {
+    fn translate_comparison(&self, binary: &BinaryExpr) -> Option<TranslatedPredicate> {
         if let Some(predicate) = self.translate_column_literal_comparison(
             binary.left.as_ref(),
             binary.op,
             binary.right.as_ref(),
         ) {
-            return Some(predicate);
+            return self.exact(predicate);
         }
 
         let reversed = reverse_comparison_operator(binary.op)?;
-        self.translate_column_literal_comparison(
+        self.exact(self.translate_column_literal_comparison(
             binary.right.as_ref(),
             reversed,
             binary.left.as_ref(),
-        )
+        )?)
     }
 
     fn translate_column_literal_comparison(
@@ -221,7 +240,7 @@ impl<'a> FilterTranslator<'a> {
         }
     }
 
-    fn translate_in_list(&self, in_list: &InList) -> Option<Predicate> {
+    fn translate_in_list(&self, in_list: &InList) -> Option<TranslatedPredicate> {
         let field = self.resolve_field(in_list.expr.as_ref())?;
         let literals: Option<Vec<_>> = in_list
             .list
@@ -233,16 +252,16 @@ impl<'a> FilterTranslator<'a> {
             .collect();
         let literals = literals?;
 
-        if in_list.negated {
+        self.exact(if in_list.negated {
             self.predicate_builder
                 .is_not_in(field.name(), literals)
-                .ok()
+                .ok()?
         } else {
-            self.predicate_builder.is_in(field.name(), literals).ok()
-        }
+            self.predicate_builder.is_in(field.name(), literals).ok()?
+        })
     }
 
-    fn translate_between(&self, between: &Between) -> Option<Predicate> {
+    fn translate_between(&self, between: &Between) -> Option<TranslatedPredicate> {
         let field = self.resolve_field(between.expr.as_ref())?;
         let low = scalar_to_datum(
             extract_scalar_literal(between.low.as_ref())?,
@@ -259,16 +278,18 @@ impl<'a> FilterTranslator<'a> {
         // Parquet row filter all treat a NULL operand as non-matching (SQL
         // three-valued logic), and a data-column range stays Inexact so
         // DataFusion keeps the residual filter.
-        if between.negated {
+        self.exact(if between.negated {
             self.predicate_builder
                 .not_between(field.name(), low, high)
-                .ok()
+                .ok()?
         } else {
-            self.predicate_builder.between(field.name(), low, high).ok()
-        }
+            self.predicate_builder
+                .between(field.name(), low, high)
+                .ok()?
+        })
     }
 
-    fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<Predicate> {
+    fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
         // DataFusion built-in UDFs surfaced from `LIKE 'x%' / '%x' / '%x%'`
         // rewrites and direct `starts_with(col, 'x') / ends_with / contains`
         // calls. Only `(col, literal)` shapes are handled; anything else
@@ -280,21 +301,35 @@ impl<'a> FilterTranslator<'a> {
         let scalar = extract_scalar_literal(&func.args[1])?;
         let datum = scalar_to_datum(scalar, field.data_type())?;
 
-        match func.name() {
-            "starts_with" => self.predicate_builder.starts_with(field.name(), datum).ok(),
-            "ends_with" => self.predicate_builder.ends_with(field.name(), datum).ok(),
-            "contains" => self.predicate_builder.contains(field.name(), datum).ok(),
-            _ => None,
+        let predicate = match func.name() {
+            "starts_with" => self
+                .predicate_builder
+                .starts_with(field.name(), datum)
+                .ok()?,
+            "ends_with" => self.predicate_builder.ends_with(field.name(), datum).ok()?,
+            "contains" => self.predicate_builder.contains(field.name(), datum).ok()?,
+            _ => return None,
+        };
+        self.exact(predicate)
+    }
+
+    fn translate_like(&self, like: &Like) -> Option<TranslatedPredicate> {
+        // ILIKE has no equivalent in Paimon's predicate model.
+        if like.case_insensitive {
+            return None;
+        }
+        let predicate = self.translate_positive_like(like)?;
+        if like.negated {
+            Some(TranslatedPredicate {
+                predicate: Predicate::negate(predicate),
+                requires_residual: true,
+            })
+        } else {
+            self.exact(predicate)
         }
     }
 
-    fn translate_like(&self, like: &Like) -> Option<Predicate> {
-        // Negated and case-insensitive (ILIKE) variants stay unsupported for
-        // now: NOT-LIKE has the same NULL-semantics concern as `Expr::Not`;
-        // ILIKE has no equivalent in paimon's predicate model.
-        if like.negated || like.case_insensitive {
-            return None;
-        }
+    fn translate_positive_like(&self, like: &Like) -> Option<Predicate> {
         let field = self.resolve_field(like.expr.as_ref())?;
         let scalar = extract_scalar_literal(like.pattern.as_ref())?;
         let datum = scalar_to_datum(scalar, field.data_type())?;
@@ -303,6 +338,13 @@ impl<'a> FilterTranslator<'a> {
         self.predicate_builder
             .like(field.name(), datum, like.escape_char)
             .ok()
+    }
+
+    fn exact(&self, predicate: Predicate) -> Option<TranslatedPredicate> {
+        Some(TranslatedPredicate {
+            predicate,
+            requires_residual: false,
+        })
     }
 
     fn resolve_field(&self, expr: &Expr) -> Option<&'a DataField> {
@@ -682,11 +724,11 @@ mod tests {
                 .to_string(),
             "id > 10"
         );
-        assert!(!analysis.has_untranslated_residual);
+        assert!(!analysis.requires_residual);
     }
 
     #[test]
-    fn test_analyze_filters_marks_partial_translation_as_untranslated_residual() {
+    fn test_analyze_filters_pushes_not_and_marks_residual_required() {
         let fields = test_fields();
         let filters = vec![Expr::Column(Column::from_name("dt"))
             .eq(lit("2024-01-01"))
@@ -700,21 +742,27 @@ mod tests {
                 .pushed_predicate
                 .expect("supported conjunct should still translate")
                 .to_string(),
-            "dt = '2024-01-01'"
+            "(dt = '2024-01-01' AND NOT (hr = 10))"
         );
-        assert!(analysis.has_untranslated_residual);
+        assert!(analysis.requires_residual);
     }
 
     #[test]
-    fn test_analyze_filters_marks_unsupported_filter_as_untranslated_residual() {
+    fn test_analyze_filters_pushes_not_filter_and_marks_residual_required() {
         let fields = test_fields();
         let filters = vec![Expr::Not(Box::new(
             Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01")),
         ))];
         let analysis = analyze_filters(&filters, &fields);
 
-        assert!(analysis.pushed_predicate.is_none());
-        assert!(analysis.has_untranslated_residual);
+        assert_eq!(
+            analysis
+                .pushed_predicate
+                .expect("NOT partition predicate should translate inexactly")
+                .to_string(),
+            "NOT (dt = '2024-01-01')"
+        );
+        assert!(analysis.requires_residual);
     }
 
     #[test]
@@ -805,20 +853,22 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_not_is_not_supported() {
+    fn test_translate_not_pushes_negated_predicate() {
         let fields = test_fields();
         let filter = Expr::Not(Box::new(
             Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01")),
         ));
 
-        assert!(
-            build_pushed_predicate(&[filter], &fields).is_none(),
-            "NOT expressions should not translate due to NULL semantics"
+        assert_eq!(
+            build_pushed_predicate(&[filter], &fields)
+                .expect("NOT should translate as an inexact pushed predicate")
+                .to_string(),
+            "NOT (dt = '2024-01-01')"
         );
     }
 
     #[test]
-    fn test_classify_not_filter_as_unsupported() {
+    fn test_classify_not_filter_as_inexact_even_when_partition_only() {
         let fields = test_fields();
         let filter = Expr::Not(Box::new(
             Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01")),
@@ -826,7 +876,7 @@ mod tests {
 
         assert_eq!(
             classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
-            TableProviderFilterPushDown::Unsupported
+            TableProviderFilterPushDown::Inexact
         );
     }
 
@@ -987,11 +1037,18 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_negated_like_falls_open() {
+    fn test_translate_negated_like_pushes_inexact_not() {
         let fields = test_fields();
-        assert!(
-            build_pushed_predicate(&[like_filter("a%", true, false)], &fields).is_none(),
-            "NOT LIKE must not translate (NULL semantics)"
+        let predicate = build_pushed_predicate(&[like_filter("a%", true, false)], &fields)
+            .expect("NOT LIKE should translate as inexact NOT over LIKE");
+        assert_eq!(predicate.to_string(), "NOT (dt STARTS_WITH 'a')");
+        assert_eq!(
+            classify_filter_pushdown(
+                &like_filter("a%", true, false),
+                &fields,
+                is_exact_filter_pushdown
+            ),
+            TableProviderFilterPushDown::Inexact
         );
     }
 

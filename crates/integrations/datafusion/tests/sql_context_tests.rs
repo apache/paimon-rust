@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::Array;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
 use paimon::catalog::Identifier;
@@ -841,6 +842,54 @@ async fn test_register_temp_table_database_qualified() {
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+}
+
+#[tokio::test]
+async fn test_not_filter_pushdown_keeps_sql_null_semantics() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+
+    catalog
+        .create_database("my_db", false, Default::default())
+        .await
+        .unwrap();
+    ctx.sql("CREATE TABLE paimon.my_db.t (id INT, name STRING)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO paimon.my_db.t VALUES (1, 'one'), (2, 'two'), (NULL, 'nil')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM paimon.my_db.t WHERE NOT (id = 1) ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                })
+                .expect("id column");
+            (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![2]);
 }
 
 #[tokio::test]

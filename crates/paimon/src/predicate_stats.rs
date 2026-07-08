@@ -207,6 +207,104 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     }
 }
 
+pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
+    index: usize,
+    stats_data_type: &DataType,
+    predicate_data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+    stats: &T,
+) -> bool {
+    let row_count = stats.row_count();
+    if row_count <= 0 {
+        return false;
+    }
+
+    let null_count = stats.null_count(index);
+    match op {
+        PredicateOperator::IsNull => return null_count == Some(row_count),
+        PredicateOperator::IsNotNull => return null_count == Some(0),
+        _ => {
+            if null_count != Some(0) {
+                return false;
+            }
+        }
+    }
+
+    let min_value = match stats
+        .min_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return false,
+    };
+    let max_value = match stats
+        .max_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return false,
+    };
+    if !matches!(
+        min_value.partial_cmp(&max_value),
+        Some(Ordering::Less | Ordering::Equal)
+    ) {
+        return false;
+    }
+
+    match op {
+        PredicateOperator::Eq => literals
+            .first()
+            .is_some_and(|literal| min_value == *literal && max_value == *literal),
+        PredicateOperator::NotEq => literals.first().is_some_and(|literal| {
+            matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
+                || matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
+        }),
+        PredicateOperator::Lt => literals
+            .first()
+            .is_some_and(|literal| matches!(max_value.partial_cmp(literal), Some(Ordering::Less))),
+        PredicateOperator::LtEq => literals.first().is_some_and(|literal| {
+            matches!(
+                max_value.partial_cmp(literal),
+                Some(Ordering::Less | Ordering::Equal)
+            )
+        }),
+        PredicateOperator::Gt => literals.first().is_some_and(|literal| {
+            matches!(min_value.partial_cmp(literal), Some(Ordering::Greater))
+        }),
+        PredicateOperator::GtEq => literals.first().is_some_and(|literal| {
+            matches!(
+                min_value.partial_cmp(literal),
+                Some(Ordering::Greater | Ordering::Equal)
+            )
+        }),
+        PredicateOperator::In => min_value == max_value && literals.contains(&min_value),
+        PredicateOperator::Between => {
+            let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+                return false;
+            };
+            let min_ge_low = !matches!(min_value.partial_cmp(low), Some(Ordering::Less));
+            let max_le_high = !matches!(max_value.partial_cmp(high), Some(Ordering::Greater));
+            min_ge_low && max_le_high
+        }
+        PredicateOperator::NotBetween => {
+            let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+                return false;
+            };
+            let max_lt_low = matches!(max_value.partial_cmp(low), Some(Ordering::Less));
+            let min_gt_high = matches!(min_value.partial_cmp(high), Some(Ordering::Greater));
+            max_lt_low || min_gt_high
+        }
+        PredicateOperator::IsNull
+        | PredicateOperator::IsNotNull
+        | PredicateOperator::NotIn
+        | PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => false,
+    }
+}
+
 /// Return the literal prefix of a SQL LIKE pattern up to the first unescaped
 /// `%` or `_`. A backslash escapes the next character (which is appended
 /// literally, mirroring arrow's `like` kernel); a trailing backslash is a
@@ -250,6 +348,10 @@ pub(crate) fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> 
     }
 
     matches!(op, PredicateOperator::IsNull)
+}
+
+pub(crate) fn missing_field_must_match(op: PredicateOperator, row_count: i64) -> bool {
+    row_count > 0 && matches!(op, PredicateOperator::IsNull)
 }
 
 /// Stats-prune `field BETWEEN low AND high` (and its negation) by treating it
@@ -321,7 +423,9 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
         Predicate::Or(children) => children
             .iter()
             .any(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
-        Predicate::Not(_) => true,
+        Predicate::Not(inner) => {
+            !predicate_must_match_with_schema(inner, stats, field_mapping, file_fields)
+        }
         Predicate::Leaf {
             index,
             data_type,
@@ -343,6 +447,49 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
                 )
             }
             None => missing_field_may_match(*op, stats.row_count()),
+        },
+    }
+}
+
+fn predicate_must_match_with_schema<T: StatsAccessor>(
+    predicate: &Predicate,
+    stats: &T,
+    field_mapping: &[Option<usize>],
+    file_fields: &[DataField],
+) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue => stats.row_count() > 0,
+        Predicate::AlwaysFalse => false,
+        Predicate::And(children) => children.iter().all(|child| {
+            predicate_must_match_with_schema(child, stats, field_mapping, file_fields)
+        }),
+        Predicate::Or(children) => children.iter().any(|child| {
+            predicate_must_match_with_schema(child, stats, field_mapping, file_fields)
+        }),
+        Predicate::Not(inner) => {
+            !predicate_may_match_with_schema(inner, stats, field_mapping, file_fields)
+        }
+        Predicate::Leaf {
+            index,
+            data_type,
+            op,
+            literals,
+            ..
+        } => match field_mapping.get(*index).copied().flatten() {
+            Some(file_index) => {
+                let Some(file_field) = file_fields.get(file_index) else {
+                    return false;
+                };
+                data_leaf_must_match(
+                    file_index,
+                    file_field.data_type(),
+                    data_type,
+                    *op,
+                    literals,
+                    stats,
+                )
+            }
+            None => missing_field_must_match(*op, stats.row_count()),
         },
     }
 }
@@ -610,6 +757,95 @@ mod tests {
             PredicateOperator::NotBetween,
             &[Datum::Int(50), Datum::Int(60)],
             &stats,
+        ));
+    }
+
+    #[test]
+    fn not_predicate_prunes_only_when_inner_must_match() {
+        let dt = DataType::Int(IntType::new());
+        let fields = vec![DataField::new(0, "id".to_string(), dt.clone())];
+        let mapping = vec![Some(0)];
+        let stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: Some(Datum::Int(10)),
+            max: Some(Datum::Int(10)),
+        };
+        let predicate = Predicate::negate(Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: dt,
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(10)],
+        });
+
+        assert!(!predicates_may_match_with_schema(
+            &[predicate],
+            &stats,
+            &mapping,
+            &fields,
+        ));
+    }
+
+    #[test]
+    fn not_predicate_fails_open_when_nulls_or_stats_make_inner_uncertain() {
+        let dt = DataType::Int(IntType::new());
+        let fields = vec![DataField::new(0, "id".to_string(), dt.clone())];
+        let mapping = vec![Some(0)];
+        let predicate = Predicate::negate(Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: dt,
+            op: PredicateOperator::Gt,
+            literals: vec![Datum::Int(5)],
+        });
+
+        let with_nulls = MockStats {
+            row_count: 5,
+            null_count: Some(1),
+            min: Some(Datum::Int(10)),
+            max: Some(Datum::Int(20)),
+        };
+        assert!(predicates_may_match_with_schema(
+            std::slice::from_ref(&predicate),
+            &with_nulls,
+            &mapping,
+            &fields,
+        ));
+
+        let missing_stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: None,
+            max: Some(Datum::Int(20)),
+        };
+        assert!(predicates_may_match_with_schema(
+            &[predicate],
+            &missing_stats,
+            &mapping,
+            &fields,
+        ));
+    }
+
+    #[test]
+    fn not_predicate_prunes_inner_range_that_must_match() {
+        let dt = DataType::Int(IntType::new());
+        let fields = vec![DataField::new(0, "id".to_string(), dt.clone())];
+        let mapping = vec![Some(0)];
+        let stats = int_stats(10, 20);
+        let predicate = Predicate::negate(Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: dt,
+            op: PredicateOperator::Between,
+            literals: vec![Datum::Int(0), Datum::Int(100)],
+        });
+
+        assert!(!predicates_may_match_with_schema(
+            &[predicate],
+            &stats,
+            &mapping,
+            &fields,
         ));
     }
 

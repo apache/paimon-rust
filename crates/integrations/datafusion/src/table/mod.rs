@@ -363,7 +363,7 @@ impl TableProvider for PaimonTableProvider {
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
-        let pushed_limit = limit.filter(|_| !filter_analysis.has_untranslated_residual);
+        let pushed_limit = limit.filter(|_| !filter_analysis.requires_residual);
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
@@ -377,7 +377,7 @@ impl TableProvider for PaimonTableProvider {
             .map_err(to_datafusion_error)?;
 
         let target = state.config_options().execution.target_partitions;
-        let filter_exact = !filter_analysis.has_untranslated_residual
+        let filter_exact = !filter_analysis.requires_residual
             && filter_analysis
                 .pushed_predicate
                 .as_ref()
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_partially_translated_filter_keeps_partition_pruning_but_skips_limit_hint() {
+    async fn test_scan_partially_translated_not_filter_prunes_partitions_but_skips_limit_hint() {
         let provider = create_provider("multi_partitioned_log_table").await;
         let filter = col("dt")
             .eq(lit("2024-01-01"))
@@ -794,10 +794,7 @@ mod tests {
         assert_eq!(scan.limit(), None);
         assert_eq!(
             extract_dt_hr_partition_set(scan.planned_partitions()),
-            BTreeSet::from([
-                ("2024-01-01".to_string(), 10),
-                ("2024-01-01".to_string(), 20),
-            ]),
+            BTreeSet::from([("2024-01-01".to_string(), 20)]),
         );
         assert_eq!(
             scan.planned_partitions()
@@ -831,6 +828,23 @@ mod tests {
             .expect("data filter should translate");
 
         assert_eq!(scan.pushed_predicate(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_scan_pushes_not_as_inexact_and_skips_limit_hint() {
+        let provider = data_evolution_projection_pruning_provider().await;
+        let filter = Expr::Not(Box::new(col("id").eq(lit(1))));
+        let plan = plan_scan(&provider, vec![filter.clone()], Some(1)).await;
+        let scan = plan
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        let expected = build_pushed_predicate(&[filter], provider.table().schema().fields())
+            .expect("NOT filter should translate as inexact pushdown");
+
+        assert_eq!(scan.pushed_predicate(), Some(&expected));
+        assert!(!scan.filter_exact());
+        assert_eq!(scan.limit(), None);
     }
 
     #[tokio::test]
