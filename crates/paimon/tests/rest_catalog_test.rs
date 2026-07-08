@@ -255,6 +255,39 @@ async fn test_catalog_get_table() {
 }
 
 #[tokio::test]
+async fn test_rest_env_get_table_reuses_catalog_environment() {
+    let ctx = setup_catalog(vec!["default"]).await;
+
+    ctx.server.add_table_with_schema(
+        "default",
+        "current_table",
+        test_schema(),
+        "file:///tmp/test_warehouse/default.db/current_table",
+    );
+    ctx.server.add_table_with_schema(
+        "default",
+        "upstream_table",
+        test_schema(),
+        "file:///tmp/test_warehouse/default.db/upstream_table",
+    );
+
+    let current = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "current_table"))
+        .await
+        .expect("current table should load");
+    let upstream = current
+        .rest_env()
+        .expect("REST table should carry RESTEnv")
+        .get_table(&Identifier::new("default", "upstream_table"))
+        .await
+        .expect("upstream table should load via RESTEnv");
+
+    assert_eq!(upstream.identifier().full_name(), "default.upstream_table");
+    assert!(upstream.rest_env().is_some());
+}
+
+#[tokio::test]
 async fn test_catalog_get_table_not_found() {
     let ctx = setup_catalog(vec!["default"]).await;
 

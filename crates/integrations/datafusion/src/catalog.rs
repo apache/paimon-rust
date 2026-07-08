@@ -384,10 +384,9 @@ impl SchemaProvider for PaimonSchemaProvider {
                 Ok(table) => {
                     let opts = dynamic_options.read().unwrap().clone();
                     let provider = if opts.is_empty() {
-                        PaimonTableProvider::try_new_with_blob_reader_registry_and_catalog(
+                        PaimonTableProvider::try_new_with_blob_reader_registry(
                             table,
                             blob_reader_registry,
-                            Arc::clone(&catalog),
                         )?
                     } else {
                         let table_definition = crate::table::build_table_definition(&table).ok();
@@ -398,11 +397,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                             .copy_with_time_travel(opts)
                             .await
                             .map_err(to_datafusion_error)?;
-                        PaimonTableProvider::try_new_with_blob_reader_registry_definition_and_catalog(
+                        PaimonTableProvider::try_new_with_blob_reader_registry_and_definition(
                             table,
                             blob_reader_registry,
                             table_definition,
-                            Arc::clone(&catalog),
                         )?
                     };
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))

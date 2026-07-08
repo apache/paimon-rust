@@ -526,13 +526,10 @@ impl SQLContext {
                 .copy_with_time_travel(options)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider = Arc::new(
-                PaimonTableProvider::try_new_with_blob_reader_registry_and_catalog(
-                    table_with_options,
-                    self.blob_reader_registry.clone(),
-                    Arc::clone(&catalog),
-                )?,
-            );
+            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                table_with_options,
+                self.blob_reader_registry.clone(),
+            )?);
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;
@@ -561,13 +558,10 @@ impl SQLContext {
                 .copy_with_time_travel(options)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider = Arc::new(
-                PaimonTableProvider::try_new_with_blob_reader_registry_and_catalog(
-                    table_with_options,
-                    self.blob_reader_registry.clone(),
-                    Arc::clone(&catalog),
-                )?,
-            );
+            let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
+                table_with_options,
+                self.blob_reader_registry.clone(),
+            )?);
 
             let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
             self.register_temp_table(uuid_name.as_str(), provider)?;

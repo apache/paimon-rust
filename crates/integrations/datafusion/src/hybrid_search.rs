@@ -201,7 +201,6 @@ impl TableProvider for HybridSearchTableProvider {
             limit,
             target_partitions: state.config_options().execution.target_partitions,
             filter_exact: false,
-            blob_view_catalog: None,
         }
         .build()
     }

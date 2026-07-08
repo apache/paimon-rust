@@ -33,12 +33,9 @@ use crate::catalog::{
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::FileIO;
-use crate::spec::{Partition, Schema, SchemaChange, TableSchema};
+use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
-
-use super::rest_token_file_io::RESTTokenFileIO;
 
 /// REST catalog implementation.
 ///
@@ -199,76 +196,13 @@ impl Catalog for RESTCatalog {
     // ======================= table methods ===============================
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
-        let response = self
-            .api
-            .get_table(identifier)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, identifier))?;
-
-        // Extract schema from response
-        let schema = response.schema.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing schema", identifier.full_name()),
-            source: None,
-        })?;
-
-        let schema_id = response.schema_id.ok_or_else(|| Error::DataInvalid {
-            message: format!(
-                "Table {} response missing schema_id",
-                identifier.full_name()
-            ),
-            source: None,
-        })?;
-        let table_schema = TableSchema::new(schema_id, &schema);
-
-        // Extract table path from response
-        let table_path = response.path.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing path", identifier.full_name()),
-            source: None,
-        })?;
-
-        // Check if the table is external
-        let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
-            message: format!(
-                "Table {} response missing is_external",
-                identifier.full_name()
-            ),
-            source: None,
-        })?;
-
-        // Extract table uuid for RESTEnv
-        let uuid = response.id.ok_or_else(|| Error::DataInvalid {
-            message: format!(
-                "Table {} response missing id (uuid)",
-                identifier.full_name()
-            ),
-            source: None,
-        })?;
-
-        // Build FileIO based on data_token_enabled and is_external
-        // TODO Support token cache and direct oss access
-        let file_io = if self.data_token_enabled && !is_external {
-            // Use RESTTokenFileIO to get token-based FileIO
-            let token_file_io =
-                RESTTokenFileIO::new(identifier.clone(), table_path.clone(), self.options.clone());
-            token_file_io.build_file_io().await?
-        } else {
-            // Mirrors Java RESTCatalog.fileIOFromOptions: build FileIO from
-            // catalog options so OSS-backed paths can pick up the
-            // user-supplied `fs.oss.*` keys.
-            let mut builder = FileIO::from_path(&table_path)?;
-            builder = builder.with_props(self.options.to_map());
-            builder.build()?
-        };
-
-        let rest_env = RESTEnv::new(identifier.clone(), uuid, self.api.clone());
-
-        Ok(Table::new(
-            file_io,
-            identifier.clone(),
-            table_path,
-            table_schema,
-            Some(rest_env),
-        ))
+        RESTEnv::load_table(
+            identifier,
+            self.api.clone(),
+            self.options.clone(),
+            self.data_token_enabled,
+        )
+        .await
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {

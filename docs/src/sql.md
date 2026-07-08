@@ -178,9 +178,11 @@ SELECT
 FROM paimon.my_db.assets;
 ```
 
-By default, reads resolve Blob View fields to the upstream BLOB value. Set the
-dynamic option `paimon.blob-view.resolve.enabled` to `false` to preserve the raw
-serialized `BlobViewStruct` bytes in query results:
+By default, RESTCatalog-backed reads resolve Blob View fields to the upstream
+BLOB value by reusing the table's REST environment. Other catalog types
+currently preserve the raw serialized `BlobViewStruct` bytes. Set the dynamic
+option `paimon.blob-view.resolve.enabled` to `false` to preserve raw references
+even for RESTCatalog-backed reads:
 
 ```sql
 SET 'paimon.blob-view.resolve.enabled' = 'false';
@@ -1253,7 +1255,7 @@ RESET 'paimon.blob-as-descriptor';
 ```
 
 Example — preserve Blob View references instead of resolving upstream BLOB
-values:
+values on RESTCatalog-backed reads:
 
 ```sql
 SET 'paimon.blob-view.resolve.enabled' = 'false';

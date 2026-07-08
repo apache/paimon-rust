@@ -21,7 +21,6 @@ use super::data_file_reader::{
 };
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::FilePredicates;
-use crate::catalog::Catalog;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
@@ -30,8 +29,7 @@ use crate::spec::{
 };
 use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
-use crate::table::ArrowRecordBatchStream;
-use crate::table::RowRange;
+use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
 use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
 use async_stream::try_stream;
@@ -107,7 +105,7 @@ pub(crate) struct DataEvolutionReader {
     blob_descriptor_fields: HashSet<String>,
     blob_view_fields: HashSet<String>,
     blob_view_resolve_enabled: bool,
-    blob_view_catalog: Option<Arc<dyn Catalog>>,
+    blob_view_rest_env: Option<RESTEnv>,
 }
 
 impl DataEvolutionReader {
@@ -123,7 +121,7 @@ impl DataEvolutionReader {
         blob_descriptor_fields: HashSet<String>,
         blob_view_fields: HashSet<String>,
         blob_view_resolve_enabled: bool,
-        blob_view_catalog: Option<Arc<dyn Catalog>>,
+        blob_view_rest_env: Option<RESTEnv>,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -166,7 +164,7 @@ impl DataEvolutionReader {
             blob_descriptor_fields,
             blob_view_fields,
             blob_view_resolve_enabled,
-            blob_view_catalog,
+            blob_view_rest_env,
         })
     }
 
@@ -439,7 +437,7 @@ impl DataEvolutionReader {
     }
 
     fn blob_view_read_fields(&self) -> Vec<DataField> {
-        if !self.blob_view_resolve_enabled || self.blob_view_catalog.is_none() {
+        if !self.blob_view_resolve_enabled || self.blob_view_rest_env.is_none() {
             return Vec::new();
         }
         self.wide_file_read_type
@@ -457,7 +455,7 @@ impl DataEvolutionReader {
         if view_fields.is_empty() {
             return Ok(None);
         }
-        let Some(catalog) = self.blob_view_catalog.clone() else {
+        let Some(rest_env) = self.blob_view_rest_env.clone() else {
             return Ok(None);
         };
 
@@ -481,7 +479,7 @@ impl DataEvolutionReader {
             collect_blob_view_structs(&batch, &self.blob_view_fields, &mut view_structs)?;
         }
 
-        BlobViewLookup::load(catalog, view_structs).await.map(Some)
+        BlobViewLookup::load(rest_env, view_structs).await.map(Some)
     }
 
     fn descriptor_fields_to_resolve(&self, resolve_blob_views: bool) -> HashSet<String> {
@@ -884,10 +882,7 @@ struct BlobViewLookup {
 }
 
 impl BlobViewLookup {
-    async fn load(
-        catalog: Arc<dyn Catalog>,
-        view_structs: HashSet<BlobViewStruct>,
-    ) -> crate::Result<Self> {
+    async fn load(rest_env: RESTEnv, view_structs: HashSet<BlobViewStruct>) -> crate::Result<Self> {
         if view_structs.is_empty() {
             return Ok(Self::default());
         }
@@ -905,7 +900,7 @@ impl BlobViewLookup {
 
         let mut lookup = Self::default();
         for ((identifier, field_id), refs) in by_table_and_field {
-            let table = catalog.get_table(&identifier).await?;
+            let table = rest_env.get_table(&identifier).await?;
             let field = table
                 .schema()
                 .fields()

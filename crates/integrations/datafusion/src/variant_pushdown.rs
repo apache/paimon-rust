@@ -252,7 +252,6 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             filter_exact,
             Some(scan_trace),
             Some(node.pushed_variants.clone()),
-            None,
         ))))
     }
 }

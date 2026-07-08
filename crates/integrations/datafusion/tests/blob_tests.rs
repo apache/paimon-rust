@@ -800,7 +800,7 @@ async fn test_blob_as_descriptor_dynamic_option() {
 }
 
 #[tokio::test]
-async fn test_blob_view_resolves_upstream_blob() {
+async fn test_blob_view_without_rest_env_preserves_reference() {
     let (tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;
     sql_context
@@ -855,8 +855,18 @@ async fn test_blob_view_resolves_upstream_blob() {
         "SELECT id, name, picture FROM paimon.test_db.view_t ORDER BY id",
     )
     .await;
-    assert_eq!(rows[0].2, Some(b"alice".to_vec()));
-    assert_eq!(rows[1].2, Some(b"bob".to_vec()));
+    assert_eq!(rows[0].1, "Alice");
+    assert_eq!(rows[1].1, "Bob");
+    let view0_bytes = rows[0].2.as_ref().expect("view bytes should be preserved");
+    let view1_bytes = rows[1].2.as_ref().expect("view bytes should be preserved");
+    assert!(BlobViewStruct::is_blob_view_struct(view0_bytes));
+    assert!(BlobViewStruct::is_blob_view_struct(view1_bytes));
+    let view0 = BlobViewStruct::deserialize(view0_bytes).unwrap();
+    let view1 = BlobViewStruct::deserialize(view1_bytes).unwrap();
+    assert_eq!(view0.identifier().full_name(), "test_db.src");
+    assert_eq!(view1.identifier().full_name(), "test_db.src");
+    assert_eq!(view0.row_id(), 0);
+    assert_eq!(view1.row_id(), 1);
 
     drop(tmp);
 }
