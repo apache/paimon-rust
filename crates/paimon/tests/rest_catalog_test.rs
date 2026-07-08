@@ -378,6 +378,10 @@ async fn test_rest_env_get_table_reuses_catalog_environment() {
     assert!(upstream.rest_env().is_some());
 }
 
+// This regression uses FileSystemCatalog to write real table files before reading
+// them back through RESTCatalog. FileSystemCatalog directory listing is skipped
+// on Windows elsewhere for the same opendal `fs` StripPrefixError.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
     let tmp = tempfile::tempdir().unwrap();
