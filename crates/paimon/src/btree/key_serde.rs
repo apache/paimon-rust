@@ -136,7 +136,11 @@ pub fn serialize_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
             precision,
             ..
         } => {
-            if *precision <= DECIMAL_COMPACT_PRECISION {
+            let key_precision = match data_type {
+                DataType::Decimal(decimal_type) => decimal_type.precision(),
+                _ => *precision,
+            };
+            if key_precision <= DECIMAL_COMPACT_PRECISION {
                 (*unscaled as i64).to_le_bytes().to_vec()
             } else {
                 encode_java_big_integer_i128(*unscaled)
@@ -224,6 +228,32 @@ mod tests {
             ),
             vec![0xff, 0x7f]
         );
+    }
+
+    #[test]
+    fn test_decimal_key_serialization_uses_column_precision_not_literal_precision() {
+        let compact_column = DataType::Decimal(DecimalType::new(10, 0).unwrap());
+        let non_compact_column = DataType::Decimal(DecimalType::new(20, 0).unwrap());
+
+        let compact_column_key = serialize_datum(
+            &Datum::Decimal {
+                unscaled: 128,
+                precision: 20,
+                scale: 0,
+            },
+            &compact_column,
+        );
+        assert_eq!(compact_column_key, 128i64.to_le_bytes());
+
+        let non_compact_column_key = serialize_datum(
+            &Datum::Decimal {
+                unscaled: 128,
+                precision: 10,
+                scale: 0,
+            },
+            &non_compact_column,
+        );
+        assert_eq!(non_compact_column_key, vec![0x00, 0x80]);
     }
 
     #[test]
