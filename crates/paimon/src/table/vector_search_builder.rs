@@ -1152,31 +1152,31 @@ fn collect_raw_batch_vector_batch(
         };
         ensure_raw_vector_values_not_null(values, start, end)?;
 
+        let raw_row = RawVectorRow {
+            row_id,
+            values,
+            start,
+            end,
+        };
         for &query_index in &scoring_plan.all_query_indices {
             offer_raw_vector_score(
-                row_id,
-                values,
-                start,
-                end,
+                raw_row,
+                query_index,
                 metric,
                 vector_searches,
                 scoring_plan,
                 top_k_out,
-                query_index,
             )?;
         }
         if let Some(query_indices) = scoring_plan.candidate_query_indices.get(&row_id) {
             for &query_index in query_indices {
                 offer_raw_vector_score(
-                    row_id,
-                    values,
-                    start,
-                    end,
+                    raw_row,
+                    query_index,
                     metric,
                     vector_searches,
                     scoring_plan,
                     top_k_out,
-                    query_index,
                 )?;
             }
         }
@@ -1201,19 +1201,24 @@ fn ensure_raw_vector_values_not_null(
     Ok(())
 }
 
-fn offer_raw_vector_score(
+#[derive(Clone, Copy)]
+struct RawVectorRow<'a> {
     row_id: u64,
-    values: &Float32Array,
+    values: &'a Float32Array,
     start: usize,
     end: usize,
+}
+
+fn offer_raw_vector_score(
+    row: RawVectorRow<'_>,
+    query_index: usize,
     metric: RawVectorMetric,
     vector_searches: &[VectorSearch],
     scoring_plan: &RawScoringPlan,
     top_k_out: &mut [RawScoreTopK],
-    query_index: usize,
 ) -> crate::Result<()> {
     let vector_search = &vector_searches[query_index];
-    let stored_len = end - start;
+    let stored_len = row.end - row.start;
     if stored_len != vector_search.vector.len() {
         return Err(crate::Error::DataInvalid {
             message: format!(
@@ -1227,12 +1232,12 @@ fn offer_raw_vector_score(
     let score = compute_raw_vector_score_from_values(
         &vector_search.vector,
         scoring_plan.query_l2_norms[query_index],
-        values,
-        start,
-        end,
+        row.values,
+        row.start,
+        row.end,
         metric,
     );
-    top_k_out[query_index].offer(row_id, score);
+    top_k_out[query_index].offer(row.row_id, score);
     Ok(())
 }
 
