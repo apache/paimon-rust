@@ -20,8 +20,8 @@
 use super::{Plan, ScanTrace, Table};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType, Datum,
-    PartitionComputer, Predicate, PredicateOperator,
+    extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType,
+    Datum, PartitionComputer, Predicate, PredicateOperator,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::DataSplitBuilder;
@@ -134,6 +134,7 @@ impl<'a> FormatTableScan<'a> {
                     predicate,
                     core_options.partition_default_name(),
                     core_options.legacy_partition_name(),
+                    core_options.format_table_partition_only_value_in_path(),
                 ) {
                     return Ok(vec![ScanRoot {
                         path,
@@ -153,10 +154,21 @@ impl<'a> FormatTableScan<'a> {
             core_options.partition_default_name(),
             core_options.legacy_partition_name(),
         )?;
+        let only_value_in_path = core_options.format_table_partition_only_value_in_path();
         let mut roots = Vec::with_capacity(partitions.len());
         for partition in partitions {
             let row = BinaryRow::from_serialized_bytes(partition)?;
-            let partition_path = partition_computer.generate_partition_path(&row)?;
+            let partition_path = if only_value_in_path {
+                partition_path_from_row(
+                    &row,
+                    &partition_fields,
+                    core_options.partition_default_name(),
+                    core_options.legacy_partition_name(),
+                    true,
+                )?
+            } else {
+                partition_computer.generate_partition_path(&row)?
+            };
             roots.push(ScanRoot {
                 path: join_path(table_path, &partition_path),
                 partition: row,
@@ -222,12 +234,14 @@ impl<'a> FormatTableScan<'a> {
         {
             known_partition
         } else {
+            let core_options = CoreOptions::new(self.table.schema().options());
             let Some(partition) = partition_row_from_path(
                 table_path,
                 &parent,
                 partition_fields,
                 self.table.schema().partition_keys(),
-                CoreOptions::new(self.table.schema().options()).partition_default_name(),
+                core_options.partition_default_name(),
+                core_options.format_table_partition_only_value_in_path(),
             )?
             else {
                 return Ok(None);
@@ -303,6 +317,7 @@ fn leading_equality_partition_path(
     predicate: &Predicate,
     default_partition_name: &str,
     legacy_partition_name: bool,
+    only_value_in_path: bool,
 ) -> Option<String> {
     let predicates = predicate.clone().split_and();
     let mut values: Vec<Option<&Datum>> = vec![None; partition_keys.len()];
@@ -332,11 +347,15 @@ fn leading_equality_partition_path(
             default_partition_name,
             legacy_partition_name,
         )?;
-        segments.push(format!(
-            "{}={}",
-            escape_path_name(key),
-            escape_path_name(&value)
-        ));
+        if only_value_in_path {
+            segments.push(escape_path_name(&value));
+        } else {
+            segments.push(format!(
+                "{}={}",
+                escape_path_name(key),
+                escape_path_name(&value)
+            ));
+        }
     }
 
     if segments.is_empty() {
@@ -344,6 +363,43 @@ fn leading_equality_partition_path(
     } else {
         Some(join_path(table_path, &segments.join("/")))
     }
+}
+
+fn partition_path_from_row(
+    row: &BinaryRow,
+    partition_fields: &[DataField],
+    default_partition_name: &str,
+    legacy_partition_name: bool,
+    only_value_in_path: bool,
+) -> crate::Result<String> {
+    let mut segments = Vec::with_capacity(partition_fields.len());
+    for (idx, field) in partition_fields.iter().enumerate() {
+        let value = match extract_datum(row, idx, field.data_type())? {
+            None => default_partition_name.to_string(),
+            Some(datum) => partition_value_from_datum(
+                &datum,
+                field.data_type(),
+                default_partition_name,
+                legacy_partition_name,
+            )
+            .ok_or_else(|| crate::Error::Unsupported {
+                message: format!(
+                    "Format table partition path generation does not support type '{:?}'",
+                    field.data_type()
+                ),
+            })?,
+        };
+        if only_value_in_path {
+            segments.push(escape_path_name(&value));
+        } else {
+            segments.push(format!(
+                "{}={}",
+                escape_path_name(field.name()),
+                escape_path_name(&value)
+            ));
+        }
+    }
+    Ok(segments.join("/"))
 }
 
 fn partition_value_from_datum(
@@ -424,6 +480,7 @@ fn partition_row_from_path(
     partition_fields: &[DataField],
     partition_keys: &[String],
     default_partition_name: &str,
+    only_value_in_path: bool,
 ) -> crate::Result<Option<BinaryRow>> {
     let relative = match file_parent
         .trim_end_matches('/')
@@ -437,14 +494,30 @@ fn partition_row_from_path(
     }
 
     let mut values = Vec::with_capacity(partition_keys.len());
-    for key in partition_keys {
-        let Some(value) = relative
+    if only_value_in_path {
+        for segment in relative
             .split('/')
-            .find_map(|segment| partition_segment_value(segment, key))
-        else {
+            .filter(|segment| !segment.is_empty())
+            .take(partition_keys.len())
+        {
+            let Some(value) = unescape_path_name(segment) else {
+                return Ok(None);
+            };
+            values.push(value);
+        }
+        if values.len() != partition_keys.len() {
             return Ok(None);
-        };
-        values.push(value);
+        }
+    } else {
+        for key in partition_keys {
+            let Some(value) = relative
+                .split('/')
+                .find_map(|segment| partition_segment_value(segment, key))
+            else {
+                return Ok(None);
+            };
+            values.push(value);
+        }
     }
 
     let mut builder = BinaryRowBuilder::new(partition_fields.len() as i32);

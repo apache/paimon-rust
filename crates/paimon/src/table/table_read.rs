@@ -44,11 +44,7 @@ impl<'a> TableRead<'a> {
         data_predicates: Vec<Predicate>,
     ) -> Self {
         if table.is_format_table() {
-            Self(TableReadKind::Format(FormatTableRead::new(
-                table,
-                read_type,
-                data_predicates,
-            )))
+            Self::new_format(table, read_type, data_predicates, None)
         } else {
             Self(TableReadKind::Paimon(PaimonTableRead::new(
                 table,
@@ -56,6 +52,20 @@ impl<'a> TableRead<'a> {
                 data_predicates,
             )))
         }
+    }
+
+    pub(crate) fn new_format(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self(TableReadKind::Format(FormatTableRead::new(
+            table,
+            read_type,
+            data_predicates,
+            limit,
+        )))
     }
 
     /// Schema (fields) that this read will produce.

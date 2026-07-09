@@ -99,10 +99,11 @@ impl<'a> FormatReadBuilder<'a> {
             None => self.table.schema().fields().to_vec(),
             Some(fields) => fields.clone(),
         };
-        Ok(TableRead::new(
+        Ok(TableRead::new_format(
             self.table,
             read_type,
             self.data_predicates.clone(),
+            self.limit,
         ))
     }
 }
