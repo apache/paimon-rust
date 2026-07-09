@@ -165,8 +165,8 @@ impl SearchResult {
         let mut indices: Vec<usize> = (0..self.row_ids.len()).collect();
         indices.sort_by(|&a, &b| {
             self.scores[b]
-                .partial_cmp(&self.scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&self.scores[a])
+                .then_with(|| self.row_ids[a].cmp(&self.row_ids[b]))
         });
         indices.truncate(k);
         let row_ids = indices.iter().map(|&i| self.row_ids[i]).collect();
@@ -275,6 +275,14 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!(top.row_ids.contains(&2));
         assert!(top.row_ids.contains(&4));
+    }
+
+    #[test]
+    fn test_search_result_top_k_tie_breaks_by_smaller_row_id() {
+        let result = SearchResult::new(vec![30, 10, 20], vec![0.9, 0.9, 0.9]);
+        let top = result.top_k(2);
+        assert_eq!(top.row_ids, vec![10, 20]);
+        assert_eq!(top.scores, vec![0.9, 0.9]);
     }
 
     #[test]
