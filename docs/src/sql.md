@@ -1027,6 +1027,70 @@ The function performs ANN search across all matching vector index files for the
 target column, merges results, and returns the top-k rows ordered by relevance
 score. If no matching index is found, an empty result is returned.
 
+### Refine / Rerank
+
+Vector index search can optionally refine ANN results by reading the raw vectors
+for a larger candidate set, recomputing exact scores, and reranking the final
+top-k results. This is useful for quantized indexes, such as IVF-PQ, where ANN
+scores are approximate.
+
+Refine is disabled by default. Configure a positive refine factor as a table
+property. The search first requests `limit * refine_factor` candidates from the
+index, then reranks those candidates by exact raw-vector scores and keeps the
+requested `limit` rows. A factor of `1` still performs exact reranking over the
+original `limit` candidates, but does not over-fetch additional candidates.
+Omit the option to keep the default ANN-only behavior.
+
+Set the option when creating the table:
+
+```sql
+CREATE TABLE paimon.my_db.items (
+  id INT,
+  embedding ARRAY<FLOAT>
+) WITH (
+  'bucket' = '1',
+  'row-tracking.enabled' = 'true',
+  'data-evolution.enabled' = 'true',
+  'global-index.enabled' = 'true',
+  'fields.embedding.ivf.refine-factor' = '3'
+);
+```
+
+Or enable it on an existing table:
+
+```sql
+ALTER TABLE paimon.my_db.items SET TBLPROPERTIES(
+  'fields.embedding.ivf.refine-factor' = '3'
+);
+```
+
+Then run `vector_search` as usual:
+
+```sql
+SELECT *
+FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
+```
+
+Supported refine option names are `refine_factor`, `refine-factor`,
+`rerank_factor`, and `rerank-factor`. Option lookup checks field-specific and
+index-specific keys before global keys. For example, for an `ivf-flat` index on
+column `embedding`, these keys are accepted, from more specific to more general:
+
+| Example Key | Scope |
+|---|---|
+| `fields.embedding.ivf-flat.refine-factor` | This column and index type |
+| `fields.embedding.ivf_flat.refine-factor` | This column and normalized index type |
+| `fields.embedding.ivf.refine-factor` | This column and all IVF vector indexes |
+| `fields.embedding.refine-factor` | This column |
+| `ivf-flat.refine-factor` | This index type |
+| `ivf_flat.refine-factor` | This normalized index type |
+| `ivf.refine-factor` | All IVF vector indexes |
+| `refine-factor` | All vector searches on the table |
+
+Larger refine factors may improve recall and ordering quality, but they also
+increase index result merging, raw-vector reads, and exact scoring work. Use the
+smallest factor that provides the desired recall.
+
 ### Lateral Joins
 
 Use `CROSS JOIN LATERAL` when query vectors come from another relation. In this mode, the third `vector_search` argument is a column reference from the left side of the join instead of a JSON literal:
