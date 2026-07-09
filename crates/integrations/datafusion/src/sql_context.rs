@@ -49,10 +49,10 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, CreateTable, CreateTableOptions,
-    CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType,
-    RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption, Statement,
-    TableFactor, TableObject, Truncate, Update, Value as SqlValue,
+    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateTable,
+    CreateTableOptions, CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName,
+    ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption,
+    Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -1723,7 +1723,7 @@ fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
 
 fn column_def_comment(col: &ColumnDef) -> Option<String> {
     col.options.iter().find_map(|opt| match &opt.option {
-        datafusion::sql::sqlparser::ast::ColumnOption::Comment(comment) => Some(comment.clone()),
+        ColumnOption::Comment(comment) => Some(comment.clone()),
         _ => None,
     })
 }
@@ -1838,6 +1838,10 @@ fn sql_data_type_to_paimon_type(
             .map_err(to_datafusion_error)?,
         )),
         SqlType::Bytea => Ok(PaimonDataType::VarBinary(
+            VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)
+                .map_err(to_datafusion_error)?,
+        )),
+        other if other.to_string().eq_ignore_ascii_case("BYTES") => Ok(PaimonDataType::VarBinary(
             VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)
                 .map_err(to_datafusion_error)?,
         )),
@@ -3402,6 +3406,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_table_blob_comment_directives() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql(
+                "CREATE TABLE mydb.t1 (\
+                 id INT, \
+                 photo BYTES COMMENT '__BLOB_FIELD; raw photo', \
+                 thumb BINARY COMMENT '__BLOB_DESCRIPTOR_FIELD', \
+                 preview VARBINARY COMMENT '__BLOB_VIEW_FIELD; preview ref'\
+                 ) WITH ('data-evolution.enabled' = 'true')",
+            )
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
+            assert!(matches!(
+                schema.fields()[1].data_type(),
+                PaimonDataType::Blob(_)
+            ));
+            assert!(matches!(
+                schema.fields()[2].data_type(),
+                PaimonDataType::Blob(_)
+            ));
+            assert!(matches!(
+                schema.fields()[3].data_type(),
+                PaimonDataType::Blob(_)
+            ));
+            assert_eq!(schema.fields()[1].description(), Some("raw photo"));
+            assert_eq!(schema.fields()[2].description(), None);
+            assert_eq!(schema.fields()[3].description(), Some("preview ref"));
+            assert_eq!(
+                schema.options().get("blob-field").map(String::as_str),
+                Some("photo")
+            );
+            assert_eq!(
+                schema
+                    .options()
+                    .get("blob-descriptor-field")
+                    .map(String::as_str),
+                Some("thumb")
+            );
+            assert_eq!(
+                schema.options().get("blob-view-field").map(String::as_str),
+                Some("preview")
+            );
+        } else {
+            panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
     async fn test_alter_table_add_column() {
         let catalog = Arc::new(MockCatalog::new());
         let sql_context = make_sql_context(catalog.clone()).await;
@@ -3451,6 +3510,36 @@ mod tests {
                     data_type,
                     ..
                 } if field_names.first().map(String::as_str) == Some("payload") && matches!(data_type, PaimonDataType::Blob(_))
+            ));
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_blob_comment_directive_passes_core_input() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("ALTER TABLE mydb.t1 ADD COLUMN preview BYTES COMMENT '__BLOB_DESCRIPTOR_FIELD; preview descriptor'")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+            assert_eq!(changes.len(), 1);
+            assert!(matches!(
+                &changes[0],
+                SchemaChange::AddColumn {
+                    field_names,
+                    data_type,
+                    comment,
+                    ..
+                } if field_names.first().map(String::as_str) == Some("preview")
+                    && matches!(data_type, PaimonDataType::VarBinary(_))
+                    && comment.as_deref() == Some("__BLOB_DESCRIPTOR_FIELD; preview descriptor")
             ));
         } else {
             panic!("expected AlterTable call");

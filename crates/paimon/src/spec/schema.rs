@@ -16,17 +16,22 @@
 // under the License.
 
 use crate::spec::core_options::{
-    first_row_supports_changelog_producer, CoreOptions, BUCKET_KEY_OPTION,
-    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
+    first_row_supports_changelog_producer, CoreOptions, BLOB_DESCRIPTOR_FIELD_OPTION,
+    BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION, QUERY_AUTH_ENABLED_OPTION,
+    SEQUENCE_FIELD_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
 use crate::spec::{
-    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, ColumnMove,
-    ColumnMoveType, PartialUpdateConfig,
+    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, BlobType,
+    ColumnMove, ColumnMoveType, PartialUpdateConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
+
+const BLOB_FIELD_DIRECTIVE: &str = "__BLOB_FIELD";
+const BLOB_DESCRIPTOR_FIELD_DIRECTIVE: &str = "__BLOB_DESCRIPTOR_FIELD";
+const BLOB_VIEW_FIELD_DIRECTIVE: &str = "__BLOB_VIEW_FIELD";
 
 /// The table schema for paimon table.
 ///
@@ -203,8 +208,8 @@ impl TableSchema {
                 }
                 SchemaChange::AddColumn {
                     field_names,
-                    data_type,
-                    comment,
+                    mut data_type,
+                    mut comment,
                     column_move,
                 } => {
                     let name = top_level_field(&field_names)?;
@@ -213,6 +218,11 @@ impl TableSchema {
                             full_name: full_name.to_string(),
                             column: name.to_string(),
                         });
+                    }
+                    if let Some(directive) = parse_blob_comment_directive(comment.as_deref())? {
+                        append_csv_option(&mut new_schema.options, directive.option_key, name);
+                        comment = directive.comment;
+                        data_type = normalize_blob_field_type(name, data_type)?;
                     }
                     // Mirrors Java: an added column has no value for existing
                     // rows, so it must be nullable.
@@ -618,6 +628,98 @@ fn reassign_field_ids(data_type: DataType, next_id: &mut i32) -> DataType {
     }
 }
 
+struct BlobCommentDirective {
+    option_key: &'static str,
+    comment: Option<String>,
+}
+
+fn parse_blob_comment_directive(
+    comment: Option<&str>,
+) -> crate::Result<Option<BlobCommentDirective>> {
+    let Some(comment) = comment else {
+        return Ok(None);
+    };
+    let comment = comment.trim();
+    if !comment.starts_with("__BLOB") {
+        return Ok(None);
+    }
+    let Some((option_key, marker)) = match_blob_comment_directive(comment) else {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Unsupported BLOB comment directive '{comment}'. Supported directives are \
+                 '{BLOB_FIELD_DIRECTIVE}', '{BLOB_DESCRIPTOR_FIELD_DIRECTIVE}', and \
+                 '{BLOB_VIEW_FIELD_DIRECTIVE}'."
+            ),
+        });
+    };
+    let real_comment = if comment.len() == marker.len() {
+        None
+    } else {
+        let real_comment = comment[marker.len() + 1..].trim();
+        (!real_comment.is_empty()).then(|| real_comment.to_string())
+    };
+    Ok(Some(BlobCommentDirective {
+        option_key,
+        comment: real_comment,
+    }))
+}
+
+fn match_blob_comment_directive(comment: &str) -> Option<(&'static str, &'static str)> {
+    [
+        (BLOB_VIEW_FIELD_DIRECTIVE, BLOB_VIEW_FIELD_OPTION),
+        (
+            BLOB_DESCRIPTOR_FIELD_DIRECTIVE,
+            BLOB_DESCRIPTOR_FIELD_OPTION,
+        ),
+        (BLOB_FIELD_DIRECTIVE, BLOB_FIELD_OPTION),
+    ]
+    .into_iter()
+    .find_map(|(marker, option_key)| {
+        if !comment.starts_with(marker) {
+            return None;
+        }
+        if comment.len() == marker.len() || comment.as_bytes().get(marker.len()) == Some(&b';') {
+            Some((option_key, marker))
+        } else {
+            None
+        }
+    })
+}
+
+fn append_csv_option(options: &mut HashMap<String, String>, key: &'static str, field_name: &str) {
+    let value = append_csv_field(options.get(key).map(String::as_str), field_name);
+    options.insert(key.to_string(), value);
+}
+
+fn append_csv_field(existing: Option<&str>, field_name: &str) -> String {
+    let mut fields = existing
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !fields.iter().any(|field| field == field_name) {
+        fields.push(field_name.to_string());
+    }
+    fields.join(",")
+}
+
+fn normalize_blob_field_type(field_name: &str, data_type: DataType) -> crate::Result<DataType> {
+    let nullable = data_type.is_nullable();
+    match data_type {
+        DataType::Blob(_) => Ok(data_type),
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            Ok(DataType::Blob(BlobType::with_nullable(nullable)))
+        }
+        other => Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "BLOB field option references non-binary column '{field_name}' with type {other:?}"
+            ),
+        }),
+    }
+}
+
 /// Insert a brand-new field according to an optional move (used by `AddColumn`).
 fn insert_field_with_move(
     fields: &mut Vec<DataField>,
@@ -792,7 +894,7 @@ pub struct Schema {
 impl Schema {
     /// Build a schema with validation. Normalizes partition/primary keys from options if present.
     fn new(
-        fields: Vec<DataField>,
+        mut fields: Vec<DataField>,
         partition_keys: Vec<String>,
         primary_keys: Vec<String>,
         mut options: HashMap<String, String>,
@@ -800,7 +902,8 @@ impl Schema {
     ) -> crate::Result<Self> {
         let primary_keys = Self::normalize_primary_keys(&primary_keys, &mut options)?;
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
-        let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
+        Self::normalize_blob_comment_directives(&mut fields, &mut options)?;
+        let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys, &options)?;
         Self::validate_key_field_types(&fields, &primary_keys, &options)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         Self::validate_vector_store_fields(&fields, &partition_keys, &options)?;
@@ -861,12 +964,14 @@ impl Schema {
         Ok(partition_keys.to_vec())
     }
 
-    /// Normalize fields: validate (duplicate/subset checks) and make primary key columns non-nullable.
+    /// Normalize fields: validate duplicate/subset checks, promote configured
+    /// binary BLOB fields, and make primary key columns non-nullable.
     /// Corresponds to Java `normalizeFields`.
     fn normalize_fields(
         fields: &[DataField],
         partition_keys: &[String],
         primary_keys: &[String],
+        options: &HashMap<String, String>,
     ) -> crate::Result<Vec<DataField>> {
         let field_names: Vec<String> = fields.iter().map(|f| f.name().to_string()).collect();
         Self::validate_no_duplicate_fields(&field_names)?;
@@ -874,25 +979,34 @@ impl Schema {
         Self::validate_primary_keys(&field_names, primary_keys)?;
         Self::validate_primary_keys_not_partition_only(partition_keys, primary_keys)?;
 
-        if primary_keys.is_empty() {
+        let blob_field_names = CoreOptions::new(options).blob_fields();
+        for name in &blob_field_names {
+            if !field_names.iter().any(|field| field == name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("BLOB field option references missing column '{name}'"),
+                });
+            }
+        }
+
+        if primary_keys.is_empty() && blob_field_names.is_empty() {
             return Ok(fields.to_vec());
         }
 
         let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let mut new_fields = Vec::with_capacity(fields.len());
         for f in fields {
-            if pk_set.contains(f.name()) && f.data_type().is_nullable() {
-                new_fields.push(
-                    DataField::new(
-                        f.id(),
-                        f.name().to_string(),
-                        f.data_type().copy_with_nullable(false)?,
-                    )
-                    .with_description(f.description().map(|s| s.to_string())),
-                );
+            let mut data_type = if blob_field_names.contains(f.name()) {
+                normalize_blob_field_type(f.name(), f.data_type().clone())?
             } else {
-                new_fields.push(f.clone());
+                f.data_type().clone()
+            };
+            if pk_set.contains(f.name()) && data_type.is_nullable() {
+                data_type = data_type.copy_with_nullable(false)?;
             }
+            new_fields.push(
+                DataField::new(f.id(), f.name().to_string(), data_type)
+                    .with_description(f.description().map(|s| s.to_string())),
+            );
         }
         Ok(new_fields)
     }
@@ -909,6 +1023,20 @@ impl Schema {
                 ),
             })
         }
+    }
+
+    fn normalize_blob_comment_directives(
+        fields: &mut [DataField],
+        options: &mut HashMap<String, String>,
+    ) -> crate::Result<()> {
+        for field in fields {
+            let Some(directive) = parse_blob_comment_directive(field.description())? else {
+                continue;
+            };
+            append_csv_option(options, directive.option_key, field.name());
+            *field = field.clone().with_description(directive.comment);
+        }
+        Ok(())
     }
 
     /// Partition key constraint must not contain duplicates; all partition keys must be in table columns.
@@ -1029,6 +1157,22 @@ impl Schema {
         }
 
         let core_options = CoreOptions::new(options);
+        let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        let blob_view_fields = core_options.blob_view_fields();
+        let mut overlapping_fields = blob_view_fields
+            .intersection(&blob_descriptor_fields)
+            .cloned()
+            .collect::<Vec<_>>();
+        overlapping_fields.sort();
+        if let Some(field) = overlapping_fields.first() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Field '{field}' in '{BLOB_VIEW_FIELD_OPTION}' can not also be in \
+                     '{BLOB_DESCRIPTOR_FIELD_OPTION}'."
+                ),
+            });
+        }
+
         if !core_options.data_evolution_enabled() {
             return Err(crate::Error::ConfigInvalid {
                 message: "Data evolution config must enabled for table with BLOB type column."
@@ -1641,6 +1785,199 @@ mod tests {
             .unwrap();
 
         assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_blob_field_option_promotes_binary_column() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "payload",
+                DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+            )
+            .option("blob-field", "payload")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+
+        assert!(matches!(schema.fields()[1].data_type(), DataType::Blob(_)));
+    }
+
+    #[test]
+    fn test_blob_comment_directive_promotes_column_and_strips_comment() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column_with_description(
+                "payload",
+                DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                Some("__BLOB_FIELD; payload bytes".to_string()),
+            )
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+
+        assert!(matches!(schema.fields()[1].data_type(), DataType::Blob(_)));
+        assert_eq!(schema.fields()[1].description(), Some("payload bytes"));
+        assert_eq!(
+            schema.options().get("blob-field").map(String::as_str),
+            Some("payload")
+        );
+    }
+
+    #[test]
+    fn test_blob_comment_directive_rejects_unknown_create_directive() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column_with_description(
+                "payload",
+                DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                Some("__BLOB_FIEL; payload bytes".to_string()),
+            )
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Unsupported BLOB comment directive") && message.contains("__BLOB_FIEL")),
+            "unknown __BLOB* comment directive should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_blob_comment_directive_rejects_malformed_marker_separator() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column_with_description(
+                "payload",
+                DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                Some("__BLOB_FIELD ; payload bytes".to_string()),
+            )
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Unsupported BLOB comment directive") && message.contains("__BLOB_FIELD ; payload bytes")),
+            "BLOB directive marker should be followed immediately by ';'"
+        );
+    }
+
+    #[test]
+    fn test_blob_comment_directive_rejects_descriptor_view_conflict() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column_with_description(
+                "preview",
+                DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                Some("__BLOB_VIEW_FIELD".to_string()),
+            )
+            .option("blob-descriptor-field", "preview")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message }
+                if message.contains("preview")
+                    && message.contains("blob-view-field")
+                    && message.contains("blob-descriptor-field")),
+            "field configured as both blob descriptor and blob view should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_blob_comment_directive_add_column_updates_options() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("thumb", DataType::Blob(BlobType::new()))
+            .option("blob-descriptor-field", "thumb")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+
+        let schema = TableSchema::new(0, &schema)
+            .apply_changes(vec![crate::spec::SchemaChange::AddColumn {
+                field_names: vec!["preview".to_string()],
+                data_type: DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                comment: Some("__BLOB_DESCRIPTOR_FIELD; preview descriptor".to_string()),
+                column_move: None,
+            }])
+            .unwrap();
+
+        let preview = schema
+            .fields()
+            .iter()
+            .find(|field| field.name() == "preview")
+            .unwrap();
+        assert!(matches!(preview.data_type(), DataType::Blob(_)));
+        assert_eq!(preview.description(), Some("preview descriptor"));
+        assert_eq!(
+            schema
+                .options()
+                .get("blob-descriptor-field")
+                .map(String::as_str),
+            Some("thumb,preview")
+        );
+    }
+
+    #[test]
+    fn test_blob_comment_directive_rejects_unknown_add_column_directive() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+
+        let err = TableSchema::new(0, &schema)
+            .apply_changes(vec![crate::spec::SchemaChange::AddColumn {
+                field_names: vec!["preview".to_string()],
+                data_type: DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                        .unwrap(),
+                ),
+                comment: Some("__BLOB_UNKNOWN; preview descriptor".to_string()),
+                column_move: None,
+            }])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Unsupported BLOB comment directive") && message.contains("__BLOB_UNKNOWN")),
+            "unknown __BLOB* add-column directive should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_blob_field_option_rejects_non_binary_column() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Int(IntType::new()))
+            .option("blob-field", "payload")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { message } if message.contains("non-binary column")),
+            "blob-field on a non-binary column should be rejected"
+        );
     }
 
     #[test]
