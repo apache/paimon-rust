@@ -36,7 +36,8 @@ use futures::TryStreamExt;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Cursor;
 
 const INDEX_DIR: &str = "index";
@@ -583,9 +584,7 @@ async fn maybe_rerank_indexed_batch_results(
         message: "Vector index rerank requires table context".to_string(),
         source: None,
     })?;
-    let row_ids = union_candidates.iter().collect::<Vec<_>>();
-    let raw_ranges =
-        SearchResult::new(row_ids.clone(), vec![0.0; row_ids.len()]).to_row_ranges()?;
+    let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
     let metric = resolve_raw_vector_metric(
         evaluation.file_io,
         evaluation.table_path.trim_end_matches('/'),
@@ -597,6 +596,39 @@ async fn maybe_rerank_indexed_batch_results(
     .await?;
 
     read_raw_batch_vector_search(table, &candidate_searches, &raw_ranges, metric).await
+}
+
+fn sorted_row_ids_to_row_ranges(
+    row_ids: impl IntoIterator<Item = u64>,
+) -> crate::Result<Vec<RowRange>> {
+    let mut row_ids = row_ids.into_iter();
+    let Some(first) = row_ids.next() else {
+        return Ok(Vec::new());
+    };
+    let mut start = row_id_to_i64_for_range(first)?;
+    let mut end = start;
+    let mut ranges = Vec::new();
+    for row_id in row_ids {
+        let row_id = row_id_to_i64_for_range(row_id)?;
+        if end.checked_add(1) == Some(row_id) {
+            end = row_id;
+        } else {
+            ranges.push(RowRange::new(start, end));
+            start = row_id;
+            end = row_id;
+        }
+    }
+    ranges.push(RowRange::new(start, end));
+    Ok(ranges)
+}
+
+fn row_id_to_i64_for_range(row_id: u64) -> crate::Result<i64> {
+    i64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+        message: format!(
+            "Vector search row id {row_id} exceeds i64::MAX and cannot be converted to RowRange"
+        ),
+        source: None,
+    })
 }
 
 async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
@@ -868,33 +900,155 @@ async fn read_raw_batch_vector_search(
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
 
-    let mut row_ids = vec![Vec::new(); vector_searches.len()];
-    let mut scores = vec![Vec::new(); vector_searches.len()];
+    let scoring_plan = RawScoringPlan::new(vector_searches, metric);
+    let mut top_k = vector_searches
+        .iter()
+        .map(|vector_search| RawScoreTopK::new(vector_search.limit))
+        .collect::<Vec<_>>();
     while let Some(batch) = stream.try_next().await? {
-        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &mut row_ids, &mut scores)?;
+        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &scoring_plan, &mut top_k)?;
     }
 
-    Ok(row_ids
+    Ok(top_k
         .into_iter()
-        .zip(scores)
-        .zip(vector_searches)
-        .map(|((row_ids, scores), vector_search)| {
-            SearchResult::new(row_ids, scores).top_k(vector_search.limit)
-        })
+        .map(RawScoreTopK::into_search_result)
         .collect())
+}
+
+struct RawScoringPlan {
+    all_query_indices: Vec<usize>,
+    candidate_query_indices: HashMap<u64, Vec<usize>>,
+    query_l2_norms: Vec<f32>,
+}
+
+impl RawScoringPlan {
+    fn new(vector_searches: &[VectorSearch], metric: RawVectorMetric) -> Self {
+        let mut all_query_indices = Vec::new();
+        let mut candidate_query_indices: HashMap<u64, Vec<usize>> = HashMap::new();
+        let query_l2_norms = vector_searches
+            .iter()
+            .map(|vector_search| match metric {
+                RawVectorMetric::Cosine => vector_search
+                    .vector
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt(),
+                RawVectorMetric::L2 | RawVectorMetric::InnerProduct => 0.0,
+            })
+            .collect();
+
+        for (query_index, vector_search) in vector_searches.iter().enumerate() {
+            if let Some(include_row_ids) = &vector_search.include_row_ids {
+                for row_id in include_row_ids.iter() {
+                    candidate_query_indices
+                        .entry(row_id)
+                        .or_default()
+                        .push(query_index);
+                }
+            } else {
+                all_query_indices.push(query_index);
+            }
+        }
+
+        Self {
+            all_query_indices,
+            candidate_query_indices,
+            query_l2_norms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RawScoredRow {
+    row_id: u64,
+    score: f32,
+}
+
+impl Eq for RawScoredRow {}
+
+impl PartialOrd for RawScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawScoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl RawScoredRow {
+    fn is_stronger_than(&self, other: &Self) -> bool {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.row_id.cmp(&self.row_id))
+            == Ordering::Greater
+    }
+}
+
+struct RawScoreTopK {
+    limit: usize,
+    heap: BinaryHeap<RawScoredRow>,
+}
+
+impl RawScoreTopK {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.min(1024).saturating_add(1)),
+        }
+    }
+
+    fn offer(&mut self, row_id: u64, score: f32) {
+        if self.limit == 0 {
+            return;
+        }
+        let entry = RawScoredRow { row_id, score };
+        if self.heap.len() < self.limit {
+            self.heap.push(entry);
+        } else if self
+            .heap
+            .peek()
+            .is_some_and(|weakest| entry.is_stronger_than(weakest))
+        {
+            self.heap.pop();
+            self.heap.push(entry);
+        }
+    }
+
+    fn into_search_result(self) -> SearchResult {
+        let mut rows = self.heap.into_vec();
+        rows.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        let mut row_ids = Vec::with_capacity(rows.len());
+        let mut scores = Vec::with_capacity(rows.len());
+        for row in rows {
+            row_ids.push(row.row_id);
+            scores.push(row.score);
+        }
+        SearchResult::new(row_ids, scores)
+    }
 }
 
 fn collect_raw_batch_vector_batch(
     batch: &RecordBatch,
     vector_searches: &[VectorSearch],
     metric: RawVectorMetric,
-    row_ids_out: &mut [Vec<u64>],
-    scores_out: &mut [Vec<f32>],
+    scoring_plan: &RawScoringPlan,
+    top_k_out: &mut [RawScoreTopK],
 ) -> crate::Result<()> {
     if vector_searches.is_empty() {
         return Ok(());
     }
-    if row_ids_out.len() != vector_searches.len() || scores_out.len() != vector_searches.len() {
+    if top_k_out.len() != vector_searches.len() {
         return Err(crate::Error::DataInvalid {
             message: "Raw batch vector search output buffers must match query vector count"
                 .to_string(),
@@ -996,46 +1150,134 @@ fn collect_raw_batch_vector_batch(
                 (row * len, (row + 1) * len)
             }
         };
+        ensure_raw_vector_values_not_null(values, start, end)?;
 
-        let mut stored = Vec::with_capacity(end - start);
-        for value_index in start..end {
-            if values.is_null(value_index) {
-                return Err(crate::Error::DataInvalid {
-                    message: "Vector raw search found null vector element".to_string(),
-                    source: None,
-                });
-            }
-            stored.push(values.value(value_index));
-        }
-
-        for (query_index, vector_search) in vector_searches.iter().enumerate() {
-            if vector_search
-                .include_row_ids
-                .as_ref()
-                .is_some_and(|include_row_ids| !include_row_ids.contains(row_id))
-            {
-                continue;
-            }
-            if stored.len() != vector_search.vector.len() {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Query vector dimension mismatch: raw row has {}, but query has {}",
-                        stored.len(),
-                        vector_search.vector.len()
-                    ),
-                    source: None,
-                });
-            }
-            row_ids_out[query_index].push(row_id);
-            scores_out[query_index].push(compute_raw_vector_score(
-                &vector_search.vector,
-                &stored,
+        for &query_index in &scoring_plan.all_query_indices {
+            offer_raw_vector_score(
+                row_id,
+                values,
+                start,
+                end,
                 metric,
-            ));
+                vector_searches,
+                scoring_plan,
+                top_k_out,
+                query_index,
+            )?;
+        }
+        if let Some(query_indices) = scoring_plan.candidate_query_indices.get(&row_id) {
+            for &query_index in query_indices {
+                offer_raw_vector_score(
+                    row_id,
+                    values,
+                    start,
+                    end,
+                    metric,
+                    vector_searches,
+                    scoring_plan,
+                    top_k_out,
+                    query_index,
+                )?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn ensure_raw_vector_values_not_null(
+    values: &Float32Array,
+    start: usize,
+    end: usize,
+) -> crate::Result<()> {
+    for value_index in start..end {
+        if values.is_null(value_index) {
+            return Err(crate::Error::DataInvalid {
+                message: "Vector raw search found null vector element".to_string(),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn offer_raw_vector_score(
+    row_id: u64,
+    values: &Float32Array,
+    start: usize,
+    end: usize,
+    metric: RawVectorMetric,
+    vector_searches: &[VectorSearch],
+    scoring_plan: &RawScoringPlan,
+    top_k_out: &mut [RawScoreTopK],
+    query_index: usize,
+) -> crate::Result<()> {
+    let vector_search = &vector_searches[query_index];
+    let stored_len = end - start;
+    if stored_len != vector_search.vector.len() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Query vector dimension mismatch: raw row has {}, but query has {}",
+                stored_len,
+                vector_search.vector.len()
+            ),
+            source: None,
+        });
+    }
+    let score = compute_raw_vector_score_from_values(
+        &vector_search.vector,
+        scoring_plan.query_l2_norms[query_index],
+        values,
+        start,
+        end,
+        metric,
+    );
+    top_k_out[query_index].offer(row_id, score);
+    Ok(())
+}
+
+fn compute_raw_vector_score_from_values(
+    query: &[f32],
+    query_l2_norm: f32,
+    values: &Float32Array,
+    start: usize,
+    end: usize,
+    metric: RawVectorMetric,
+) -> f32 {
+    debug_assert_eq!(query.len(), end - start);
+    match metric {
+        RawVectorMetric::L2 => {
+            let sum_sq = query
+                .iter()
+                .zip(start..end)
+                .map(|(q, value_index)| {
+                    let diff = q - values.value(value_index);
+                    diff * diff
+                })
+                .sum::<f32>();
+            1.0 / (1.0 + sum_sq)
+        }
+        RawVectorMetric::Cosine => {
+            let mut dot = 0.0;
+            let mut norm_b = 0.0;
+            for (q, value_index) in query.iter().zip(start..end) {
+                let stored = values.value(value_index);
+                dot += q * stored;
+                norm_b += stored * stored;
+            }
+            let denominator = query_l2_norm * norm_b.sqrt();
+            if denominator == 0.0 {
+                0.0
+            } else {
+                dot / denominator
+            }
+        }
+        RawVectorMetric::InnerProduct => query
+            .iter()
+            .zip(start..end)
+            .map(|(q, value_index)| q * values.value(value_index))
+            .sum(),
+    }
 }
 
 fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
@@ -1045,6 +1287,7 @@ fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
     })
 }
 
+#[cfg(test)]
 fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetric) -> f32 {
     match metric {
         RawVectorMetric::L2 => {
@@ -1280,21 +1523,23 @@ mod tests {
             VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap(),
             VectorSearch::new(vec![0.0, 1.0], 1, "embedding".to_string()).unwrap(),
         ];
-        let mut row_ids = vec![Vec::new(); searches.len()];
-        let mut scores = vec![Vec::new(); searches.len()];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
         collect_raw_batch_vector_batch(
             &batch,
             &searches,
             RawVectorMetric::L2,
-            &mut row_ids,
-            &mut scores,
+            &scoring_plan,
+            &mut top_k,
         )
         .unwrap();
-        let results = row_ids
+        let results = top_k
             .into_iter()
-            .zip(scores)
-            .map(|(row_ids, scores)| SearchResult::new(row_ids, scores).top_k(1))
+            .map(RawScoreTopK::into_search_result)
             .collect::<Vec<_>>();
 
         assert_eq!(results[0].row_ids, vec![10]);
@@ -1337,20 +1582,27 @@ mod tests {
                 .unwrap()
                 .with_include_row_ids(include_row_ids),
         ];
-        let mut row_ids = vec![Vec::new(); searches.len()];
-        let mut scores = vec![Vec::new(); searches.len()];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
         collect_raw_batch_vector_batch(
             &batch,
             &searches,
             RawVectorMetric::L2,
-            &mut row_ids,
-            &mut scores,
+            &scoring_plan,
+            &mut top_k,
         )
         .unwrap();
+        let results = top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .collect::<Vec<_>>();
 
-        assert_eq!(row_ids, vec![vec![12]]);
-        assert_eq!(scores[0].len(), 1);
+        assert_eq!(results[0].row_ids, vec![12]);
+        assert_eq!(results[0].scores.len(), 1);
     }
 
     #[tokio::test]

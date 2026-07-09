@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone)]
 pub struct VectorSearch {
@@ -98,6 +99,46 @@ pub struct SearchResult {
     pub scores: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScoredRow {
+    row_id: u64,
+    score: f32,
+}
+
+impl Eq for ScoredRow {}
+
+impl PartialOrd for ScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl ScoredRow {
+    fn is_stronger_than(&self, other: &Self) -> bool {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.row_id.cmp(&self.row_id))
+            == Ordering::Greater
+    }
+}
+
+fn sort_scored_rows_by_rank(rows: &mut [ScoredRow]) {
+    rows.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.row_id.cmp(&b.row_id))
+    });
+}
+
 impl SearchResult {
     pub fn new(row_ids: Vec<u64>, scores: Vec<f32>) -> Self {
         assert_eq!(row_ids.len(), scores.len());
@@ -159,18 +200,39 @@ impl SearchResult {
     }
 
     pub fn top_k(&self, k: usize) -> Self {
+        if k == 0 {
+            return Self::empty();
+        }
         if self.row_ids.len() <= k {
             return self.clone();
         }
-        let mut indices: Vec<usize> = (0..self.row_ids.len()).collect();
-        indices.sort_by(|&a, &b| {
-            self.scores[b]
-                .total_cmp(&self.scores[a])
-                .then_with(|| self.row_ids[a].cmp(&self.row_ids[b]))
-        });
-        indices.truncate(k);
-        let row_ids = indices.iter().map(|&i| self.row_ids[i]).collect();
-        let scores = indices.iter().map(|&i| self.scores[i]).collect();
+
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let entry = ScoredRow { row_id, score };
+            if heap.len() < k {
+                heap.push(entry);
+            } else if heap
+                .peek()
+                .is_some_and(|weakest| entry.is_stronger_than(weakest))
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+
+        let mut rows = heap.into_vec();
+        sort_scored_rows_by_rank(&mut rows);
+        Self::from_scored_rows(rows)
+    }
+
+    fn from_scored_rows(rows: Vec<ScoredRow>) -> Self {
+        let mut row_ids = Vec::with_capacity(rows.len());
+        let mut scores = Vec::with_capacity(rows.len());
+        for row in rows {
+            row_ids.push(row.row_id);
+            scores.push(row.score);
+        }
         Self { row_ids, scores }
     }
 
