@@ -17,7 +17,6 @@
 
 mod avro;
 pub(crate) mod blob;
-#[cfg(feature = "mosaic")]
 mod mosaic;
 mod orc;
 mod parquet;
@@ -128,7 +127,6 @@ pub(crate) fn create_format_reader(
     } else if lower.ends_with(".row") {
         Box::new(row::RowFormatReader)
     } else {
-        #[cfg(feature = "mosaic")]
         if lower.ends_with(".mosaic") {
             return Ok(shredding::maybe_wrap_reader(
                 Box::new(mosaic::MosaicFormatReader),
@@ -159,7 +157,6 @@ fn supported_read_formats() -> Vec<&'static str> {
         ".orc",
         ".avro",
         ".row",
-        #[cfg(feature = "mosaic")]
         ".mosaic",
         #[cfg(feature = "vortex")]
         ".vortex",

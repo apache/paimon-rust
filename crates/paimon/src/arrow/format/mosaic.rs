@@ -24,7 +24,7 @@ use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchOptions;
-use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -449,42 +449,7 @@ fn validate_mosaic_schema(schema: &SchemaRef) -> crate::Result<()> {
 }
 
 fn validate_mosaic_arrow_type(data_type: &ArrowDataType) -> Result<(), String> {
-    match data_type {
-        ArrowDataType::Boolean
-        | ArrowDataType::Int8
-        | ArrowDataType::Int16
-        | ArrowDataType::Int32
-        | ArrowDataType::Int64
-        | ArrowDataType::Float32
-        | ArrowDataType::Float64
-        | ArrowDataType::Date32
-        | ArrowDataType::Utf8
-        | ArrowDataType::Binary => Ok(()),
-        ArrowDataType::Time32(TimeUnit::Millisecond) => Ok(()),
-        ArrowDataType::Decimal128(precision, _) => {
-            if *precision == 0 || *precision > 38 {
-                Err(format!(
-                    "Decimal precision must be in 1..=38, got {precision}"
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        ArrowDataType::Timestamp(
-            TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
-            _,
-        ) => Ok(()),
-        ArrowDataType::Struct(fields) if is_timestamp_nanos_struct(fields) => Ok(()),
-        other => Err(format!("unsupported Arrow type {other:?}")),
-    }
-}
-
-fn is_timestamp_nanos_struct(fields: &arrow_schema::Fields) -> bool {
-    fields.len() == 2
-        && fields[0].name() == "millis"
-        && *fields[0].data_type() == ArrowDataType::Int64
-        && fields[1].name() == "nanos_of_milli"
-        && *fields[1].data_type() == ArrowDataType::Int32
+    paimon_mosaic_core::types::validate_data_type(data_type)
 }
 
 fn selected_slices_for_row_group(
@@ -625,15 +590,17 @@ mod tests {
     use crate::arrow::format::{FilePredicates, FormatFileReader};
     use crate::spec::{
         ArrayType, BigIntType, BooleanType, DataType, DateType, Datum, DecimalType, DoubleType,
-        FloatType, IntType, LocalZonedTimestampType, Predicate, PredicateBuilder, RowType,
+        FloatType, IntType, LocalZonedTimestampType, MapType, Predicate, PredicateBuilder, RowType,
         SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
     };
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, StringArray,
+        StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray,
     };
-    use arrow_schema::{DataType as ArrowDataType, Field, Schema};
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema, TimeUnit};
     use bytes::Bytes;
     use futures::TryStreamExt;
     use paimon_mosaic_core::spec::COMPRESSION_NONE;
@@ -737,6 +704,41 @@ mod tests {
 
     fn field(id: i32, name: &str, data_type: DataType) -> DataField {
         DataField::new(id, name.to_string(), data_type)
+    }
+
+    fn test_map_array(
+        offsets: Vec<i32>,
+        validities: Vec<bool>,
+        key_nullable: bool,
+        value_nullable: bool,
+        keys: Vec<Option<&str>>,
+        values: Vec<Option<i32>>,
+    ) -> MapArray {
+        let entries = StructArray::try_new(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, key_nullable)),
+                Arc::new(Field::new("value", ArrowDataType::Int32, value_nullable)),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int32Array::from(values)),
+            ],
+            None,
+        )
+        .unwrap();
+        MapArray::try_new(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(entries.fields().clone()),
+                false,
+            )),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            entries,
+            Some(NullBuffer::new(BooleanBuffer::from(validities))),
+            false,
+        )
+        .unwrap()
     }
 
     fn arrow_schema() -> SchemaRef {
@@ -1302,8 +1304,12 @@ mod tests {
             fields[0].clone(),
             field(
                 3,
-                "new_items",
-                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+                "new_nested",
+                DataType::Row(RowType::new(vec![field(
+                    4,
+                    "value",
+                    DataType::Int(IntType::new()),
+                )])),
             ),
         ];
         let data = write_mosaic(&sample_batch());
@@ -1320,7 +1326,11 @@ mod tests {
         let projected = vec![field(
             0,
             "id",
-            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            DataType::Row(RowType::new(vec![field(
+                1,
+                "value",
+                DataType::Int(IntType::new()),
+            )])),
         )];
         let data = write_mosaic(&sample_batch());
         let err = read_batches(data, &projected, None).await.unwrap_err();
@@ -1498,8 +1508,7 @@ mod tests {
     }
 
     /// Round-trips every scalar/temporal type Mosaic supports through write + read,
-    /// asserting values survive the format. ARRAY/MAP are intentionally excluded:
-    /// `paimon-mosaic-core` 0.1.0 does not support them and the reader rejects them.
+    /// asserting values survive the format. Collection types are covered separately.
     #[tokio::test]
     async fn test_read_full_types() {
         let fields = full_type_fields();
@@ -1656,6 +1665,91 @@ mod tests {
             result.schema().field(16).data_type(),
             &ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_array_and_map_types() {
+        let fields = vec![
+            field(
+                0,
+                "nums",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::with_nullable(true)))),
+            ),
+            field(
+                1,
+                "labels",
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::with_nullable(false, 20).unwrap()),
+                    DataType::Int(IntType::with_nullable(true)),
+                )),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let nums = ListArray::try_new(
+            Arc::new(Field::new("element", ArrowDataType::Int32, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 3, 5])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ])),
+            Some(NullBuffer::new(BooleanBuffer::from(vec![
+                true, false, true,
+            ]))),
+        )
+        .unwrap();
+        let labels = test_map_array(
+            vec![0, 2, 2, 3],
+            vec![true, false, true],
+            false,
+            true,
+            vec![Some("a"), Some("b"), Some("c")],
+            vec![Some(10), None, Some(30)],
+        );
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(nums), Arc::new(labels)]).unwrap();
+        let data = write_mosaic(&batch);
+        let batches = read_batches(data, &fields, None).await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 2);
+
+        let nums = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(nums.value_offsets(), &[0, 3, 3, 5]);
+        assert!(nums.is_null(1));
+        let nums_values = nums.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(nums_values.value(0), 1);
+        assert!(nums_values.is_null(1));
+        assert_eq!(nums_values.value(4), 5);
+
+        let labels = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(labels.value_offsets(), &[0, 2, 2, 3]);
+        assert!(labels.is_null(1));
+        let label_keys = labels
+            .keys()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let label_values = labels
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(label_keys.value(0), "a");
+        assert_eq!(label_keys.value(2), "c");
+        assert!(label_values.is_null(1));
+        assert_eq!(label_values.value(2), 30);
     }
 
     /// Null values in nullable columns must round-trip as nulls.

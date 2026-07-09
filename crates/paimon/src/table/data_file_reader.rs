@@ -976,7 +976,7 @@ mod row_tests {
     }
 }
 
-#[cfg(all(test, feature = "mosaic"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;

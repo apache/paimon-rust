@@ -42,7 +42,8 @@ storage-all = [
     "storage-hdfs",
 ]
 fulltext = ["tantivy", "tempfile"]
-mosaic = ["dep:paimon-mosaic-core"]
+# Kept for compatibility with existing Cargo.toml feature declarations; Mosaic is always enabled.
+mosaic = []
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
@@ -104,7 +105,7 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
-paimon-mosaic-core = { version = "0.1.0", optional = true }
+paimon-mosaic-core = "0.2.0"
 paimon-vindex-core = "0.2.0"
 vortex = { version = "0.75.0", features = ["tokio"], optional = true }
 libloading = "0.9"

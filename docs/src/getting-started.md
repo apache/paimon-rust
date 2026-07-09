@@ -58,16 +58,9 @@ Available storage features:
 paimon = { git = "https://github.com/apache/paimon-rust", features = ["storage-cos"] }
 ```
 
-## Optional File Formats
+## Mosaic File Format
 
-Mosaic data files can be read by enabling the `mosaic` feature. This feature is not in the latest release yet; it is available on the `main` branch:
-
-```toml
-[dependencies]
-paimon = { git = "https://github.com/apache/paimon-rust", features = ["mosaic"] }
-```
-
-The current Mosaic support is read-only. Paimon Rust can read existing `.mosaic` data files in a Paimon table, but it does not write Mosaic data files yet.
+Mosaic data file reads are always available. The current Mosaic support is read-only: Paimon Rust can read existing `.mosaic` data files, including array and map columns, in a Paimon table, but it does not write Mosaic data files yet.
 
 ## Catalog Management
 

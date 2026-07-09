@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "mosaic")]
-
 //! Mosaic file format read compatibility tests.
 
 use std::path::Path;
