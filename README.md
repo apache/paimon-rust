@@ -24,7 +24,7 @@
 [Latest Version]: https://img.shields.io/crates/v/paimon.svg
 [crates.io]: https://crates.io/crates/paimon
 
-The rust implementation of Apache Paimon. 
+The rust implementation of Apache Paimon. 1
 
 ## Issue Tracker
 
