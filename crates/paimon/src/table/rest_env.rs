@@ -23,7 +23,7 @@ use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::Options;
 use crate::error::Error;
 use crate::io::FileIO;
-use crate::spec::TableSchema;
+use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::Table;
 use crate::Result;
@@ -105,6 +105,11 @@ impl RESTEnv {
             source: None,
         })?;
 
+        let table_path = response.path.ok_or_else(|| Error::DataInvalid {
+            message: format!("Table {} response missing path", identifier.full_name()),
+            source: None,
+        })?;
+
         let schema_id = response.schema_id.ok_or_else(|| Error::DataInvalid {
             message: format!(
                 "Table {} response missing schema_id",
@@ -112,12 +117,13 @@ impl RESTEnv {
             ),
             source: None,
         })?;
-        let table_schema = TableSchema::new(schema_id, &schema);
-
-        let table_path = response.path.ok_or_else(|| Error::DataInvalid {
-            message: format!("Table {} response missing path", identifier.full_name()),
-            source: None,
-        })?;
+        let mut table_schema = TableSchema::new(schema_id, &schema);
+        if CoreOptions::new(table_schema.options()).is_format_table() {
+            table_schema = table_schema.copy_with_options(std::collections::HashMap::from([(
+                PATH_OPTION.to_string(),
+                table_path.clone(),
+            )]));
+        }
 
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
             message: format!(

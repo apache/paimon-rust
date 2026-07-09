@@ -17,6 +17,7 @@
 
 use super::data_evolution_reader::DataEvolutionReader;
 use super::data_file_reader::DataFileReader;
+use super::format_table_read::FormatTableRead;
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
@@ -27,13 +28,85 @@ use crate::DataSplit;
 ///
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
 #[derive(Debug, Clone)]
-pub struct TableRead<'a> {
+pub struct TableRead<'a>(TableReadKind<'a>);
+
+#[derive(Debug, Clone)]
+enum TableReadKind<'a> {
+    Paimon(PaimonTableRead<'a>),
+    Format(FormatTableRead<'a>),
+}
+
+impl<'a> TableRead<'a> {
+    /// Create a new TableRead with a specific read type (projected fields).
+    pub fn new(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+    ) -> Self {
+        if table.is_format_table() {
+            Self(TableReadKind::Format(FormatTableRead::new(
+                table,
+                read_type,
+                data_predicates,
+            )))
+        } else {
+            Self(TableReadKind::Paimon(PaimonTableRead::new(
+                table,
+                read_type,
+                data_predicates,
+            )))
+        }
+    }
+
+    /// Schema (fields) that this read will produce.
+    pub fn read_type(&self) -> &[DataField] {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.read_type(),
+            TableReadKind::Format(read) => read.read_type(),
+        }
+    }
+
+    /// Data predicates for read-side pruning.
+    pub fn data_predicates(&self) -> &[Predicate] {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.data_predicates(),
+            TableReadKind::Format(read) => read.data_predicates(),
+        }
+    }
+
+    /// Table for this read.
+    pub fn table(&self) -> &Table {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.table(),
+            TableReadKind::Format(read) => read.table(),
+        }
+    }
+
+    /// Set a filter predicate.
+    pub fn with_filter(self, filter: Predicate) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(read.with_filter(filter))),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read.with_filter(filter))),
+        }
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`].
+    pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_arrow(data_splits),
+            TableReadKind::Format(read) => read.to_arrow(data_splits),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
 }
 
-impl<'a> TableRead<'a> {
+impl<'a> PaimonTableRead<'a> {
     /// Create a new TableRead with a specific read type (projected fields).
     pub fn new(
         table: &'a Table,

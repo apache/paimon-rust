@@ -21,6 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::bucket_filter::compute_target_buckets;
+use super::format_table_scan::FormatTableScan;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
@@ -616,11 +617,110 @@ async fn prune_data_evolution_group_by_read_fields(
         .collect())
 }
 
-/// TableScan for full table scan (no incremental, no predicate).
+#[derive(Debug, Clone)]
+pub struct TableScan<'a>(TableScanKind<'a>);
+
+#[derive(Debug, Clone)]
+enum TableScanKind<'a> {
+    Paimon(PaimonTableScan<'a>),
+    Format(FormatTableScan<'a>),
+}
+
+impl<'a> TableScan<'a> {
+    pub(crate) fn new(
+        table: &'a Table,
+        partition_filter: Option<PartitionFilter>,
+        data_predicates: Vec<Predicate>,
+        bucket_predicate: Option<Predicate>,
+        limit: Option<usize>,
+        row_ranges: Option<Vec<RowRange>>,
+    ) -> Self {
+        if table.is_format_table() {
+            Self(TableScanKind::Format(FormatTableScan::new(
+                table,
+                partition_filter,
+                limit,
+            )))
+        } else {
+            Self(TableScanKind::Paimon(PaimonTableScan::new(
+                table,
+                partition_filter,
+                data_predicates,
+                bucket_predicate,
+                limit,
+                row_ranges,
+            )))
+        }
+    }
+
+    pub fn with_scan_all_files(self) -> Self {
+        match self.0 {
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(scan.with_scan_all_files())),
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+        }
+    }
+
+    pub fn with_row_ranges(self, ranges: Vec<RowRange>) -> Self {
+        match self.0 {
+            TableScanKind::Paimon(scan) => {
+                Self(TableScanKind::Paimon(scan.with_row_ranges(ranges)))
+            }
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+        }
+    }
+
+    pub(super) fn with_projected_read_field_ids(
+        self,
+        projected_read_field_ids: Option<HashSet<i32>>,
+    ) -> Self {
+        match self.0 {
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(
+                scan.with_projected_read_field_ids(projected_read_field_ids),
+            )),
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+        }
+    }
+
+    pub async fn plan(&self) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan().await,
+            TableScanKind::Format(scan) => scan.plan().await,
+        }
+    }
+
+    pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_with_trace().await,
+            TableScanKind::Format(scan) => scan.plan_with_trace().await,
+        }
+    }
+
+    pub(crate) async fn plan_manifest_entries(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Vec<ManifestEntry>> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_manifest_entries(snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not have Paimon manifest entries".to_string(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.apply_limit_pushdown(splits),
+            TableScanKind::Format(scan) => scan.apply_limit_pushdown(splits),
+        }
+    }
+}
+
+/// Paimon table scan: resolves snapshots, reads manifests, and builds data splits.
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
 #[derive(Debug, Clone)]
-pub struct TableScan<'a> {
+struct PaimonTableScan<'a> {
     table: &'a Table,
     partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
@@ -636,7 +736,7 @@ pub struct TableScan<'a> {
     projected_read_field_ids: Option<HashSet<i32>>,
 }
 
-impl<'a> TableScan<'a> {
+impl<'a> PaimonTableScan<'a> {
     pub(crate) fn new(
         table: &'a Table,
         partition_filter: Option<PartitionFilter>,
@@ -717,11 +817,11 @@ impl<'a> TableScan<'a> {
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         self.ensure_query_auth_allowed()?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
         };
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match self.resolve_snapshot().await? {
             Some(snapshot) => snapshot,
             None => return Ok((Plan::new(Vec::new()), trace)),

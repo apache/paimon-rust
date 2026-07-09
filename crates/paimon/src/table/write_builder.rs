@@ -19,6 +19,7 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
+use super::format_write_builder::FormatWriteBuilder;
 use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
@@ -26,13 +27,94 @@ use uuid::Uuid;
 ///
 /// Provides `new_write` and `new_commit` methods, with optional
 /// `overwrite` support for partition-level overwrites.
-pub struct WriteBuilder<'a> {
+pub struct WriteBuilder<'a>(WriteBuilderKind<'a>);
+
+enum WriteBuilderKind<'a> {
+    Paimon(PaimonWriteBuilder<'a>),
+    Format(FormatWriteBuilder<'a>),
+}
+
+impl<'a> WriteBuilder<'a> {
+    pub fn new(table: &'a Table) -> Self {
+        if table.is_format_table() {
+            Self(WriteBuilderKind::Format(FormatWriteBuilder::new(table)))
+        } else {
+            Self(WriteBuilderKind::Paimon(PaimonWriteBuilder::new(table)))
+        }
+    }
+
+    /// Get the commit user shared by writers and committers created by this builder.
+    pub fn commit_user(&self) -> &str {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.commit_user(),
+            WriteBuilderKind::Format(builder) => builder.commit_user(),
+        }
+    }
+
+    /// Set the commit user shared by writers and committers created by this builder.
+    pub fn with_commit_user(self, commit_user: impl Into<String>) -> crate::Result<Self> {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => Ok(Self(WriteBuilderKind::Paimon(
+                builder.with_commit_user(commit_user)?,
+            ))),
+            WriteBuilderKind::Format(builder) => Ok(Self(WriteBuilderKind::Format(
+                builder.with_commit_user(commit_user)?,
+            ))),
+        }
+    }
+
+    /// Mark writers created by this builder as overwrite-aware.
+    pub fn with_overwrite(self) -> Self {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => {
+                Self(WriteBuilderKind::Paimon(builder.with_overwrite()))
+            }
+            WriteBuilderKind::Format(builder) => {
+                Self(WriteBuilderKind::Format(builder.with_overwrite()))
+            }
+        }
+    }
+
+    /// Create a new TableCommit for committing write results.
+    pub fn new_commit(&self) -> TableCommit {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_commit(),
+            WriteBuilderKind::Format(builder) => builder.new_commit(),
+        }
+    }
+
+    /// Create a new TableWrite for writing Arrow data.
+    pub fn new_write(&self) -> crate::Result<TableWrite> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_write(),
+            WriteBuilderKind::Format(builder) => builder.new_write(),
+        }
+    }
+
+    /// Create a new TableUpdate for data-evolution row-id updates.
+    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_update(update_columns),
+            WriteBuilderKind::Format(builder) => builder.new_update(update_columns),
+        }
+    }
+
+    /// Create a new writer for data-evolution row-id deletes.
+    pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_delete(),
+            WriteBuilderKind::Format(builder) => builder.new_delete(),
+        }
+    }
+}
+
+struct PaimonWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
     overwrite: bool,
 }
 
-impl<'a> WriteBuilder<'a> {
+impl<'a> PaimonWriteBuilder<'a> {
     pub fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -117,7 +199,7 @@ impl<'a> WriteBuilder<'a> {
     }
 }
 
-fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
+pub(super) fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
     let is_invalid = commit_user.is_empty()
         || commit_user == "."
         || commit_user == ".."

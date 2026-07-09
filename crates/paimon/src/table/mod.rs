@@ -37,6 +37,10 @@ pub mod data_evolution_writer;
 mod data_file_reader;
 mod data_file_writer;
 mod dedicated_format_file_writer;
+mod format_read_builder;
+mod format_table_read;
+mod format_table_scan;
+mod format_write_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
@@ -183,6 +187,10 @@ impl Table {
     /// Get the REST environment, if this table was loaded from a REST catalog.
     pub fn rest_env(&self) -> Option<&RESTEnv> {
         self.rest_env.as_ref()
+    }
+
+    pub(crate) fn is_format_table(&self) -> bool {
+        CoreOptions::new(self.schema.options()).is_format_table()
     }
 
     /// Create a read builder for scan/read.

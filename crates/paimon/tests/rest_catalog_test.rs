@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
@@ -487,6 +487,139 @@ async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
         collect_blob_rows(&batches),
         vec![(2, "Kept".to_string(), Some(b"bob".to_vec()))]
     );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_rest_catalog_reads_format_table() {
+    use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let format_path = format!("file://{}", tmp.path().display());
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+        ],
+    )
+    .unwrap();
+    let file = File::create(tmp.path().join("part-0.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let identifier = Identifier::new("default", "format_users");
+    ctx.server
+        .add_table_with_schema("default", "format_users", schema, &format_path);
+
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(table.location(), format_path);
+    assert_eq!(table.schema().options().get("path"), Some(&format_path));
+    assert!(table.new_write_builder().new_write().is_err());
+
+    let read_builder = table.new_read_builder();
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 1);
+
+    let read = read_builder.new_read().unwrap();
+    let batches = read
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2]);
+    assert_eq!(names.value(0), "alice");
+    assert_eq!(names.value(1), "bob");
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_rest_catalog_prunes_format_table_partition_filter() {
+    use parquet::arrow::ArrowWriter;
+    use std::fs::{create_dir_all, File};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let format_path = format!("file://{}", tmp.path().display());
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    for (dt, id, name) in [("2024-01-01", 1_i64, "alice"), ("2024-01-02", 2_i64, "bob")] {
+        let dir = tmp.path().join(format!("dt={dt}"));
+        create_dir_all(&dir).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(StringArray::from(vec![name])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(dir.join("part-0.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("dt", DataType::VarChar(VarCharType::new(32).unwrap()))
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .partition_keys(["dt"])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let identifier = Identifier::new("default", "format_partitioned_users");
+    ctx.server
+        .add_table_with_schema("default", "format_partitioned_users", schema, &format_path);
+
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("dt", Datum::String("2024-01-02".to_string()))
+        .unwrap();
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(predicate);
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 1);
+    assert!(plan.splits()[0].bucket_path().contains("dt=2024-01-02"));
+
+    let missing_predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("dt", Datum::String("2024-01-03".to_string()))
+        .unwrap();
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(missing_predicate);
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    assert!(plan.splits().is_empty());
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@
 //! and [TypeUtils.project](https://github.com/apache/paimon/blob/master/paimon-common/src/main/java/org/apache/paimon/utils/TypeUtils.java).
 
 use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_predicates};
+use super::format_read_builder::FormatReadBuilder;
 use super::partition_filter::PartitionFilter;
 use super::table_read::TableRead;
 use super::{Table, TableScan};
@@ -108,7 +109,118 @@ fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
 /// Rust keeps a names-based projection API for ergonomics, while aligning the
 /// resulting read semantics with Java Paimon's order-preserving projection.
 #[derive(Debug, Clone)]
-pub struct ReadBuilder<'a> {
+pub struct ReadBuilder<'a>(ReadBuilderKind<'a>);
+
+#[derive(Debug, Clone)]
+enum ReadBuilderKind<'a> {
+    Paimon(PaimonReadBuilder<'a>),
+    Format(FormatReadBuilder<'a>),
+}
+
+impl<'a> ReadBuilder<'a> {
+    pub(crate) fn new(table: &'a Table) -> Self {
+        if table.is_format_table() {
+            Self(ReadBuilderKind::Format(FormatReadBuilder::new(table)))
+        } else {
+            Self(ReadBuilderKind::Paimon(PaimonReadBuilder::new(table)))
+        }
+    }
+
+    /// Set column projection by name. Output order follows the caller-specified order.
+    /// Unknown or duplicate names cause this method to fail; an empty list is a valid
+    /// zero-column projection.
+    pub fn with_projection(&mut self, columns: &[&str]) -> Result<&mut Self> {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_projection(columns)?;
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_projection(columns)?;
+            }
+        }
+        Ok(self)
+    }
+
+    /// Set the full read type, including nested field pruning or connector-defined
+    /// logical read types such as Variant extractions.
+    pub fn with_read_type(&mut self, read_type: Vec<DataField>) -> &mut Self {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_read_type(read_type);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_read_type(read_type);
+            }
+        }
+        self
+    }
+
+    /// Set a filter predicate for scan planning and conservative read pruning.
+    pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_filter(filter);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_filter(filter);
+            }
+        }
+        self
+    }
+
+    /// Whether a translated predicate is exact at the table-provider boundary.
+    pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
+        match &self.0 {
+            ReadBuilderKind::Paimon(builder) => builder.is_exact_filter_pushdown(filter),
+            ReadBuilderKind::Format(builder) => builder.is_exact_filter_pushdown(filter),
+        }
+    }
+
+    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_row_ranges(ranges);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_row_ranges(ranges);
+            }
+        }
+        self
+    }
+
+    /// Push a row-limit hint down to scan planning.
+    pub fn with_limit(&mut self, limit: usize) -> &mut Self {
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_limit(limit);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_limit(limit);
+            }
+        }
+        self
+    }
+
+    /// Create a table scan. Call [TableScan::plan] to get splits.
+    pub fn new_scan(&self) -> TableScan<'a> {
+        match &self.0 {
+            ReadBuilderKind::Paimon(builder) => builder.new_scan(),
+            ReadBuilderKind::Format(builder) => builder.new_scan(),
+        }
+    }
+
+    /// Create a table read for consuming splits (e.g. from a scan plan).
+    pub fn new_read(&self) -> Result<TableRead<'a>> {
+        match &self.0 {
+            ReadBuilderKind::Paimon(builder) => builder.new_read(),
+            ReadBuilderKind::Format(builder) => builder.new_read(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PaimonReadBuilder<'a> {
     table: &'a Table,
     read_type: Option<Vec<DataField>>,
     filter: NormalizedFilter,
@@ -116,7 +228,7 @@ pub struct ReadBuilder<'a> {
     row_ranges: Option<Vec<RowRange>>,
 }
 
-impl<'a> ReadBuilder<'a> {
+impl<'a> PaimonReadBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -336,7 +448,7 @@ pub(super) fn is_system_projection_field(field_id: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ReadBuilder;
+    use super::{PaimonReadBuilder, ReadBuilder, ReadBuilderKind};
     use crate::table::TableRead;
     mod test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
@@ -355,6 +467,13 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
+
+    fn paimon_builder<'a, 'b>(builder: &'b ReadBuilder<'a>) -> &'b PaimonReadBuilder<'a> {
+        match &builder.0 {
+            ReadBuilderKind::Paimon(inner) => inner,
+            ReadBuilderKind::Format(_) => panic!("expected Paimon read builder"),
+        }
+    }
 
     fn collect_int_column(batches: &[RecordBatch], column_name: &str) -> Vec<i32> {
         batches
@@ -877,15 +996,16 @@ mod tests {
         builder.with_filter(filter);
 
         // _ROW_ID predicates should be extracted into row_ranges
-        assert!(builder.row_ranges.is_some());
-        let ranges = builder.row_ranges.as_ref().unwrap();
+        let inner = paimon_builder(&builder);
+        assert!(inner.row_ranges.is_some());
+        let ranges = inner.row_ranges.as_ref().unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].from(), 10);
         assert_eq!(ranges[0].to(), 20);
 
         // _ROW_ID predicates should be removed from data_predicates
-        assert!(!builder.filter.data_predicates.is_empty());
-        for p in &builder.filter.data_predicates {
+        assert!(!inner.filter.data_predicates.is_empty());
+        for p in &inner.filter.data_predicates {
             if let Predicate::Leaf { column, .. } = p {
                 assert_ne!(column, crate::spec::ROW_ID_FIELD_NAME);
             }
@@ -923,7 +1043,7 @@ mod tests {
         builder.with_filter(filter);
 
         // Explicit row_ranges should be preserved, not overwritten
-        let ranges = builder.row_ranges.as_ref().unwrap();
+        let ranges = paimon_builder(&builder).row_ranges.as_ref().unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].from(), 0);
         assert_eq!(ranges[0].to(), 5);

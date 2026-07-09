@@ -54,6 +54,9 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+pub(crate) const TABLE_TYPE_OPTION: &str = "type";
+pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
+pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
@@ -383,6 +386,17 @@ impl<'a> CoreOptions<'a> {
             .get(DATA_EVOLUTION_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    pub fn is_format_table(&self) -> bool {
+        self.options
+            .get(TABLE_TYPE_OPTION)
+            .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
+            .unwrap_or(false)
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.options.get(PATH_OPTION).map(String::as_str)
     }
 
     pub fn global_index_enabled(&self) -> bool {
