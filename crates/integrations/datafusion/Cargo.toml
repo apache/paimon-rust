@@ -29,8 +29,6 @@ keywords = ["paimon", "datafusion", "integrations"]
 
 [features]
 fulltext = ["paimon/fulltext"]
-# Kept for compatibility with existing Cargo.toml feature declarations; Mosaic is always enabled.
-mosaic = ["paimon/mosaic"]
 vortex = ["paimon/vortex"]
 
 [dependencies]

@@ -42,8 +42,6 @@ storage-all = [
     "storage-hdfs",
 ]
 fulltext = ["tantivy", "tempfile"]
-# Kept for compatibility with existing Cargo.toml feature declarations; Mosaic is always enabled.
-mosaic = []
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
