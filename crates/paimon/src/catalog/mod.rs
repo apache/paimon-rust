@@ -377,6 +377,18 @@ pub trait Catalog: Send + Sync {
 
     // ======================= view methods ===============================
 
+    /// Create a persistent view.
+    async fn create_view(
+        &self,
+        _identifier: &Identifier,
+        _schema: ViewSchema,
+        _ignore_if_exists: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support views".to_string(),
+        })
+    }
+
     /// List persistent view names in a database.
     async fn list_views(&self, _database_name: &str) -> Result<Vec<String>> {
         Err(Error::Unsupported {

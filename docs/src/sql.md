@@ -40,9 +40,9 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
-Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, persistent `CREATE VIEW`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
+Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, `CREATE FUNCTION`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
@@ -76,12 +76,41 @@ catalogs; registering a catalog also registers the built-in scalar function
 feature is enabled) against it. It also manages session-scoped dynamic options
 internally for `SET`/`RESET` support.
 
-### Existing REST Catalog Views and SQL Functions
+### REST Catalog Views and SQL Functions
 
 When the registered catalog is a Paimon REST Catalog, `SQLContext` can read and
-execute persistent views and SQL scalar functions that already exist in the
-catalog. This integration is read-only: it does not add `CREATE`, `ALTER`, or
-`DROP` support for persistent views or functions.
+execute persistent views and SQL scalar functions in the catalog. It can also
+create persistent views with this syntax:
+
+```sql
+CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
+```
+
+For example:
+
+```sql
+CREATE VIEW paimon.reporting.daily_orders (order_date, order_count) AS
+SELECT order_date, COUNT(*)
+FROM orders
+GROUP BY order_date;
+```
+
+The defining query is planned before the view is created. Its output types and
+nullability become the stored REST view schema, with field IDs assigned from
+zero. An optional column list changes only the output names and must contain
+exactly one unique name per query column. `IF NOT EXISTS` is passed to the
+catalog so the REST server handles concurrent creates atomically.
+
+Unqualified relations and REST SQL functions in the defining query resolve in
+the new view's owning catalog and database, not the session's current database.
+The canonical query is stored as both the default query and the `datafusion`
+dialect definition.
+
+Persistent `CREATE VIEW` is currently implemented by REST Catalog. Other
+catalog implementations may return `Unsupported`. `CREATE OR REPLACE VIEW`,
+materialized/secure views, view comments or options, vendor-specific modifiers,
+and persistent `ALTER VIEW` / `DROP VIEW` are not supported. Persistent
+`CREATE FUNCTION`, `ALTER FUNCTION`, and `DROP FUNCTION` are also not supported.
 
 Persistent views resolve through the normal DataFusion catalog path, so they
 can be queried wherever a table can be used:

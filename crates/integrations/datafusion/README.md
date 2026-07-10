@@ -26,19 +26,28 @@ This crate contains the integration of [Apache DataFusion](https://datafusion.ap
 
 ## REST Catalog views and SQL functions
 
-`SQLContext` can read persistent views and SQL scalar functions that already exist in a Paimon
-REST Catalog. No view or function DDL is added.
+`SQLContext` can read persistent views and SQL scalar functions in a Paimon REST Catalog. It can
+also create persistent REST Catalog views:
+
+```sql
+CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
+```
 
 - A persistent view is resolved lazily like a table. The `datafusion` dialect is preferred and the
   default view query is used when that dialect is absent. Unqualified relations inside the view
   resolve in the view's owning catalog and database.
+- `CREATE VIEW` infers stored field types and nullability from the defining query. An optional
+  column list overrides names only and must match the query output. Unqualified relations and REST
+  SQL functions are planned in the new view's owning catalog and database. `IF NOT EXISTS` is
+  handled atomically by the catalog.
 - A SQL function can be called as `function(args...)` in the current catalog/database or as
   `catalog.database.function(args...)`. Its `definitions.datafusion` value must be a scalar SQL
   expression, it must be deterministic, and it must declare its input parameters and exactly one
   return parameter.
-- Only reads and execution are supported. Lambda/file functions, named arguments, multiple return
-  values, non-deterministic functions, and calls made directly through a raw DataFusion
-  `SessionContext` are not supported.
+- `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW` /
+  `DROP VIEW`, and persistent function DDL are not supported. Lambda/file functions, named
+  arguments, multiple return values, non-deterministic functions, and calls made directly through
+  a raw DataFusion `SessionContext` are also not supported.
 
 Use `SQLContext::sql` for function expansion:
 
@@ -46,6 +55,7 @@ Use `SQLContext::sql` for function expansion:
 let mut ctx = paimon_datafusion::SQLContext::new();
 ctx.register_catalog("paimon", rest_catalog).await?;
 
+ctx.sql("CREATE VIEW daily_scores AS SELECT normalize_score(score) AS score FROM scores").await?;
 let view = ctx.sql("SELECT * FROM analytics_view").await?;
 let function = ctx.sql("SELECT normalize_score(score) FROM scores").await?;
 ```

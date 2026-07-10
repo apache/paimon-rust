@@ -278,6 +278,22 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn create_view(
+        &self,
+        identifier: &Identifier,
+        schema: crate::catalog::ViewSchema,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .create_view(identifier, schema)
+            .await
+            .map_err(|error| map_rest_error_for_view(error, identifier));
+        ignore_error_if(result, |error| {
+            ignore_if_exists && matches!(error, Error::ViewAlreadyExist { .. })
+        })
+    }
+
     async fn list_views(&self, database_name: &str) -> Result<Vec<String>> {
         self.api
             .list_views(database_name)
@@ -406,6 +422,11 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
 /// Map a REST API error to a catalog-level view error.
 fn map_rest_error_for_view(err: Error, identifier: &Identifier) -> Error {
     match err {
+        Error::RestApi {
+            source: RestError::AlreadyExists { .. },
+        } => Error::ViewAlreadyExist {
+            full_name: identifier.full_name(),
+        },
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::ViewNotExist {

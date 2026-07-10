@@ -111,6 +111,30 @@ async fn test_get_view() {
 }
 
 #[tokio::test]
+async fn test_create_view() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let schema = ViewSchema::new(
+        serde_json::from_value(json!([
+            {"id": 0, "name": "id", "type": "INT"}
+        ]))
+        .unwrap(),
+        "SELECT id FROM source".to_string(),
+        HashMap::from([(
+            "datafusion".to_string(),
+            "SELECT id FROM source".to_string(),
+        )]),
+        None,
+        HashMap::new(),
+    );
+    let identifier = Identifier::new("default", "active_ids");
+
+    ctx.api.create_view(&identifier, schema).await.unwrap();
+
+    let response = ctx.api.get_view(&identifier).await.unwrap();
+    assert_eq!(response.schema.query(), "SELECT id FROM source");
+}
+
+#[tokio::test]
 async fn test_list_views() {
     let ctx = setup_test_server(vec!["default"]).await;
     ctx.server.set_list_page_size(1);

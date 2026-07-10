@@ -30,10 +30,11 @@
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
 //! - `ALTER TABLE db.t RENAME TO new_name`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
+//! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -48,6 +49,7 @@ use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateTable,
     CreateTableOptions, CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName,
@@ -1348,16 +1350,14 @@ impl SQLContext {
             ));
         }
 
-        let view_name = create_view.name.to_string();
-        let table_ref: TableReference = view_name.as_str().into();
-        let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
-
-        // Use DataFusion's SQL planner to convert the sqlparser Query into a LogicalPlan
         let query_sql = create_view.query.to_string();
-        let df = self.ctx.sql(&query_sql).await?;
-        let logical_plan = df.logical_plan().clone();
 
         if create_view.temporary {
+            let view_name = create_view.name.to_string();
+            let table_ref: TableReference = view_name.as_str().into();
+            let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
+            let df = self.ctx.sql(&query_sql).await?;
+            let logical_plan = df.logical_plan().clone();
             if create_view.if_not_exists
                 && self.temp_table_exist(format!("{catalog}.{database}.{name}"))?
             {
@@ -1368,10 +1368,65 @@ impl SQLContext {
             self.register_temp_table(format!("{catalog}.{database}.{name}"), Arc::new(view_table))?;
             ok_result(&self.ctx)
         } else {
-            Err(DataFusionError::Plan(
-                "CREATE VIEW (non-temporary) is not supported. Use CREATE TEMPORARY VIEW instead."
-                    .to_string(),
-            ))
+            validate_persistent_create_view(create_view)?;
+            let (catalog, catalog_name, identifier) =
+                self.resolve_catalog_and_table(&create_view.name)?;
+            let mut state = self.ctx.state();
+            state.config_mut().options_mut().catalog.default_catalog = catalog_name.clone();
+            state.config_mut().options_mut().catalog.default_schema =
+                identifier.database().to_string();
+            let expanded_query = crate::sql_function::expand_sql(
+                &query_sql,
+                &self.catalogs,
+                &catalog_name,
+                identifier.database(),
+            )
+            .await?;
+            let logical_plan = state.create_logical_plan(&expanded_query).await?;
+            let mut arrow_fields = logical_plan
+                .schema()
+                .as_arrow()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            if !create_view.columns.is_empty() && create_view.columns.len() != arrow_fields.len() {
+                return Err(DataFusionError::Plan(format!(
+                    "view column list has {} columns but query produces {} columns",
+                    create_view.columns.len(),
+                    arrow_fields.len()
+                )));
+            }
+            let column_names = create_view
+                .columns
+                .iter()
+                .map(|column| IdentNormalizer::default().normalize(column.name.clone()))
+                .collect::<Vec<_>>();
+            let mut unique_names = HashSet::with_capacity(column_names.len());
+            for name in &column_names {
+                if !unique_names.insert(name.clone()) {
+                    return Err(DataFusionError::Plan(format!(
+                        "duplicate view column name '{name}'"
+                    )));
+                }
+            }
+            for (field, name) in arrow_fields.iter_mut().zip(column_names) {
+                *field = field.clone().with_name(name);
+            }
+            let fields = paimon::arrow::arrow_fields_to_paimon(&arrow_fields)
+                .map_err(to_datafusion_error)?;
+            let schema = paimon::catalog::ViewSchema::new(
+                fields,
+                query_sql.clone(),
+                HashMap::from([("datafusion".to_string(), query_sql)]),
+                None,
+                HashMap::new(),
+            );
+            catalog
+                .create_view(&identifier, schema, create_view.if_not_exists)
+                .await
+                .map_err(to_datafusion_error)?;
+            ok_result(&self.ctx)
         }
     }
 
@@ -1512,6 +1567,72 @@ impl SQLContext {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
     }
+}
+
+fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
+    let unsupported = if create_view.or_alter {
+        Some("CREATE OR ALTER VIEW is not supported")
+    } else if create_view.or_replace {
+        Some("CREATE OR REPLACE VIEW is not supported")
+    } else if create_view.secure {
+        Some("CREATE SECURE VIEW is not supported")
+    } else if create_view.name_before_not_exists {
+        Some("CREATE VIEW with the name before IF NOT EXISTS is not supported")
+    } else {
+        match &create_view.options {
+            CreateTableOptions::None => None,
+            CreateTableOptions::With(_) => Some("CREATE VIEW WITH options are not supported"),
+            CreateTableOptions::Options(_) => Some("CREATE VIEW OPTIONS are not supported"),
+            _ => Some("CREATE VIEW options are not supported"),
+        }
+    };
+    if let Some(message) = unsupported {
+        return Err(DataFusionError::Plan(message.to_string()));
+    }
+    if create_view.comment.is_some() {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW COMMENT is not supported".to_string(),
+        ));
+    }
+    if !create_view.cluster_by.is_empty() {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW CLUSTER BY is not supported".to_string(),
+        ));
+    }
+    if create_view.to.is_some() {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW TO is not supported".to_string(),
+        ));
+    }
+    if create_view.with_no_schema_binding {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW WITH NO SCHEMA BINDING is not supported".to_string(),
+        ));
+    }
+    if create_view.params.is_some() {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW view parameters are not supported".to_string(),
+        ));
+    }
+    if create_view
+        .columns
+        .iter()
+        .any(|column| column.data_type.is_some())
+    {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW column data types are not supported".to_string(),
+        ));
+    }
+    if create_view
+        .columns
+        .iter()
+        .any(|column| column.options.is_some())
+    {
+        return Err(DataFusionError::Plan(
+            "CREATE VIEW column options are not supported".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Quick check whether the SQL looks like a CREATE TABLE statement.
@@ -2882,6 +3003,28 @@ mod tests {
                     full_name: identifier.full_name(),
                 })
         }
+
+        async fn create_view(
+            &self,
+            identifier: &Identifier,
+            schema: paimon::catalog::ViewSchema,
+            ignore_if_exists: bool,
+        ) -> paimon::Result<()> {
+            let mut views = self.views.lock().unwrap();
+            if views.contains_key(identifier) {
+                if ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(paimon::Error::ViewAlreadyExist {
+                    full_name: identifier.full_name(),
+                });
+            }
+            views.insert(
+                identifier.clone(),
+                paimon::catalog::View::new(identifier.clone(), schema),
+            );
+            Ok(())
+        }
     }
 
     async fn make_sql_context(catalog: Arc<MockCatalog>) -> SQLContext {
@@ -2968,6 +3111,315 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_can_be_created_and_read() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        ctx.sql(
+            "CREATE VIEW answer_view AS \
+             SELECT CAST(42 AS BIGINT) AS answer",
+        )
+        .await
+        .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM answer_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_infers_type_and_nullability() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE VIEW paimon.default.inferred_view AS \
+             SELECT CAST(1 AS BIGINT) AS required, CAST(NULL AS BIGINT) AS optional",
+        )
+        .await
+        .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "inferred_view"))
+            .await
+            .unwrap();
+        let fields = view.schema().fields();
+        assert!(matches!(fields[0].data_type(), PaimonDataType::BigInt(_)));
+        assert!(!fields[0].data_type().is_nullable());
+        assert!(matches!(fields[1].data_type(), PaimonDataType::BigInt(_)));
+        assert!(fields[1].data_type().is_nullable());
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_expands_function_in_owning_database() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function_in_database(&catalog, "default", "plus_one", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_one", "x + 100", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.set_current_database("other").await.unwrap();
+
+        ctx.sql(
+            "CREATE VIEW paimon.default.function_view AS \
+             SELECT plus_one(41) AS answer",
+        )
+        .await
+        .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "function_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("datafusion").contains("plus_one(41)"));
+        let batches = ctx
+            .sql("SELECT * FROM paimon.default.function_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_binds_to_owning_database() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "base_view",
+            "SELECT CAST(42 AS BIGINT) AS answer",
+        );
+        let other_schema = serde_json::from_value(serde_json::json!({
+            "fields": [
+                {"id": 0, "name": "answer", "type": "BIGINT"},
+                {"id": 1, "name": "extra", "type": "BIGINT"}
+            ],
+            "query": "SELECT CAST(7 AS BIGINT) AS answer, CAST(8 AS BIGINT) AS extra",
+            "dialects": {},
+            "comment": null,
+            "options": {}
+        }))
+        .unwrap();
+        catalog.add_view(paimon::catalog::View::new(
+            Identifier::new("other", "base_view"),
+            other_schema,
+        ));
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.set_current_database("other").await.unwrap();
+
+        ctx.sql("CREATE VIEW paimon.default.created_view AS SELECT * FROM base_view")
+            .await
+            .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "created_view"))
+            .await
+            .unwrap();
+        assert_eq!(view.schema().fields().len(), 1);
+        assert_eq!(view.schema().fields()[0].name(), "answer");
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_columns_override_names() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE VIEW paimon.default.named_view (renamed) \
+             AS SELECT CAST(42 AS BIGINT) AS answer",
+        )
+        .await
+        .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "named_view"))
+            .await
+            .unwrap();
+        assert_eq!(view.schema().fields()[0].name(), "renamed");
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_rejects_column_count_mismatch() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql(
+                "CREATE VIEW paimon.default.invalid_view (first, second) \
+                 AS SELECT CAST(42 AS BIGINT) AS answer",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("view column list has 2 columns but query produces 1 columns"));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_rejects_duplicate_column_names() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql(
+                "CREATE VIEW paimon.default.invalid_view (duplicate, duplicate) \
+                 AS SELECT CAST(42 AS BIGINT), CAST(7 AS BIGINT)",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate view column name 'duplicate'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_rejects_duplicate_inferred_names() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql(
+                "CREATE VIEW paimon.default.invalid_view AS \
+                 SELECT CAST(42 AS BIGINT) AS duplicate, \
+                        CAST(7 AS BIGINT) AS duplicate",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Projections require unique expression names"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_if_not_exists_preserves_existing_view() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE VIEW paimon.default.existing_view \
+             AS SELECT CAST(1 AS BIGINT) AS answer",
+        )
+        .await
+        .unwrap();
+        ctx.sql(
+            "CREATE VIEW IF NOT EXISTS paimon.default.existing_view \
+             AS SELECT CAST(2 AS BIGINT) AS answer",
+        )
+        .await
+        .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "existing_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("datafusion").contains("CAST(1 AS BIGINT)"));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_rejects_or_replace() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql(
+                "CREATE OR REPLACE VIEW paimon.default.invalid_view \
+                 AS SELECT CAST(1 AS BIGINT) AS answer",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CREATE OR REPLACE VIEW is not supported"));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_rejects_unsupported_clauses() {
+        let cases = [
+            (
+                "CREATE OR ALTER VIEW paimon.default.invalid_view AS SELECT 1",
+                "OR ALTER",
+            ),
+            (
+                "CREATE SECURE VIEW paimon.default.invalid_view AS SELECT 1",
+                "SECURE",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view IF NOT EXISTS AS SELECT 1",
+                "name before IF NOT EXISTS",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view WITH ('key' = 'value') AS SELECT 1",
+                "WITH options",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view OPTIONS(key = 'value') AS SELECT 1",
+                "OPTIONS",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view COMMENT = 'comment' AS SELECT 1",
+                "COMMENT",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view CLUSTER BY (answer) AS SELECT 1 AS answer",
+                "CLUSTER BY",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view TO default.sink AS SELECT 1",
+                "TO",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view AS SELECT 1 WITH NO SCHEMA BINDING",
+                "WITH NO SCHEMA BINDING",
+            ),
+            (
+                "CREATE ALGORITHM = MERGE VIEW paimon.default.invalid_view AS SELECT 1",
+                "view parameters",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view (answer COMMENT 'comment') AS SELECT 1",
+                "column options",
+            ),
+        ];
+
+        for (sql, clause) in cases {
+            let catalog = Arc::new(MockCatalog::new());
+            let ctx = make_sql_context(catalog).await;
+            let error = ctx.sql(sql).await.unwrap_err();
+            assert!(
+                error.to_string().contains(clause),
+                "expected error for {clause}, got: {error}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -76,6 +76,23 @@ pub struct ViewSchema {
 }
 
 impl ViewSchema {
+    /// Create a persistent view schema.
+    pub fn new(
+        fields: Vec<DataField>,
+        query: String,
+        dialects: HashMap<String, String>,
+        comment: Option<String>,
+        options: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            fields,
+            query,
+            dialects,
+            comment,
+            options,
+        }
+    }
+
     /// Declared output fields of the view.
     pub fn fields(&self) -> &[DataField] {
         &self.fields

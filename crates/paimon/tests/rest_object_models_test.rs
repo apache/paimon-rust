@@ -17,9 +17,66 @@
 
 use std::collections::HashMap;
 
+use paimon::api::CreateViewRequest;
 use paimon::catalog::{Function, FunctionDefinition, Identifier, View, ViewSchema};
 use paimon::spec::DataField;
 use serde_json::json;
+
+#[test]
+fn construct_view_schema_contract() {
+    let fields: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "id", "type": "INT"}
+    ]))
+    .unwrap();
+    let schema = ViewSchema::new(
+        fields,
+        "SELECT id FROM source".to_string(),
+        HashMap::from([(
+            "datafusion".to_string(),
+            "SELECT id FROM source".to_string(),
+        )]),
+        None,
+        HashMap::new(),
+    );
+
+    assert_eq!(schema.fields()[0].name(), "id");
+    assert_eq!(schema.query_for("datafusion"), "SELECT id FROM source");
+}
+
+#[test]
+fn create_view_request_serialization_contract() {
+    let fields: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "id", "type": "INT"}
+    ]))
+    .unwrap();
+    let request = CreateViewRequest::new(
+        Identifier::new("analytics", "active_ids"),
+        ViewSchema::new(
+            fields,
+            "SELECT id FROM source".to_string(),
+            HashMap::from([(
+                "datafusion".to_string(),
+                "SELECT id FROM source".to_string(),
+            )]),
+            None,
+            HashMap::new(),
+        ),
+    );
+
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({
+            "identifier": {"database": "analytics", "object": "active_ids"},
+            "schema": {
+                "fields": [{"id": 0, "name": "id", "type": "INT"}],
+                "query": "SELECT id FROM source",
+                "dialects": {"datafusion": "SELECT id FROM source"},
+                "comment": null,
+                "options": {}
+            }
+        })
+    );
+}
 
 #[test]
 fn deserialize_view_schema_contract() {

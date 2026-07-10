@@ -1026,6 +1026,83 @@ async fn test_catalog_get_view() {
 }
 
 #[tokio::test]
+async fn test_catalog_create_view() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = ViewSchema::new(
+        serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "id", "type": "INT"}
+        ]))
+        .unwrap(),
+        "SELECT id FROM source".to_string(),
+        HashMap::from([(
+            "datafusion".to_string(),
+            "SELECT id FROM source".to_string(),
+        )]),
+        None,
+        HashMap::new(),
+    );
+    let identifier = Identifier::new("default", "active_ids");
+
+    ctx.catalog
+        .create_view(&identifier, schema, false)
+        .await
+        .unwrap();
+
+    let view = ctx.catalog.get_view(&identifier).await.unwrap();
+    assert_eq!(view.query_for("datafusion"), "SELECT id FROM source");
+}
+
+#[tokio::test]
+async fn test_catalog_create_view_already_exists() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "active_ids");
+    let schema = ViewSchema::new(
+        Vec::new(),
+        "SELECT 1".to_string(),
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    ctx.catalog
+        .create_view(&identifier, schema.clone(), false)
+        .await
+        .unwrap();
+
+    let error = ctx
+        .catalog
+        .create_view(&identifier, schema, false)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::ViewAlreadyExist { full_name } if full_name == "default.active_ids"
+    ));
+}
+
+#[tokio::test]
+async fn test_catalog_create_view_ignore_if_exists() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "active_ids");
+    let schema = ViewSchema::new(
+        Vec::new(),
+        "SELECT 1".to_string(),
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    ctx.catalog
+        .create_view(&identifier, schema.clone(), false)
+        .await
+        .unwrap();
+
+    ctx.catalog
+        .create_view(&identifier, schema, true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_catalog_list_views() {
     let ctx = setup_catalog(vec!["default"]).await;
     let schema: ViewSchema = serde_json::from_value(serde_json::json!({
@@ -1153,6 +1230,23 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
     let ctx = setup_catalog(vec!["default"]).await;
     ctx.server.set_view_function_endpoints_unsupported();
 
+    assert!(matches!(
+        ctx.catalog
+            .create_view(
+                &Identifier::new("default", "view"),
+                ViewSchema::new(
+                    Vec::new(),
+                    "SELECT 1".to_string(),
+                    HashMap::new(),
+                    None,
+                    HashMap::new(),
+                ),
+                false,
+            )
+            .await
+            .unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
     assert!(matches!(
         ctx.catalog.list_views("default").await.unwrap_err(),
         paimon::Error::Unsupported { .. }

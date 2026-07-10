@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    catalog::Identifier,
+    catalog::{Identifier, ViewSchema},
     spec::{Schema, SchemaChange},
 };
 
@@ -94,6 +94,23 @@ pub struct CreateTableRequest {
 impl CreateTableRequest {
     /// Create a new CreateTableRequest.
     pub fn new(identifier: Identifier, schema: Schema) -> Self {
+        Self { identifier, schema }
+    }
+}
+
+/// Request to create a persistent view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateViewRequest {
+    /// The identifier for the view to create.
+    pub identifier: Identifier,
+    /// The schema and SQL definitions for the view.
+    pub schema: ViewSchema,
+}
+
+impl CreateViewRequest {
+    /// Create a new create-view request.
+    pub fn new(identifier: Identifier, schema: ViewSchema) -> Self {
         Self { identifier, schema }
     }
 }

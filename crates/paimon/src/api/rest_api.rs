@@ -23,14 +23,14 @@
 use std::collections::HashMap;
 
 use crate::api::rest_client::HttpClient;
-use crate::catalog::Identifier;
+use crate::catalog::{Identifier, ViewSchema};
 use crate::common::{CatalogOptions, Options};
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot};
 use crate::Result;
 
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateTableRequest,
-    RenameTableRequest,
+    CreateViewRequest, RenameTableRequest,
 };
 use super::api_response::{
     ConfigResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
@@ -396,6 +396,17 @@ impl RESTApi {
     }
 
     // ==================== View Operations ====================
+
+    /// Create a persistent view.
+    pub async fn create_view(&self, identifier: &Identifier, schema: ViewSchema) -> Result<()> {
+        let database = identifier.database();
+        let view = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (view, "view name")])?;
+        let path = self.resource_paths.views(database);
+        let request = CreateViewRequest::new(identifier.clone(), schema);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
 
     /// List persistent views in a database.
     pub async fn list_views(&self, database: &str) -> Result<Vec<String>> {

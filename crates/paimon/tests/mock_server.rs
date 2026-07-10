@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use paimon::api::{
-    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, ErrorResponse,
-    GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
+    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateViewRequest,
+    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
     ListDatabasesResponse, ListFunctionsResponse, ListTablesResponse, ListViewsResponse,
     RenameTableRequest, ResourcePaths,
 };
@@ -397,6 +397,52 @@ impl RESTServer {
             Json(ListViewsResponse::new(views, next_page_token)),
         )
             .into_response()
+    }
+
+    /// Handle POST /databases/:db/views - create a persistent view.
+    pub async fn create_view(
+        Path(db): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateViewRequest>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+        let view = request.identifier.object().to_string();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
+        if !s.databases.contains_key(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db.clone()),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        }
+        let key = format!("{db}.{view}");
+        if s.views.contains_key(&key) {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Already Exists".to_string()),
+                Some(409),
+            );
+            return (StatusCode::CONFLICT, Json(err)).into_response();
+        }
+        let response = GetViewResponse::new(
+            Some(view.clone()),
+            Some(view),
+            request.schema,
+            AuditRESTResponse::new(None, None, None, None, None),
+        );
+        s.views.insert(key, response);
+        (StatusCode::OK, Json(serde_json::json!(""))).into_response()
     }
 
     /// Handle GET /databases/:db/functions/:function - get a persistent function.
@@ -945,7 +991,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/views"),
-            get(RESTServer::list_views),
+            get(RESTServer::list_views).post(RESTServer::create_view),
         )
         .route(
             &format!("{prefix}/databases/:db/views/:view"),
