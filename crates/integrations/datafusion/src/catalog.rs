@@ -48,6 +48,7 @@ pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Se
 /// This provider uses lazy loading - databases and tables are fetched
 /// on-demand from the catalog, ensuring data is always fresh.
 pub struct PaimonCatalogProvider {
+    catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
     /// Session-scoped dynamic options shared with the SQL context.
@@ -61,7 +62,6 @@ pub struct PaimonCatalogProvider {
     /// becoming invisible or stale, which is recoverable by re-registering it.
     temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
     blob_reader_registry: BlobReaderRegistry,
-    catalog_name: Option<String>,
     session_state: Option<SessionStateProvider>,
 }
 
@@ -74,34 +74,20 @@ impl Debug for PaimonCatalogProvider {
 impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
     ///
-    /// For standalone use without `SET`/`RESET` support.
-    /// When used via [`SQLContext`], the handler creates the provider
-    /// internally with shared dynamic options.
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        PaimonCatalogProvider {
-            catalog,
-            dynamic_options: Default::default(),
-            temp_tables: Arc::new(RwLock::new(HashMap::new())),
-            blob_reader_registry: BlobReaderRegistry::default(),
-            catalog_name: None,
-            session_state: None,
-        }
-    }
-
-    pub(crate) fn with_dynamic_options(
+    pub fn new(
+        catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
         blob_reader_registry: BlobReaderRegistry,
-        catalog_name: String,
-        session_state: SessionStateProvider,
+        session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonCatalogProvider {
+            catalog_name,
             catalog,
             dynamic_options,
             temp_tables: Arc::new(RwLock::new(HashMap::new())),
             blob_reader_registry,
-            catalog_name: Some(catalog_name),
-            session_state: Some(session_state),
+            session_state,
         }
     }
 }

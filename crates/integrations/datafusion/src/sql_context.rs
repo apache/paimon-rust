@@ -180,12 +180,12 @@ impl SQLContext {
             Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
         self.ctx.register_catalog(
             &catalog_name,
-            Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
+            Arc::new(crate::catalog::PaimonCatalogProvider::new(
+                Some(catalog_name.clone()),
                 catalog.clone(),
                 self.dynamic_options.clone(),
                 self.blob_reader_registry.clone(),
-                catalog_name.clone(),
-                session_state,
+                Some(session_state),
             )),
         );
         register_table_functions(&self.ctx, &catalog, default_db.unwrap_or("default"));

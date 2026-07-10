@@ -622,7 +622,13 @@ async fn test_drop_schema() {
 #[tokio::test]
 async fn test_schema_names_via_catalog_provider() {
     let (_tmp, catalog) = create_test_env();
-    let provider = PaimonCatalogProvider::new(catalog.clone());
+    let provider = PaimonCatalogProvider::new(
+        None,
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    );
 
     catalog
         .create_database("db_a", false, Default::default())
