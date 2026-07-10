@@ -87,9 +87,10 @@ pub(crate) async fn expand_statement(
                     "REST SQL function expansion exceeded the reference limit of {MAX_FUNCTION_REFERENCES}"
                 )));
             }
-            let catalog = catalogs.get(&reference.0).ok_or_else(|| {
-                DataFusionError::Plan(format!("Unknown catalog '{}'", reference.0))
-            })?;
+            let Some(catalog) = catalogs.get(&reference.0) else {
+                functions.insert(reference, None);
+                continue;
+            };
             let function = match catalog.get_function(&reference.1).await {
                 Ok(function) => Some(function),
                 Err(paimon::Error::FunctionNotExist { .. })
@@ -405,5 +406,23 @@ fn bare_function_name(function: &datafusion::sql::sqlparser::ast::Function) -> O
     match function.name.0.as_slice() {
         [part] => part.as_ident().cloned(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::expand_sql;
+
+    #[tokio::test]
+    async fn leaves_bare_functions_for_datafusion_without_a_paimon_catalog() {
+        let sql = "SELECT vector_from_json('[1, 2.5]')";
+
+        let expanded = expand_sql(sql, &HashMap::new(), "datafusion", "public")
+            .await
+            .unwrap();
+
+        assert_eq!(expanded, sql);
     }
 }
