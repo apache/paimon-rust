@@ -33,6 +33,8 @@ impl ResourcePaths {
     const TABLES: &'static str = "tables";
     const TABLE_DETAILS: &'static str = "table-details";
     const PARTITIONS: &'static str = "partitions";
+    const VIEWS: &'static str = "views";
+    const FUNCTIONS: &'static str = "functions";
 
     /// Create a new ResourcePaths with the given prefix.
     pub fn new(prefix: &str) -> Self {
@@ -102,6 +104,46 @@ impl ResourcePaths {
             RESTUtil::encode_string(database_name),
             Self::TABLES,
             RESTUtil::encode_string(table_name)
+        )
+    }
+
+    /// Get the views endpoint path for a database.
+    pub fn views(&self, database_name: &str) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.base_path,
+            Self::DATABASES,
+            RESTUtil::encode_string(database_name),
+            Self::VIEWS
+        )
+    }
+
+    /// Get a specific view endpoint path.
+    pub fn view(&self, database_name: &str, view_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.views(database_name),
+            RESTUtil::encode_string(view_name)
+        )
+    }
+
+    /// Get the functions endpoint path for a database.
+    pub fn functions(&self, database_name: &str) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.base_path,
+            Self::DATABASES,
+            RESTUtil::encode_string(database_name),
+            Self::FUNCTIONS
+        )
+    }
+
+    /// Get a specific function endpoint path.
+    pub fn function(&self, database_name: &str, function_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.functions(database_name),
+            RESTUtil::encode_string(function_name)
         )
     }
 
@@ -203,5 +245,41 @@ mod tests {
     #[test]
     fn test_config_path() {
         assert_eq!(ResourcePaths::config(), "/v1/config");
+    }
+
+    #[test]
+    fn test_views_path_encodes_database() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.views("analytics db"),
+            "/v1/catalog/databases/analytics+db/views"
+        );
+    }
+
+    #[test]
+    fn test_view_path_encodes_object_name() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.view("analytics", "active ids"),
+            "/v1/catalog/databases/analytics/views/active+ids"
+        );
+    }
+
+    #[test]
+    fn test_functions_path_encodes_database() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.functions("analytics db"),
+            "/v1/catalog/databases/analytics+db/functions"
+        );
+    }
+
+    #[test]
+    fn test_function_path_encodes_object_name() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.function("analytics", "rectangle area"),
+            "/v1/catalog/databases/analytics/functions/rectangle+area"
+        );
     }
 }

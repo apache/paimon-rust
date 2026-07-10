@@ -175,12 +175,17 @@ impl SQLContext {
                 Err(e) => return Err(DataFusionError::External(Box::new(e))),
             }
         }
+        let weak_state = self.ctx.state_weak_ref();
+        let session_state: crate::catalog::SessionStateProvider =
+            Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
         self.ctx.register_catalog(
             &catalog_name,
             Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
                 catalog.clone(),
                 self.dynamic_options.clone(),
                 self.blob_reader_registry.clone(),
+                catalog_name.clone(),
+                session_state,
             )),
         );
         register_table_functions(&self.ctx, &catalog, default_db.unwrap_or("default"));
@@ -474,6 +479,24 @@ impl SQLContext {
                     func,
                 )
                 .await
+            }
+            Statement::Query(_) => {
+                let current_catalog = self.current_catalog_name();
+                let current_database = self
+                    .ctx
+                    .state()
+                    .config_options()
+                    .catalog
+                    .default_schema
+                    .clone();
+                let expanded = crate::sql_function::expand_statement(
+                    statements[0].clone(),
+                    &self.catalogs,
+                    &current_catalog,
+                    &current_database,
+                )
+                .await?;
+                self.ctx.sql(&expanded.to_string()).await
             }
             _ => self.ctx.sql(sql).await,
         }
@@ -2653,7 +2676,9 @@ mod tests {
 
     use async_trait::async_trait;
     use paimon::catalog::Database;
-    use paimon::spec::{DataType as PaimonDataType, IntType, Schema as PaimonSchema};
+    use paimon::spec::{
+        DataField as PaimonDataField, DataType as PaimonDataType, IntType, Schema as PaimonSchema,
+    };
     use paimon::table::Table;
 
     // ==================== Mock Catalog ====================
@@ -2681,6 +2706,8 @@ mod tests {
     struct MockCatalog {
         calls: Mutex<Vec<CatalogCall>>,
         existing_table: Mutex<Option<Table>>,
+        functions: Mutex<HashMap<Identifier, paimon::catalog::Function>>,
+        views: Mutex<HashMap<Identifier, paimon::catalog::View>>,
     }
 
     impl MockCatalog {
@@ -2688,11 +2715,27 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 existing_table: Mutex::new(None),
+                functions: Mutex::new(HashMap::new()),
+                views: Mutex::new(HashMap::new()),
             }
         }
 
         fn take_calls(&self) -> Vec<CatalogCall> {
             std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+
+        fn add_function(&self, function: paimon::catalog::Function) {
+            self.functions
+                .lock()
+                .unwrap()
+                .insert(function.identifier().clone(), function);
+        }
+
+        fn add_view(&self, view: paimon::catalog::View) {
+            self.views
+                .lock()
+                .unwrap()
+                .insert(view.identifier().clone(), view);
         }
     }
 
@@ -2710,9 +2753,7 @@ mod tests {
             Ok(())
         }
         async fn get_database(&self, _name: &str) -> paimon::Result<Database> {
-            Err(paimon::Error::DatabaseNotExist {
-                database: _name.to_string(),
-            })
+            Ok(Database::new(_name.to_string(), HashMap::new(), None))
         }
         async fn drop_database(
             &self,
@@ -2779,12 +2820,522 @@ mod tests {
             });
             Ok(())
         }
+
+        async fn list_functions(&self, database_name: &str) -> paimon::Result<Vec<String>> {
+            Ok(self
+                .functions
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|identifier| identifier.database() == database_name)
+                .map(|identifier| identifier.object().to_string())
+                .collect())
+        }
+
+        async fn get_function(
+            &self,
+            identifier: &Identifier,
+        ) -> paimon::Result<paimon::catalog::Function> {
+            self.functions
+                .lock()
+                .unwrap()
+                .get(identifier)
+                .cloned()
+                .ok_or_else(|| paimon::Error::FunctionNotExist {
+                    full_name: identifier.full_name(),
+                })
+        }
+
+        async fn list_views(&self, database_name: &str) -> paimon::Result<Vec<String>> {
+            Ok(self
+                .views
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|identifier| identifier.database() == database_name)
+                .map(|identifier| identifier.object().to_string())
+                .collect())
+        }
+
+        async fn get_view(&self, identifier: &Identifier) -> paimon::Result<paimon::catalog::View> {
+            self.views
+                .lock()
+                .unwrap()
+                .get(identifier)
+                .cloned()
+                .ok_or_else(|| paimon::Error::ViewNotExist {
+                    full_name: identifier.full_name(),
+                })
+        }
     }
 
     async fn make_sql_context(catalog: Arc<MockCatalog>) -> SQLContext {
         let mut ctx = SQLContext::new();
         ctx.register_catalog("paimon", catalog).await.unwrap();
         ctx
+    }
+
+    fn add_unary_sql_function(
+        catalog: &MockCatalog,
+        name: &str,
+        definition: &str,
+        deterministic: bool,
+    ) {
+        add_unary_sql_function_in_database(catalog, "default", name, definition, deterministic);
+    }
+
+    fn add_unary_sql_function_in_database(
+        catalog: &MockCatalog,
+        database: &str,
+        name: &str,
+        definition: &str,
+        deterministic: bool,
+    ) {
+        let input_params: Vec<PaimonDataField> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "x", "type": "BIGINT"}
+        ]))
+        .unwrap();
+        let return_params: Vec<PaimonDataField> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "result", "type": "BIGINT"}
+        ]))
+        .unwrap();
+        catalog.add_function(paimon::catalog::Function::new(
+            Identifier::new(database, name),
+            Some(input_params),
+            Some(return_params),
+            deterministic,
+            HashMap::from([(
+                "datafusion".to_string(),
+                paimon::catalog::FunctionDefinition::Sql {
+                    definition: definition.to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        ));
+    }
+
+    fn add_plus_one_function(catalog: &MockCatalog) {
+        add_unary_sql_function(catalog, "plus_one", "x + 1", true);
+    }
+
+    fn add_constant_view(catalog: &MockCatalog) {
+        let schema = serde_json::from_value(serde_json::json!({
+            "fields": [
+                {"id": 0, "name": "answer", "type": "BIGINT"}
+            ],
+            "query": "SELECT CAST(0 AS BIGINT) AS answer",
+            "dialects": {
+                "datafusion": "SELECT CAST(42 AS INT) AS source_answer"
+            },
+            "comment": null,
+            "options": {}
+        }))
+        .unwrap();
+        catalog.add_view(paimon::catalog::View::new(
+            Identifier::new("default", "answer_view"),
+            schema,
+        ));
+    }
+
+    fn add_bigint_view(catalog: &MockCatalog, database: &str, name: &str, query: &str) {
+        let schema = serde_json::from_value(serde_json::json!({
+            "fields": [
+                {"id": 0, "name": "answer", "type": "BIGINT"}
+            ],
+            "query": query,
+            "dialects": {},
+            "comment": null,
+            "options": {}
+        }))
+        .unwrap();
+        catalog.add_view(paimon::catalog::View::new(
+            Identifier::new(database, name),
+            schema,
+        ));
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_view_is_planned_lazily() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_constant_view(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT * FROM answer_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_view_can_call_bare_sql_function() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let schema = serde_json::from_value(serde_json::json!({
+            "fields": [
+                {"id": 0, "name": "answer", "type": "BIGINT"}
+            ],
+            "query": "SELECT plus_one(41) AS answer",
+            "dialects": {},
+            "comment": null,
+            "options": {}
+        }))
+        .unwrap();
+        catalog.add_view(paimon::catalog::View::new(
+            Identifier::new("default", "function_view"),
+            schema,
+        ));
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT * FROM function_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_view_is_discoverable_from_schema_provider() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_constant_view(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let schema = ctx
+            .ctx
+            .catalog("paimon")
+            .unwrap()
+            .schema("default")
+            .unwrap();
+
+        assert!(schema.table_names().contains(&"answer_view".to_string()));
+        assert!(schema.table_exist("answer_view"));
+    }
+
+    #[tokio::test]
+    async fn nested_rest_catalog_view_binds_bare_names_to_owning_database() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "base_view",
+            "SELECT CAST(42 AS BIGINT) AS answer",
+        );
+        add_bigint_view(
+            &catalog,
+            "other",
+            "base_view",
+            "SELECT CAST(7 AS BIGINT) AS answer",
+        );
+        add_bigint_view(&catalog, "default", "outer_view", "SELECT * FROM base_view");
+        let ctx = make_sql_context(catalog).await;
+        ctx.set_current_database("other").await.unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM paimon.default.outer_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn recursive_rest_catalog_views_are_rejected() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "first_view",
+            "SELECT * FROM second_view",
+        );
+        add_bigint_view(
+            &catalog,
+            "default",
+            "second_view",
+            "SELECT * FROM first_view",
+        );
+        let ctx = make_sql_context(catalog).await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ctx.sql("SELECT * FROM first_view"),
+        )
+        .await
+        .expect("recursive view planning should terminate")
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("recursive REST catalog view"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_view_rejects_non_query_sql() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "unsafe_view",
+            "DELETE FROM missing_table",
+        );
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql("SELECT * FROM unsafe_view")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("read-only query"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_rest_sql_function_is_expanded() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT plus_one(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_accepts_outer_column_argument() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT plus_one(x) AS answer FROM (VALUES (41)) AS t(x)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn fully_qualified_rest_sql_function_is_expanded() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT paimon.default.plus_one(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_result_is_cast_to_declared_type() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "narrow_body", "CAST(x AS INT)", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT narrow_body(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 41);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_rejects_undeclared_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "captures_column", "x + y", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql("SELECT captures_column(41)")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("undeclared identifier 'y'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_deterministic_rest_sql_function_is_rejected() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "unsafe_plus_one", "x + 1", false);
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql("SELECT unsafe_plus_one(41)")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("non-deterministic"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_without_single_return_is_rejected() {
+        let catalog = Arc::new(MockCatalog::new());
+        let input_params: Vec<PaimonDataField> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "x", "type": "BIGINT"}
+        ]))
+        .unwrap();
+        catalog.add_function(paimon::catalog::Function::new(
+            Identifier::new("default", "missing_return"),
+            Some(input_params),
+            None,
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                paimon::catalog::FunctionDefinition::Sql {
+                    definition: "x + 1".to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        ));
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx
+            .sql("SELECT missing_return(41)")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("exactly one return parameter"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_rest_sql_functions_are_expanded() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        add_unary_sql_function(&catalog, "plus_two", "plus_one(x) + 1", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT plus_two(40) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn nested_rest_sql_function_binds_to_owning_database() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "plus_one", "x + 100", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_one", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_two", "plus_one(x) + 1", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT paimon.other.plus_two(40) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn recursive_rest_sql_functions_are_rejected() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "first", "second(x)", true);
+        add_unary_sql_function(&catalog, "second", "first(x)", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx.sql("SELECT first(1)").await.unwrap_err().to_string();
+
+        assert!(error.contains("recursive"), "unexpected error: {error}");
     }
 
     // ==================== register_catalog_with_default_db tests ====================

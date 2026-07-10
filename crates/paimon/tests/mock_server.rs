@@ -35,20 +35,43 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, ErrorResponse,
-    GetDatabaseResponse, GetTableResponse, ListDatabasesResponse, ListTablesResponse,
+    GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListTablesResponse, ListViewsResponse,
     RenameTableRequest, ResourcePaths,
 };
+use paimon::catalog::Function;
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
     databases: HashMap<String, GetDatabaseResponse>,
     tables: HashMap<String, GetTableResponse>,
+    views: HashMap<String, GetViewResponse>,
+    functions: HashMap<String, GetFunctionResponse>,
+    list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
     ecs_token: Option<serde_json::Value>,
+}
+
+fn paginate_names(
+    names: Vec<String>,
+    params: &HashMap<String, String>,
+    page_size: Option<usize>,
+) -> (Vec<String>, Option<String>) {
+    let Some(page_size) = page_size else {
+        return (names, None);
+    };
+    let offset = params
+        .get("pageToken")
+        .and_then(|token| token.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(names.len());
+    let end = (offset + page_size).min(names.len());
+    let next_page_token = (end < names.len()).then(|| end.to_string());
+    (names[offset..end].to_vec(), next_page_token)
 }
 
 #[derive(Clone)]
@@ -313,6 +336,88 @@ impl RESTServer {
 
         let response = ListTablesResponse::new(Some(tables), None);
         (StatusCode::OK, Json(response)).into_response()
+    }
+
+    /// Handle GET /databases/:db/views/:view - get a persistent view.
+    pub async fn get_view(
+        Path((db, view)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let key = format!("{db}.{view}");
+        if let Some(response) = s.views.get(&key) {
+            (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle GET /databases/:db/views - list persistent views.
+    pub async fn list_views(
+        Path(db): Path<String>,
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let prefix = format!("{db}.");
+        let mut views: Vec<String> = s
+            .views
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
+            .collect();
+        views.sort();
+        let (views, next_page_token) = paginate_names(views, &params, s.list_page_size);
+        (
+            StatusCode::OK,
+            Json(ListViewsResponse::new(views, next_page_token)),
+        )
+    }
+
+    /// Handle GET /databases/:db/functions/:function - get a persistent function.
+    pub async fn get_function(
+        Path((db, function)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let key = format!("{db}.{function}");
+        if let Some(response) = s.functions.get(&key) {
+            (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle GET /databases/:db/functions - list persistent functions.
+    pub async fn list_functions(
+        Path(db): Path<String>,
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let prefix = format!("{db}.");
+        let mut functions: Vec<String> = s
+            .functions
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
+            .collect();
+        functions.sort();
+        let (functions, next_page_token) = paginate_names(functions, &params, s.list_page_size);
+        (
+            StatusCode::OK,
+            Json(ListFunctionsResponse::new(functions, next_page_token)),
+        )
     }
 
     /// Handle POST /databases/:db/tables - create a new table.
@@ -602,6 +707,36 @@ impl RESTServer {
         });
     }
 
+    /// Add a persistent view to the server state.
+    pub fn add_view(&self, database: &str, view: &str, schema: paimon::catalog::ViewSchema) {
+        let mut s = self.inner.lock().unwrap();
+        let key = format!("{database}.{view}");
+        s.views.insert(
+            key,
+            GetViewResponse::new(
+                Some(view.to_string()),
+                Some(view.to_string()),
+                schema,
+                AuditRESTResponse::new(None, None, None, None, None),
+            ),
+        );
+    }
+
+    /// Add a persistent function to the server state.
+    pub fn add_function(&self, function: Function) {
+        let key = function.full_name();
+        let response = GetFunctionResponse::from_function(
+            &function,
+            AuditRESTResponse::new(None, None, None, None, None),
+        );
+        self.inner.lock().unwrap().functions.insert(key, response);
+    }
+
+    /// Force list-view and list-function handlers to paginate at this size.
+    pub fn set_list_page_size(&self, page_size: usize) {
+        self.inner.lock().unwrap().list_page_size = Some(page_size.max(1));
+    }
+
     /// Add a table with schema and path to the server state.
     ///
     /// This is needed for `RESTCatalog::get_table` which requires
@@ -760,6 +895,22 @@ pub async fn start_mock_server(
             get(RESTServer::get_table)
                 .post(RESTServer::alter_table)
                 .delete(RESTServer::drop_table),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/views"),
+            get(RESTServer::list_views),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/views/:view"),
+            get(RESTServer::get_view),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/functions"),
+            get(RESTServer::list_functions),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/functions/:function"),
+            get(RESTServer::get_function),
         )
         .route(
             &format!("{prefix}/tables/rename"),

@@ -22,7 +22,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::spec::Schema;
+use crate::catalog::{Function, FunctionDefinition, ViewSchema};
+use crate::spec::{DataField, Schema};
 
 /// Error response from REST API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +129,81 @@ pub struct GetTableResponse {
     pub schema_id: Option<i64>,
     /// The schema of the table.
     pub schema: Option<Schema>,
+}
+
+/// Response for getting a persistent view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetViewResponse {
+    /// Audit information.
+    #[serde(flatten)]
+    pub audit: AuditRESTResponse,
+    /// The unique identifier of the view.
+    pub id: Option<String>,
+    /// The name of the view.
+    pub name: Option<String>,
+    /// Stored view schema and SQL representations.
+    pub schema: ViewSchema,
+}
+
+/// Response for getting a persistent function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFunctionResponse {
+    /// Audit information.
+    #[serde(flatten)]
+    pub audit: AuditRESTResponse,
+    /// The unique identifier of the function.
+    pub uuid: Option<String>,
+    /// The name of the function.
+    pub name: Option<String>,
+    /// Declared input parameters.
+    pub input_params: Option<Vec<DataField>>,
+    /// Declared return parameters.
+    pub return_params: Option<Vec<DataField>>,
+    /// Whether the function is deterministic.
+    pub deterministic: bool,
+    /// Engine-specific function definitions.
+    pub definitions: HashMap<String, FunctionDefinition>,
+    /// Optional function comment.
+    pub comment: Option<String>,
+    /// Function options.
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+}
+
+impl GetFunctionResponse {
+    /// Create a response from a catalog function.
+    pub fn from_function(function: &Function, audit: AuditRESTResponse) -> Self {
+        Self {
+            audit,
+            uuid: None,
+            name: Some(function.name().to_string()),
+            input_params: function.input_params().map(<[DataField]>::to_vec),
+            return_params: function.return_params().map(<[DataField]>::to_vec),
+            deterministic: function.is_deterministic(),
+            definitions: function.definitions().clone(),
+            comment: function.comment().map(ToString::to_string),
+            options: function.options().clone(),
+        }
+    }
+}
+
+impl GetViewResponse {
+    /// Create a new get-view response.
+    pub fn new(
+        id: Option<String>,
+        name: Option<String>,
+        schema: ViewSchema,
+        audit: AuditRESTResponse,
+    ) -> Self {
+        Self {
+            audit,
+            id,
+            name,
+            schema,
+        }
+    }
 }
 
 impl GetTableResponse {
@@ -246,6 +322,46 @@ pub struct ListTablesResponse {
     pub tables: Option<Vec<String>>,
     /// Token for the next page.
     pub next_page_token: Option<String>,
+}
+
+/// Response for listing persistent views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListViewsResponse {
+    /// View names.
+    pub views: Option<Vec<String>>,
+    /// Token for the next page.
+    pub next_page_token: Option<String>,
+}
+
+/// Response for listing persistent functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListFunctionsResponse {
+    /// Function names.
+    pub functions: Option<Vec<String>>,
+    /// Token for the next page.
+    pub next_page_token: Option<String>,
+}
+
+impl ListFunctionsResponse {
+    /// Create a list-functions response.
+    pub fn new(functions: Vec<String>, next_page_token: Option<String>) -> Self {
+        Self {
+            functions: Some(functions),
+            next_page_token,
+        }
+    }
+}
+
+impl ListViewsResponse {
+    /// Create a list-views response.
+    pub fn new(views: Vec<String>, next_page_token: Option<String>) -> Self {
+        Self {
+            views: Some(views),
+            next_page_token,
+        }
+    }
 }
 
 impl ListTablesResponse {

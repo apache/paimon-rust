@@ -76,6 +76,60 @@ catalogs; registering a catalog also registers the built-in scalar function
 feature is enabled) against it. It also manages session-scoped dynamic options
 internally for `SET`/`RESET` support.
 
+### Existing REST Catalog Views and SQL Functions
+
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read and
+execute persistent views and SQL scalar functions that already exist in the
+catalog. This integration is read-only: it does not add `CREATE`, `ALTER`, or
+`DROP` support for persistent views or functions.
+
+Persistent views resolve through the normal DataFusion catalog path, so they
+can be queried wherever a table can be used:
+
+```sql
+SELECT * FROM analytics_view;
+SELECT * FROM paimon.reporting.daily_orders;
+```
+
+For a view, the `datafusion` entry in `schema.dialects` is preferred. If that
+entry is absent, DataFusion uses the view's default `schema.query`. Unqualified
+relations inside the stored query resolve against the view's owning catalog and
+database, not the caller's current database. The REST-declared output fields
+are authoritative: query results are matched by position, renamed to the
+declared field names, and cast to the declared types. Recursive view
+dependencies are rejected during planning.
+
+REST SQL scalar functions support bare names in the current catalog/database
+and fully qualified three-part names:
+
+```sql
+SELECT normalize_score(score) FROM scores;
+SELECT paimon.reporting.normalize_score(score) FROM scores;
+```
+
+A function is executable only when all of the following are true:
+
+- `definitions.datafusion` exists and has `type: "sql"`;
+- input parameters are declared and the call supplies the exact number of
+  positional expression arguments;
+- exactly one return parameter is declared;
+- the function is deterministic;
+- the SQL definition is a scalar expression that references inputs by their
+  declared parameter names.
+
+Nested REST SQL functions are supported. Bare function names inside a stored
+definition resolve in that function's owning catalog/database. Recursive
+function dependencies, missing DataFusion SQL definitions, undeclared
+identifiers, named arguments, and incompatible return types fail during
+planning. If no REST function exists for a bare name, normal DataFusion
+built-in or registered-function resolution continues.
+
+Function expansion is implemented by `SQLContext::sql`. Queries executed
+directly through a raw DataFusion `SessionContext` do not expand REST SQL
+functions. Two-part function names such as `database.function(...)`, lambda or
+file definitions, aggregate/table/multi-return functions, and non-deterministic
+functions are not supported by this read-only integration.
+
 ## Data Types
 
 The following SQL data types are supported in CREATE TABLE and mapped to their corresponding Paimon types:

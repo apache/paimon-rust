@@ -52,6 +52,7 @@ mod procedures;
 mod relation_planner;
 pub mod runtime;
 mod sql_context;
+mod sql_function;
 mod system_tables;
 mod table;
 mod table_function_args;

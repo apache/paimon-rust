@@ -27,11 +27,11 @@ use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, RecordBatch, Strin
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
-use paimon::catalog::{Catalog, Identifier, RESTCatalog};
+use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
-    BigIntType, BlobType, BlobViewStruct, DataType, Datum, IntType, PredicateBuilder, Schema,
-    SchemaChange, VarCharType,
+    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PredicateBuilder,
+    Schema, SchemaChange, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -997,4 +997,153 @@ async fn test_catalog_multiple_databases_with_tables() {
     let tables_db2 = ctx.catalog.list_tables("db2").await.unwrap();
     assert_eq!(tables_db2.len(), 1);
     assert!(tables_db2.contains(&"table1_db2".to_string()));
+}
+
+#[tokio::test]
+async fn test_catalog_get_view() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema: ViewSchema = serde_json::from_value(serde_json::json!({
+        "fields": [{"id": 0, "name": "id", "type": "INT"}],
+        "query": "SELECT id FROM source",
+        "dialects": {"datafusion": "SELECT id FROM source WHERE id > 0"},
+        "comment": null,
+        "options": {}
+    }))
+    .unwrap();
+    ctx.server.add_view("default", "active_ids", schema);
+
+    let view = ctx
+        .catalog
+        .get_view(&Identifier::new("default", "active_ids"))
+        .await
+        .unwrap();
+
+    assert_eq!(view.full_name(), "default.active_ids");
+    assert_eq!(
+        view.query_for("datafusion"),
+        "SELECT id FROM source WHERE id > 0"
+    );
+}
+
+#[tokio::test]
+async fn test_catalog_list_views() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema: ViewSchema = serde_json::from_value(serde_json::json!({
+        "fields": [{"id": 0, "name": "id", "type": "INT"}],
+        "query": "SELECT 1 AS id",
+        "dialects": {},
+        "comment": null,
+        "options": {}
+    }))
+    .unwrap();
+    ctx.server.add_view("default", "v2", schema.clone());
+    ctx.server.add_view("default", "v1", schema);
+
+    assert_eq!(
+        ctx.catalog.list_views("default").await.unwrap(),
+        vec!["v1", "v2"]
+    );
+}
+
+#[tokio::test]
+async fn test_catalog_get_function() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let input_params: Vec<DataField> = serde_json::from_value(serde_json::json!([
+        {"id": 0, "name": "x", "type": "INT"}
+    ]))
+    .unwrap();
+    let return_params: Vec<DataField> = serde_json::from_value(serde_json::json!([
+        {"id": 0, "name": "result", "type": "INT"}
+    ]))
+    .unwrap();
+    ctx.server.add_function(Function::new(
+        Identifier::new("default", "plus_one"),
+        Some(input_params),
+        Some(return_params),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "x + 1".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    ));
+
+    let function = ctx
+        .catalog
+        .get_function(&Identifier::new("default", "plus_one"))
+        .await
+        .unwrap();
+
+    assert_eq!(function.full_name(), "default.plus_one");
+    assert_eq!(
+        function
+            .definition("datafusion")
+            .and_then(FunctionDefinition::sql),
+        Some("x + 1")
+    );
+}
+
+#[tokio::test]
+async fn test_catalog_list_functions() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let return_params: Vec<DataField> = serde_json::from_value(serde_json::json!([
+        {"id": 0, "name": "result", "type": "INT"}
+    ]))
+    .unwrap();
+    for name in ["zeta", "alpha"] {
+        ctx.server.add_function(Function::new(
+            Identifier::new("default", name),
+            Some(Vec::new()),
+            Some(return_params.clone()),
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                FunctionDefinition::Sql {
+                    definition: "1".to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        ));
+    }
+
+    assert_eq!(
+        ctx.catalog.list_functions("default").await.unwrap(),
+        vec!["alpha", "zeta"]
+    );
+}
+
+#[tokio::test]
+async fn test_catalog_get_missing_view_maps_error() {
+    let ctx = setup_catalog(vec!["default"]).await;
+
+    let error = ctx
+        .catalog
+        .get_view(&Identifier::new("default", "missing"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::ViewNotExist { full_name } if full_name == "default.missing"
+    ));
+}
+
+#[tokio::test]
+async fn test_catalog_get_missing_function_maps_error() {
+    let ctx = setup_catalog(vec!["default"]).await;
+
+    let error = ctx
+        .catalog
+        .get_function(&Identifier::new("default", "missing"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::FunctionNotExist { full_name } if full_name == "default.missing"
+    ));
 }

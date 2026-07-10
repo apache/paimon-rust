@@ -25,8 +25,9 @@ use std::collections::HashMap;
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
 use paimon::api::rest_api::RESTApi;
 use paimon::api::ConfigResponse;
-use paimon::catalog::Identifier;
+use paimon::catalog::{Function, FunctionDefinition, Identifier, ViewSchema};
 use paimon::common::Options;
+use paimon::spec::DataField;
 use serde_json::json;
 
 mod mock_server;
@@ -80,6 +81,129 @@ async fn test_list_databases() {
     assert!(dbs.contains(&"default".to_string()));
     assert!(dbs.contains(&"test_db1".to_string()));
     assert!(dbs.contains(&"prod_db".to_string()));
+}
+
+#[tokio::test]
+async fn test_get_view() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let schema: ViewSchema = serde_json::from_value(json!({
+        "fields": [{"id": 0, "name": "id", "type": "INT"}],
+        "query": "SELECT id FROM source",
+        "dialects": {"datafusion": "SELECT id FROM source WHERE id > 0"},
+        "comment": null,
+        "options": {}
+    }))
+    .unwrap();
+    ctx.server.add_view("default", "active_ids", schema);
+
+    let response = ctx
+        .api
+        .get_view(&Identifier::new("default", "active_ids"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.name.as_deref(), Some("active_ids"));
+    assert_eq!(response.id.as_deref(), Some("active_ids"));
+    assert_eq!(
+        response.schema.query_for("datafusion"),
+        "SELECT id FROM source WHERE id > 0"
+    );
+}
+
+#[tokio::test]
+async fn test_list_views() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    ctx.server.set_list_page_size(1);
+    let schema: ViewSchema = serde_json::from_value(json!({
+        "fields": [{"id": 0, "name": "id", "type": "INT"}],
+        "query": "SELECT 1 AS id",
+        "dialects": {},
+        "comment": null,
+        "options": {}
+    }))
+    .unwrap();
+    ctx.server.add_view("default", "v2", schema.clone());
+    ctx.server.add_view("default", "v1", schema);
+
+    assert_eq!(
+        ctx.api.list_views("default").await.unwrap(),
+        vec!["v1", "v2"]
+    );
+}
+
+#[tokio::test]
+async fn test_get_function() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let input_params: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "length", "type": "DOUBLE"},
+        {"id": 1, "name": "width", "type": "DOUBLE"}
+    ]))
+    .unwrap();
+    let return_params: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "area", "type": "DOUBLE"}
+    ]))
+    .unwrap();
+    ctx.server.add_function(Function::new(
+        Identifier::new("default", "area"),
+        Some(input_params),
+        Some(return_params),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "length * width".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    ));
+
+    let response = ctx
+        .api
+        .get_function(&Identifier::new("default", "area"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.name.as_deref(), Some("area"));
+    assert_eq!(
+        response
+            .definitions
+            .get("datafusion")
+            .and_then(FunctionDefinition::sql),
+        Some("length * width")
+    );
+}
+
+#[tokio::test]
+async fn test_list_functions() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    ctx.server.set_list_page_size(1);
+    for name in ["zeta", "alpha"] {
+        ctx.server.add_function(Function::new(
+            Identifier::new("default", name),
+            Some(Vec::new()),
+            Some(
+                serde_json::from_value(json!([
+                    {"id": 0, "name": "result", "type": "INT"}
+                ]))
+                .unwrap(),
+            ),
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                FunctionDefinition::Sql {
+                    definition: "1".to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        ));
+    }
+
+    assert_eq!(
+        ctx.api.list_functions("default").await.unwrap(),
+        vec!["alpha", "zeta"]
+    );
 }
 
 #[tokio::test]

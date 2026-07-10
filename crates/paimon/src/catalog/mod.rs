@@ -23,8 +23,10 @@
 mod database;
 mod factory;
 mod filesystem;
+mod function;
 mod partition_listing;
 mod rest;
+mod view;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -33,9 +35,11 @@ use crate::{Error, Result};
 pub use database::*;
 pub use factory::*;
 pub use filesystem::*;
+pub use function::*;
 pub use partition_listing::list_partitions_from_file_system;
 pub use rest::*;
 use serde::{Deserialize, Serialize};
+pub use view::*;
 
 /// Splitter for system table names (e.g. `table$snapshots`).
 pub const SYSTEM_TABLE_SPLITTER: &str = "$";
@@ -370,6 +374,38 @@ pub trait Catalog: Send + Sync {
         changes: Vec<SchemaChange>,
         ignore_if_not_exists: bool,
     ) -> Result<()>;
+
+    // ======================= view methods ===============================
+
+    /// List persistent view names in a database.
+    async fn list_views(&self, _database_name: &str) -> Result<Vec<String>> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support views".to_string(),
+        })
+    }
+
+    /// Get a persistent view by identifier.
+    async fn get_view(&self, _identifier: &Identifier) -> Result<View> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support views".to_string(),
+        })
+    }
+
+    // ======================= function methods ===============================
+
+    /// List persistent function names in a database.
+    async fn list_functions(&self, _database_name: &str) -> Result<Vec<String>> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support functions".to_string(),
+        })
+    }
+
+    /// Get a persistent function by identifier.
+    async fn get_function(&self, _identifier: &Identifier) -> Result<Function> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support functions".to_string(),
+        })
+    }
 
     /// List partitions for a table.
     ///

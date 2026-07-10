@@ -278,6 +278,43 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn list_views(&self, database_name: &str) -> Result<Vec<String>> {
+        self.api.list_views(database_name).await
+    }
+
+    async fn get_view(&self, identifier: &Identifier) -> Result<crate::catalog::View> {
+        let response = self
+            .api
+            .get_view(identifier)
+            .await
+            .map_err(|e| map_rest_error_for_view(e, identifier))?;
+        Ok(crate::catalog::View::new(
+            identifier.clone(),
+            response.schema,
+        ))
+    }
+
+    async fn list_functions(&self, database_name: &str) -> Result<Vec<String>> {
+        self.api.list_functions(database_name).await
+    }
+
+    async fn get_function(&self, identifier: &Identifier) -> Result<crate::catalog::Function> {
+        let response = self
+            .api
+            .get_function(identifier)
+            .await
+            .map_err(|e| map_rest_error_for_function(e, identifier))?;
+        Ok(crate::catalog::Function::new(
+            identifier.clone(),
+            response.input_params,
+            response.return_params,
+            response.deterministic,
+            response.definitions,
+            response.comment,
+            response.options,
+        ))
+    }
+
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.api.list_partitions(identifier).await {
             Ok(parts) => Ok(parts),
@@ -354,6 +391,30 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
         Error::RestApi {
             source: RestError::AlreadyExists { .. },
         } => Error::TableAlreadyExist {
+            full_name: identifier.full_name(),
+        },
+        other => other,
+    }
+}
+
+/// Map a REST API error to a catalog-level view error.
+fn map_rest_error_for_view(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::ViewNotExist {
+            full_name: identifier.full_name(),
+        },
+        other => other,
+    }
+}
+
+/// Map a REST API error to a catalog-level function error.
+fn map_rest_error_for_function(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::FunctionNotExist {
             full_name: identifier.full_name(),
         },
         other => other,

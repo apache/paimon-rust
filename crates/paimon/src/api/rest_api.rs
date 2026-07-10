@@ -33,8 +33,9 @@ use super::api_request::{
     RenameTableRequest,
 };
 use super::api_response::{
-    ConfigResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListPartitionsResponse, ListTablesResponse, PagedList,
+    ConfigResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
+    ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::resource_paths::ResourcePaths;
@@ -88,6 +89,8 @@ impl RESTApi {
     pub const PAGE_TOKEN: &'static str = "pageToken";
     pub const DATABASE_NAME_PATTERN: &'static str = "databaseNamePattern";
     pub const TABLE_NAME_PATTERN: &'static str = "tableNamePattern";
+    pub const VIEW_NAME_PATTERN: &'static str = "viewNamePattern";
+    pub const FUNCTION_NAME_PATTERN: &'static str = "functionNamePattern";
     pub const TABLE_TYPE: &'static str = "tableType";
 
     /// Create a new RESTApi from options.
@@ -390,6 +393,131 @@ impl RESTApi {
         let path = self.resource_paths.table(database, table);
         let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== View Operations ====================
+
+    /// List persistent views in a database.
+    pub async fn list_views(&self, database: &str) -> Result<Vec<String>> {
+        validate_non_empty(database, "database name")?;
+        let mut results = Vec::new();
+        let mut page_token = None;
+        loop {
+            let page = self
+                .list_views_paged(database, None, page_token.as_deref(), None)
+                .await?;
+            let is_empty = page.elements.is_empty();
+            results.extend(page.elements);
+            page_token = page.next_page_token;
+            if page_token.is_none() || is_empty {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// List persistent views in a database with pagination.
+    pub async fn list_views_paged(
+        &self,
+        database: &str,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+        view_name_pattern: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        validate_non_empty(database, "database name")?;
+        let path = self.resource_paths.views(database);
+        let mut params = Vec::new();
+        if let Some(max_results) = max_results {
+            params.push((Self::MAX_RESULTS, max_results.to_string()));
+        }
+        if let Some(page_token) = page_token {
+            params.push((Self::PAGE_TOKEN, page_token.to_string()));
+        }
+        if let Some(view_name_pattern) = view_name_pattern {
+            params.push((Self::VIEW_NAME_PATTERN, view_name_pattern.to_string()));
+        }
+        let response: ListViewsResponse = if params.is_empty() {
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
+        } else {
+            self.client.get(&path, Some(&params)).await?
+        };
+        Ok(PagedList::new(
+            response.views.unwrap_or_default(),
+            response.next_page_token,
+        ))
+    }
+
+    /// Get persistent view information.
+    pub async fn get_view(&self, identifier: &Identifier) -> Result<GetViewResponse> {
+        let database = identifier.database();
+        let view = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (view, "view name")])?;
+        let path = self.resource_paths.view(database, view);
+        self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    // ==================== Function Operations ====================
+
+    /// List persistent functions in a database.
+    pub async fn list_functions(&self, database: &str) -> Result<Vec<String>> {
+        validate_non_empty(database, "database name")?;
+        let mut results = Vec::new();
+        let mut page_token = None;
+        loop {
+            let page = self
+                .list_functions_paged(database, None, page_token.as_deref(), None)
+                .await?;
+            let is_empty = page.elements.is_empty();
+            results.extend(page.elements);
+            page_token = page.next_page_token;
+            if page_token.is_none() || is_empty {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// List persistent functions in a database with pagination.
+    pub async fn list_functions_paged(
+        &self,
+        database: &str,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+        function_name_pattern: Option<&str>,
+    ) -> Result<PagedList<String>> {
+        validate_non_empty(database, "database name")?;
+        let path = self.resource_paths.functions(database);
+        let mut params = Vec::new();
+        if let Some(max_results) = max_results {
+            params.push((Self::MAX_RESULTS, max_results.to_string()));
+        }
+        if let Some(page_token) = page_token {
+            params.push((Self::PAGE_TOKEN, page_token.to_string()));
+        }
+        if let Some(function_name_pattern) = function_name_pattern {
+            params.push((
+                Self::FUNCTION_NAME_PATTERN,
+                function_name_pattern.to_string(),
+            ));
+        }
+        let response: ListFunctionsResponse = if params.is_empty() {
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
+        } else {
+            self.client.get(&path, Some(&params)).await?
+        };
+        Ok(PagedList::new(
+            response.functions.unwrap_or_default(),
+            response.next_page_token,
+        ))
+    }
+
+    /// Get persistent function information.
+    pub async fn get_function(&self, identifier: &Identifier) -> Result<GetFunctionResponse> {
+        let database = identifier.database();
+        let function = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (function, "function name")])?;
+        let path = self.resource_paths.function(database, function);
+        self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
     // ==================== Partition Operations ====================

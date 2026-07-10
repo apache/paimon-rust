@@ -24,4 +24,30 @@
 
 This crate contains the integration of [Apache DataFusion](https://datafusion.apache.org/) and [Apache Paimon](https://paimon.apache.org/).
 
+## REST Catalog views and SQL functions
+
+`SQLContext` can read persistent views and SQL scalar functions that already exist in a Paimon
+REST Catalog. No view or function DDL is added.
+
+- A persistent view is resolved lazily like a table. The `datafusion` dialect is preferred and the
+  default view query is used when that dialect is absent. Unqualified relations inside the view
+  resolve in the view's owning catalog and database.
+- A SQL function can be called as `function(args...)` in the current catalog/database or as
+  `catalog.database.function(args...)`. Its `definitions.datafusion` value must be a scalar SQL
+  expression, it must be deterministic, and it must declare its input parameters and exactly one
+  return parameter.
+- Only reads and execution are supported. Lambda/file functions, named arguments, multiple return
+  values, non-deterministic functions, and calls made directly through a raw DataFusion
+  `SessionContext` are not supported.
+
+Use `SQLContext::sql` for function expansion:
+
+```rust,ignore
+let mut ctx = paimon_datafusion::SQLContext::new();
+ctx.register_catalog("paimon", rest_catalog).await?;
+
+let view = ctx.sql("SELECT * FROM analytics_view").await?;
+let function = ctx.sql("SELECT normalize_score(score) FROM scores").await?;
+```
+
 See the [documentation](https://paimon.apache.org/docs/rust/datafusion/) for getting started guide and more details.
