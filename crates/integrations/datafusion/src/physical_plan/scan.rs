@@ -60,6 +60,9 @@ pub struct PaimonTableScan {
     scan_trace: Option<ScanTrace>,
     /// Human-readable Variant extraction summary for explain output.
     pushed_variants: Option<String>,
+    /// Column-name case sensitivity carried from planning to execution so the
+    /// read path resolves names the same way the scan was planned.
+    case_sensitive: bool,
 }
 
 impl PaimonTableScan {
@@ -74,6 +77,7 @@ impl PaimonTableScan {
         filter_exact: bool,
         scan_trace: Option<ScanTrace>,
         pushed_variants: Option<String>,
+        case_sensitive: bool,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -91,6 +95,7 @@ impl PaimonTableScan {
             filter_exact,
             scan_trace,
             pushed_variants,
+            case_sensitive,
         }
     }
 
@@ -154,10 +159,12 @@ impl ExecutionPlan for PaimonTableScan {
         let schema = self.schema();
         let read_type = self.read_type.clone();
         let pushed_predicate = self.pushed_predicate.clone();
+        let case_sensitive = self.case_sensitive;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
 
+            read_builder.with_case_sensitive(case_sensitive);
             read_builder.with_read_type(read_type);
             if let Some(filter) = pushed_predicate {
                 read_builder.with_filter(filter);
@@ -315,6 +322,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
@@ -337,6 +345,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
     }
@@ -420,6 +429,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
 
         let ctx = SessionContext::new();

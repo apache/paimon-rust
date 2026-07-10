@@ -249,6 +249,7 @@ impl TableProvider for VectorSearchTableProvider {
             limit,
             target_partitions: target,
             filter_exact: false,
+            case_sensitive: true,
         }
         .build()
     }

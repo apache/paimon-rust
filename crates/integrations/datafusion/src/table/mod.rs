@@ -283,6 +283,9 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) target_partitions: usize,
     pub(crate) filter_exact: bool,
+    /// Column-name case sensitivity, carried into the physical scan so execute()
+    /// resolves names the same way planning did.
+    pub(crate) case_sensitive: bool,
 }
 
 impl PaimonScanBuilder<'_> {
@@ -324,6 +327,7 @@ impl PaimonScanBuilder<'_> {
             self.filter_exact,
             self.scan_trace,
             None,
+            self.case_sensitive,
         )))
     }
 }
@@ -349,9 +353,16 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Derive column-name case sensitivity from the DataFusion session:
+        // when DataFusion normalizes (lowercases) unquoted identifiers (its
+        // default), Paimon should match case-insensitively; when normalization
+        // is off, match exactly.
+        let case_sensitive = !state.config_options().sql_parser.enable_ident_normalization;
         // Plan splits eagerly so we know partition count upfront.
-        let filter_analysis = analyze_filters(filters, self.table.schema().fields());
+        let filter_analysis =
+            analyze_filters(filters, self.table.schema().fields(), case_sensitive);
         let mut read_builder = self.table.new_read_builder();
+        read_builder.with_case_sensitive(case_sensitive);
         if let Some(indices) = projection {
             let read_fields = datafusion_read_fields(&self.table);
             let read_type = indices
@@ -392,6 +403,7 @@ impl TableProvider for PaimonTableProvider {
             limit: pushed_limit,
             target_partitions: target,
             filter_exact,
+            case_sensitive,
         }
         .build()
     }
@@ -420,12 +432,20 @@ impl TableProvider for PaimonTableProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let fields = self.table.schema().fields();
+        // DataFusion's `supports_filters_pushdown` has no `Session`, so the
+        // session's identifier-normalization setting isn't available here.
+        // Classify case-sensitively (the default); `classify_filter_pushdown`
+        // additionally refuses to report `Exact` for a schema with ASCII
+        // case-folding collisions, which is the only case where a
+        // case-insensitive `scan` could resolve differently. So the residual is
+        // always kept when it might be needed.
+        let case_sensitive = true;
         let read_builder = self.table.new_read_builder();
 
         Ok(filters
             .iter()
             .map(|filter| {
-                classify_filter_pushdown(filter, fields, |predicate| {
+                classify_filter_pushdown(filter, fields, case_sensitive, |predicate| {
                     read_builder.is_exact_filter_pushdown(predicate)
                 })
             })

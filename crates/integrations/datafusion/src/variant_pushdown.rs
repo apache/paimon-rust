@@ -208,8 +208,15 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             return internal_err!("PaimonVariantExtractionScan physical planning expects no input");
         }
 
-        let filter_analysis = analyze_filters(&node.filters, node.table.schema().fields());
+        // Derive case sensitivity from the session, mirroring `TableProvider::scan`.
+        let case_sensitive = !session_state
+            .config_options()
+            .sql_parser
+            .enable_ident_normalization;
+        let filter_analysis =
+            analyze_filters(&node.filters, node.table.schema().fields(), case_sensitive);
         let mut read_builder = node.table.new_read_builder();
+        read_builder.with_case_sensitive(case_sensitive);
         read_builder.with_read_type(node.read_type.clone());
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
@@ -250,6 +257,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             filter_exact,
             Some(scan_trace),
             Some(node.pushed_variants.clone()),
+            case_sensitive,
         ))))
     }
 }

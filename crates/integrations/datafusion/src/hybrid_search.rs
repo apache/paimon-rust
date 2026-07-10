@@ -201,6 +201,7 @@ impl TableProvider for HybridSearchTableProvider {
             limit,
             target_partitions: state.config_options().execution.target_partitions,
             filter_exact: false,
+            case_sensitive: true,
         }
         .build()
     }
