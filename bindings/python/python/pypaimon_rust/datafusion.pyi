@@ -54,6 +54,17 @@ class TableRead:
 
 class ReadBuilder:
     def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
+    def with_case_sensitive(self, case_sensitive: bool) -> "ReadBuilder":
+        """
+        Set whether column-name matching (projection and predicate column
+        resolution) is case-sensitive. Defaults to ``True`` (exact match).
+
+        Projection resolution is lazy, so this is order-independent with
+        ``with_projection``. Predicates built via ``with_filter`` capture case
+        sensitivity when they are constructed, so ``with_case_sensitive`` must be
+        set before ``with_filter`` for the filter to honor it.
+        """
+        ...
     def with_limit(self, limit: int) -> "ReadBuilder": ...
     def with_filter(self, predicate: dict) -> "ReadBuilder": ...
     def new_scan(self) -> TableScan: ...

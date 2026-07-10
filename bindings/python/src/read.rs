@@ -69,7 +69,9 @@ fn apply_read_config(
     projection: &Option<Vec<String>>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
+    case_sensitive: bool,
 ) -> PyResult<()> {
+    builder.with_case_sensitive(case_sensitive);
     if let Some(projection) = projection {
         let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
         builder.with_projection(&cols).map_err(to_py_err)?;
@@ -108,6 +110,7 @@ pub struct PyReadBuilder {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    case_sensitive: bool,
 }
 
 impl PyReadBuilder {
@@ -117,6 +120,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            case_sensitive: true,
         }
     }
 
@@ -158,6 +162,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            case_sensitive: true,
         })
     }
 }
@@ -174,6 +179,17 @@ impl PyReadBuilder {
         slf
     }
 
+    /// Set whether column-name matching (projection and predicate resolution) is
+    /// case-sensitive. Defaults to `true` (exact match); pass `false` to match
+    /// column names case-insensitively (ASCII case-folding).
+    fn with_case_sensitive(
+        mut slf: PyRefMut<'_, Self>,
+        case_sensitive: bool,
+    ) -> PyRefMut<'_, Self> {
+        slf.case_sensitive = case_sensitive;
+        slf
+    }
+
     /// Convert a lightweight dict predicate into a Rust [`Predicate`] and store
     /// it for pushdown. Conversion happens immediately, so conversion errors
     /// (unknown field, type mismatch, unsupported operator/type) surface at call
@@ -182,7 +198,7 @@ impl PyReadBuilder {
         mut slf: PyRefMut<'py, Self>,
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let filter = dict_to_predicate(predicate, slf.table.schema().fields())?;
+        let filter = dict_to_predicate(predicate, slf.table.schema().fields(), slf.case_sensitive)?;
         slf.filter = Some(filter);
         Ok(slf)
     }
@@ -193,6 +209,7 @@ impl PyReadBuilder {
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            case_sensitive: self.case_sensitive,
         }
     }
 
@@ -202,6 +219,7 @@ impl PyReadBuilder {
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            case_sensitive: self.case_sensitive,
         }
     }
 }
@@ -212,6 +230,7 @@ pub struct PyTableScan {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    case_sensitive: bool,
 }
 
 #[pymethods]
@@ -221,7 +240,13 @@ impl PyTableScan {
         let splits = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
-                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter)?;
+                apply_read_config(
+                    &mut builder,
+                    &self.projection,
+                    self.limit,
+                    &self.filter,
+                    self.case_sensitive,
+                )?;
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())
             })
@@ -236,6 +261,7 @@ pub struct PyTableRead {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    case_sensitive: bool,
 }
 
 #[pymethods]
@@ -247,7 +273,13 @@ impl PyTableRead {
         let batches = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
-                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter)?;
+                apply_read_config(
+                    &mut builder,
+                    &self.projection,
+                    self.limit,
+                    &self.filter,
+                    self.case_sensitive,
+                )?;
                 // Validate config (e.g. projection) before the empty-splits fast
                 // path so an invalid projection fails consistently regardless of
                 // how many splits are passed.

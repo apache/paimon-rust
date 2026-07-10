@@ -362,6 +362,7 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 pub(crate) fn dict_to_predicate(
     node: &Bound<'_, PyDict>,
     fields: &[DataField],
+    case_sensitive: bool,
 ) -> PyResult<Predicate> {
     let method: String = node
         .get_item("method")?
@@ -387,7 +388,7 @@ pub(crate) fn dict_to_predicate(
                     .cast::<PyDict>()
                     .map_err(|_| PyValueError::new_err("each child must be a dict"))?;
                 // Unsupported child propagates → no partial pushdown.
-                preds.push(dict_to_predicate(child_dict, fields)?);
+                preds.push(dict_to_predicate(child_dict, fields, case_sensitive)?);
             }
             Ok(if method == "and" {
                 Predicate::and(preds)
@@ -398,8 +399,39 @@ pub(crate) fn dict_to_predicate(
         m if METHOD_NOT_SUPPORTED.contains(&m) => Err(PyNotImplementedError::new_err(format!(
             "predicate operator '{m}' is not supported for Rust pushdown"
         ))),
-        _ => leaf_to_predicate(&method, node, fields),
+        _ => leaf_to_predicate(&method, node, fields, case_sensitive),
     }
+}
+
+/// Resolve a leaf's field name to its schema [`DataType`] under the given case
+/// sensitivity.
+///
+/// Case-sensitive: exact match. Case-insensitive: ASCII-fold and require a
+/// unique match. Absent → `ValueError("Column '{field}' not found in schema")`;
+/// ambiguous (2+ fields collide under folding) → `ValueError` naming the clash.
+fn resolve_leaf_field_type(
+    fields: &[DataField],
+    field: &str,
+    case_sensitive: bool,
+) -> PyResult<DataType> {
+    let not_found = || PyValueError::new_err(format!("Column '{field}' not found in schema"));
+    if case_sensitive {
+        return fields
+            .iter()
+            .find(|f| f.name() == field)
+            .map(|f| f.data_type().clone())
+            .ok_or_else(not_found);
+    }
+    let mut matches = fields
+        .iter()
+        .filter(|f| f.name().eq_ignore_ascii_case(field));
+    let first = matches.next().ok_or_else(not_found)?;
+    if matches.next().is_some() {
+        return Err(PyValueError::new_err(format!(
+            "Ambiguous column '{field}': multiple schema fields match case-insensitively"
+        )));
+    }
+    Ok(first.data_type().clone())
 }
 
 /// Convert a single leaf dict (already known not to be `and`/`or`) into a
@@ -408,6 +440,7 @@ fn leaf_to_predicate(
     method: &str,
     node: &Bound<'_, PyDict>,
     fields: &[DataField],
+    case_sensitive: bool,
 ) -> PyResult<Predicate> {
     let field: String = node
         .get_item("field")?
@@ -415,14 +448,10 @@ fn leaf_to_predicate(
         .extract()?;
 
     // Resolve field DataType from schema (authoritative) for literal conversion.
-    let data_type = fields
-        .iter()
-        .find(|f| f.name() == field)
-        .map(|f| f.data_type().clone())
-        .ok_or_else(|| PyValueError::new_err(format!("Column '{field}' not found in schema")))?;
+    let data_type = resolve_leaf_field_type(fields, &field, case_sensitive)?;
 
     let literals_obj = node.get_item("literals")?;
-    let pb = PredicateBuilder::new(fields);
+    let pb = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
 
     // Convert literals (DataType-driven), wrapping NotImplemented type messages
     // with field context.
@@ -607,7 +636,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = leaf_dict(py, "equal", "id", &[1]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             match &pred {
                 Predicate::Leaf {
                     column,
@@ -629,7 +658,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = leaf_dict(py, "not", "id", &[1]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyNotImplementedError>(py));
         });
     }
@@ -666,7 +695,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "startsWith", "name", &["ab"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             expect_leaf_op(&pred, PredicateOperator::StartsWith);
         });
     }
@@ -676,7 +705,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "endsWith", "name", &["ab"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             expect_leaf_op(&pred, PredicateOperator::EndsWith);
         });
     }
@@ -686,8 +715,59 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "contains", "name", &["ab"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             expect_leaf_op(&pred, PredicateOperator::Contains);
+        });
+    }
+
+    /// Fields whose string column is spelled `Name` (mixed case).
+    fn mixed_case_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "Name".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn case_insensitive_leaf_resolves_differently_cased_field() {
+        Python::attach(|py| {
+            let fields = mixed_case_fields();
+            // Request uses `name`; the schema field is `Name`.
+            let dict = str_leaf_dict(py, "equal", "name", &["bob"]);
+
+            // Case-sensitive (default): `name` != `Name` → column not found.
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+
+            // Case-insensitive: resolves to the canonical `Name`.
+            let pred = dict_to_predicate(&dict, &fields, false).unwrap();
+            match &pred {
+                Predicate::Leaf { column, op, .. } => {
+                    assert_eq!(
+                        column, "Name",
+                        "canonical schema name is stored in the leaf"
+                    );
+                    assert_eq!(*op, PredicateOperator::Eq);
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn case_insensitive_ambiguous_field_raises_value_error() {
+        Python::attach(|py| {
+            let fields = vec![
+                DataField::new(0, "Col".to_string(), DataType::Int(IntType::new())),
+                DataField::new(1, "col".to_string(), DataType::Int(IntType::new())),
+            ];
+            let dict = leaf_dict(py, "equal", "COL", &[1]);
+            let err = dict_to_predicate(&dict, &fields, false).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
 
@@ -696,7 +776,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["ab%"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             expect_leaf_op(&pred, PredicateOperator::StartsWith);
         });
     }
@@ -706,7 +786,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["a%b%c"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             expect_leaf_op(&pred, PredicateOperator::Like);
         });
     }
@@ -716,7 +796,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["100\\%%", "\\"]);
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             // Escaped-wildcard patterns are not rewritten by the core's LIKE
             // optimization; they stay as a residual Like leaf.
             expect_leaf_op(&pred, PredicateOperator::Like);
@@ -728,7 +808,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["100!%%", "!"]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -738,7 +818,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["a%", "ab"]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -748,7 +828,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = str_leaf_dict(py, "like", "name", &["a%", "\\", "x"]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -759,7 +839,7 @@ mod tests {
             let fields = test_fields();
             for method in ["startsWith", "endsWith", "contains"] {
                 let dict = str_leaf_dict(py, method, "name", &[""]);
-                let pred = dict_to_predicate(&dict, &fields).unwrap();
+                let pred = dict_to_predicate(&dict, &fields, true).unwrap();
                 expect_leaf_op(&pred, PredicateOperator::IsNotNull);
             }
         });
@@ -771,7 +851,7 @@ mod tests {
             let fields = test_fields();
             for method in ["startsWith", "endsWith", "contains", "like"] {
                 let dict = str_leaf_dict(py, method, "id", &["a"]);
-                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
                 assert!(err.is_instance_of::<PyValueError>(py), "{method}");
             }
         });
@@ -783,12 +863,12 @@ mod tests {
             let fields = test_fields();
             for method in ["startsWith", "endsWith", "contains", "like"] {
                 let dict = str_leaf_dict(py, method, "name", &[]);
-                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
                 assert!(err.is_instance_of::<PyValueError>(py), "{method} zero");
             }
             for method in ["startsWith", "endsWith", "contains"] {
                 let dict = str_leaf_dict(py, method, "name", &["a", "b"]);
-                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
                 assert!(err.is_instance_of::<PyValueError>(py), "{method} two");
             }
         });
@@ -802,7 +882,7 @@ mod tests {
             // leaf path: field resolution happens first, so an unknown field is
             // a ValueError (not NotImplementedError as before).
             let dict = str_leaf_dict(py, "like", "nope", &["x"]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -816,7 +896,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "not").unwrap();
             dict.set_item("children", PyList::empty(py)).unwrap();
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyNotImplementedError>(py));
         });
     }
@@ -826,7 +906,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = leaf_dict(py, "equal", "nope", &[1]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -838,7 +918,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "and").unwrap();
             dict.set_item("children", PyList::empty(py)).unwrap();
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -855,7 +935,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "and").unwrap();
             dict.set_item("children", children).unwrap();
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             // No partial pushdown: the unsupported child propagates.
             assert!(err.is_instance_of::<PyNotImplementedError>(py));
         });
@@ -873,7 +953,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "and").unwrap();
             dict.set_item("children", children).unwrap();
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             match &pred {
                 Predicate::And(ch) => assert_eq!(ch.len(), 2),
                 other => panic!("expected And, got {other:?}"),
@@ -893,7 +973,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "or").unwrap();
             dict.set_item("children", children).unwrap();
-            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
             match &pred {
                 Predicate::Or(ch) => assert_eq!(ch.len(), 2),
                 other => panic!("expected Or, got {other:?}"),
@@ -911,7 +991,7 @@ mod tests {
             let lits = PyList::empty(py);
             lits.append(py.None()).unwrap();
             d.set_item("literals", lits).unwrap();
-            let err = dict_to_predicate(&d, &fields).unwrap_err();
+            let err = dict_to_predicate(&d, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -921,7 +1001,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = leaf_dict(py, "equal", "id", &[1, 2]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
@@ -932,7 +1012,7 @@ mod tests {
             let fields = test_fields();
             for method in ["isNull", "isNotNull"] {
                 let dict = leaf_dict(py, method, "name", &[1]);
-                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
                 assert!(err.is_instance_of::<PyValueError>(py));
             }
         });
@@ -944,12 +1024,12 @@ mod tests {
             let fields = test_fields();
             // Empty literals list is accepted.
             let with_empty = leaf_dict(py, "isNull", "name", &[]);
-            assert!(dict_to_predicate(&with_empty, &fields).is_ok());
+            assert!(dict_to_predicate(&with_empty, &fields, true).is_ok());
             // Missing literals key is accepted.
             let no_lits = PyDict::new(py);
             no_lits.set_item("method", "isNotNull").unwrap();
             no_lits.set_item("field", "name").unwrap();
-            assert!(dict_to_predicate(&no_lits, &fields).is_ok());
+            assert!(dict_to_predicate(&no_lits, &fields, true).is_ok());
         });
     }
 
