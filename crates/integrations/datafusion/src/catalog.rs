@@ -29,6 +29,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -74,7 +75,13 @@ impl Debug for PaimonCatalogProvider {
 impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
     ///
-    pub fn new(
+    /// For standalone use without `SET`/`RESET` or persistent REST view support.
+    /// [`crate::SQLContext`] supplies the session-aware provider internally.
+    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        Self::with_session(None, catalog, Default::default(), Default::default(), None)
+    }
+
+    pub(crate) fn with_session(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
@@ -122,7 +129,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
+                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::with_session(
                         catalog_name,
                         Arc::clone(&catalog),
                         name,
@@ -133,7 +140,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
-                            Some(Arc::new(PaimonSchemaProvider::new(
+                            Some(Arc::new(PaimonSchemaProvider::with_session(
                                 catalog_name,
                                 Arc::clone(&catalog),
                                 name,
@@ -173,7 +180,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
                     catalog_name,
                     Arc::clone(&catalog),
                     name,
@@ -204,7 +211,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
                     catalog_name,
                     Arc::clone(&catalog),
                     name,
@@ -325,8 +332,26 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`].
+    /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
     pub fn new(
+        catalog: Arc<dyn Catalog>,
+        database: String,
+        dynamic_options: DynamicOptions,
+        temp_provider: Option<Arc<MemorySchemaProvider>>,
+        blob_reader_registry: BlobReaderRegistry,
+    ) -> Self {
+        Self::with_session(
+            None,
+            catalog,
+            database,
+            dynamic_options,
+            temp_provider,
+            blob_reader_registry,
+            None,
+        )
+    }
+
+    pub(crate) fn with_session(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         database: String,
@@ -702,7 +727,7 @@ fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Id
     Ok(visitor.identifiers)
 }
 
-type SqlIdentifierKey = (Option<char>, String);
+type SqlIdentifierKey = String;
 
 struct QueryCteScope {
     visible: HashSet<SqlIdentifierKey>,
@@ -800,14 +825,7 @@ impl Visitor for ViewRelationVisitor<'_> {
 }
 
 fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
-    (
-        identifier.quote_style,
-        if identifier.quote_style.is_some() {
-            identifier.value.clone()
-        } else {
-            identifier.value.to_ascii_lowercase()
-        },
-    )
+    IdentNormalizer::default().normalize(identifier.clone())
 }
 
 fn relation_identifier(
@@ -818,13 +836,13 @@ fn relation_identifier(
     let parts = relation
         .0
         .iter()
-        .map(|part| part.as_ident().map(|identifier| identifier.value.as_str()))
+        .map(|part| part.as_ident().map(sql_identifier_key))
         .collect::<Option<Vec<_>>>()?;
     match parts.as_slice() {
-        [object] => Some(Identifier::new(current_database, *object)),
-        [database, object] => Some(Identifier::new(*database, *object)),
-        [catalog, database, object] if *catalog == catalog_name => {
-            Some(Identifier::new(*database, *object))
+        [object] => Some(Identifier::new(current_database, object.as_str())),
+        [database, object] => Some(Identifier::new(database.as_str(), object.as_str())),
+        [catalog, database, object] if catalog == catalog_name => {
+            Some(Identifier::new(database.as_str(), object.as_str()))
         }
         _ => None,
     }
@@ -868,4 +886,23 @@ fn find_view_dependency_cycle(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_identifiers_follow_datafusion_normalization() {
+        let relation = ObjectName(vec![
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("PAIMON")),
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("DEFAULT")),
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("ANSWER_VIEW")),
+        ]);
+
+        assert_eq!(
+            relation_identifier(&relation, "paimon", "unused"),
+            Some(Identifier::new("default", "answer_view"))
+        );
+    }
 }

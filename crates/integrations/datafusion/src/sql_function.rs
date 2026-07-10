@@ -20,6 +20,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, ObjectName, Statement,
@@ -254,7 +255,7 @@ fn function_reference(
         .name
         .0
         .iter()
-        .map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .map(|part| part.as_ident().map(normalize_identifier))
         .collect::<Option<Vec<_>>>()?;
     match identifiers.as_slice() {
         [function] => Some((
@@ -266,6 +267,10 @@ fn function_reference(
         }
         _ => None,
     }
+}
+
+fn normalize_identifier(identifier: &Ident) -> String {
+    IdentNormalizer::default().normalize(identifier.clone())
 }
 
 fn expand_call(
@@ -341,14 +346,14 @@ fn expand_call(
         .map_err(|error| {
             DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
         })?;
-    let replacements: HashMap<&str, SqlExpr> = input_params
+    let replacements: HashMap<String, SqlExpr> = input_params
         .iter()
         .zip(values)
-        .map(|(field, value)| (field.name(), value))
+        .map(|(field, value)| (normalize_identifier(&Ident::new(field.name())), value))
         .collect();
     let validation = visit_expressions(&body, |expr| match expr {
         SqlExpr::Identifier(identifier)
-            if !replacements.contains_key(identifier.value.as_str()) =>
+            if !replacements.contains_key(&normalize_identifier(identifier)) =>
         {
             ControlFlow::Break(identifier.value.clone())
         }
@@ -374,22 +379,23 @@ fn expand_call(
         let Some(function_name) = bare_function_name(call) else {
             return ControlFlow::Continue(());
         };
+        let function_name = normalize_identifier(&function_name);
         let reference = (
             owner_catalog.to_string(),
-            Identifier::new(function.identifier().database(), &function_name.value),
+            Identifier::new(function.identifier().database(), &function_name),
         );
         if matches!(functions.get(&reference), Some(Some(_))) {
             call.name = ObjectName::from(vec![
                 Ident::with_quote('"', owner_catalog),
                 Ident::with_quote('"', function.identifier().database()),
-                function_name,
+                Ident::with_quote('"', function_name),
             ]);
         }
         ControlFlow::Continue(())
     });
     let _: ControlFlow<()> = visit_expressions_mut(&mut body, |expr| {
         if let SqlExpr::Identifier(identifier) = expr {
-            if let Some(replacement) = replacements.get(identifier.value.as_str()) {
+            if let Some(replacement) = replacements.get(&normalize_identifier(identifier)) {
                 *expr = replacement.clone();
             }
         }

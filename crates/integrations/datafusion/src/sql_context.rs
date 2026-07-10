@@ -180,7 +180,7 @@ impl SQLContext {
             Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
         self.ctx.register_catalog(
             &catalog_name,
-            Arc::new(crate::catalog::PaimonCatalogProvider::new(
+            Arc::new(crate::catalog::PaimonCatalogProvider::with_session(
                 Some(catalog_name.clone()),
                 catalog.clone(),
                 self.dynamic_options.clone(),
@@ -480,7 +480,7 @@ impl SQLContext {
                 )
                 .await
             }
-            Statement::Query(_) => {
+            Statement::Query(_) | Statement::Explain { .. } => {
                 let current_catalog = self.current_catalog_name();
                 let current_database = self
                     .ctx
@@ -625,8 +625,23 @@ impl SQLContext {
             );
         }
 
-        // Execute the rewritten SQL; tracker auto-deregisters on drop
-        self.ctx.sql(&rewritten_sql).await
+        // Execute the rewritten SQL; tracker auto-deregisters on drop.
+        let current_catalog = self.current_catalog_name();
+        let current_database = self
+            .ctx
+            .state()
+            .config_options()
+            .catalog
+            .default_schema
+            .clone();
+        let expanded = crate::sql_function::expand_sql(
+            &rewritten_sql,
+            &self.catalogs,
+            &current_catalog,
+            &current_database,
+        )
+        .await?;
+        self.ctx.sql(&expanded).await
     }
 
     /// Parse a timestamp string to milliseconds since epoch (using local timezone).
@@ -3128,6 +3143,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_catalog_view_normalizes_cte_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "cte_view",
+            "WITH cte_view AS (SELECT CAST(42 AS BIGINT) AS answer) \
+             SELECT * FROM \"cte_view\"",
+        );
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT * FROM cte_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
     async fn rest_catalog_view_rejects_non_query_sql() {
         let catalog = Arc::new(MockCatalog::new());
         add_bigint_view(
@@ -3158,6 +3201,28 @@ mod tests {
 
         let batches = ctx
             .sql("SELECT plus_one(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_normalizes_call_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT PAIMON.DEFAULT.PLUS_ONE(41) AS answer")
             .await
             .unwrap()
             .collect()
@@ -3236,6 +3301,97 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 41);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_normalizes_definition_parameters() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "uppercase_parameter", "X + 1", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT uppercase_parameter(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_is_expanded_in_explain() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        ctx.sql("EXPLAIN SELECT plus_one(1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_sql_function_is_expanded_in_time_travel_query() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage_catalog = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut setup = SQLContext::new();
+        setup
+            .register_catalog("paimon", storage_catalog.clone())
+            .await
+            .unwrap();
+        setup
+            .sql("CREATE TABLE paimon.default.time_travel_source (id INT)")
+            .await
+            .unwrap();
+        setup
+            .sql("INSERT INTO paimon.default.time_travel_source VALUES (41)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let catalog = Arc::new(MockCatalog::new());
+        *catalog.existing_table.lock().unwrap() = Some(
+            storage_catalog
+                .get_table(&Identifier::new("default", "time_travel_source"))
+                .await
+                .unwrap(),
+        );
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql(
+                "SELECT plus_one(id) AS answer \
+                 FROM time_travel_source VERSION AS OF 1",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
     }
 
     #[tokio::test]
@@ -3338,6 +3494,30 @@ mod tests {
         add_unary_sql_function(&catalog, "plus_one", "x + 100", true);
         add_unary_sql_function_in_database(&catalog, "other", "plus_one", "x + 1", true);
         add_unary_sql_function_in_database(&catalog, "other", "plus_two", "plus_one(x) + 1", true);
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT paimon.other.plus_two(40) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn nested_rest_sql_function_normalizes_owning_database_reference() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "plus_one", "x + 100", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_one", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_two", "PLUS_ONE(x) + 1", true);
         let ctx = make_sql_context(catalog).await;
 
         let batches = ctx
