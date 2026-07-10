@@ -959,3 +959,60 @@ def test_partition_stats_with_partitioned_table():
 
         ctx.sql("DROP TABLE paimon.default.events")
 
+
+def test_partition_stats_excludes_overwritten_partition():
+    """Validates the merge_active_entries (FileKind::Add / Delete sign-flip) logic.
+
+    INSERT OVERWRITE on a specific partition replaces the old data files with
+    new ones. The old files become FileKind::Delete entries in the manifest, so
+    aggregate_partition_stats() must net them out correctly:
+    - The overwritten partition reflects the NEW row count, not the old one.
+    - A partition that is overwritten with zero rows must not appear in the
+      output (file_count nets to 0, triggering the `<= 0` guard).
+    """
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+
+        ctx.sql(
+            "CREATE TABLE paimon.default.events "
+            "(id INT, name STRING, dt STRING) "
+            "PARTITIONED BY (dt)"
+        )
+        # Initial state: 2 rows in 2024-01-01, 1 row in 2024-01-02.
+        ctx.sql(
+            "INSERT INTO paimon.default.events VALUES "
+            "(1, 'alice', '2024-01-01'), "
+            "(2, 'bob',   '2024-01-01'), "
+            "(3, 'carol', '2024-01-02')"
+        )
+
+        # Overwrite 2024-01-01 with a single new row.
+        # This generates FileKind::Delete entries for the old files of that
+        # partition and a FileKind::Add entry for the new file.
+        ctx.sql(
+            "INSERT OVERWRITE paimon.default.events "
+            "VALUES (10, 'dave', '2024-01-01')"
+        )
+
+        catalog = PaimonCatalog({"warehouse": warehouse})
+        table = catalog.get_table("default.events")
+
+        # Both partitions must still be present.
+        parts = table.list_partitions()
+        part_values = sorted(p["dt"] for p in parts)
+        assert part_values == ["2024-01-01", "2024-01-02"]
+
+        stats = table.partition_stats()
+        by_dt = {s.partition()["dt"]: s for s in stats}
+
+        # 2024-01-01: overwritten to 1 row — old Delete entries must be
+        # netted out so record_count reflects only the new file.
+        s1 = by_dt["2024-01-01"]
+        assert s1.record_count() == 1
+
+        # 2024-01-02: untouched.
+        s2 = by_dt["2024-01-02"]
+        assert s2.record_count() == 1
+
+        ctx.sql("DROP TABLE paimon.default.events")
