@@ -17,10 +17,8 @@
 
 //! Paimon catalog integration for DataFusion.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -43,31 +41,6 @@ use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
-
-tokio::task_local! {
-    static VIEW_RESOLUTION_STACK: RefCell<Vec<String>>;
-}
-
-async fn with_view_resolution<T, F>(name: &str, future: F) -> DFResult<T>
-where
-    F: Future<Output = DFResult<T>>,
-{
-    let mut path = VIEW_RESOLUTION_STACK
-        .try_with(|stack| stack.borrow().clone())
-        .unwrap_or_default();
-    if let Some(start) = path.iter().position(|entry| entry == name) {
-        let mut cycle = path[start..].to_vec();
-        cycle.push(name.to_string());
-        return Err(plan_datafusion_err!(
-            "recursive REST catalog view dependency detected: {}",
-            cycle.join(" -> ")
-        ));
-    }
-    path.push(name.to_string());
-    VIEW_RESOLUTION_STACK
-        .scope(RefCell::new(path), future)
-        .await
-}
 
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
@@ -519,39 +492,33 @@ impl SchemaProvider for PaimonSchemaProvider {
                         )
                     })?;
                     validate_view_dependencies(&catalog, &catalog_name, &view).await?;
-                    let view_name = format!("{}.{}", catalog_name, identifier.full_name());
-                    with_view_resolution(&view_name, async move {
-                        let mut state = session_state
-                            .and_then(|provider| provider())
-                            .ok_or_else(|| {
-                                plan_datafusion_err!(
-                                    "DataFusion session is unavailable while planning REST catalog view '{}'",
-                                    identifier.full_name()
-                                )
-                            })?;
-                        state.config_mut().options_mut().catalog.default_catalog =
-                            catalog_name.clone();
-                        state.config_mut().options_mut().catalog.default_schema =
-                            identifier.database().to_string();
-                        let catalogs = HashMap::from([(
-                            catalog_name.clone(),
-                            Arc::clone(&catalog),
-                        )]);
-                        let query = crate::sql_function::expand_sql(
-                            view.query_for("datafusion"),
-                            &catalogs,
-                            &catalog_name,
-                            identifier.database(),
-                        )
-                        .await?;
-                        let plan = state.create_logical_plan(&query).await?;
-                        let plan = enforce_view_schema(plan, &view)?;
-                        Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
-                            plan,
-                            Some(query),
-                        )) as Arc<dyn TableProvider>))
-                    })
-                    .await
+                    let mut state = session_state
+                        .and_then(|provider| provider())
+                        .ok_or_else(|| {
+                            plan_datafusion_err!(
+                                "DataFusion session is unavailable while planning REST catalog view '{}'",
+                                identifier.full_name()
+                            )
+                        })?;
+                    state.config_mut().options_mut().catalog.default_catalog =
+                        catalog_name.clone();
+                    state.config_mut().options_mut().catalog.default_schema =
+                        identifier.database().to_string();
+                    let catalogs =
+                        HashMap::from([(catalog_name.clone(), Arc::clone(&catalog))]);
+                    let query = crate::sql_function::expand_sql(
+                        view.query_for("datafusion"),
+                        &catalogs,
+                        &catalog_name,
+                        identifier.database(),
+                    )
+                    .await?;
+                    let plan = state.create_logical_plan(&query).await?;
+                    let plan = enforce_view_schema(plan, &view)?;
+                    Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
+                        plan,
+                        Some(query),
+                    )) as Arc<dyn TableProvider>))
                 }
                 Err(e) => Err(to_datafusion_error(e)),
             }
@@ -832,25 +799,4 @@ fn find_view_dependency_cycle(
         }
     }
     None
-}
-
-#[cfg(test)]
-mod view_resolution_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn recursive_view_resolution_reports_dependency_path() {
-        let error = with_view_resolution("paimon.default.first", async {
-            with_view_resolution("paimon.default.second", async {
-                with_view_resolution("paimon.default.first", async { Ok(()) }).await
-            })
-            .await
-        })
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("recursive REST catalog view"));
-        assert!(error.contains("first -> paimon.default.second -> paimon.default.first"));
-    }
 }
