@@ -74,14 +74,7 @@ impl Debug for PaimonCatalogProvider {
 
 impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
-    ///
-    /// For standalone use without `SET`/`RESET` or persistent REST view support.
-    /// [`crate::SQLContext`] supplies the session-aware provider internally.
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self::with_session(None, catalog, Default::default(), Default::default(), None)
-    }
-
-    pub(crate) fn with_session(
+    pub fn new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
@@ -129,7 +122,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::with_session(
+                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
                         catalog_name,
                         Arc::clone(&catalog),
                         name,
@@ -140,7 +133,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
-                            Some(Arc::new(PaimonSchemaProvider::with_session(
+                            Some(Arc::new(PaimonSchemaProvider::new(
                                 catalog_name,
                                 Arc::clone(&catalog),
                                 name,
@@ -180,7 +173,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
                     catalog_name,
                     Arc::clone(&catalog),
                     name,
@@ -211,7 +204,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
                     catalog_name,
                     Arc::clone(&catalog),
                     name,
@@ -332,26 +325,8 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
+    /// Creates a new [`PaimonSchemaProvider`].
     pub fn new(
-        catalog: Arc<dyn Catalog>,
-        database: String,
-        dynamic_options: DynamicOptions,
-        temp_provider: Option<Arc<MemorySchemaProvider>>,
-        blob_reader_registry: BlobReaderRegistry,
-    ) -> Self {
-        Self::with_session(
-            None,
-            catalog,
-            database,
-            dynamic_options,
-            temp_provider,
-            blob_reader_registry,
-            None,
-        )
-    }
-
-    pub(crate) fn with_session(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         database: String,

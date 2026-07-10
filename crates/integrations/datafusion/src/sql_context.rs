@@ -180,7 +180,7 @@ impl SQLContext {
             Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
         self.ctx.register_catalog(
             &catalog_name,
-            Arc::new(crate::catalog::PaimonCatalogProvider::with_session(
+            Arc::new(crate::catalog::PaimonCatalogProvider::new(
                 Some(catalog_name.clone()),
                 catalog.clone(),
                 self.dynamic_options.clone(),
