@@ -47,6 +47,7 @@ struct MockState {
     tables: HashMap<String, GetTableResponse>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
+    view_function_endpoints_unsupported: bool,
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
@@ -344,6 +345,15 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let s = state.inner.lock().unwrap();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
         let key = format!("{db}.{view}");
         if let Some(response) = s.views.get(&key) {
             (StatusCode::OK, Json(response.clone())).into_response()
@@ -365,6 +375,15 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let s = state.inner.lock().unwrap();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                None,
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
         let prefix = format!("{db}.");
         let mut views: Vec<String> = s
             .views
@@ -377,6 +396,7 @@ impl RESTServer {
             StatusCode::OK,
             Json(ListViewsResponse::new(views, next_page_token)),
         )
+            .into_response()
     }
 
     /// Handle GET /databases/:db/functions/:function - get a persistent function.
@@ -385,6 +405,15 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let s = state.inner.lock().unwrap();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
         let key = format!("{db}.{function}");
         if let Some(response) = s.functions.get(&key) {
             (StatusCode::OK, Json(response.clone())).into_response()
@@ -406,6 +435,15 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let s = state.inner.lock().unwrap();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                None,
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
         let prefix = format!("{db}.");
         let mut functions: Vec<String> = s
             .functions
@@ -418,6 +456,7 @@ impl RESTServer {
             StatusCode::OK,
             Json(ListFunctionsResponse::new(functions, next_page_token)),
         )
+            .into_response()
     }
 
     /// Handle POST /databases/:db/tables - create a new table.
@@ -735,6 +774,14 @@ impl RESTServer {
     /// Force list-view and list-function handlers to paginate at this size.
     pub fn set_list_page_size(&self, page_size: usize) {
         self.inner.lock().unwrap().list_page_size = Some(page_size.max(1));
+    }
+
+    /// Make persistent view and function endpoints return HTTP 501.
+    pub fn set_view_function_endpoints_unsupported(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .view_function_endpoints_unsupported = true;
     }
 
     /// Add a table with schema and path to the server state.

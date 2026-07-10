@@ -1147,3 +1147,32 @@ async fn test_catalog_get_missing_function_maps_error() {
         paimon::Error::FunctionNotExist { full_name } if full_name == "default.missing"
     ));
 }
+
+#[tokio::test]
+async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.set_view_function_endpoints_unsupported();
+
+    assert!(matches!(
+        ctx.catalog.list_views("default").await.unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .get_view(&Identifier::new("default", "view"))
+            .await
+            .unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+    assert!(matches!(
+        ctx.catalog.list_functions("default").await.unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .get_function(&Identifier::new("default", "function"))
+            .await
+            .unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+}

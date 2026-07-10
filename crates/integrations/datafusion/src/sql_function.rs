@@ -30,6 +30,7 @@ use paimon::catalog::{Catalog, Function, Identifier};
 
 const MAX_EXPANSION_DEPTH: usize = 32;
 const MAX_FUNCTION_REFERENCES: usize = 1024;
+const MAX_EXPANDED_CALLS: usize = 1024;
 type FunctionReference = (String, Identifier);
 
 pub(crate) async fn expand_sql(
@@ -57,13 +58,31 @@ pub(crate) async fn expand_sql(
 }
 
 pub(crate) async fn expand_statement(
-    mut statement: Statement,
+    statement: Statement,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
     current_database: &str,
 ) -> DFResult<Statement> {
+    expand_statement_with_budget(
+        statement,
+        catalogs,
+        current_catalog,
+        current_database,
+        MAX_EXPANDED_CALLS,
+    )
+    .await
+}
+
+pub(crate) async fn expand_statement_with_budget(
+    mut statement: Statement,
+    catalogs: &HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: &str,
+    current_database: &str,
+    max_expanded_calls: usize,
+) -> DFResult<Statement> {
     let mut functions = HashMap::new();
     let mut dependencies = HashMap::new();
+    let mut total_expanded_calls = 0;
     for _ in 0..MAX_EXPANSION_DEPTH {
         let mut references = BTreeMap::new();
         let _: ControlFlow<()> = visit_expressions(&statement, |expr| {
@@ -128,6 +147,12 @@ pub(crate) async fn expand_statement(
             let Some(Some(function)) = functions.get(&reference) else {
                 return ControlFlow::Continue(());
             };
+            if total_expanded_calls >= max_expanded_calls {
+                return ControlFlow::Break(DataFusionError::Plan(format!(
+                    "REST SQL function expansion budget of {max_expanded_calls} calls exceeded"
+                )));
+            }
+            total_expanded_calls += 1;
 
             match expand_call(function, call, &reference.0, &functions) {
                 Ok(expanded) => {

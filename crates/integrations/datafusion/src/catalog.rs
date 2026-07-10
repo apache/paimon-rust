@@ -29,7 +29,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
-use datafusion::sql::sqlparser::ast::{visit_relations, ObjectName, Statement};
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier, View};
@@ -697,16 +697,117 @@ fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Id
         ));
     }
 
-    let mut identifiers = Vec::new();
-    let _: std::ops::ControlFlow<()> = visit_relations(&statements, |relation| {
-        if let Some(identifier) =
-            relation_identifier(relation, catalog_name, view.identifier().database())
-        {
-            identifiers.push(identifier);
+    let mut visitor = ViewRelationVisitor::new(catalog_name, view.identifier().database());
+    let _: std::ops::ControlFlow<()> = statements.visit(&mut visitor);
+    Ok(visitor.identifiers)
+}
+
+type SqlIdentifierKey = (Option<char>, String);
+
+struct QueryCteScope {
+    visible: HashSet<SqlIdentifierKey>,
+    cte_query_visibility: HashMap<usize, HashSet<SqlIdentifierKey>>,
+}
+
+struct ViewRelationVisitor<'a> {
+    catalog_name: &'a str,
+    current_database: &'a str,
+    scopes: Vec<QueryCteScope>,
+    identifiers: Vec<Identifier>,
+}
+
+impl<'a> ViewRelationVisitor<'a> {
+    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
+        Self {
+            catalog_name,
+            current_database,
+            scopes: Vec::new(),
+            identifiers: Vec::new(),
+        }
+    }
+}
+
+impl Visitor for ViewRelationVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        let query_address = query as *const Query as usize;
+        let inherited = self
+            .scopes
+            .last()
+            .map(|scope| {
+                scope
+                    .cte_query_visibility
+                    .get(&query_address)
+                    .unwrap_or(&scope.visible)
+                    .clone()
+            })
+            .unwrap_or_default();
+        let mut visible = inherited.clone();
+        let mut cte_query_visibility = HashMap::new();
+
+        if let Some(with) = &query.with {
+            let local_ctes = with
+                .cte_tables
+                .iter()
+                .map(|cte| sql_identifier_key(&cte.alias.name))
+                .collect::<Vec<_>>();
+            if with.recursive {
+                visible.extend(local_ctes);
+                for cte in &with.cte_tables {
+                    cte_query_visibility
+                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
+                }
+            } else {
+                for (cte, alias) in with.cte_tables.iter().zip(local_ctes) {
+                    cte_query_visibility
+                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
+                    visible.insert(alias);
+                }
+            }
+        }
+
+        self.scopes.push(QueryCteScope {
+            visible,
+            cte_query_visibility,
+        });
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        self.scopes.pop();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
+        let is_cte = match relation.0.as_slice() {
+            [part] => part.as_ident().is_some_and(|identifier| {
+                self.scopes
+                    .last()
+                    .is_some_and(|scope| scope.visible.contains(&sql_identifier_key(identifier)))
+            }),
+            _ => false,
+        };
+        if !is_cte {
+            if let Some(identifier) =
+                relation_identifier(relation, self.catalog_name, self.current_database)
+            {
+                self.identifiers.push(identifier);
+            }
         }
         std::ops::ControlFlow::Continue(())
-    });
-    Ok(identifiers)
+    }
+}
+
+fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
+    (
+        identifier.quote_style,
+        if identifier.quote_style.is_some() {
+            identifier.value.clone()
+        } else {
+            identifier.value.to_ascii_lowercase()
+        },
+    )
 }
 
 fn relation_identifier(

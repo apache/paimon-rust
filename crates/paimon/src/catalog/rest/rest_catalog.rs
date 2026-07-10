@@ -279,7 +279,10 @@ impl Catalog for RESTCatalog {
     }
 
     async fn list_views(&self, database_name: &str) -> Result<Vec<String>> {
-        self.api.list_views(database_name).await
+        self.api
+            .list_views(database_name)
+            .await
+            .map_err(|e| map_unsupported_endpoint(e, "view"))
     }
 
     async fn get_view(&self, identifier: &Identifier) -> Result<crate::catalog::View> {
@@ -295,7 +298,10 @@ impl Catalog for RESTCatalog {
     }
 
     async fn list_functions(&self, database_name: &str) -> Result<Vec<String>> {
-        self.api.list_functions(database_name).await
+        self.api
+            .list_functions(database_name)
+            .await
+            .map_err(|e| map_unsupported_endpoint(e, "function"))
     }
 
     async fn get_function(&self, identifier: &Identifier) -> Result<crate::catalog::Function> {
@@ -405,7 +411,7 @@ fn map_rest_error_for_view(err: Error, identifier: &Identifier) -> Error {
         } => Error::ViewNotExist {
             full_name: identifier.full_name(),
         },
-        other => other,
+        other => map_unsupported_endpoint(other, "view"),
     }
 }
 
@@ -416,6 +422,17 @@ fn map_rest_error_for_function(err: Error, identifier: &Identifier) -> Error {
             source: RestError::NoSuchResource { .. },
         } => Error::FunctionNotExist {
             full_name: identifier.full_name(),
+        },
+        other => map_unsupported_endpoint(other, "function"),
+    }
+}
+
+fn map_unsupported_endpoint(err: Error, object_type: &str) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::NotImplemented { message },
+        } => Error::Unsupported {
+            message: format!("REST catalog {object_type} endpoint is not supported: {message}"),
         },
         other => other,
     }

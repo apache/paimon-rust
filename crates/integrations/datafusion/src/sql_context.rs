@@ -3098,6 +3098,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_catalog_view_allows_cte_with_same_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "cte_view",
+            "WITH wrapper AS (\
+                 WITH cte_view AS (SELECT CAST(42 AS BIGINT) AS answer) \
+                 SELECT * FROM cte_view\
+             ) SELECT * FROM wrapper",
+        );
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT * FROM cte_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
     async fn rest_catalog_view_rejects_non_query_sql() {
         let catalog = Arc::new(MockCatalog::new());
         add_bigint_view(
@@ -3336,6 +3366,41 @@ mod tests {
         let error = ctx.sql("SELECT first(1)").await.unwrap_err().to_string();
 
         assert!(error.contains("recursive"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn branching_rest_sql_function_expansion_is_bounded() {
+        let catalog = Arc::new(MockCatalog::new());
+        for index in 0..3 {
+            let next = index + 1;
+            add_unary_sql_function(
+                &catalog,
+                &format!("f{index}"),
+                &format!("f{next}(x) + f{next}(x)"),
+                true,
+            );
+        }
+        add_unary_sql_function(&catalog, "f3", "x", true);
+        let ctx = make_sql_context(catalog).await;
+        let statement = Parser::parse_sql(&GenericDialect {}, "SELECT f0(1)")
+            .unwrap()
+            .remove(0);
+
+        let error = crate::sql_function::expand_statement_with_budget(
+            statement,
+            &ctx.catalogs,
+            &ctx.current_catalog_name(),
+            "default",
+            4,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("expansion budget"),
+            "unexpected error: {error}"
+        );
     }
 
     // ==================== register_catalog_with_default_db tests ====================
