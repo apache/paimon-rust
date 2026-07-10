@@ -19,7 +19,7 @@ mod avro;
 pub(crate) mod blob;
 mod mosaic;
 mod orc;
-mod parquet;
+pub(crate) mod parquet;
 mod row;
 mod shredding;
 #[cfg(feature = "vortex")]
@@ -29,6 +29,7 @@ mod vortex;
 pub(crate) use parquet::ParquetFormatWriter;
 
 use crate::io::{FileRead, OutputFile};
+use crate::spec::stats::BinaryTableStats;
 use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -102,8 +103,40 @@ pub(crate) trait FormatFileWriter: Send {
     async fn flush(&mut self) -> crate::Result<()>;
 
     /// Flush and close the writer, finalizing the file on storage.
-    /// Returns the total number of bytes written.
-    async fn close(self: Box<Self>) -> crate::Result<u64>;
+    async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult>;
+}
+
+pub(crate) struct FormatWriteResult {
+    pub(crate) file_size: u64,
+    pub(crate) value_stats: Option<FormatValueStats>,
+}
+
+pub(crate) struct FormatValueStats {
+    pub(crate) stats: BinaryTableStats,
+    pub(crate) columns: Option<Vec<String>>,
+}
+
+impl FormatWriteResult {
+    pub(crate) fn new(file_size: u64) -> Self {
+        Self {
+            file_size,
+            value_stats: None,
+        }
+    }
+
+    pub(crate) fn with_value_stats(
+        file_size: u64,
+        value_stats: BinaryTableStats,
+        columns: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            file_size,
+            value_stats: Some(FormatValueStats {
+                stats: value_stats,
+                columns,
+            }),
+        }
+    }
 }
 
 /// Create a format reader based on the file extension.
@@ -180,6 +213,7 @@ pub(crate) async fn create_format_writer(
             output,
             compression,
             zstd_level,
+            format_options.cloned().unwrap_or_default(),
         ));
         shredding::ShreddingFormatWriter::create(
             writer_factory,

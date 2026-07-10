@@ -55,6 +55,14 @@ const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
 const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
+const METADATA_STATS_MODE_OPTION: &str = "metadata.stats-mode";
+const METADATA_STATS_DENSE_STORE_OPTION: &str = "metadata.stats-dense-store";
+const METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION: &str = "metadata.stats-keep-first-n-columns";
+const DEFAULT_METADATA_STATS_MODE: &str = "truncate(16)";
+const DEFAULT_METADATA_STATS_DENSE_STORE: bool = true;
+const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
+const FIELDS_PREFIX: &str = "fields";
+const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
@@ -151,6 +159,56 @@ pub enum GlobalIndexSearchMode {
     Full,
     /// Use actual data-file row ID ranges to detect exact missing row IDs.
     Detail,
+}
+
+/// Metadata stats collection mode.
+///
+/// Reference: Java `SimpleColStatsCollector.from`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataStatsMode {
+    None,
+    Counts,
+    Full,
+    Truncate(usize),
+}
+
+impl MetadataStatsMode {
+    pub(crate) fn parse(option_name: &str, value: &str) -> crate::Result<Self> {
+        let value = value.trim();
+        let upper = value.to_ascii_uppercase();
+        match upper.as_str() {
+            "NONE" => Ok(Self::None),
+            "COUNTS" => Ok(Self::Counts),
+            "FULL" => Ok(Self::Full),
+            _ => {
+                let Some(length) = upper
+                    .strip_prefix("TRUNCATE(")
+                    .and_then(|value| value.strip_suffix(')'))
+                else {
+                    return Err(crate::Error::Unsupported {
+                        message: format!("Unsupported {option_name}: '{value}'"),
+                    });
+                };
+                let length = length
+                    .parse::<usize>()
+                    .map_err(|e| crate::Error::DataInvalid {
+                        message: format!(
+                            "Option '{option_name}' must use truncate(N) with a positive integer, got: {value}"
+                        ),
+                        source: Some(Box::new(e)),
+                    })?;
+                if length == 0 {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Option '{option_name}' must use truncate(N) with N > 0, got: {value}"
+                        ),
+                        source: None,
+                    });
+                }
+                Ok(Self::Truncate(length))
+            }
+        }
+    }
 }
 
 /// Bucket function used to map bucket keys to fixed bucket ids.
@@ -820,6 +878,79 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
     }
 
+    /// Whether metadata stats should omit columns without collected stats.
+    pub(crate) fn metadata_stats_dense_store(&self) -> bool {
+        self.options
+            .get(METADATA_STATS_DENSE_STORE_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_METADATA_STATS_DENSE_STORE)
+    }
+
+    /// Table-wide metadata stats mode.
+    pub(crate) fn metadata_stats_mode(&self) -> crate::Result<MetadataStatsMode> {
+        let value = self
+            .options
+            .get(METADATA_STATS_MODE_OPTION)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_METADATA_STATS_MODE);
+        MetadataStatsMode::parse(METADATA_STATS_MODE_OPTION, value)
+    }
+
+    /// Number of leading columns whose stats should be kept.
+    ///
+    /// A negative value means the option is ignored, matching Java Paimon.
+    pub(crate) fn metadata_stats_keep_first_n_columns(&self) -> crate::Result<i32> {
+        self.options
+            .get(METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION)
+            .map(|value| {
+                value.parse::<i32>().map_err(|e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Invalid value for {METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION}: '{value}'"
+                    ),
+                    source: Some(Box::new(e)),
+                })
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS))
+    }
+
+    /// Per-field metadata stats mode.
+    pub(crate) fn field_metadata_stats_mode(
+        &self,
+        field_name: &str,
+    ) -> crate::Result<Option<MetadataStatsMode>> {
+        let option_name = format!("{FIELDS_PREFIX}.{field_name}.{STATS_MODE_SUFFIX}");
+        self.options
+            .get(&option_name)
+            .map(|value| MetadataStatsMode::parse(&option_name, value))
+            .transpose()
+    }
+
+    /// Resolve metadata stats modes for fields using Java's priority:
+    /// field override > keep-first-n > table-wide mode.
+    pub(crate) fn metadata_stats_modes<'b, I>(
+        &self,
+        field_names: I,
+    ) -> crate::Result<Vec<MetadataStatsMode>>
+    where
+        I: IntoIterator<Item = &'b str>,
+    {
+        let table_mode = self.metadata_stats_mode()?;
+        let keep_first_n = self.metadata_stats_keep_first_n_columns()?;
+        let mut modes = Vec::new();
+        for (column_count, field_name) in field_names.into_iter().enumerate() {
+            let mode = if let Some(field_mode) = self.field_metadata_stats_mode(field_name)? {
+                field_mode
+            } else if keep_first_n >= 0 && column_count >= keep_first_n as usize {
+                MetadataStatsMode::None
+            } else {
+                table_mode
+            };
+            modes.push(mode);
+        }
+        Ok(modes)
+    }
+
     /// Avro compression codec for manifest, manifest-list and index-manifest files.
     /// Default is `"zstd"`, matching Java Paimon `CoreOptions.MANIFEST_COMPRESSION`.
     pub fn manifest_compression(&self) -> &str {
@@ -1323,6 +1454,49 @@ mod tests {
         assert_eq!(custom_core.changelog_file_format(), "parquet");
         assert_eq!(custom_core.changelog_file_compression(), "zstd");
         assert_eq!(custom_core.changelog_file_stats_mode(), Some("counts"));
+    }
+
+    #[test]
+    fn test_metadata_stats_modes_follow_java_priority() {
+        let options = HashMap::from([
+            (METADATA_STATS_MODE_OPTION.to_string(), "counts".to_string()),
+            (
+                METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION.to_string(),
+                "2".to_string(),
+            ),
+            ("fields.name.stats-mode".to_string(), "full".to_string()),
+            (
+                "fields.payload.stats-mode".to_string(),
+                "truncate(8)".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(
+            core.metadata_stats_modes(["id", "name", "payload", "extra"])
+                .unwrap(),
+            vec![
+                MetadataStatsMode::Counts,
+                MetadataStatsMode::Full,
+                MetadataStatsMode::Truncate(8),
+                MetadataStatsMode::None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_metadata_stats_mode_rejects_invalid_values() {
+        let options = HashMap::from([(
+            METADATA_STATS_MODE_OPTION.to_string(),
+            "truncate(0)".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+
+        let err = core
+            .metadata_stats_mode()
+            .expect_err("zero truncate length should fail");
+        assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+            if message.contains(METADATA_STATS_MODE_OPTION)));
     }
 
     #[test]

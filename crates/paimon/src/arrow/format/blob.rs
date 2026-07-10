@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader, FormatFileWriter};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::{FileRead, FileWrite};
 use crate::spec::{BlobDescriptor, DataField, DataType};
@@ -725,7 +725,7 @@ impl FormatFileWriter for BlobFormatWriter {
         Ok(())
     }
 
-    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
         let index_bytes = encode_delta_varints_write(&self.lengths);
         let index_length = index_bytes.len() as i32;
 
@@ -739,7 +739,7 @@ impl FormatFileWriter for BlobFormatWriter {
 
         let total = self.bytes_written + index_length as u64 + BLOB_FOOTER_SIZE;
         self.writer.close().await?;
-        Ok(total)
+        Ok(FormatWriteResult::new(total))
     }
 }
 

@@ -423,7 +423,7 @@ impl KeyValueFileWriter {
             writer.write(&chunk_batch).await?;
         }
 
-        let file_size = writer.close().await? as i64;
+        let file_size = writer.close().await?.file_size as i64;
 
         let key_columns: Vec<Arc<dyn Array>> = self
             .config

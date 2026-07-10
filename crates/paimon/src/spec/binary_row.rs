@@ -859,48 +859,24 @@ pub fn extract_datum_from_arrow(
         }
         DataType::Variant(_) => extract_variant_datum_from_arrow(col, row_idx, col_idx)?,
         DataType::Timestamp(ts) => {
-            if ts.precision() <= 3 {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
-                    .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?;
-                Datum::Timestamp {
-                    millis: arr.value(row_idx),
-                    nanos: 0,
-                }
-            } else {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
-                    .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?;
-                let micros = arr.value(row_idx);
-                Datum::Timestamp {
-                    millis: micros.div_euclid(1_000),
-                    nanos: (micros.rem_euclid(1_000) * 1_000) as i32,
-                }
-            }
+            let (millis, nanos) = extract_timestamp_parts_from_arrow(
+                col,
+                row_idx,
+                col_idx,
+                ts.precision(),
+                "Timestamp",
+            )?;
+            Datum::Timestamp { millis, nanos }
         }
         DataType::LocalZonedTimestamp(ts) => {
-            if ts.precision() <= 3 {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
-                    .ok_or_else(|| type_mismatch_err("LocalZonedTimestamp(ms)", col_idx))?;
-                Datum::LocalZonedTimestamp {
-                    millis: arr.value(row_idx),
-                    nanos: 0,
-                }
-            } else {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
-                    .ok_or_else(|| type_mismatch_err("LocalZonedTimestamp(us)", col_idx))?;
-                let micros = arr.value(row_idx);
-                Datum::LocalZonedTimestamp {
-                    millis: micros.div_euclid(1_000),
-                    nanos: (micros.rem_euclid(1_000) * 1_000) as i32,
-                }
-            }
+            let (millis, nanos) = extract_timestamp_parts_from_arrow(
+                col,
+                row_idx,
+                col_idx,
+                ts.precision(),
+                "LocalZonedTimestamp",
+            )?;
+            Datum::LocalZonedTimestamp { millis, nanos }
         }
         _ => {
             return Err(crate::Error::Unsupported {
@@ -913,6 +889,55 @@ pub fn extract_datum_from_arrow(
     };
 
     Ok(Some(datum))
+}
+
+fn extract_timestamp_parts_from_arrow(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+    precision: u32,
+    expected: &str,
+) -> crate::Result<(i64, i32)> {
+    match precision {
+        0..=3 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(ms)"), col_idx))?;
+            Ok((arr.value(row_idx), 0))
+        }
+        4..=6 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(us)"), col_idx))?;
+            Ok(timestamp_parts_from_micros(arr.value(row_idx)))
+        }
+        7..=9 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(ns)"), col_idx))?;
+            Ok(timestamp_parts_from_nanos(arr.value(row_idx)))
+        }
+        _ => Err(crate::Error::Unsupported {
+            message: format!("Unsupported {expected} precision {precision}"),
+        }),
+    }
+}
+
+fn timestamp_parts_from_micros(micros: i64) -> (i64, i32) {
+    (
+        micros.div_euclid(1_000),
+        (micros.rem_euclid(1_000) * 1_000) as i32,
+    )
+}
+
+fn timestamp_parts_from_nanos(nanos: i64) -> (i64, i32) {
+    (
+        nanos.div_euclid(1_000_000),
+        nanos.rem_euclid(1_000_000) as i32,
+    )
 }
 
 fn encode_variant_bytes(value: &[u8], metadata: &[u8]) -> crate::Result<Vec<u8>> {
@@ -1045,6 +1070,7 @@ enum TypedColumn<'a> {
     Variant(&'a arrow_array::StructArray),
     TimestampMs(&'a arrow_array::TimestampMillisecondArray),
     TimestampUs(&'a arrow_array::TimestampMicrosecondArray),
+    TimestampNs(&'a arrow_array::TimestampNanosecondArray),
 }
 
 /// Downcast Arrow columns once, returning typed references paired with their DataType.
@@ -1059,118 +1085,134 @@ fn downcast_columns<'a>(
         .map(|&col_idx| {
             let field = &fields[col_idx];
             let col = batch.column(col_idx);
-            let typed =
-                match field.data_type() {
-                    DataType::Boolean(_) => TypedColumn::Boolean(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?,
-                    ),
-                    DataType::TinyInt(_) => TypedColumn::Int8(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?,
-                    ),
-                    DataType::SmallInt(_) => TypedColumn::Int16(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?,
-                    ),
-                    DataType::Int(_) => TypedColumn::Int32(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Int", col_idx))?,
-                    ),
-                    DataType::BigInt(_) => TypedColumn::Int64(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?,
-                    ),
-                    DataType::Float(_) => TypedColumn::Float32(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Float", col_idx))?,
-                    ),
-                    DataType::Double(_) => TypedColumn::Float64(
-                        col.as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Double", col_idx))?,
-                    ),
-                    DataType::Char(_) | DataType::VarChar(_) => {
-                        if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                            TypedColumn::Utf8(arr)
-                        } else if let Some(arr) =
-                            col.as_any().downcast_ref::<arrow_array::StringViewArray>()
-                        {
-                            TypedColumn::Utf8View(arr)
-                        } else if let Some(arr) =
-                            col.as_any().downcast_ref::<arrow_array::LargeStringArray>()
-                        {
-                            TypedColumn::LargeUtf8(arr)
-                        } else {
-                            return Err(type_mismatch_err("String", col_idx));
-                        }
+            let typed = match field.data_type() {
+                DataType::Boolean(_) => TypedColumn::Boolean(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?,
+                ),
+                DataType::TinyInt(_) => TypedColumn::Int8(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?,
+                ),
+                DataType::SmallInt(_) => TypedColumn::Int16(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?,
+                ),
+                DataType::Int(_) => TypedColumn::Int32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Int", col_idx))?,
+                ),
+                DataType::BigInt(_) => TypedColumn::Int64(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?,
+                ),
+                DataType::Float(_) => TypedColumn::Float32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Float", col_idx))?,
+                ),
+                DataType::Double(_) => TypedColumn::Float64(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Double", col_idx))?,
+                ),
+                DataType::Char(_) | DataType::VarChar(_) => {
+                    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                        TypedColumn::Utf8(arr)
+                    } else if let Some(arr) =
+                        col.as_any().downcast_ref::<arrow_array::StringViewArray>()
+                    {
+                        TypedColumn::Utf8View(arr)
+                    } else if let Some(arr) =
+                        col.as_any().downcast_ref::<arrow_array::LargeStringArray>()
+                    {
+                        TypedColumn::LargeUtf8(arr)
+                    } else {
+                        return Err(type_mismatch_err("String", col_idx));
                     }
-                    DataType::Date(_) => TypedColumn::Date32(
+                }
+                DataType::Date(_) => TypedColumn::Date32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Date", col_idx))?,
+                ),
+                DataType::Decimal(d) => TypedColumn::Decimal128(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?,
+                    d.precision(),
+                    d.scale(),
+                ),
+                DataType::Binary(_) | DataType::VarBinary(_) => TypedColumn::Binary(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,
+                ),
+                DataType::Variant(_) => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
+                    validate_variant_struct_array(arr, col_idx)?;
+                    TypedColumn::Variant(arr)
+                }
+                DataType::Timestamp(ts) => match ts.precision() {
+                    0..=3 => TypedColumn::TimestampMs(
                         col.as_any()
                             .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Date", col_idx))?,
+                            .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?,
                     ),
-                    DataType::Decimal(d) => TypedColumn::Decimal128(
+                    4..=6 => TypedColumn::TimestampUs(
                         col.as_any()
                             .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?,
-                        d.precision(),
-                        d.scale(),
+                            .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?,
                     ),
-                    DataType::Binary(_) | DataType::VarBinary(_) => TypedColumn::Binary(
+                    7..=9 => TypedColumn::TimestampNs(
                         col.as_any()
                             .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,
+                            .ok_or_else(|| type_mismatch_err("Timestamp(ns)", col_idx))?,
                     ),
-                    DataType::Variant(_) => {
-                        let arr = col
-                            .as_any()
-                            .downcast_ref()
-                            .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
-                        validate_variant_struct_array(arr, col_idx)?;
-                        TypedColumn::Variant(arr)
-                    }
-                    DataType::Timestamp(ts) => {
-                        if ts.precision() <= 3 {
-                            TypedColumn::TimestampMs(
-                                col.as_any()
-                                    .downcast_ref()
-                                    .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?,
-                            )
-                        } else {
-                            TypedColumn::TimestampUs(
-                                col.as_any()
-                                    .downcast_ref()
-                                    .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?,
-                            )
-                        }
-                    }
-                    DataType::LocalZonedTimestamp(ts) => {
-                        if ts.precision() <= 3 {
-                            TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
-                                || type_mismatch_err("LocalZonedTimestamp(ms)", col_idx),
-                            )?)
-                        } else {
-                            TypedColumn::TimestampUs(col.as_any().downcast_ref().ok_or_else(
-                                || type_mismatch_err("LocalZonedTimestamp(us)", col_idx),
-                            )?)
-                        }
-                    }
-                    other => {
+                    _ => {
                         return Err(crate::Error::Unsupported {
-                            message: format!(
-                                "Unsupported data type {:?} for batch column downcast at column {}",
-                                other, col_idx
-                            ),
+                            message: format!("Unsupported Timestamp precision {}", ts.precision()),
                         });
                     }
-                };
+                },
+                DataType::LocalZonedTimestamp(ts) => {
+                    match ts.precision() {
+                        0..=3 => TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(ms)", col_idx),
+                        )?),
+                        4..=6 => TypedColumn::TimestampUs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(us)", col_idx),
+                        )?),
+                        7..=9 => TypedColumn::TimestampNs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(ns)", col_idx),
+                        )?),
+                        _ => {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Unsupported LocalZonedTimestamp precision {}",
+                                    ts.precision()
+                                ),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    return Err(crate::Error::Unsupported {
+                        message: format!(
+                            "Unsupported data type {:?} for batch column downcast at column {}",
+                            other, col_idx
+                        ),
+                    });
+                }
+            };
             Ok((typed, field))
         })
         .collect()
@@ -1339,9 +1381,15 @@ fn write_typed_value(
             if arr.is_null(row_idx) {
                 builder.set_null_at(pos);
             } else {
-                let micros = arr.value(row_idx);
-                let millis = micros.div_euclid(1_000);
-                let nanos = (micros.rem_euclid(1_000) * 1_000) as i32;
+                let (millis, nanos) = timestamp_parts_from_micros(arr.value(row_idx));
+                builder.write_timestamp_non_compact(pos, millis, nanos);
+            }
+        }
+        TypedColumn::TimestampNs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let (millis, nanos) = timestamp_parts_from_nanos(arr.value(row_idx));
                 builder.write_timestamp_non_compact(pos, millis, nanos);
             }
         }

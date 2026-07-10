@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader, FormatFileWriter};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::residual::{
     filter_record_batch_by_predicates, same_data_field, widen_scan_fields,
 };
@@ -480,7 +480,7 @@ impl FormatFileWriter for VortexFormatWriter {
         Ok(())
     }
 
-    async fn close(self: Box<Self>) -> crate::Result<u64> {
+    async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
         let this = *self;
         let VortexFormatWriter {
             dtype,
@@ -502,7 +502,7 @@ impl FormatFileWriter for VortexFormatWriter {
         output.write(bytes::Bytes::from(buffer)).await?;
         bytes_written.store(size, Ordering::Relaxed);
 
-        Ok(size)
+        Ok(FormatWriteResult::new(size))
     }
 }
 
@@ -628,10 +628,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let bytes = verifier_runtime
+        let result = verifier_runtime
             .block_on(async { Box::new(writer).close().await })
             .unwrap();
-        assert!(bytes > 0);
+        assert!(result.file_size > 0);
     }
 
     #[test]
@@ -701,8 +701,8 @@ mod tests {
 
         let batch = test_batch(&schema, vec![1, 2, 3], vec![10, 20, 30]);
         writer.write(&batch).await.unwrap();
-        let bytes = writer.close().await.unwrap();
-        assert!(bytes > 0);
+        let result = writer.close().await.unwrap();
+        assert!(result.file_size > 0);
 
         // Read back using VortexFormatReader.
         let input = file_io.new_input(path).unwrap();
@@ -767,7 +767,7 @@ mod tests {
         )
         .unwrap();
         writer.write(&batch).await.unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();
@@ -836,7 +836,7 @@ mod tests {
             .write(&test_batch(&schema, vec![3, 4, 5], vec![30, 40, 50]))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();
@@ -897,7 +897,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();
@@ -965,7 +965,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();
@@ -1022,7 +1022,7 @@ mod tests {
         )
         .unwrap();
         writer.write(&batch).await.unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_bytes = input.read().await.unwrap();
@@ -1098,7 +1098,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();
@@ -1229,7 +1229,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let fields = test_file_fields();
         let builder = PredicateBuilder::new(&fields);
@@ -1349,7 +1349,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let input = file_io.new_input(path).unwrap();
         let file_reader = input.reader().await.unwrap();

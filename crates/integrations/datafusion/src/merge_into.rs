@@ -26,7 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int32Array, RecordBatch, UInt32Array, UInt64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int32Array, RecordBatch, UInt32Array, UInt64Array,
+};
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -37,7 +39,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use futures::TryStreamExt;
 
-use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions};
+use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions, DataField};
 use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table, WriteBuilder};
 
 use crate::error::to_datafusion_error;
@@ -569,13 +571,6 @@ async fn execute_cow_merge_inner(
 
     // Handle NOT MATCHED → INSERT
     if !clauses.inserts.is_empty() {
-        let table_fields: Vec<String> = table
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
-
         let insert_sql = if has_target_data {
             format!(
                 "SELECT {s_alias}.* FROM {source_ref} AS {s_alias} \
@@ -595,7 +590,7 @@ async fn execute_cow_merge_inner(
                 &clauses.inserts,
                 s_alias,
                 &[],
-                &table_fields,
+                table.schema().fields(),
                 temp_tracker,
             )
             .await?;
@@ -734,13 +729,6 @@ async fn execute_merge_into_once(
                 injected_columns.push(format!("__upd_{col}"));
             }
         }
-        // Table schema field names for reordering INSERT columns
-        let table_fields: Vec<String> = table
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
         let mut temp_tracker = TempTableTracker::new(ctx);
         let insert_batches = build_insert_batches(
             ctx,
@@ -748,7 +736,7 @@ async fn execute_merge_into_once(
             &parsed.inserts,
             s_alias,
             &injected_columns,
-            &table_fields,
+            table.schema().fields(),
             &mut temp_tracker,
         )
         .await?;
@@ -854,7 +842,7 @@ async fn build_insert_batches(
     inserts: &[MergeInsertClause],
     s_alias: &str,
     injected_columns: &[String],
-    table_fields: &[String],
+    table_fields: &[DataField],
     temp_tracker: &mut TempTableTracker<'_>,
 ) -> DFResult<Vec<RecordBatch>> {
     if not_matched_batches.is_empty() || not_matched_batches.iter().all(|b| b.num_rows() == 0) {
@@ -883,7 +871,7 @@ async fn build_insert_batches_inner(
     inserts: &[MergeInsertClause],
     s_alias: &str,
     tmp_name: &str,
-    table_fields: &[String],
+    table_fields: &[DataField],
 ) -> DFResult<Vec<RecordBatch>> {
     let mut all_batches = Vec::new();
     let mut consumed_predicates: Vec<String> = Vec::new();
@@ -910,10 +898,62 @@ async fn build_insert_batches_inner(
         let sql = format!("SELECT {select_clause} FROM {tmp_name} AS {s_alias}{where_clause}");
 
         let batches = ctx.ctx().sql(&sql).await?.collect().await?;
-        all_batches.extend(batches);
+        for batch in batches {
+            all_batches.push(normalize_insert_batch_to_table_schema(
+                &batch,
+                table_fields,
+            )?);
+        }
     }
 
     Ok(all_batches)
+}
+
+fn normalize_insert_batch_to_table_schema(
+    batch: &RecordBatch,
+    table_fields: &[DataField],
+) -> DFResult<RecordBatch> {
+    let target_schema =
+        paimon::arrow::build_target_arrow_schema(table_fields).map_err(to_datafusion_error)?;
+    let mut columns = Vec::with_capacity(table_fields.len());
+
+    for (target_idx, field) in table_fields.iter().enumerate() {
+        let source_idx = batch
+            .schema()
+            .index_of(field.name())
+            .ok()
+            .or_else(|| (target_idx < batch.num_columns()).then_some(target_idx))
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "MERGE INSERT output is missing target column '{}'",
+                    field.name()
+                ))
+            })?;
+        let column = batch.column(source_idx).clone();
+        let target_type = target_schema.field(target_idx).data_type();
+        let column = cast_insert_column(field.name(), column, target_type)?;
+        columns.push(column);
+    }
+
+    RecordBatch::try_new(target_schema, columns).map_err(DataFusionError::from)
+}
+
+fn cast_insert_column(
+    name: &str,
+    column: ArrayRef,
+    target_type: &ArrowDataType,
+) -> DFResult<ArrayRef> {
+    if column.data_type() == target_type {
+        return Ok(column);
+    }
+
+    compute::cast(column.as_ref(), target_type).map_err(|e| {
+        DataFusionError::Plan(format!(
+            "Cannot cast MERGE INSERT column '{name}' from {:?} to {:?}: {e}",
+            column.data_type(),
+            target_type
+        ))
+    })
 }
 
 /// Remove injected columns from batches, keeping only source columns.
@@ -946,7 +986,7 @@ fn strip_non_source_columns(
 /// When the INSERT specifies explicit columns (`INSERT (col2, col1) VALUES (expr2, expr1)`),
 /// the output must be reordered to match the table schema so that `write_arrow_batch`
 /// (which reads columns by positional index) maps them correctly.
-fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[String]) -> String {
+fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[DataField]) -> String {
     if ins.columns.is_empty() && ins.value_exprs.is_empty() {
         "*".to_string()
     } else {
@@ -962,11 +1002,11 @@ fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[String]) -> Str
         table_fields
             .iter()
             .map(|field| {
-                let key = field.to_lowercase();
+                let key = field.name().to_lowercase();
                 match col_expr_map.get(&key) {
-                    Some(expr) => format!("{expr} AS {}", quote_identifier(field)),
+                    Some(expr) => format!("{expr} AS {}", quote_identifier(field.name())),
                     // Column not in INSERT list — fill with NULL
-                    None => format!("NULL AS {}", quote_identifier(field)),
+                    None => format!("NULL AS {}", quote_identifier(field.name())),
                 }
             })
             .collect::<Vec<_>>()

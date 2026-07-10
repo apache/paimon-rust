@@ -3281,7 +3281,7 @@ mod tests {
                     .await
                     .unwrap();
             writer.write(&batch).await.unwrap();
-            writer.close().await.unwrap();
+            let _ = writer.close().await.unwrap();
         }
 
         let table_schema = TableSchema::new(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader, FormatFileWriter};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::shredding::{
     assemble_shredded_variant_batch, batch_to_shredded_physical,
@@ -289,12 +289,12 @@ impl FormatFileWriter for ShreddingFormatWriter {
         }
     }
 
-    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
         self.finalize_inferred_writer().await?;
         match std::mem::replace(&mut self.state, ShreddingWriterState::Closed) {
             ShreddingWriterState::Ready { inner, .. } => inner.close().await,
             ShreddingWriterState::Infer { .. } => unreachable!("infer writer finalized above"),
-            ShreddingWriterState::Closed => Ok(0),
+            ShreddingWriterState::Closed => Ok(FormatWriteResult::new(0)),
         }
     }
 }

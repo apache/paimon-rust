@@ -786,15 +786,16 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
-        bucket_dir_name, BigIntType, BinaryRowBuilder, BlobType, DataField, DataType, DecimalType,
-        FileKind, FloatType, IndexManifest, IntType, LocalZonedTimestampType, Manifest,
-        ManifestList, Schema, TableSchema, TimestampType, TinyIntType, VarCharType, VectorType,
+        bucket_dir_name, BigIntType, BinaryRow, BinaryRowBuilder, BinaryType, BlobType, DataField,
+        DataType, Datum, DecimalType, FileKind, FloatType, IndexManifest, IntType,
+        LocalZonedTimestampType, Manifest, ManifestList, PredicateBuilder, Schema, TableSchema,
+        TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
         SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
         VALUE_KIND_FIELD_NAME,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
-    use arrow_array::{Int32Array, Int64Array, Int8Array, StringArray};
+    use arrow_array::{Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray};
     use arrow_schema::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
     };
@@ -883,6 +884,21 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_nullable_batch(ids: Vec<Option<i32>>, values: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
         ]));
         RecordBatch::try_new(
             schema,
@@ -1106,6 +1122,445 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert_eq!(snapshot.total_record_count(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_append_write_populates_value_stats() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_value_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_nullable_batch(
+                vec![Some(3), None],
+                vec![Some(30), Some(10)],
+            ))
+            .await
+            .unwrap();
+        table_write
+            .write_arrow_batch(&make_nullable_batch(vec![Some(1)], vec![None]))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.row_count, 3);
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(1), Some(1)]);
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(0).unwrap(), 1);
+        assert_eq!(max_values.get_int(0).unwrap(), 3);
+        assert_eq!(min_values.get_int(1).unwrap(), 10);
+        assert_eq!(max_values.get_int(1).unwrap(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_append_write_populates_microsecond_timestamp_value_stats() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_timestamp6_value_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("ts", DataType::Timestamp(TimestampType::new(6).unwrap()))
+            .column(
+                "lzts",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
+            )
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_timestamp9_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            ArrowField::new(
+                "lzts",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+                    Some(1_704_067_200_987_654_i64),
+                    Some(1_704_067_200_123_456_i64),
+                ])),
+                Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from(vec![
+                        Some(1_704_067_201_999_999_i64),
+                        Some(1_704_067_201_000_001_i64),
+                    ])
+                    .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.value_stats_cols, None);
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(
+            min_values.get_timestamp_raw(0, 6).unwrap(),
+            (1_704_067_200_123, 456_000)
+        );
+        assert_eq!(
+            max_values.get_timestamp_raw(0, 6).unwrap(),
+            (1_704_067_200_987, 654_000)
+        );
+        assert_eq!(
+            min_values.get_timestamp_raw(1, 6).unwrap(),
+            (1_704_067_201_000, 1_000)
+        );
+        assert_eq!(
+            max_values.get_timestamp_raw(1, 6).unwrap(),
+            (1_704_067_201_999, 999_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_write_nanosecond_timestamp_value_stats_keeps_counts_only() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_timestamp9_value_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("ts", DataType::Timestamp(TimestampType::new(9).unwrap()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_timestamp9_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "ts",
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
+                Some(1_704_067_200_987_654_321_i64),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(1)]);
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert!(min_values.is_null_at(0));
+        assert!(max_values.is_null_at(0));
+    }
+
+    #[tokio::test]
+    async fn test_append_write_truncates_string_value_stats_and_keeps_binary_counts() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_skip_variable_length_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column(
+                "payload",
+                DataType::VarBinary(VarBinaryType::new(1024).unwrap()),
+            )
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_variable_length_stats_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("payload", ArrowDataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![2, 1])),
+                Arc::new(StringArray::from(vec![
+                    Some("a long string value"),
+                    Some("another long string value"),
+                ])),
+                Arc::new(arrow_array::BinaryArray::from(vec![
+                    Some(b"large-binary-value" as &[u8]),
+                    Some(b"another-large-binary-value" as &[u8]),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(
+            file.value_stats.null_counts(),
+            &vec![Some(0), Some(0), Some(0)]
+        );
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(0).unwrap(), 1);
+        assert_eq!(max_values.get_int(0).unwrap(), 2);
+        assert_eq!(min_values.get_string(1).unwrap(), "a long string va");
+        assert_eq!(max_values.get_string(1).unwrap(), "another long sts");
+        assert!(min_values.is_null_at(2));
+        assert!(max_values.is_null_at(2));
+    }
+
+    #[tokio::test]
+    async fn test_append_write_applies_configured_metadata_stats_modes() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_configured_metadata_stats_modes";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("payload", DataType::Binary(BinaryType::new(1024).unwrap()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("metadata.stats-mode", "counts")
+            .option("metadata.stats-keep-first-n-columns", "2")
+            .option("fields.name.stats-mode", "full")
+            .option("fields.payload.stats-mode", "full")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_configured_stats_modes_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("payload", ArrowDataType::Binary, true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(2), None])),
+                Arc::new(StringArray::from(vec![
+                    Some("alpha-long-value-12345"),
+                    Some("zeta-long-value-99999"),
+                ])),
+                Arc::new(arrow_array::BinaryArray::from(vec![
+                    Some(b"first-binary-value" as &[u8]),
+                    None,
+                ])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(
+            file.value_stats_cols,
+            Some(vec![
+                "id".to_string(),
+                "name".to_string(),
+                "payload".to_string()
+            ])
+        );
+        assert_eq!(
+            file.value_stats.null_counts(),
+            &vec![Some(1), Some(0), Some(1)]
+        );
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert!(min_values.is_null_at(0));
+        assert!(max_values.is_null_at(0));
+        assert_eq!(min_values.get_string(1).unwrap(), "alpha-long-value-12345");
+        assert_eq!(max_values.get_string(1).unwrap(), "zeta-long-value-99999");
+        assert!(min_values.is_null_at(2));
+        assert!(max_values.is_null_at(2));
+    }
+
+    #[tokio::test]
+    async fn test_append_write_respects_non_dense_metadata_stats_storage() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_non_dense_metadata_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ignored", DataType::Int(IntType::new()))
+            .option("metadata.stats-mode", "none")
+            .option("metadata.stats-dense-store", "false")
+            .option("fields.id.stats-mode", "counts")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_non_dense_stats_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("ignored", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(1), None]);
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.arity(), 2);
+        assert_eq!(max_values.arity(), 2);
+        assert!(min_values.is_null_at(0));
+        assert!(max_values.is_null_at(0));
+        assert!(min_values.is_null_at(1));
+        assert!(max_values.is_null_at(1));
+    }
+
+    #[tokio::test]
+    async fn test_append_write_populates_time_value_stats() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_time_value_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("tm", DataType::Time(TimeType::new(3).unwrap()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_time_value_stats_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tm",
+            ArrowDataType::Time32(TimeUnit::Millisecond),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Time32MillisecondArray::from(vec![
+                Some(3_000),
+                None,
+                Some(1_000),
+            ]))],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(1)]);
+
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(0).unwrap(), 1_000);
+        assert_eq!(max_values.get_int(0).unwrap(), 3_000);
+    }
+
+    #[tokio::test]
+    async fn test_scan_prunes_real_append_files_using_written_value_stats() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_table_write_value_stats_scan";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![100, 101], vec![1000, 1010]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_than("id", Datum::Int(10))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(predicate);
+        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(trace.final_files, 1, "scan trace: {trace:?}");
+        assert!(
+            trace.manifest_entries_pruned_by_data_stats >= 1,
+            "scan trace: {trace:?}"
+        );
     }
 
     #[tokio::test]

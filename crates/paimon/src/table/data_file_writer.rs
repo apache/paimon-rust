@@ -22,7 +22,7 @@
 //! handles file rolling when `target_file_size` is reached, and collects
 //! [`DataFileMeta`] for the commit path.
 
-use crate::arrow::format::{create_format_writer, FormatFileWriter};
+use crate::arrow::format::{create_format_writer, FormatFileWriter, FormatValueStats};
 use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{bucket_dir_name, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
@@ -117,8 +117,8 @@ impl DataFileWriter {
             self.open_new_file(batch.schema()).await?;
         }
 
-        self.current_row_count += batch.num_rows() as i64;
         self.current_writer.as_mut().unwrap().write(batch).await?;
+        self.current_row_count += batch.num_rows() as i64;
 
         // Roll to a new file if target size is reached — close in background
         if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.target_file_size {
@@ -142,7 +142,6 @@ impl DataFileWriter {
             self.written_files.len(),
             self.file_format,
         );
-
         let bucket_dir = if self.partition_path.is_empty() {
             format!("{}/{}", self.table_location, bucket_dir_name(self.bucket))
         } else {
@@ -183,16 +182,17 @@ impl DataFileWriter {
 
         let row_count = self.current_row_count;
         self.current_row_count = 0;
-        let file_size = writer.close().await? as i64;
+        let write_result = writer.close().await?;
 
         let meta = Self::build_meta(
             file_name,
-            file_size,
+            write_result.file_size as i64,
             row_count,
             self.schema_id,
             self.file_source,
             self.first_row_id,
             self.write_cols.clone(),
+            write_result.value_stats,
         );
         self.written_files.push(meta);
         Ok(())
@@ -213,15 +213,16 @@ impl DataFileWriter {
         let write_cols = self.write_cols.clone();
 
         self.in_flight_closes.spawn(async move {
-            let file_size = writer.close().await? as i64;
+            let write_result = writer.close().await?;
             Ok(Self::build_meta(
                 file_name,
-                file_size,
+                write_result.file_size as i64,
                 row_count,
                 schema_id,
                 file_source,
                 first_row_id,
                 write_cols,
+                write_result.value_stats,
             ))
         });
     }
@@ -239,6 +240,7 @@ impl DataFileWriter {
         Ok(std::mem::take(&mut self.written_files))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_meta(
         file_name: String,
         file_size: i64,
@@ -247,23 +249,20 @@ impl DataFileWriter {
         file_source: Option<i32>,
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
+        format_value_stats: Option<FormatValueStats>,
     ) -> DataFileMeta {
+        let (value_stats, value_stats_cols) = match format_value_stats {
+            Some(stats) => (stats.stats, stats.columns),
+            None => (BinaryTableStats::empty(), Some(Vec::new())),
+        };
         DataFileMeta {
             file_name,
             file_size,
             row_count,
             min_key: EMPTY_SERIALIZED_ROW.clone(),
             max_key: EMPTY_SERIALIZED_ROW.clone(),
-            key_stats: BinaryTableStats::new(
-                EMPTY_SERIALIZED_ROW.clone(),
-                EMPTY_SERIALIZED_ROW.clone(),
-                vec![],
-            ),
-            value_stats: BinaryTableStats::new(
-                EMPTY_SERIALIZED_ROW.clone(),
-                EMPTY_SERIALIZED_ROW.clone(),
-                vec![],
-            ),
+            key_stats: BinaryTableStats::empty(),
+            value_stats,
             min_sequence_number: 0,
             max_sequence_number: 0,
             schema_id,
@@ -273,7 +272,7 @@ impl DataFileWriter {
             delete_row_count: Some(0),
             embedded_index: None,
             file_source,
-            value_stats_cols: Some(vec![]),
+            value_stats_cols,
             external_path: None,
             first_row_id,
             write_cols,

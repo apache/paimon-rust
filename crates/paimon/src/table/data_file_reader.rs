@@ -752,7 +752,7 @@ mod row_tests {
             .await
             .unwrap();
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap() as i64;
+        let file_size = writer.close().await.unwrap().file_size as i64;
 
         let schema_id = 1;
         let split = DataSplitBuilder::new()
@@ -823,7 +823,7 @@ mod row_tests {
             .await
             .unwrap();
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap() as i64;
+        let file_size = writer.close().await.unwrap().file_size as i64;
 
         let schema_id = 1;
         let split = DataSplitBuilder::new()
@@ -904,7 +904,7 @@ mod row_tests {
             .await
             .unwrap();
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap() as i64;
+        let file_size = writer.close().await.unwrap().file_size as i64;
 
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -1545,12 +1545,19 @@ mod vector_parquet_tests {
         let file_path = format!("{bucket_path}/{file_name}");
         let output = file_io.new_output(&file_path).unwrap();
         let mut writer: Box<dyn FormatFileWriter> = Box::new(
-            ParquetFormatWriter::new(&output, arrow_schema.clone(), "zstd", 1)
-                .await
-                .unwrap(),
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                None,
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap(),
         );
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
 
         // Build a split whose data file's schema_id matches the table schema_id, so the
         // read path uses `read_type` directly (no SchemaManager lookup needed).

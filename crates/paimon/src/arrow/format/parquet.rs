@@ -16,10 +16,14 @@
 // under the License.
 
 use super::shredding::PhysicalFormatWriterFactory;
-use super::{FilePredicates, FormatFileReader, FormatFileWriter};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::io::{FileRead, OutputFile};
-use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::stats::BinaryTableStats;
+use crate::spec::{
+    BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode, Predicate,
+    PredicateOperator,
+};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{BooleanArray, RecordBatch};
@@ -39,6 +43,7 @@ use parquet::file::metadata::{
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -49,20 +54,30 @@ pub(crate) struct ParquetFormatReader;
 /// Streams data directly to storage via `AsyncArrowWriter` + opendal.
 pub(crate) struct ParquetFormatWriter {
     inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
+    write_fields: Option<Vec<DataField>>,
+    stats_modes: Option<Vec<MetadataStatsMode>>,
+    stats_dense_store: bool,
 }
 
 pub(crate) struct ParquetPhysicalWriterFactory {
     output: OutputFile,
     compression: String,
     zstd_level: i32,
+    format_options: HashMap<String, String>,
 }
 
 impl ParquetPhysicalWriterFactory {
-    pub(crate) fn new(output: &OutputFile, compression: &str, zstd_level: i32) -> Self {
+    pub(crate) fn new(
+        output: &OutputFile,
+        compression: &str,
+        zstd_level: i32,
+        format_options: HashMap<String, String>,
+    ) -> Self {
         Self {
             output: output.clone(),
             compression: compression.to_string(),
             zstd_level,
+            format_options,
         }
     }
 }
@@ -72,11 +87,18 @@ impl PhysicalFormatWriterFactory for ParquetPhysicalWriterFactory {
     async fn create_writer(
         &mut self,
         schema: arrow_schema::SchemaRef,
-        _write_fields: Option<&[DataField]>,
+        write_fields: Option<&[DataField]>,
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         Ok(Box::new(
-            ParquetFormatWriter::new(&self.output, schema, &self.compression, self.zstd_level)
-                .await?,
+            ParquetFormatWriter::new(
+                &self.output,
+                schema,
+                &self.compression,
+                self.zstd_level,
+                write_fields,
+                &self.format_options,
+            )
+            .await?,
         ))
     }
 }
@@ -87,11 +109,22 @@ impl ParquetFormatWriter {
         schema: arrow_schema::SchemaRef,
         compression: &str,
         zstd_level: i32,
+        write_fields: Option<&[DataField]>,
+        format_options: &HashMap<String, String>,
     ) -> crate::Result<Self> {
         let async_write = output.async_writer().await?;
         let codec = parse_compression(compression, zstd_level);
         let inner = create_parquet_arrow_writer(async_write, schema, codec)?;
-        Ok(Self { inner })
+        let core_options = CoreOptions::new(format_options);
+        let stats_modes = write_fields
+            .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
+            .transpose()?;
+        Ok(Self {
+            inner,
+            write_fields: write_fields.map(|fields| fields.to_vec()),
+            stats_modes,
+            stats_dense_store: core_options.metadata_stats_dense_store(),
+        })
     }
 }
 
@@ -154,15 +187,27 @@ impl FormatFileWriter for ParquetFormatWriter {
             })
     }
 
-    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
-        self.inner
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        let metadata = self
+            .inner
             .finish()
             .await
             .map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to close parquet writer: {e}"),
                 source: None,
             })?;
-        Ok(self.inner.bytes_written() as u64)
+        let file_size = self.inner.bytes_written() as u64;
+        if let (Some(write_fields), Some(stats_modes)) = (&self.write_fields, &self.stats_modes) {
+            let (value_stats, value_stats_cols) =
+                extract_value_stats(&metadata, write_fields, stats_modes, self.stats_dense_store);
+            Ok(FormatWriteResult::with_value_stats(
+                file_size,
+                value_stats,
+                value_stats_cols,
+            ))
+        } else {
+            Ok(FormatWriteResult::new(file_size))
+        }
     }
 }
 
@@ -625,6 +670,272 @@ fn build_row_group_column_indices(
         .collect()
 }
 
+fn extract_value_stats(
+    metadata: &ParquetMetaData,
+    write_fields: &[DataField],
+    stats_modes: &[MetadataStatsMode],
+    stats_dense_store: bool,
+) -> (BinaryTableStats, Option<Vec<String>>) {
+    debug_assert_eq!(write_fields.len(), stats_modes.len());
+    let row_groups = metadata.row_groups();
+    let column_indices = row_groups
+        .first()
+        .map(|row_group| build_row_group_column_indices(row_group.columns(), write_fields))
+        .unwrap_or_else(|| vec![None; write_fields.len()]);
+    let mut column_names = Vec::new();
+    let mut column_types = Vec::new();
+    let mut min_datums = Vec::new();
+    let mut max_datums = Vec::new();
+    let mut null_counts = Vec::new();
+
+    for (field_idx, field) in write_fields.iter().enumerate() {
+        let mode = stats_modes
+            .get(field_idx)
+            .copied()
+            .unwrap_or(MetadataStatsMode::None);
+        let column_stats = if mode == MetadataStatsMode::None {
+            None
+        } else {
+            column_indices
+                .get(field_idx)
+                .copied()
+                .flatten()
+                .and_then(|column_idx| {
+                    extract_column_value_stats(row_groups, column_idx, field.data_type(), mode)
+                })
+        };
+
+        // Non-dense stats stay aligned with write_fields, including unavailable stats.
+        match column_stats {
+            Some((min_datum, max_datum, null_count)) => {
+                if stats_dense_store {
+                    column_names.push(field.name().to_string());
+                }
+                column_types.push(field.data_type().clone());
+                min_datums.push(min_datum);
+                max_datums.push(max_datum);
+                null_counts.push(null_count);
+            }
+            None if !stats_dense_store => {
+                column_types.push(field.data_type().clone());
+                min_datums.push(None);
+                max_datums.push(None);
+                null_counts.push(None);
+            }
+            None => {}
+        }
+    }
+
+    let stats = if column_types.is_empty() {
+        BinaryTableStats::empty()
+    } else {
+        binary_table_stats_from_datums(&column_types, &min_datums, &max_datums, null_counts)
+    };
+    // Java omits the dense mapping when stats already cover every write field.
+    let value_stats_cols = if stats_dense_store && column_types.len() != write_fields.len() {
+        Some(column_names)
+    } else {
+        None
+    };
+    (stats, value_stats_cols)
+}
+
+fn extract_column_value_stats(
+    row_groups: &[RowGroupMetaData],
+    column_idx: usize,
+    data_type: &DataType,
+    mode: MetadataStatsMode,
+) -> Option<(Option<Datum>, Option<Datum>, Option<i64>)> {
+    let collect_min_max = matches!(
+        mode,
+        MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
+    ) && supports_manifest_min_max(data_type);
+    let mut min_datum: Option<Datum> = None;
+    let mut max_datum: Option<Datum> = None;
+    let mut min_complete = true;
+    let mut max_complete = true;
+    let mut null_count = Some(0_i64);
+    let mut has_stats = false;
+
+    for row_group in row_groups {
+        let Some(stats) = row_group.column(column_idx).statistics() else {
+            min_complete = false;
+            max_complete = false;
+            null_count = None;
+            continue;
+        };
+        has_stats = true;
+
+        match stats
+            .null_count_opt()
+            .and_then(|count| i64::try_from(count).ok())
+        {
+            Some(count) => {
+                if let Some(total) = null_count.as_mut() {
+                    *total += count;
+                }
+            }
+            None => null_count = None,
+        }
+
+        let row_group_all_null = stats.null_count_opt() == Some(row_group.num_rows().max(0) as u64);
+        if !collect_min_max || row_group_all_null {
+            continue;
+        }
+
+        match parquet_stats_to_datum(stats, data_type, true) {
+            Some(candidate) => {
+                if let Some(current) = &min_datum {
+                    match candidate.partial_cmp(current) {
+                        Some(Ordering::Less) => min_datum = Some(candidate),
+                        Some(Ordering::Equal | Ordering::Greater) => {}
+                        None => min_complete = false,
+                    }
+                } else {
+                    min_datum = Some(candidate);
+                }
+            }
+            None => min_complete = false,
+        }
+
+        match parquet_stats_to_datum(stats, data_type, false) {
+            Some(candidate) => {
+                if let Some(current) = &max_datum {
+                    match candidate.partial_cmp(current) {
+                        Some(Ordering::Greater) => max_datum = Some(candidate),
+                        Some(Ordering::Less | Ordering::Equal) => {}
+                        None => max_complete = false,
+                    }
+                } else {
+                    max_datum = Some(candidate);
+                }
+            }
+            None => max_complete = false,
+        }
+    }
+
+    if !has_stats {
+        return None;
+    }
+    if !min_complete {
+        min_datum = None;
+    }
+    if !max_complete {
+        max_datum = None;
+    }
+    let (min_datum, max_datum) = apply_stats_mode(data_type, mode, min_datum, max_datum);
+    if min_datum.is_none() && max_datum.is_none() && null_count.is_none() {
+        None
+    } else {
+        Some((min_datum, max_datum, null_count))
+    }
+}
+
+fn supports_manifest_min_max(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean(_)
+            | DataType::TinyInt(_)
+            | DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::BigInt(_)
+            | DataType::Char(_)
+            | DataType::VarChar(_)
+            | DataType::Decimal(_)
+            | DataType::Double(_)
+            | DataType::Float(_)
+            | DataType::Date(_)
+            | DataType::Time(_)
+            | DataType::LocalZonedTimestamp(_)
+            | DataType::Timestamp(_)
+    )
+}
+
+fn apply_stats_mode(
+    data_type: &DataType,
+    mode: MetadataStatsMode,
+    min_datum: Option<Datum>,
+    max_datum: Option<Datum>,
+) -> (Option<Datum>, Option<Datum>) {
+    let MetadataStatsMode::Truncate(length) = mode else {
+        return (min_datum, max_datum);
+    };
+    match data_type {
+        DataType::Char(_) | DataType::VarChar(_) => {
+            let min = min_datum.map(|datum| truncate_string_min_datum(datum, length));
+            let max = match max_datum {
+                Some(datum) => match truncate_string_max_datum(datum, length) {
+                    Some(max) => Some(max),
+                    None => return (None, None),
+                },
+                None => None,
+            };
+            (min, max)
+        }
+        _ => (min_datum, max_datum),
+    }
+}
+
+fn truncate_string_min_datum(datum: Datum, length: usize) -> Datum {
+    match datum {
+        Datum::String(value) => Datum::String(truncate_string_min(&value, length)),
+        other => other,
+    }
+}
+
+fn truncate_string_max_datum(datum: Datum, length: usize) -> Option<Datum> {
+    match datum {
+        Datum::String(value) => truncate_string_max(&value, length).map(Datum::String),
+        other => Some(other),
+    }
+}
+
+fn truncate_string_min(value: &str, length: usize) -> String {
+    value.chars().take(length).collect()
+}
+
+fn truncate_string_max(value: &str, length: usize) -> Option<String> {
+    let char_count = value.chars().count();
+    if char_count <= length {
+        return Some(value.to_string());
+    }
+
+    let mut chars: Vec<char> = value.chars().take(length).collect();
+    for idx in (0..chars.len()).rev() {
+        if let Some(next) = char::from_u32(chars[idx] as u32 + 1) {
+            chars.truncate(idx);
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn binary_table_stats_from_datums(
+    column_types: &[DataType],
+    min_datums: &[Option<Datum>],
+    max_datums: &[Option<Datum>],
+    null_counts: Vec<Option<i64>>,
+) -> BinaryTableStats {
+    let mut min_builder = BinaryRowBuilder::new(column_types.len() as i32);
+    let mut max_builder = BinaryRowBuilder::new(column_types.len() as i32);
+    for (pos, data_type) in column_types.iter().enumerate() {
+        match &min_datums[pos] {
+            Some(datum) => min_builder.write_datum(pos, datum, data_type),
+            None => min_builder.set_null_at(pos),
+        }
+        match &max_datums[pos] {
+            Some(datum) => max_builder.write_datum(pos, datum, data_type),
+            None => max_builder.set_null_at(pos),
+        }
+    }
+    BinaryTableStats::new(
+        min_builder.build_serialized(),
+        max_builder.build_serialized(),
+        null_counts,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Page-index (ColumnIndex / OffsetIndex) pruning
 // ---------------------------------------------------------------------------
@@ -984,17 +1295,33 @@ fn parquet_stats_to_datum(
                 .copied()
                 .map(Datum::Long)
         }
-        (ParquetStatistics::Int64(stats), DataType::Timestamp(ts)) if ts.precision() <= 3 => {
+        (ParquetStatistics::Int32(stats), DataType::Decimal(d)) => {
             exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
                 .copied()
-                .map(|millis| Datum::Timestamp { millis, nanos: 0 })
+                .map(|unscaled| Datum::Decimal {
+                    unscaled: unscaled as i128,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
         }
-        (ParquetStatistics::Int64(stats), DataType::LocalZonedTimestamp(ts))
-            if ts.precision() <= 3 =>
-        {
+        (ParquetStatistics::Int64(stats), DataType::Decimal(d)) => {
             exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
                 .copied()
-                .map(|millis| Datum::LocalZonedTimestamp { millis, nanos: 0 })
+                .map(|unscaled| Datum::Decimal {
+                    unscaled: unscaled as i128,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        (ParquetStatistics::Int64(stats), DataType::Timestamp(ts)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .and_then(|value| timestamp_datum_from_parquet_i64(value, ts.precision(), false))
+        }
+        (ParquetStatistics::Int64(stats), DataType::LocalZonedTimestamp(ts)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .and_then(|value| timestamp_datum_from_parquet_i64(value, ts.precision(), true))
         }
         (ParquetStatistics::Float(stats), DataType::Float(_)) => {
             exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
@@ -1022,8 +1349,56 @@ fn parquet_stats_to_datum(
             exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
                 .map(|value| Datum::Bytes(value.data().to_vec()))
         }
+        (ParquetStatistics::ByteArray(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| signed_be_bytes_to_i128(value.data()))
+                .map(|unscaled| Datum::Decimal {
+                    unscaled,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        (ParquetStatistics::FixedLenByteArray(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| signed_be_bytes_to_i128(value.data()))
+                .map(|unscaled| Datum::Decimal {
+                    unscaled,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
         _ => None,
     }
+}
+
+fn timestamp_datum_from_parquet_i64(
+    value: i64,
+    precision: u32,
+    local_zoned: bool,
+) -> Option<Datum> {
+    let (millis, nanos) = match precision {
+        0..=3 => (value, 0),
+        4..=6 => (
+            value.div_euclid(1_000),
+            (value.rem_euclid(1_000) * 1_000) as i32,
+        ),
+        _ => return None,
+    };
+    if local_zoned {
+        Some(Datum::LocalZonedTimestamp { millis, nanos })
+    } else {
+        Some(Datum::Timestamp { millis, nanos })
+    }
+}
+
+fn signed_be_bytes_to_i128(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let sign_extend = if bytes[0] & 0x80 == 0 { 0 } else { 0xff };
+    let mut padded = [sign_extend; 16];
+    padded[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(padded))
 }
 
 fn exact_parquet_value<'a, T>(
@@ -1766,14 +2141,14 @@ mod tests {
         let schema = writer_arrow_schema();
 
         let mut writer: Box<dyn FormatFileWriter> = Box::new(
-            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
                 .await
                 .unwrap(),
         );
 
         let batch = writer_test_batch(&schema, vec![1, 2, 3], vec![10, 20, 30]);
         writer.write(&batch).await.unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         // Verify valid parquet by reading back
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
@@ -1791,7 +2166,7 @@ mod tests {
         let schema = writer_arrow_schema();
 
         let mut writer: Box<dyn FormatFileWriter> = Box::new(
-            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
                 .await
                 .unwrap(),
         );
@@ -1804,7 +2179,7 @@ mod tests {
             .write(&writer_test_batch(&schema, vec![3, 4, 5], vec![30, 40, 50]))
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let reader =
@@ -1844,12 +2219,12 @@ mod tests {
         let path = "memory:/test_parquet_inline_vector.parquet";
         let output = file_io.new_output(path).unwrap();
         let mut writer: Box<dyn FormatFileWriter> = Box::new(
-            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
                 .await
                 .unwrap(),
         );
         writer.write(&batch).await.unwrap();
-        writer.close().await.unwrap();
+        let _ = writer.close().await.unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         let reader =
@@ -1936,7 +2311,7 @@ mod tests {
         .await
         .unwrap();
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
 
         let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
         let raw_batches =
@@ -2069,7 +2444,7 @@ mod tests {
             .write(&make_batch(vec![3], &late_variants))
             .await
             .unwrap();
-        let file_size = writer.close().await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
 
         let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
         let raw_batches =
@@ -2153,7 +2528,7 @@ mod tests {
                 .write(&writer_test_batch(&schema, ids, values))
                 .await
                 .unwrap();
-            writer.close().await.unwrap();
+            let _ = writer.close().await.unwrap();
         }
         buf
     }
@@ -2296,7 +2671,7 @@ mod tests {
                 .write(&writer_test_batch(&schema, ids, values))
                 .await
                 .unwrap();
-            writer.close().await.unwrap();
+            let _ = writer.close().await.unwrap();
         }
         buf
     }
@@ -2361,7 +2736,7 @@ mod tests {
                 .write(&writer_test_batch(&schema, ids, values))
                 .await
                 .unwrap();
-            writer.close().await.unwrap();
+            let _ = writer.close().await.unwrap();
         }
         let metadata = load_metadata_with_page_index(&buf, true);
         let fields = vec![int_field("id"), int_field("value")];
@@ -2417,7 +2792,7 @@ mod tests {
             let mut writer =
                 AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
             writer.write(&batch).await.unwrap();
-            writer.close().await.unwrap();
+            let _ = writer.close().await.unwrap();
         }
         buf
     }

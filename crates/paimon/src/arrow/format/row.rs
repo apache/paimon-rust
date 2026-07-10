@@ -20,7 +20,7 @@
 //! Layout reference:
 //! `org.apache.paimon.format.row.RowFormatWriter` in paimon-java.
 
-use super::{FilePredicates, FormatFileReader, FormatFileWriter};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
     variant_arrow_type,
@@ -172,7 +172,7 @@ impl FormatFileWriter for RowFormatWriter {
         self.flush_block().await
     }
 
-    async fn close(mut self: Box<Self>) -> crate::Result<u64> {
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
         self.flush_block().await?;
 
         let index_offset = self.bytes_written;
@@ -206,7 +206,7 @@ impl FormatFileWriter for RowFormatWriter {
         self.writer.write(Bytes::from(footer_bytes)).await?;
         self.bytes_written += FOOTER_SIZE;
         self.writer.close().await?;
-        Ok(self.bytes_written)
+        Ok(FormatWriteResult::new(self.bytes_written))
     }
 }
 

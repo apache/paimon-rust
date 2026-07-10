@@ -184,7 +184,7 @@ impl PostponeFileWriter {
         let creation_time = self.current_file_creation_time;
 
         self.in_flight_closes.spawn(async move {
-            let file_size = writer.close().await? as i64;
+            let file_size = writer.close().await?.file_size as i64;
             Ok(build_meta(
                 file_name,
                 file_size,
@@ -249,7 +249,7 @@ impl PostponeFileWriter {
         let file_name = self.current_file_name.take().unwrap();
         let row_count = self.current_row_count;
         self.current_row_count = 0;
-        let file_size = writer.close().await? as i64;
+        let file_size = writer.close().await?.file_size as i64;
 
         let min_seq = self.current_file_start_seq;
         let max_seq = self.next_sequence_number - 1;
