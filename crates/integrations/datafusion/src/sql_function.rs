@@ -349,7 +349,7 @@ fn expand_call(
     let replacements: HashMap<String, SqlExpr> = input_params
         .iter()
         .zip(values)
-        .map(|(field, value)| (normalize_identifier(&Ident::new(field.name())), value))
+        .map(|(field, value)| (field.name().to_string(), value))
         .collect();
     let validation = visit_expressions(&body, |expr| match expr {
         SqlExpr::Identifier(identifier)

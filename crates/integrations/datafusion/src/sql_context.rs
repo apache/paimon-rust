@@ -3326,6 +3326,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_sql_function_preserves_quoted_metadata_parameter() {
+        let catalog = Arc::new(MockCatalog::new());
+        let input_params: Vec<PaimonDataField> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "X", "type": "BIGINT"}
+        ]))
+        .unwrap();
+        let return_params: Vec<PaimonDataField> = serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "result", "type": "BIGINT"}
+        ]))
+        .unwrap();
+        catalog.add_function(paimon::catalog::Function::new(
+            Identifier::new("default", "quoted_parameter"),
+            Some(input_params),
+            Some(return_params),
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                paimon::catalog::FunctionDefinition::Sql {
+                    definition: "\"X\" + 1".to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        ));
+        let ctx = make_sql_context(catalog).await;
+
+        let batches = ctx
+            .sql("SELECT quoted_parameter(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
     async fn rest_sql_function_is_expanded_in_explain() {
         let catalog = Arc::new(MockCatalog::new());
         add_plus_one_function(&catalog);
