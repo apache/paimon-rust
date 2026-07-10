@@ -727,10 +727,16 @@ async fn test_read_projection_duplicate_column() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
+    // `id` exists, so with_projection passes its best-effort early check; the
+    // duplicate is a case-dependent outcome resolved lazily, so it surfaces when
+    // the read is built.
     let mut read_builder = table.new_read_builder();
-    let err = read_builder
+    read_builder
         .with_projection(&["id", "id"])
-        .expect_err("Duplicate projection should fail");
+        .expect("with_projection defers duplicate detection to read build");
+    let err = read_builder
+        .new_read()
+        .expect_err("Duplicate projection should fail at new_read");
 
     assert!(
         matches!(&err, Error::ConfigInvalid { message } if message.contains("Duplicate projection column 'id'")),

@@ -615,14 +615,24 @@ impl fmt::Display for Predicate {
 pub struct PredicateBuilder {
     field_names: Vec<String>,
     field_types: Vec<DataType>,
+    case_sensitive: bool,
 }
 
 impl PredicateBuilder {
-    /// Create a new builder from schema fields. Infallible.
+    /// Create a new builder from schema fields, matching column names
+    /// case-sensitively. Infallible.
     pub fn new(fields: &[DataField]) -> Self {
+        Self::new_with_case_sensitive(fields, true)
+    }
+
+    /// Create a builder with explicit case sensitivity. When `case_sensitive`
+    /// is `false`, column names are resolved by ASCII case-folding and an
+    /// ambiguous (case-colliding) schema errors. Infallible.
+    pub fn new_with_case_sensitive(fields: &[DataField], case_sensitive: bool) -> Self {
         Self {
             field_names: fields.iter().map(|f| f.name().to_string()).collect(),
             field_types: fields.iter().map(|f| f.data_type().clone()).collect(),
+            case_sensitive,
         }
     }
 
@@ -801,13 +811,13 @@ impl PredicateBuilder {
 
     /// Resolve field name to index + type, validate literals, and build a leaf predicate.
     fn leaf(&self, field: &str, op: PredicateOperator, literals: Vec<Datum>) -> Result<Predicate> {
-        let (index, data_type) = self.resolve_field(field)?;
+        let (index, canonical, data_type) = self.resolve_field(field)?;
         Self::validate_literal_count(op, &literals)?;
         for lit in &literals {
             validate_datum_matches_type(lit, &data_type)?;
         }
         Ok(Predicate::Leaf {
-            column: field.to_string(),
+            column: canonical,
             index,
             data_type,
             op,
@@ -816,11 +826,41 @@ impl PredicateBuilder {
     }
 
     /// Look up a field name, returning its (index, DataType) or an error.
-    fn resolve_field(&self, field: &str) -> Result<(usize, DataType)> {
-        self.field_names
-            .iter()
-            .position(|n| n == field)
-            .map(|idx| (idx, self.field_types[idx].clone()))
+    /// Resolve a column name to `(index, canonical_name, data_type)`.
+    ///
+    /// The canonical name is the schema's stored field name for the matched
+    /// index. It is stored in the resulting [`Predicate::Leaf`] so downstream
+    /// name-based lookups (e.g. global-index pruning) match the schema even
+    /// when the caller passed a different casing. Case-insensitive matching
+    /// errors on an ambiguous (case-colliding) schema.
+    fn resolve_field(&self, field: &str) -> Result<(usize, String, DataType)> {
+        let index = if self.case_sensitive {
+            self.field_names.iter().position(|n| n == field)
+        } else {
+            let mut hits = self
+                .field_names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.eq_ignore_ascii_case(field));
+            let first = hits.next();
+            if first.is_some() && hits.next().is_some() {
+                return Err(Error::ConfigInvalid {
+                    message: format!(
+                        "Ambiguous column '{field}' matches multiple schema fields case-insensitively: {:?}",
+                        self.field_names
+                    ),
+                });
+            }
+            first.map(|(i, _)| i)
+        };
+        index
+            .map(|idx| {
+                (
+                    idx,
+                    self.field_names[idx].clone(),
+                    self.field_types[idx].clone(),
+                )
+            })
             .ok_or_else(|| Error::ConfigInvalid {
                 message: format!(
                     "Column '{}' not found in schema fields {:?}",
@@ -1279,6 +1319,39 @@ mod tests {
     }
 
     // ======================== PredicateBuilder basics ========================
+
+    #[test]
+    fn test_builder_case_insensitive_matches_wrong_case() {
+        let pb = PredicateBuilder::new_with_case_sensitive(&test_fields(), false);
+        assert!(pb.equal("ID", Datum::Int(1)).is_ok());
+    }
+
+    #[test]
+    fn test_builder_case_sensitive_default_rejects_wrong_case() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb.equal("ID", Datum::Int(1)).is_err());
+    }
+
+    #[test]
+    fn test_builder_case_insensitive_stores_canonical_column_name() {
+        // The leaf must carry the canonical schema name, not the caller's
+        // casing, so downstream name-based lookups (e.g. index pruning) match.
+        let pb = PredicateBuilder::new_with_case_sensitive(&test_fields(), false);
+        match pb.equal("ID", Datum::Int(1)).unwrap() {
+            Predicate::Leaf { column, .. } => assert_eq!(column, "id"),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_case_insensitive_ambiguous_errors() {
+        let fields = vec![
+            DataField::new(0, "Col".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "col".to_string(), DataType::Int(IntType::new())),
+        ];
+        let pb = PredicateBuilder::new_with_case_sensitive(&fields, false);
+        assert!(pb.equal("col", Datum::Int(1)).is_err());
+    }
 
     #[test]
     fn test_builder_equal() {

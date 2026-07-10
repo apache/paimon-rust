@@ -18,8 +18,8 @@
 //! Read builder for Java-compatible `type=format-table` metadata.
 
 use super::partition_filter::PartitionFilter;
-use super::read_builder::resolve_projected_fields;
 use super::read_builder::split_scan_predicates;
+use super::read_builder::{resolve_projected_fields, validate_projection_possible};
 use super::{Table, TableRead, TableScan};
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
@@ -29,9 +29,14 @@ use crate::Result;
 pub(crate) struct FormatReadBuilder<'a> {
     table: &'a Table,
     read_type: Option<Vec<DataField>>,
+    /// Deferred projection column names, resolved lazily at read build time so
+    /// projection and case sensitivity are order-independent. Mutually exclusive
+    /// with `read_type`.
+    projection_names: Option<Vec<String>>,
     partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
     limit: Option<usize>,
+    case_sensitive: bool,
 }
 
 impl<'a> FormatReadBuilder<'a> {
@@ -39,24 +44,35 @@ impl<'a> FormatReadBuilder<'a> {
         Self {
             table,
             read_type: None,
+            projection_names: None,
             partition_filter: None,
             data_predicates: Vec::new(),
             limit: None,
+            case_sensitive: true,
         }
     }
 
     pub(crate) fn with_projection(&mut self, columns: &[&str]) -> Result<&mut Self> {
-        let projection_names = columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>();
-        self.read_type = Some(resolve_projected_fields(
+        let projection_names: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
+        validate_projection_possible(
             self.table.identifier().full_name(),
             self.table.schema().fields(),
             &projection_names,
-        )?);
+        )?;
+        self.projection_names = Some(projection_names);
+        self.read_type = None;
         Ok(self)
+    }
+
+    /// Set whether column-name matching is case-sensitive. Defaults to `true`.
+    pub(crate) fn with_case_sensitive(&mut self, case_sensitive: bool) -> &mut Self {
+        self.case_sensitive = case_sensitive;
+        self
     }
 
     pub(crate) fn with_read_type(&mut self, read_type: Vec<DataField>) -> &mut Self {
         self.read_type = Some(read_type);
+        self.projection_names = None;
         self
     }
 
@@ -95,9 +111,9 @@ impl<'a> FormatReadBuilder<'a> {
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let read_type = match &self.read_type {
+        let read_type = match self.resolve_read_type()? {
             None => self.table.schema().fields().to_vec(),
-            Some(fields) => fields.clone(),
+            Some(fields) => fields,
         };
         Ok(TableRead::new_format(
             self.table,
@@ -105,5 +121,23 @@ impl<'a> FormatReadBuilder<'a> {
             self.data_predicates.clone(),
             self.limit,
         ))
+    }
+
+    /// Resolve the effective read type, deferring projection name resolution to
+    /// the case sensitivity effective at build time (order-independent with
+    /// `with_case_sensitive`).
+    fn resolve_read_type(&self) -> Result<Option<Vec<DataField>>> {
+        if let Some(read_type) = &self.read_type {
+            return Ok(Some(read_type.clone()));
+        }
+        if let Some(names) = &self.projection_names {
+            return Ok(Some(resolve_projected_fields(
+                self.table.identifier().full_name(),
+                self.table.schema().fields(),
+                names,
+                self.case_sensitive,
+            )?));
+        }
+        Ok(None)
     }
 }
