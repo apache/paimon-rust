@@ -136,24 +136,24 @@ impl CatalogProvider for PaimonCatalogProvider {
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::with_session(
+                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
+                        catalog_name,
                         Arc::clone(&catalog),
                         name,
                         dynamic_options,
                         temp_provider,
                         blob_reader_registry,
-                        catalog_name,
                         session_state,
                     )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
-                            Some(Arc::new(PaimonSchemaProvider::with_session(
+                            Some(Arc::new(PaimonSchemaProvider::new(
+                                catalog_name,
                                 Arc::clone(&catalog),
                                 name,
                                 dynamic_options,
                                 temp_provider,
                                 blob_reader_registry,
-                                catalog_name,
                                 session_state,
                             )) as Arc<dyn SchemaProvider>)
                         } else {
@@ -187,13 +187,13 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                    catalog_name,
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
                     None,
                     blob_reader_registry,
-                    catalog_name,
                     session_state,
                 )) as Arc<dyn SchemaProvider>))
             },
@@ -218,13 +218,13 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::with_session(
+                Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                    catalog_name,
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
                     None,
                     blob_reader_registry,
-                    catalog_name,
                     session_state,
                 )) as Arc<dyn SchemaProvider>))
             },
@@ -316,6 +316,7 @@ impl PaimonCatalogProvider {
 ///
 /// Tables are loaded lazily when accessed via the `table()` method.
 pub struct PaimonSchemaProvider {
+    catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
     /// Database name this schema represents.
@@ -325,7 +326,6 @@ pub struct PaimonSchemaProvider {
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
     blob_reader_registry: BlobReaderRegistry,
-    catalog_name: Option<String>,
     session_state: Option<SessionStateProvider>,
 }
 
@@ -339,41 +339,23 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
+    /// Creates a new [`PaimonSchemaProvider`].
     pub fn new(
-        catalog: Arc<dyn Catalog>,
-        database: String,
-        dynamic_options: DynamicOptions,
-        temp_provider: Option<Arc<MemorySchemaProvider>>,
-        blob_reader_registry: BlobReaderRegistry,
-    ) -> Self {
-        Self::with_session(
-            catalog,
-            database,
-            dynamic_options,
-            temp_provider,
-            blob_reader_registry,
-            None,
-            None,
-        )
-    }
-
-    fn with_session(
-        catalog: Arc<dyn Catalog>,
-        database: String,
-        dynamic_options: DynamicOptions,
-        temp_provider: Option<Arc<MemorySchemaProvider>>,
-        blob_reader_registry: BlobReaderRegistry,
         catalog_name: Option<String>,
+        catalog: Arc<dyn Catalog>,
+        database: String,
+        dynamic_options: DynamicOptions,
+        temp_provider: Option<Arc<MemorySchemaProvider>>,
+        blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonSchemaProvider {
+            catalog_name,
             catalog,
             database,
             dynamic_options,
             temp_provider,
             blob_reader_registry,
-            catalog_name,
             session_state,
         }
     }
