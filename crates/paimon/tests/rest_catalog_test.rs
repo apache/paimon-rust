@@ -1053,6 +1053,30 @@ async fn test_catalog_create_view() {
 }
 
 #[tokio::test]
+async fn test_catalog_create_view_missing_database() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("missing_db", "active_ids");
+    let schema = ViewSchema::new(
+        Vec::new(),
+        "SELECT 1".to_string(),
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+
+    let error = ctx
+        .catalog
+        .create_view(&identifier, schema, false)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::DatabaseNotExist { database } if database == "missing_db"
+    ));
+}
+
+#[tokio::test]
 async fn test_catalog_create_view_already_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
     let identifier = Identifier::new("default", "active_ids");

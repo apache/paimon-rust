@@ -288,7 +288,7 @@ impl Catalog for RESTCatalog {
             .api
             .create_view(identifier, schema)
             .await
-            .map_err(|error| map_rest_error_for_view(error, identifier));
+            .map_err(|error| map_rest_error_for_create_view(error, identifier));
         ignore_error_if(result, |error| {
             ignore_if_exists && matches!(error, Error::ViewAlreadyExist { .. })
         })
@@ -416,6 +416,18 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
             full_name: identifier.full_name(),
         },
         other => other,
+    }
+}
+
+/// Map a REST API error from creating a persistent view.
+fn map_rest_error_for_create_view(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::DatabaseNotExist {
+            database: identifier.database().to_string(),
+        },
+        other => map_rest_error_for_view(other, identifier),
     }
 }
 

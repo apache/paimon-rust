@@ -1576,6 +1576,8 @@ fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
         Some("CREATE OR REPLACE VIEW is not supported")
     } else if create_view.secure {
         Some("CREATE SECURE VIEW is not supported")
+    } else if create_view.copy_grants {
+        Some("CREATE VIEW COPY GRANTS is not supported")
     } else if create_view.name_before_not_exists {
         Some("CREATE VIEW with the name before IF NOT EXISTS is not supported")
     } else {
@@ -3372,6 +3374,10 @@ mod tests {
             (
                 "CREATE SECURE VIEW paimon.default.invalid_view AS SELECT 1",
                 "SECURE",
+            ),
+            (
+                "CREATE VIEW paimon.default.invalid_view COPY GRANTS AS SELECT 1",
+                "COPY GRANTS",
             ),
             (
                 "CREATE VIEW paimon.default.invalid_view IF NOT EXISTS AS SELECT 1",
