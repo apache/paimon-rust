@@ -113,10 +113,12 @@ pub unsafe extern "C" fn paimon_read_builder_free(rb: *mut paimon_read_builder) 
 ///
 /// The `columns` parameter is a null-terminated array of null-terminated C strings.
 /// Output order follows the caller-specified order. An empty list is a valid
-/// zero-column projection. Column-name resolution is deferred to
-/// `paimon_read_builder_new_read` (order-independent with
-/// `paimon_read_builder_with_case_sensitive`), so unknown, duplicate, or
-/// ambiguous names are reported there, not by this call.
+/// zero-column projection. An obvious typo — a name that matches no field under
+/// any case sensitivity — is rejected by this call. Case-dependent resolution
+/// (a name that matches only case-insensitively, or a case-fold ambiguity) is
+/// deferred to `paimon_read_builder_new_read`, which uses the case sensitivity
+/// effective then, so this stays order-independent with
+/// `paimon_read_builder_with_case_sensitive`.
 ///
 /// # Safety
 /// `rb` must be a valid pointer from `paimon_table_new_read_builder`, or null (returns error).

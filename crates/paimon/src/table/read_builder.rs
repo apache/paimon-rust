@@ -28,7 +28,7 @@ use super::{Table, TableScan};
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
 struct NormalizedFilter {
@@ -464,35 +464,6 @@ impl<'a> PaimonReadBuilder<'a> {
     }
 }
 
-/// Look up a schema field by name under the given case sensitivity.
-///
-/// Case-sensitive: exact match. Case-insensitive: match by ASCII
-/// case-folding, returning the unique match, `None` if absent, or
-/// `Error::ConfigInvalid` when two or more fields collide under folding
-/// (ambiguous, mirroring Spark's `AMBIGUOUS` behavior).
-fn find_projection_field<'a>(
-    fields: &'a [DataField],
-    name: &str,
-    case_sensitive: bool,
-    full_name: &str,
-) -> Result<Option<&'a DataField>> {
-    if case_sensitive {
-        return Ok(fields.iter().find(|f| f.name() == name));
-    }
-    let mut matches = fields
-        .iter()
-        .filter(|f| f.name().eq_ignore_ascii_case(name));
-    let first = matches.next();
-    if first.is_some() && matches.next().is_some() {
-        return Err(Error::ConfigInvalid {
-            message: format!(
-                "Ambiguous projection column '{name}' for table {full_name}: multiple fields match case-insensitively"
-            ),
-        });
-    }
-    Ok(first)
-}
-
 /// Best-effort early validation for `with_projection`: reject only columns that
 /// cannot match the schema under *any* case sensitivity, so an obvious typo
 /// (e.g. `foo`) fails fast at call time. Case-dependent outcomes (a name that
@@ -505,12 +476,17 @@ pub(super) fn validate_projection_possible(
     fields: &[DataField],
     projection_names: &[String],
 ) -> Result<()> {
+    // Fold the schema names once (O(fields)) so validation is O(fields +
+    // projections) rather than scanning the whole schema per projected name.
+    let folded_names: HashSet<String> = fields
+        .iter()
+        .map(|f| f.name().to_ascii_lowercase())
+        .collect();
     for name in projection_names {
         if name == crate::spec::ROW_ID_FIELD_NAME {
             continue;
         }
-        let matches_any = fields.iter().any(|f| f.name().eq_ignore_ascii_case(name));
-        if !matches_any {
+        if !folded_names.contains(&name.to_ascii_lowercase()) {
             return Err(Error::ColumnNotExist {
                 full_name: full_name.clone(),
                 column: name.clone(),
@@ -530,14 +506,33 @@ pub(super) fn resolve_projected_fields(
         return Ok(Vec::new());
     }
 
+    // Build the name index once (O(fields)) so resolution is O(fields +
+    // projections) rather than scanning the whole schema per projected name.
+    // Case-sensitive: exact name -> field. Case-insensitive: ASCII-folded name
+    // -> the unique field, or `None` when two or more fields collide under
+    // folding (ambiguous, mirroring Spark's `AMBIGUOUS` behavior).
+    let sensitive_index: HashMap<&str, &DataField> = if case_sensitive {
+        fields.iter().map(|f| (f.name(), f)).collect()
+    } else {
+        HashMap::new()
+    };
+    let mut folded_index: HashMap<String, Option<&DataField>> = HashMap::new();
+    if !case_sensitive {
+        for f in fields {
+            folded_index
+                .entry(f.name().to_ascii_lowercase())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(f));
+        }
+    }
+
     let mut seen: HashSet<String> = HashSet::with_capacity(projection_names.len());
     let mut resolved = Vec::with_capacity(projection_names.len());
 
     for name in projection_names {
         // Dedup under the same case sensitivity used for resolution: with
         // `case-sensitive=false`, `["Name","name"]` must flag a duplicate rather
-        // than resolve the same field twice. ASCII folding matches
-        // `find_projection_field`.
+        // than resolve the same field twice.
         let dedup_key = if case_sensitive {
             name.clone()
         } else {
@@ -558,13 +553,25 @@ pub(super) fn resolve_projected_fields(
             continue;
         }
 
-        let field =
-            find_projection_field(fields, name, case_sensitive, &full_name)?.ok_or_else(|| {
-                Error::ColumnNotExist {
-                    full_name: full_name.clone(),
-                    column: name.clone(),
+        let field = if case_sensitive {
+            sensitive_index.get(name.as_str()).copied()
+        } else {
+            match folded_index.get(&name.to_ascii_lowercase()) {
+                Some(Some(f)) => Some(*f),
+                Some(None) => {
+                    return Err(Error::ConfigInvalid {
+                        message: format!(
+                            "Ambiguous projection column '{name}' for table {full_name}: multiple fields match case-insensitively"
+                        ),
+                    });
                 }
-            })?;
+                None => None,
+            }
+        };
+        let field = field.ok_or_else(|| Error::ColumnNotExist {
+            full_name: full_name.clone(),
+            column: name.clone(),
+        })?;
         resolved.push(field.clone());
     }
 
