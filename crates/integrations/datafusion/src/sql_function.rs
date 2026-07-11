@@ -457,19 +457,12 @@ fn expand_call(
     });
 
     let return_type = function.return_params().expect("validated above")[0].data_type();
-    let serialized_type = serde_json::to_value(return_type).map_err(|error| {
+    let sql_type = crate::table::data_type_to_sql(return_type).map_err(|error| {
         DataFusionError::Plan(format!(
             "Invalid return type for REST SQL function '{}': {error}",
             function.full_name()
         ))
     })?;
-    let sql_type = serialized_type.as_str().ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "REST SQL function '{}' has a return type that cannot be represented in SQL",
-            function.full_name()
-        ))
-    })?;
-    let sql_type = sql_type.strip_suffix(" NOT NULL").unwrap_or(sql_type);
     Parser::new(&GenericDialect {})
         .try_with_sql(&format!("CAST(({body}) AS {sql_type})"))
         .map_err(|error| {

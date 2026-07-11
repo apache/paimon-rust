@@ -209,7 +209,7 @@ fn quote_string_literal(text: &str) -> String {
 /// at the top of a column definition, not nested inside `MAP`, `ARRAY`, or
 /// `STRUCT` arguments. Callers that render a column should append `NOT NULL`
 /// themselves when the field is non-nullable; recursive calls below must not.
-fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
+pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
     match data_type {
         DataType::Boolean(_) => Ok("BOOLEAN".to_string()),
         DataType::TinyInt(_) => Ok("TINYINT".to_string()),

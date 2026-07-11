@@ -1557,22 +1557,14 @@ impl SQLContext {
             .unwrap_or_default()
             .iter()
             .map(|field| {
-                let value = serde_json::to_value(field.data_type()).map_err(|error| {
-                    DataFusionError::Plan(format!(
-                        "Invalid CREATE FUNCTION argument type '{:?}': {error}",
-                        field.data_type()
-                    ))
-                })?;
-                let sql_type = value.as_str().ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "CREATE FUNCTION argument type '{:?}' cannot be represented in SQL",
-                        field.data_type()
-                    ))
-                })?;
-                Ok(format!(
-                    "CAST(NULL AS {})",
-                    sql_type.strip_suffix(" NOT NULL").unwrap_or(sql_type)
-                ))
+                let sql_type =
+                    crate::table::data_type_to_sql(field.data_type()).map_err(|error| {
+                        DataFusionError::Plan(format!(
+                            "Invalid CREATE FUNCTION argument type '{:?}': {error}",
+                            field.data_type()
+                        ))
+                    })?;
+                Ok(format!("CAST(NULL AS {sql_type})"))
             })
             .collect::<DFResult<Vec<_>>>()?
             .join(", ");
@@ -3647,6 +3639,54 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_supports_array_argument() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE FUNCTION array_answer(x ARRAY<BIGINT>) \
+             RETURNS BIGINT RETURN 42",
+        )
+        .await
+        .unwrap();
+
+        assert!(catalog
+            .get_function(&Identifier::new("default", "array_answer"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_supports_array_return_type() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        ctx.sql(
+            "CREATE FUNCTION singleton(x BIGINT) \
+             RETURNS ARRAY<BIGINT> RETURN make_array(x)",
+        )
+        .await
+        .unwrap();
+
+        let batches = ctx
+            .sql("SELECT singleton(42) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        assert!(matches!(
+            batches[0]
+                .schema()
+                .field_with_name("answer")
+                .unwrap()
+                .data_type(),
+            ArrowDataType::List(_)
+        ));
     }
 
     #[tokio::test]
