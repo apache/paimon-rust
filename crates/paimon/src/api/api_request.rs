@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    catalog::{Identifier, ViewSchema},
-    spec::{Schema, SchemaChange},
+    catalog::{Function, FunctionDefinition, Identifier, ViewSchema},
+    spec::{DataField, Schema, SchemaChange},
 };
 
 /// Request to create a new database.
@@ -112,6 +112,41 @@ impl CreateViewRequest {
     /// Create a new create-view request.
     pub fn new(identifier: Identifier, schema: ViewSchema) -> Self {
         Self { identifier, schema }
+    }
+}
+
+/// Request to create a persistent function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFunctionRequest {
+    /// Unqualified function name.
+    pub name: String,
+    /// Declared input parameters.
+    pub input_params: Option<Vec<DataField>>,
+    /// Declared return parameters.
+    pub return_params: Option<Vec<DataField>>,
+    /// Whether the function is deterministic.
+    pub deterministic: bool,
+    /// Engine-specific function definitions.
+    pub definitions: HashMap<String, FunctionDefinition>,
+    /// Optional function comment.
+    pub comment: Option<String>,
+    /// Function options.
+    pub options: HashMap<String, String>,
+}
+
+impl CreateFunctionRequest {
+    /// Create a request from a catalog function.
+    pub fn from_function(function: &Function) -> Self {
+        Self {
+            name: function.name().to_string(),
+            input_params: function.input_params().map(<[_]>::to_vec),
+            return_params: function.return_params().map(<[_]>::to_vec),
+            deterministic: function.is_deterministic(),
+            definitions: function.definitions().clone(),
+            comment: function.comment().map(str::to_string),
+            options: function.options().clone(),
+        }
     }
 }
 

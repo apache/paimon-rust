@@ -231,6 +231,41 @@ async fn test_list_functions() {
 }
 
 #[tokio::test]
+async fn test_create_function() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let function = Function::new(
+        Identifier::new("default", "plus_one"),
+        Some(
+            serde_json::from_value(json!([
+                {"id": 0, "name": "x", "type": "BIGINT"}
+            ]))
+            .unwrap(),
+        ),
+        Some(
+            serde_json::from_value(json!([
+                {"id": 0, "name": "result", "type": "BIGINT"}
+            ]))
+            .unwrap(),
+        ),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "x + 1".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    );
+
+    ctx.api.create_function(&function).await.unwrap();
+
+    let response = ctx.api.get_function(function.identifier()).await.unwrap();
+    assert_eq!(response.name.as_deref(), Some("plus_one"));
+    assert_eq!(response.input_params.unwrap()[0].name(), "x");
+}
+
+#[tokio::test]
 async fn test_create_database() {
     let ctx = setup_test_server(vec!["default"]).await;
 

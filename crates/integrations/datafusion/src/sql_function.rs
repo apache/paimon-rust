@@ -40,6 +40,16 @@ pub(crate) async fn expand_sql(
     current_catalog: &str,
     current_database: &str,
 ) -> DFResult<String> {
+    expand_sql_internal(sql, catalogs, current_catalog, current_database, None).await
+}
+
+async fn expand_sql_internal(
+    sql: &str,
+    catalogs: &HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: &str,
+    current_database: &str,
+    candidate: Option<&Function>,
+) -> DFResult<String> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql)
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
     if statements.len() != 1 {
@@ -48,14 +58,33 @@ pub(crate) async fn expand_sql(
             statements.len()
         )));
     }
-    let statement = expand_statement(
+    let statement = expand_statement_internal(
         statements.remove(0),
         catalogs,
         current_catalog,
         current_database,
+        MAX_EXPANDED_CALLS,
+        candidate,
     )
     .await?;
     Ok(statement.to_string())
+}
+
+pub(crate) async fn expand_sql_with_candidate(
+    sql: &str,
+    catalogs: &HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: &str,
+    current_database: &str,
+    candidate: &Function,
+) -> DFResult<String> {
+    expand_sql_internal(
+        sql,
+        catalogs,
+        current_catalog,
+        current_database,
+        Some(candidate),
+    )
+    .await
 }
 
 pub(crate) async fn expand_statement(
@@ -75,12 +104,33 @@ pub(crate) async fn expand_statement(
 }
 
 pub(crate) async fn expand_statement_with_budget(
-    mut statement: Statement,
+    statement: Statement,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
     current_database: &str,
     max_expanded_calls: usize,
 ) -> DFResult<Statement> {
+    expand_statement_internal(
+        statement,
+        catalogs,
+        current_catalog,
+        current_database,
+        max_expanded_calls,
+        None,
+    )
+    .await
+}
+
+async fn expand_statement_internal(
+    mut statement: Statement,
+    catalogs: &HashMap<String, Arc<dyn Catalog>>,
+    current_catalog: &str,
+    current_database: &str,
+    max_expanded_calls: usize,
+    candidate: Option<&Function>,
+) -> DFResult<Statement> {
+    let candidate_reference =
+        candidate.map(|function| (current_catalog.to_string(), function.identifier().clone()));
     let mut functions = HashMap::new();
     let mut dependencies = HashMap::new();
     let mut total_expanded_calls = 0;
@@ -111,11 +161,15 @@ pub(crate) async fn expand_statement_with_budget(
                 functions.insert(reference, None);
                 continue;
             };
-            let function = match catalog.get_function(&reference.1).await {
-                Ok(function) => Some(function),
-                Err(paimon::Error::FunctionNotExist { .. })
-                | Err(paimon::Error::Unsupported { .. }) => None,
-                Err(error) => return Err(crate::to_datafusion_error(error)),
+            let function = if candidate_reference.as_ref() == Some(&reference) {
+                candidate.cloned()
+            } else {
+                match catalog.get_function(&reference.1).await {
+                    Ok(function) => Some(function),
+                    Err(paimon::Error::FunctionNotExist { .. })
+                    | Err(paimon::Error::Unsupported { .. }) => None,
+                    Err(error) => return Err(crate::to_datafusion_error(error)),
+                }
             };
             if let Some(function) = &function {
                 let nested = function_dependencies(function, &reference.0, reference.1.database());

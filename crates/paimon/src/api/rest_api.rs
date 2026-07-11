@@ -23,14 +23,14 @@
 use std::collections::HashMap;
 
 use crate::api::rest_client::HttpClient;
-use crate::catalog::{Identifier, ViewSchema};
+use crate::catalog::{Function, Identifier, ViewSchema};
 use crate::common::{CatalogOptions, Options};
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange, Snapshot};
 use crate::Result;
 
 use super::api_request::{
-    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateTableRequest,
-    CreateViewRequest, RenameTableRequest,
+    AlterDatabaseRequest, AlterTableRequest, CreateDatabaseRequest, CreateFunctionRequest,
+    CreateTableRequest, CreateViewRequest, RenameTableRequest,
 };
 use super::api_response::{
     ConfigResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
@@ -468,6 +468,19 @@ impl RESTApi {
     }
 
     // ==================== Function Operations ====================
+
+    /// Create a persistent function.
+    pub async fn create_function(&self, function: &Function) -> Result<()> {
+        let database = function.identifier().database();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (function.name(), "function name"),
+        ])?;
+        let path = self.resource_paths.functions(database);
+        let request = CreateFunctionRequest::from_function(function);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
 
     /// List persistent functions in a database.
     pub async fn list_functions(&self, database: &str) -> Result<Vec<String>> {

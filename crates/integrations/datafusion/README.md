@@ -26,11 +26,17 @@ This crate contains the integration of [Apache DataFusion](https://datafusion.ap
 
 ## REST Catalog views and SQL functions
 
-`SQLContext` can read persistent views and SQL scalar functions in a Paimon REST Catalog. It can
-also create persistent REST Catalog views:
+`SQLContext` can read, execute, and create persistent views and SQL scalar functions in a Paimon
+REST Catalog:
 
 ```sql
 CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
+
+CREATE FUNCTION [IF NOT EXISTS] function_name([parameter_name data_type, ...])
+RETURNS data_type
+LANGUAGE SQL
+IMMUTABLE
+RETURN scalar_expression;
 ```
 
 - A persistent view is resolved lazily like a table. The `datafusion` dialect is preferred and the
@@ -44,10 +50,14 @@ CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
   `catalog.database.function(args...)`. Its `definitions.datafusion` value must be a scalar SQL
   expression, it must be deterministic, and it must declare its input parameters and exactly one
   return parameter.
+- `CREATE FUNCTION` requires named parameters, one return type, `LANGUAGE SQL`, `IMMUTABLE`, and a
+  scalar `RETURN` expression. It validates dependencies, recursion, volatility, and return-type
+  compatibility before sending the REST create request. Bare, two-part, and three-part creation
+  targets are supported; calls remain limited to bare and three-part names.
 - `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW` /
-  `DROP VIEW`, and persistent function DDL are not supported. Lambda/file functions, named
-  arguments, multiple return values, non-deterministic functions, and calls made directly through
-  a raw DataFusion `SessionContext` are also not supported.
+  `DROP VIEW`, `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION` /
+  `DROP FUNCTION` are not supported. Lambda/file, aggregate/table/multi-return, non-deterministic,
+  Stable/Volatile, and non-SQL functions are also not supported.
 
 Use `SQLContext::sql` for function expansion:
 
@@ -56,8 +66,9 @@ let mut ctx = paimon_datafusion::SQLContext::new();
 ctx.register_catalog("paimon", rest_catalog).await?;
 
 ctx.sql("CREATE VIEW daily_scores AS SELECT normalize_score(score) AS score FROM scores").await?;
+ctx.sql("CREATE FUNCTION plus_one(x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x + 1").await?;
 let view = ctx.sql("SELECT * FROM analytics_view").await?;
-let function = ctx.sql("SELECT normalize_score(score) FROM scores").await?;
+let function = ctx.sql("SELECT plus_one(score) FROM scores").await?;
 ```
 
 See the [documentation](https://paimon.apache.org/docs/rust/datafusion/) for getting started guide and more details.

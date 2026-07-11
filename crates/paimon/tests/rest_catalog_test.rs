@@ -1188,6 +1188,123 @@ async fn test_catalog_get_function() {
 }
 
 #[tokio::test]
+async fn test_catalog_create_function() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let function = Function::new(
+        Identifier::new("default", "plus_one"),
+        Some(
+            serde_json::from_value(serde_json::json!([
+                {"id": 0, "name": "x", "type": "BIGINT"}
+            ]))
+            .unwrap(),
+        ),
+        Some(
+            serde_json::from_value(serde_json::json!([
+                {"id": 0, "name": "result", "type": "BIGINT"}
+            ]))
+            .unwrap(),
+        ),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "x + 1".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    );
+
+    ctx.catalog.create_function(&function, false).await.unwrap();
+
+    let stored = ctx
+        .catalog
+        .get_function(function.identifier())
+        .await
+        .unwrap();
+    assert_eq!(stored, function);
+}
+
+#[tokio::test]
+async fn test_catalog_create_function_already_exists() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let function = Function::new(
+        Identifier::new("default", "answer"),
+        Some(Vec::new()),
+        Some(
+            serde_json::from_value(serde_json::json!([
+                {"id": 0, "name": "result", "type": "INT"}
+            ]))
+            .unwrap(),
+        ),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "42".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    );
+    ctx.catalog.create_function(&function, false).await.unwrap();
+
+    let error = ctx
+        .catalog
+        .create_function(&function, false)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::FunctionAlreadyExist { full_name }
+            if full_name == "default.answer"
+    ));
+}
+
+#[tokio::test]
+async fn test_catalog_create_function_ignore_if_exists() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let function = Function::new(
+        Identifier::new("default", "answer"),
+        Some(Vec::new()),
+        Some(Vec::new()),
+        true,
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    ctx.catalog.create_function(&function, false).await.unwrap();
+
+    ctx.catalog.create_function(&function, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_catalog_create_function_missing_database() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let function = Function::new(
+        Identifier::new("missing_db", "answer"),
+        Some(Vec::new()),
+        Some(Vec::new()),
+        true,
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+
+    let error = ctx
+        .catalog
+        .create_function(&function, false)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::DatabaseNotExist { database } if database == "missing_db"
+    ));
+}
+
+#[tokio::test]
 async fn test_catalog_list_functions() {
     let ctx = setup_catalog(vec!["default"]).await;
     let return_params: Vec<DataField> = serde_json::from_value(serde_json::json!([
@@ -1284,6 +1401,24 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
     ));
     assert!(matches!(
         ctx.catalog.list_functions("default").await.unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .create_function(
+                &Function::new(
+                    Identifier::new("default", "function"),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                    true,
+                    HashMap::new(),
+                    None,
+                    HashMap::new(),
+                ),
+                false,
+            )
+            .await
+            .unwrap_err(),
         paimon::Error::Unsupported { .. }
     ));
     assert!(matches!(

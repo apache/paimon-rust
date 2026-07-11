@@ -31,6 +31,7 @@
 //! - `ALTER TABLE db.t RENAME TO new_name`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
+//! - `CREATE FUNCTION name(args) RETURNS type LANGUAGE SQL IMMUTABLE RETURN expression`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
@@ -44,20 +45,25 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateTable,
-    CreateTableOptions, CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName,
-    ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption,
-    Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
+    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateFunction,
+    CreateFunctionBody, CreateTable, CreateTableOptions, CreateView, Delete, Expr as SqlExpr,
+    FromTable, FunctionBehavior, FunctionReturnType, Insert, Merge, ObjectName, ObjectType,
+    RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption, Statement,
+    TableFactor, TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use futures::StreamExt;
 use paimon::catalog::{parse_object_name, Catalog, Identifier};
 use paimon::spec::{
@@ -356,8 +362,7 @@ impl SQLContext {
             return self.handle_time_travel_query(&rewritten_sql).await;
         }
 
-        let statements = Parser::parse_sql(&GenericDialect {}, &rewritten_sql)
-            .map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))?;
+        let statements = parse_sql_statements(&rewritten_sql)?;
 
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -448,6 +453,13 @@ impl SQLContext {
                     } else {
                         self.ctx.sql(sql).await
                     }
+                }
+            }
+            Statement::CreateFunction(create_function) => {
+                if self.is_paimon_function_name(&create_function.name) {
+                    self.handle_create_function(create_function).await
+                } else {
+                    self.ctx.sql(sql).await
                 }
             }
             Statement::Drop {
@@ -1430,6 +1442,162 @@ impl SQLContext {
         }
     }
 
+    async fn handle_create_function(
+        &self,
+        create_function: &CreateFunction,
+    ) -> DFResult<DataFrame> {
+        validate_persistent_create_function(create_function)?;
+        if create_function
+            .language
+            .as_ref()
+            .is_none_or(|language| !language.value.eq_ignore_ascii_case("sql"))
+        {
+            return Err(DataFusionError::Plan(
+                "CREATE FUNCTION requires LANGUAGE SQL".to_string(),
+            ));
+        }
+        if create_function.behavior != Some(FunctionBehavior::Immutable) {
+            return Err(DataFusionError::Plan(
+                "CREATE FUNCTION requires IMMUTABLE".to_string(),
+            ));
+        }
+        let FunctionReturnType::DataType(return_type) = create_function
+            .return_type
+            .as_ref()
+            .ok_or_else(|| DataFusionError::Plan("CREATE FUNCTION requires RETURNS".to_string()))?
+        else {
+            return Err(DataFusionError::Plan(
+                "CREATE FUNCTION SETOF return types are not supported".to_string(),
+            ));
+        };
+        let CreateFunctionBody::Return(body) = create_function
+            .function_body
+            .as_ref()
+            .ok_or_else(|| DataFusionError::Plan("CREATE FUNCTION requires RETURN".to_string()))?
+        else {
+            return Err(DataFusionError::Plan(
+                "CREATE FUNCTION only supports a RETURN expression".to_string(),
+            ));
+        };
+
+        let mut parameter_names = HashSet::new();
+        let input_params = create_function
+            .args
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(id, argument)| {
+                if argument.mode.is_some() || argument.default_expr.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "CREATE FUNCTION argument modes and defaults are not supported".to_string(),
+                    ));
+                }
+                let name = argument
+                    .name
+                    .clone()
+                    .map(normalize_create_function_argument_name)
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "CREATE FUNCTION arguments must have names".to_string(),
+                        )
+                    })?;
+                if !parameter_names.insert(name.clone()) {
+                    return Err(DataFusionError::Plan(format!(
+                        "duplicate function argument name '{name}'"
+                    )));
+                }
+                Ok(PaimonDataField::new(
+                    id as i32,
+                    name,
+                    sql_data_type_to_paimon_type(&argument.data_type, true)?,
+                ))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let return_params = vec![PaimonDataField::new(
+            0,
+            "result".to_string(),
+            sql_data_type_to_paimon_type(return_type, true)?,
+        )];
+        let (catalog, catalog_name, identifier) =
+            self.resolve_catalog_and_function(&create_function.name)?;
+        let function = paimon::catalog::Function::new(
+            identifier,
+            Some(input_params),
+            Some(return_params),
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                paimon::catalog::FunctionDefinition::Sql {
+                    definition: body.to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        );
+        self.validate_create_function(&function, &catalog_name)
+            .await?;
+        catalog
+            .create_function(&function, create_function.if_not_exists)
+            .await
+            .map_err(to_datafusion_error)?;
+        ok_result(&self.ctx)
+    }
+
+    async fn validate_create_function(
+        &self,
+        function: &paimon::catalog::Function,
+        catalog_name: &str,
+    ) -> DFResult<()> {
+        let arguments = function
+            .input_params()
+            .unwrap_or_default()
+            .iter()
+            .map(|field| {
+                let value = serde_json::to_value(field.data_type()).map_err(|error| {
+                    DataFusionError::Plan(format!(
+                        "Invalid CREATE FUNCTION argument type '{:?}': {error}",
+                        field.data_type()
+                    ))
+                })?;
+                let sql_type = value.as_str().ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "CREATE FUNCTION argument type '{:?}' cannot be represented in SQL",
+                        field.data_type()
+                    ))
+                })?;
+                Ok(format!(
+                    "CAST(NULL AS {})",
+                    sql_type.strip_suffix(" NOT NULL").unwrap_or(sql_type)
+                ))
+            })
+            .collect::<DFResult<Vec<_>>>()?
+            .join(", ");
+        let quote = |identifier: &str| format!("\"{}\"", identifier.replace('"', "\"\""));
+        let validation_sql = format!(
+            "SELECT {}.{}.{}({arguments})",
+            quote(catalog_name),
+            quote(function.identifier().database()),
+            quote(function.name())
+        );
+        let expanded = crate::sql_function::expand_sql_with_candidate(
+            &validation_sql,
+            &self.catalogs,
+            catalog_name,
+            function.identifier().database(),
+            function,
+        )
+        .await?;
+        let mut state = self.ctx.state();
+        state.config_mut().options_mut().catalog.default_catalog = catalog_name.to_string();
+        state.config_mut().options_mut().catalog.default_schema =
+            function.identifier().database().to_string();
+        let logical_plan = state.create_logical_plan(&expanded).await?;
+        validate_immutable_scalar_plan(&logical_plan)?;
+        state.create_physical_plan(&logical_plan).await?;
+        Ok(())
+    }
+
     async fn handle_drop_partitions(
         &self,
         catalog: &Arc<dyn Catalog>,
@@ -1494,6 +1662,77 @@ impl SQLContext {
             }
         };
         self.catalogs.contains_key(&catalog_name)
+    }
+
+    fn is_paimon_function_name(&self, name: &ObjectName) -> bool {
+        let Some(parts) = name
+            .0
+            .iter()
+            .map(|part| {
+                part.as_ident()
+                    .map(|identifier| IdentNormalizer::default().normalize(identifier.clone()))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let catalog_name = match parts.as_slice() {
+            [catalog, _, _] => catalog.clone(),
+            [_] | [_, _] => self.current_catalog_name(),
+            _ => return false,
+        };
+        self.catalogs.contains_key(&catalog_name)
+    }
+
+    fn resolve_catalog_and_function(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
+        let parts = name
+            .0
+            .iter()
+            .map(|part| {
+                part.as_ident()
+                    .cloned()
+                    .map(|identifier| IdentNormalizer::default().normalize(identifier))
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!("Invalid function reference: {name}"))
+                    })
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        match parts.as_slice() {
+            [catalog_name, database, function] => {
+                let catalog = self.catalogs.get(catalog_name).ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
+                })?;
+                Ok((
+                    Arc::clone(catalog),
+                    catalog_name.clone(),
+                    Identifier::new(database, function),
+                ))
+            }
+            [database, function] => Ok((
+                self.current_catalog()?,
+                self.current_catalog_name(),
+                Identifier::new(database, function),
+            )),
+            [function] => Ok((
+                self.current_catalog()?,
+                self.current_catalog_name(),
+                Identifier::new(
+                    self.ctx
+                        .state()
+                        .config_options()
+                        .catalog
+                        .default_schema
+                        .clone(),
+                    function,
+                ),
+            )),
+            _ => Err(DataFusionError::Plan(format!(
+                "Invalid function reference: {name}"
+            ))),
+        }
     }
 
     /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
@@ -1567,6 +1806,182 @@ impl SQLContext {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
     }
+}
+
+fn validate_immutable_scalar_plan(plan: &LogicalPlan) -> DFResult<()> {
+    let mut violation = None;
+    plan.apply(|node| {
+        node.apply_expressions(|expression| {
+            expression.apply(|expression| {
+                match expression {
+                    LogicalExpr::ScalarFunction(function)
+                        if function.func.signature().volatility != Volatility::Immutable =>
+                    {
+                        violation = Some(format!(
+                            "CREATE FUNCTION body uses non-immutable function '{}'",
+                            function.func.name()
+                        ));
+                    }
+                    LogicalExpr::HigherOrderFunction(function)
+                        if function.func.signature().volatility != Volatility::Immutable =>
+                    {
+                        violation = Some(format!(
+                            "CREATE FUNCTION body uses non-immutable function '{}'",
+                            function.func.name()
+                        ));
+                    }
+                    LogicalExpr::AggregateFunction(_) | LogicalExpr::WindowFunction(_) => {
+                        violation = Some(
+                            "CREATE FUNCTION body must be a scalar expression; aggregate and window functions are not supported"
+                                .to_string(),
+                        );
+                    }
+                    LogicalExpr::Exists(_)
+                    | LogicalExpr::InSubquery(_)
+                    | LogicalExpr::SetComparison(_)
+                    | LogicalExpr::ScalarSubquery(_) => {
+                        violation = Some(
+                            "CREATE FUNCTION body must be a scalar expression; subqueries are not supported"
+                                .to_string(),
+                        );
+                    }
+                    LogicalExpr::Unnest(_) => {
+                        violation = Some(
+                            "CREATE FUNCTION body must be a scalar expression; UNNEST is not supported"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if let Some(message) = violation {
+        return Err(DataFusionError::Plan(message));
+    }
+    Ok(())
+}
+
+fn normalize_create_function_argument_name(
+    identifier: datafusion::sql::sqlparser::ast::Ident,
+) -> String {
+    if identifier.quote_style.is_none() {
+        if let Some(value) = identifier
+            .value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            return value.replace("\"\"", "\"");
+        }
+    }
+    IdentNormalizer::default().normalize(identifier)
+}
+
+fn validate_persistent_create_function(create_function: &CreateFunction) -> DFResult<()> {
+    let unsupported = if create_function.or_alter {
+        Some("CREATE OR ALTER FUNCTION is not supported")
+    } else if create_function.or_replace {
+        Some("CREATE OR REPLACE FUNCTION is not supported")
+    } else if create_function.temporary {
+        Some("CREATE TEMPORARY FUNCTION is not supported")
+    } else if create_function.args.is_none() {
+        Some("CREATE FUNCTION requires a parenthesized argument list")
+    } else if create_function.called_on_null.is_some() {
+        Some("CREATE FUNCTION NULL INPUT clauses are not supported")
+    } else if create_function.parallel.is_some() {
+        Some("CREATE FUNCTION PARALLEL clauses are not supported")
+    } else if create_function.security.is_some() {
+        Some("CREATE FUNCTION SECURITY clauses are not supported")
+    } else if !create_function.set_params.is_empty() {
+        Some("CREATE FUNCTION SET clauses are not supported")
+    } else if create_function.using.is_some() {
+        Some("CREATE FUNCTION USING clauses are not supported")
+    } else if create_function.determinism_specifier.is_some() {
+        Some("CREATE FUNCTION determinism specifiers are not supported")
+    } else if create_function.options.is_some() {
+        Some("CREATE FUNCTION OPTIONS clauses are not supported")
+    } else if create_function.remote_connection.is_some() {
+        Some("CREATE FUNCTION REMOTE clauses are not supported")
+    } else {
+        None
+    };
+    if let Some(message) = unsupported {
+        return Err(DataFusionError::Plan(message.to_string()));
+    }
+    Ok(())
+}
+
+fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+    let dialect = GenericDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
+    let significant = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| match &token.token {
+            Token::Whitespace(_) => None,
+            Token::Word(word) => Some((index, word.keyword)),
+            _ => Some((index, Keyword::NoKeyword)),
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    let create_function_if_not_exists = matches!(
+        significant.as_slice(),
+        [
+            (_, Keyword::CREATE),
+            (_, Keyword::FUNCTION),
+            (_, Keyword::IF),
+            (_, Keyword::NOT),
+            (_, Keyword::EXISTS)
+        ]
+    );
+    let create_function_or_alter = matches!(
+        significant.as_slice(),
+        [
+            (_, Keyword::CREATE),
+            (_, Keyword::OR),
+            (_, Keyword::ALTER),
+            (_, Keyword::FUNCTION),
+            ..
+        ]
+    );
+    if create_function_if_not_exists {
+        let removed = significant[2..=4]
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<HashSet<_>>();
+        tokens = tokens
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !removed.contains(index))
+            .map(|(_, token)| token)
+            .collect();
+    }
+    let mut statements = Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
+    if create_function_if_not_exists {
+        let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
+            return Err(DataFusionError::Plan(
+                "SQL parse error: invalid CREATE FUNCTION IF NOT EXISTS statement".to_string(),
+            ));
+        };
+        create_function.if_not_exists = true;
+    }
+    if create_function_or_alter {
+        let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
+            return Err(DataFusionError::Plan(
+                "SQL parse error: invalid CREATE OR ALTER FUNCTION statement".to_string(),
+            ));
+        };
+        create_function.or_alter = true;
+    }
+    Ok(statements)
 }
 
 fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
@@ -2970,6 +3385,24 @@ mod tests {
                 .collect())
         }
 
+        async fn create_function(
+            &self,
+            function: &paimon::catalog::Function,
+            ignore_if_exists: bool,
+        ) -> paimon::Result<()> {
+            let mut functions = self.functions.lock().unwrap();
+            if functions.contains_key(function.identifier()) {
+                if ignore_if_exists {
+                    return Ok(());
+                }
+                return Err(paimon::Error::FunctionAlreadyExist {
+                    full_name: function.full_name(),
+                });
+            }
+            functions.insert(function.identifier().clone(), function.clone());
+            Ok(())
+        }
+
         async fn get_function(
             &self,
             identifier: &Identifier,
@@ -3141,6 +3574,463 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_can_be_created_and_called() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE FUNCTION plus_one(x BIGINT) RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN x + 1",
+        )
+        .await
+        .unwrap();
+
+        let stored = catalog
+            .get_function(&Identifier::new("default", "plus_one"))
+            .await
+            .unwrap();
+        assert_eq!(stored.input_params().unwrap()[0].id(), 0);
+        assert_eq!(stored.input_params().unwrap()[0].name(), "x");
+        assert!(stored.input_params().unwrap()[0].data_type().is_nullable());
+        assert_eq!(stored.return_params().unwrap()[0].id(), 0);
+        assert_eq!(stored.return_params().unwrap()[0].name(), "result");
+        assert!(stored.return_params().unwrap()[0].data_type().is_nullable());
+
+        let batches = ctx
+            .sql("SELECT plus_one(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_normalizes_unquoted_bare_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE FUNCTION PlusOne(X BIGINT) RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN X + 1",
+        )
+        .await
+        .unwrap();
+
+        let stored = catalog
+            .get_function(&Identifier::new("default", "plusone"))
+            .await
+            .unwrap();
+        assert_eq!(stored.input_params().unwrap()[0].name(), "x");
+        let batches = ctx
+            .sql("SELECT plusone(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_preserves_quoted_names() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql(
+            "CREATE FUNCTION \"PlusOne\"(\"Input\" BIGINT) RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN \"Input\" + 1",
+        )
+        .await
+        .unwrap();
+
+        let stored = catalog
+            .get_function(&Identifier::new("default", "PlusOne"))
+            .await
+            .unwrap();
+        assert_eq!(stored.input_params().unwrap()[0].name(), "Input");
+        let batches = ctx
+            .sql("SELECT \"PlusOne\"(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_if_not_exists_preserves_existing_function() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql(
+            "CREATE FUNCTION answer() RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN 1",
+        )
+        .await
+        .unwrap();
+
+        ctx.sql(
+            "CrEaTe /* keep comments */ FuNcTiOn IF /* gap */ NOT EXISTS answer() \
+             RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN 2",
+        )
+        .await
+        .unwrap();
+
+        let stored = catalog
+            .get_function(&Identifier::new("default", "answer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .definition("datafusion")
+                .and_then(paimon::catalog::FunctionDefinition::sql),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_if_not_exists_validates_proposed_body() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql(
+            "CREATE FUNCTION answer() RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN 1",
+        )
+        .await
+        .unwrap();
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION IF NOT EXISTS answer() RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE RETURN undeclared + 1",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("undeclared identifier"));
+        let stored = catalog
+            .get_function(&Identifier::new("default", "answer"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .definition("datafusion")
+                .and_then(paimon::catalog::FunctionDefinition::sql),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_uses_owning_database_for_dependencies() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function_in_database(&catalog, "default", "plus_one", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "other", "plus_one", "x + 100", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.set_current_database("other").await.unwrap();
+
+        ctx.sql(
+            "CREATE FUNCTION paimon.default.wrapper(x BIGINT) RETURNS BIGINT \
+             LANGUAGE SQL IMMUTABLE RETURN plus_one(x)",
+        )
+        .await
+        .unwrap();
+
+        let batches = ctx
+            .sql("SELECT paimon.default.wrapper(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_nondeterministic_dependency() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "unstable", "x + 1", false);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION wrapper(x BIGINT) RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE RETURN unstable(x)",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-deterministic"));
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "wrapper"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_direct_recursion_before_create() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION abs(x BIGINT) RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE RETURN abs(x)",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("recursive REST SQL function"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "abs"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_indirect_recursion_before_create() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "existing", "candidate(x)", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION candidate(x BIGINT) RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE RETURN existing(x)",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("recursive REST SQL function"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "candidate"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_volatile_datafusion_function() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION random_value() RETURNS DOUBLE \
+                 LANGUAGE SQL IMMUTABLE RETURN random()",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-immutable function 'random'"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "random_value"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_unsupported_clauses() {
+        let cases = [
+            (
+                "CREATE OR REPLACE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN 1",
+                "OR REPLACE",
+            ),
+            (
+                "CREATE OR ALTER FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN 1",
+                "OR ALTER",
+            ),
+            (
+                "CREATE TEMPORARY FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN 1",
+                "TEMPORARY",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE CALLED ON NULL INPUT RETURN 1",
+                "NULL INPUT",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE PARALLEL SAFE RETURN 1",
+                "PARALLEL",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE SECURITY INVOKER RETURN 1",
+                "SECURITY",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE SET search_path TO public RETURN 1",
+                "SET",
+            ),
+        ];
+
+        for (sql, clause) in cases {
+            let catalog = Arc::new(MockCatalog::new());
+            let ctx = make_sql_context(catalog).await;
+            let error = match ctx.sql(sql).await {
+                Ok(_) => panic!("expected error for {clause}: {sql}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(clause),
+                "expected error for {clause}, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_non_scalar_bodies() {
+        let cases = [
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN count(1)",
+                "aggregate and window",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN row_number() OVER ()",
+                "aggregate and window",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN (SELECT 1)",
+                "subqueries",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let catalog = Arc::new(MockCatalog::new());
+            let ctx = make_sql_context(catalog).await;
+            let error = match ctx.sql(sql).await {
+                Ok(_) => panic!("expected error containing {expected}: {sql}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_invalid_signature_and_body_forms() {
+        let cases = [
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT IMMUTABLE RETURN 1",
+                "LANGUAGE SQL",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL RETURN 1",
+                "IMMUTABLE",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL STABLE RETURN 1",
+                "IMMUTABLE",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE AS '1'",
+                "RETURN expression",
+            ),
+            (
+                "CREATE FUNCTION invalid() RETURNS SETOF BIGINT LANGUAGE SQL IMMUTABLE RETURN 1",
+                "SETOF",
+            ),
+            (
+                "CREATE FUNCTION invalid(BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN 1",
+                "must have names",
+            ),
+            (
+                "CREATE FUNCTION invalid(IN x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x",
+                "modes and defaults",
+            ),
+            (
+                "CREATE FUNCTION invalid(x BIGINT = 1) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x",
+                "modes and defaults",
+            ),
+            (
+                "CREATE FUNCTION invalid(X BIGINT, x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x",
+                "duplicate function argument",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let catalog = Arc::new(MockCatalog::new());
+            let ctx = make_sql_context(catalog).await;
+            let error = match ctx.sql(sql).await {
+                Ok(_) => panic!("expected error containing {expected}: {sql}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_incompatible_return_type() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql(
+                "CREATE FUNCTION invalid() RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE RETURN named_struct('value', 1)",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("cast"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "invalid"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
     }
 
     #[tokio::test]

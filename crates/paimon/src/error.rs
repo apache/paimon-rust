@@ -108,6 +108,8 @@ pub enum Error {
     ViewNotExist { full_name: String },
     #[snafu(display("Function {} does not exist.", full_name))]
     FunctionNotExist { full_name: String },
+    #[snafu(display("Function {} already exists.", full_name))]
+    FunctionAlreadyExist { full_name: String },
     #[snafu(display("Column {} already exists in table {}.", column, full_name))]
     ColumnAlreadyExist { full_name: String, column: String },
     #[snafu(display("Column {} does not exist in table {}.", column, full_name))]

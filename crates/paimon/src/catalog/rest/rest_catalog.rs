@@ -320,6 +320,21 @@ impl Catalog for RESTCatalog {
             .map_err(|e| map_unsupported_endpoint(e, "function"))
     }
 
+    async fn create_function(
+        &self,
+        function: &crate::catalog::Function,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .create_function(function)
+            .await
+            .map_err(|error| map_rest_error_for_create_function(error, function.identifier()));
+        ignore_error_if(result, |error| {
+            ignore_if_exists && matches!(error, Error::FunctionAlreadyExist { .. })
+        })
+    }
+
     async fn get_function(&self, identifier: &Identifier) -> Result<crate::catalog::Function> {
         let response = self
             .api
@@ -454,6 +469,23 @@ fn map_rest_error_for_function(err: Error, identifier: &Identifier) -> Error {
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::FunctionNotExist {
+            full_name: identifier.full_name(),
+        },
+        other => map_unsupported_endpoint(other, "function"),
+    }
+}
+
+/// Map a REST API error from creating a persistent function.
+fn map_rest_error_for_create_function(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::DatabaseNotExist {
+            database: identifier.database().to_string(),
+        },
+        Error::RestApi {
+            source: RestError::AlreadyExists { .. },
+        } => Error::FunctionAlreadyExist {
             full_name: identifier.full_name(),
         },
         other => map_unsupported_endpoint(other, "function"),

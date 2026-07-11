@@ -40,9 +40,9 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW` and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
-Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, `CREATE FUNCTION`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
+Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
@@ -78,9 +78,10 @@ internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
-When the registered catalog is a Paimon REST Catalog, `SQLContext` can read and
-execute persistent views and SQL scalar functions in the catalog. It can also
-create persistent views with this syntax:
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read,
+execute, and create persistent views and SQL scalar functions.
+
+Create a persistent view with this syntax:
 
 ```sql
 CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
@@ -109,8 +110,7 @@ dialect definition.
 Persistent `CREATE VIEW` is currently implemented by REST Catalog. Other
 catalog implementations may return `Unsupported`. `CREATE OR REPLACE VIEW`,
 materialized/secure views, view comments or options, vendor-specific modifiers,
-and persistent `ALTER VIEW` / `DROP VIEW` are not supported. Persistent
-`CREATE FUNCTION`, `ALTER FUNCTION`, and `DROP FUNCTION` are also not supported.
+and persistent `ALTER VIEW` / `DROP VIEW` are not supported.
 
 Persistent views resolve through the normal DataFusion catalog path, so they
 can be queried wherever a table can be used:
@@ -136,6 +136,55 @@ SELECT normalize_score(score) FROM scores;
 SELECT paimon.reporting.normalize_score(score) FROM scores;
 ```
 
+Create a persistent REST SQL scalar function with this syntax:
+
+```sql
+CREATE FUNCTION [IF NOT EXISTS] function_name(
+    [parameter_name data_type, ...]
+)
+RETURNS data_type
+LANGUAGE SQL
+IMMUTABLE
+RETURN scalar_expression;
+```
+
+For example:
+
+```sql
+CREATE FUNCTION paimon.reporting.add_tax(amount DECIMAL(12, 2))
+RETURNS DECIMAL(12, 2)
+LANGUAGE SQL
+IMMUTABLE
+RETURN amount * DECIMAL '1.10';
+
+SELECT add_tax(total) FROM orders;
+```
+
+Bare, two-part (`database.function`), and three-part
+(`catalog.database.function`) names are accepted as creation targets. Unquoted
+names are normalized and quoted names are preserved. Calls remain limited to
+bare or three-part names; two-part function calls are not supported.
+
+Parameters must be named and cannot have modes or defaults. Zero parameters
+are allowed. Inputs and the single return value are stored as nullable fields;
+parameter IDs start at zero and the return field has ID `0` and name `result`.
+The canonical, unexpanded `RETURN` expression is stored in
+`definitions.datafusion` with `type: "sql"`.
+
+Before the REST create request is sent, `SQLContext` expands dependencies using
+the new function as a candidate, validates argument substitution and the
+declared return cast, and builds both logical and physical DataFusion plans in
+the function's owning catalog/database. This rejects undeclared identifiers,
+recursive dependencies (including indirect recursion), non-deterministic REST
+dependencies, subqueries/table access, aggregate or window functions,
+Stable/Volatile DataFusion functions, and incompatible return types. The
+`IMMUTABLE` keyword is therefore checked against the planned expression rather
+than trusted as a declaration alone.
+
+`IF NOT EXISTS` still validates the proposed definition first. The REST server
+then handles the create atomically; only an already-existing function error is
+ignored.
+
 A function is executable only when all of the following are true:
 
 - `definitions.datafusion` exists and has `type: "sql"`;
@@ -157,7 +206,11 @@ Function expansion is implemented by `SQLContext::sql`. Queries executed
 directly through a raw DataFusion `SessionContext` do not expand REST SQL
 functions. Two-part function names such as `database.function(...)`, lambda or
 file definitions, aggregate/table/multi-return functions, and non-deterministic
-functions are not supported by this read-only integration.
+functions are not supported. `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`,
+non-SQL bodies, `STABLE`/`VOLATILE`, null-input/parallel/security/SET clauses,
+options/remote functions, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
+are also not supported. Catalog implementations other than REST Catalog may
+return `Unsupported` for persistent function creation.
 
 ## Data Types
 

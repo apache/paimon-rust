@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use paimon::api::CreateViewRequest;
+use paimon::api::{CreateFunctionRequest, CreateViewRequest};
 use paimon::catalog::{Function, FunctionDefinition, Identifier, View, ViewSchema};
 use paimon::spec::DataField;
 use serde_json::json;
@@ -208,4 +208,71 @@ fn function_binds_identifier_signature_and_definition() {
             .and_then(FunctionDefinition::sql),
         Some("length * width")
     );
+}
+
+#[test]
+fn create_function_request_serialization_contract() {
+    let input_params: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "x", "type": "BIGINT"}
+    ]))
+    .unwrap();
+    let return_params: Vec<DataField> = serde_json::from_value(json!([
+        {"id": 0, "name": "result", "type": "BIGINT"}
+    ]))
+    .unwrap();
+    let function = Function::new(
+        Identifier::new("analytics", "plus_one"),
+        Some(input_params),
+        Some(return_params),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "x + 1".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    );
+
+    assert_eq!(
+        serde_json::to_value(CreateFunctionRequest::from_function(&function)).unwrap(),
+        json!({
+            "name": "plus_one",
+            "inputParams": [{"id": 0, "name": "x", "type": "BIGINT"}],
+            "returnParams": [{"id": 0, "name": "result", "type": "BIGINT"}],
+            "deterministic": true,
+            "definitions": {
+                "datafusion": {"type": "sql", "definition": "x + 1"}
+            },
+            "comment": null,
+            "options": {}
+        })
+    );
+}
+
+#[test]
+fn create_function_request_serializes_zero_arguments_as_empty_array() {
+    let function = Function::new(
+        Identifier::new("analytics", "answer"),
+        Some(Vec::new()),
+        Some(
+            serde_json::from_value(json!([
+                {"id": 0, "name": "result", "type": "BIGINT"}
+            ]))
+            .unwrap(),
+        ),
+        true,
+        HashMap::from([(
+            "datafusion".to_string(),
+            FunctionDefinition::Sql {
+                definition: "42".to_string(),
+            },
+        )]),
+        None,
+        HashMap::new(),
+    );
+
+    let json = serde_json::to_value(CreateFunctionRequest::from_function(&function)).unwrap();
+    assert_eq!(json["inputParams"], json!([]));
 }

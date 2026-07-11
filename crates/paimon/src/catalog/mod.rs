@@ -405,6 +405,21 @@ pub trait Catalog: Send + Sync {
 
     // ======================= function methods ===============================
 
+    /// Create a persistent function.
+    ///
+    /// * `ignore_if_exists` - if true, do nothing when the function already exists;
+    ///   if false, return [`crate::Error::FunctionAlreadyExist`].
+    ///
+    /// # Errors
+    /// * [`crate::Error::DatabaseNotExist`] - database in the function identifier does not exist.
+    /// * [`crate::Error::FunctionAlreadyExist`] - function already exists when
+    ///   `ignore_if_exists` is false.
+    async fn create_function(&self, _function: &Function, _ignore_if_exists: bool) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support functions".to_string(),
+        })
+    }
+
     /// List persistent function names in a database.
     async fn list_functions(&self, _database_name: &str) -> Result<Vec<String>> {
         Err(Error::Unsupported {

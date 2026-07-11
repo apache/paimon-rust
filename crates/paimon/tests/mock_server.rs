@@ -34,12 +34,13 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use paimon::api::{
-    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateViewRequest,
-    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListTablesResponse, ListViewsResponse,
-    RenameTableRequest, ResourcePaths,
+    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
+    CreateFunctionRequest, CreateViewRequest, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListTablesResponse, ListViewsResponse, RenameTableRequest,
+    ResourcePaths,
 };
-use paimon::catalog::Function;
+use paimon::catalog::{Function, Identifier};
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
@@ -503,6 +504,61 @@ impl RESTServer {
             Json(ListFunctionsResponse::new(functions, next_page_token)),
         )
             .into_response()
+    }
+
+    /// Handle POST /databases/:db/functions - create a persistent function.
+    pub async fn create_function(
+        Path(db): Path<String>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateFunctionRequest>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+        let function_name = request.name.clone();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function_name),
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
+        if !s.databases.contains_key(&db) {
+            let err = ErrorResponse::new(
+                Some("database".to_string()),
+                Some(db),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(err)).into_response();
+        }
+        let key = format!("{db}.{function_name}");
+        if s.functions.contains_key(&key) {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function_name),
+                Some("Already Exists".to_string()),
+                Some(409),
+            );
+            return (StatusCode::CONFLICT, Json(err)).into_response();
+        }
+        let function = Function::new(
+            Identifier::new(&db, &request.name),
+            request.input_params,
+            request.return_params,
+            request.deterministic,
+            request.definitions,
+            request.comment,
+            request.options,
+        );
+        s.functions.insert(
+            key,
+            GetFunctionResponse::from_function(
+                &function,
+                AuditRESTResponse::new(None, None, None, None, None),
+            ),
+        );
+        (StatusCode::OK, Json(json!({"function": function_name}))).into_response()
     }
 
     /// Handle POST /databases/:db/tables - create a new table.
@@ -999,7 +1055,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/functions"),
-            get(RESTServer::list_functions),
+            get(RESTServer::list_functions).post(RESTServer::create_function),
         )
         .route(
             &format!("{prefix}/databases/:db/functions/:function"),
