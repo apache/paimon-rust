@@ -45,6 +45,30 @@ This is a pure Rust project, so only `cargo` is needed. Here are some common com
 2. Open a pull request on the project's GitHub page. Provide a clear description of your changes and why they are necessary.
 3. Wait for reviews and address any feedback. Once the pull request is approved and merged, your changes will be part of the project.
 
+## AI-Assisted Contributions
+
+Apache Paimon Rust has the following policy for AI-assisted pull requests:
+
+- The PR author should **understand the core ideas** behind the implementation **end-to-end** and be able to justify the design and code during review.
+- **Call out unknowns and assumptions.** It is acceptable not to fully understand some details of AI-generated code, but authors should identify these cases and point them out to reviewers. This allows reviewers to apply their knowledge of the codebase and evaluate potential concerns, such as correctness, concurrency, compatibility, or performance risks.
+
+### Why fully AI-generated PRs without understanding are not helpful
+
+AI tools cannot reliably make complex changes to Apache Paimon Rust on their own, which is why we rely on pull requests and code review.
+
+The purposes of code review are:
+
+1. Complete the intended task correctly.
+2. Share knowledge between authors and reviewers as a long-term investment in the project.
+
+A fully AI-generated contribution without sufficient author understanding does not meet these purposes. Maintainers could use AI tools directly, while contributors acting only as a proxy gain little knowledge of the project.
+
+Review capacity is limited, so large pull requests that appear to lack the required understanding may not be reviewed and may eventually be closed or redirected.
+
+### Better ways to contribute than an "AI dump"
+
+Consider writing a high-quality issue with a clear problem statement and a minimal reproducible example. This often makes it easier for the community to investigate the problem and develop an appropriate solution.
+
 ### Read the design docs
 
 For a deeper understanding of the project, read the design documentation available on our [Paimon Rust](https://paimon.apache.org/docs/rust/).
