@@ -766,10 +766,10 @@ mod tests {
     fn test_classify_never_exact_for_case_colliding_schema() {
         use paimon::spec::{DataField, DataType, IntType};
         // A schema with two fields colliding under ASCII case-folding makes
-        // case-insensitive resolution ambiguous. Because `supports_filters_pushdown`
-        // cannot see the session's case sensitivity, classify must not promise
-        // `Exact` here (else a case-insensitive `scan` that fails to resolve the
-        // reference would push nothing while DataFusion drops its residual).
+        // case-insensitive resolution ambiguous. The SQL path is case-sensitive,
+        // but `classify_filter_pushdown` still caps at `Inexact` for such schemas
+        // as a conservative guard, so a residual is never dropped when a caller
+        // could resolve the reference case-insensitively.
         let fields = vec![
             DataField::new(0, "Dt".to_string(), DataType::Int(IntType::new())),
             DataField::new(1, "dt".to_string(), DataType::Int(IntType::new())),
