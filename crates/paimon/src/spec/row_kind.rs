@@ -48,4 +48,87 @@ impl RowKind {
     pub fn is_add(&self) -> bool {
         matches!(self, RowKind::Insert | RowKind::UpdateAfter)
     }
+
+    /// Byte value for serialization, matching Java `toByteValue()`.
+    pub fn to_value(self) -> i8 {
+        self as i8
+    }
+
+    /// Short string form: `"+I"`, `"-U"`, `"+U"`, `"-D"`.
+    pub fn short_string(self) -> &'static str {
+        match self {
+            RowKind::Insert => "+I",
+            RowKind::UpdateBefore => "-U",
+            RowKind::UpdateAfter => "+U",
+            RowKind::Delete => "-D",
+        }
+    }
+
+    /// Parse from short string; case-insensitive (Java `RowKind.fromShortString`).
+    pub fn from_short_string(value: &str) -> crate::Result<Self> {
+        if value.len() != 2 {
+            return Err(crate::Error::DataInvalid {
+                message: format!("Unsupported short string '{value}' for row kind"),
+                source: None,
+            });
+        }
+        let bytes = value.as_bytes();
+        let sign = bytes[0].to_ascii_uppercase();
+        let letter = bytes[1].to_ascii_uppercase();
+        match (sign, letter) {
+            (b'+', b'I') => Ok(RowKind::Insert),
+            (b'-', b'U') => Ok(RowKind::UpdateBefore),
+            (b'+', b'U') => Ok(RowKind::UpdateAfter),
+            (b'-', b'D') => Ok(RowKind::Delete),
+            _ => Err(crate::Error::DataInvalid {
+                message: format!("Unsupported short string '{value}' for row kind"),
+                source: None,
+            }),
+        }
+    }
+
+    /// Whether this is `UPDATE_BEFORE` or `DELETE` (Java `isRetract()`).
+    pub fn is_retract(self) -> bool {
+        matches!(self, RowKind::UpdateBefore | RowKind::Delete)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RowKind;
+
+    #[test]
+    fn from_short_string_accepts_case_insensitive_tokens() {
+        assert_eq!(RowKind::from_short_string("+i").unwrap(), RowKind::Insert);
+        assert_eq!(
+            RowKind::from_short_string("-u").unwrap(),
+            RowKind::UpdateBefore
+        );
+        assert_eq!(
+            RowKind::from_short_string("+U").unwrap(),
+            RowKind::UpdateAfter
+        );
+        assert_eq!(RowKind::from_short_string("-D").unwrap(), RowKind::Delete);
+    }
+
+    #[test]
+    fn from_short_string_rejects_invalid() {
+        assert!(RowKind::from_short_string("INSERT").is_err());
+        assert!(RowKind::from_short_string("").is_err());
+    }
+
+    #[test]
+    fn short_string_round_trip() {
+        for kind in [
+            RowKind::Insert,
+            RowKind::UpdateBefore,
+            RowKind::UpdateAfter,
+            RowKind::Delete,
+        ] {
+            assert_eq!(
+                RowKind::from_short_string(kind.short_string()).unwrap(),
+                kind
+            );
+        }
+    }
 }

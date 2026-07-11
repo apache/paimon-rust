@@ -107,3 +107,6 @@ pub use partition_statistics::PartitionStatistics;
 
 mod row_kind;
 pub use row_kind::RowKind;
+
+mod row_kind_filter;
+pub(crate) use row_kind_filter::RowKindFilter;

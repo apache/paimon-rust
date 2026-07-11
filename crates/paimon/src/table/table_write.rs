@@ -24,7 +24,8 @@ use crate::arrow::build_target_arrow_schema;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -39,6 +40,7 @@ use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
+use crate::table::row_kind_generator::RowKindGenerator;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -121,6 +123,8 @@ pub struct TableWrite {
     vector_file_format: Option<String>,
     /// Whether the table has VECTOR fields requiring dedicated vector files.
     has_dedicated_vector_fields: bool,
+    row_kind_generator: Option<RowKindGenerator>,
+    row_kind_filter: Option<RowKindFilter>,
 }
 
 impl TableWrite {
@@ -278,11 +282,13 @@ impl TableWrite {
             });
         }
 
-        if has_primary_keys && core_options.rowkind_field().is_some() {
-            return Err(crate::Error::Unsupported {
-                message: "KeyValueFileWriter does not support rowkind.field".to_string(),
-            });
-        }
+        let row_kind_generator = match core_options.rowkind_field() {
+            Some(field_name) if has_primary_keys => {
+                Some(RowKindGenerator::create(schema, field_name)?)
+            }
+            _ => None,
+        };
+        let row_kind_filter = RowKindFilter::of(core_options);
 
         let target_bucket_row_number = core_options.dynamic_bucket_target_row_num();
         let bucket_function_type = core_options.bucket_function_type()?;
@@ -366,6 +372,8 @@ impl TableWrite {
             has_blob_fields,
             vector_file_format,
             has_dedicated_vector_fields,
+            row_kind_generator,
+            row_kind_filter,
         })
     }
 
@@ -430,7 +438,12 @@ impl TableWrite {
             return Ok(());
         }
 
-        let grouped = self.divide_by_partition_bucket(batch).await?;
+        let batch = self.enrich_rowkind_batch(batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let grouped = self.divide_by_partition_bucket(&batch).await?;
         for ((partition_bytes, bucket), sub_batch) in grouped {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
@@ -475,16 +488,20 @@ impl TableWrite {
         }
 
         let mut result = Vec::with_capacity(groups.len());
+        let batch_has_value_kind = batch
+            .schema()
+            .column_with_name(VALUE_KIND_FIELD_NAME)
+            .is_some();
         // Cross-partition writers must always include _VALUE_KIND to keep the
         // Arrow schema stable across batches (some batches may have deletes,
         // others may not — KeyValueFileWriter's concat_batches requires a
         // consistent schema).
-        let needs_value_kind =
-            matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
-                || !output.deletes.is_empty();
+        let needs_value_kind = batch_has_value_kind
+            || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+            || !output.deletes.is_empty();
         for (key, row_indices) in groups {
             let sub_batch = Self::take_rows(batch, &row_indices)?;
-            let sub_batch = if needs_value_kind {
+            let sub_batch = if needs_value_kind && !batch_has_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
                 sub_batch
@@ -553,6 +570,84 @@ impl TableWrite {
         let schema = Arc::new(arrow_schema::Schema::new(fields));
         RecordBatch::try_new(schema, columns).map_err(|e| crate::Error::DataInvalid {
             message: format!("Failed to add _VALUE_KIND column: {e}"),
+            source: None,
+        })
+    }
+
+    fn enrich_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(generator) = &self.row_kind_generator else {
+            return Ok(batch.clone());
+        };
+        if batch
+            .schema()
+            .column_with_name(VALUE_KIND_FIELD_NAME)
+            .is_some()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "batch must not contain _VALUE_KIND when rowkind.field is configured"
+                    .to_string(),
+                source: None,
+            });
+        }
+
+        let mut keep_rows = Vec::new();
+        let mut kinds = Vec::new();
+        for row in 0..batch.num_rows() {
+            let kind = generator.generate(batch, row)?;
+            if let Some(filter) = &self.row_kind_filter {
+                if !filter.test(kind) {
+                    continue;
+                }
+            }
+            keep_rows.push(row);
+            kinds.push(kind.to_value());
+        }
+        if keep_rows.is_empty() {
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+        let filtered = Self::take_rows(batch, &keep_rows)?;
+        Self::add_per_row_value_kind_column(&filtered, kinds)
+    }
+
+    fn add_per_row_value_kind_column(
+        batch: &RecordBatch,
+        value_kinds: Vec<i8>,
+    ) -> Result<RecordBatch> {
+        use arrow_array::Int8Array;
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+
+        if batch.num_rows() != value_kinds.len() {
+            return Err(crate::Error::DataInvalid {
+                message: "rowkind batch row count must match value kind array length".to_string(),
+                source: None,
+            });
+        }
+        if batch
+            .schema()
+            .column_with_name(VALUE_KIND_FIELD_NAME)
+            .is_some()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "batch already contains _VALUE_KIND column".to_string(),
+                source: None,
+            });
+        }
+
+        let vk_array = Arc::new(Int8Array::from(value_kinds));
+        let vk_field = Arc::new(ArrowField::new(
+            VALUE_KIND_FIELD_NAME,
+            ArrowDataType::Int8,
+            false,
+        ));
+
+        let mut fields = batch.schema().fields().to_vec();
+        let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
+        fields.push(vk_field);
+        columns.push(vk_array);
+
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        RecordBatch::try_new(schema, columns).map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to add per-row _VALUE_KIND column: {e}"),
             source: None,
         })
     }

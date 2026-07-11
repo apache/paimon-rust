@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::spec::core_options::{
-    first_row_supports_changelog_producer, CoreOptions, BLOB_DESCRIPTOR_FIELD_OPTION,
-    BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION, QUERY_AUTH_ENABLED_OPTION,
-    SEQUENCE_FIELD_OPTION,
+    first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
+    BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
+    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
 };
-use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
+use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
     remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, BlobType,
     ColumnMove, ColumnMoveType, PartialUpdateConfig,
@@ -470,6 +470,11 @@ impl TableSchema {
         AggregationConfig::new(&new_schema.options)
             .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        Schema::validate_rowkind_field(
+            &new_schema.options,
+            &new_schema.primary_keys,
+            &new_schema.fields,
+        )?;
         Ok(new_schema)
     }
 
@@ -910,6 +915,7 @@ impl Schema {
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
+        Self::validate_rowkind_field(&options, &primary_keys, &fields)?;
 
         Ok(Self {
             fields,
@@ -1268,6 +1274,60 @@ impl Schema {
                 changelog_producer.as_str()
             ),
         })
+    }
+
+    fn validate_rowkind_field(
+        options: &HashMap<String, String>,
+        primary_keys: &[String],
+        fields: &[DataField],
+    ) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        let Some(field_name) = core.rowkind_field() else {
+            return Ok(());
+        };
+
+        if primary_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "rowkind.field requires a primary-key table".to_string(),
+            });
+        }
+
+        let merge_engine = core
+            .merge_engine()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if merge_engine != MergeEngine::Deduplicate {
+            return Err(crate::Error::ConfigInvalid {
+                message: "rowkind.field only supports merge-engine=deduplicate".to_string(),
+            });
+        }
+
+        let producer = core
+            .try_changelog_producer()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if producer == ChangelogProducer::Input {
+            return Err(crate::Error::ConfigInvalid {
+                message: "rowkind.field cannot be used with changelog-producer=input".to_string(),
+            });
+        }
+
+        let Some(field) = fields.iter().find(|f| f.name() == field_name) else {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Rowkind field '{field_name}' can not be found in table schema."),
+            });
+        };
+
+        if !matches!(
+            field.data_type(),
+            DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH
+        ) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "rowkind.field '{field_name}' must be STRING (unbounded VARCHAR) type"
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     fn options_error_to_config_invalid(error: crate::Error) -> crate::Error {
@@ -2848,5 +2908,97 @@ mod tests {
         } else {
             panic!("expected Row type");
         }
+    }
+
+    #[test]
+    fn rowkind_field_requires_primary_key_table() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("rowkind.field")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rowkind_field_rejects_non_deduplicate_merge_engine() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("merge-engine", "partial-update")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("deduplicate")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rowkind_field_rejects_changelog_producer_input() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("changelog-producer", "input")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("changelog-producer=input")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rowkind_field_rejects_non_string_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("op", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("STRING")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rowkind_field_rejects_missing_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("can not be found")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rowkind_field_accepts_valid_deduplicate_table() {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
     }
 }

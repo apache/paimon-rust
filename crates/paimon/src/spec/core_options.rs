@@ -71,6 +71,13 @@ pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
+const IGNORE_DELETE_OPTION: &str = "ignore-delete";
+const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";
+const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
+    "first-row.ignore-delete",
+    "deduplicate.ignore-delete",
+    "partial-update.ignore-delete",
+];
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
@@ -382,6 +389,25 @@ impl<'a> CoreOptions<'a> {
     /// The `rowkind.field` option: a user column whose value encodes the row kind.
     pub fn rowkind_field(&self) -> Option<&str> {
         self.options.get(ROWKIND_FIELD_OPTION).map(String::as_str)
+    }
+
+    /// Whether to ignore delete records (and all retracts when used by `RowKindFilter`).
+    pub fn ignore_delete(&self) -> bool {
+        for key in
+            std::iter::once(IGNORE_DELETE_OPTION).chain(IGNORE_DELETE_FALLBACK_KEYS.iter().copied())
+        {
+            if let Some(v) = self.options.get(key) {
+                return v.eq_ignore_ascii_case("true");
+            }
+        }
+        false
+    }
+
+    /// Whether to ignore update-before records at write time.
+    pub fn ignore_update_before(&self) -> bool {
+        self.options
+            .get(IGNORE_UPDATE_BEFORE_OPTION)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     pub fn data_evolution_enabled(&self) -> bool {
@@ -1636,5 +1662,24 @@ mod tests {
     fn test_validate_scan_options_allows_supported_selectors() {
         let options = HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string())]);
         assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
+    }
+
+    #[test]
+    fn ignore_delete_reads_primary_and_fallback_keys() {
+        let fallback =
+            HashMap::from([("deduplicate.ignore-delete".to_string(), "true".to_string())]);
+        let opts = CoreOptions::new(&fallback);
+        assert!(opts.ignore_delete());
+
+        let primary = HashMap::from([("ignore-delete".to_string(), "true".to_string())]);
+        let opts = CoreOptions::new(&primary);
+        assert!(opts.ignore_delete());
+    }
+
+    #[test]
+    fn ignore_update_before_defaults_false() {
+        let options = HashMap::new();
+        let opts = CoreOptions::new(&options);
+        assert!(!opts.ignore_update_before());
     }
 }
