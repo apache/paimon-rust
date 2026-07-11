@@ -48,6 +48,7 @@ mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
 mod global_index_types;
 mod hybrid_search_builder;
+mod incremental_scan;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -93,6 +94,9 @@ pub use global_index_types::{
 };
 pub use hybrid_search_builder::{
     HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+};
+pub use incremental_scan::{
+    IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use read_builder::ReadBuilder;

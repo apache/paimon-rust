@@ -22,6 +22,7 @@
 
 use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_predicates};
 use super::format_read_builder::FormatReadBuilder;
+use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
 use super::table_read::TableRead;
 use super::{Table, TableScan};
@@ -207,6 +208,32 @@ impl<'a> ReadBuilder<'a> {
         match &self.0 {
             ReadBuilderKind::Paimon(builder) => builder.new_scan(),
             ReadBuilderKind::Format(builder) => builder.new_scan(),
+        }
+    }
+
+    /// Create a batch incremental scan over snapshot id range
+    /// `(start_exclusive, end_inclusive]`.
+    ///
+    /// Filters and projection configured on this builder are pushed into the
+    /// incremental plan (partition / bucket pruning on the delta path).
+    pub fn new_incremental_scan(
+        &self,
+        mode: IncrementalScanMode,
+        start_exclusive: i64,
+        end_inclusive: i64,
+    ) -> IncrementalScan<'a> {
+        match &self.0 {
+            ReadBuilderKind::Paimon(builder) => IncrementalScan::new(
+                builder.table,
+                builder.new_scan(),
+                mode,
+                start_exclusive,
+                end_inclusive,
+            ),
+            // Format tables share the API surface; planning fails with Unsupported.
+            ReadBuilderKind::Format(builder) => {
+                IncrementalScan::for_table(builder.table(), mode, start_exclusive, end_inclusive)
+            }
         }
     }
 

@@ -45,6 +45,10 @@ impl<'a> FormatReadBuilder<'a> {
         }
     }
 
+    pub(crate) fn table(&self) -> &'a Table {
+        self.table
+    }
+
     pub(crate) fn with_projection(&mut self, columns: &[&str]) -> Result<&mut Self> {
         let projection_names = columns.iter().map(|c| (*c).to_string()).collect::<Vec<_>>();
         self.read_type = Some(resolve_projected_fields(

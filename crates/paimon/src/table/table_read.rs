@@ -18,6 +18,7 @@
 use super::data_evolution_reader::DataEvolutionReader;
 use super::data_file_reader::DataFileReader;
 use super::format_table_read::FormatTableRead;
+use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
@@ -107,6 +108,22 @@ impl<'a> TableRead<'a> {
             TableReadKind::Format(read) => read.to_arrow(data_splits),
         }
     }
+
+    /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
+    ///
+    /// Only [`IncrementalSplit::Data`] is supported in this release. Diff
+    /// planning/read remains unimplemented.
+    pub fn to_incremental_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental batch read".to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +175,34 @@ impl<'a> PaimonTableRead<'a> {
         // drop compound predicates before the residual could enforce them.
         self.data_predicates = data_predicates;
         self
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
+    pub fn to_incremental_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        if plan.mode() == IncrementalScanMode::Diff {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff read not yet implemented".to_string(),
+            });
+        }
+
+        let mut data_splits = Vec::new();
+        for split in plan.splits() {
+            match split {
+                IncrementalSplit::Data(data) => data_splits.push(data.clone()),
+                IncrementalSplit::DiffPair { .. } => {
+                    return Err(crate::Error::UnexpectedError {
+                        message: "DiffPair appeared in non-Diff incremental plan".to_string(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        // Delta / Changelog rows are read as-is from planned files (no full-table
+        // merge against historical base versions).
+        self.new_data_file_reader().read(&data_splits)
     }
 
     /// Returns an [`ArrowRecordBatchStream`].

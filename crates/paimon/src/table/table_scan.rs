@@ -706,6 +706,16 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan data splits from a snapshot's delta manifest list only.
+    pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_delta(snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental delta scan".to_string(),
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         match &self.0 {
@@ -1048,9 +1058,152 @@ impl<'a> PaimonTableScan<'a> {
         }
     }
 
+    /// Plan data splits from a snapshot's delta manifest list (APPEND deltas).
+    ///
+    /// Reuses the same split-building path as a full snapshot plan, but only
+    /// reads the delta manifest list and keeps ADD entries.
+    pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let entries = self
+            .plan_manifest_list_entries(snapshot.delta_manifest_list())
+            .await?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot_from_entries(
+            snapshot.clone(),
+            entries,
+            data_evolution_read_field_ids.as_ref(),
+            None,
+        )
+        .await
+    }
+
+    /// Read entries from a single manifest list (delta or changelog) with
+    /// partition / bucket filter pushdown matching the full scan path.
+    async fn plan_manifest_list_entries(
+        &self,
+        manifest_list_name: &str,
+    ) -> crate::Result<Vec<ManifestEntry>> {
+        let file_io = self.table.file_io();
+        let table_path = self.table.location();
+        let core_options = CoreOptions::new(self.table.schema().options());
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let partition_fields = self.table.schema().partition_fields();
+
+        let mut manifest_metas =
+            read_manifest_list(file_io, table_path, manifest_list_name).await?;
+
+        if let Some(pf) = self.partition_filter.as_ref() {
+            if !partition_fields.is_empty() {
+                manifest_metas.retain(|meta| {
+                    let stats = meta.partition_stats();
+                    let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
+                    let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
+                    let null_counts = stats.null_counts().clone();
+                    let file_stats = FileStatsRows::for_manifest_partition(
+                        meta.num_added_files() + meta.num_deleted_files(),
+                        min_values,
+                        max_values,
+                        null_counts,
+                    );
+                    pf.matches_manifest(&file_stats, &partition_fields)
+                });
+            }
+        }
+
+        let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
+            Vec::new()
+        } else {
+            let bucket_keys = core_options.bucket_key().unwrap_or_else(|| {
+                if has_primary_keys {
+                    self.table.schema().trimmed_primary_keys()
+                } else {
+                    Vec::new()
+                }
+            });
+            bucket_keys
+                .iter()
+                .filter_map(|key| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .find(|f| f.name() == key)
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let bucket_function_type = core_options.bucket_function_type()?;
+
+        let base_path = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
+        let shared_cache = SharedSchemaCache::new();
+        let partition_filter = self.partition_filter.as_ref();
+        let bucket_predicate = self.bucket_predicate.as_ref();
+        let scan_all_files = self.scan_all_files;
+
+        let mut entries = Vec::new();
+        for meta in manifest_metas {
+            let path = format!("{base_path}/{}", meta.file_name());
+            let input = file_io.new_input(&path)?;
+            let bytes = input.read().await?;
+            let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+            let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
+                &bytes,
+                &shared_cache,
+                &mut |_kind, partition_bytes, bucket, total_buckets| {
+                    if has_primary_keys && !scan_all_files && bucket < 0 {
+                        return false;
+                    }
+                    if let Some(pred) = bucket_predicate {
+                        let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
+                            compute_target_buckets(
+                                pred,
+                                &bucket_key_fields,
+                                bucket_function_type,
+                                total_buckets,
+                            )
+                        });
+                        if let Some(targets) = targets {
+                            if !targets.contains(&bucket) {
+                                return false;
+                            }
+                        }
+                    }
+                    if let Some(pf) = partition_filter {
+                        match pf.matches_entry(partition_bytes) {
+                            Ok(false) => return false,
+                            Ok(true) => {}
+                            Err(_) => {}
+                        }
+                    }
+                    true
+                },
+            )?;
+            entries.extend(manifest_entries);
+        }
+        let entries = entries
+            .into_iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+            .collect();
+        Ok(entries)
+    }
+
     async fn plan_snapshot(
         &self,
         snapshot: Snapshot,
+        data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        mut trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
+        let entries = self
+            .plan_manifest_entries_with_trace(&snapshot, trace.as_deref_mut())
+            .await?;
+        self.plan_snapshot_from_entries(snapshot, entries, data_evolution_read_field_ids, trace)
+            .await
+    }
+
+    async fn plan_snapshot_from_entries(
+        &self,
+        snapshot: Snapshot,
+        entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
@@ -1066,9 +1219,6 @@ impl<'a> PaimonTableScan<'a> {
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
 
-        let entries = self
-            .plan_manifest_entries_with_trace(&snapshot, trace.as_deref_mut())
-            .await?;
         if entries.is_empty() {
             if let Some(trace) = trace {
                 trace.record_final_plan(0, 0, 0);
