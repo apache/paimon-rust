@@ -353,11 +353,18 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Derive column-name case sensitivity from the DataFusion session:
-        // when DataFusion normalizes (lowercases) unquoted identifiers (its
-        // default), Paimon should match case-insensitively; when normalization
-        // is off, match exactly.
-        let case_sensitive = !state.config_options().sql_parser.enable_ident_normalization;
+        // Column-name matching is case-sensitive on the DataFusion path.
+        //
+        // DataFusion resolves projection/filter columns against the provider
+        // schema (`schema()`, which exposes the original field casing) during
+        // logical planning, *before* `scan` is called. `enable_ident_normalization`
+        // only lowercases unquoted identifiers at parse time; it does not make
+        // schema resolution case-insensitive. So a genuine case mismatch
+        // (`SELECT name` against a `Name` field) already fails at planning and
+        // never reaches this code — see the negative test in `tests/read_tables.rs`.
+        // Case-insensitive column matching is therefore offered only through the
+        // direct ReadBuilder API (core / C / Python), not via SQL.
+        let case_sensitive = true;
         // Plan splits eagerly so we know partition count upfront.
         let filter_analysis =
             analyze_filters(filters, self.table.schema().fields(), case_sensitive);
@@ -432,13 +439,10 @@ impl TableProvider for PaimonTableProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let fields = self.table.schema().fields();
-        // DataFusion's `supports_filters_pushdown` has no `Session`, so the
-        // session's identifier-normalization setting isn't available here.
-        // Classify case-sensitively (the default); `classify_filter_pushdown`
-        // additionally refuses to report `Exact` for a schema with ASCII
-        // case-folding collisions, which is the only case where a
-        // case-insensitive `scan` could resolve differently. So the residual is
-        // always kept when it might be needed.
+        // SQL reads resolve columns case-sensitively (see `scan`), so classify
+        // pushdown the same way. `classify_filter_pushdown` still caps at
+        // `Inexact` for schemas with ASCII case-folding collisions as a
+        // conservative guard, so a needed residual is never dropped.
         let case_sensitive = true;
         let read_builder = self.table.new_read_builder();
 

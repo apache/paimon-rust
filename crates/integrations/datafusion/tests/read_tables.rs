@@ -1392,6 +1392,49 @@ async fn test_filter_row_id_from_data_evolution_table() {
     }
 }
 
+/// Pins that the DataFusion SQL path is always case-sensitive for column names.
+///
+/// Paimon exposes case-insensitive column matching only through the direct
+/// ReadBuilder API (core / C / Python). It cannot be offered via SQL: DataFusion
+/// resolves projection/filter columns against the provider schema during logical
+/// planning, *before* `TableProvider::scan` runs. `enable_ident_normalization`
+/// only lowercases unquoted identifiers at parse time; it does not make schema
+/// resolution case-insensitive. So a differently-cased reference fails at
+/// planning and never reaches the scan-level resolution. This test documents
+/// that boundary so any future attempt to claim SQL-level case-insensitivity has
+/// to confront the planner-side resolution first.
+#[tokio::test]
+async fn test_case_insensitive_column_not_supported_via_sql() {
+    let (_tmp, sql_context) = common::setup_sql_context().await;
+    // Quote the identifier so DDL parsing preserves the mixed-case field name.
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.mixed_case_cols (id INT, \"Name\" STRING)")
+        .await
+        .expect("CREATE TABLE should succeed")
+        .collect()
+        .await
+        .expect("CREATE TABLE should collect");
+
+    // The exact-case (quoted) column resolves and the query plans fine.
+    sql_context
+        .sql("SELECT \"Name\" FROM paimon.test_db.mixed_case_cols")
+        .await
+        .expect("exact-case column reference should resolve");
+
+    // An unquoted `name` is normalized to lowercase and fails during logical
+    // planning against the `Name` schema field — the scan-level case-insensitive
+    // resolution is never reached, confirming SQL reads stay case-sensitive.
+    let err = sql_context
+        .sql("SELECT name FROM paimon.test_db.mixed_case_cols")
+        .await
+        .expect_err("case-mismatched column must fail at planning, not resolve case-insensitively");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("name"),
+        "expected a column-resolution error referencing `name`, got: {err}"
+    );
+}
+
 // ======================= Full-Text Search Tests =======================
 
 #[cfg(feature = "fulltext")]

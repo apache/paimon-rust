@@ -101,15 +101,16 @@ pub(crate) fn classify_filter_pushdown<F>(
 where
     F: Fn(&Predicate) -> bool,
 {
-    // `supports_filters_pushdown` has no `Session`, so this may be called with a
-    // different `case_sensitive` than `scan` derives from the session. Reporting
-    // `Exact` tells DataFusion to drop its residual filter, so it must only be
-    // returned when column resolution is unambiguous regardless of case
-    // sensitivity. That holds unless the schema has two fields colliding under
-    // ASCII case-folding (e.g. `Name`/`name`): then a case-insensitive `scan`
-    // would fail to resolve the reference and push nothing, while `Exact` here
-    // would have dropped the residual — filtering neither side. Cap at `Inexact`
-    // for such schemas so the residual is always kept.
+    // `FilterTranslator` still supports case-insensitive column resolution for
+    // direct ReadBuilder API callers (and its own unit tests), but the DataFusion
+    // TableProvider/SQL path always passes `case_sensitive = true`: the planner
+    // resolves columns against the schema before `scan`, so SQL reads are
+    // case-sensitive. Reporting `Exact` tells DataFusion to drop its residual
+    // filter, so it must only be returned when column resolution is unambiguous.
+    // The `Inexact` cap for schemas with ASCII case-folding collisions (e.g.
+    // `Name`/`name`) is a conservative guard: if a reference were ever resolved
+    // case-insensitively, `Exact` would have dropped the residual while the
+    // translation pushed nothing — filtering neither side. Keep the residual.
     let allow_exact = !has_ascii_case_collision(fields);
     let translator = FilterTranslator::new(fields, case_sensitive);
     if let Some(translated) = translator.translate(filter) {

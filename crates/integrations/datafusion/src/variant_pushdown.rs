@@ -208,11 +208,12 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             return internal_err!("PaimonVariantExtractionScan physical planning expects no input");
         }
 
-        // Derive case sensitivity from the session, mirroring `TableProvider::scan`.
-        let case_sensitive = !session_state
-            .config_options()
-            .sql_parser
-            .enable_ident_normalization;
+        // Column-name matching is case-sensitive on the DataFusion path, mirroring
+        // `TableProvider::scan`: DataFusion resolves columns against the provider
+        // schema before this planner runs, so a genuine case mismatch fails at
+        // planning and never reaches here. Case-insensitive matching is offered
+        // only through the direct ReadBuilder API (core / C / Python), not via SQL.
+        let case_sensitive = true;
         let filter_analysis =
             analyze_filters(&node.filters, node.table.schema().fields(), case_sensitive);
         let mut read_builder = node.table.new_read_builder();

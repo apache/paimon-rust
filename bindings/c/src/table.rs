@@ -811,12 +811,28 @@ unsafe fn build_leaf_predicate(
     }
 }
 
-/// Create an equality predicate: `column = datum`.
+/// Create an equality predicate: `column = datum` (case-sensitive column match).
+///
+/// For case-insensitive column matching use
+/// `paimon_predicate_equal_with_case_sensitive`.
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_equal(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| pb.equal(col, d))
+}
+
+/// Create an equality predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_equal_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -827,12 +843,27 @@ pub unsafe extern "C" fn paimon_predicate_equal(
     })
 }
 
-/// Create a not-equal predicate: `column != datum`.
+/// Create a not-equal predicate: `column != datum` (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_not_equal(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.not_equal(col, d)
+    })
+}
+
+/// Create a not-equal predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_not_equal_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -843,12 +874,27 @@ pub unsafe extern "C" fn paimon_predicate_not_equal(
     })
 }
 
-/// Create a less-than predicate: `column < datum`.
+/// Create a less-than predicate: `column < datum` (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_less_than(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.less_than(col, d)
+    })
+}
+
+/// Create a less-than predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_less_than_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -859,12 +905,27 @@ pub unsafe extern "C" fn paimon_predicate_less_than(
     })
 }
 
-/// Create a less-or-equal predicate: `column <= datum`.
+/// Create a less-or-equal predicate: `column <= datum` (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_less_or_equal(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.less_or_equal(col, d)
+    })
+}
+
+/// Create a less-or-equal predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_less_or_equal_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -875,12 +936,27 @@ pub unsafe extern "C" fn paimon_predicate_less_or_equal(
     })
 }
 
-/// Create a greater-than predicate: `column > datum`.
+/// Create a greater-than predicate: `column > datum` (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_greater_than(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.greater_than(col, d)
+    })
+}
+
+/// Create a greater-than predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_greater_than_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -891,12 +967,27 @@ pub unsafe extern "C" fn paimon_predicate_greater_than(
     })
 }
 
-/// Create a greater-or-equal predicate: `column >= datum`.
+/// Create a greater-or-equal predicate: `column >= datum` (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_greater_or_equal(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.greater_or_equal(col, d)
+    })
+}
+
+/// Create a greater-or-equal predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_greater_or_equal_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datum: paimon_datum,
@@ -907,7 +998,7 @@ pub unsafe extern "C" fn paimon_predicate_greater_or_equal(
     })
 }
 
-/// Create an IS NULL predicate.
+/// Create an IS NULL predicate (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
@@ -915,12 +1006,24 @@ pub unsafe extern "C" fn paimon_predicate_greater_or_equal(
 pub unsafe extern "C" fn paimon_predicate_is_null(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
+) -> paimon_result_predicate {
+    build_leaf_predicate(table, column, true, |pb, col| pb.is_null(col))
+}
+
+/// Create an IS NULL predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_is_null_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
     case_sensitive: bool,
 ) -> paimon_result_predicate {
     build_leaf_predicate(table, column, case_sensitive, |pb, col| pb.is_null(col))
 }
 
-/// Create an IS NOT NULL predicate.
+/// Create an IS NOT NULL predicate (case-sensitive column match).
 ///
 /// # Safety
 /// `table` and `column` must be valid pointers.
@@ -928,17 +1031,50 @@ pub unsafe extern "C" fn paimon_predicate_is_null(
 pub unsafe extern "C" fn paimon_predicate_is_not_null(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
+) -> paimon_result_predicate {
+    build_leaf_predicate(table, column, true, |pb, col| pb.is_not_null(col))
+}
+
+/// Create an IS NOT NULL predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_is_not_null_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
     case_sensitive: bool,
 ) -> paimon_result_predicate {
     build_leaf_predicate(table, column, case_sensitive, |pb, col| pb.is_not_null(col))
 }
 
-/// Create an IN predicate: `column IN (datum1, datum2, ...)`.
+/// Create an IN predicate: `column IN (datum1, datum2, ...)` (case-sensitive column match).
 ///
 /// # Safety
 /// `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_is_in(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datums: *const paimon_datum,
+    datums_len: usize,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums,
+        datums_len,
+        true,
+        |pb, col, values| pb.is_in(col, values),
+    )
+}
+
+/// Create an IN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_is_in_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datums: *const paimon_datum,
@@ -955,12 +1091,33 @@ pub unsafe extern "C" fn paimon_predicate_is_in(
     )
 }
 
-/// Create a NOT IN predicate: `column NOT IN (datum1, datum2, ...)`.
+/// Create a NOT IN predicate: `column NOT IN (datum1, datum2, ...)` (case-sensitive column match).
 ///
 /// # Safety
 /// `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_is_not_in(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datums: *const paimon_datum,
+    datums_len: usize,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums,
+        datums_len,
+        true,
+        |pb, col, values| pb.is_not_in(col, values),
+    )
+}
+
+/// Create a NOT IN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_is_not_in_with_case_sensitive(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
     datums: *const paimon_datum,
@@ -1118,3 +1275,67 @@ pub unsafe extern "C" fn paimon_predicate_free(p: *mut paimon_predicate) {
         }
     }
 }
+
+// --- C ABI signature guards -------------------------------------------------
+//
+// The `paimon_predicate_*` constructors are called across the FFI boundary with
+// fixed argument counts: the Go binding prepares a libffi call interface (CIF)
+// per symbol (see `bindings/go/predicate.go`), and external consumers can link
+// against the generated headers (e.g. Doris integrations). Adding a parameter to
+// one of these existing symbols silently breaks every such caller — the extra
+// argument is read from an undefined register/stack slot at the ABI boundary.
+//
+// These compile-time assertions pin the existing signatures. To add behavior
+// (e.g. case-insensitive column matching), introduce a new
+// `paimon_predicate_*_with_case_sensitive` symbol instead of changing one of
+// these; touching a signature here will fail to compile.
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_equal;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_not_equal;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_less_than;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_less_or_equal;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_greater_than;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_greater_or_equal;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+) -> paimon_result_predicate = paimon_predicate_is_null;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+) -> paimon_result_predicate = paimon_predicate_is_not_null;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    *const paimon_datum,
+    usize,
+) -> paimon_result_predicate = paimon_predicate_is_in;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    *const paimon_datum,
+    usize,
+) -> paimon_result_predicate = paimon_predicate_is_not_in;
