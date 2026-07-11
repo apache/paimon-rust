@@ -31,7 +31,7 @@
 //! - `ALTER TABLE db.t RENAME TO new_name`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
-//! - `CREATE FUNCTION name(args) RETURNS type LANGUAGE SQL IMMUTABLE RETURN expression`
+//! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
@@ -1450,15 +1450,18 @@ impl SQLContext {
         if create_function
             .language
             .as_ref()
-            .is_none_or(|language| !language.value.eq_ignore_ascii_case("sql"))
+            .is_some_and(|language| !language.value.eq_ignore_ascii_case("sql"))
         {
             return Err(DataFusionError::Plan(
-                "CREATE FUNCTION requires LANGUAGE SQL".to_string(),
+                "CREATE FUNCTION only supports LANGUAGE SQL".to_string(),
             ));
         }
-        if create_function.behavior != Some(FunctionBehavior::Immutable) {
+        if matches!(
+            create_function.behavior,
+            Some(FunctionBehavior::Stable | FunctionBehavior::Volatile)
+        ) {
             return Err(DataFusionError::Plan(
-                "CREATE FUNCTION requires IMMUTABLE".to_string(),
+                "CREATE FUNCTION only supports deterministic SQL functions".to_string(),
             ));
         }
         let FunctionReturnType::DataType(return_type) = create_function
@@ -3616,6 +3619,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_rest_catalog_function_uses_databricks_default_sql_syntax() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql("CREATE FUNCTION plus_one(x BIGINT) RETURNS BIGINT RETURN x + 1")
+            .await
+            .unwrap();
+
+        let stored = catalog
+            .get_function(&Identifier::new("default", "plus_one"))
+            .await
+            .unwrap();
+        assert!(stored.is_deterministic());
+
+        let batches = ctx
+            .sql("SELECT plus_one(41) AS answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
     async fn persistent_rest_catalog_function_normalizes_unquoted_bare_name() {
         let catalog = Arc::new(MockCatalog::new());
         let ctx = make_sql_context(Arc::clone(&catalog)).await;
@@ -3957,16 +3991,12 @@ mod tests {
     async fn persistent_rest_catalog_function_rejects_invalid_signature_and_body_forms() {
         let cases = [
             (
-                "CREATE FUNCTION invalid() RETURNS BIGINT IMMUTABLE RETURN 1",
+                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE PYTHON RETURN 1",
                 "LANGUAGE SQL",
             ),
             (
-                "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL RETURN 1",
-                "IMMUTABLE",
-            ),
-            (
                 "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL STABLE RETURN 1",
-                "IMMUTABLE",
+                "deterministic SQL",
             ),
             (
                 "CREATE FUNCTION invalid() RETURNS BIGINT LANGUAGE SQL IMMUTABLE AS '1'",

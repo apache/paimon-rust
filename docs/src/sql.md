@@ -143,8 +143,7 @@ CREATE FUNCTION [IF NOT EXISTS] function_name(
     [parameter_name data_type, ...]
 )
 RETURNS data_type
-LANGUAGE SQL
-IMMUTABLE
+[LANGUAGE SQL]
 RETURN scalar_expression;
 ```
 
@@ -153,8 +152,6 @@ For example:
 ```sql
 CREATE FUNCTION paimon.reporting.add_tax(amount DECIMAL(12, 2))
 RETURNS DECIMAL(12, 2)
-LANGUAGE SQL
-IMMUTABLE
 RETURN amount * DECIMAL '1.10';
 
 SELECT add_tax(total) FROM orders;
@@ -171,6 +168,11 @@ parameter IDs start at zero and the return field has ID `0` and name `result`.
 The canonical, unexpanded `RETURN` expression is stored in
 `definitions.datafusion` with `type: "sql"`.
 
+`LANGUAGE SQL` is optional and SQL is the default, matching Databricks SQL
+function syntax. `IMMUTABLE` is not required; when omitted, determinism is
+inferred from the planned expression. An explicit `IMMUTABLE` clause remains
+accepted for compatibility.
+
 Before the REST create request is sent, `SQLContext` expands dependencies using
 the new function as a candidate, validates argument substitution and the
 declared return cast, and builds both logical and physical DataFusion plans in
@@ -178,8 +180,8 @@ the function's owning catalog/database. This rejects undeclared identifiers,
 recursive dependencies (including indirect recursion), non-deterministic REST
 dependencies, subqueries/table access, aggregate or window functions,
 Stable/Volatile DataFusion functions, and incompatible return types. The
-`IMMUTABLE` keyword is therefore checked against the planned expression rather
-than trusted as a declaration alone.
+function is stored as deterministic only after the planned expression passes
+these checks.
 
 `IF NOT EXISTS` still validates the proposed definition first. The REST server
 then handles the create atomically; only an already-existing function error is

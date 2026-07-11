@@ -34,8 +34,7 @@ CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
 
 CREATE FUNCTION [IF NOT EXISTS] function_name([parameter_name data_type, ...])
 RETURNS data_type
-LANGUAGE SQL
-IMMUTABLE
+[LANGUAGE SQL]
 RETURN scalar_expression;
 ```
 
@@ -50,10 +49,11 @@ RETURN scalar_expression;
   `catalog.database.function(args...)`. Its `definitions.datafusion` value must be a scalar SQL
   expression, it must be deterministic, and it must declare its input parameters and exactly one
   return parameter.
-- `CREATE FUNCTION` requires named parameters, one return type, `LANGUAGE SQL`, `IMMUTABLE`, and a
-  scalar `RETURN` expression. It validates dependencies, recursion, volatility, and return-type
-  compatibility before sending the REST create request. Bare, two-part, and three-part creation
-  targets are supported; calls remain limited to bare and three-part names.
+- `CREATE FUNCTION` requires named parameters, one return type, and a scalar `RETURN` expression.
+  `LANGUAGE SQL` is optional and SQL is the default, matching Databricks syntax. Determinism is
+  inferred and validated from the planned expression before sending the REST create request. Bare,
+  two-part, and three-part creation targets are supported; calls remain limited to bare and
+  three-part names.
 - `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW` /
   `DROP VIEW`, `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION` /
   `DROP FUNCTION` are not supported. Lambda/file, aggregate/table/multi-return, non-deterministic,
@@ -66,7 +66,7 @@ let mut ctx = paimon_datafusion::SQLContext::new();
 ctx.register_catalog("paimon", rest_catalog).await?;
 
 ctx.sql("CREATE VIEW daily_scores AS SELECT normalize_score(score) AS score FROM scores").await?;
-ctx.sql("CREATE FUNCTION plus_one(x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x + 1").await?;
+ctx.sql("CREATE FUNCTION plus_one(x BIGINT) RETURNS BIGINT RETURN x + 1").await?;
 let view = ctx.sql("SELECT * FROM analytics_view").await?;
 let function = ctx.sql("SELECT plus_one(score) FROM scores").await?;
 ```
