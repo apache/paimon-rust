@@ -167,10 +167,16 @@ pub unsafe extern "C" fn paimon_read_builder_with_projection(
     std::ptr::null_mut()
 }
 
-/// Set whether column-name matching (projection and predicate resolution) is
-/// case-sensitive for this ReadBuilder. Defaults to `true` (exact match). When
-/// `false`, column names are matched by ASCII case-folding and an ambiguous
+/// Set whether column-name matching for **projection** is case-sensitive for
+/// this ReadBuilder. Defaults to `true` (exact match). When `false`, projected
+/// column names are matched by ASCII case-folding and an ambiguous
 /// (case-colliding) request errors.
+///
+/// This does **not** affect predicate resolution: a predicate is resolved when
+/// it is constructed, so its case sensitivity is chosen by which constructor
+/// you call — `paimon_predicate_*` (case-sensitive) or the additive
+/// `paimon_predicate_*_with_case_sensitive` variant — independently of this
+/// setting.
 ///
 /// # Safety
 /// `rb` must be a valid pointer from `paimon_table_new_read_builder`, or null (returns error).

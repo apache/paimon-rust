@@ -107,16 +107,15 @@ where
     // resolves columns against the schema before `scan`, so SQL reads are
     // case-sensitive. Reporting `Exact` tells DataFusion to drop its residual
     // filter, so it must only be returned when column resolution is unambiguous.
-    // The `Inexact` cap for schemas with ASCII case-folding collisions (e.g.
-    // `Name`/`name`) is a conservative guard: if a reference were ever resolved
-    // case-insensitively, `Exact` would have dropped the residual while the
-    // translation pushed nothing — filtering neither side. Keep the residual.
-    let allow_exact = !has_ascii_case_collision(fields);
+    // Under case-sensitive resolution a reference matches exactly one field, so
+    // ASCII case-folding collisions elsewhere in the schema (e.g. an unrelated
+    // `Name`/`name` pair) never make a resolved filter ambiguous and must not
+    // downgrade its classification.
     let translator = FilterTranslator::new(fields, case_sensitive);
     if let Some(translated) = translator.translate(filter) {
         if translated.requires_residual {
             TableProviderFilterPushDown::Inexact
-        } else if allow_exact && is_exact_filter_pushdown(&translated.predicate) {
+        } else if is_exact_filter_pushdown(&translated.predicate) {
             TableProviderFilterPushDown::Exact
         } else {
             TableProviderFilterPushDown::Inexact
@@ -129,21 +128,6 @@ where
     } else {
         TableProviderFilterPushDown::Unsupported
     }
-}
-
-/// Whether any two fields collide under ASCII case-folding. Such a schema makes
-/// case-insensitive column resolution ambiguous, so pushdown classification must
-/// not promise `Exact` for it (see `classify_filter_pushdown`).
-fn has_ascii_case_collision(fields: &[DataField]) -> bool {
-    let mut seen: Vec<String> = Vec::with_capacity(fields.len());
-    for field in fields {
-        let folded = field.name().to_ascii_lowercase();
-        if seen.contains(&folded) {
-            return true;
-        }
-        seen.push(folded);
-    }
-    false
 }
 
 fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
@@ -763,23 +747,30 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_never_exact_for_case_colliding_schema() {
+    fn test_classify_exact_for_case_colliding_unrelated_schema() {
         use paimon::spec::{DataField, DataType, IntType};
-        // A schema with two fields colliding under ASCII case-folding makes
-        // case-insensitive resolution ambiguous. The SQL path is case-sensitive,
-        // but `classify_filter_pushdown` still caps at `Inexact` for such schemas
-        // as a conservative guard, so a residual is never dropped when a caller
-        // could resolve the reference case-insensitively.
-        let fields = vec![
-            DataField::new(0, "Dt".to_string(), DataType::Int(IntType::new())),
-            DataField::new(1, "dt".to_string(), DataType::Int(IntType::new())),
-        ];
-        let filter = Expr::Column(Column::from_name("Dt")).eq(lit(1));
+        // The SQL path is case-sensitive, so an unrelated `Name`/`name` pair
+        // that only collides under ASCII case-folding must not affect the
+        // classification of a filter on a different column: the partition
+        // column `dt` resolves to exactly one field and stays `Exact`.
+        let mut fields = test_fields();
+        let next_id = fields.len() as i32;
+        fields.push(DataField::new(
+            next_id,
+            "Name".to_string(),
+            DataType::Int(IntType::new()),
+        ));
+        fields.push(DataField::new(
+            next_id + 1,
+            "name".to_string(),
+            DataType::Int(IntType::new()),
+        ));
+        let filter = Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01"));
 
-        // A permissive exactness closure would otherwise allow Exact; the
-        // collision cap forces Inexact so the residual is retained.
-        let result = classify_filter_pushdown(&filter, &fields, true, |_| true);
-        assert_eq!(result, TableProviderFilterPushDown::Inexact);
+        assert_eq!(
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
+            TableProviderFilterPushDown::Exact
+        );
     }
 
     #[test]
