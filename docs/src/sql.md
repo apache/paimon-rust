@@ -40,7 +40,7 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW` and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -78,13 +78,18 @@ internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
-When the registered catalog is a Paimon REST Catalog, `SQLContext` can read,
-execute, and create persistent views and SQL scalar functions.
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions.
 
 Create a persistent view with this syntax:
 
 ```sql
 CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
+```
+
+Drop a persistent view with this syntax:
+
+```sql
+DROP VIEW [IF EXISTS] view_name;
 ```
 
 For example:
@@ -107,10 +112,14 @@ the new view's owning catalog and database, not the session's current database.
 The canonical query is stored as both the default query and the `datafusion`
 dialect definition.
 
-Persistent `CREATE VIEW` is currently implemented by REST Catalog. Other
-catalog implementations may return `Unsupported`. `CREATE OR REPLACE VIEW`,
-materialized/secure views, view comments or options, vendor-specific modifiers,
-and persistent `ALTER VIEW` / `DROP VIEW` are not supported.
+Persistent `CREATE VIEW` and `DROP VIEW` are currently implemented by REST
+Catalog. `DROP VIEW` sends a direct delete request; `IF EXISTS` ignores only a
+missing-view response. Bare, two-part, and three-part names are supported, but
+only one target may be dropped per statement. Other catalog implementations may
+return `Unsupported`. `CREATE OR REPLACE VIEW`, materialized/secure views, view
+comments or options, vendor-specific create modifiers, persistent `ALTER VIEW`,
+and `DROP VIEW` modifiers such as `CASCADE`, `RESTRICT`, or `PURGE` are not
+supported.
 
 Persistent views resolve through the normal DataFusion catalog path, so they
 can be queried wherever a table can be used:
@@ -587,6 +596,18 @@ CREATE TABLE paimon.my_db.complex_types (
 DROP TABLE paimon.my_db.users;
 DROP TABLE IF EXISTS paimon.my_db.users;
 ```
+
+### DROP VIEW
+
+Drop one persistent view from a REST Catalog:
+
+```sql
+DROP VIEW active_users;
+DROP VIEW IF EXISTS my_db.active_users;
+DROP VIEW IF EXISTS paimon.my_db.active_users;
+```
+
+`IF EXISTS` ignores only a missing view; authorization, server, and network errors are still returned. Only one persistent view target is supported per statement. `CASCADE`, `RESTRICT`, `PURGE`, and other drop modifiers are rejected. Catalog implementations without persistent view support return `Unsupported`.
 
 ### CREATE TEMPORARY TABLE
 

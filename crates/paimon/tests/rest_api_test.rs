@@ -135,6 +135,37 @@ async fn test_create_view() {
 }
 
 #[tokio::test]
+async fn test_drop_view_uses_encoded_individual_view_path() {
+    let database = "db+%";
+    let view = "active+?#%";
+    let ctx = setup_test_server(vec![database]).await;
+    let schema = ViewSchema::new(
+        Vec::new(),
+        "SELECT 1".to_string(),
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    let identifier = Identifier::new(database, view);
+    ctx.api.create_view(&identifier, schema).await.unwrap();
+
+    ctx.api.drop_view(&identifier).await.unwrap();
+
+    assert!(matches!(
+        ctx.api.get_view(&identifier).await.unwrap_err(),
+        paimon::Error::RestApi {
+            source: paimon::api::RestError::NoSuchResource { .. }
+        }
+    ));
+    assert!(matches!(
+        ctx.api.drop_view(&identifier).await.unwrap_err(),
+        paimon::Error::RestApi {
+            source: paimon::api::RestError::NoSuchResource { .. }
+        }
+    ));
+}
+
+#[tokio::test]
 async fn test_list_views() {
     let ctx = setup_test_server(vec!["default"]).await;
     ctx.server.set_list_page_size(1);

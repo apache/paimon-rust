@@ -26,11 +26,11 @@ This crate contains the integration of [Apache DataFusion](https://datafusion.ap
 
 ## REST Catalog views and SQL functions
 
-`SQLContext` can read, execute, and create persistent views and SQL scalar functions in a Paimon
-REST Catalog:
+`SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions in a Paimon REST Catalog:
 
 ```sql
 CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
+DROP VIEW [IF EXISTS] view_name;
 
 CREATE FUNCTION [IF NOT EXISTS] function_name([parameter_name data_type, ...])
 RETURNS data_type
@@ -45,6 +45,10 @@ RETURN scalar_expression;
   column list overrides names only and must match the query output. Unqualified relations and REST
   SQL functions are planned in the new view's owning catalog and database. `IF NOT EXISTS` is
   handled atomically by the catalog.
+- `DROP VIEW` accepts bare, two-part, and three-part names and sends one direct REST delete request.
+  `IF EXISTS` ignores only a missing view. Multiple targets and `CASCADE`, `RESTRICT`, `PURGE`, or
+  other drop modifiers are not supported. Catalogs without persistent view support may return
+  `Unsupported`.
 - A SQL function can be called as `function(args...)` in the current catalog/database or as
   `catalog.database.function(args...)`. Its `definitions.datafusion` value must be a scalar SQL
   expression, it must be deterministic, and it must declare its input parameters and exactly one
@@ -54,10 +58,10 @@ RETURN scalar_expression;
   inferred and validated from the planned expression before sending the REST create request. Bare,
   two-part, and three-part creation targets are supported; calls remain limited to bare and
   three-part names.
-- `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW` /
-  `DROP VIEW`, `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION` /
-  `DROP FUNCTION` are not supported. Lambda/file, aggregate/table/multi-return, non-deterministic,
-  Stable/Volatile, and non-SQL functions are also not supported.
+- `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW`,
+  `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
+  are not supported. Lambda/file, aggregate/table/multi-return, non-deterministic, Stable/Volatile,
+  and non-SQL functions are also not supported.
 
 Use `SQLContext::sql` for function expansion:
 

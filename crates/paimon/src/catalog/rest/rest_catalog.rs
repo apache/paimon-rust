@@ -313,6 +313,17 @@ impl Catalog for RESTCatalog {
         ))
     }
 
+    async fn drop_view(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
+        let result = self
+            .api
+            .drop_view(identifier)
+            .await
+            .map_err(|error| map_rest_error_for_view(error, identifier));
+        ignore_error_if(result, |error| {
+            ignore_if_not_exists && matches!(error, Error::ViewNotExist { .. })
+        })
+    }
+
     async fn list_functions(&self, database_name: &str) -> Result<Vec<String>> {
         self.api
             .list_functions(database_name)

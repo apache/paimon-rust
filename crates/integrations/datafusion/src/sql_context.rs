@@ -31,6 +31,7 @@
 //! - `ALTER TABLE db.t RENAME TO new_name`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
+//! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
@@ -466,8 +467,11 @@ impl SQLContext {
                 object_type,
                 if_exists,
                 names,
+                cascade,
+                restrict,
+                purge,
                 temporary,
-                ..
+                table,
             } if matches!(*object_type, ObjectType::Table | ObjectType::View) => {
                 if *temporary {
                     self.handle_drop_temp_table(names, *if_exists)
@@ -482,7 +486,42 @@ impl SQLContext {
                         self.ctx.sql(sql).await
                     }
                 } else {
-                    self.ctx.sql(sql).await
+                    let targets_paimon_catalog = names.iter().any(|name| {
+                        let table_ref: TableReference = name.to_string().as_str().into();
+                        self.is_paimon_catalog_ref(&table_ref)
+                    });
+                    if !targets_paimon_catalog {
+                        return self.ctx.sql(sql).await;
+                    }
+                    let [name] = names.as_slice() else {
+                        return Err(DataFusionError::Plan(
+                            "Persistent DROP VIEW does not support multiple views".to_string(),
+                        ));
+                    };
+                    if *cascade {
+                        return Err(DataFusionError::Plan(
+                            "DROP VIEW CASCADE is not supported".to_string(),
+                        ));
+                    }
+                    if *restrict {
+                        return Err(DataFusionError::Plan(
+                            "DROP VIEW RESTRICT is not supported".to_string(),
+                        ));
+                    }
+                    if *purge {
+                        return Err(DataFusionError::Plan(
+                            "DROP VIEW PURGE is not supported".to_string(),
+                        ));
+                    }
+                    if table.is_some() {
+                        return Err(DataFusionError::Plan(
+                            "DROP VIEW ON clauses are not supported".to_string(),
+                        ));
+                    }
+                    let (catalog, _catalog_name, identifier) =
+                        self.resolve_catalog_and_table(name)?;
+                    self.handle_drop_view(&catalog, &identifier, *if_exists)
+                        .await
                 }
             }
             Statement::Call(func) => {
@@ -937,6 +976,19 @@ impl SQLContext {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         }
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_drop_view(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        identifier: &Identifier,
+        if_exists: bool,
+    ) -> DFResult<DataFrame> {
+        catalog
+            .drop_view(identifier, if_exists)
+            .await
+            .map_err(to_datafusion_error)?;
         ok_result(&self.ctx)
     }
 
@@ -3256,6 +3308,7 @@ mod tests {
         existing_table: Mutex<Option<Table>>,
         functions: Mutex<HashMap<Identifier, paimon::catalog::Function>>,
         views: Mutex<HashMap<Identifier, paimon::catalog::View>>,
+        drop_view_supported: bool,
     }
 
     impl MockCatalog {
@@ -3265,6 +3318,14 @@ mod tests {
                 existing_table: Mutex::new(None),
                 functions: Mutex::new(HashMap::new()),
                 views: Mutex::new(HashMap::new()),
+                drop_view_supported: true,
+            }
+        }
+
+        fn without_drop_view_support() -> Self {
+            Self {
+                drop_view_supported: false,
+                ..Self::new()
             }
         }
 
@@ -3455,6 +3516,25 @@ mod tests {
             );
             Ok(())
         }
+
+        async fn drop_view(
+            &self,
+            identifier: &Identifier,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            if !self.drop_view_supported {
+                return Err(paimon::Error::Unsupported {
+                    message: "Catalog does not support views".to_string(),
+                });
+            }
+            if self.views.lock().unwrap().remove(identifier).is_some() || ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(paimon::Error::ViewNotExist {
+                    full_name: identifier.full_name(),
+                })
+            }
+        }
     }
 
     async fn make_sql_context(catalog: Arc<MockCatalog>) -> SQLContext {
@@ -3569,6 +3649,148 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_can_be_dropped() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql(
+            "CREATE VIEW answer_view AS \
+             SELECT CAST(42 AS BIGINT) AS answer",
+        )
+        .await
+        .unwrap();
+
+        ctx.sql("DROP VIEW answer_view").await.unwrap();
+
+        assert!(matches!(
+            catalog
+                .get_view(&Identifier::new("default", "answer_view"))
+                .await,
+            Err(paimon::Error::ViewNotExist { .. })
+        ));
+        assert!(ctx.sql("SELECT * FROM answer_view").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_honors_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx.sql("DROP VIEW missing_view").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("View default.missing_view does not exist"),
+            "unexpected error: {error}"
+        );
+        ctx.sql("DROP VIEW IF EXISTS missing_view").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_resolves_supported_name_forms() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(&catalog, "default", "bare_view", "SELECT 1 AS answer");
+        add_bigint_view(&catalog, "other", "two_part", "SELECT 1 AS answer");
+        add_bigint_view(&catalog, "other", "three_part", "SELECT 1 AS answer");
+        add_bigint_view(&catalog, "default", "Quoted View", "SELECT 1 AS answer");
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        ctx.sql("DROP VIEW bare_view").await.unwrap();
+        ctx.sql("DROP VIEW IF EXISTS other.two_part").await.unwrap();
+        ctx.sql("DROP VIEW IF EXISTS paimon.other.three_part")
+            .await
+            .unwrap();
+        ctx.sql("DROP VIEW \"Quoted View\"").await.unwrap();
+
+        for identifier in [
+            Identifier::new("default", "bare_view"),
+            Identifier::new("other", "two_part"),
+            Identifier::new("other", "three_part"),
+            Identifier::new("default", "Quoted View"),
+        ] {
+            assert!(matches!(
+                catalog.get_view(&identifier).await,
+                Err(paimon::Error::ViewNotExist { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_rejects_unsupported_modifiers() {
+        let cases = [
+            ("DROP VIEW paimon.default.invalid_view CASCADE", "CASCADE"),
+            ("DROP VIEW paimon.default.invalid_view RESTRICT", "RESTRICT"),
+            ("DROP VIEW paimon.default.invalid_view PURGE", "PURGE"),
+            (
+                "DROP VIEW paimon.default.invalid_view ON default.target",
+                "ON clauses",
+            ),
+        ];
+
+        for (sql, modifier) in cases {
+            let catalog = Arc::new(MockCatalog::new());
+            let ctx = make_sql_context(catalog).await;
+            let error = ctx.sql(sql).await.unwrap_err();
+            assert!(
+                error.to_string().contains(modifier),
+                "expected {modifier} error, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_rejects_multiple_targets_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(&catalog, "default", "first", "SELECT 1 AS answer");
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx
+            .sql("DROP VIEW paimon.default.first, datafusion.public.second")
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Persistent DROP VIEW does not support multiple views"));
+        assert!(catalog
+            .get_view(&Identifier::new("default", "first"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_propagates_unsupported_catalog() {
+        let catalog = Arc::new(MockCatalog::without_drop_view_support());
+        add_bigint_view(&catalog, "default", "answer_view", "SELECT 1 AS answer");
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        let error = ctx.sql("DROP VIEW answer_view").await.unwrap_err();
+
+        assert!(error.to_string().contains("Catalog does not support views"));
+        assert!(catalog
+            .get_view(&Identifier::new("default", "answer_view"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_view_drop_delegates_non_paimon_catalog() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+        ctx.sql("CREATE VIEW datafusion.public.delegated_view AS SELECT 1 AS answer")
+            .await
+            .unwrap();
+
+        ctx.sql("DROP VIEW datafusion.public.delegated_view")
+            .await
+            .unwrap();
+
+        assert!(ctx
+            .sql("SELECT * FROM datafusion.public.delegated_view")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

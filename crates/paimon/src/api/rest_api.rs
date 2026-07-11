@@ -467,6 +467,16 @@ impl RESTApi {
         self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
+    /// Drop a persistent view.
+    pub async fn drop_view(&self, identifier: &Identifier) -> Result<()> {
+        let database = identifier.database();
+        let view = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (view, "view name")])?;
+        let path = self.resource_paths.view(database, view);
+        let _resp: serde_json::Value = self.client.delete(&path, None::<&[(&str, &str)]>).await?;
+        Ok(())
+    }
+
     // ==================== Function Operations ====================
 
     /// Create a persistent function.

@@ -389,6 +389,17 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Drop a persistent view.
+    ///
+    /// # Errors
+    /// * [`crate::Error::ViewNotExist`] - view does not exist when
+    ///   `ignore_if_not_exists` is false.
+    async fn drop_view(&self, _identifier: &Identifier, _ignore_if_not_exists: bool) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support views".to_string(),
+        })
+    }
+
     /// List persistent view names in a database.
     async fn list_views(&self, _database_name: &str) -> Result<Vec<String>> {
         Err(Error::Unsupported {

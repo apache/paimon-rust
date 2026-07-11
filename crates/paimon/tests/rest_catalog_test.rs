@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use axum::http::StatusCode;
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
@@ -1053,6 +1054,70 @@ async fn test_catalog_create_view() {
 }
 
 #[tokio::test]
+async fn test_catalog_drop_view() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "active_ids");
+    ctx.catalog
+        .create_view(
+            &identifier,
+            ViewSchema::new(
+                Vec::new(),
+                "SELECT 1".to_string(),
+                HashMap::new(),
+                None,
+                HashMap::new(),
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+
+    ctx.catalog.drop_view(&identifier, false).await.unwrap();
+
+    assert!(ctx.catalog.list_views("default").await.unwrap().is_empty());
+    assert!(matches!(
+        ctx.catalog.get_view(&identifier).await.unwrap_err(),
+        paimon::Error::ViewNotExist { full_name } if full_name == "default.active_ids"
+    ));
+}
+
+#[tokio::test]
+async fn test_catalog_drop_missing_view_honors_ignore_if_not_exists() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "missing");
+
+    assert!(matches!(
+        ctx.catalog.drop_view(&identifier, false).await.unwrap_err(),
+        paimon::Error::ViewNotExist { full_name } if full_name == "default.missing"
+    ));
+    ctx.catalog.drop_view(&identifier, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_catalog_drop_view_if_exists_does_not_hide_other_errors() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "active_ids");
+
+    ctx.server
+        .set_drop_view_error_status(Some(StatusCode::FORBIDDEN));
+    assert!(matches!(
+        ctx.catalog.drop_view(&identifier, true).await.unwrap_err(),
+        paimon::Error::RestApi {
+            source: paimon::api::RestError::Forbidden { .. }
+        }
+    ));
+
+    ctx.server
+        .set_drop_view_error_status(Some(StatusCode::INTERNAL_SERVER_ERROR));
+    assert!(matches!(
+        ctx.catalog.drop_view(&identifier, true).await.unwrap_err(),
+        paimon::Error::RestApi {
+            source: paimon::api::RestError::ServiceFailure { .. }
+        }
+    ));
+}
+
+#[tokio::test]
 async fn test_catalog_create_view_missing_database() {
     let ctx = setup_catalog(vec!["default"]).await;
     let identifier = Identifier::new("missing_db", "active_ids");
@@ -1395,6 +1460,13 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
     assert!(matches!(
         ctx.catalog
             .get_view(&Identifier::new("default", "view"))
+            .await
+            .unwrap_err(),
+        paimon::Error::Unsupported { .. }
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .drop_view(&Identifier::new("default", "view"), true)
             .await
             .unwrap_err(),
         paimon::Error::Unsupported { .. }

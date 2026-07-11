@@ -49,6 +49,7 @@ struct MockState {
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     view_function_endpoints_unsupported: bool,
+    drop_view_error_status: Option<StatusCode>,
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
@@ -358,6 +359,44 @@ impl RESTServer {
         let key = format!("{db}.{view}");
         if let Some(response) = s.views.get(&key) {
             (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle DELETE /databases/:db/views/:view - drop a persistent view.
+    pub async fn drop_view(
+        Path((db, view)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+        if s.view_function_endpoints_unsupported {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                Some("Not Implemented".to_string()),
+                Some(501),
+            );
+            return (StatusCode::NOT_IMPLEMENTED, Json(err)).into_response();
+        }
+        if let Some(status) = s.drop_view_error_status {
+            let err = ErrorResponse::new(
+                Some("view".to_string()),
+                Some(view),
+                status.canonical_reason().map(ToString::to_string),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(err)).into_response();
+        }
+        let key = format!("{db}.{view}");
+        if s.views.remove(&key).is_some() {
+            (StatusCode::OK, Json(serde_json::json!(""))).into_response()
         } else {
             let err = ErrorResponse::new(
                 Some("view".to_string()),
@@ -886,6 +925,11 @@ impl RESTServer {
             .view_function_endpoints_unsupported = true;
     }
 
+    /// Make the drop-view endpoint return the given status.
+    pub fn set_drop_view_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().drop_view_error_status = status;
+    }
+
     /// Add a table with schema and path to the server state.
     ///
     /// This is needed for `RESTCatalog::get_table` which requires
@@ -1051,7 +1095,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/views/:view"),
-            get(RESTServer::get_view),
+            get(RESTServer::get_view).delete(RESTServer::drop_view),
         )
         .route(
             &format!("{prefix}/databases/:db/functions"),
