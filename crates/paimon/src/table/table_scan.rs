@@ -987,6 +987,20 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan before/after full-snapshot splits for batch incremental Diff.
+    pub(crate) async fn plan_snapshot_diff(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> crate::Result<(Plan, Plan)> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_diff(before, after).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental Diff scan".to_string(),
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         match &self.0 {
@@ -1533,6 +1547,118 @@ impl<'a> PaimonTableScan<'a> {
             None,
         )
         .await
+    }
+
+    /// Plan before/after full-snapshot states for Diff incremental scan.
+    ///
+    /// Loads full manifest entries for both snapshots, rejects bucket rescale,
+    /// prunes files that are identical and unaffected by exclusive changes, then
+    /// builds splits via the shared snapshot planning path.
+    pub(crate) async fn plan_snapshot_diff(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> crate::Result<(Plan, Plan)> {
+        self.ensure_query_auth_allowed()?;
+        let mut before_entries = self.plan_manifest_entries(before).await?;
+        let mut after_entries = self.plan_manifest_entries(after).await?;
+        Self::validate_diff_bucket_layout(&before_entries, &after_entries)?;
+        Self::prune_unchanged_diff_files(&mut before_entries, &mut after_entries);
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        let before_plan = self
+            .plan_snapshot_from_entries(
+                before.clone(),
+                before_entries,
+                data_evolution_read_field_ids.as_ref(),
+                None,
+            )
+            .await?;
+        let after_plan = self
+            .plan_snapshot_from_entries(
+                after.clone(),
+                after_entries,
+                data_evolution_read_field_ids.as_ref(),
+                None,
+            )
+            .await?;
+        Ok((before_plan, after_plan))
+    }
+
+    fn validate_diff_bucket_layout(
+        before_entries: &[ManifestEntry],
+        after_entries: &[ManifestEntry],
+    ) -> crate::Result<()> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        fn totals(entries: &[ManifestEntry]) -> BTreeMap<Vec<u8>, BTreeSet<i32>> {
+            let mut result: BTreeMap<Vec<u8>, BTreeSet<i32>> = BTreeMap::new();
+            for entry in entries {
+                result
+                    .entry(entry.partition().to_vec())
+                    .or_default()
+                    .insert(entry.total_buckets());
+            }
+            result
+        }
+
+        let before = totals(before_entries);
+        let after = totals(after_entries);
+        for (partition, before_totals) in &before {
+            let Some(after_totals) = after.get(partition) else {
+                continue;
+            };
+            if before_totals != after_totals {
+                return Err(crate::Error::Unsupported {
+                    message:
+                        "Batch incremental Diff does not support bucket rescale between snapshots"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_unchanged_diff_files(before: &mut Vec<ManifestEntry>, after: &mut Vec<ManifestEntry>) {
+        // Common files (byte-equal manifest entries) that do not overlap any
+        // exclusive before/after file key-range can be dropped from both sides.
+        let mut common: Vec<ManifestEntry> = before
+            .iter()
+            .filter(|entry| after.iter().any(|other| other == *entry))
+            .cloned()
+            .collect();
+        if common.is_empty() {
+            return;
+        }
+
+        let exclusive_after: Vec<&ManifestEntry> = after
+            .iter()
+            .filter(|entry| !common.iter().any(|c| c == *entry))
+            .collect();
+        let exclusive_before: Vec<&ManifestEntry> = before
+            .iter()
+            .filter(|entry| !common.iter().any(|c| c == *entry))
+            .collect();
+        common.retain(|entry| {
+            let overlaps_exclusive = |other: &&ManifestEntry| {
+                Self::key_ranges_overlap_bytes(
+                    &entry.file().min_key,
+                    &entry.file().max_key,
+                    &other.file().min_key,
+                    &other.file().max_key,
+                )
+            };
+            !exclusive_after.iter().any(overlaps_exclusive)
+                && !exclusive_before.iter().any(overlaps_exclusive)
+        });
+        if common.is_empty() {
+            return;
+        }
+        before.retain(|entry| !common.iter().any(|c| c == entry));
+        after.retain(|entry| !common.iter().any(|c| c == entry));
+    }
+
+    fn key_ranges_overlap_bytes(min_a: &[u8], max_a: &[u8], min_b: &[u8], max_b: &[u8]) -> bool {
+        min_a <= max_b && min_b <= max_a
     }
 
     /// Read entries from a single manifest list (delta or changelog) with

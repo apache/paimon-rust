@@ -320,9 +320,45 @@ async fn audit_log_exposes_sequence_number_when_enabled() {
     assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
 }
 
+async fn audit_diff_rows(
+    table: &paimon::table::Table,
+    start: i64,
+    end: i64,
+) -> Vec<(String, i32, i32)> {
+    let audit = AuditLogTable::new(table.clone());
+    let plan = audit
+        .new_incremental_scan(IncrementalScanMode::Diff, start, end)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = audit.to_arrow(&plan).unwrap().try_collect().await.unwrap();
+    collect_audit_rows(&batches)
+}
+
+fn assert_rows_contain(rows: &[(String, i32, i32)], expected: &[(&str, i32, i32)]) {
+    for (kind, id, value) in expected {
+        assert!(
+            rows.iter()
+                .any(|(k, i, v)| k == *kind && i == id && v == value),
+            "missing rowkind={kind} id={id} value={value} in {rows:?}"
+        );
+    }
+}
+
+fn assert_rows_exclude(rows: &[(String, i32, i32)], excluded: &[(&str, i32, i32)]) {
+    for (kind, id, value) in excluded {
+        assert!(
+            !rows
+                .iter()
+                .any(|(k, i, v)| k == *kind && i == id && v == value),
+            "unexpected rowkind={kind} id={id} value={value} in {rows:?}"
+        );
+    }
+}
+
 #[tokio::test]
-async fn audit_log_diff_mode_is_unsupported() {
-    let table_path = "memory:/audit_log/diff_unsupported";
+async fn audit_log_diff_scan_emits_row_level_delete_insert_and_updates() {
+    let table_path = "memory:/audit_log/diff_range";
     let (file_io, table) = memory_table(
         table_path,
         pk_schema(&[
@@ -333,17 +369,243 @@ async fn audit_log_diff_mode_is_unsupported() {
     );
     setup_dirs(&file_io, table_path).await;
     persist_table_schema(&file_io, table_path, table.schema()).await;
-    write_batch(&table, &make_batch(vec![1], vec![10])).await;
-    write_batch(&table, &make_batch(vec![2], vec![20])).await;
 
-    let audit = AuditLogTable::new(table.clone());
-    let err = audit
+    write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+    write_batch(&table, &make_batch(vec![2, 3], vec![25, 30])).await;
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("+I".to_string(), 3, 30),
+            ("+U".to_string(), 2, 25),
+            ("-U".to_string(), 2, 20),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn audit_log_diff_same_snapshot_range_returns_no_rows() {
+    let table_path = "memory:/audit_log/diff_same_snapshot";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+
+    let rows = audit_diff_rows(&table, 1, 1).await;
+    assert!(
+        rows.is_empty(),
+        "same start/end snapshot should yield empty diff"
+    );
+}
+
+#[tokio::test]
+async fn audit_log_diff_insert_only_emits_plus_i() {
+    let table_path = "memory:/audit_log/diff_insert_only";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_eq!(rows, vec![("+I".to_string(), 2, 20)]);
+}
+
+#[tokio::test]
+async fn audit_log_diff_update_only_emits_minus_u_and_plus_u_from_before_after() {
+    let table_path = "memory:/audit_log/diff_update_only";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_eq!(
+        rows,
+        vec![("+U".to_string(), 1, 20), ("-U".to_string(), 1, 10),]
+    );
+}
+
+#[tokio::test]
+async fn audit_log_diff_delete_via_input_delete_row() {
+    // Diff compares materialized PK state; input -D removes a key without compact.
+    let table_path = "memory:/audit_log/diff_delete_input";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 2], vec![10, 20], vec![0, 0]),
+    )
+    .await;
+    write_batch(&table, &make_batch_with_kinds(vec![1], vec![10], vec![3])).await;
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_rows_contain(&rows, &[("-D", 1, 10)]);
+    assert_rows_exclude(&rows, &[("+I", 1, 10), ("-U", 1, 10), ("+U", 1, 10)]);
+}
+
+#[tokio::test]
+async fn audit_log_diff_mixed_delete_insert_update_without_compact() {
+    let table_path = "memory:/audit_log/diff_mixed";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 2, 3], vec![10, 20, 30], vec![0, 0, 0]),
+    )
+    .await;
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 2, 4], vec![10, 25, 40], vec![3, 2, 0]),
+    )
+    .await;
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_rows_contain(
+        &rows,
+        &[("-D", 1, 10), ("-U", 2, 20), ("+U", 2, 25), ("+I", 4, 40)],
+    );
+    assert_rows_exclude(&rows, &[("+I", 3, 30), ("-D", 3, 30)]);
+}
+
+#[tokio::test]
+async fn audit_log_diff_processes_multiple_bucket_pairs() {
+    let table_path = "memory:/audit_log/diff_multi_bucket";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "4"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1, 8], vec![10, 80])).await;
+    write_batch(&table, &make_batch(vec![1, 8], vec![11, 81])).await;
+
+    let plan = table
+        .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
         .plan()
         .await
-        .unwrap_err();
+        .unwrap();
+    let diff_pairs = plan
+        .splits()
+        .iter()
+        .filter(|split| matches!(split, paimon::table::IncrementalSplit::DiffPair { .. }))
+        .count();
     assert!(
-        matches!(err, paimon::Error::Unsupported { .. }),
-        "expected Unsupported for Diff audit plan, got {err:?}"
+        diff_pairs >= 2,
+        "expected multiple (partition,bucket) diff pairs, got {diff_pairs}"
     );
+
+    let rows = audit_diff_rows(&table, 1, 2).await;
+    assert_rows_contain(
+        &rows,
+        &[("-U", 1, 10), ("+U", 1, 11), ("-U", 8, 80), ("+U", 8, 81)],
+    );
+}
+
+#[tokio::test]
+async fn audit_log_diff_with_sequence_number_enabled_exposes_ordered_columns() {
+    use std::collections::HashMap;
+
+    let table_path = "memory:/audit_log/diff_sequence";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ])
+        .copy_with_options(HashMap::from([(
+            "table-read.sequence-number.enabled".to_string(),
+            "true".to_string(),
+        )])),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let audit = AuditLogTable::new(table.clone());
+    let field_names: Vec<String> = audit
+        .fields()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    assert_eq!(
+        field_names,
+        vec![
+            "rowkind".to_string(),
+            SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+            "id".to_string(),
+            "value".to_string(),
+        ]
+    );
+
+    let plan = audit
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = audit.to_arrow(&plan).unwrap().try_collect().await.unwrap();
+    let rows = collect_audit_rows_with_sequence(&batches);
+    assert_eq!(rows.len(), 2);
+    assert_rows_contain(
+        &rows
+            .iter()
+            .map(|(k, _s, i, v)| (k.clone(), *i, *v))
+            .collect::<Vec<_>>(),
+        &[("-U", 1, 10), ("+U", 1, 20)],
+    );
+    assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
 }

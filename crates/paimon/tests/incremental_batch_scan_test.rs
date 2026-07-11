@@ -429,10 +429,51 @@ async fn incremental_changelog_scan_applies_partition_filter_from_read_builder()
     assert_eq!(collect_pairs(&batches), vec![(1, 10)]);
 }
 
-/// Diff mode remains unsupported in this PR.
 #[tokio::test]
-async fn diff_mode_is_unsupported() {
-    let table_path = "memory:/incremental_batch/diff_unsupported";
+async fn diff_between_snapshots_returns_after_image_rows() {
+    let table_path = "memory:/incremental_batch/diff_after_image";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+    write_batch(&table, &make_batch(vec![2, 3], vec![25, 30])).await;
+
+    let rows = read_incremental_pairs(&table, IncrementalScanMode::Diff, 1, 2).await;
+    assert_eq!(rows, vec![(2, 25), (3, 30)]);
+}
+
+#[tokio::test]
+async fn diff_identical_rows_are_skipped_from_after_image() {
+    let table_path = "memory:/incremental_batch/diff_identical";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1, 2], vec![10, 20])).await;
+
+    let rows = read_incremental_pairs(&table, IncrementalScanMode::Diff, 1, 2).await;
+    assert_eq!(rows, vec![(2, 20)]);
+}
+
+#[tokio::test]
+async fn diff_rejects_start_before_earliest_snapshot() {
+    let table_path = "memory:/incremental_batch/diff_earliest";
     let (file_io, table) = memory_table(
         table_path,
         pk_schema(&[
@@ -444,14 +485,72 @@ async fn diff_mode_is_unsupported() {
     setup_dirs(&file_io, table_path).await;
     persist_table_schema(&file_io, table_path, table.schema()).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
+
+    let err = plan_incremental(&table, IncrementalScanMode::Diff, 0, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { .. }),
+        "expected DataInvalid, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn diff_rejects_non_deduplicate_merge_engine() {
+    for merge_engine in ["partial-update", "aggregation", "first-row"] {
+        let table_path = format!("memory:/incremental_batch/diff_engine_{merge_engine}");
+        let (file_io, table) = memory_table(
+            &table_path,
+            pk_schema(&[
+                ("changelog-producer", "none"),
+                ("merge-engine", merge_engine),
+                ("bucket", "1"),
+            ]),
+        );
+        setup_dirs(&file_io, &table_path).await;
+        persist_table_schema(&file_io, &table_path, table.schema()).await;
+        write_batch(&table, &make_batch(vec![1], vec![10])).await;
+        write_batch(&table, &make_batch(vec![2], vec![20])).await;
+
+        let err = plan_incremental(&table, IncrementalScanMode::Diff, 1, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, paimon::Error::Unsupported { .. }),
+            "merge-engine={merge_engine} expected Unsupported, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn diff_rejects_bucket_rescale_between_snapshots() {
+    use std::collections::HashMap;
+
+    let table_path = "memory:/incremental_batch/diff_bucket_rescale";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+
+    let table = table.copy_with_options(HashMap::from([("bucket".to_string(), "2".to_string())]));
+    persist_table_schema(&file_io, table_path, table.schema()).await;
     write_batch(&table, &make_batch(vec![2], vec![20])).await;
 
-    // Non-empty range so planning reaches plan_diff (empty range short-circuits).
     let err = plan_incremental(&table, IncrementalScanMode::Diff, 1, 2)
         .await
         .unwrap_err();
     assert!(
-        matches!(err, paimon::Error::Unsupported { .. }),
-        "expected Unsupported for Diff, got {err:?}"
+        matches!(
+            err,
+            paimon::Error::Unsupported { ref message } if message.contains("bucket rescale")
+        ),
+        "expected Unsupported for bucket rescale, got {err:?}"
     );
 }

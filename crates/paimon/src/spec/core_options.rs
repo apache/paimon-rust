@@ -89,6 +89,8 @@ const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
     "deduplicate.ignore-delete",
     "partial-update.ignore-delete",
 ];
+const DIFF_PARALLELISM_OPTION: &str = "diff.parallelism";
+const DEFAULT_DIFF_PARALLELISM: usize = 4;
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
@@ -510,6 +512,17 @@ impl<'a> CoreOptions<'a> {
         self.options
             .get(IGNORE_UPDATE_BEFORE_OPTION)
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
+    /// Parallelism for batch incremental Diff pair reads (`diff.parallelism`).
+    ///
+    /// Default is 4; values below 1 are clamped to 1.
+    pub fn diff_parallelism(&self) -> usize {
+        self.options
+            .get(DIFF_PARALLELISM_OPTION)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_DIFF_PARALLELISM)
+            .max(1)
     }
 
     pub fn data_evolution_enabled(&self) -> bool {
@@ -1620,6 +1633,21 @@ mod tests {
             core.try_changelog_producer().unwrap(),
             ChangelogProducer::None
         );
+    }
+
+    #[test]
+    fn test_diff_parallelism_defaults() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.diff_parallelism(), 4);
+
+        let options = HashMap::from([(DIFF_PARALLELISM_OPTION.to_string(), "0".into())]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.diff_parallelism(), 1);
+
+        let options = HashMap::from([(DIFF_PARALLELISM_OPTION.to_string(), "8".into())]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.diff_parallelism(), 8);
     }
 
     #[test]

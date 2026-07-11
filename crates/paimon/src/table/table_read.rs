@@ -29,9 +29,12 @@ use crate::spec::{
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::DataSplit;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{builder::StringBuilder, Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
-use futures::StreamExt;
+use arrow_select::concat::concat as arrow_concat;
+use arrow_select::take::take;
+use futures::{stream, StreamExt};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -136,8 +139,8 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
     ///
-    /// Only [`IncrementalSplit::Data`] is supported in this release. Diff
-    /// planning/read remains unimplemented.
+    /// Delta/Changelog use [`IncrementalSplit::Data`]. Diff uses
+    /// [`IncrementalSplit::DiffPair`] and emits after-image rows only.
     pub fn to_incremental_arrow(
         &self,
         plan: &IncrementalPlan,
@@ -154,8 +157,8 @@ impl<'a> TableRead<'a> {
     ///
     /// Output schema is `rowkind` (+ optional `_SEQUENCE_NUMBER`) followed by
     /// the projected user columns. Primary-key Delta and Changelog rows take
-    /// kinds from `_VALUE_KIND`; append-only Delta rows are `+I`. Diff remains
-    /// unsupported.
+    /// kinds from `_VALUE_KIND`; append-only Delta rows are `+I`. Diff emits
+    /// `+I`/`-U`/`+U`/`-D` from before/after image comparison.
     pub fn to_audit_log_arrow(
         &self,
         plan: &IncrementalPlan,
@@ -233,9 +236,7 @@ impl<'a> PaimonTableRead<'a> {
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
         if plan.mode() == IncrementalScanMode::Diff {
-            return Err(crate::Error::Unsupported {
-                message: "Batch incremental Diff read not yet implemented".to_string(),
-            });
+            return self.to_incremental_diff_arrow(plan);
         }
 
         let mut data_splits = Vec::new();
@@ -255,15 +256,53 @@ impl<'a> PaimonTableRead<'a> {
         self.new_data_file_reader()?.read(&data_splits)
     }
 
+    fn to_incremental_diff_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let pairs: Vec<(Vec<DataSplit>, Vec<DataSplit>)> = plan
+            .splits()
+            .iter()
+            .filter_map(|s| match s {
+                IncrementalSplit::DiffPair { before, after } => {
+                    Some((before.clone(), after.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let parallel = CoreOptions::new(self.table.schema().options()).diff_parallelism();
+        let table = self.table.clone();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
+                let table = table.clone();
+                let read_type = read_type.clone();
+                let data_predicates = data_predicates.clone();
+                async move {
+                    let pair_read =
+                        PaimonTableRead::new(&table, read_type, data_predicates);
+                    pair_read.to_diff_after_image_stream(&before, &after)
+                }
+            }))
+            .buffer_unordered(parallel);
+            while let Some(stream_result) = workers.next().await {
+                let mut pair_stream = stream_result?;
+                while let Some(batch) = pair_stream.next().await {
+                    yield batch?;
+                }
+            }
+        }))
+    }
+
     /// Returns an audit-log stream for a planned incremental scan.
     pub fn to_audit_log_arrow(
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
         match plan.mode() {
-            IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
-                message: "Batch incremental Diff audit read not yet implemented".to_string(),
-            }),
+            IncrementalScanMode::Diff => self.audit_diff_stream(plan),
             IncrementalScanMode::Delta => {
                 self.audit_raw_stream(plan, !self.table.schema().primary_keys().is_empty())
             }
@@ -359,6 +398,232 @@ impl<'a> PaimonTableRead<'a> {
                 })?;
             }
         }))
+    }
+
+    fn audit_diff_stream(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
+        let pairs: Vec<(Vec<DataSplit>, Vec<DataSplit>)> = plan
+            .splits()
+            .iter()
+            .filter_map(|s| match s {
+                IncrementalSplit::DiffPair { before, after } => {
+                    Some((before.clone(), after.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let parallel = CoreOptions::new(self.table.schema().options()).diff_parallelism();
+        let table = self.table.clone();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
+                let table = table.clone();
+                let read_type = read_type.clone();
+                let data_predicates = data_predicates.clone();
+                async move {
+                    let pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
+                    pair_read.to_audit_log_arrow_for_diff(&before, &after)
+                }
+            }))
+            .buffer_unordered(parallel);
+            while let Some(stream_result) = workers.next().await {
+                let mut pair_stream = stream_result?;
+                while let Some(batch) = pair_stream.next().await {
+                    yield batch?;
+                }
+            }
+        }))
+    }
+
+    fn to_audit_log_arrow_for_diff(
+        &self,
+        before: &[DataSplit],
+        after: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        ensure_diff_supported_read_type(&self.read_type)?;
+        let include_sequence = audit_sequence_number_enabled(self.table);
+        let audit_schema = audit_schema_for_read_type(&self.read_type, include_sequence)?;
+
+        let mut diff_read_type = self.read_type.clone();
+        if include_sequence {
+            diff_read_type.insert(
+                0,
+                DataField::new(
+                    SEQUENCE_NUMBER_FIELD_ID,
+                    SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+            );
+        }
+
+        let key_indices = primary_key_indices(self.table, &diff_read_type)?;
+        let value_indices = value_indices_for_diff(self.table, &diff_read_type);
+
+        let before = before.to_vec();
+        let after = after.to_vec();
+        let table = self.table.clone();
+        let read_type_for_output = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+
+        Ok(Box::pin(async_stream::try_stream! {
+            let core_options = CoreOptions::new(table.schema().options());
+            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates);
+            let before_stream =
+                pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
+            let after_stream =
+                pair_read.read_pk_sorted_for_diff_with_type(&after, &core_options, &diff_read_type)?;
+            let mut bc = ArrowCursor::new(before_stream).await?;
+            let mut ac = ArrowCursor::new(after_stream).await?;
+            let mut data_col_indices: Option<Vec<usize>> = None;
+            let mut builder = AuditBatchBuilder::new(audit_schema.clone());
+
+            while bc.alive() || ac.alive() {
+                let indices = data_col_indices.get_or_insert_with(|| {
+                    let sample = if bc.alive() {
+                        bc.batch()
+                    } else {
+                        ac.batch()
+                    };
+                    diff_output_col_indices(sample, &read_type_for_output, include_sequence)
+                        .expect("diff output column indices")
+                });
+                if !builder.has_data_columns() {
+                    builder.set_data_col_indices(indices.clone());
+                }
+                match cursor_cmp(&bc, &ac, &key_indices, &value_indices)? {
+                    CursorOrd::BeforeOnly => {
+                        builder.push("-D", bc.batch(), bc.row());
+                        bc.advance().await?;
+                    }
+                    CursorOrd::AfterOnly => {
+                        builder.push("+I", ac.batch(), ac.row());
+                        ac.advance().await?;
+                    }
+                    CursorOrd::EqualSame => {
+                        bc.advance().await?;
+                        ac.advance().await?;
+                    }
+                    CursorOrd::EqualDiff => {
+                        builder.push("-U", bc.batch(), bc.row());
+                        builder.push("+U", ac.batch(), ac.row());
+                        bc.advance().await?;
+                        ac.advance().await?;
+                    }
+                }
+                if builder.len() >= DIFF_BATCH_SIZE {
+                    yield builder.flush()?;
+                }
+            }
+            if builder.len() > 0 {
+                yield builder.flush()?;
+            }
+        }))
+    }
+
+    fn to_diff_after_image_stream(
+        &self,
+        before: &[DataSplit],
+        after: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        ensure_diff_supported_read_type(&self.read_type)?;
+        let key_indices = primary_key_indices(self.table, &self.read_type)?;
+        let value_indices = value_indices_for_diff(self.table, &self.read_type);
+        let output_schema = build_target_arrow_schema(&self.read_type)?;
+        let output_col_indices: Vec<usize> = (0..self.read_type.len()).collect();
+
+        let table = self.table.clone();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+        let before = before.to_vec();
+        let after = after.to_vec();
+
+        Ok(Box::pin(async_stream::try_stream! {
+            let core_options = CoreOptions::new(table.schema().options());
+            let pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
+            let before_stream = pair_read.read_pk_sorted_for_diff(&before, &core_options)?;
+            let after_stream = pair_read.read_pk_sorted_for_diff(&after, &core_options)?;
+            let mut bc = ArrowCursor::new(before_stream).await?;
+            let mut ac = ArrowCursor::new(after_stream).await?;
+            let mut builder =
+                DiffAfterImageBatchBuilder::new(output_schema.clone(), output_col_indices.clone());
+
+            while bc.alive() || ac.alive() {
+                match cursor_cmp(&bc, &ac, &key_indices, &value_indices)? {
+                    CursorOrd::BeforeOnly => {
+                        bc.advance().await?;
+                    }
+                    CursorOrd::AfterOnly => {
+                        builder.push(ac.batch(), ac.row());
+                        ac.advance().await?;
+                    }
+                    CursorOrd::EqualSame => {
+                        bc.advance().await?;
+                        ac.advance().await?;
+                    }
+                    CursorOrd::EqualDiff => {
+                        builder.push(ac.batch(), ac.row());
+                        bc.advance().await?;
+                        ac.advance().await?;
+                    }
+                }
+                if builder.len() >= DIFF_BATCH_SIZE {
+                    yield builder.flush()?;
+                }
+            }
+            if builder.len() > 0 {
+                yield builder.flush()?;
+            }
+        }))
+    }
+
+    fn read_pk_sorted_for_diff(
+        &self,
+        splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_pk_sorted_for_diff_with_type(splits, core_options, &self.read_type)
+    }
+
+    fn read_pk_sorted_for_diff_with_type(
+        &self,
+        splits: &[DataSplit],
+        core_options: &CoreOptions,
+        read_type: &[DataField],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        if splits.is_empty() {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+        for split in splits {
+            if split
+                .data_deletion_files()
+                .is_some_and(|files| files.iter().any(|file| file.is_some()))
+            {
+                return Err(crate::Error::Unsupported {
+                    message: "Batch incremental Diff does not support deletion vectors".to_string(),
+                });
+            }
+        }
+        let reader = KeyValueFileReader::new(
+            self.table.file_io.clone(),
+            KeyValueReadConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
+                schema_manager: self.table.schema_manager().clone(),
+                table_schema_id: self.table.schema().id(),
+                table_fields: self.table.schema.fields().to_vec(),
+                read_type: read_type.to_vec(),
+                predicates: self.data_predicates.clone(),
+                primary_keys: self.table.schema.trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine()?,
+                sequence_fields: core_options
+                    .sequence_fields()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+        );
+        reader.read(splits)
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -609,6 +874,448 @@ fn rowkind_array_from_column(column: &dyn arrow_array::Array) -> crate::Result<S
     Ok(StringArray::from(strings))
 }
 
+const DIFF_BATCH_SIZE: usize = 8192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorOrd {
+    BeforeOnly,
+    AfterOnly,
+    EqualSame,
+    EqualDiff,
+}
+
+struct ArrowCursor {
+    stream: ArrowRecordBatchStream,
+    batch: Option<RecordBatch>,
+    row: usize,
+}
+
+impl ArrowCursor {
+    async fn new(stream: ArrowRecordBatchStream) -> crate::Result<Self> {
+        let mut cursor = Self {
+            stream,
+            batch: None,
+            row: 0,
+        };
+        cursor.advance().await?;
+        Ok(cursor)
+    }
+
+    fn alive(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    fn batch(&self) -> &RecordBatch {
+        self.batch.as_ref().expect("cursor must be alive")
+    }
+
+    fn row(&self) -> usize {
+        self.row
+    }
+
+    async fn advance(&mut self) -> crate::Result<()> {
+        loop {
+            if let Some(ref batch) = self.batch {
+                if self.row + 1 < batch.num_rows() {
+                    self.row += 1;
+                    return Ok(());
+                }
+            }
+            match self.stream.next().await {
+                Some(Ok(batch)) if batch.num_rows() > 0 => {
+                    self.batch = Some(batch);
+                    self.row = 0;
+                    return Ok(());
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e),
+                None => {
+                    self.batch = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+struct AuditBatchBuilder {
+    schema: Arc<ArrowSchema>,
+    rowkind: StringBuilder,
+    row_indices: Vec<(usize, usize)>,
+    pinned_batches: Vec<RecordBatch>,
+    data_col_indices: Vec<usize>,
+    len: usize,
+}
+
+impl AuditBatchBuilder {
+    fn new(schema: Arc<ArrowSchema>) -> Self {
+        Self {
+            schema,
+            rowkind: StringBuilder::new(),
+            row_indices: Vec::new(),
+            pinned_batches: Vec::new(),
+            data_col_indices: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn has_data_columns(&self) -> bool {
+        !self.data_col_indices.is_empty()
+    }
+
+    fn set_data_col_indices(&mut self, indices: Vec<usize>) {
+        self.data_col_indices = indices;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, kind: &str, batch: &RecordBatch, row: usize) {
+        self.rowkind.append_value(kind);
+        let batch_id = self.pin_batch(batch);
+        self.row_indices.push((batch_id, row));
+        self.len += 1;
+    }
+
+    fn pin_batch(&mut self, batch: &RecordBatch) -> usize {
+        if let Some(last) = self.pinned_batches.last() {
+            if std::ptr::eq(batch, last) {
+                return self.pinned_batches.len() - 1;
+            }
+        }
+        let batch_id = self.pinned_batches.len();
+        self.pinned_batches.push(batch.clone());
+        batch_id
+    }
+
+    fn flush(&mut self) -> crate::Result<RecordBatch> {
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(self.rowkind.finish())];
+        self.rowkind = StringBuilder::new();
+        for &col_idx in &self.data_col_indices {
+            let taken: Vec<ArrayRef> = self
+                .row_indices
+                .iter()
+                .map(|(batch_id, row)| {
+                    take(
+                        self.pinned_batches[*batch_id].column(col_idx).as_ref(),
+                        &UInt32Array::from(vec![*row as u32]),
+                        None,
+                    )
+                    .map_err(|e| crate::Error::UnexpectedError {
+                        message: format!("Failed to take audit diff column: {e}"),
+                        source: Some(Box::new(e)),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let refs: Vec<&dyn Array> = taken.iter().map(|array| array.as_ref()).collect();
+            columns.push(
+                arrow_concat(&refs).map_err(|e| crate::Error::UnexpectedError {
+                    message: format!("Failed to concat audit diff column: {e}"),
+                    source: Some(Box::new(e)),
+                })?,
+            );
+        }
+        self.row_indices.clear();
+        self.pinned_batches.clear();
+        self.len = 0;
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| {
+            crate::Error::UnexpectedError {
+                message: format!("Failed to build audit diff batch: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })
+    }
+}
+
+struct DiffAfterImageBatchBuilder {
+    schema: Arc<ArrowSchema>,
+    row_indices: Vec<(usize, usize)>,
+    pinned_batches: Vec<RecordBatch>,
+    col_indices: Vec<usize>,
+    len: usize,
+}
+
+impl DiffAfterImageBatchBuilder {
+    fn new(schema: Arc<ArrowSchema>, col_indices: Vec<usize>) -> Self {
+        Self {
+            schema,
+            row_indices: Vec::new(),
+            pinned_batches: Vec::new(),
+            col_indices,
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, batch: &RecordBatch, row: usize) {
+        let batch_id = self.pin_batch(batch);
+        self.row_indices.push((batch_id, row));
+        self.len += 1;
+    }
+
+    fn pin_batch(&mut self, batch: &RecordBatch) -> usize {
+        if let Some(last) = self.pinned_batches.last() {
+            if std::ptr::eq(batch, last) {
+                return self.pinned_batches.len() - 1;
+            }
+        }
+        let batch_id = self.pinned_batches.len();
+        self.pinned_batches.push(batch.clone());
+        batch_id
+    }
+
+    fn flush(&mut self) -> crate::Result<RecordBatch> {
+        let mut columns = Vec::with_capacity(self.col_indices.len());
+        for &col_idx in &self.col_indices {
+            let taken: Vec<ArrayRef> = self
+                .row_indices
+                .iter()
+                .map(|(batch_id, row)| {
+                    take(
+                        self.pinned_batches[*batch_id].column(col_idx).as_ref(),
+                        &UInt32Array::from(vec![*row as u32]),
+                        None,
+                    )
+                    .map_err(|e| crate::Error::UnexpectedError {
+                        message: format!("Failed to take diff after-image column: {e}"),
+                        source: Some(Box::new(e)),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let refs: Vec<&dyn Array> = taken.iter().map(|array| array.as_ref()).collect();
+            columns.push(
+                arrow_concat(&refs).map_err(|e| crate::Error::UnexpectedError {
+                    message: format!("Failed to concat diff after-image column: {e}"),
+                    source: Some(Box::new(e)),
+                })?,
+            );
+        }
+        self.row_indices.clear();
+        self.pinned_batches.clear();
+        self.len = 0;
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| {
+            crate::Error::UnexpectedError {
+                message: format!("Failed to build diff after-image batch: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })
+    }
+}
+
+fn diff_output_col_indices(
+    batch: &RecordBatch,
+    read_type: &[DataField],
+    include_sequence: bool,
+) -> crate::Result<Vec<usize>> {
+    let mut indices = Vec::with_capacity(read_type.len() + usize::from(include_sequence));
+    if include_sequence {
+        indices.push(
+            batch
+                .schema()
+                .index_of(SEQUENCE_NUMBER_FIELD_NAME)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Diff read missing _SEQUENCE_NUMBER: {e}"),
+                    source: None,
+                })?,
+        );
+    }
+    for field in read_type {
+        indices.push(batch.schema().index_of(field.name()).map_err(|e| {
+            crate::Error::DataInvalid {
+                message: format!("Diff read missing column '{}': {e}", field.name()),
+                source: None,
+            }
+        })?);
+    }
+    Ok(indices)
+}
+
+fn value_indices_for_diff(table: &Table, fields: &[DataField]) -> Vec<usize> {
+    let primary_key_names = table.schema().trimmed_primary_keys();
+    let primary_keys: std::collections::HashSet<&str> =
+        primary_key_names.iter().map(|key| key.as_str()).collect();
+    fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| {
+            field.name() != SEQUENCE_NUMBER_FIELD_NAME && !primary_keys.contains(field.name())
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn primary_key_indices(table: &Table, read_type: &[DataField]) -> crate::Result<Vec<usize>> {
+    let mut indices = Vec::new();
+    for pk in table.schema().trimmed_primary_keys() {
+        let idx = read_type
+            .iter()
+            .position(|field| field.name() == pk)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Primary key column '{pk}' missing from read projection"),
+                source: None,
+            })?;
+        indices.push(idx);
+    }
+    Ok(indices)
+}
+
+fn ensure_diff_supported_read_type(read_type: &[DataField]) -> crate::Result<()> {
+    for field in read_type {
+        if !is_diff_supported_type(field.data_type()) {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Batch incremental Diff does not support nested or decimal column '{}'",
+                    field.name()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_diff_supported_type(data_type: &DataType) -> bool {
+    !matches!(
+        data_type,
+        DataType::Decimal(_) | DataType::Array(_) | DataType::Map(_) | DataType::Row(_)
+    )
+}
+
+fn cursor_cmp(
+    bc: &ArrowCursor,
+    ac: &ArrowCursor,
+    key_indices: &[usize],
+    value_indices: &[usize],
+) -> crate::Result<CursorOrd> {
+    match (bc.alive(), ac.alive()) {
+        (false, false) => unreachable!("cursor_cmp called with both streams exhausted"),
+        (false, true) => return Ok(CursorOrd::AfterOnly),
+        (true, false) => return Ok(CursorOrd::BeforeOnly),
+        (true, true) => {}
+    }
+    match compare_pk(bc, ac, key_indices)? {
+        Ordering::Less => Ok(CursorOrd::BeforeOnly),
+        Ordering::Greater => Ok(CursorOrd::AfterOnly),
+        Ordering::Equal => {
+            if rows_equal_at(bc.batch(), bc.row(), ac.batch(), ac.row(), value_indices)? {
+                Ok(CursorOrd::EqualSame)
+            } else {
+                Ok(CursorOrd::EqualDiff)
+            }
+        }
+    }
+}
+
+fn compare_pk(
+    bc: &ArrowCursor,
+    ac: &ArrowCursor,
+    key_indices: &[usize],
+) -> crate::Result<Ordering> {
+    for &idx in key_indices {
+        let ord = scalar_compare(
+            bc.batch().column(idx),
+            bc.row(),
+            ac.batch().column(idx),
+            ac.row(),
+        )?;
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+fn rows_equal_at(
+    left_batch: &RecordBatch,
+    left_row: usize,
+    right_batch: &RecordBatch,
+    right_row: usize,
+    indices: &[usize],
+) -> crate::Result<bool> {
+    for &idx in indices {
+        let ord = scalar_compare(
+            left_batch.column(idx),
+            left_row,
+            right_batch.column(idx),
+            right_row,
+        )?;
+        if ord != Ordering::Equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn scalar_compare(
+    left: &dyn Array,
+    left_row: usize,
+    right: &dyn Array,
+    right_row: usize,
+) -> crate::Result<Ordering> {
+    use arrow_array::{
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    };
+
+    macro_rules! compare {
+        ($ty:ty, $getter:expr) => {
+            if let (Some(a), Some(b)) = (
+                left.as_any().downcast_ref::<$ty>(),
+                right.as_any().downcast_ref::<$ty>(),
+            ) {
+                return Ok($getter(a, left_row).cmp(&$getter(b, right_row)));
+            }
+        };
+    }
+
+    compare!(Int8Array, |a: &Int8Array, r| a.value(r));
+    compare!(Int16Array, |a: &Int16Array, r| a.value(r));
+    compare!(Int32Array, |a: &Int32Array, r| a.value(r));
+    compare!(Int64Array, |a: &Int64Array, r| a.value(r));
+    compare!(UInt8Array, |a: &UInt8Array, r| a.value(r));
+    compare!(UInt16Array, |a: &UInt16Array, r| a.value(r));
+    compare!(UInt32Array, |a: &UInt32Array, r| a.value(r));
+    compare!(UInt64Array, |a: &UInt64Array, r| a.value(r));
+    compare!(BooleanArray, |a: &BooleanArray, r| a.value(r));
+    compare!(Date32Array, |a: &Date32Array, r| a.value(r));
+
+    if let (Some(a), Some(b)) = (
+        left.as_any().downcast_ref::<StringArray>(),
+        right.as_any().downcast_ref::<StringArray>(),
+    ) {
+        return Ok(a.value(left_row).cmp(b.value(right_row)));
+    }
+
+    if let (Some(a), Some(b)) = (
+        left.as_any().downcast_ref::<Float32Array>(),
+        right.as_any().downcast_ref::<Float32Array>(),
+    ) {
+        return Ok(a
+            .value(left_row)
+            .partial_cmp(&b.value(right_row))
+            .unwrap_or(Ordering::Equal));
+    }
+    if let (Some(a), Some(b)) = (
+        left.as_any().downcast_ref::<Float64Array>(),
+        right.as_any().downcast_ref::<Float64Array>(),
+    ) {
+        return Ok(a
+            .value(left_row)
+            .partial_cmp(&b.value(right_row))
+            .unwrap_or(Ordering::Equal));
+    }
+
+    Err(crate::Error::Unsupported {
+        message: format!(
+            "Batch incremental Diff does not support comparing column type {:?}",
+            left.data_type()
+        ),
+    })
+}
+
 /// Whether a primary-key split must go through the sort-merge reader.
 ///
 /// Mirrors Java `PrimaryKeyTableRawFileSplitReadProvider#match`: a raw read
@@ -730,5 +1437,29 @@ mod tests {
             ),
             "directly-constructed read of a query-auth.enabled table must fail closed"
         );
+    }
+
+    #[test]
+    fn test_diff_rejects_nested_and_decimal_types() {
+        use crate::spec::{ArrayType, DecimalType, IntType};
+
+        let decimal = DataField::new(
+            1,
+            "amount".to_string(),
+            DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+        );
+        let nested = DataField::new(
+            2,
+            "tags".to_string(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        );
+        assert!(matches!(
+            ensure_diff_supported_read_type(&[decimal]),
+            Err(crate::Error::Unsupported { message }) if message.contains("nested or decimal")
+        ));
+        assert!(matches!(
+            ensure_diff_supported_read_type(&[nested]),
+            Err(crate::Error::Unsupported { message }) if message.contains("nested or decimal")
+        ));
     }
 }

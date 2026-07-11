@@ -35,10 +35,11 @@ pub enum IncrementalScanMode {
     /// Resolve to [`Delta`](Self::Delta) when `changelog-producer=none`,
     /// otherwise to [`Changelog`](Self::Changelog).
     Auto,
-    /// Diff before/after snapshots.
+    /// Diff before/after snapshot states for PK tables.
     ///
-    /// Not fully implemented in this release; planning returns
-    /// [`Error::Unsupported`](crate::Error::Unsupported).
+    /// Phase 1 supports only `merge-engine=deduplicate`. Planning compares the
+    /// full table state at `start_exclusive` vs `end_inclusive` and yields
+    /// per-(partition, bucket) [`IncrementalSplit::DiffPair`] units.
     Diff,
 }
 
@@ -223,9 +224,51 @@ impl<'a> IncrementalScan<'a> {
     }
 
     async fn plan_diff(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {
-        let _ = mode;
-        Err(crate::Error::Unsupported {
-            message: "Batch incremental Diff scan is not implemented yet".to_string(),
-        })
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if core_options.merge_engine()? != crate::spec::MergeEngine::Deduplicate {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff only supports merge-engine=deduplicate in Phase 1"
+                    .to_string(),
+            });
+        }
+        let before = self
+            .snapshot_manager
+            .get_snapshot(self.start_exclusive)
+            .await?;
+        let after = self
+            .snapshot_manager
+            .get_snapshot(self.end_inclusive)
+            .await?;
+        let (before_plan, after_plan) = self.scan.plan_snapshot_diff(&before, &after).await?;
+
+        use std::collections::BTreeMap;
+        type PBKey = (Vec<u8>, i32);
+
+        let mut before_map: BTreeMap<PBKey, Vec<DataSplit>> = BTreeMap::new();
+        for split in before_plan.splits() {
+            let key = (split.partition().to_serialized_bytes(), split.bucket());
+            before_map.entry(key).or_default().push(split.clone());
+        }
+
+        let mut after_map: BTreeMap<PBKey, Vec<DataSplit>> = BTreeMap::new();
+        for split in after_plan.splits() {
+            let key = (split.partition().to_serialized_bytes(), split.bucket());
+            after_map.entry(key).or_default().push(split.clone());
+        }
+
+        let mut keys: std::collections::BTreeSet<PBKey> = before_map.keys().cloned().collect();
+        keys.extend(after_map.keys().cloned());
+
+        let mut splits = Vec::new();
+        for key in keys {
+            let before = before_map.remove(&key).unwrap_or_default();
+            let after = after_map.remove(&key).unwrap_or_default();
+            if before.is_empty() && after.is_empty() {
+                continue;
+            }
+            splits.push(IncrementalSplit::DiffPair { before, after });
+        }
+
+        Ok(IncrementalPlan::new(mode, splits))
     }
 }
