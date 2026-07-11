@@ -26,10 +26,11 @@ use crate::spec::{CommitKind, CoreOptions};
 pub enum IncrementalScanMode {
     /// Read data files from APPEND snapshots in the range (delta manifests).
     Delta,
-    /// Read changelog manifest files in the range.
+    /// Read existing changelog manifest files in the range.
     ///
-    /// Not fully implemented in this release; planning returns
-    /// [`Error::Unsupported`](crate::Error::Unsupported).
+    /// Skips [`OVERWRITE`](crate::spec::CommitKind::OVERWRITE) snapshots and
+    /// snapshots without a `changelog_manifest_list`. Does not generate
+    /// changelogs (no compact/lookup producer path).
     Changelog,
     /// Resolve to [`Delta`](Self::Delta) when `changelog-producer=none`,
     /// otherwise to [`Changelog`](Self::Changelog).
@@ -204,10 +205,21 @@ impl<'a> IncrementalScan<'a> {
     }
 
     async fn plan_changelog(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {
-        let _ = mode;
-        Err(crate::Error::Unsupported {
-            message: "Batch incremental Changelog scan is not implemented yet".to_string(),
-        })
+        let mut splits = Vec::new();
+        for snapshot_id in (self.start_exclusive + 1)..=self.end_inclusive {
+            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            // OVERWRITE rewrites table contents and does not contribute changelog
+            // files for batch incremental reads (Java IncrementalChangelogStartingScanner).
+            if snapshot.commit_kind() == &CommitKind::OVERWRITE {
+                continue;
+            }
+            if snapshot.changelog_manifest_list().is_none() {
+                continue;
+            }
+            let plan = self.scan.plan_snapshot_changelog(&snapshot).await?;
+            splits.extend(plan.splits().iter().cloned().map(IncrementalSplit::Data));
+        }
+        Ok(IncrementalPlan::new(mode, splits))
     }
 
     async fn plan_diff(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {

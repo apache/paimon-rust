@@ -22,8 +22,8 @@ use futures::TryStreamExt;
 use paimon::table::IncrementalScanMode;
 
 use common::incremental_helpers::{
-    make_batch, make_partitioned_batch, memory_table, partitioned_pk_schema, persist_table_schema,
-    pk_schema, setup_dirs, write_batch, write_partitioned,
+    make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, partitioned_pk_schema,
+    persist_table_schema, pk_schema, setup_dirs, write_batch, write_partitioned,
 };
 
 fn collect_pairs(batches: &[RecordBatch]) -> Vec<(i32, i32)> {
@@ -241,10 +241,157 @@ async fn incremental_delta_scan_applies_partition_filter_from_read_builder() {
     assert_eq!(collect_pairs(&batches), vec![(1, 10)]);
 }
 
-/// Changelog mode is reserved but not implemented in this PR.
+/// Changelog mode reads existing changelog_manifest_list data files.
 #[tokio::test]
-async fn changelog_mode_is_unsupported() {
-    let table_path = "memory:/incremental_batch/changelog_unsupported";
+async fn changelog_between_snapshots_reads_changelog_manifest_files() {
+    let table_path = "memory:/incremental_batch/changelog_range";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write
+        .write_arrow_batch(&make_batch_with_kinds(vec![1, 1], vec![10, 20], vec![0, 2]))
+        .await
+        .unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let rows = read_incremental_pairs(&table, IncrementalScanMode::Changelog, 0, 1).await;
+    assert_eq!(rows, vec![(1, 10), (1, 20)]);
+}
+
+/// Multi-snapshot changelog range is left-open / right-closed and ordered by snapshot id.
+#[tokio::test]
+async fn changelog_multi_snapshot_range_is_ordered_and_left_open() {
+    let table_path = "memory:/incremental_batch/changelog_multi";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch_with_kinds(vec![1], vec![10], vec![0])).await;
+    write_batch(&table, &make_batch_with_kinds(vec![2], vec![20], vec![0])).await;
+
+    let all = read_incremental_pairs(&table, IncrementalScanMode::Changelog, 0, 2).await;
+    assert_eq!(all, vec![(1, 10), (2, 20)]);
+
+    let second_only = read_incremental_pairs(&table, IncrementalScanMode::Changelog, 1, 2).await;
+    assert_eq!(second_only, vec![(2, 20)]);
+}
+
+/// Auto resolves to Changelog when producer is not `none`.
+#[tokio::test]
+async fn auto_uses_changelog_when_producer_is_input() {
+    let table_path = "memory:/incremental_batch/auto_changelog";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 1], vec![10, 20], vec![0, 2]),
+    )
+    .await;
+
+    let plan = plan_incremental(&table, IncrementalScanMode::Auto, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(plan.mode(), IncrementalScanMode::Changelog);
+
+    let auto = read_incremental_pairs(&table, IncrementalScanMode::Auto, 0, 1).await;
+    let changelog = read_incremental_pairs(&table, IncrementalScanMode::Changelog, 0, 1).await;
+    assert_eq!(auto, changelog);
+    assert_eq!(auto, vec![(1, 10), (1, 20)]);
+}
+
+/// Partition filter from ReadBuilder is pushed into the changelog plan path.
+#[tokio::test]
+async fn incremental_changelog_scan_applies_partition_filter_from_read_builder() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use std::collections::HashMap;
+
+    let table_path = "memory:/incremental_batch/changelog_partition_filter";
+    let (file_io, mut table) = memory_table(table_path, partitioned_pk_schema("1"));
+    table = table.copy_with_options(HashMap::from([(
+        "changelog-producer".to_string(),
+        "input".to_string(),
+    )]));
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    // Two partitions in one commit → one snapshot with both changelog files.
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("pt", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("_VALUE_KIND", arrow_schema::DataType::Int8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(arrow_array::StringArray::from(vec!["a", "b"])),
+            std::sync::Arc::new(arrow_array::Int32Array::from(vec![1, 2])),
+            std::sync::Arc::new(arrow_array::Int32Array::from(vec![10, 20])),
+            std::sync::Arc::new(arrow_array::Int8Array::from(vec![0, 0])),
+        ],
+    )
+    .unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let filter = PredicateBuilder::new(table.schema().fields())
+        .equal("pt", Datum::String("a".to_string()))
+        .unwrap();
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&["id", "value"])
+        .unwrap()
+        .with_filter(filter);
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Changelog, 0, 1)
+        .plan()
+        .await
+        .unwrap();
+    let read = builder.new_read().unwrap();
+    let batches: Vec<RecordBatch> = read
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(collect_pairs(&batches), vec![(1, 10)]);
+}
+
+/// Diff mode remains unsupported in this PR.
+#[tokio::test]
+async fn diff_mode_is_unsupported() {
+    let table_path = "memory:/incremental_batch/diff_unsupported";
     let (file_io, table) = memory_table(
         table_path,
         pk_schema(&[
@@ -256,12 +403,14 @@ async fn changelog_mode_is_unsupported() {
     setup_dirs(&file_io, table_path).await;
     persist_table_schema(&file_io, table_path, table.schema()).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![2], vec![20])).await;
 
-    let err = plan_incremental(&table, IncrementalScanMode::Changelog, 0, 1)
+    // Non-empty range so planning reaches plan_diff (empty range short-circuits).
+    let err = plan_incremental(&table, IncrementalScanMode::Diff, 1, 2)
         .await
         .unwrap_err();
     assert!(
         matches!(err, paimon::Error::Unsupported { .. }),
-        "expected Unsupported for Changelog, got {err:?}"
+        "expected Unsupported for Diff, got {err:?}"
     );
 }

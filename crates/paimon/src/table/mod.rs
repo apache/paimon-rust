@@ -18,6 +18,7 @@
 //! Table API for Apache Paimon
 
 pub(crate) mod aggregator;
+mod audit_log_table;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_reader;
 mod blob_resolver;
@@ -82,6 +83,7 @@ mod write_builder;
 
 use crate::Result;
 use arrow_array::RecordBatch;
+pub use audit_log_table::AuditLogTable;
 pub use branch_manager::BranchManager;
 pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
 pub use commit_message::CommitMessage;

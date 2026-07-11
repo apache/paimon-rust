@@ -716,6 +716,16 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan data splits from a snapshot's changelog manifest list only.
+    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental changelog scan".to_string(),
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         match &self.0 {
@@ -1067,6 +1077,27 @@ impl<'a> PaimonTableScan<'a> {
         let entries = self
             .plan_manifest_list_entries(snapshot.delta_manifest_list())
             .await?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot_from_entries(
+            snapshot.clone(),
+            entries,
+            data_evolution_read_field_ids.as_ref(),
+            None,
+        )
+        .await
+    }
+
+    /// Plan data splits from a snapshot's changelog manifest list.
+    ///
+    /// Reuses the same split-building path as a full snapshot plan, but only
+    /// reads the changelog manifest list and keeps ADD entries. Snapshots
+    /// without a changelog list yield an empty plan.
+    pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let Some(list_name) = snapshot.changelog_manifest_list() else {
+            return Ok(Plan::new(Vec::new()));
+        };
+        let entries = self.plan_manifest_list_entries(list_name).await?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         self.plan_snapshot_from_entries(
             snapshot.clone(),

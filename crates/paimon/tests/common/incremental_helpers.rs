@@ -17,7 +17,7 @@
 
 //! Minimal helpers for batch incremental scan tests (no compact/lookup APIs).
 
-use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_array::{Int32Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
@@ -103,6 +103,26 @@ pub fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
         vec![
             Arc::new(Int32Array::from(ids)),
             Arc::new(Int32Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Batch with explicit `_VALUE_KIND` for `changelog-producer=input`.
+///
+/// Kind codes: 0=+I, 1=-U, 2=+U, 3=-D.
+pub fn make_batch_with_kinds(ids: Vec<i32>, values: Vec<i32>, kinds: Vec<i8>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("value", ArrowDataType::Int32, false),
+        ArrowField::new("_VALUE_KIND", ArrowDataType::Int8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(values)),
+            Arc::new(Int8Array::from(kinds)),
         ],
     )
     .unwrap()
