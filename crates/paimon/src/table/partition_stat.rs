@@ -191,7 +191,12 @@ mod tests {
 
     /// Build a minimal synthetic ManifestEntry for unit testing.
     /// Mirrors the helper used in `spec::manifest` tests.
-    fn make_entry(kind: FileKind, partition: Vec<u8>, file_name: &str, row_count: i64) -> ManifestEntry {
+    fn make_entry(
+        kind: FileKind,
+        partition: Vec<u8>,
+        file_name: &str,
+        row_count: i64,
+    ) -> ManifestEntry {
         let stats = BinaryTableStats::empty();
         let file = DataFileMeta {
             file_name: file_name.to_string(),
@@ -223,13 +228,8 @@ mod tests {
     /// `merge_active_entries` collapses identical identifiers to one.
     #[test]
     fn test_duplicate_add_entries_are_not_double_counted() {
-        let computer = PartitionComputer::new(
-            &[] as &[String],
-            &[],
-            "__DEFAULT_PT__",
-            false,
-        )
-        .unwrap();
+        let computer =
+            PartitionComputer::new(&[] as &[String], &[], "__DEFAULT_PT__", false).unwrap();
 
         // Same file_name / level appears twice (base manifest + delta manifest).
         let entries = vec![
