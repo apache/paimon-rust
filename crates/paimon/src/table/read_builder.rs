@@ -150,8 +150,9 @@ impl<'a> ReadBuilder<'a> {
     /// Set whether column-name matching (projection and predicate column
     /// resolution) is case-sensitive. Defaults to `true` (exact match). When set
     /// to `false`, names are matched by ASCII case-folding and an ambiguous
-    /// (case-colliding) request errors. Mirrors Java's
-    /// `RowType.getFieldIndex(name, caseSensitive)`.
+    /// (case-colliding) request errors. This mirrors the per-read case
+    /// sensitivity engines like Spark drive from `spark.sql.caseSensitive`,
+    /// rather than being a table property.
     ///
     /// Projection resolution is lazy, so this affects a projection set via
     /// [`with_projection`](Self::with_projection) regardless of call order (the

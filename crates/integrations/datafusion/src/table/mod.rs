@@ -440,9 +440,7 @@ impl TableProvider for PaimonTableProvider {
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let fields = self.table.schema().fields();
         // SQL reads resolve columns case-sensitively (see `scan`), so classify
-        // pushdown the same way. `classify_filter_pushdown` still caps at
-        // `Inexact` for schemas with ASCII case-folding collisions as a
-        // conservative guard, so a needed residual is never dropped.
+        // pushdown the same way.
         let case_sensitive = true;
         let read_builder = self.table.new_read_builder();
 
