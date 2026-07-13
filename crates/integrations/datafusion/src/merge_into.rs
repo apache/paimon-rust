@@ -913,23 +913,20 @@ fn normalize_insert_batch_to_table_schema(
     batch: &RecordBatch,
     table_fields: &[DataField],
 ) -> DFResult<RecordBatch> {
+    if batch.num_columns() != table_fields.len() {
+        return Err(DataFusionError::Plan(format!(
+            "MERGE INSERT output has {} columns but target table has {}",
+            batch.num_columns(),
+            table_fields.len()
+        )));
+    }
+
     let target_schema =
         paimon::arrow::build_target_arrow_schema(table_fields).map_err(to_datafusion_error)?;
     let mut columns = Vec::with_capacity(table_fields.len());
 
     for (target_idx, field) in table_fields.iter().enumerate() {
-        let source_idx = batch
-            .schema()
-            .index_of(field.name())
-            .ok()
-            .or_else(|| (target_idx < batch.num_columns()).then_some(target_idx))
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "MERGE INSERT output is missing target column '{}'",
-                    field.name()
-                ))
-            })?;
-        let column = batch.column(source_idx).clone();
+        let column = batch.column(target_idx).clone();
         let target_type = target_schema.field(target_idx).data_type();
         let column = cast_insert_column(field.name(), column, target_type)?;
         columns.push(column);
@@ -1586,7 +1583,7 @@ mod tests {
     use datafusion::sql::sqlparser::parser::Parser;
     use paimon::catalog::{Catalog, Identifier};
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+    use paimon::spec::{DataField, DataType, IntType, Schema as PaimonSchema, TableSchema};
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
@@ -1651,6 +1648,42 @@ mod tests {
             datafusion::sql::sqlparser::ast::Statement::Merge(m) => m,
             _ => panic!("Expected MERGE statement"),
         }
+    }
+
+    #[test]
+    fn test_normalize_merge_insert_batch_uses_position() {
+        let table_fields = vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("b", ArrowDataType::Int32, false),
+                Field::new("x", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+
+        let normalized = normalize_insert_batch_to_table_schema(&batch, &table_fields).unwrap();
+        let first = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let second = normalized
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(normalized.schema().field(0).name(), "a");
+        assert_eq!(normalized.schema().field(1).name(), "b");
+        assert_eq!(first.value(0), 100);
+        assert_eq!(second.value(0), 7);
     }
 
     #[test]
