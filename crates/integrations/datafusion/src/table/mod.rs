@@ -292,6 +292,14 @@ impl PaimonScanBuilder<'_> {
     /// Build a [`PaimonTableScan`] from the configured parameters.
     pub(crate) fn build(self) -> DFResult<Arc<dyn ExecutionPlan>> {
         let read_fields = datafusion_read_fields(self.table);
+        self.build_with_read_fields(read_fields)
+    }
+
+    /// Build using an internal read schema which may contain hidden system fields.
+    pub(crate) fn build_with_read_fields(
+        self,
+        read_fields: Vec<DataField>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()

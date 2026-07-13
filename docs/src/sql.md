@@ -1391,7 +1391,26 @@ FROM hybrid_search(
 );
 ```
 
-The function searches each route independently, merges route results with the selected ranker, and returns the top-k matching rows from the target table. The current DataFusion table function returns table rows only; it does not expose a metadata score column.
+The function searches each route independently, merges route results with the selected ranker, and returns the top-k matching rows from the target table. Its output also includes a nullable `FLOAT` metadata column named `__paimon_search_score`, which contains the final score produced by the selected ranker:
+
+```sql
+SELECT id, __paimon_search_score
+FROM hybrid_search(
+    'paimon.my_db.docs',
+    array(
+        named_struct(
+            'field', 'embedding',
+            'query_vector', array(1.0, 0.0, 0.0, 0.0)
+        )
+    ),
+    array(),
+    10,
+    'rrf'
+)
+ORDER BY __paimon_search_score DESC;
+```
+
+The metadata column is part of the DataFusion table function schema, so `SELECT *` includes it. Use an explicit `ORDER BY __paimon_search_score DESC` when result ranking order matters; scan output order is not an ordering guarantee.
 
 ## Full-Text Search
 

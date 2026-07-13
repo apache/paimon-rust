@@ -33,7 +33,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::catalog::{Session, TableFunctionImpl};
 use datafusion::common::{project_schema, ScalarValue};
 use datafusion::datasource::{TableProvider, TableType};
@@ -43,17 +45,22 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use paimon::catalog::Catalog;
-use paimon::table::{HybridSearchRanker, HybridSearchRoute};
+use paimon::spec::{
+    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+};
+use paimon::table::{HybridSearchRanker, HybridSearchRoute, Table};
 
 use crate::error::to_datafusion_error;
+use crate::physical_plan::{SearchScoreExec, SearchScoreOutputColumn};
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
-use crate::table::{PaimonScanBuilder, PaimonTableProvider};
+use crate::table::{datafusion_read_fields, PaimonScanBuilder, PaimonTableProvider};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
 use crate::table_loader::load_data_table_for_read;
 
 const FUNCTION_NAME: &str = "hybrid_search";
+const SEARCH_SCORE_COLUMN: &str = "__paimon_search_score";
 
 pub fn register_hybrid_search(
     ctx: &SessionContext,
@@ -128,27 +135,71 @@ impl TableFunctionImpl for HybridSearchFunction {
             "hybrid_search: catalog access thread panicked",
         )?;
 
-        Ok(Arc::new(HybridSearchTableProvider {
-            inner: PaimonTableProvider::try_new(table)?,
+        Ok(Arc::new(HybridSearchTableProvider::try_new(
+            PaimonTableProvider::try_new(table)?,
             routes,
-            limit: limit as usize,
+            limit as usize,
             ranker,
-        }))
+        )?))
     }
 }
 
 #[derive(Debug)]
 struct HybridSearchTableProvider {
     inner: PaimonTableProvider,
+    schema: ArrowSchemaRef,
     routes: Vec<HybridSearchRoute>,
     limit: usize,
     ranker: String,
 }
 
+impl HybridSearchTableProvider {
+    fn try_new(
+        inner: PaimonTableProvider,
+        routes: Vec<HybridSearchRoute>,
+        limit: usize,
+        ranker: String,
+    ) -> DFResult<Self> {
+        let inner_schema = inner.schema();
+        if inner_schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == SEARCH_SCORE_COLUMN)
+        {
+            return Err(DataFusionError::Plan(format!(
+                "hybrid_search: table already contains reserved column {SEARCH_SCORE_COLUMN}"
+            )));
+        }
+
+        let mut fields = inner_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields.push(Field::new(
+            SEARCH_SCORE_COLUMN,
+            ArrowDataType::Float32,
+            true,
+        ));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            inner_schema.metadata().clone(),
+        ));
+
+        Ok(Self {
+            inner,
+            schema,
+            routes,
+            limit,
+            ranker,
+        })
+    }
+}
+
 #[async_trait]
 impl TableProvider for HybridSearchTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        self.inner.schema()
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -160,11 +211,11 @@ impl TableProvider for HybridSearchTableProvider {
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.inner.table();
 
-        let row_ranges = await_with_runtime(async {
+        let search_result = await_with_runtime(async {
             let mut builder = table.new_hybrid_search_builder();
             for route in self.routes.clone() {
                 builder.add_route(route);
@@ -173,37 +224,91 @@ impl TableProvider for HybridSearchTableProvider {
                 .with_limit(self.limit)
                 .with_ranker(&self.ranker)
                 .map_err(to_datafusion_error)?;
-            builder.execute().await.map_err(to_datafusion_error)
+            builder.execute_scored().await.map_err(to_datafusion_error)
         })
         .await?;
 
+        let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
+
         if row_ranges.is_empty() {
-            let schema = project_schema(&self.schema(), projection)?;
+            let schema = project_schema(&self.schema, projection)?;
             return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
-        let mut read_builder = table.new_read_builder();
-        if let Some(limit) = limit {
-            read_builder.with_limit(limit);
-        }
-        let scan = read_builder.new_scan().with_row_ranges(row_ranges);
+        // Raw row-range scans can include non-matching rows from selected files,
+        // so the outer limit must remain above the row-ID filter.
+        let scan = table
+            .new_read_builder()
+            .new_scan()
+            .with_row_ranges(row_ranges);
         let plan = await_with_runtime(scan.plan())
             .await
             .map_err(to_datafusion_error)?;
 
-        PaimonScanBuilder {
+        let inner_schema = self.inner.schema();
+        let score_index = inner_schema.fields().len();
+        let input_read_fields = search_read_fields(table)?;
+        let input_schema = paimon::arrow::build_target_arrow_schema(&input_read_fields)
+            .map_err(to_datafusion_error)?;
+        let row_id_table_index = input_read_fields
+            .iter()
+            .position(|field| field.name() == ROW_ID_FIELD_NAME)
+            .expect("search read fields contain _ROW_ID");
+        let projected_indices = projection
+            .cloned()
+            .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+        let mut input_projection = projected_indices
+            .iter()
+            .copied()
+            .filter(|index| *index != score_index)
+            .collect::<Vec<_>>();
+        if !input_projection.contains(&row_id_table_index) {
+            input_projection.push(row_id_table_index);
+        }
+        let row_id_input_index = input_projection
+            .iter()
+            .position(|index| *index == row_id_table_index)
+            .expect("row ID was added to the input projection");
+        let output_columns = projected_indices
+            .iter()
+            .map(|index| {
+                if *index == score_index {
+                    SearchScoreOutputColumn::Score
+                } else {
+                    let input_index = input_projection
+                        .iter()
+                        .position(|input_index| input_index == index)
+                        .expect("projected table column exists in the input projection");
+                    SearchScoreOutputColumn::Input(input_index)
+                }
+            })
+            .collect();
+        let output_schema = project_schema(&self.schema, projection)?;
+        let input = PaimonScanBuilder {
             table,
-            schema: &self.schema(),
+            schema: &input_schema,
             plan: &plan,
             scan_trace: None,
-            projection,
+            projection: Some(&input_projection),
             pushed_predicate: None,
-            limit,
+            limit: None,
             target_partitions: state.config_options().execution.target_partitions,
             filter_exact: false,
             case_sensitive: true,
         }
-        .build()
+        .build_with_read_fields(input_read_fields)?;
+        let scores = search_result
+            .row_ids
+            .into_iter()
+            .zip(search_result.scores)
+            .collect();
+        Ok(Arc::new(SearchScoreExec::new(
+            input,
+            output_schema,
+            row_id_input_index,
+            output_columns,
+            Arc::new(scores),
+        )))
     }
 
     fn supports_filters_pushdown(
@@ -215,6 +320,25 @@ impl TableProvider for HybridSearchTableProvider {
             filters.len()
         ])
     }
+}
+
+fn search_read_fields(table: &Table) -> DFResult<Vec<DataField>> {
+    let mut fields = datafusion_read_fields(table);
+    if fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+        return Ok(fields);
+    }
+    if !CoreOptions::new(table.schema().options()).row_tracking_enabled() {
+        return Err(DataFusionError::Plan(
+            "hybrid_search: cannot materialize search results because _ROW_ID is not available"
+                .to_string(),
+        ));
+    }
+    fields.push(DataField::new(
+        ROW_ID_FIELD_ID,
+        ROW_ID_FIELD_NAME.to_string(),
+        DataType::BigInt(BigIntType::with_nullable(true)),
+    ));
+    Ok(fields)
 }
 
 fn parse_vector_routes(expr: &Expr, default_limit: usize) -> DFResult<Vec<HybridSearchRoute>> {

@@ -2149,7 +2149,9 @@ mod vector_search_tests {
 mod hybrid_search_tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::Int32Array;
+    #[cfg(feature = "fulltext")]
+    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::array::{Float32Array, Int32Array};
     use paimon::catalog::Identifier;
     use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -2200,6 +2202,245 @@ mod hybrid_search_tests {
         }
         ids.sort();
         ids
+    }
+
+    fn extract_scored_ids(
+        batches: &[datafusion::arrow::record_batch::RecordBatch],
+    ) -> Vec<(i32, f32)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            let score_array = batch
+                .column_by_name("__paimon_search_score")
+                .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+                .expect("Expected Float32Array for __paimon_search_score");
+            for row in 0..batch.num_rows() {
+                rows.push((id_array.value(row), score_array.value(row)));
+            }
+        }
+        rows
+    }
+
+    fn extract_scores(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<f32> {
+        let mut scores = Vec::new();
+        for batch in batches {
+            assert_eq!(batch.num_columns(), 1, "only the score column was selected");
+            let score_array = batch
+                .column_by_name("__paimon_search_score")
+                .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+                .expect("Expected Float32Array for __paimon_search_score");
+            scores.extend((0..batch.num_rows()).map(|row| score_array.value(row)));
+        }
+        scores
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_exposes_ranked_scores() {
+        let (ctx, _catalog, _tmp) = create_hybrid_search_context().await;
+        let batches = ctx
+            .sql(
+                "SELECT __paimon_search_score, id FROM hybrid_search( \
+                 'paimon.default.test_java_vindex_vector', \
+                 array(named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(1.0, 0.0, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0)), \
+                 array(), \
+                 3, \
+                 'rrf') \
+                 ORDER BY __paimon_search_score DESC",
+            )
+            .await
+            .expect("hybrid_search score SQL should parse")
+            .collect()
+            .await
+            .expect("hybrid_search score query should execute");
+
+        let rows = extract_scored_ids(&batches);
+        assert_eq!(rows.len(), 3);
+        for ((id, score), (expected_id, expected_score)) in
+            rows.into_iter()
+                .zip([(0, 1.0 / 61.0), (1, 1.0 / 62.0), (2, 1.0 / 63.0)])
+        {
+            assert_eq!(id, expected_id);
+            assert!(
+                (score - expected_score).abs() < 1e-6,
+                "score for id {id}: expected {expected_score}, got {score}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_score_only_and_empty_results() {
+        let (ctx, _catalog, _tmp) = create_hybrid_search_context().await;
+        let score_batches = ctx
+            .sql(
+                "SELECT __paimon_search_score FROM hybrid_search( \
+                 'paimon.default.test_java_vindex_vector', \
+                 array(named_struct( \
+                   'field', 'embedding', \
+                   'query_vector', array(1.0, 0.0, 0.0, 0.0), \
+                   'limit', 3, \
+                   'weight', 1.0)), \
+                 array(), \
+                 3, \
+                 'rrf') \
+                 ORDER BY __paimon_search_score DESC",
+            )
+            .await
+            .expect("score-only hybrid_search SQL should parse")
+            .collect()
+            .await
+            .expect("score-only hybrid_search query should execute");
+
+        let scores = extract_scores(&score_batches);
+        assert_eq!(scores.len(), 3);
+        for (score, expected) in scores.into_iter().zip([1.0 / 61.0, 1.0 / 62.0, 1.0 / 63.0]) {
+            assert!((score - expected).abs() < 1e-6);
+        }
+
+        let empty_batches = ctx
+            .sql(
+                "SELECT __paimon_search_score FROM hybrid_search( \
+                 'paimon.default.test_java_vindex_vector', \
+                 array(named_struct( \
+                   'field', 'missing_embedding', \
+                   'query_vector', array(1.0), \
+                   'limit', 3, \
+                   'weight', 1.0)), \
+                 array(), \
+                 3, \
+                 'rrf')",
+            )
+            .await
+            .expect("empty hybrid_search score SQL should parse")
+            .collect()
+            .await
+            .expect("empty hybrid_search score query should execute");
+        assert_eq!(
+            empty_batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[cfg(feature = "fulltext")]
+    #[tokio::test]
+    async fn test_hybrid_search_score_with_row_tracking_only_fulltext() {
+        let (_tmp, ctx) = super::common::setup_sql_context().await;
+        super::common::exec(
+            &ctx,
+            "CREATE TABLE paimon.test_db.hybrid_raw_fulltext (id INT, content STRING) \
+             WITH ( \
+               'row-tracking.enabled' = 'true', \
+               'global-index.search-mode' = 'full')",
+        )
+        .await;
+        super::common::exec(
+            &ctx,
+            "INSERT INTO paimon.test_db.hybrid_raw_fulltext VALUES \
+             (1, 'paimon search'), (2, 'other'), (3, 'paimon table')",
+        )
+        .await;
+
+        const SEARCH: &str = "hybrid_search( \
+             'paimon.test_db.hybrid_raw_fulltext', \
+             array(), \
+             array(named_struct( \
+               'column', 'content', \
+               'query', 'paimon', \
+               'limit', 10, \
+               'weight', 1.0)), \
+             10, \
+             'rrf')";
+        let explicit_sql = format!("SELECT id, __paimon_search_score FROM {SEARCH} ORDER BY id");
+        let explicit_batches = ctx
+            .sql(&explicit_sql)
+            .await
+            .expect("row-tracking-only score SQL should parse")
+            .collect()
+            .await
+            .expect("row-tracking-only score query should execute");
+
+        let mut ids = Vec::new();
+        for batch in &explicit_batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+                .expect("id column");
+            let score_array = batch
+                .column_by_name("__paimon_search_score")
+                .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+                .expect("score column");
+            assert_eq!(score_array.null_count(), 0);
+            for row in 0..batch.num_rows() {
+                ids.push(id_array.value(row));
+                assert!(score_array.value(row) > 0.0);
+            }
+        }
+        assert_eq!(ids, vec![1, 3]);
+
+        let limited_sql = format!("SELECT id, __paimon_search_score FROM {SEARCH} LIMIT 2");
+        let limited_batches = ctx
+            .sql(&limited_sql)
+            .await
+            .expect("row-tracking-only limited SQL should parse")
+            .collect()
+            .await
+            .expect("row-tracking-only limited query should execute");
+        assert_eq!(extract_scored_ids(&limited_batches).len(), 2);
+
+        let projected_sql = format!("SELECT id FROM {SEARCH} ORDER BY id");
+        let projected_batches = ctx
+            .sql(&projected_sql)
+            .await
+            .expect("row-tracking-only projected SQL should parse")
+            .collect()
+            .await
+            .expect("row-tracking-only projected query should execute");
+        assert_eq!(extract_ids(&projected_batches), vec![1, 3]);
+
+        let count_sql = format!("SELECT COUNT(*) AS matches FROM {SEARCH}");
+        let count_batches = ctx
+            .sql(&count_sql)
+            .await
+            .expect("row-tracking-only aggregate SQL should parse")
+            .collect()
+            .await
+            .expect("row-tracking-only aggregate query should execute");
+        let matches = count_batches
+            .first()
+            .and_then(|batch| batch.column_by_name("matches"))
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .expect("matches column");
+        assert_eq!(matches.value(0), 2);
+
+        let star_sql = format!("SELECT * FROM {SEARCH}");
+        let star_batches = ctx
+            .sql(&star_sql)
+            .await
+            .expect("row-tracking-only SELECT * SQL should parse")
+            .collect()
+            .await
+            .expect("row-tracking-only SELECT * query should execute");
+        assert_eq!(
+            star_batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            2
+        );
+        for batch in &star_batches {
+            assert_eq!(batch.num_columns(), 3);
+            assert!(batch.column_by_name("__paimon_search_score").is_some());
+            assert!(batch.column_by_name("_ROW_ID").is_none());
+        }
     }
 
     #[tokio::test]

@@ -16,7 +16,9 @@
 // under the License.
 
 pub(crate) mod scan;
+mod search_score;
 pub(crate) mod sink;
 
 pub use scan::PaimonTableScan;
+pub(crate) use search_score::{SearchScoreExec, SearchScoreOutputColumn};
 pub use sink::PaimonDataSink;
