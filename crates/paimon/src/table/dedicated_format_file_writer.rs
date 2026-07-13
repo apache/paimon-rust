@@ -131,6 +131,10 @@ impl AppendDedicatedFormatFileWriter {
         }
 
         let normal_schema = Arc::new(arrow_schema::Schema::new(normal_arrow_fields));
+        let normal_field_names = normal_table_fields
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect();
         let vector_writer = if let Some(vector_file_format) = vector_file_format {
             if vector_table_fields.is_empty() {
                 None
@@ -178,7 +182,7 @@ impl AppendDedicatedFormatFileWriter {
             format_options.clone(),
             Some(0),
             None,
-            None,
+            Some(normal_field_names),
         );
 
         Self {

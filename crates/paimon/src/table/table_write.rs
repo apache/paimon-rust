@@ -1688,6 +1688,7 @@ mod tests {
 
         assert_eq!(parquet_files[0].row_count, 3);
         assert_eq!(blob_files[0].row_count, 3);
+        assert_eq!(parquet_files[0].write_cols, Some(vec!["id".to_string()]));
         assert_eq!(blob_files[0].write_cols, Some(vec!["payload".to_string()]));
 
         // Commit and verify snapshot
@@ -1697,6 +1698,71 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dedicated_blob_stats_use_normal_write_columns() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_dedicated_blob_stats_mapping";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("payload", DataType::Blob(BlobType::new()))
+            .column("a", DataType::Int(IntType::new()))
+            .column("b", DataType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_dedicated_blob_stats_mapping"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("payload", ArrowDataType::Binary, true),
+                ArrowField::new("a", ArrowDataType::Int32, false),
+                ArrowField::new("b", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(arrow_array::BinaryArray::from(vec![Some(
+                    b"payload" as &[u8],
+                )])),
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let normal_write_cols = messages[0]
+            .new_files
+            .iter()
+            .find(|file| file.file_name.ends_with(".parquet"))
+            .unwrap()
+            .write_cols
+            .clone();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_than("a", Datum::Int(50))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(predicate);
+        let (_plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert!(trace.final_files > 0, "scan trace: {trace:?}");
+        assert_eq!(
+            normal_write_cols,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
     }
 
     async fn assert_vector_write_uses_dedicated_file(table_path: &str, vector_file_format: &str) {
@@ -1739,6 +1805,7 @@ mod tests {
         assert_eq!(vector_files.len(), 1);
         assert_eq!(normal_files[0].row_count, 3);
         assert_eq!(vector_files[0].row_count, 3);
+        assert_eq!(normal_files[0].write_cols, Some(vec!["id".to_string()]));
         assert_eq!(
             vector_files[0].write_cols,
             Some(vec!["embedding".to_string()])
