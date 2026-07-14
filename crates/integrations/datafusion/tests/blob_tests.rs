@@ -22,7 +22,7 @@
 mod common;
 
 use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
-use common::{create_sql_context, create_test_env, exec};
+use common::{assert_sql_error, create_sql_context, create_test_env, exec};
 use paimon::catalog::Identifier;
 use paimon::spec::{BlobDescriptor, BlobViewStruct};
 use paimon::table::BranchManager;
@@ -577,6 +577,66 @@ async fn test_blob_resolve_descriptor_with_offset() {
     assert_eq!(rows[0], (1, "Partial".into(), Some(b"PAYLOAD".to_vec())));
 }
 
+#[tokio::test]
+async fn test_blob_resolve_unknown_length_descriptor() {
+    let (tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
+
+    let source_data = b"HEADER_PAYLOAD_TRAILER";
+    let source_path = tmp.path().join("blob_unknown_length.bin");
+    std::fs::write(&source_path, source_data).unwrap();
+
+    let uri = format!("file://{}", source_path.display());
+    let full_hex = to_hex(&BlobDescriptor::new(uri.clone(), 0, -1).serialize());
+    let suffix_hex = to_hex(&BlobDescriptor::new(uri.clone(), 7, -1).serialize());
+    let eof_hex =
+        to_hex(&BlobDescriptor::new(uri.clone(), source_data.len() as i64, -1).serialize());
+    let past_eof_hex =
+        to_hex(&BlobDescriptor::new(uri, source_data.len() as i64 + 5, -1).serialize());
+
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Full', X'{full_hex}'), \
+         (2, 'Suffix', X'{suffix_hex}'), \
+         (3, 'Eof', X'{eof_hex}'), \
+         (4, 'PastEof', X'{past_eof_hex}'), \
+         (5, 'Raw', X'524157'), \
+         (6, 'Null', NULL)"
+    );
+    exec(&sql_context, &sql).await;
+
+    let rows = query_id_name_picture(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Full".into(), Some(source_data.to_vec())),
+            (2, "Suffix".into(), Some(b"PAYLOAD_TRAILER".to_vec())),
+            (3, "Eof".into(), Some(Vec::new())),
+            (4, "PastEof".into(), Some(Vec::new())),
+            (5, "Raw".into(), Some(b"RAW".to_vec())),
+            (6, "Null".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_blob_descriptor_short_read_returns_error() {
+    let (tmp, sql_context) = setup(BLOB_TABLE_DDL).await;
+
+    let source_path = tmp.path().join("blob_short_read.bin");
+    std::fs::write(&source_path, b"short").unwrap();
+    let uri = format!("file://{}", source_path.display());
+    let desc_hex = to_hex(&BlobDescriptor::new(uri, 0, 6).serialize());
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Short', X'{desc_hex}')"
+    );
+
+    assert_sql_error(&sql_context, &sql, "Failed to read BlobDescriptor").await;
+}
+
 /// Blob files roll independently when `blob.target-file-size` is small.
 #[tokio::test]
 async fn test_blob_rolling() {
@@ -707,6 +767,123 @@ async fn test_blob_descriptor_field_resolve_descriptor_value() {
             (2, "Raw".into(), Some(b"Hello".to_vec())),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_blob_descriptor_field_resolve_unknown_length_descriptor() {
+    let (tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.t (\
+            id INT, \
+            name STRING, \
+            picture BLOB \
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true', \
+            'blob-descriptor-field' = 'picture'\
+         )",
+    )
+    .await;
+
+    let source_data = b"HEADER_PAYLOAD_TRAILER";
+    let source_path = tmp.path().join("descriptor_unknown_length.bin");
+    std::fs::write(&source_path, source_data).unwrap();
+
+    let uri = format!("file://{}", source_path.display());
+    let bounded_hex = to_hex(&BlobDescriptor::new(uri.clone(), 0, 6).serialize());
+    let suffix_hex = to_hex(&BlobDescriptor::new(uri.clone(), 7, -1).serialize());
+    let eof_hex =
+        to_hex(&BlobDescriptor::new(uri.clone(), source_data.len() as i64, -1).serialize());
+    let past_eof_hex =
+        to_hex(&BlobDescriptor::new(uri, source_data.len() as i64 + 5, -1).serialize());
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES \
+         (1, 'Bounded', X'{bounded_hex}'), \
+         (2, 'Suffix', X'{suffix_hex}'), \
+         (3, 'Eof', X'{eof_hex}'), \
+         (4, 'PastEof', X'{past_eof_hex}'), \
+         (5, 'Raw', X'524157'), \
+         (6, 'Null', NULL)"
+    );
+    exec(&sql_context, &sql).await;
+
+    let rows = query_id_name_picture(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Bounded".into(), Some(b"HEADER".to_vec())),
+            (2, "Suffix".into(), Some(b"PAYLOAD_TRAILER".to_vec())),
+            (3, "Eof".into(), Some(Vec::new())),
+            (4, "PastEof".into(), Some(Vec::new())),
+            (5, "Raw".into(), Some(b"RAW".to_vec())),
+            (6, "Null".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_blob_descriptor_field_rejects_invalid_length() {
+    let (tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.t (\
+            id INT, \
+            name STRING, \
+            picture BLOB \
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true', \
+            'blob-descriptor-field' = 'picture'\
+         )",
+    )
+    .await;
+
+    let uri = format!("file://{}", tmp.path().join("unused.bin").display());
+    let desc_hex = to_hex(&BlobDescriptor::new(uri, 0, -2).serialize());
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Invalid', X'{desc_hex}')"
+    );
+    exec(&sql_context, &sql).await;
+
+    assert_sql_error(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.t",
+        "length must be -1 or non-negative",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_blob_descriptor_field_short_read_returns_error() {
+    let (tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.t (\
+            id INT, \
+            name STRING, \
+            picture BLOB \
+         ) WITH (\
+            'data-evolution.enabled' = 'true', \
+            'row-tracking.enabled' = 'true', \
+            'blob-descriptor-field' = 'picture'\
+         )",
+    )
+    .await;
+
+    let source_path = tmp.path().join("descriptor_short_read.bin");
+    std::fs::write(&source_path, b"short").unwrap();
+    let uri = format!("file://{}", source_path.display());
+    let desc_hex = to_hex(&BlobDescriptor::new(uri, 0, 6).serialize());
+    let sql = format!(
+        "INSERT INTO paimon.test_db.t (id, name, picture) VALUES (1, 'Short', X'{desc_hex}')"
+    );
+    exec(&sql_context, &sql).await;
+
+    assert_sql_error(
+        &sql_context,
+        "SELECT id, name, picture FROM paimon.test_db.t",
+        "Failed to read BlobDescriptor",
+    )
+    .await;
 }
 
 #[tokio::test]

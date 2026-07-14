@@ -46,7 +46,7 @@ pub(crate) async fn resolve_blob_column(
     }
 
     let mut cells = Vec::with_capacity(col.len());
-    let mut requests_by_uri: HashMap<String, Vec<BlobReadRequest>> = HashMap::new();
+    let mut requests_by_uri: HashMap<String, Vec<BlobReadRequestSpec>> = HashMap::new();
     let mut value_capacity = 0usize;
 
     for row in 0..col.len() {
@@ -58,36 +58,14 @@ pub(crate) async fn resolve_blob_column(
         let value = col.value(row);
         if BlobDescriptor::is_blob_descriptor(value) {
             let desc = BlobDescriptor::deserialize(value)?;
-            let offset = u64::try_from(desc.offset()).map_err(|e| crate::Error::DataInvalid {
-                message: format!(
-                    "BlobDescriptor offset must be non-negative: {}",
-                    desc.offset()
-                ),
-                source: Some(Box::new(e)),
-            })?;
-            let length = u64::try_from(desc.length()).map_err(|e| crate::Error::DataInvalid {
-                message: format!(
-                    "BlobDescriptor length must be non-negative: {}",
-                    desc.length()
-                ),
-                source: Some(Box::new(e)),
-            })?;
-            offset
-                .checked_add(length)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor range overflows u64: offset={offset}, length={length}"
-                    ),
-                    source: None,
-                })?;
-            value_capacity = value_capacity.saturating_add(length as usize);
+            let range = desc.range_spec()?;
             requests_by_uri
                 .entry(desc.uri().to_string())
                 .or_default()
-                .push(BlobReadRequest {
+                .push(BlobReadRequestSpec {
                     row,
-                    offset,
-                    length,
+                    offset: range.offset(),
+                    length: range.length(),
                 });
             cells.push(ResolvedBlobCell::Null);
         } else {
@@ -96,19 +74,101 @@ pub(crate) async fn resolve_blob_column(
         }
     }
 
-    let mut readers: HashMap<String, Box<dyn FileRead>> = HashMap::new();
     for (uri, requests) in requests_by_uri {
-        if !readers.contains_key(&uri) {
-            let input = file_io.new_input(&uri)?;
-            let reader = input.reader().await?;
-            readers.insert(uri.clone(), Box::new(reader));
+        let input = file_io.new_input(&uri)?;
+        let file_size = if requests.iter().any(|request| request.length.is_none()) {
+            input
+                .metadata()
+                .await
+                .map_err(|e| crate::Error::UnexpectedError {
+                    message: format!("Failed to read metadata for BlobDescriptor URI '{uri}': {e}"),
+                    source: Some(Box::new(e)),
+                })?
+                .size
+        } else {
+            0
+        };
+        let mut bounded_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            let length = request
+                .length
+                .unwrap_or_else(|| file_size.saturating_sub(request.offset));
+            request
+                .offset
+                .checked_add(length)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "BlobDescriptor range overflows u64: offset={}, length={length}",
+                        request.offset
+                    ),
+                    source: None,
+                })?;
+            value_capacity = value_capacity.saturating_add(length as usize);
+            if length == 0 {
+                cells[request.row] = ResolvedBlobCell::Value(Bytes::new());
+                continue;
+            }
+            bounded_requests.push(BlobReadRequest {
+                row: request.row,
+                offset: request.offset,
+                length,
+            });
         }
-        let reader = readers.get(&uri).unwrap();
-        for merged in merge_blob_read_requests(requests) {
-            let data = reader.read(merged.start..merged.end).await?;
+
+        if bounded_requests.is_empty() {
+            continue;
+        }
+
+        let reader = input.reader().await?;
+        for merged in merge_blob_read_requests(bounded_requests) {
+            let data = reader.read(merged.start..merged.end).await.map_err(|e| {
+                crate::Error::UnexpectedError {
+                    message: format!(
+                        "Failed to read BlobDescriptor URI '{uri}' range {}..{}: {e}",
+                        merged.start, merged.end
+                    ),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+            let expected_len = merged.end - merged.start;
+            let actual_len = data.len() as u64;
+            if actual_len != expected_len {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to read BlobDescriptor URI '{uri}': short read for range {}..{}, expected={expected_len} bytes, actual={actual_len} bytes",
+                        merged.start, merged.end
+                    ),
+                    source: None,
+                });
+            }
             for request in merged.requests {
-                let start = (request.offset - merged.start) as usize;
-                let end = start + request.length as usize;
+                let start = usize::try_from(request.offset - merged.start).map_err(|e| {
+                    crate::Error::DataInvalid {
+                        message: format!(
+                            "BlobDescriptor slice offset exceeds usize: offset={}, merged_start={}",
+                            request.offset, merged.start
+                        ),
+                        source: Some(Box::new(e)),
+                    }
+                })?;
+                let length =
+                    usize::try_from(request.length).map_err(|e| crate::Error::DataInvalid {
+                        message: format!(
+                            "BlobDescriptor slice length exceeds usize: {}",
+                            request.length
+                        ),
+                        source: Some(Box::new(e)),
+                    })?;
+                let end = start
+                    .checked_add(length)
+                    .filter(|end| *end <= data.len())
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!(
+                            "BlobDescriptor slice exceeds read data: start={start}, length={length}, actual={}",
+                            data.len()
+                        ),
+                        source: None,
+                    })?;
                 cells[request.row] = ResolvedBlobCell::Value(data.slice(start..end));
             }
         }
@@ -128,6 +188,13 @@ pub(crate) async fn resolve_blob_column(
 enum ResolvedBlobCell {
     Null,
     Value(Bytes),
+}
+
+#[derive(Debug)]
+struct BlobReadRequestSpec {
+    row: usize,
+    offset: u64,
+    length: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -294,6 +294,10 @@ the supported directives is rejected.
 | `__BLOB_DESCRIPTOR_FIELD` | `blob-descriptor-field` | Store serialized `BlobDescriptor` bytes inline |
 | `__BLOB_VIEW_FIELD` | `blob-view-field` | Store serialized `BlobViewStruct` bytes inline |
 
+For serialized `BlobDescriptor` values supplied by another Paimon engine,
+`length = -1` means reading from `offset` to the end of the referenced object.
+The offset must be non-negative, and lengths below `-1` are invalid.
+
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
 
 ### Blob View

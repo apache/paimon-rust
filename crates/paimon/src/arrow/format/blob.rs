@@ -617,6 +617,23 @@ impl BlobFormatWriter {
 
 const BLOB_WRITE_BUFFER_SIZE: u64 = 8 * 1024 * 1024; // 8 MB
 
+fn checked_blob_entry_length(payload_len: u64) -> crate::Result<i64> {
+    let entry_length = payload_len
+        .checked_add(BLOB_ENTRY_OVERHEAD)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Blob entry length overflows u64: payload_length={payload_len}, overhead={BLOB_ENTRY_OVERHEAD}"
+            ),
+            source: None,
+        })?;
+    i64::try_from(entry_length).map_err(|e| Error::DataInvalid {
+        message: format!(
+            "Blob entry length exceeds i64: payload_length={payload_len}, entry_length={entry_length}"
+        ),
+        source: Some(Box::new(e)),
+    })
+}
+
 #[async_trait]
 impl FormatFileWriter for BlobFormatWriter {
     async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
@@ -643,9 +660,7 @@ impl FormatFileWriter for BlobFormatWriter {
 
             if BlobDescriptor::is_blob_descriptor(value) {
                 let desc = BlobDescriptor::deserialize(value)?;
-                let payload_len = desc.length() as u64;
-                let entry_length = (payload_len + BLOB_ENTRY_OVERHEAD) as i64;
-                self.lengths.push(entry_length);
+                let range = desc.range_spec()?;
 
                 let file_io = self.file_io.as_ref().ok_or_else(|| Error::DataInvalid {
                     message:
@@ -654,7 +669,47 @@ impl FormatFileWriter for BlobFormatWriter {
                     source: None,
                 })?;
                 let input = file_io.new_input(desc.uri())?;
-                let reader = input.reader().await?;
+                let offset = range.offset();
+                let payload_len = match range.length() {
+                    Some(length) => length,
+                    None => input
+                        .metadata()
+                        .await
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!(
+                                "Failed to read metadata for BlobDescriptor '{}': {e}",
+                                desc.uri()
+                            ),
+                            source: Some(Box::new(e)),
+                        })?
+                        .size
+                        .saturating_sub(offset),
+                };
+                let end = offset
+                    .checked_add(payload_len)
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            "BlobDescriptor range overflows u64: offset={offset}, length={payload_len}"
+                        ),
+                        source: None,
+                    })?;
+                let entry_length = checked_blob_entry_length(payload_len)?;
+                let entry_length_u64 = entry_length as u64;
+                let bytes_written = self
+                    .bytes_written
+                    .checked_add(entry_length_u64)
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            "Blob file size overflows u64: current_size={}, entry_length={entry_length_u64}",
+                            self.bytes_written
+                        ),
+                        source: None,
+                    })?;
+                let reader = if payload_len == 0 {
+                    None
+                } else {
+                    Some(input.reader().await?)
+                };
 
                 let mut hasher = crc32fast::Hasher::new();
 
@@ -664,15 +719,34 @@ impl FormatFileWriter for BlobFormatWriter {
                     .await?;
 
                 // Stream payload in chunks to avoid loading entire blob into memory
-                let start = desc.offset() as u64;
-                let end = start + payload_len;
-                let mut pos = start;
-                while pos < end {
-                    let chunk_end = (pos + BLOB_WRITE_BUFFER_SIZE).min(end);
-                    let chunk = reader.read(pos..chunk_end).await?;
-                    hasher.update(&chunk);
-                    self.writer.write(chunk).await?;
-                    pos = chunk_end;
+                if let Some(reader) = reader.as_ref() {
+                    let mut pos = offset;
+                    while pos < end {
+                        let chunk_end = pos.saturating_add(BLOB_WRITE_BUFFER_SIZE).min(end);
+                        let chunk = reader.read(pos..chunk_end).await.map_err(|e| {
+                            Error::UnexpectedError {
+                                message: format!(
+                                    "Failed to read BlobDescriptor '{}' range {pos}..{chunk_end}: {e}",
+                                    desc.uri()
+                                ),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                        let actual_len = chunk.len() as u64;
+                        let expected_len = chunk_end - pos;
+                        if actual_len != expected_len {
+                            return Err(Error::DataInvalid {
+                                message: format!(
+                                    "Failed to read BlobDescriptor '{}': short read for range {pos}..{chunk_end}, expected={expected_len} bytes, actual={actual_len} bytes",
+                                    desc.uri()
+                                ),
+                                source: None,
+                            });
+                        }
+                        hasher.update(&chunk);
+                        self.writer.write(chunk).await?;
+                        pos = chunk_end;
+                    }
                 }
 
                 let entry_length_bytes = entry_length.to_le_bytes();
@@ -685,7 +759,8 @@ impl FormatFileWriter for BlobFormatWriter {
                     .write(Bytes::copy_from_slice(&hasher.finalize().to_le_bytes()))
                     .await?;
 
-                self.bytes_written += entry_length as u64;
+                self.lengths.push(entry_length);
+                self.bytes_written = bytes_written;
             } else {
                 let entry_length = (value.len() + BLOB_ENTRY_OVERHEAD as usize) as i64;
                 self.lengths.push(entry_length);
@@ -1048,6 +1123,19 @@ mod tests {
         let encoded = encode_delta_varints_write(&values);
         let decoded = decode_delta_varints(&encoded).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_checked_blob_entry_length() {
+        assert_eq!(
+            checked_blob_entry_length(0).unwrap(),
+            BLOB_ENTRY_OVERHEAD as i64
+        );
+
+        let max_payload = i64::MAX as u64 - BLOB_ENTRY_OVERHEAD;
+        assert_eq!(checked_blob_entry_length(max_payload).unwrap(), i64::MAX);
+        assert!(checked_blob_entry_length(max_payload + 1).is_err());
+        assert!(checked_blob_entry_length(u64::MAX).is_err());
     }
 
     fn basic_blob_rows() -> [Option<&'static [u8]>; 4] {

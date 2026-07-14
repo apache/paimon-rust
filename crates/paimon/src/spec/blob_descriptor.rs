@@ -28,6 +28,22 @@ pub struct BlobDescriptor {
     length: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobRangeSpec {
+    offset: u64,
+    length: Option<u64>,
+}
+
+impl BlobRangeSpec {
+    pub(crate) fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) fn length(self) -> Option<u64> {
+        self.length
+    }
+}
+
 impl BlobDescriptor {
     pub fn new(uri: String, offset: i64, length: i64) -> Self {
         Self {
@@ -48,6 +64,46 @@ impl BlobDescriptor {
 
     pub fn length(&self) -> i64 {
         self.length
+    }
+
+    pub(crate) fn range_spec(&self) -> crate::Result<BlobRangeSpec> {
+        if self.offset < 0 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "BlobDescriptor offset must be non-negative: {}",
+                    self.offset
+                ),
+                source: None,
+            });
+        }
+        if self.length < -1 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "BlobDescriptor length must be -1 or non-negative: {}",
+                    self.length
+                ),
+                source: None,
+            });
+        }
+
+        let offset = self.offset as u64;
+        let length = if self.length == -1 {
+            None
+        } else {
+            Some(self.length as u64)
+        };
+        if let Some(length) = length {
+            offset
+                .checked_add(length)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "BlobDescriptor range overflows u64: offset={offset}, length={length}"
+                    ),
+                    source: None,
+                })?;
+        }
+
+        Ok(BlobRangeSpec { offset, length })
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -197,5 +253,61 @@ mod tests {
         let mut bytes = BlobDescriptor::new("x".to_string(), 0, 0).serialize();
         bytes[1] = 0xFF;
         assert!(BlobDescriptor::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_range_spec_supports_unknown_length() {
+        let full = BlobDescriptor::new("x".to_string(), 0, -1)
+            .range_spec()
+            .unwrap();
+        assert_eq!(full.offset(), 0);
+        assert_eq!(full.length(), None);
+
+        let range = BlobDescriptor::new("x".to_string(), 7, -1)
+            .range_spec()
+            .unwrap();
+        assert_eq!(range.offset(), 7);
+        assert_eq!(range.length(), None);
+    }
+
+    #[test]
+    fn test_range_spec_supports_bounded_and_empty_ranges() {
+        let bounded = BlobDescriptor::new("x".to_string(), 7, 11)
+            .range_spec()
+            .unwrap();
+        assert_eq!(bounded.offset(), 7);
+        assert_eq!(bounded.length(), Some(11));
+
+        let empty = BlobDescriptor::new("x".to_string(), 7, 0)
+            .range_spec()
+            .unwrap();
+        assert_eq!(empty.offset(), 7);
+        assert_eq!(empty.length(), Some(0));
+    }
+
+    #[test]
+    fn test_range_spec_rejects_invalid_signed_values() {
+        let err = BlobDescriptor::new("x".to_string(), -1, 1)
+            .range_spec()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("offset must be non-negative"))
+        );
+
+        let err = BlobDescriptor::new("x".to_string(), 0, -2)
+            .range_spec()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("length must be -1 or non-negative"))
+        );
+    }
+
+    #[test]
+    fn test_range_spec_handles_largest_bounded_range() {
+        let range = BlobDescriptor::new("x".to_string(), i64::MAX, i64::MAX)
+            .range_spec()
+            .unwrap();
+        assert_eq!(range.offset(), i64::MAX as u64);
+        assert_eq!(range.length(), Some(i64::MAX as u64));
     }
 }
