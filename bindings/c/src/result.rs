@@ -77,3 +77,29 @@ pub struct paimon_result_next_batch {
     pub batch: paimon_arrow_batch,
     pub error: *mut paimon_error,
 }
+
+// === Write/Commit result types ===
+
+#[repr(C)]
+pub struct paimon_result_write_builder {
+    pub write_builder: *mut paimon_write_builder,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_table_write {
+    pub write: *mut paimon_table_write,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_table_commit {
+    pub commit: *mut paimon_table_commit,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_prepare_commit {
+    pub messages: *mut paimon_commit_messages,
+    pub error: *mut paimon_error,
+}

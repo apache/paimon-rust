@@ -25,11 +25,13 @@ license.workspace = true
 version.workspace = true
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 doc = false
 
 [dependencies]
 paimon = { path = "../../crates/paimon" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures = "0.3"
+arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
