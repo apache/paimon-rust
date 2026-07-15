@@ -1972,4 +1972,127 @@ mod tests {
             paimon_table_free(table);
         }
     }
+
+    /// Assert the result is a built read builder (read_builder non-null, error
+    /// null) and free it.
+    unsafe fn assert_rb_ok_and_free(r: paimon_result_read_builder) {
+        assert!(!r.read_builder.is_null(), "expected a read builder");
+        assert!(r.error.is_null(), "expected no error");
+        paimon_read_builder_free(r.read_builder);
+    }
+
+    /// Assert the result is an error (read_builder null, error non-null) and free
+    /// it.
+    unsafe fn assert_rb_err_and_free(r: paimon_result_read_builder) {
+        assert!(r.read_builder.is_null(), "expected no read builder");
+        assert!(!r.error.is_null(), "expected an error");
+        paimon_error_free(r.error);
+    }
+
+    /// A `paimon_option` borrowing `key`/`value` (kept alive by the caller).
+    fn opt(key: &std::ffi::CStr, value: &std::ffi::CStr) -> paimon_option {
+        paimon_option {
+            key: key.as_ptr(),
+            value: value.as_ptr(),
+        }
+    }
+
+    #[test]
+    fn empty_options_builds_like_plain_new_read_builder() {
+        unsafe {
+            let table = boxed_test_table();
+            // Null pointer + zero length.
+            assert_rb_ok_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                std::ptr::null(),
+                0,
+            ));
+            // The plain entry point (delegates with an empty map).
+            assert_rb_ok_and_free(paimon_table_new_read_builder(table));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn non_selector_option_builds() {
+        unsafe {
+            let table = boxed_test_table();
+            let k = CString::new("some.unrelated.option").unwrap();
+            let v = CString::new("value").unwrap();
+            let opts = [opt(&k, &v)];
+            assert_rb_ok_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                opts.as_ptr(),
+                1,
+            ));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn more_than_one_selector_is_rejected() {
+        unsafe {
+            let table = boxed_test_table();
+            let k1 = CString::new("scan.snapshot-id").unwrap();
+            let v1 = CString::new("1").unwrap();
+            let k2 = CString::new("scan.tag-name").unwrap();
+            let v2 = CString::new("t").unwrap();
+            let opts = [opt(&k1, &v1), opt(&k2, &v2)];
+            assert_rb_err_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                opts.as_ptr(),
+                2,
+            ));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn unsupported_scan_option_is_rejected() {
+        unsafe {
+            let table = boxed_test_table();
+            let k = CString::new("scan.watermark").unwrap();
+            let v = CString::new("0").unwrap();
+            let opts = [opt(&k, &v)];
+            // Core's validate_scan_options rejects this before resolution.
+            assert_rb_err_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                opts.as_ptr(),
+                1,
+            ));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn malformed_selector_value_does_not_silently_read_latest() {
+        unsafe {
+            let table = boxed_test_table();
+            let k = CString::new("scan.snapshot-id").unwrap();
+            let v = CString::new("abc").unwrap();
+            let opts = [opt(&k, &v)];
+            // Core swallows the parse error and falls back; the binding reports
+            // the unified "did not resolve" error rather than building a
+            // latest-reading builder.
+            assert_rb_err_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                opts.as_ptr(),
+                1,
+            ));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn null_options_with_nonzero_length_is_rejected() {
+        unsafe {
+            let table = boxed_test_table();
+            assert_rb_err_and_free(paimon_table_new_read_builder_with_options(
+                table,
+                std::ptr::null(),
+                2,
+            ));
+            paimon_table_free(table);
+        }
+    }
 }
