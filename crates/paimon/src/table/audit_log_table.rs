@@ -18,14 +18,14 @@
 use super::incremental_scan::{IncrementalPlan, IncrementalScan, IncrementalScanMode};
 use super::{ArrowRecordBatchStream, Table};
 use crate::spec::{
-    BigIntType, DataField, DataType, VarCharType, SEQUENCE_NUMBER_FIELD_ID,
-    SEQUENCE_NUMBER_FIELD_NAME,
+    BigIntType, DataField, DataType, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
+    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
 };
 
 /// Wrapper that exposes table rows with a leading `rowkind` audit column.
 ///
 /// Incremental reads produce:
-/// - Delta: every row is `+I`
+/// - Delta: primary-key rows use physical `_VALUE_KIND`; append rows are `+I`
 /// - Changelog: kinds come from physical `_VALUE_KIND` (`+I`/`-U`/`+U`/`-D`)
 /// - Diff: not implemented in this release
 #[derive(Debug, Clone)]
@@ -48,9 +48,9 @@ impl AuditLogTable {
     pub fn fields(&self) -> crate::Result<Vec<DataField>> {
         let mut fields = Vec::with_capacity(self.wrapped.schema().fields().len() + 2);
         fields.push(DataField::new(
-            -1,
-            "rowkind".to_string(),
-            DataType::VarChar(VarCharType::new(8)?),
+            ROW_KIND_FIELD_ID,
+            ROW_KIND_FIELD_NAME.to_string(),
+            DataType::VarChar(VarCharType::string_type()),
         ));
         if self.sequence_number_enabled() {
             fields.push(DataField::new(

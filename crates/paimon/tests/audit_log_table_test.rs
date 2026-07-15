@@ -19,7 +19,10 @@ mod common;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
-use paimon::spec::SEQUENCE_NUMBER_FIELD_NAME;
+use paimon::spec::{
+    DataType, IntType, Schema, TableSchema, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
+    SEQUENCE_NUMBER_FIELD_NAME,
+};
 use paimon::table::{AuditLogTable, IncrementalScanMode};
 
 use common::incremental_helpers::{
@@ -152,14 +155,14 @@ async fn audit_log_changelog_scan_exposes_rowkind_as_first_column() {
 #[tokio::test]
 async fn audit_log_delta_scan_emits_plus_i_for_all_rows() {
     let table_path = "memory:/audit_log/delta_plus_i";
-    let (file_io, table) = memory_table(
-        table_path,
-        pk_schema(&[
-            ("changelog-producer", "none"),
-            ("merge-engine", "deduplicate"),
-            ("bucket", "1"),
-        ]),
-    );
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(table_path, TableSchema::new(0, &schema));
     setup_dirs(&file_io, table_path).await;
     persist_table_schema(&file_io, table_path, table.schema()).await;
 
@@ -173,10 +176,80 @@ async fn audit_log_delta_scan_emits_plus_i_for_all_rows() {
         .unwrap();
     let batches: Vec<RecordBatch> = audit.to_arrow(&plan).unwrap().try_collect().await.unwrap();
 
+    let rowkind_field = batches[0].schema().field(0).clone();
+    assert_eq!(rowkind_field.name(), ROW_KIND_FIELD_NAME);
+    assert_eq!(rowkind_field.data_type(), &arrow_schema::DataType::Utf8);
+    assert!(rowkind_field.is_nullable());
+    assert_eq!(
+        rowkind_field.metadata().get("PARQUET:field_id"),
+        Some(&ROW_KIND_FIELD_ID.to_string())
+    );
+
     assert_eq!(
         collect_audit_rows(&batches),
         vec![("+I".to_string(), 1, 10), ("+I".to_string(), 2, 20),]
     );
+}
+
+#[tokio::test]
+async fn audit_log_delta_scan_preserves_pk_row_kinds() {
+    let table_path = "memory:/audit_log/delta_rowkind";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write
+        .write_arrow_batch(&make_batch_with_kinds(
+            // Use distinct keys so the PK writer does not merge multiple
+            // changes for one key before the audit read sees the data file.
+            vec![1, 2, 3, 4],
+            vec![10, 20, 25, 30],
+            vec![0, 1, 2, 3],
+        ))
+        .await
+        .unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let audit = AuditLogTable::new(table.clone());
+    let plan = audit
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 1)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = audit.to_arrow(&plan).unwrap().try_collect().await.unwrap();
+
+    assert_eq!(
+        collect_audit_rows(&batches),
+        vec![
+            ("+I".to_string(), 1, 10),
+            ("+U".to_string(), 3, 25),
+            ("-D".to_string(), 4, 30),
+            ("-U".to_string(), 2, 20),
+        ]
+    );
+}
+
+#[test]
+fn audit_log_rowkind_field_matches_java_special_field() {
+    let (_, table) = memory_table("memory:/audit_log/rowkind_field", pk_schema(&[]));
+    let field = AuditLogTable::new(table).fields().unwrap().remove(0);
+
+    assert_eq!(field.id(), ROW_KIND_FIELD_ID);
+    assert_eq!(field.name(), ROW_KIND_FIELD_NAME);
+    assert!(matches!(
+        field.data_type(),
+        DataType::VarChar(varchar) if varchar.length() == VarCharType::MAX_LENGTH
+    ));
 }
 
 #[tokio::test]

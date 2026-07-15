@@ -811,6 +811,11 @@ pub const VALUE_KIND_FIELD_NAME: &str = "_VALUE_KIND";
 /// Must match Java Paimon's `SpecialFields.VALUE_KIND` (Integer.MAX_VALUE - 2).
 pub const VALUE_KIND_FIELD_ID: i32 = i32::MAX - 2;
 
+pub const ROW_KIND_FIELD_NAME: &str = "rowkind";
+
+/// Must match Java Paimon's `SpecialFields.ROW_KIND` (Integer.MAX_VALUE - 4).
+pub const ROW_KIND_FIELD_ID: i32 = i32::MAX - 4;
+
 /// Data field for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>

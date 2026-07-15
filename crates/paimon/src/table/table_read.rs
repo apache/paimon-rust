@@ -25,8 +25,8 @@ use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
-    VALUE_KIND_FIELD_NAME,
+    ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::DataSplit;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
@@ -137,8 +137,9 @@ impl<'a> TableRead<'a> {
     /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
     ///
     /// Output schema is `rowkind` (+ optional `_SEQUENCE_NUMBER`) followed by
-    /// the projected user columns. Delta rows are all `+I`; Changelog rows take
-    /// kinds from `_VALUE_KIND`. Diff remains unsupported.
+    /// the projected user columns. Primary-key Delta and Changelog rows take
+    /// kinds from `_VALUE_KIND`; append-only Delta rows are `+I`. Diff remains
+    /// unsupported.
     pub fn to_audit_log_arrow(
         &self,
         plan: &IncrementalPlan,
@@ -240,7 +241,9 @@ impl<'a> PaimonTableRead<'a> {
             IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
                 message: "Batch incremental Diff audit read not yet implemented".to_string(),
             }),
-            IncrementalScanMode::Delta => self.audit_raw_stream(plan, false),
+            IncrementalScanMode::Delta => {
+                self.audit_raw_stream(plan, !self.table.schema().primary_keys().is_empty())
+            }
             IncrementalScanMode::Changelog => self.audit_raw_stream(plan, true),
             IncrementalScanMode::Auto => unreachable!("Auto resolved during plan()"),
         }
@@ -487,9 +490,9 @@ fn audit_schema_for_read_type(
 ) -> crate::Result<Arc<ArrowSchema>> {
     let mut fields = Vec::with_capacity(read_type.len() + 2);
     fields.push(DataField::new(
-        -1,
-        "rowkind".to_string(),
-        DataType::VarChar(crate::spec::VarCharType::new(8)?),
+        ROW_KIND_FIELD_ID,
+        ROW_KIND_FIELD_NAME.to_string(),
+        DataType::VarChar(crate::spec::VarCharType::string_type()),
     ));
     if include_sequence {
         fields.push(DataField::new(
