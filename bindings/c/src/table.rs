@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -66,6 +67,66 @@ pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
     free_table_wrapper(table, |t| t.inner);
 }
 
+/// Time-travel selector option names, in the core's resolution priority order.
+const TIME_TRAVEL_SELECTORS: [&str; 4] = [
+    "scan.timestamp-millis",
+    "scan.version",
+    "scan.snapshot-id",
+    "scan.tag-name",
+];
+
+/// Build a `ReadBuilderState` from a table and a scan-option map, resolving any
+/// time-travel selector at construction time.
+///
+/// Rejects more than one time-travel selector up front (the core silently falls
+/// back on a conflict, which would misattribute the failure). Otherwise runs the
+/// core's `copy_with_time_travel`, which validates unsupported scan options and
+/// resolves the selector; a set selector that does not resolve to a snapshot is
+/// an error, so a mistyped or missing selector can never silently read latest.
+unsafe fn new_read_builder_state(
+    table: &Table,
+    options: HashMap<String, String>,
+) -> Result<ReadBuilderState, *mut paimon_error> {
+    let present: Vec<&str> = TIME_TRAVEL_SELECTORS
+        .iter()
+        .copied()
+        .filter(|name| options.contains_key(*name))
+        .collect();
+    if present.len() > 1 {
+        return Err(paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            format!(
+                "Only one time-travel selector may be set, found: {}",
+                present.join(", ")
+            ),
+        ));
+    }
+    let selector = TIME_TRAVEL_SELECTORS
+        .iter()
+        .find_map(|&name| options.get(name).map(|v| (name.to_string(), v.clone())));
+
+    let resolved = match runtime().block_on(table.copy_with_time_travel(options)) {
+        Ok(t) => t,
+        Err(e) => return Err(paimon_error::from_paimon(e)),
+    };
+
+    if let Some((name, value)) = selector {
+        if !resolved.has_resolved_travel_snapshot() {
+            return Err(paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                format!("time-travel selector {name}={value} did not resolve to any snapshot"),
+            ));
+        }
+    }
+
+    Ok(ReadBuilderState {
+        table: resolved,
+        projected_columns: None,
+        filter: None,
+        case_sensitive: true,
+    })
+}
+
 /// Create a new ReadBuilder from a Table.
 ///
 /// # Safety
@@ -74,22 +135,73 @@ pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
 pub unsafe extern "C" fn paimon_table_new_read_builder(
     table: *const paimon_table,
 ) -> paimon_result_read_builder {
+    paimon_table_new_read_builder_with_options(table, std::ptr::null(), 0)
+}
+
+/// Create a ReadBuilder from a Table with scan options (e.g. time-travel
+/// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` /
+/// `scan.version`). At most one time-travel selector may be set. A selector that
+/// does not resolve to a snapshot is an error (never a silent read-of-latest).
+///
+/// # Safety
+/// `table` must be a valid pointer. `options` must be a valid pointer to
+/// `options_len` `paimon_option` values, or null when `options_len` is 0.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_new_read_builder_with_options(
+    table: *const paimon_table,
+    options: *const paimon_option,
+    options_len: usize,
+) -> paimon_result_read_builder {
     if let Err(e) = check_non_null(table, "table") {
         return paimon_result_read_builder {
             read_builder: std::ptr::null_mut(),
             error: e,
         };
     }
+    if options.is_null() && options_len > 0 {
+        return paimon_result_read_builder {
+            read_builder: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "null options pointer with non-zero length".to_string(),
+            ),
+        };
+    }
+    let mut map = HashMap::with_capacity(options_len);
+    if options_len > 0 {
+        let slice = std::slice::from_raw_parts(options, options_len);
+        for opt in slice {
+            let key = match validate_cstr(opt.key, "option key") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_read_builder {
+                        read_builder: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            let value = match validate_cstr(opt.value, "option value") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_read_builder {
+                        read_builder: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            map.insert(key, value);
+        }
+    }
     let table_ref = &*((*table).inner as *const Table);
-    let state = ReadBuilderState {
-        table: table_ref.clone(),
-        projected_columns: None,
-        filter: None,
-        case_sensitive: true,
-    };
-    paimon_result_read_builder {
-        read_builder: box_read_builder_state(state),
-        error: std::ptr::null_mut(),
+    match new_read_builder_state(table_ref, map) {
+        Ok(state) => paimon_result_read_builder {
+            read_builder: box_read_builder_state(state),
+            error: std::ptr::null_mut(),
+        },
+        Err(e) => paimon_result_read_builder {
+            read_builder: std::ptr::null_mut(),
+            error: e,
+        },
     }
 }
 
