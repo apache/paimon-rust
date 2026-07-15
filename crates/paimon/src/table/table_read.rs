@@ -29,7 +29,7 @@ use crate::spec::{
     VALUE_KIND_FIELD_NAME,
 };
 use crate::DataSplit;
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::Schema as ArrowSchema;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -518,15 +518,30 @@ fn rowkind_array_from_column(column: &dyn arrow_array::Array) -> crate::Result<S
             message: "AuditLogTable _VALUE_KIND column must be Int8".to_string(),
             source: None,
         })?;
-    let strings: Vec<&'static str> = (0..values.len())
-        .map(|idx| match values.value(idx) {
+    let mut strings = Vec::with_capacity(values.len());
+    for idx in 0..values.len() {
+        if values.is_null(idx) {
+            return Err(crate::Error::DataInvalid {
+                message: format!("AuditLogTable _VALUE_KIND is null at row {idx}"),
+                source: None,
+            });
+        }
+        let rowkind = match values.value(idx) {
             0 => "+I",
             1 => "-U",
             2 => "+U",
             3 => "-D",
-            _ => "?",
-        })
-        .collect();
+            value => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "AuditLogTable _VALUE_KIND has invalid value {value} at row {idx}"
+                    ),
+                    source: None,
+                });
+            }
+        };
+        strings.push(rowkind);
+    }
     Ok(StringArray::from(strings))
 }
 
@@ -617,6 +632,25 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_rowkind_rejects_null_value_kind() {
+        let values = arrow_array::Int8Array::from(vec![Some(0), None]);
+        assert!(matches!(
+            rowkind_array_from_column(&values),
+            Err(crate::Error::DataInvalid { ref message, .. }) if message.contains("null at row 1")
+        ));
+    }
+
+    #[test]
+    fn test_rowkind_rejects_invalid_value_kind() {
+        let values = arrow_array::Int8Array::from(vec![4]);
+        assert!(matches!(
+            rowkind_array_from_column(&values),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("invalid value 4 at row 0")
+        ));
     }
 
     #[test]
