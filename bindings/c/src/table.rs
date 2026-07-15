@@ -1371,7 +1371,8 @@ pub unsafe extern "C" fn paimon_predicate_not_between_with_case_sensitive(
     )
 }
 
-/// Helper to build an IN/NOT IN predicate with a datum array.
+/// Helper to build a predicate from a datum array (IN / NOT IN, BETWEEN / NOT
+/// BETWEEN).
 unsafe fn build_leaf_predicate_datums(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
@@ -1576,6 +1577,39 @@ const _: unsafe extern "C" fn(
     *const paimon_datum,
     usize,
 ) -> paimon_result_predicate = paimon_predicate_is_not_in;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_starts_with;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_ends_with;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_contains;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    std::ffi::c_char,
+) -> paimon_result_predicate = paimon_predicate_like;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_between;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_not_between;
 
 #[cfg(test)]
 mod tests {
@@ -1754,6 +1788,61 @@ mod tests {
                 col.as_ptr(),
                 int_datum(20),
                 int_datum(10),
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn with_case_sensitive_variants_build_predicates() {
+        // Touch every `_with_case_sensitive` symbol so all twelve new FFI
+        // entry points are exercised, not just the default-case-sensitive ones.
+        unsafe {
+            let table = boxed_test_table();
+            let name = CString::new("name").unwrap();
+            let age = CString::new("age").unwrap();
+            let pat = CString::new("ab").unwrap();
+            let like_pat = CString::new("ab%").unwrap();
+
+            assert_ok_and_free(paimon_predicate_starts_with_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_ends_with_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_contains_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_like_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&like_pat),
+                0,
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_between_with_case_sensitive(
+                table,
+                age.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_not_between_with_case_sensitive(
+                table,
+                age.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+                false,
             ));
 
             paimon_table_free(table);
