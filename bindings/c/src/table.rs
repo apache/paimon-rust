@@ -1289,6 +1289,88 @@ pub unsafe extern "C" fn paimon_predicate_like_with_case_sensitive(
     )
 }
 
+/// Create a BETWEEN predicate: `low <= column <= high` (inclusive, case-sensitive
+/// column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_between(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(table, column, datums.as_ptr(), 2, true, |pb, col, ds| {
+        pb.between(col, ds[0].clone(), ds[1].clone())
+    })
+}
+
+/// Create a BETWEEN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_between_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums.as_ptr(),
+        2,
+        case_sensitive,
+        |pb, col, ds| pb.between(col, ds[0].clone(), ds[1].clone()),
+    )
+}
+
+/// Create a NOT BETWEEN predicate: `column < low OR column > high`
+/// (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_not_between(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(table, column, datums.as_ptr(), 2, true, |pb, col, ds| {
+        pb.not_between(col, ds[0].clone(), ds[1].clone())
+    })
+}
+
+/// Create a NOT BETWEEN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_not_between_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums.as_ptr(),
+        2,
+        case_sensitive,
+        |pb, col, ds| pb.not_between(col, ds[0].clone(), ds[1].clone()),
+    )
+}
+
 /// Helper to build an IN/NOT IN predicate with a datum array.
 unsafe fn build_leaf_predicate_datums(
     table: *const paimon_table,
