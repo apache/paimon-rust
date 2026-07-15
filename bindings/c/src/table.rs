@@ -1142,6 +1142,99 @@ pub unsafe extern "C" fn paimon_predicate_is_not_in_with_case_sensitive(
     )
 }
 
+/// Create a starts-with predicate: `column LIKE 'datum%'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_starts_with(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.starts_with(col, d)
+    })
+}
+
+/// Create a starts-with predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_starts_with_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.starts_with(col, d)
+    })
+}
+
+/// Create an ends-with predicate: `column LIKE '%datum'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_ends_with(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.ends_with(col, d)
+    })
+}
+
+/// Create an ends-with predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_ends_with_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.ends_with(col, d)
+    })
+}
+
+/// Create a contains predicate: `column LIKE '%datum%'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_contains(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.contains(col, d)
+    })
+}
+
+/// Create a contains predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_contains_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.contains(col, d)
+    })
+}
+
 /// Helper to build an IN/NOT IN predicate with a datum array.
 unsafe fn build_leaf_predicate_datums(
     table: *const paimon_table,
