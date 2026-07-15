@@ -641,6 +641,20 @@ unsafe fn datum_from_c(d: &paimon_datum) -> Result<Datum, *mut paimon_error> {
     }
 }
 
+/// Map a C escape byte to the core's `Option<char>` escape parameter.
+///
+/// `0` (NUL) means "use the core default escape" (`None`; the core resolves it
+/// to `\`). Any other byte is the escape character. `c_char` is signed on the
+/// target platforms, so the byte is taken through `u8` before `char` to avoid
+/// sign extension.
+fn escape_char_from_c(escape: std::ffi::c_char) -> Option<char> {
+    if escape == 0 {
+        None
+    } else {
+        Some(escape as u8 as char)
+    }
+}
+
 /// Coerce an integer-family datum to match the target column's integer type.
 ///
 /// FFI callers (e.g. Go) often pass a narrower integer literal (Int) for a
@@ -1233,6 +1247,46 @@ pub unsafe extern "C" fn paimon_predicate_contains_with_case_sensitive(
     build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
         pb.contains(col, d)
     })
+}
+
+/// Create a LIKE predicate: `column LIKE pattern ESCAPE escape` (case-sensitive
+/// column match). `escape == 0` uses the default escape character.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_like(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    pattern: paimon_datum,
+    escape: std::ffi::c_char,
+) -> paimon_result_predicate {
+    let escape_opt = escape_char_from_c(escape);
+    build_leaf_predicate_datum(table, column, &pattern, true, move |pb, col, d| {
+        pb.like(col, d, escape_opt)
+    })
+}
+
+/// Create a LIKE predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_like_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    pattern: paimon_datum,
+    escape: std::ffi::c_char,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let escape_opt = escape_char_from_c(escape);
+    build_leaf_predicate_datum(
+        table,
+        column,
+        &pattern,
+        case_sensitive,
+        move |pb, col, d| pb.like(col, d, escape_opt),
+    )
 }
 
 /// Helper to build an IN/NOT IN predicate with a datum array.
