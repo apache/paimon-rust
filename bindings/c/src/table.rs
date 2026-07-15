@@ -1723,6 +1723,18 @@ const _: unsafe extern "C" fn(
     paimon_datum,
 ) -> paimon_result_predicate = paimon_predicate_not_between;
 
+// Read builder ABI signature guards. These pin the C-linked read-builder
+// constructors so an accidental signature change fails to compile rather than
+// silently breaking header consumers. To add behavior, introduce a new
+// `paimon_table_new_read_builder_*` symbol instead of changing one of these.
+const _: unsafe extern "C" fn(*const paimon_table) -> paimon_result_read_builder =
+    paimon_table_new_read_builder;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const paimon_option,
+    usize,
+) -> paimon_result_read_builder = paimon_table_new_read_builder_with_options;
+
 #[cfg(test)]
 mod tests {
     use super::*;
