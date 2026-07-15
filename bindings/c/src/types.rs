@@ -16,9 +16,11 @@
 // under the License.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
+use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
-use paimon::table::Table;
+use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -189,6 +191,25 @@ pub(crate) struct WriteBuilderState {
     pub overwrite: bool,
 }
 
+pub(crate) struct TableWriteState {
+    pub write: TableWrite,
+    pub target_schema: Arc<ArrowSchema>,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct TableCommitState {
+    pub commit: TableCommit,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct CommitMessagesState {
+    pub messages: Vec<CommitMessage>,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
 #[repr(C)]
 pub struct paimon_write_builder {
     pub inner: *mut c_void,
@@ -204,7 +225,7 @@ pub struct paimon_table_commit {
     pub inner: *mut c_void,
 }
 
-/// Opaque container for a Vec<CommitMessage> produced by prepare_commit.
+/// Opaque container for commit messages and their originating write context.
 #[repr(C)]
 pub struct paimon_commit_messages {
     pub inner: *mut c_void,

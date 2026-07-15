@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use arrow_array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{RecordBatch, StructArray};
-use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use paimon::table::Table;
 
-use crate::error::{check_non_null, paimon_error, PaimonErrorCode};
+use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
     paimon_result_prepare_commit, paimon_result_table_commit, paimon_result_table_write,
     paimon_result_write_builder,
@@ -31,6 +33,42 @@ use crate::runtime;
 use crate::types::*;
 
 // ======================= WriteBuilder ===============================
+
+unsafe fn new_write_builder(
+    table: *const paimon_table,
+    commit_user: Option<String>,
+) -> paimon_result_write_builder {
+    if let Err(e) = check_non_null(table, "table") {
+        return paimon_result_write_builder {
+            write_builder: ptr::null_mut(),
+            error: e,
+        };
+    }
+    let table_ref = &*((*table).inner as *const Table);
+    let builder = table_ref.new_write_builder();
+    let commit_user = match commit_user {
+        Some(commit_user) => match builder.with_commit_user(commit_user) {
+            Ok(builder) => builder.commit_user().to_string(),
+            Err(e) => {
+                return paimon_result_write_builder {
+                    write_builder: ptr::null_mut(),
+                    error: paimon_error::from_paimon(e),
+                }
+            }
+        },
+        None => builder.commit_user().to_string(),
+    };
+    let state = WriteBuilderState {
+        table: table_ref.clone(),
+        commit_user,
+        overwrite: false,
+    };
+    let inner = Box::into_raw(Box::new(state)) as *mut c_void;
+    paimon_result_write_builder {
+        write_builder: Box::into_raw(Box::new(paimon_write_builder { inner })),
+        error: ptr::null_mut(),
+    }
+}
 
 /// Create a new WriteBuilder from a Table.
 ///
@@ -43,25 +81,31 @@ use crate::types::*;
 pub unsafe extern "C" fn paimon_table_new_write_builder(
     table: *const paimon_table,
 ) -> paimon_result_write_builder {
-    if let Err(e) = check_non_null(table, "table") {
-        return paimon_result_write_builder {
-            write_builder: ptr::null_mut(),
-            error: e,
-        };
-    }
-    let table_ref = &*((*table).inner as *const Table);
-    let wb = table_ref.new_write_builder();
-    let commit_user = wb.commit_user().to_string();
-    let state = WriteBuilderState {
-        table: table_ref.clone(),
-        commit_user,
-        overwrite: false,
+    new_write_builder(table, None)
+}
+
+/// Create a WriteBuilder with a caller-provided stable commit identity.
+///
+/// Distributed writers for one commit should use the same `commit_user`.
+///
+/// # Safety
+/// `table` must be a valid table pointer. `commit_user` must be a valid UTF-8
+/// C string and a safe file-name segment.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_new_write_builder_with_commit_user(
+    table: *const paimon_table,
+    commit_user: *const c_char,
+) -> paimon_result_write_builder {
+    let commit_user = match validate_cstr(commit_user, "commit_user") {
+        Ok(commit_user) => commit_user,
+        Err(error) => {
+            return paimon_result_write_builder {
+                write_builder: ptr::null_mut(),
+                error,
+            }
+        }
     };
-    let inner = Box::into_raw(Box::new(state)) as *mut c_void;
-    paimon_result_write_builder {
-        write_builder: Box::into_raw(Box::new(paimon_write_builder { inner })),
-        error: ptr::null_mut(),
-    }
+    new_write_builder(table, Some(commit_user))
 }
 
 /// Free a paimon_write_builder.
@@ -98,6 +142,75 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
 }
 
 // ======================= TableWrite ===============================
+
+fn invalid_input(message: impl Into<String>) -> *mut paimon_error {
+    paimon_error::new(PaimonErrorCode::InvalidInput, message.into())
+}
+
+fn validate_batch_schema(
+    input: &ArrowSchema,
+    target: &ArrowSchema,
+) -> Result<(), *mut paimon_error> {
+    let matches = input.fields().len() == target.fields().len()
+        && input
+            .fields()
+            .iter()
+            .zip(target.fields().iter())
+            .all(|(input, target)| {
+                input.name() == target.name() && input.data_type() == target.data_type()
+            });
+    if matches {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "Input schema is not consistent with the table schema. input: {input:?}, table: {target:?}"
+        )))
+    }
+}
+
+unsafe fn import_record_batch(
+    array: *mut c_void,
+    schema: *mut c_void,
+) -> Result<RecordBatch, *mut paimon_error> {
+    // Arrow's from_raw implements the C Data Interface move operation: it
+    // replaces the caller-owned struct with an empty/released value.
+    let ffi_array = FFI_ArrowArray::from_raw(array as *mut FFI_ArrowArray);
+    let ffi_schema = FFI_ArrowSchema::from_raw(schema as *mut FFI_ArrowSchema);
+    let data = match from_ffi(ffi_array, &ffi_schema) {
+        Ok(data) => data,
+        Err(e) => {
+            drop(ffi_schema);
+            return Err(invalid_input(format!(
+                "Failed to import Arrow record batch: {e}"
+            )));
+        }
+    };
+    drop(ffi_schema);
+
+    if !matches!(data.data_type(), ArrowDataType::Struct(_)) {
+        return Err(invalid_input(format!(
+            "Arrow record batch root must be Struct, got {:?}",
+            data.data_type()
+        )));
+    }
+
+    let struct_array = StructArray::from(data);
+    if struct_array.null_count() != 0 {
+        return Err(invalid_input(
+            "Arrow record batch root Struct must not contain nulls",
+        ));
+    }
+
+    let row_count = struct_array.len();
+    let (fields, columns, _) = struct_array.into_parts();
+    let schema = Arc::new(ArrowSchema::new(fields));
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .map_err(|e| invalid_input(format!("Failed to construct Arrow record batch: {e}")))
+}
 
 /// Create a new TableWrite from the WriteBuilder.
 ///
@@ -145,7 +258,23 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
         }
     };
 
-    let inner = Box::into_raw(Box::new(tw)) as *mut c_void;
+    let target_schema =
+        match paimon::arrow::build_target_arrow_schema(state.table.schema().fields()) {
+            Ok(schema) => schema,
+            Err(e) => {
+                return paimon_result_table_write {
+                    write: ptr::null_mut(),
+                    error: paimon_error::from_paimon(e),
+                }
+            }
+        };
+    let table_write = TableWriteState {
+        write: tw,
+        target_schema,
+        table_location: state.table.location().to_string(),
+        commit_user: state.commit_user.clone(),
+    };
+    let inner = Box::into_raw(Box::new(table_write)) as *mut c_void;
     paimon_result_table_write {
         write: Box::into_raw(Box::new(paimon_table_write { inner })),
         error: ptr::null_mut(),
@@ -164,7 +293,7 @@ pub unsafe extern "C" fn paimon_table_write_free(tw: *mut paimon_table_write) {
     if !tw.is_null() {
         let wrapper = Box::from_raw(tw);
         if !wrapper.inner.is_null() {
-            drop(Box::from_raw(wrapper.inner as *mut TableWrite));
+            drop(Box::from_raw(wrapper.inner as *mut TableWriteState));
         }
     }
 }
@@ -196,31 +325,16 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
         return e;
     }
 
-    let table_write = &mut *((*tw).inner as *mut TableWrite);
-
-    let ffi_array = ptr::read(array as *const FFI_ArrowArray);
-    let ffi_schema = ptr::read(schema as *const FFI_ArrowSchema);
-
-    let batch = match unsafe { from_ffi(ffi_array, &ffi_schema) } {
-        Ok(data) => {
-            // The ffi_array was consumed by from_ffi (moved by value).
-            // The ffi_schema was only borrowed; it will be dropped below,
-            // calling release on the schema resources.
-            drop(ffi_schema);
-            RecordBatch::from(StructArray::from(data))
-        }
-        Err(e) => {
-            // from_ffi consumed ffi_array (by value). Its drop will call release.
-            // We let ffi_schema drop normally here too.
-            drop(ffi_schema);
-            return paimon_error::new(
-                PaimonErrorCode::InvalidInput,
-                format!("Failed to import Arrow record batch: {e}"),
-            );
-        }
+    let table_write = &mut *((*tw).inner as *mut TableWriteState);
+    let batch = match import_record_batch(array, schema) {
+        Ok(batch) => batch,
+        Err(error) => return error,
     };
+    if let Err(error) = validate_batch_schema(&batch.schema(), &table_write.target_schema) {
+        return error;
+    }
 
-    match runtime().block_on(table_write.write_arrow_batch(&batch)) {
+    match runtime().block_on(table_write.write.write_arrow_batch(&batch)) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -248,10 +362,15 @@ pub unsafe extern "C" fn paimon_table_write_prepare_commit(
             error: e,
         };
     }
-    let table_write = &mut *((*tw).inner as *mut TableWrite);
+    let table_write = &mut *((*tw).inner as *mut TableWriteState);
 
-    match runtime().block_on(table_write.prepare_commit()) {
+    match runtime().block_on(table_write.write.prepare_commit()) {
         Ok(messages) => {
+            let messages = CommitMessagesState {
+                messages,
+                table_location: table_write.table_location.clone(),
+                commit_user: table_write.commit_user.clone(),
+            };
             let inner = Box::into_raw(Box::new(messages)) as *mut c_void;
             paimon_result_prepare_commit {
                 messages: Box::into_raw(Box::new(paimon_commit_messages { inner })),
@@ -310,7 +429,12 @@ pub unsafe extern "C" fn paimon_write_builder_new_commit(
         }
     };
 
-    let inner = Box::into_raw(Box::new(tc)) as *mut c_void;
+    let table_commit = TableCommitState {
+        commit: tc,
+        table_location: state.table.location().to_string(),
+        commit_user: state.commit_user.clone(),
+    };
+    let inner = Box::into_raw(Box::new(table_commit)) as *mut c_void;
     paimon_result_table_commit {
         commit: Box::into_raw(Box::new(paimon_table_commit { inner })),
         error: ptr::null_mut(),
@@ -326,7 +450,7 @@ pub unsafe extern "C" fn paimon_table_commit_free(tc: *mut paimon_table_commit) 
     if !tc.is_null() {
         let wrapper = Box::from_raw(tc);
         if !wrapper.inner.is_null() {
-            drop(Box::from_raw(wrapper.inner as *mut TableCommit));
+            drop(Box::from_raw(wrapper.inner as *mut TableCommitState));
         }
     }
 }
@@ -342,16 +466,36 @@ pub unsafe extern "C" fn paimon_commit_messages_free(msgs: *mut paimon_commit_me
     if !msgs.is_null() {
         let wrapper = Box::from_raw(msgs);
         if !wrapper.inner.is_null() {
-            drop(Box::from_raw(wrapper.inner as *mut Vec<CommitMessage>));
+            drop(Box::from_raw(wrapper.inner as *mut CommitMessagesState));
         }
     }
 }
 
 // ======================= Commit operations ===============================
 
+fn validate_commit_context(
+    commit: &TableCommitState,
+    messages: &CommitMessagesState,
+) -> Result<(), *mut paimon_error> {
+    if commit.table_location != messages.table_location {
+        return Err(invalid_input(format!(
+            "commit messages were prepared for a different table (message table '{}', committer table '{}')",
+            messages.table_location, commit.table_location
+        )));
+    }
+    if commit.commit_user != messages.commit_user {
+        return Err(invalid_input(
+            "commit messages were prepared with a different commit_user",
+        ));
+    }
+    Ok(())
+}
+
 /// Commit the given messages in APPEND mode.
 ///
 /// Empty messages is a no-op success.
+/// The caller retains ownership of `msgs`; it may retry after an error and
+/// must eventually release the handle with `paimon_commit_messages_free`.
 ///
 /// # Safety
 /// `tc` must be a valid pointer from `paimon_write_builder_new_commit`, or null (returns error).
@@ -361,6 +505,20 @@ pub unsafe extern "C" fn paimon_table_commit_commit(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
 ) -> *mut paimon_error {
+    paimon_table_commit_commit_with_identifier(tc, msgs, i64::MAX)
+}
+
+/// Commit the given messages with a caller-provided stable identifier.
+///
+/// Reusing the same non-batch identifier with the same `commit_user` is
+/// idempotent, including across separate invocations after an uncertain result.
+/// The caller retains ownership of `msgs` and must free it explicitly.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
+    tc: *const paimon_table_commit,
+    msgs: *mut paimon_commit_messages,
+    commit_identifier: i64,
+) -> *mut paimon_error {
     if let Err(e) = check_non_null(tc, "tc") {
         return e;
     }
@@ -368,16 +526,17 @@ pub unsafe extern "C" fn paimon_table_commit_commit(
         return e;
     }
 
-    let table_commit = &*((*tc).inner as *const TableCommit);
-    let messages = Box::from_raw((*msgs).inner as *mut Vec<CommitMessage>);
-    // Release the outer wrapper to avoid double-free when caller frees msgs
-    drop(Box::from_raw(msgs));
-
-    if messages.is_empty() {
-        return ptr::null_mut();
+    let table_commit = &*((*tc).inner as *const TableCommitState);
+    let messages = &*((*msgs).inner as *const CommitMessagesState);
+    if let Err(error) = validate_commit_context(table_commit, messages) {
+        return error;
     }
 
-    match runtime().block_on(table_commit.commit(*messages)) {
+    match runtime().block_on(
+        table_commit
+            .commit
+            .commit_with_identifier(messages.messages.clone(), commit_identifier),
+    ) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -387,6 +546,8 @@ pub unsafe extern "C" fn paimon_table_commit_commit(
 ///
 /// `static_partitions` is currently passed as `None` (overwrite all
 /// partitions that were written to).
+/// The caller retains ownership of `msgs`; it may retry after an error and
+/// must eventually release the handle with `paimon_commit_messages_free`.
 ///
 /// # Safety
 /// `tc` must be a valid pointer from `paimon_write_builder_new_commit`, or null (returns error).
@@ -396,6 +557,18 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
 ) -> *mut paimon_error {
+    paimon_table_commit_overwrite_with_identifier(tc, msgs, i64::MAX)
+}
+
+/// Overwrite with a caller-provided stable commit identifier.
+///
+/// The caller retains ownership of `msgs` and must free it explicitly.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_overwrite_with_identifier(
+    tc: *const paimon_table_commit,
+    msgs: *mut paimon_commit_messages,
+    commit_identifier: i64,
+) -> *mut paimon_error {
     if let Err(e) = check_non_null(tc, "tc") {
         return e;
     }
@@ -403,15 +576,17 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite(
         return e;
     }
 
-    let table_commit = &*((*tc).inner as *const TableCommit);
-    let messages = Box::from_raw((*msgs).inner as *mut Vec<CommitMessage>);
-    drop(Box::from_raw(msgs));
-
-    if messages.is_empty() {
-        return ptr::null_mut();
+    let table_commit = &*((*tc).inner as *const TableCommitState);
+    let messages = &*((*msgs).inner as *const CommitMessagesState);
+    if let Err(error) = validate_commit_context(table_commit, messages) {
+        return error;
     }
 
-    match runtime().block_on(table_commit.overwrite(*messages, None)) {
+    match runtime().block_on(table_commit.commit.overwrite_with_identifier(
+        messages.messages.clone(),
+        None,
+        commit_identifier,
+    )) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -428,13 +603,26 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite(
 pub unsafe extern "C" fn paimon_table_commit_truncate_table(
     tc: *const paimon_table_commit,
 ) -> *mut paimon_error {
+    paimon_table_commit_truncate_table_with_identifier(tc, i64::MAX)
+}
+
+/// Truncate the table with a caller-provided stable commit identifier.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_truncate_table_with_identifier(
+    tc: *const paimon_table_commit,
+    commit_identifier: i64,
+) -> *mut paimon_error {
     if let Err(e) = check_non_null(tc, "tc") {
         return e;
     }
 
-    let table_commit = &*((*tc).inner as *const TableCommit);
+    let table_commit = &*((*tc).inner as *const TableCommitState);
 
-    match runtime().block_on(table_commit.truncate_table()) {
+    match runtime().block_on(
+        table_commit
+            .commit
+            .truncate_table_with_identifier(commit_identifier),
+    ) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -442,9 +630,10 @@ pub unsafe extern "C" fn paimon_table_commit_truncate_table(
 
 /// Abort a prepared commit, cleaning up written data files.
 ///
-/// This is a best-effort cleanup — it attempts to delete new data and
-/// changelog files produced by the writer. Errors during cleanup are
-/// returned but do not roll back the cleanup of previously-deleted files.
+/// This is a best-effort cleanup — it attempts to delete new data, changelog,
+/// and index files produced by the writer. Storage deletion errors are ignored
+/// so cleanup does not mask an earlier write or commit failure.
+/// The caller retains ownership of `msgs` and must free it explicitly.
 ///
 /// # Safety
 /// `tc` must be a valid pointer from `paimon_write_builder_new_commit`, or null (returns error).
@@ -461,15 +650,13 @@ pub unsafe extern "C" fn paimon_table_commit_abort(
         return e;
     }
 
-    let table_commit = &*((*tc).inner as *const TableCommit);
-    let messages = Box::from_raw((*msgs).inner as *mut Vec<CommitMessage>);
-    drop(Box::from_raw(msgs));
-
-    if messages.is_empty() {
-        return ptr::null_mut();
+    let table_commit = &*((*tc).inner as *const TableCommitState);
+    let messages = &*((*msgs).inner as *const CommitMessagesState);
+    if let Err(error) = validate_commit_context(table_commit, messages) {
+        return error;
     }
 
-    match runtime().block_on(table_commit.abort(&messages)) {
+    match runtime().block_on(table_commit.commit.abort(&messages.messages)) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -479,6 +666,8 @@ pub unsafe extern "C" fn paimon_table_commit_abort(
 
 const _: unsafe extern "C" fn(*const paimon_table) -> paimon_result_write_builder =
     paimon_table_new_write_builder;
+const _: unsafe extern "C" fn(*const paimon_table, *const c_char) -> paimon_result_write_builder =
+    paimon_table_new_write_builder_with_commit_user;
 const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_table_write =
     paimon_write_builder_new_write;
 const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_table_commit =
@@ -497,9 +686,21 @@ const _: unsafe extern "C" fn(
 const _: unsafe extern "C" fn(
     *const paimon_table_commit,
     *mut paimon_commit_messages,
+    i64,
+) -> *mut paimon_error = paimon_table_commit_commit_with_identifier;
+const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    *mut paimon_commit_messages,
 ) -> *mut paimon_error = paimon_table_commit_overwrite;
+const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    *mut paimon_commit_messages,
+    i64,
+) -> *mut paimon_error = paimon_table_commit_overwrite_with_identifier;
 const _: unsafe extern "C" fn(*const paimon_table_commit) -> *mut paimon_error =
     paimon_table_commit_truncate_table;
+const _: unsafe extern "C" fn(*const paimon_table_commit, i64) -> *mut paimon_error =
+    paimon_table_commit_truncate_table_with_identifier;
 const _: unsafe extern "C" fn(
     *const paimon_table_commit,
     *mut paimon_commit_messages,

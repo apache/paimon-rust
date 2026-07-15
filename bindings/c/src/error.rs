@@ -58,6 +58,7 @@ impl paimon_error {
             | paimon::Error::ColumnAlreadyExist { .. } => PaimonErrorCode::AlreadyExists,
             paimon::Error::ConfigInvalid { .. }
             | paimon::Error::DataTypeInvalid { .. }
+            | paimon::Error::DataInvalid { .. }
             | paimon::Error::IdentifierInvalid { .. } => PaimonErrorCode::InvalidInput,
             paimon::Error::IoUnexpected { .. } => PaimonErrorCode::IoError,
             _ => PaimonErrorCode::Unexpected,

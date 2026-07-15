@@ -27,16 +27,18 @@
 
 use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
+use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
 
+use arrow::buffer::NullBuffer;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
 use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
-use paimon::table::Table;
+use paimon::table::{SnapshotManager, Table};
 
 use crate::error::*;
 use crate::table::*;
@@ -87,6 +89,21 @@ fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     .unwrap()
 }
 
+fn make_type_mismatch_batch(ids: Vec<&str>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Utf8, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
 fn export_batch_to_ffi(
     batch: RecordBatch,
 ) -> (
@@ -101,6 +118,32 @@ fn export_batch_to_ffi(
         Box::new(ManuallyDrop::new(ffi_array)),
         Box::new(ManuallyDrop::new(ffi_schema)),
     )
+}
+
+fn export_array_to_ffi(
+    array: &dyn Array,
+) -> (
+    Box<ManuallyDrop<FFI_ArrowArray>>,
+    Box<ManuallyDrop<FFI_ArrowSchema>>,
+) {
+    let data = array.to_data();
+    (
+        Box::new(ManuallyDrop::new(FFI_ArrowArray::new(&data))),
+        Box::new(ManuallyDrop::new(
+            FFI_ArrowSchema::try_from(data.data_type()).unwrap(),
+        )),
+    )
+}
+
+fn run_current_test_in_child(test_name: &str, env_name: &str, env_value: &str) -> bool {
+    Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(env_name, env_value)
+        .status()
+        .unwrap()
+        .success()
 }
 
 /// Use Rust API to write data (runs on global runtime via block_on).
@@ -614,6 +657,7 @@ fn test_write_commit_read_roundtrip() {
 
         let err = paimon_table_commit_commit(tc, pc_result.messages);
         assert!(err.is_null());
+        paimon_commit_messages_free(pc_result.messages);
 
         let rows = read_rows_ffi(handle);
         assert_eq!(
@@ -626,6 +670,352 @@ fn test_write_commit_read_roundtrip() {
         paimon_write_builder_free(wb);
         unwrap_table(handle);
     }
+}
+
+#[test]
+fn test_write_arrow_batch_moves_ffi_structs() {
+    let path = "memory:/test_write_arrow_batch_moves_ffi_structs";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let wb = paimon_table_new_write_builder(handle).write_builder;
+        let tw = paimon_write_builder_new_write(wb).write;
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+
+        let err = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(err.is_null());
+        assert!(array.is_released(), "import must clear ArrowArray.release");
+        assert!(
+            schema.release.is_none(),
+            "import must clear ArrowSchema.release"
+        );
+
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_write_arrow_batch_rejects_table_schema_mismatch() {
+    let path = "memory:/test_write_arrow_batch_rejects_table_schema_mismatch";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let wb = paimon_table_new_write_builder(handle).write_builder;
+        let tw = paimon_write_builder_new_write(wb).write;
+        let (array, schema) = export_batch_to_ffi(make_type_mismatch_batch(vec!["1"], vec!["a"]));
+
+        let err = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!err.is_null(), "schema mismatch must be rejected");
+        paimon_error_free(err);
+
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_write_arrow_batch_rejects_invalid_root_arrays_without_aborting() {
+    const CHILD_ENV: &str = "PAIMON_C_INVALID_ROOT_CHILD";
+    if let Ok(mode) = std::env::var(CHILD_ENV) {
+        let path = format!("memory:/test_invalid_root_{mode}");
+        let file_io = memory_file_io();
+        setup_table_dirs(&file_io, &path);
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test"),
+            path,
+            simple_table_schema(),
+            None,
+        );
+        let handle = unsafe { wrap_table(table) };
+
+        unsafe {
+            let wb = paimon_table_new_write_builder(handle).write_builder;
+            let tw = paimon_write_builder_new_write(wb).write;
+            let (array, schema) = if mode == "non_struct" {
+                let array = Int32Array::from(vec![1]);
+                export_array_to_ffi(&array)
+            } else {
+                let fields =
+                    vec![Arc::new(ArrowField::new("id", ArrowDataType::Int32, false))].into();
+                let array = StructArray::new(
+                    fields,
+                    vec![Arc::new(Int32Array::from(vec![1]))],
+                    Some(NullBuffer::new_null(1)),
+                );
+                export_array_to_ffi(&array)
+            };
+            let err = paimon_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(!err.is_null(), "invalid root array must return an error");
+            paimon_error_free(err);
+            paimon_table_write_free(tw);
+            paimon_write_builder_free(wb);
+            unwrap_table(handle);
+        }
+        return;
+    }
+
+    for mode in ["non_struct", "nullable_struct"] {
+        assert!(
+            run_current_test_in_child(
+                "tests::test_write_arrow_batch_rejects_invalid_root_arrays_without_aborting",
+                CHILD_ENV,
+                mode,
+            ),
+            "{mode} input must return an error instead of aborting the process"
+        );
+    }
+}
+
+#[test]
+fn test_commit_rejects_messages_from_another_table() {
+    let file_io = memory_file_io();
+    let source_path = "memory:/test_commit_provenance_source";
+    let target_path = "memory:/test_commit_provenance_target";
+    setup_table_dirs(&file_io, source_path);
+    setup_table_dirs(&file_io, target_path);
+    let source = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "source"),
+        source_path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let target = Table::new(
+        file_io,
+        Identifier::new("default", "target"),
+        target_path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let source_handle = unsafe { wrap_table(source) };
+    let target_handle = unsafe { wrap_table(target) };
+
+    unsafe {
+        let source_wb = paimon_table_new_write_builder(source_handle).write_builder;
+        let source_tw = paimon_write_builder_new_write(source_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+        let err = paimon_table_write_write_arrow_batch(
+            source_tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(err.is_null());
+        let messages = paimon_table_write_prepare_commit(source_tw).messages;
+
+        let target_wb = paimon_table_new_write_builder(target_handle).write_builder;
+        let target_commit = paimon_write_builder_new_commit(target_wb).commit;
+        let err = paimon_table_commit_commit(target_commit, messages);
+        assert!(
+            !err.is_null(),
+            "a committer must reject messages prepared for another table"
+        );
+        paimon_error_free(err);
+
+        paimon_commit_messages_free(messages);
+        paimon_table_commit_free(target_commit);
+        paimon_write_builder_free(target_wb);
+        paimon_table_write_free(source_tw);
+        paimon_write_builder_free(source_wb);
+        unwrap_table(target_handle);
+        unwrap_table(source_handle);
+    }
+}
+
+#[test]
+fn test_commit_rejects_messages_from_different_builder_identity() {
+    let path = "memory:/test_commit_builder_provenance";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let writer_wb = paimon_table_new_write_builder(handle).write_builder;
+        let tw = paimon_write_builder_new_write(writer_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+        let err = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(err.is_null());
+        let messages = paimon_table_write_prepare_commit(tw).messages;
+
+        let other_wb = paimon_table_new_write_builder(handle).write_builder;
+        let wrong_commit = paimon_write_builder_new_commit(other_wb).commit;
+        let err = paimon_table_commit_commit(wrong_commit, messages);
+        assert!(
+            !err.is_null(),
+            "messages from another commit_user must be rejected"
+        );
+        paimon_error_free(err);
+
+        let correct_commit = paimon_write_builder_new_commit(writer_wb).commit;
+        let err = paimon_table_commit_commit(correct_commit, messages);
+        assert!(err.is_null(), "rejected messages must remain reusable");
+
+        paimon_commit_messages_free(messages);
+        paimon_table_commit_free(correct_commit);
+        paimon_table_commit_free(wrong_commit);
+        paimon_write_builder_free(other_wb);
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(writer_wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_commit_messages_live_until_explicit_free() {
+    const CHILD_ENV: &str = "PAIMON_C_MESSAGES_LIFETIME_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let path = "memory:/test_commit_messages_lifetime";
+        let file_io = memory_file_io();
+        setup_table_dirs(&file_io, path);
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test"),
+            path.to_string(),
+            simple_table_schema(),
+            None,
+        );
+        let handle = unsafe { wrap_table(table) };
+
+        unsafe {
+            let wb = paimon_table_new_write_builder(handle).write_builder;
+            let tw = paimon_write_builder_new_write(wb).write;
+            let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+            let err = paimon_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(err.is_null());
+            let messages = paimon_table_write_prepare_commit(tw).messages;
+            let commit = paimon_write_builder_new_commit(wb).commit;
+            let err = paimon_table_commit_commit(commit, messages);
+            assert!(err.is_null());
+
+            paimon_commit_messages_free(messages);
+            paimon_table_commit_free(commit);
+            paimon_table_write_free(tw);
+            paimon_write_builder_free(wb);
+            unwrap_table(handle);
+        }
+        return;
+    }
+
+    assert!(
+        run_current_test_in_child(
+            "tests::test_commit_messages_live_until_explicit_free",
+            CHILD_ENV,
+            "1",
+        ),
+        "commit must not destroy a handle that callers are required to free"
+    );
+}
+
+#[test]
+fn test_caller_supplied_commit_identity_is_shared_and_persisted() {
+    let path = "memory:/test_caller_supplied_commit_identity";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("doris-load-job-42").unwrap();
+
+    unsafe {
+        let writer_wb =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+                .write_builder;
+        let committer_wb =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+                .write_builder;
+        let tw = paimon_write_builder_new_write(writer_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+        let err = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(err.is_null());
+        let messages = paimon_table_write_prepare_commit(tw).messages;
+        let commit = paimon_write_builder_new_commit(committer_wb).commit;
+        let err = paimon_table_commit_commit_with_identifier(commit, messages, 42);
+        assert!(err.is_null());
+
+        let retry_wb =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+                .write_builder;
+        let retry_commit = paimon_write_builder_new_commit(retry_wb).commit;
+        let err = paimon_table_commit_commit_with_identifier(retry_commit, messages, 42);
+        assert!(
+            err.is_null(),
+            "retrying the same identity must be idempotent"
+        );
+
+        paimon_commit_messages_free(messages);
+        paimon_table_commit_free(retry_commit);
+        paimon_write_builder_free(retry_wb);
+        paimon_table_commit_free(commit);
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(committer_wb);
+        paimon_write_builder_free(writer_wb);
+        unwrap_table(handle);
+    }
+
+    let snapshot = crate::runtime()
+        .block_on(SnapshotManager::new(file_io, path.to_string()).get_latest_snapshot())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.commit_user(), "doris-load-job-42");
+    assert_eq!(snapshot.commit_identifier(), 42);
+    assert_eq!(snapshot.id(), 1, "retry must not create another snapshot");
 }
 
 #[test]
@@ -667,6 +1057,7 @@ fn test_write_multiple_batches() {
         let tc = tc_result.commit;
         let err = paimon_table_commit_commit(tc, pc_result.messages);
         assert!(err.is_null());
+        paimon_commit_messages_free(pc_result.messages);
 
         let rows = read_rows_ffi(handle);
         assert_eq!(rows, vec![(1, "a".into()), (2, "b".into())]);
@@ -706,6 +1097,7 @@ fn test_commit_empty_messages_noop() {
         let tc = tc_result.commit;
         let err = paimon_table_commit_commit(tc, pc_result.messages);
         assert!(err.is_null());
+        paimon_commit_messages_free(pc_result.messages);
 
         let rows = read_rows_ffi(handle);
         assert!(rows.is_empty());
@@ -750,6 +1142,7 @@ fn test_write_overwrite_mode() {
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
             paimon_table_commit_commit(tc_result.commit, pc.messages);
+            paimon_commit_messages_free(pc.messages);
 
             paimon_table_commit_free(tc_result.commit);
             paimon_table_write_free(tw);
@@ -778,6 +1171,7 @@ fn test_write_overwrite_mode() {
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
             paimon_table_commit_overwrite(tc_result.commit, pc.messages);
+            paimon_commit_messages_free(pc.messages);
 
             paimon_table_commit_free(tc_result.commit);
             paimon_table_write_free(tw);
@@ -822,6 +1216,7 @@ fn test_truncate_table() {
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
             paimon_table_commit_commit(tc_result.commit, pc.messages);
+            paimon_commit_messages_free(pc.messages);
             paimon_table_commit_free(tc_result.commit);
             paimon_table_write_free(tw);
             paimon_write_builder_free(wb);
@@ -882,6 +1277,7 @@ fn test_abort_commit() {
         let tc = tc_result.commit;
         let err = paimon_table_commit_abort(tc, pc_result.messages);
         assert!(err.is_null());
+        paimon_commit_messages_free(pc_result.messages);
 
         let rows = read_rows_ffi(handle);
         assert!(rows.is_empty());
@@ -964,6 +1360,7 @@ fn test_two_commits_same_builder() {
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
             paimon_table_commit_commit(tc_result.commit, pc.messages);
+            paimon_commit_messages_free(pc.messages);
             paimon_table_commit_free(tc_result.commit);
             paimon_table_write_free(tw);
         }
@@ -982,6 +1379,7 @@ fn test_two_commits_same_builder() {
             let pc = paimon_table_write_prepare_commit(tw);
             let tc_result = paimon_write_builder_new_commit(wb);
             paimon_table_commit_commit(tc_result.commit, pc.messages);
+            paimon_commit_messages_free(pc.messages);
             paimon_table_commit_free(tc_result.commit);
             paimon_table_write_free(tw);
         }

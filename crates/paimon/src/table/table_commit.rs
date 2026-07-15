@@ -535,7 +535,7 @@ impl TableCommit {
         .await
     }
 
-    /// Abort a prepared commit by deleting newly written data and changelog files.
+    /// Abort a prepared commit by deleting newly written data, changelog and index files.
     ///
     /// Deletion is best-effort and mirrors Python `FileStoreCommit.abort`: missing
     /// files or storage errors are ignored so abort cleanup never masks the
@@ -553,6 +553,11 @@ impl TableCommit {
                 for path in file.collect_files(&bucket_path) {
                     let _ = self.table.file_io().delete_file(&path).await;
                 }
+            }
+            let index_dir = format!("{}/index", self.table.location().trim_end_matches('/'));
+            for file in &message.new_index_files {
+                let path = format!("{index_dir}/{}", file.file_name);
+                let _ = self.table.file_io().delete_file(&path).await;
             }
         }
         Ok(())
@@ -594,7 +599,13 @@ impl TableCommit {
 
         loop {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
-            if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
+            // Explicit identifiers are stable commit identities and must also
+            // deduplicate a fresh invocation after an uncertain result. The
+            // batch identifier is intentionally excluded because callers may
+            // perform multiple independent batch commits with the same user.
+            let duplicate_check_start = duplicate_check_start_snapshot_id
+                .or((commit_identifier != BATCH_COMMIT_IDENTIFIER).then_some(1));
+            if let Some(start_snapshot_id) = duplicate_check_start {
                 if self
                     .is_duplicate_commit(
                         start_snapshot_id,
@@ -3115,6 +3126,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repeated_commit_with_same_identity_is_idempotent() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_repeated_commit_with_same_identity";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let message = CommitMessage::new(vec![], 0, vec![test_data_file("data-0.parquet", 100)]);
+
+        commit
+            .commit_with_identifier(vec![message.clone()], 7)
+            .await
+            .unwrap();
+        commit
+            .commit_with_identifier(vec![message], 7)
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(
+            snapshot.id(),
+            1,
+            "retrying the same commit identity must not create another snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn test_multiple_appends() {
         let file_io = test_file_io();
         let table_path = "memory:/test_multiple_appends";
@@ -4686,6 +4723,40 @@ mod tests {
             .exists(&format!("{bucket_dir}/changelog.parquet"))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_abort_deletes_new_index_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_abort_index_cleanup";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let index_dir = format!("{table_path}/index");
+        let index_path = format!("{index_dir}/bucket-index");
+        file_io.mkdirs(&format!("{index_dir}/")).await.unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "HASH".to_string(),
+            file_name: "bucket-index".to_string(),
+            file_size: 5,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            global_index_meta: None,
+        }];
+        commit.abort(&[message]).await.unwrap();
+
+        assert!(
+            !file_io.exists(&index_path).await.unwrap(),
+            "abort must remove newly written index files"
+        );
     }
 
     #[tokio::test]
