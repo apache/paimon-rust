@@ -36,6 +36,7 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod blob_descriptor_functions;
 mod blob_reader;
 mod blob_view;
 mod catalog;

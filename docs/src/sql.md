@@ -68,13 +68,14 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner
-pre-registered. Use `register_catalog(...).await` to add one or more Paimon
-catalogs; registering a catalog also registers the built-in scalar function
-`blob_view` (alias `sys.blob_view`) and the built-in table-valued functions
-(`vector_search`, `hybrid_search`, and `full_text_search` when the `fulltext`
-feature is enabled) against it. It also manages session-scoped dynamic options
-internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner and
+the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
+functions pre-registered. Use `register_catalog(...).await` to add one or more
+Paimon catalogs; registering a catalog also registers the built-in scalar
+function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
+functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
+`fulltext` feature is enabled) against it. It also manages session-scoped
+dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -299,6 +300,25 @@ For serialized `BlobDescriptor` values supplied by another Paimon engine,
 The offset must be non-negative, and lengths below `-1` are invalid.
 
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
+
+### Blob Descriptor Functions
+
+`path_to_descriptor(path)` converts a string path into Java-compatible
+`BlobDescriptor` bytes with offset `0` and length `-1`. Its alias is
+`sys.path_to_descriptor(path)`. The function only serializes the path; it does
+not access the referenced object or validate that it exists.
+
+`descriptor_to_string(descriptor)` converts serialized descriptor bytes to the
+same string representation used by Java Paimon. Its alias is
+`sys.descriptor_to_string(descriptor)`. Invalid descriptor bytes return an
+error. Both functions return `NULL` for `NULL` input.
+
+```sql
+SELECT sys.descriptor_to_string(
+    sys.path_to_descriptor('file:///tmp/image.png')
+);
+-- BlobDescriptor{version=2, uri='file:///tmp/image.png', offset=0, length=-1}
+```
 
 ### Blob View
 

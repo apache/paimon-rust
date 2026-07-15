@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::{Display, Formatter};
+
 use crate::Error;
 
 const CURRENT_VERSION: u8 = 2;
@@ -26,6 +28,16 @@ pub struct BlobDescriptor {
     uri: String,
     offset: i64,
     length: i64,
+}
+
+impl Display for BlobDescriptor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BlobDescriptor{{version={}, uri='{}', offset={}, length={}}}",
+            self.version, self.uri, self.offset, self.length
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +231,15 @@ mod tests {
         let bytes = desc.serialize();
         let deserialized = BlobDescriptor::deserialize(&bytes).unwrap();
         assert_eq!(desc, deserialized);
+    }
+
+    #[test]
+    fn test_display_matches_java() {
+        let desc = BlobDescriptor::new("file:///tmp/a".to_string(), 0, -1);
+        assert_eq!(
+            desc.to_string(),
+            "BlobDescriptor{version=2, uri='file:///tmp/a', offset=0, length=-1}"
+        );
     }
 
     #[test]

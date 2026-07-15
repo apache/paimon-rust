@@ -117,6 +117,7 @@ impl SQLContext {
             ))
             .build();
         let ctx = SessionContext::new_with_state(state);
+        crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         Self {
             ctx,
