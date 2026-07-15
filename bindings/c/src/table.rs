@@ -1576,3 +1576,187 @@ const _: unsafe extern "C" fn(
     *const paimon_datum,
     usize,
 ) -> paimon_result_predicate = paimon_predicate_is_not_in;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::paimon_error_free;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use paimon::table::Table;
+    use std::ffi::CString;
+
+    /// Build an in-memory table with one varchar column `name` and one int
+    /// column `age`, boxed in the exact wrapper shape `paimon_table_free`
+    /// expects, so the same free path is exercised.
+    fn boxed_test_table() -> *mut paimon_table {
+        let schema = Schema::builder()
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("age", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "c_predicate_test"),
+            "memory:/c_predicate_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let inner = Box::into_raw(Box::new(table)) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(paimon_table { inner }))
+    }
+
+    /// A string `paimon_datum` borrowing `s` (kept alive by the caller).
+    fn string_datum(s: &std::ffi::CStr) -> paimon_datum {
+        let bytes = s.to_bytes();
+        paimon_datum {
+            tag: 7,
+            int_val: 0,
+            double_val: 0.0,
+            str_data: bytes.as_ptr(),
+            str_len: bytes.len(),
+            int_val2: 0,
+            uint_val: 0,
+            uint_val2: 0,
+        }
+    }
+
+    /// An int (tag 3) `paimon_datum`.
+    fn int_datum(v: i64) -> paimon_datum {
+        paimon_datum {
+            tag: 3,
+            int_val: v,
+            double_val: 0.0,
+            str_data: std::ptr::null(),
+            str_len: 0,
+            int_val2: 0,
+            uint_val: 0,
+            uint_val2: 0,
+        }
+    }
+
+    /// Assert the result is a built predicate (predicate non-null, error null)
+    /// and free it.
+    unsafe fn assert_ok_and_free(result: paimon_result_predicate) {
+        assert!(!result.predicate.is_null(), "expected a predicate");
+        assert!(result.error.is_null(), "expected no error");
+        paimon_predicate_free(result.predicate);
+    }
+
+    /// Assert the result is an error (predicate null, error non-null) and free it.
+    unsafe fn assert_err_and_free(result: paimon_result_predicate) {
+        assert!(result.predicate.is_null(), "expected no predicate");
+        assert!(!result.error.is_null(), "expected an error");
+        paimon_error_free(result.error);
+    }
+
+    #[test]
+    fn escape_char_from_c_maps_sentinel_and_bytes() {
+        assert_eq!(escape_char_from_c(0), None);
+        assert_eq!(escape_char_from_c(b'\\' as std::ffi::c_char), Some('\\'));
+    }
+
+    #[test]
+    fn string_ops_build_predicates() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            let pat = CString::new("ab").unwrap();
+
+            assert_ok_and_free(paimon_predicate_starts_with(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+            assert_ok_and_free(paimon_predicate_ends_with(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+            assert_ok_and_free(paimon_predicate_contains(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn like_builds_and_rejects_bad_escape() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            let pat = CString::new("ab%").unwrap();
+
+            // Default escape (sentinel 0) -> resolves to core default '\'.
+            assert_ok_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                0,
+            ));
+            // Explicit backslash escape -> accepted.
+            assert_ok_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                b'\\' as std::ffi::c_char,
+            ));
+            // Non-backslash escape -> core rejects -> error result.
+            assert_err_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                b'/' as std::ffi::c_char,
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn contains_rejects_non_string_datum() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            // A long datum into a string op -> core's typed error, not a panic.
+            assert_err_and_free(paimon_predicate_contains(table, col.as_ptr(), int_datum(5)));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn range_ops_build_predicates() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("age").unwrap();
+
+            // low <= high -> normal predicate.
+            assert_ok_and_free(paimon_predicate_between(
+                table,
+                col.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+            ));
+            assert_ok_and_free(paimon_predicate_not_between(
+                table,
+                col.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+            ));
+            // low > high -> core short-circuits (AlwaysFalse / is_not_null),
+            // still a built predicate, not an error.
+            assert_ok_and_free(paimon_predicate_between(
+                table,
+                col.as_ptr(),
+                int_datum(20),
+                int_datum(10),
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+}
