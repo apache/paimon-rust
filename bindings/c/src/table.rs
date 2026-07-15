@@ -1722,7 +1722,7 @@ mod tests {
         unsafe {
             let table = boxed_test_table();
             let col = CString::new("name").unwrap();
-            // A long datum into a string op -> core's typed error, not a panic.
+            // An int datum into a string op -> core's typed error, not a panic.
             assert_err_and_free(paimon_predicate_contains(table, col.as_ptr(), int_datum(5)));
             paimon_table_free(table);
         }
