@@ -86,7 +86,8 @@ pub unsafe extern "C" fn paimon_table_new_write_builder(
 
 /// Create a WriteBuilder with a caller-provided stable commit identity.
 ///
-/// Distributed writers for one commit should use the same `commit_user`.
+/// Writers whose messages are merged into one logical commit must use the
+/// same `commit_user`.
 ///
 /// # Safety
 /// `table` must be a valid table pointer. `commit_user` must be a valid UTF-8
@@ -148,24 +149,37 @@ fn invalid_input(message: impl Into<String>) -> *mut paimon_error {
 }
 
 fn validate_batch_schema(
-    input: &ArrowSchema,
+    input: &RecordBatch,
     target: &ArrowSchema,
 ) -> Result<(), *mut paimon_error> {
-    let matches = input.fields().len() == target.fields().len()
-        && input
-            .fields()
-            .iter()
-            .zip(target.fields().iter())
-            .all(|(input, target)| {
-                input.name() == target.name() && input.data_type() == target.data_type()
-            });
-    if matches {
-        Ok(())
-    } else {
-        Err(invalid_input(format!(
-            "Input schema is not consistent with the table schema. input: {input:?}, table: {target:?}"
-        )))
+    let input_schema = input.schema();
+    if input_schema.fields().len() != target.fields().len() {
+        return Err(invalid_input(format!(
+            "Input schema is not consistent with the table schema. input: {input_schema:?}, table: {target:?}"
+        )));
     }
+    for (index, (input_field, target_field)) in input_schema
+        .fields()
+        .iter()
+        .zip(target.fields().iter())
+        .enumerate()
+    {
+        if input_field.name() != target_field.name()
+            || input_field.data_type() != target_field.data_type()
+        {
+            return Err(invalid_input(format!(
+                "Input schema is not consistent with the table schema. input: {input_schema:?}, table: {target:?}"
+            )));
+        }
+        if !target_field.is_nullable() && input.column(index).null_count() != 0 {
+            return Err(invalid_input(format!(
+                "Column '{}' is NOT NULL but the Arrow batch contains {} null value(s)",
+                target_field.name(),
+                input.column(index).null_count()
+            )));
+        }
+    }
+    Ok(())
 }
 
 unsafe fn import_record_batch(
@@ -330,7 +344,7 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
         Ok(batch) => batch,
         Err(error) => return error,
     };
-    if let Err(error) = validate_batch_schema(&batch.schema(), &table_write.target_schema) {
+    if let Err(error) = validate_batch_schema(&batch, &table_write.target_schema) {
         return error;
     }
 
@@ -471,6 +485,39 @@ pub unsafe extern "C" fn paimon_commit_messages_free(msgs: *mut paimon_commit_me
     }
 }
 
+/// Merge `source` messages into `target` for one logical commit.
+///
+/// Both handles retain ownership and must be freed separately. They must have
+/// been prepared for the same table and `commit_user`.
+///
+/// # Safety
+/// `target` and `source` must be distinct valid commit-message handles.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_merge(
+    target: *mut paimon_commit_messages,
+    source: *const paimon_commit_messages,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(target, "target") {
+        return error;
+    }
+    if let Err(error) = check_non_null(source, "source") {
+        return error;
+    }
+    if ptr::eq(target, source.cast_mut()) {
+        return invalid_input("target and source commit messages must be distinct handles");
+    }
+
+    let target = &mut *((*target).inner as *mut CommitMessagesState);
+    let source = &*((*source).inner as *const CommitMessagesState);
+    if target.table_location != source.table_location || target.commit_user != source.commit_user {
+        return invalid_input(
+            "commit messages can only be merged when table and commit_user both match",
+        );
+    }
+    target.messages.extend(source.messages.clone());
+    ptr::null_mut()
+}
+
 // ======================= Commit operations ===============================
 
 fn validate_commit_context(
@@ -508,10 +555,13 @@ pub unsafe extern "C" fn paimon_table_commit_commit(
     paimon_table_commit_commit_with_identifier(tc, msgs, i64::MAX)
 }
 
-/// Commit the given messages with a caller-provided stable identifier.
+/// Commit the given messages with a caller-provided identifier.
 ///
-/// Reusing the same non-batch identifier with the same `commit_user` is
-/// idempotent, including across separate invocations after an uncertain result.
+/// Identifiers must increase monotonically for a `commit_user`. All messages
+/// for one identifier must be merged and submitted in a single call.
+/// This operation does not filter previously committed identifiers. Use
+/// `paimon_table_commit_filter_and_commit_with_identifier` when retrying an
+/// uncertain result.
 /// The caller retains ownership of `msgs` and must free it explicitly.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
@@ -536,6 +586,41 @@ pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
         table_commit
             .commit
             .commit_with_identifier(messages.messages.clone(), commit_identifier),
+    ) {
+        Ok(()) => ptr::null_mut(),
+        Err(e) => paimon_error::from_paimon(e),
+    }
+}
+
+/// Filter a previously committed identifier, then commit if it is new.
+///
+/// Identifiers must increase monotonically for a `commit_user`. Use this only
+/// to retry the same uncertain result after all writer messages for the
+/// logical commit have been merged.
+/// The caller retains ownership of `msgs` and must free it explicitly.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_filter_and_commit_with_identifier(
+    tc: *const paimon_table_commit,
+    msgs: *mut paimon_commit_messages,
+    commit_identifier: i64,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(tc, "tc") {
+        return e;
+    }
+    if let Err(e) = check_non_null(msgs, "msgs") {
+        return e;
+    }
+
+    let table_commit = &*((*tc).inner as *const TableCommitState);
+    let messages = &*((*msgs).inner as *const CommitMessagesState);
+    if let Err(error) = validate_commit_context(table_commit, messages) {
+        return error;
+    }
+
+    match runtime().block_on(
+        table_commit
+            .commit
+            .filter_and_commit_with_identifier(messages.messages.clone(), commit_identifier),
     ) {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
@@ -675,6 +760,10 @@ const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_tabl
 const _: unsafe extern "C" fn(*mut paimon_table_write) -> paimon_result_prepare_commit =
     paimon_table_write_prepare_commit;
 const _: unsafe extern "C" fn(
+    *mut paimon_commit_messages,
+    *const paimon_commit_messages,
+) -> *mut paimon_error = paimon_commit_messages_merge;
+const _: unsafe extern "C" fn(
     *mut paimon_table_write,
     *mut c_void,
     *mut c_void,
@@ -688,6 +777,11 @@ const _: unsafe extern "C" fn(
     *mut paimon_commit_messages,
     i64,
 ) -> *mut paimon_error = paimon_table_commit_commit_with_identifier;
+const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    *mut paimon_commit_messages,
+    i64,
+) -> *mut paimon_error = paimon_table_commit_filter_and_commit_with_identifier;
 const _: unsafe extern "C" fn(
     *const paimon_table_commit,
     *mut paimon_commit_messages,

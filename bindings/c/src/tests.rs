@@ -62,6 +62,15 @@ fn simple_table_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
+fn not_null_table_schema() -> TableSchema {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .build()
+        .unwrap();
+    TableSchema::new(0, &schema)
+}
+
 unsafe fn wrap_table(table: Table) -> *mut paimon_table {
     let inner = Box::into_raw(Box::new(table)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table { inner }))
@@ -98,6 +107,21 @@ fn make_type_mismatch_batch(ids: Vec<&str>, names: Vec<&str>) -> RecordBatch {
         schema,
         vec![
             Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_nullable_id_batch(ids: Vec<Option<i32>>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, true),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
             Arc::new(StringArray::from(names)),
         ],
     )
@@ -743,6 +767,39 @@ fn test_write_arrow_batch_rejects_table_schema_mismatch() {
 }
 
 #[test]
+fn test_write_arrow_batch_rejects_null_for_not_null_field() {
+    let path = "memory:/test_write_arrow_batch_rejects_null_for_not_null_field";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        not_null_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let wb = paimon_table_new_write_builder(handle).write_builder;
+        let tw = paimon_write_builder_new_write(wb).write;
+        let (array, schema) = export_batch_to_ffi(make_nullable_id_batch(vec![None], vec!["a"]));
+
+        let err = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!err.is_null(), "NULL must be rejected for a NOT NULL field");
+        paimon_error_free(err);
+
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_write_arrow_batch_rejects_invalid_root_arrays_without_aborting() {
     const CHILD_ENV: &str = "PAIMON_C_INVALID_ROOT_CHILD";
     if let Ok(mode) = std::env::var(CHILD_ENV) {
@@ -993,7 +1050,7 @@ fn test_caller_supplied_commit_identity_is_shared_and_persisted() {
             paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
                 .write_builder;
         let retry_commit = paimon_write_builder_new_commit(retry_wb).commit;
-        let err = paimon_table_commit_commit_with_identifier(retry_commit, messages, 42);
+        let err = paimon_table_commit_filter_and_commit_with_identifier(retry_commit, messages, 42);
         assert!(
             err.is_null(),
             "retrying the same identity must be idempotent"
@@ -1016,6 +1073,63 @@ fn test_caller_supplied_commit_identity_is_shared_and_persisted() {
     assert_eq!(snapshot.commit_user(), "doris-load-job-42");
     assert_eq!(snapshot.commit_identifier(), 42);
     assert_eq!(snapshot.id(), 1, "retry must not create another snapshot");
+}
+
+#[test]
+fn test_commit_messages_merge_preserves_all_writer_files() {
+    let path = "memory:/test_commit_messages_merge";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("distributed-job-7").unwrap();
+
+    unsafe {
+        let wb1 = paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+            .write_builder;
+        let wb2 = paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+            .write_builder;
+        let tw1 = paimon_write_builder_new_write(wb1).write;
+        let tw2 = paimon_write_builder_new_write(wb2).write;
+
+        for (tw, ids, names) in [(tw1, vec![1], vec!["a"]), (tw2, vec![2], vec!["b"])] {
+            let (array, schema) = export_batch_to_ffi(make_batch(ids, names));
+            let err = paimon_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(err.is_null());
+        }
+
+        let messages1 = paimon_table_write_prepare_commit(tw1).messages;
+        let messages2 = paimon_table_write_prepare_commit(tw2).messages;
+        let err = paimon_commit_messages_merge(messages1, messages2);
+        assert!(err.is_null());
+
+        let commit = paimon_write_builder_new_commit(wb1).commit;
+        let err = paimon_table_commit_commit_with_identifier(commit, messages1, 7);
+        assert!(err.is_null());
+        assert_eq!(
+            read_rows_ffi(handle),
+            vec![(1, "a".into()), (2, "b".into())]
+        );
+
+        paimon_commit_messages_free(messages2);
+        paimon_commit_messages_free(messages1);
+        paimon_table_commit_free(commit);
+        paimon_table_write_free(tw2);
+        paimon_table_write_free(tw1);
+        paimon_write_builder_free(wb2);
+        paimon_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
 }
 
 #[test]

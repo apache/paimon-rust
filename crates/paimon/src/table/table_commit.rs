@@ -121,12 +121,39 @@ impl TableCommit {
 
     /// Commit new files with a caller-provided commit identifier.
     ///
-    /// The identifier participates in retry idempotency, matching Python
-    /// `FileStoreCommit.commit(commit_messages, commit_identifier)`.
+    /// Identifiers must increase monotonically for a given `commit_user`.
+    /// All messages for one identifier must be submitted in a single call.
+    /// This method does not filter previously committed identifiers. Use
+    /// [`Self::filter_and_commit_with_identifier`] when retrying an uncertain
+    /// commit result.
     pub async fn commit_with_identifier(
         &self,
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
+    ) -> Result<()> {
+        self.commit_with_identifier_impl(commit_messages, commit_identifier, false)
+            .await
+    }
+
+    /// Filter a previously committed identifier, then commit if it is new.
+    ///
+    /// Identifiers must increase monotonically for a given `commit_user`. This
+    /// method is intended for retrying the same uncertain result; regular
+    /// commits should use [`Self::commit_with_identifier`].
+    pub async fn filter_and_commit_with_identifier(
+        &self,
+        commit_messages: Vec<CommitMessage>,
+        commit_identifier: i64,
+    ) -> Result<()> {
+        self.commit_with_identifier_impl(commit_messages, commit_identifier, true)
+            .await
+    }
+
+    async fn commit_with_identifier_impl(
+        &self,
+        commit_messages: Vec<CommitMessage>,
+        commit_identifier: i64,
+        filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -147,6 +174,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
+            filter_committed,
         )
         .await
     }
@@ -189,6 +217,7 @@ impl TableCommit {
             },
             Some(expected_snapshot_id),
             commit_identifier,
+            false,
         )
         .await
     }
@@ -262,6 +291,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
+            false,
         )
         .await
     }
@@ -476,6 +506,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
+            false,
         )
         .await
     }
@@ -531,6 +562,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
+            false,
         )
         .await
     }
@@ -591,21 +623,26 @@ impl TableCommit {
         mut plan: CommitEntriesPlan,
         expected_snapshot_id: Option<i64>,
         commit_identifier: i64,
+        filter_committed: bool,
     ) -> Result<()> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
         let start_time_ms = current_time_millis();
+        let mut filter_committed = filter_committed;
 
         loop {
             let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
-            // Explicit identifiers are stable commit identities and must also
-            // deduplicate a fresh invocation after an uncertain result. The
-            // batch identifier is intentionally excluded because callers may
-            // perform multiple independent batch commits with the same user.
-            let duplicate_check_start = duplicate_check_start_snapshot_id
-                .or((commit_identifier != BATCH_COMMIT_IDENTIFIER).then_some(1));
-            if let Some(start_snapshot_id) = duplicate_check_start {
+            if filter_committed {
+                if self
+                    .is_committed_identifier(&latest_snapshot, commit_identifier)
+                    .await?
+                {
+                    break;
+                }
+                filter_committed = false;
+            }
+            if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
                 if self
                     .is_duplicate_commit(
                         start_snapshot_id,
@@ -1076,6 +1113,35 @@ impl TableCommit {
     }
 
     /// Check if this commit was already completed (idempotency).
+    async fn is_committed_identifier(
+        &self,
+        latest_snapshot: &Option<Snapshot>,
+        commit_identifier: i64,
+    ) -> Result<bool> {
+        let Some(latest) = latest_snapshot else {
+            return Ok(false);
+        };
+        let earliest_snapshot_id = self
+            .snapshot_manager
+            .earliest_snapshot_id()
+            .await?
+            .unwrap_or(latest.id());
+        for snapshot_id in (earliest_snapshot_id..=latest.id()).rev() {
+            let snapshot = if snapshot_id == latest.id() {
+                Some(latest.clone())
+            } else {
+                self.snapshot_manager.get_snapshot(snapshot_id).await.ok()
+            };
+            if let Some(snapshot) = snapshot {
+                if snapshot.commit_user() == self.commit_user {
+                    return Ok(commit_identifier <= snapshot.commit_identifier());
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check if this commit was already completed during an in-process retry.
     async fn is_duplicate_commit(
         &self,
         start_snapshot_id: i64,
@@ -3126,7 +3192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repeated_commit_with_same_identity_is_idempotent() {
+    async fn test_filter_and_commit_with_same_identity_is_idempotent() {
         let file_io = test_file_io();
         let table_path = "memory:/test_repeated_commit_with_same_identity";
         setup_dirs(&file_io, table_path).await;
@@ -3139,7 +3205,7 @@ mod tests {
             .await
             .unwrap();
         commit
-            .commit_with_identifier(vec![message], 7)
+            .filter_and_commit_with_identifier(vec![message], 7)
             .await
             .unwrap();
 
@@ -3148,6 +3214,39 @@ mod tests {
             snapshot.id(),
             1,
             "retrying the same commit identity must not create another snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_and_commit_rejects_expired_older_identifier() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_filter_expired_identifier";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let first = CommitMessage::new(vec![], 0, vec![test_data_file("data-0.parquet", 100)]);
+        let second = CommitMessage::new(vec![], 0, vec![test_data_file("data-1.parquet", 100)]);
+        commit
+            .commit_with_identifier(vec![first.clone()], 1)
+            .await
+            .unwrap();
+        commit
+            .commit_with_identifier(vec![second], 2)
+            .await
+            .unwrap();
+
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        snapshot_manager.delete_snapshot(1).await.unwrap();
+        commit
+            .filter_and_commit_with_identifier(vec![first], 1)
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(
+            snapshot.id(),
+            2,
+            "an expired older identifier is still a retry"
         );
     }
 
