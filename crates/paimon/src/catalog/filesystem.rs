@@ -280,7 +280,7 @@ impl Catalog for FileSystemCatalog {
             return Ok(());
         }
 
-        let tables = self.list_directories(&path).await?;
+        let tables = self.list_tables(name).await?;
         if !tables.is_empty() && !cascade {
             return Err(Error::DatabaseNotEmpty {
                 database: name.to_string(),
@@ -600,6 +600,24 @@ mod tests {
             .await
             .unwrap()
             .contains(&"markerless".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_drop_database_ignores_incomplete_table_directories() {
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .file_io()
+            .mkdirs("memory:/warehouse/db1.db/incomplete")
+            .await
+            .unwrap();
+
+        assert!(catalog.list_tables("db1").await.unwrap().is_empty());
+        catalog.drop_database("db1", false, false).await.unwrap();
+        assert!(!catalog.database_exists("db1").await.unwrap());
     }
 
     #[tokio::test]
