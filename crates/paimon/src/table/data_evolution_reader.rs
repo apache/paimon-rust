@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod blob_fallback;
+
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
     DataFileReader,
@@ -35,7 +37,8 @@ use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Whether a file name denotes a dedicated vector-store file (`*.vector.<format>`).
@@ -1072,6 +1075,21 @@ fn open_source_stream(
     blob_as_descriptor: bool,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
+    if let FieldSource::BlobBunch { bunch, read_fields } = source {
+        // A single sequence group has no fallback work, so keep per-file lazy streaming.
+        if !bunch.can_read_sequentially() {
+            return blob_fallback::read(
+                split,
+                bunch.clone(),
+                read_fields.clone(),
+                row_ranges,
+                file_io,
+                blob_as_descriptor,
+                anchor_deletion_vector.cloned(),
+            );
+        }
+    }
+
     let file_reader = DataFileReader::new(
         file_io,
         schema_manager,
@@ -1095,16 +1113,26 @@ fn open_source_stream(
                 row_ranges,
             )
         }
-        FieldSource::BlobBunch {
-            bunch, data_fields, ..
-        } => read_bunch_files_stream(
-            file_reader,
-            split,
-            bunch.files.clone(),
-            data_fields.clone(),
-            row_ranges,
-            anchor_deletion_vector.cloned(),
-        ),
+        FieldSource::BlobBunch { bunch, .. } => {
+            let selected_ranges = selected_absolute_row_ranges_for_file(
+                bunch.expected_first_row_id,
+                bunch.expected_row_count,
+                row_ranges.as_deref(),
+                anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
+            )?;
+            let files = match selected_ranges.as_deref() {
+                Some(ranges) => bunch.files_overlapping(ranges)?,
+                None => bunch.files.clone(),
+            };
+            read_bunch_files_stream(
+                file_reader,
+                split,
+                files,
+                None,
+                row_ranges,
+                anchor_deletion_vector.cloned(),
+            )
+        }
         FieldSource::VectorBunch {
             bunch, data_fields, ..
         } => read_bunch_files_stream(
@@ -1513,8 +1541,7 @@ fn build_source_plan(
             } else {
                 let source_idx = sources.len();
                 sources.push(FieldSource::BlobBunch {
-                    bunch: BlobBunch::new(expected_row_count),
-                    data_fields: info.data_fields.clone(),
+                    bunch: BlobBunch::new(prepared_group.first_row_id, expected_row_count),
                     read_fields: Vec::new(),
                 });
                 blob_source_indices.insert(field_id, source_idx);
@@ -1630,15 +1657,8 @@ fn build_source_plan(
             bunch, read_fields, ..
         } = source
         {
-            if !read_fields.is_empty() && bunch.row_count() != prepared_group.logical_row_count {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "Blob bunch row count {} does not match logical row count {}",
-                        bunch.row_count(),
-                        prepared_group.logical_row_count
-                    ),
-                    source: None,
-                });
+            if !read_fields.is_empty() {
+                bunch.validate_logical_range()?;
             }
         }
     }
@@ -1696,7 +1716,6 @@ enum FieldSource {
     },
     BlobBunch {
         bunch: BlobBunch,
-        data_fields: Option<Vec<DataField>>,
         read_fields: Vec<DataField>,
     },
 }
@@ -1742,25 +1761,20 @@ impl FieldSource {
     }
 }
 
+/// All physical BLOB files for one field, including overlapping older sequence groups.
 #[derive(Debug, Clone)]
 struct BlobBunch {
     files: Vec<DataFileMeta>,
+    expected_first_row_id: i64,
     expected_row_count: i64,
-    latest_first_row_id: i64,
-    expected_next_first_row_id: i64,
-    latest_max_sequence_number: i64,
-    row_count: i64,
 }
 
 impl BlobBunch {
-    fn new(expected_row_count: i64) -> Self {
+    fn new(expected_first_row_id: i64, expected_row_count: i64) -> Self {
         Self {
             files: Vec::new(),
+            expected_first_row_id,
             expected_row_count,
-            latest_first_row_id: -1,
-            expected_next_first_row_id: -1,
-            latest_max_sequence_number: -1,
-            row_count: 0,
         }
     }
 
@@ -1772,83 +1786,164 @@ impl BlobBunch {
             });
         }
 
-        let first_row_id = file.first_row_id.ok_or_else(|| Error::DataInvalid {
-            message: format!("Blob file '{}' is missing first_row_id", file.file_name),
-            source: None,
-        })?;
-
-        if first_row_id == self.latest_first_row_id {
-            if file.max_sequence_number >= self.latest_max_sequence_number {
+        let range = blob_file_row_range(&file)?;
+        if let Some(first_file) = self.files.first() {
+            if file.write_cols != first_file.write_cols {
                 return Err(Error::DataInvalid {
-                    message:
-                        "Blob file with same first row id should have decreasing sequence number."
-                            .to_string(),
+                    message: "All files in a blob bunch should have the same write columns."
+                        .to_string(),
                     source: None,
                 });
             }
-            return Ok(());
         }
 
-        if !self.files.is_empty() {
-            if first_row_id < self.expected_next_first_row_id {
-                if file.max_sequence_number >= self.latest_max_sequence_number {
-                    return Err(Error::DataInvalid {
-                        message:
-                            "Blob file with overlapping row id should have decreasing sequence number."
-                                .to_string(),
-                        source: None,
-                    });
-                }
-                return Ok(());
-            } else if first_row_id > self.expected_next_first_row_id {
+        for existing in self
+            .files
+            .iter()
+            .filter(|existing| existing.max_sequence_number == file.max_sequence_number)
+        {
+            let existing_range = blob_file_row_range(existing)?;
+            if range.overlaps_inclusive(existing_range.from(), existing_range.to()) {
                 return Err(Error::DataInvalid {
                     message: format!(
-                        "Blob file first row id should be continuous, expect {} but got {}",
-                        self.expected_next_first_row_id, first_row_id
+                        "Blob files '{}' and '{}' in the same max sequence group overlap",
+                        existing.file_name, file.file_name
                     ),
                     source: None,
                 });
             }
-
-            if !self.files.is_empty() {
-                let first_file = &self.files[0];
-                if file.schema_id != first_file.schema_id {
-                    return Err(Error::DataInvalid {
-                        message: "All files in a blob bunch should have the same schema id."
-                            .to_string(),
-                        source: None,
-                    });
-                }
-                if file.write_cols != first_file.write_cols {
-                    return Err(Error::DataInvalid {
-                        message: "All files in a blob bunch should have the same write columns."
-                            .to_string(),
-                        source: None,
-                    });
-                }
-            }
         }
 
-        self.row_count += file.row_count;
-        if self.row_count > self.expected_row_count {
+        let mut ranges = self.logical_ranges();
+        ranges.push(range);
+        let row_count = crate::table::merge_row_ranges(ranges)
+            .iter()
+            .map(RowRange::count)
+            .sum::<i64>();
+        if row_count > self.expected_row_count {
             return Err(Error::DataInvalid {
                 message: format!(
-                    "Blob files row count {} exceed the expected {}",
-                    self.row_count, self.expected_row_count
+                    "Blob files logical row count {row_count} exceeds the expected {}",
+                    self.expected_row_count
                 ),
                 source: None,
             });
         }
-        self.latest_max_sequence_number = file.max_sequence_number;
-        self.latest_first_row_id = first_row_id;
-        self.expected_next_first_row_id = first_row_id + file.row_count;
+
         self.files.push(file);
         Ok(())
     }
 
     fn row_count(&self) -> i64 {
-        self.row_count
+        self.logical_ranges().iter().map(RowRange::count).sum()
     }
+
+    fn logical_ranges(&self) -> Vec<RowRange> {
+        crate::table::merge_row_ranges(
+            self.files
+                .iter()
+                .map(|file| blob_file_row_range(file).expect("validated blob file range"))
+                .collect(),
+        )
+    }
+
+    fn expected_range(&self) -> crate::Result<RowRange> {
+        if self.expected_row_count <= 0 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Blob bunch expected row count must be positive, got {}",
+                    self.expected_row_count
+                ),
+                source: None,
+            });
+        }
+        let to = self
+            .expected_first_row_id
+            .checked_add(self.expected_row_count - 1)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Blob bunch expected row range overflows i64".to_string(),
+                source: None,
+            })?;
+        Ok(RowRange::new(self.expected_first_row_id, to))
+    }
+
+    fn validate_logical_range(&self) -> crate::Result<()> {
+        let ranges = self.logical_ranges();
+        let expected = self.expected_range()?;
+        if ranges.as_slice() != [expected.clone()] {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Blob bunch logical row ranges {ranges:?} ({} rows) do not match expected range {expected:?}",
+                    self.row_count()
+                ),
+                source: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn sequence_groups(&self) -> Vec<Vec<DataFileMeta>> {
+        let mut groups: BTreeMap<Reverse<i64>, Vec<DataFileMeta>> = BTreeMap::new();
+        for file in &self.files {
+            groups
+                .entry(Reverse(file.max_sequence_number))
+                .or_default()
+                .push(file.clone());
+        }
+        for files in groups.values_mut() {
+            files.sort_by_key(|file| file.first_row_id.expect("validated blob first_row_id"));
+        }
+        groups.into_values().collect()
+    }
+
+    fn can_read_sequentially(&self) -> bool {
+        let Some(first_file) = self.files.first() else {
+            return false;
+        };
+        self.files
+            .iter()
+            .all(|file| file.max_sequence_number == first_file.max_sequence_number)
+    }
+
+    fn files_overlapping(&self, ranges: &[RowRange]) -> crate::Result<Vec<DataFileMeta>> {
+        let mut files = Vec::new();
+        for file in &self.files {
+            let file_range = blob_file_row_range(file)?;
+            if row_range_overlaps_any(&file_range, ranges) {
+                files.push(file.clone());
+            }
+        }
+        Ok(files)
+    }
+}
+
+fn row_range_overlaps_any(range: &RowRange, ranges: &[RowRange]) -> bool {
+    ranges
+        .iter()
+        .any(|selected| range.overlaps_inclusive(selected.from(), selected.to()))
+}
+
+fn blob_file_row_range(file: &DataFileMeta) -> crate::Result<RowRange> {
+    let first_row_id = file.first_row_id.ok_or_else(|| Error::DataInvalid {
+        message: format!("Blob file '{}' is missing first_row_id", file.file_name),
+        source: None,
+    })?;
+    if file.row_count <= 0 {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Blob file '{}' row count must be positive, got {}",
+                file.file_name, file.row_count
+            ),
+            source: None,
+        });
+    }
+    let last_row_id = first_row_id
+        .checked_add(file.row_count - 1)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("Blob file '{}' row range overflows i64", file.file_name),
+            source: None,
+        })?;
+    Ok(RowRange::new(first_row_id, last_row_id))
 }
 
 /// Aggregates rolled `.vector.<format>` segments belonging to one logical vector
@@ -2064,10 +2159,11 @@ mod tests {
         BinaryRow, BlobType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema,
         VectorType,
     };
-    use crate::table::{DataSplitBuilder, Table, TableRead};
+    use crate::table::{DataSplitBuilder, DeletionFile, Table, TableRead};
     use arrow_array::{
         Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
     };
+    use bytes::Bytes;
     use futures::TryStreamExt;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2085,7 +2181,7 @@ mod tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
     }
 
-    use blob_test_utils::write_blob_file;
+    use blob_test_utils::{write_blob_file, write_blob_file_with_values, BlobFixtureValue};
     use test_utils::{local_file_path, write_int_parquet_file};
 
     #[test]
@@ -2326,8 +2422,8 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_bunch_ignores_same_first_row_id_with_lower_sequence() {
-        let mut bunch = BlobBunch::new(1000);
+    fn test_blob_bunch_retains_same_range_from_older_sequence() {
+        let mut bunch = BlobBunch::new(0, 1000);
         bunch
             .add(data_file(
                 "blob-high.blob",
@@ -2342,8 +2438,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(bunch.row_count(), 100);
-        assert_eq!(bunch.files.len(), 1);
+        assert_eq!(bunch.files.len(), 2);
         assert_eq!(bunch.files[0].file_name, "blob-high.blob");
+        assert_eq!(bunch.files[1].file_name, "blob-low.blob");
     }
 
     #[test]
@@ -2372,13 +2469,12 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_bunch_rejects_same_first_row_id_with_higher_sequence() {
-        let mut bunch = BlobBunch::new(1000);
+    fn test_blob_bunch_groups_sequences_in_descending_order() {
+        let mut bunch = BlobBunch::new(0, 1000);
         bunch
             .add(data_file("blob-low.blob", 0, 100, 2, Some(vec!["payload"])))
             .unwrap();
-
-        let err = bunch
+        bunch
             .add(data_file(
                 "blob-high.blob",
                 0,
@@ -2386,48 +2482,63 @@ mod tests {
                 3,
                 Some(vec!["payload"]),
             ))
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("same first row id"))
-        );
+        let groups = bunch.sequence_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0][0].file_name, "blob-high.blob");
+        assert_eq!(groups[1][0].file_name, "blob-low.blob");
     }
 
     #[test]
-    fn test_blob_bunch_rejects_overlapping_higher_sequence_file() {
-        let mut bunch = BlobBunch::new(1000);
+    fn test_blob_bunch_retains_overlapping_ranges_across_sequences() {
+        let mut bunch = BlobBunch::new(0, 1000);
         bunch
             .add(data_file("blob1.blob", 0, 100, 1, Some(vec!["payload"])))
             .unwrap();
+        bunch
+            .add(data_file("blob2.blob", 50, 150, 2, Some(vec!["payload"])))
+            .unwrap();
 
+        assert_eq!(bunch.files.len(), 2);
+        assert_eq!(bunch.row_count(), 200);
+        assert_eq!(bunch.logical_ranges(), vec![RowRange::new(0, 199)]);
+    }
+
+    #[test]
+    fn test_blob_bunch_rejects_overlapping_ranges_within_sequence() {
+        let mut bunch = BlobBunch::new(0, 1000);
+        bunch
+            .add(data_file("blob1.blob", 0, 100, 2, Some(vec!["payload"])))
+            .unwrap();
         let err = bunch
             .add(data_file("blob2.blob", 50, 150, 2, Some(vec!["payload"])))
             .unwrap_err();
 
         assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("overlapping row id"))
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("same max sequence group"))
         );
     }
 
     #[test]
-    fn test_blob_bunch_rejects_non_continuous_first_row_id() {
-        let mut bunch = BlobBunch::new(1000);
+    fn test_blob_bunch_rejects_non_contiguous_logical_range() {
+        let mut bunch = BlobBunch::new(0, 250);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
-
-        let err = bunch
+        bunch
             .add(data_file("blob2.blob", 150, 100, 2, Some(vec!["payload"])))
-            .unwrap_err();
+            .unwrap();
+        let err = bunch.validate_logical_range().unwrap_err();
 
         assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("continuous"))
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("logical row ranges"))
         );
     }
 
     #[test]
     fn test_blob_bunch_rejects_mixed_write_columns() {
-        let mut bunch = BlobBunch::new(200);
+        let mut bunch = BlobBunch::new(0, 200);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
@@ -2442,24 +2553,27 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_bunch_rejects_mixed_schema_ids() {
-        let mut bunch = BlobBunch::new(200);
+    fn test_blob_bunch_accepts_mixed_schema_ids() {
+        let mut bunch = BlobBunch::new(0, 200);
         bunch
             .add(data_file("blob1.blob", 0, 100, 3, Some(vec!["payload"])))
             .unwrap();
 
-        let mut mixed_schema = data_file("blob2.blob", 100, 100, 2, Some(vec!["payload"]));
+        let mut mixed_schema = data_file("blob2.blob", 100, 100, 3, Some(vec!["payload"]));
         mixed_schema.schema_id = 1;
-        let err = bunch.add(mixed_schema).unwrap_err();
+        bunch.add(mixed_schema).unwrap();
 
-        assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("same schema id"))
-        );
+        assert_eq!(bunch.files.len(), 2);
+        assert_eq!(bunch.files[0].schema_id, 0);
+        assert_eq!(bunch.files[1].schema_id, 1);
+        assert_eq!(bunch.row_count(), 200);
+        assert!(bunch.can_read_sequentially());
+        bunch.validate_logical_range().unwrap();
     }
 
     #[test]
     fn test_blob_bunch_rejects_row_count_exceeding_expected() {
-        let mut bunch = BlobBunch::new(100);
+        let mut bunch = BlobBunch::new(0, 100);
         bunch
             .add(data_file("blob1.blob", 0, 60, 3, Some(vec!["payload"])))
             .unwrap();
@@ -2469,7 +2583,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("exceed the expected"))
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("exceeds the expected"))
         );
     }
 
@@ -2672,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_source_plan_picks_latest_blob_segments() {
+    fn test_build_source_plan_retains_all_blob_sequence_groups() {
         let files = vec![
             data_file("others.parquet", 0, 1000, 1, None),
             data_file("blob1.blob", 0, 1000, 1, Some(vec!["payload"])),
@@ -2717,7 +2831,17 @@ mod tests {
                     .collect();
                 assert_eq!(
                     file_names,
-                    vec!["blob5.blob", "blob9.blob", "blob7.blob", "blob8.blob"]
+                    vec![
+                        "blob5.blob",
+                        "blob2.blob",
+                        "blob1.blob",
+                        "blob9.blob",
+                        "blob6.blob",
+                        "blob3.blob",
+                        "blob7.blob",
+                        "blob4.blob",
+                        "blob8.blob",
+                    ]
                 );
             }
             FieldSource::DataFile { .. } | FieldSource::VectorBunch { .. } => {
@@ -2910,6 +3034,400 @@ mod tests {
                 Some(b"world".to_vec()),
                 Some(Vec::new()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_read_falls_back_across_blob_sequence_groups() {
+        use BlobFixtureValue::{Null, Placeholder, Value};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4, 5, 6])], None);
+
+        let base_path = bucket_dir.join("blob-base.blob");
+        let middle_path = bucket_dir.join("blob-middle.blob");
+        let latest_path = bucket_dir.join("blob-latest.blob");
+        write_blob_file_with_values(
+            &base_path,
+            &[
+                Value(b"old-0"),
+                Value(b"old-1"),
+                Value(b"old-2"),
+                Value(b"old-3"),
+                Null,
+                Placeholder,
+            ],
+        );
+        write_blob_file_with_values(
+            &middle_path,
+            &[Placeholder, Value(b"middle-1"), Value(b"middle-2")],
+        );
+        copy_blob_fixture("blob-placeholder.blob", &latest_path);
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "blob_fallback_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let files = vec![
+            data_file_meta_with_path(
+                "data.parquet",
+                0,
+                6,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            ),
+            data_file_meta_with_path(
+                "blob-base.blob",
+                0,
+                6,
+                1,
+                base_path.metadata().unwrap().len() as i64,
+                Some(vec!["payload"]),
+            ),
+            data_file_meta_with_path(
+                "blob-middle.blob",
+                0,
+                3,
+                2,
+                middle_path.metadata().unwrap().len() as i64,
+                Some(vec!["payload"]),
+            ),
+            data_file_meta_with_path(
+                "blob-latest.blob",
+                1,
+                4,
+                3,
+                latest_path.metadata().unwrap().len() as i64,
+                Some(vec!["payload"]),
+            ),
+        ];
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(files.clone())
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            collect_binary_values(&batches, "payload"),
+            vec![
+                Some(b"old-0".to_vec()),
+                Some(b"middle-1".to_vec()),
+                None,
+                Some(b"latest-3".to_vec()),
+                None,
+                None,
+            ]
+        );
+
+        let descriptor_table = table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            "true".to_string(),
+        )]));
+        let descriptor_read = TableRead::new(
+            &descriptor_table,
+            descriptor_table.schema().fields().to_vec(),
+            Vec::new(),
+        );
+        let descriptor_batches = descriptor_read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let descriptors = collect_binary_values(&descriptor_batches, "payload");
+        assert!(
+            BlobDescriptor::deserialize(descriptors[0].as_deref().unwrap())
+                .unwrap()
+                .uri()
+                .ends_with("blob-base.blob")
+        );
+        assert!(
+            BlobDescriptor::deserialize(descriptors[1].as_deref().unwrap())
+                .unwrap()
+                .uri()
+                .ends_with("blob-middle.blob")
+        );
+        assert!(descriptors[2].is_none());
+        assert!(
+            BlobDescriptor::deserialize(descriptors[3].as_deref().unwrap())
+                .unwrap()
+                .uri()
+                .ends_with("blob-latest.blob")
+        );
+        assert!(descriptors[4].is_none());
+        assert!(descriptors[5].is_none());
+
+        let deletion_path = format!("{}/index/dv-0", local_file_path(tempdir.path()));
+        let deletion_file = write_test_deletion_file(&file_io, &deletion_path, &[2]).await;
+        let selected_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_data_deletion_files(vec![Some(deletion_file), None, None, None])
+            .with_row_ranges(vec![RowRange::new(1, 5)])
+            .build()
+            .unwrap();
+        let selected = read
+            .to_arrow(&[selected_split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&selected, "id"), vec![2, 4, 5, 6]);
+        assert_eq!(
+            collect_binary_values(&selected, "payload"),
+            vec![
+                Some(b"middle-1".to_vec()),
+                Some(b"latest-3".to_vec()),
+                None,
+                None
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_fallback_across_schema_ids_skips_unselected_files() {
+        use BlobFixtureValue::{Placeholder, Value};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let old_path = bucket_dir.join("blob-old-selected.blob");
+        let latest_path = bucket_dir.join("blob-latest-selected.blob");
+        write_blob_file_with_values(&old_path, &[Value(b"old-2"), Value(b"old-3")]);
+        write_blob_file_with_values(&latest_path, &[Placeholder, Placeholder]);
+
+        let schema_v0 = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let schema_v1 = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .column("added", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(schema_v0.fields()[1].id(), schema_v1.fields()[1].id());
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "blob_schema_fallback_t"),
+            table_path,
+            schema_v1.clone(),
+            None,
+        );
+        write_schema_file(&table, &schema_v0).await;
+        write_schema_file(&table, &schema_v1).await;
+
+        let mut anchor = data_file_meta_with_path(
+            "data.parquet",
+            0,
+            4,
+            1,
+            parquet_path.metadata().unwrap().len() as i64,
+            Some(vec!["id"]),
+        );
+        anchor.schema_id = 1;
+
+        // These two files make each sequence group cover rows 0..=3, but are
+        // deliberately absent. A read restricted to rows 2..=3 must not open them.
+        let mut latest_unselected = data_file_meta_with_path(
+            "blob-latest-unselected.blob",
+            0,
+            2,
+            2,
+            5,
+            Some(vec!["payload"]),
+        );
+        latest_unselected.schema_id = 1;
+        let old_unselected = data_file_meta_with_path(
+            "blob-old-unselected.blob",
+            0,
+            2,
+            1,
+            5,
+            Some(vec!["payload"]),
+        );
+        let mut latest_selected = data_file_meta_with_path(
+            "blob-latest-selected.blob",
+            2,
+            2,
+            2,
+            latest_path.metadata().unwrap().len() as i64,
+            Some(vec!["payload"]),
+        );
+        latest_selected.schema_id = 1;
+        let old_selected = data_file_meta_with_path(
+            "blob-old-selected.blob",
+            2,
+            2,
+            1,
+            old_path.metadata().unwrap().len() as i64,
+            Some(vec!["payload"]),
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                anchor,
+                latest_unselected,
+                old_unselected,
+                latest_selected,
+                old_selected,
+            ])
+            .with_row_ranges(vec![RowRange::new(2, 3)])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
+        assert_eq!(
+            collect_binary_values(&batches, "payload"),
+            vec![Some(b"old-2".to_vec()), Some(b"old-3".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_blob_sequence_group_yields_before_opening_next_file() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let first_blob_path = bucket_dir.join("blob-first.blob");
+        write_blob_file(
+            &first_blob_path,
+            &[Some(&b"first-0"[..]), Some(&b"first-1"[..])],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "blob_lazy_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    4,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-first.blob",
+                    0,
+                    2,
+                    1,
+                    first_blob_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-missing-next.blob",
+                    2,
+                    2,
+                    1,
+                    5,
+                    Some(vec!["payload"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let mut stream = read.to_arrow(&[split]).unwrap();
+        let first_batch = stream.try_next().await.unwrap().unwrap();
+
+        assert_eq!(
+            collect_int_values(std::slice::from_ref(&first_batch), "id"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            collect_binary_values(std::slice::from_ref(&first_batch), "payload"),
+            vec![Some(b"first-0".to_vec()), Some(b"first-1".to_vec())]
         );
     }
 
@@ -4053,6 +4571,55 @@ mod tests {
         );
         file.file_size = file_size;
         file
+    }
+
+    async fn write_schema_file(table: &Table, schema: &TableSchema) {
+        let path = table.schema_manager().schema_path(schema.id());
+        let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap();
+        table.file_io().mkdirs(dir).await.unwrap();
+        let json = serde_json::to_vec(schema).unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(json))
+            .await
+            .unwrap();
+    }
+
+    async fn write_test_deletion_file(
+        file_io: &crate::io::FileIO,
+        path: &str,
+        deleted_rows: &[u32],
+    ) -> DeletionFile {
+        const MAGIC_NUMBER: i32 = 1581511376;
+
+        let mut bitmap = RoaringBitmap::new();
+        for row in deleted_rows {
+            bitmap.insert(*row);
+        }
+        let mut bitmap_bytes = Vec::new();
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+
+        let bitmap_length = 4 + bitmap_bytes.len() as i32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&bitmap_length.to_be_bytes());
+        bytes.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        bytes.extend_from_slice(&bitmap_bytes);
+        bytes.extend_from_slice(&0i32.to_be_bytes());
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+
+        DeletionFile::new(
+            path.to_string(),
+            0,
+            bitmap_length as i64,
+            Some(deleted_rows.len() as i64),
+        )
     }
 
     fn copy_blob_fixture(name: &str, destination: &Path) {

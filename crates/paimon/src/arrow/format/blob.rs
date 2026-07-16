@@ -44,6 +44,53 @@ impl BlobFormatReader {
     }
 }
 
+pub(crate) struct IndexedBlobReader {
+    reader: Box<dyn FileRead>,
+    index: BlobFileIndex,
+    descriptor_mode: bool,
+    file_path: String,
+}
+
+impl IndexedBlobReader {
+    pub(crate) async fn open(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        file_path: String,
+        descriptor_mode: bool,
+    ) -> crate::Result<Self> {
+        let index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
+        Ok(Self {
+            reader,
+            index,
+            descriptor_mode,
+            file_path,
+        })
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.index.num_rows()
+    }
+
+    pub(crate) async fn read_positions(
+        &self,
+        positions: &[usize],
+    ) -> crate::Result<Vec<BlobReadValue>> {
+        if self.descriptor_mode {
+            build_descriptor_values(&self.index, positions, &self.file_path)
+        } else {
+            let planned_reads = plan_blob_reads(&self.index, positions)?;
+            fetch_blob_values(self.reader.as_ref(), planned_reads).await
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BlobReadValue {
+    Value(Bytes),
+    Null,
+    Placeholder,
+}
+
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
 const BLOB_INLINE_HEADER_SIZE: u64 = 4;
@@ -67,46 +114,36 @@ impl FormatFileReader for BlobFormatReader {
 
         let target_schema = build_target_arrow_schema(read_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let blob_index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
-        let mut selection = RowSelectionCursor::new(blob_index.num_rows(), row_selection)?;
+        let blob_reader = IndexedBlobReader::open(
+            reader,
+            file_size,
+            self.file_path.clone(),
+            self.descriptor_mode,
+        )
+        .await?;
+        let mut selection = RowSelectionCursor::new(blob_reader.num_rows(), row_selection)?;
         let project_values = !read_fields.is_empty();
 
-        if self.descriptor_mode {
-            let file_path = self.file_path.clone();
-            Ok(try_stream! {
-                while let Some(positions) = selection.next_batch(batch_size) {
-                    let batch = if project_values {
-                        build_descriptor_batch(&blob_index, &target_schema, &positions, &file_path)?
-                    } else {
-                        RecordBatch::try_new_with_options(
-                            target_schema.clone(),
-                            Vec::new(),
-                            &RecordBatchOptions::new().with_row_count(Some(positions.len())),
-                        )
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!("Failed to build empty blob RecordBatch: {e}"),
-                            source: Some(Box::new(e)),
-                        })?
-                    };
-                    yield batch;
-                }
+        Ok(try_stream! {
+            while let Some(positions) = selection.next_batch(batch_size) {
+                let batch = if project_values {
+                    let values = blob_reader.read_positions(&positions).await?;
+                    build_blob_batch(&target_schema, values)?
+                } else {
+                    RecordBatch::try_new_with_options(
+                        target_schema.clone(),
+                        Vec::new(),
+                        &RecordBatchOptions::new().with_row_count(Some(positions.len())),
+                    )
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to build empty blob RecordBatch: {e}"),
+                        source: Some(Box::new(e)),
+                    })?
+                };
+                yield batch;
             }
-            .boxed())
-        } else {
-            Ok(try_stream! {
-                while let Some(positions) = selection.next_batch(batch_size) {
-                    let batch = read_blob_batch(
-                        reader.as_ref(),
-                        &blob_index,
-                        &target_schema,
-                        &positions,
-                        project_values,
-                    ).await?;
-                    yield batch;
-                }
-            }
-            .boxed())
         }
+        .boxed())
     }
 }
 
@@ -138,70 +175,49 @@ fn validate_read_fields(read_fields: &[DataField]) -> crate::Result<()> {
     Ok(())
 }
 
-fn build_descriptor_batch(
+fn build_descriptor_values(
     blob_index: &BlobFileIndex,
-    target_schema: &Arc<arrow_schema::Schema>,
     positions: &[usize],
     file_path: &str,
-) -> crate::Result<RecordBatch> {
-    let mut builder = BinaryBuilder::new();
-    for &position in positions {
-        let entry = blob_index
-            .entry(position)
-            .ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "Blob row selection referenced out-of-range position {position} for {} rows",
-                    blob_index.num_rows()
-                ),
-                source: None,
-            })?;
+) -> crate::Result<Vec<BlobReadValue>> {
+    positions
+        .iter()
+        .map(|&position| {
+            let entry = blob_index
+                .entry(position)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Blob row selection referenced out-of-range position {position} for {} rows",
+                        blob_index.num_rows()
+                    ),
+                    source: None,
+                })?;
 
-        match entry.inline_data_range() {
-            None => builder.append_null(),
-            Some(range) => {
-                let descriptor = BlobDescriptor::new(
-                    file_path.to_string(),
-                    range.start as i64,
-                    (range.end - range.start) as i64,
-                );
-                builder.append_value(descriptor.serialize());
-            }
-        }
-    }
-
-    let columns: Vec<ArrayRef> = vec![Arc::new(builder.finish())];
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
-        message: format!("Failed to build descriptor blob RecordBatch: {e}"),
-        source: Some(Box::new(e)),
-    })
+            Ok(match entry {
+                BlobEntry::Value(range) => {
+                    let descriptor = BlobDescriptor::new(
+                        file_path.to_string(),
+                        range.start as i64,
+                        (range.end - range.start) as i64,
+                    );
+                    BlobReadValue::Value(Bytes::from(descriptor.serialize()))
+                }
+                BlobEntry::Null => BlobReadValue::Null,
+                BlobEntry::Placeholder => BlobReadValue::Placeholder,
+            })
+        })
+        .collect()
 }
 
-async fn read_blob_batch(
-    reader: &dyn FileRead,
-    blob_index: &BlobFileIndex,
+fn build_blob_batch(
     target_schema: &Arc<arrow_schema::Schema>,
-    positions: &[usize],
-    project_values: bool,
+    values: Vec<BlobReadValue>,
 ) -> crate::Result<RecordBatch> {
-    if !project_values {
-        return RecordBatch::try_new_with_options(
-            target_schema.clone(),
-            Vec::new(),
-            &RecordBatchOptions::new().with_row_count(Some(positions.len())),
-        )
-        .map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to build empty blob RecordBatch: {e}"),
-            source: Some(Box::new(e)),
-        });
-    }
-
-    let planned_reads = plan_blob_reads(blob_index, positions)?;
-    let values = fetch_blob_values(reader, planned_reads).await?;
     let mut builder = BinaryBuilder::new();
     for value in values {
         match value {
-            BlobValue::Null => builder.append_null(),
-            BlobValue::Inline(bytes) => builder.append_value(bytes.as_ref()),
+            BlobReadValue::Value(bytes) => builder.append_value(bytes.as_ref()),
+            BlobReadValue::Null | BlobReadValue::Placeholder => builder.append_null(),
         }
     }
 
@@ -229,10 +245,11 @@ fn plan_blob_reads(
                     source: None,
                 })?;
 
-            Ok(match entry.inline_data_range() {
-                Some(range) if range.start == range.end => PlannedBlobRead::Empty,
-                Some(range) => PlannedBlobRead::Read(range),
-                None => PlannedBlobRead::Null,
+            Ok(match entry {
+                BlobEntry::Value(range) if range.start == range.end => PlannedBlobRead::Empty,
+                BlobEntry::Value(range) => PlannedBlobRead::Read(range.clone()),
+                BlobEntry::Null => PlannedBlobRead::Null,
+                BlobEntry::Placeholder => PlannedBlobRead::Placeholder,
             })
         })
         .collect()
@@ -241,12 +258,13 @@ fn plan_blob_reads(
 async fn fetch_blob_values(
     reader: &dyn FileRead,
     planned_reads: Vec<PlannedBlobRead>,
-) -> crate::Result<Vec<BlobValue>> {
+) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
-            PlannedBlobRead::Null => Ok(BlobValue::Null),
-            PlannedBlobRead::Empty => Ok(BlobValue::Inline(Bytes::new())),
-            PlannedBlobRead::Read(range) => reader.read(range).await.map(BlobValue::Inline),
+            PlannedBlobRead::Null => Ok(BlobReadValue::Null),
+            PlannedBlobRead::Placeholder => Ok(BlobReadValue::Placeholder),
+            PlannedBlobRead::Empty => Ok(BlobReadValue::Value(Bytes::new())),
+            PlannedBlobRead::Read(range) => reader.read(range).await.map(BlobReadValue::Value),
         }
     }))
     .buffered(BLOB_READ_CONCURRENCY)
@@ -257,14 +275,9 @@ async fn fetch_blob_values(
 #[derive(Debug, Clone)]
 enum PlannedBlobRead {
     Null,
+    Placeholder,
     Empty,
     Read(Range<u64>),
-}
-
-#[derive(Debug, Clone)]
-enum BlobValue {
-    Null,
-    Inline(Bytes),
 }
 
 #[derive(Debug, Clone)]
@@ -348,9 +361,10 @@ impl BlobFileIndex {
 }
 
 #[derive(Debug, Clone)]
-struct BlobEntry {
-    data_offset: Option<u64>,
-    data_length: u64,
+enum BlobEntry {
+    Value(Range<u64>),
+    Null,
+    Placeholder,
 }
 
 impl BlobEntry {
@@ -359,16 +373,22 @@ impl BlobEntry {
         let mut next_offset = 0_u64;
 
         for &entry_length in lengths {
-            if entry_length == -1 {
-                entries.push(Self {
-                    data_offset: None,
-                    data_length: 0,
-                });
-                continue;
+            match entry_length {
+                -1 => {
+                    entries.push(Self::Null);
+                    continue;
+                }
+                -2 => {
+                    entries.push(Self::Placeholder);
+                    continue;
+                }
+                _ => {}
             }
 
             let entry_length = u64::try_from(entry_length).map_err(|e| Error::DataInvalid {
-                message: format!("Blob entry length must be positive or -1, got {entry_length}"),
+                message: format!(
+                    "Blob entry length must be positive, -1, or -2, got {entry_length}"
+                ),
                 source: Some(Box::new(e)),
             })?;
 
@@ -397,19 +417,13 @@ impl BlobEntry {
                 });
             }
 
-            entries.push(Self {
-                data_offset: Some(next_offset + BLOB_INLINE_HEADER_SIZE),
-                data_length: entry_length - BLOB_ENTRY_OVERHEAD,
-            });
+            let data_offset = next_offset + BLOB_INLINE_HEADER_SIZE;
+            let data_length = entry_length - BLOB_ENTRY_OVERHEAD;
+            entries.push(Self::Value(data_offset..data_offset + data_length));
             next_offset = entry_end;
         }
 
         Ok(entries)
-    }
-
-    fn inline_data_range(&self) -> Option<Range<u64>> {
-        self.data_offset
-            .map(|offset| offset..offset + self.data_length)
     }
 }
 
@@ -916,6 +930,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_reader_treats_java_placeholders_as_null() {
+        let read_fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let file_bytes = load_blob_fixture("blob-placeholder.blob");
+
+        let batches = BlobFormatReader::new(String::new(), false)
+            .read_batch_stream(
+                Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                file_bytes.len() as u64,
+                &read_fields,
+                None,
+                Some(2),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(collect_binary_values(&batches[0]), vec![None, None]);
+        assert_eq!(
+            collect_binary_values(&batches[1]),
+            vec![Some(b"latest-3".to_vec()), None]
+        );
+    }
+
+    #[tokio::test]
     async fn test_blob_reader_reads_payloads_with_bounded_parallelism() {
         let read_fields = vec![DataField::new(
             0,
@@ -958,6 +1004,20 @@ mod tests {
         let generated = blob_test_utils::build_blob_file_bytes(&basic_blob_rows());
 
         assert_eq!(generated, load_blob_fixture("blob-basic.blob"));
+    }
+
+    #[test]
+    fn test_blob_reader_test_helper_matches_java_placeholder_fixture() {
+        use blob_test_utils::BlobFixtureValue::{Null, Placeholder, Value};
+
+        let generated = blob_test_utils::build_blob_file_bytes_with_values(&[
+            Placeholder,
+            Null,
+            Value(b"latest-3"),
+            Placeholder,
+        ]);
+
+        assert_eq!(generated, load_blob_fixture("blob-placeholder.blob"));
     }
 
     #[tokio::test]

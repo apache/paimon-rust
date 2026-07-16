@@ -22,13 +22,31 @@ const BLOB_MAGIC_NUMBER_BYTES: [u8; 4] = 1481511375_i32.to_le_bytes();
 const BLOB_ENTRY_OVERHEAD: usize = 16;
 const BLOB_FORMAT_VERSION: u8 = 1;
 
+#[derive(Clone, Copy)]
+pub(crate) enum BlobFixtureValue<'a> {
+    Value(&'a [u8]),
+    Null,
+    Placeholder,
+}
+
 pub(crate) fn build_blob_file_bytes(rows: &[Option<&[u8]>]) -> Vec<u8> {
+    let values = rows
+        .iter()
+        .map(|row| match row {
+            Some(payload) => BlobFixtureValue::Value(payload),
+            None => BlobFixtureValue::Null,
+        })
+        .collect::<Vec<_>>();
+    build_blob_file_bytes_with_values(&values)
+}
+
+pub(crate) fn build_blob_file_bytes_with_values(rows: &[BlobFixtureValue<'_>]) -> Vec<u8> {
     let mut file_bytes = Vec::new();
     let mut lengths = Vec::with_capacity(rows.len());
 
     for row in rows {
         match row {
-            Some(payload) => {
+            BlobFixtureValue::Value(payload) => {
                 let entry_length = payload
                     .len()
                     .checked_add(BLOB_ENTRY_OVERHEAD)
@@ -49,7 +67,8 @@ pub(crate) fn build_blob_file_bytes(rows: &[Option<&[u8]>]) -> Vec<u8> {
                 hasher.update(&entry_length_bytes);
                 file_bytes.extend_from_slice(&hasher.finalize().to_le_bytes());
             }
-            None => lengths.push(-1),
+            BlobFixtureValue::Null => lengths.push(-1),
+            BlobFixtureValue::Placeholder => lengths.push(-2),
         }
     }
 
@@ -68,6 +87,12 @@ pub(crate) fn build_blob_file_bytes(rows: &[Option<&[u8]>]) -> Vec<u8> {
 
 pub(crate) fn write_blob_file(path: &Path, rows: &[Option<&[u8]>]) {
     let file_bytes = build_blob_file_bytes(rows);
+    fs::write(path, file_bytes)
+        .unwrap_or_else(|e| panic!("Failed to write blob test file {path:?}: {e}"));
+}
+
+pub(crate) fn write_blob_file_with_values(path: &Path, rows: &[BlobFixtureValue<'_>]) {
+    let file_bytes = build_blob_file_bytes_with_values(rows);
     fs::write(path, file_bytes)
         .unwrap_or_else(|e| panic!("Failed to write blob test file {path:?}: {e}"));
 }
