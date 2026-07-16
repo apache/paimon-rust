@@ -677,6 +677,11 @@ impl TableCommit {
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
         let start_time_ms = current_time_millis();
+        // An identified destructive no-op must still record its identifier.
+        // Otherwise a retry after an intervening write can execute the operation
+        // for the first time and delete data which was not present originally.
+        let commit_empty_overwrite =
+            filter_committed && plan.commit_kind_hint() == CommitKind::OVERWRITE;
         let mut filter_committed = filter_committed;
 
         loop {
@@ -711,6 +716,7 @@ impl TableCommit {
             if resolved.entries.is_empty()
                 && resolved.changelog_entries.is_empty()
                 && !resolved.index_manifest_changed
+                && !commit_empty_overwrite
             {
                 break;
             }
@@ -3390,6 +3396,46 @@ mod tests {
         let entries = active_entries(&file_io, table_path, &snapshot).await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file().file_name, "intervening.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_empty_truncate_retry_preserves_intervening_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_empty_truncate_retry_preserves_intervening_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let other_commit = TableCommit::new(test_table(&file_io, table_path), "other-user".into());
+
+        commit.truncate_table_with_identifier(1).await.unwrap();
+        let marker = latest_snapshot(&file_io, table_path)
+            .await
+            .expect("identified no-op truncate must record a snapshot");
+        assert_eq!(marker.commit_user(), "test-user");
+        assert_eq!(marker.commit_identifier(), 1);
+        assert_eq!(marker.commit_kind(), &CommitKind::OVERWRITE);
+        other_commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("intervening.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        commit.truncate_table_with_identifier(1).await.unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let entries = active_entries(&file_io, table_path, &snapshot).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].file().file_name,
+            "intervening.parquet",
+            "retrying a no-op truncate must not delete data committed in between"
+        );
     }
 
     #[tokio::test]
