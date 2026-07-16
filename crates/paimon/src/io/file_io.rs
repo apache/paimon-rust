@@ -215,6 +215,16 @@ impl FileIO {
             })
     }
 
+    /// Check if a directory exists.
+    pub async fn exists_dir(&self, path: &str) -> Result<bool> {
+        let (op, relative_path) = self.storage.create(path)?;
+        let dir_path = normalize_root(relative_path.as_ref());
+
+        op.exists(&dir_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to check existence of directory '{path}'"),
+        })
+    }
+
     /// Delete a file.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
@@ -620,6 +630,24 @@ mod file_action_test {
         let file_io = setup_memory_file_io();
         let result = file_io.exists("").await;
         assert!(matches!(result, Err(Error::ConfigInvalid { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_exists_dir_memory() {
+        let file_io = setup_memory_file_io();
+
+        file_io.mkdirs("memory:/empty").await.unwrap();
+        assert!(file_io.exists_dir("memory:/empty").await.unwrap());
+
+        file_io
+            .new_output("memory:/markerless/child")
+            .unwrap()
+            .write(Bytes::from("data"))
+            .await
+            .unwrap();
+        assert!(file_io.exists_dir("memory:/markerless").await.unwrap());
+
+        assert!(!file_io.exists_dir("memory:/missing").await.unwrap());
     }
 
     #[tokio::test]
