@@ -1037,11 +1037,7 @@ impl SQLContext {
                 AlterTableOperation::AddColumn { column_def, .. } => {
                     changes.push(column_def_to_add_column(column_def)?);
                 }
-                AlterTableOperation::DropColumn {
-                    column_names,
-                    if_exists: _,
-                    ..
-                } => {
+                AlterTableOperation::DropColumn { column_names, .. } => {
                     for col in column_names {
                         changes.push(SchemaChange::drop_column(col.value.clone()));
                     }
