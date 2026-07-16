@@ -642,7 +642,7 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
 ) -> *mut paimon_error {
-    paimon_table_commit_overwrite_with_identifier(tc, msgs, i64::MAX)
+    paimon_table_commit_overwrite_impl(tc, msgs, None)
 }
 
 /// Overwrite with a caller-provided stable commit identifier.
@@ -653,6 +653,14 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite_with_identifier(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
+) -> *mut paimon_error {
+    paimon_table_commit_overwrite_impl(tc, msgs, Some(commit_identifier))
+}
+
+unsafe fn paimon_table_commit_overwrite_impl(
+    tc: *const paimon_table_commit,
+    msgs: *mut paimon_commit_messages,
+    commit_identifier: Option<i64>,
 ) -> *mut paimon_error {
     if let Err(e) = check_non_null(tc, "tc") {
         return e;
@@ -667,11 +675,21 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite_with_identifier(
         return error;
     }
 
-    match runtime().block_on(table_commit.commit.overwrite_with_identifier(
-        messages.messages.clone(),
-        None,
-        commit_identifier,
-    )) {
+    let result = match commit_identifier {
+        Some(commit_identifier) => {
+            runtime().block_on(table_commit.commit.overwrite_with_identifier(
+                messages.messages.clone(),
+                None,
+                commit_identifier,
+            ))
+        }
+        None => runtime().block_on(
+            table_commit
+                .commit
+                .overwrite(messages.messages.clone(), None),
+        ),
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }
@@ -688,7 +706,7 @@ pub unsafe extern "C" fn paimon_table_commit_overwrite_with_identifier(
 pub unsafe extern "C" fn paimon_table_commit_truncate_table(
     tc: *const paimon_table_commit,
 ) -> *mut paimon_error {
-    paimon_table_commit_truncate_table_with_identifier(tc, i64::MAX)
+    paimon_table_commit_truncate_table_impl(tc, None)
 }
 
 /// Truncate the table with a caller-provided stable commit identifier.
@@ -697,17 +715,28 @@ pub unsafe extern "C" fn paimon_table_commit_truncate_table_with_identifier(
     tc: *const paimon_table_commit,
     commit_identifier: i64,
 ) -> *mut paimon_error {
+    paimon_table_commit_truncate_table_impl(tc, Some(commit_identifier))
+}
+
+unsafe fn paimon_table_commit_truncate_table_impl(
+    tc: *const paimon_table_commit,
+    commit_identifier: Option<i64>,
+) -> *mut paimon_error {
     if let Err(e) = check_non_null(tc, "tc") {
         return e;
     }
 
     let table_commit = &*((*tc).inner as *const TableCommitState);
 
-    match runtime().block_on(
-        table_commit
-            .commit
-            .truncate_table_with_identifier(commit_identifier),
-    ) {
+    let result = match commit_identifier {
+        Some(commit_identifier) => runtime().block_on(
+            table_commit
+                .commit
+                .truncate_table_with_identifier(commit_identifier),
+        ),
+        None => runtime().block_on(table_commit.commit.truncate_table()),
+    };
+    match result {
         Ok(()) => ptr::null_mut(),
         Err(e) => paimon_error::from_paimon(e),
     }

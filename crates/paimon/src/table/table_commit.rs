@@ -239,16 +239,35 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         static_partitions: Option<HashMap<String, Option<Datum>>>,
     ) -> Result<()> {
-        self.overwrite_with_identifier(commit_messages, static_partitions, BATCH_COMMIT_IDENTIFIER)
-            .await
+        self.overwrite_impl(
+            commit_messages,
+            static_partitions,
+            BATCH_COMMIT_IDENTIFIER,
+            false,
+        )
+        .await
     }
 
     /// Overwrite partitions with a caller-provided commit identifier.
+    ///
+    /// A previously committed identifier is filtered so retrying an uncertain
+    /// result cannot re-execute the destructive operation.
     pub async fn overwrite_with_identifier(
         &self,
         commit_messages: Vec<CommitMessage>,
         static_partitions: Option<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
+    ) -> Result<()> {
+        self.overwrite_impl(commit_messages, static_partitions, commit_identifier, true)
+            .await
+    }
+
+    async fn overwrite_impl(
+        &self,
+        commit_messages: Vec<CommitMessage>,
+        static_partitions: Option<HashMap<String, Option<Datum>>>,
+        commit_identifier: i64,
+        filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -291,7 +310,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
-            false,
+            filter_committed,
         )
         .await
     }
@@ -476,15 +495,28 @@ impl TableCommit {
         &self,
         partitions: Vec<HashMap<String, Option<Datum>>>,
     ) -> Result<()> {
-        self.truncate_partitions_with_identifier(partitions, BATCH_COMMIT_IDENTIFIER)
+        self.truncate_partitions_impl(partitions, BATCH_COMMIT_IDENTIFIER, false)
             .await
     }
 
     /// Drop specific partitions with a caller-provided commit identifier.
+    ///
+    /// A previously committed identifier is filtered so retrying an uncertain
+    /// result cannot delete data committed in between.
     pub async fn truncate_partitions_with_identifier(
         &self,
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
+    ) -> Result<()> {
+        self.truncate_partitions_impl(partitions, commit_identifier, true)
+            .await
+    }
+
+    async fn truncate_partitions_impl(
+        &self,
+        partitions: Vec<HashMap<String, Option<Datum>>>,
+        commit_identifier: i64,
+        filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -506,7 +538,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
-            false,
+            filter_committed,
         )
         .await
     }
@@ -516,8 +548,13 @@ impl TableCommit {
         &self,
         partitions: Vec<HashMap<String, Option<Datum>>>,
     ) -> Result<()> {
-        self.drop_partitions_with_identifier(partitions, BATCH_COMMIT_IDENTIFIER)
-            .await
+        if partitions.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "Partitions list cannot be empty.".to_string(),
+                source: None,
+            });
+        }
+        self.truncate_partitions(partitions).await
     }
 
     /// Python-compatible alias for dropping partitions with a caller-provided
@@ -542,12 +579,23 @@ impl TableCommit {
 
     /// Truncate the entire table (OVERWRITE with no filter, only deletes).
     pub async fn truncate_table(&self) -> Result<()> {
-        self.truncate_table_with_identifier(BATCH_COMMIT_IDENTIFIER)
+        self.truncate_table_impl(BATCH_COMMIT_IDENTIFIER, false)
             .await
     }
 
     /// Truncate the entire table with a caller-provided commit identifier.
+    ///
+    /// A previously committed identifier is filtered so retrying an uncertain
+    /// result cannot delete data committed in between.
     pub async fn truncate_table_with_identifier(&self, commit_identifier: i64) -> Result<()> {
+        self.truncate_table_impl(commit_identifier, true).await
+    }
+
+    async fn truncate_table_impl(
+        &self,
+        commit_identifier: i64,
+        filter_committed: bool,
+    ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(
@@ -562,7 +610,7 @@ impl TableCommit {
             },
             None,
             commit_identifier,
-            false,
+            filter_committed,
         )
         .await
     }
@@ -650,7 +698,7 @@ impl TableCommit {
                         commit_identifier,
                         &plan.commit_kind_hint(),
                     )
-                    .await
+                    .await?
                 {
                     break;
                 }
@@ -1128,14 +1176,12 @@ impl TableCommit {
             .unwrap_or(latest.id());
         for snapshot_id in (earliest_snapshot_id..=latest.id()).rev() {
             let snapshot = if snapshot_id == latest.id() {
-                Some(latest.clone())
+                latest.clone()
             } else {
-                self.snapshot_manager.get_snapshot(snapshot_id).await.ok()
+                self.snapshot_manager.get_snapshot(snapshot_id).await?
             };
-            if let Some(snapshot) = snapshot {
-                if snapshot.commit_user() == self.commit_user {
-                    return Ok(commit_identifier <= snapshot.commit_identifier());
-                }
+            if snapshot.commit_user() == self.commit_user {
+                return Ok(commit_identifier <= snapshot.commit_identifier());
             }
         }
         Ok(false)
@@ -1148,20 +1194,19 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
         commit_kind: &CommitKind,
-    ) -> bool {
+    ) -> Result<bool> {
         if let Some(latest) = latest_snapshot {
             for snapshot_id in start_snapshot_id..=latest.id() {
-                if let Ok(snap) = self.snapshot_manager.get_snapshot(snapshot_id).await {
-                    if snap.commit_user() == self.commit_user
-                        && snap.commit_identifier() == commit_identifier
-                        && snap.commit_kind() == commit_kind
-                    {
-                        return true;
-                    }
+                let snap = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+                if snap.commit_user() == self.commit_user
+                    && snap.commit_identifier() == commit_identifier
+                    && snap.commit_kind() == commit_kind
+                {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Resolve commit entries and merge index entries based on the plan type.
@@ -3179,16 +3224,14 @@ mod tests {
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let latest = snap_manager.get_latest_snapshot().await.unwrap();
-        assert!(
-            commit
-                .is_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
-                .await
-        );
-        assert!(
-            !commit
-                .is_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
-                .await
-        );
+        assert!(commit
+            .is_duplicate_commit(1, &latest, 7, &CommitKind::APPEND)
+            .await
+            .unwrap());
+        assert!(!commit
+            .is_duplicate_commit(1, &latest, 8, &CommitKind::APPEND)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3248,6 +3291,154 @@ mod tests {
             2,
             "an expired older identifier is still a retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_retry_preserves_intervening_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_overwrite_retry_preserves_intervening_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let other_commit = TableCommit::new(test_table(&file_io, table_path), "other-user".into());
+        commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("initial.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        let overwrite =
+            CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 100)]);
+        commit
+            .overwrite_with_identifier(vec![overwrite.clone()], None, 2)
+            .await
+            .unwrap();
+        other_commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("intervening.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        commit
+            .overwrite_with_identifier(vec![overwrite], None, 2)
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(snapshot.id(), 3, "the retry must not create a snapshot");
+        let mut file_names = active_entries(&file_io, table_path, &snapshot)
+            .await
+            .into_iter()
+            .map(|entry| entry.file().file_name.clone())
+            .collect::<Vec<_>>();
+        file_names.sort();
+        assert_eq!(
+            file_names,
+            vec!["intervening.parquet", "overwrite.parquet"],
+            "the retry must not remove data committed in between"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_retry_preserves_intervening_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_truncate_retry_preserves_intervening_commit";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let other_commit = TableCommit::new(test_table(&file_io, table_path), "other-user".into());
+        commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("initial.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+        commit.truncate_table_with_identifier(2).await.unwrap();
+        other_commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("intervening.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        commit.truncate_table_with_identifier(2).await.unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(snapshot.id(), 3, "the retry must not create a snapshot");
+        let entries = active_entries(&file_io, table_path, &snapshot).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file().file_name, "intervening.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_identifier_filter_propagates_snapshot_read_error() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_identifier_filter_snapshot_read_error";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        for identifier in 1..=2 {
+            commit
+                .commit_with_identifier(
+                    vec![CommitMessage::new(
+                        vec![],
+                        0,
+                        vec![test_data_file(&format!("data-{identifier}.parquet"), 100)],
+                    )],
+                    identifier,
+                )
+                .await
+                .unwrap();
+        }
+        let other_commit = TableCommit::new(test_table(&file_io, table_path), "other-user".into());
+        other_commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("other.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        file_io
+            .new_output(&snapshot_manager.snapshot_path(2))
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"not-json"))
+            .await
+            .unwrap();
+        let latest = snapshot_manager.get_latest_snapshot().await.unwrap();
+
+        let error = commit
+            .is_committed_identifier(&latest, 2)
+            .await
+            .expect_err("an unreadable active snapshot must fail identifier filtering");
+        assert!(error.to_string().contains("snapshot JSON invalid"));
     }
 
     #[tokio::test]
