@@ -23,7 +23,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::spec::{
-    BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest, PkVectorSourceMeta,
+    BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest, PkVectorSourceFile,
+    PkVectorSourceMeta,
 };
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
@@ -44,6 +45,56 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// files back the PK-vector index; an absent file source reads as false.
 fn should_read_pk_index_source(file: &DataFileMeta) -> bool {
     matches!(file.file_source, Some(src) if src == FILE_SOURCE_COMPACT) && file.level > 0
+}
+
+fn source_files_unique(files: &[PkVectorSourceFile]) -> bool {
+    let mut seen = HashSet::new();
+    files.iter().all(|file| seen.insert(file.file_name()))
+}
+
+fn current_ann_segments(
+    active_data_files: &[DataFileMeta],
+    ann_segments: Vec<BucketAnnSegment>,
+) -> crate::Result<Vec<BucketAnnSegment>> {
+    let mut sources_by_level: BTreeMap<i32, Vec<PkVectorSourceFile>> = BTreeMap::new();
+    for file in active_data_files {
+        if should_read_pk_index_source(file) {
+            sources_by_level
+                .entry(file.level)
+                .or_default()
+                .push(PkVectorSourceFile::new(
+                    file.file_name.clone(),
+                    file.row_count,
+                )?);
+        }
+    }
+    for sources in sources_by_level.values_mut() {
+        sources.sort_by(|a, b| a.file_name().cmp(b.file_name()));
+    }
+
+    let mut segments_by_level: BTreeMap<i32, Vec<BucketAnnSegment>> = BTreeMap::new();
+    for segment in ann_segments {
+        let source_meta = &segment.source_meta;
+        let Some(desired) = sources_by_level.get(&source_meta.data_level()) else {
+            continue;
+        };
+        if source_files_unique(source_meta.source_files())
+            && desired.as_slice() == source_meta.source_files()
+        {
+            segments_by_level
+                .entry(source_meta.data_level())
+                .or_default()
+                .push(segment);
+        }
+    }
+
+    let mut current = Vec::new();
+    for mut level_segments in segments_by_level.into_values() {
+        if level_segments.len() == 1 {
+            current.push(level_segments.remove(0));
+        }
+    }
+    Ok(current)
 }
 
 /// Combines one bucket's data splits into a single split, keeping data files and
@@ -284,8 +335,11 @@ fn plan_from_inputs(
     // Phase C: assemble one split per bucket that has data.
     let mut out = Vec::new();
     for (key, acc) in accum_by_bucket {
-        let ann_segments = segments_by_bucket.remove(&key).unwrap_or_default();
         let data_split = acc.build()?;
+        let ann_segments = current_ann_segments(
+            data_split.data_files(),
+            segments_by_bucket.remove(&key).unwrap_or_default(),
+        )?;
         let active_files: Vec<BucketActiveFile> = data_split
             .data_files()
             .iter()
@@ -369,9 +423,10 @@ mod tests {
     /// Build a `_SOURCE_META` blob the way `PkVectorSourceMeta::deserialize`
     /// expects it. There is no public serializer, so we mirror the frame used by
     /// `pk_vector_source.rs`'s own round-trip tests.
-    fn source_meta_bytes(files: &[(&str, i64)]) -> Vec<u8> {
+    fn source_meta_bytes(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&1i32.to_be_bytes()); // version
+        out.extend_from_slice(&data_level.to_be_bytes());
         out.extend_from_slice(&(files.len() as i32).to_be_bytes());
         for (name, rows) in files {
             out.extend_from_slice(&java_write_utf(name));
@@ -380,14 +435,32 @@ mod tests {
         out
     }
 
-    fn gim(field_id: i32, source_files: &[(&str, i64)]) -> GlobalIndexMeta {
+    fn gim(field_id: i32, data_level: i32, source_files: &[(&str, i64)]) -> GlobalIndexMeta {
         GlobalIndexMeta {
             row_range_start: 0,
             row_range_end: 0,
             index_field_id: field_id,
             extra_field_ids: None,
             index_meta: Some(vec![1, 2, 3]),
-            source_meta: Some(source_meta_bytes(source_files)),
+            source_meta: Some(source_meta_bytes(data_level, source_files)),
+        }
+    }
+
+    fn ann_segment(data_level: i32, path: &str, source_files: &[(&str, i64)]) -> BucketAnnSegment {
+        BucketAnnSegment {
+            source_meta: PkVectorSourceMeta::new(
+                data_level,
+                source_files
+                    .iter()
+                    .map(|(name, rows)| {
+                        PkVectorSourceFile::new((*name).to_string(), *rows).unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+            path: path.to_string(),
+            file_size: 1,
+            index_meta: Vec::new(),
         }
     }
 
@@ -397,7 +470,7 @@ mod tests {
         let entries = vec![(
             BinaryRow::new(0),
             0,
-            gim(2, &[("d0", 3)]),
+            gim(2, 5, &[("d0", 3)]),
             "idx/seg0".to_string(),
             10u64,
             "seg0".to_string(),
@@ -411,7 +484,7 @@ mod tests {
         let entries = vec![(
             BinaryRow::new(0),
             0,
-            gim(2, &[("d0", 3)]),
+            gim(2, 5, &[("d0", 3)]),
             "idx/seg0".to_string(),
             10u64,
             "seg0".to_string(),
@@ -434,6 +507,43 @@ mod tests {
         assert_eq!(seg.source_meta.resolve(0).unwrap(), ("d0".to_string(), 0));
         assert_eq!(splits[0].active_files.len(), 1); // d0 is COMPACT + level>0
         assert_eq!(splits[0].active_files[0].file_name, "d0");
+    }
+
+    #[test]
+    fn current_segments_require_exact_level_source_set() {
+        let active = vec![
+            dfm("b", 2, 5, Some(1)),
+            dfm("a", 1, 5, Some(1)),
+            dfm("c", 3, 6, Some(1)),
+        ];
+        let current = current_ann_segments(
+            &active,
+            vec![
+                // Matches level 5 after active files are sorted by file name.
+                ann_segment(5, "current-l5", &[("a", 1), ("b", 2)]),
+                // Wrong level for the same source files -> stale.
+                ann_segment(4, "wrong-level", &[("a", 1), ("b", 2)]),
+                // Incomplete level 6 coverage -> stale.
+                ann_segment(6, "partial-l6", &[("c", 2)]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].path, "current-l5");
+    }
+
+    #[test]
+    fn current_segments_drop_all_when_level_has_multiple_matches() {
+        let active = vec![dfm("a", 1, 5, Some(1))];
+        let current = current_ann_segments(
+            &active,
+            vec![
+                ann_segment(5, "first", &[("a", 1)]),
+                ann_segment(5, "second", &[("a", 1)]),
+            ],
+        )
+        .unwrap();
+        assert!(current.is_empty());
     }
 
     #[test]

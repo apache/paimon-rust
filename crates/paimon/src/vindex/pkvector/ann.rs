@@ -221,7 +221,7 @@ mod tests {
             .iter()
             .map(|(name, rows)| PkVectorSourceFile::new((*name).to_string(), *rows).unwrap())
             .collect();
-        PkVectorSourceMeta::new(files).unwrap()
+        PkVectorSourceMeta::new(1, files).unwrap()
     }
 
     fn dv(deleted: &[u32]) -> Arc<DeletionVector> {
@@ -379,10 +379,13 @@ mod tests {
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(vec![
-                PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-                PkVectorSourceFile::new("f1".into(), 5).unwrap(),
-            ])
+            PkVectorSourceMeta::new(
+                1,
+                vec![
+                    PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+                    PkVectorSourceFile::new("f1".into(), 5).unwrap(),
+                ],
+            )
             .unwrap()
         });
         let mut dvs = HashMap::new();
@@ -416,7 +419,8 @@ mod tests {
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()]).unwrap()
+            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
+                .unwrap()
         });
         let err = searcher
             .search(
@@ -440,7 +444,8 @@ mod tests {
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()]).unwrap()
+            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
+                .unwrap()
         });
         let results = searcher
             .search(

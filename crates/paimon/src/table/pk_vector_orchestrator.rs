@@ -764,6 +764,7 @@ mod e2e_tests {
     fn ann_segment(sources: &[(&str, i64)]) -> BucketAnnSegment {
         BucketAnnSegment::for_test(
             PkVectorSourceMeta::new(
+                1,
                 sources
                     .iter()
                     .map(|(n, r)| PkVectorSourceFile::new((*n).to_string(), *r).unwrap())

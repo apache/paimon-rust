@@ -2653,13 +2653,11 @@ mod tests {
     /// A `PkVectorSearchSplit` carrying a single ANN segment addressed by `path`.
     fn pk_split_with_segment(path: &str) -> PkVectorSearchSplit {
         let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-        let source_meta =
-            crate::spec::PkVectorSourceMeta::new(vec![crate::spec::PkVectorSourceFile::new(
-                "file-a".to_string(),
-                3,
-            )
-            .unwrap()])
-            .unwrap();
+        let source_meta = crate::spec::PkVectorSourceMeta::new(
+            1,
+            vec![crate::spec::PkVectorSourceFile::new("file-a".to_string(), 3).unwrap()],
+        )
+        .unwrap();
         let mut segment = BucketAnnSegment::for_test(source_meta);
         segment.path = path.to_string();
         split.ann_segments = vec![segment];

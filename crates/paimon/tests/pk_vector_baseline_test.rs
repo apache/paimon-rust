@@ -196,11 +196,13 @@ fn java_write_utf(s: &str) -> Vec<u8> {
 
 /// Assemble the `_SOURCE_META` frame the way Java `PkVectorSourceMeta` writes it
 /// and `PkVectorSourceMeta::deserialize` expects: `i32-BE version=1`, `i32-BE
-/// count`, then per source file a `writeUTF` name and an `i64-BE` row count. No
-/// trailing bytes. Source files are listed in global ordinal order.
-fn source_meta_bytes(files: &[(&str, i64)]) -> Vec<u8> {
+/// data_level`, `i32-BE count`, then per source file a `writeUTF` name and an
+/// `i64-BE` row count. No trailing bytes. Source files are listed in global
+/// ordinal order.
+fn source_meta_bytes(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&1i32.to_be_bytes()); // version
+    out.extend_from_slice(&data_level.to_be_bytes());
     out.extend_from_slice(&(files.len() as i32).to_be_bytes());
     for (name, rows) in files {
         out.extend_from_slice(&java_write_utf(name));
@@ -396,7 +398,10 @@ async fn build_table(
             row_range_end: row_count - 1,
             index_field_id: vector_field_id,
             extra_field_ids: None,
-            source_meta: Some(source_meta_bytes(&[(&data_file_name, row_count)])),
+            source_meta: Some(source_meta_bytes(
+                indexed_meta.level,
+                &[(&data_file_name, row_count)],
+            )),
             index_meta: None,
         }),
     };

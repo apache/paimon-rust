@@ -289,6 +289,7 @@ mod tests {
 
     fn meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
         PkVectorSourceMeta::new(
+            1,
             files
                 .iter()
                 .map(|(n, r)| PkVectorSourceFile::new((*n).into(), *r).unwrap())
