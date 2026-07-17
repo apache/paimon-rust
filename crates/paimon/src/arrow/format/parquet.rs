@@ -18,6 +18,8 @@
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
+use crate::arrow::shredding::map::MapShreddingReadPlan;
+use crate::arrow::shredding::ShreddingReadPlan;
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -38,7 +40,7 @@ use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::properties::WriterProperties;
@@ -54,6 +56,9 @@ pub(crate) struct ParquetFormatReader;
 /// Streams data directly to storage via `AsyncArrowWriter` + opendal.
 pub(crate) struct ParquetFormatWriter {
     inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
+    /// Physical Arrow schema the writer was created with; re-encoded with the
+    /// shredding field metadata at close time.
+    schema: arrow_schema::SchemaRef,
     write_fields: Option<Vec<DataField>>,
     stats_modes: Option<Vec<MetadataStatsMode>>,
     stats_dense_store: bool,
@@ -114,13 +119,14 @@ impl ParquetFormatWriter {
     ) -> crate::Result<Self> {
         let async_write = output.async_writer().await?;
         let codec = parse_compression(compression, zstd_level);
-        let inner = create_parquet_arrow_writer(async_write, schema, codec)?;
+        let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
         let core_options = CoreOptions::new(format_options);
         let stats_modes = write_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
         Ok(Self {
             inner,
+            schema,
             write_fields: write_fields.map(|fields| fields.to_vec()),
             stats_modes,
             stats_dense_store: core_options.metadata_stats_dense_store(),
@@ -185,6 +191,45 @@ impl FormatFileWriter for ParquetFormatWriter {
                 message: format!("Failed to flush parquet writer: {e}"),
                 source: None,
             })
+    }
+
+    fn commit_field_metadata(
+        &mut self,
+        field_metadata: &crate::arrow::shredding::FieldMetadata,
+    ) -> crate::Result<()> {
+        // Re-encode the physical Arrow schema with the shredding metadata
+        // injected into the top-level fields, mirroring Java's
+        // `FormatMetadataUtils.buildArrowSchemaMetadata`: metadata already on
+        // the field (e.g. PARQUET:field_id) wins on key conflict. The updated
+        // schema is appended as a second ARROW:schema entry; readers resolve
+        // duplicate footer keys last-wins (both arrow-rs and parquet-mr), so
+        // it overrides the construction-time schema.
+        let fields: Vec<arrow_schema::FieldRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let Some(extra) = field_metadata.get(field.name()) else {
+                    return field.clone();
+                };
+                let mut metadata = extra.clone();
+                metadata.extend(
+                    field
+                        .metadata()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            })
+            .collect();
+        let new_schema =
+            arrow_schema::Schema::new_with_metadata(fields, self.schema.metadata().clone());
+        let encoded = parquet::arrow::encode_arrow_schema(&new_schema);
+        self.inner.append_key_value_metadata(KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_string(),
+            encoded,
+        ));
+        Ok(())
     }
 
     async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
@@ -318,12 +363,29 @@ impl FormatFileReader for ParquetFormatReader {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
         }
 
+        // MAP shared-shredding read plan, built from the per-field metadata
+        // committed into the file footer at write time. `None` when no scanned
+        // field is shared-shredded. Assembly must happen before any residual
+        // predicate evaluation so predicates see logical MAP columns.
+        let map_read_plan =
+            MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
+                .map(Arc::new);
+
         let batch_stream = batch_stream_builder.build()?;
 
         if all_enforced {
             // Fast path: the row filter enforced every predicate exactly during
             // decode. Return the stream directly — no residual pass.
-            return Ok(batch_stream.map(|r| r.map_err(Error::from)).boxed());
+            let stream = batch_stream.map(|r| r.map_err(Error::from));
+            return Ok(match &map_read_plan {
+                Some(plan) => {
+                    let plan = plan.clone();
+                    stream
+                        .map(move |r| r.and_then(|batch| plan.assemble_batch(&batch)))
+                        .boxed()
+                }
+                None => stream.boxed(),
+            });
         }
 
         // Residual backstop: at least one predicate (`Or`/`Not`/unsupported leaf)
@@ -338,6 +400,10 @@ impl FormatFileReader for ParquetFormatReader {
         };
         let stream = batch_stream.map(move |result| {
             let batch = result.map_err(Error::from)?;
+            let batch = match &map_read_plan {
+                Some(plan) => plan.assemble_batch(&batch)?,
+                None => batch,
+            };
             crate::arrow::residual::filter_record_batch_by_predicates(
                 batch,
                 &residual_predicates,
@@ -1765,6 +1831,7 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)] // test row literals use nested Option<Vec<(&str, Option<i64>)>>
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
@@ -1777,9 +1844,15 @@ mod tests {
     };
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder, VariantType};
+    use crate::spec::{
+        BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder, VarCharType,
+        VariantType,
+    };
     use crate::variant::GenericVariant;
-    use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StructArray};
+    use arrow_array::{
+        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
@@ -3065,5 +3138,296 @@ mod tests {
         ));
         // Beyond the row group.
         assert!(!super::page_boundaries_valid(&[page(0), page(40)], 30));
+    }
+
+    // -----------------------------------------------------------------------
+    // MAP shared-shredding end-to-end (mirrors Java's
+    // MapSharedShreddingTableTest read/write semantics).
+    // -----------------------------------------------------------------------
+
+    fn map_shredding_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "tags".to_string(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+                    DataType::BigInt(BigIntType::new()),
+                )),
+            ),
+        ]
+    }
+
+    fn build_int64_map_array(rows: &[Option<Vec<(&str, Option<i64>)>>]) -> MapArray {
+        let map_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+            DataType::BigInt(BigIntType::new()),
+        ));
+        let ArrowDataType::Map(entries_field, ordered) =
+            crate::arrow::paimon_type_to_arrow(&map_type).unwrap()
+        else {
+            panic!("map type must convert to Arrow Map")
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type().clone() else {
+            panic!("map entries must be Struct")
+        };
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut offsets = vec![0i32];
+        let mut validity = Vec::new();
+        for row in rows {
+            match row {
+                None => {
+                    validity.push(false);
+                    offsets.push(*offsets.last().unwrap());
+                }
+                Some(entries) => {
+                    validity.push(true);
+                    for (key, value) in entries {
+                        keys.push(*key);
+                        values.push(*value);
+                    }
+                    offsets.push(*offsets.last().unwrap() + entries.len() as i32);
+                }
+            }
+        }
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(values)),
+            ],
+            None,
+        )
+        .unwrap();
+        MapArray::new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            entries,
+            Some(NullBuffer::from(validity)),
+            ordered,
+        )
+    }
+
+    fn assert_int64_map_rows(map: &MapArray, rows: &[Option<Vec<(&str, Option<i64>)>>]) {
+        let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        let values = map.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(map.len(), rows.len());
+        for (row, expected) in rows.iter().enumerate() {
+            match expected {
+                None => assert!(map.is_null(row), "row {row} must be null"),
+                Some(entries) => {
+                    assert!(!map.is_null(row), "row {row} must be non-null");
+                    let start = map.offsets()[row] as usize;
+                    let end = map.offsets()[row + 1] as usize;
+                    assert_eq!(end - start, entries.len(), "row {row} entry count");
+                    for (j, (key, value)) in entries.iter().enumerate() {
+                        assert_eq!(keys.value(start + j), *key, "row {row} key {j}");
+                        assert_eq!(
+                            values.is_null(start + j),
+                            value.is_none(),
+                            "row {row} value {j} nullness"
+                        );
+                        if let Some(v) = value {
+                            assert_eq!(values.value(start + j), *v, "row {row} value {j}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn write_map_shredding_file(
+        rows: &[Option<Vec<(&str, Option<i64>)>>],
+        ids: &[i32],
+        max_columns: usize,
+    ) -> (String, crate::io::FileIO, u64, Vec<DataField>) {
+        let fields = map_shredding_fields();
+        let options = HashMap::from([
+            (
+                "fields.tags.map.storage-layout".to_string(),
+                "shared-shredding".to_string(),
+            ),
+            (
+                "fields.tags.map.shared-shredding.max-columns".to_string(),
+                max_columns.to_string(),
+            ),
+        ]);
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(build_int64_map_array(rows)),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/map_shredding_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+        (path, file_io, file_size, fields)
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_write_read_roundtrip() {
+        let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
+            Some(vec![("a", Some(10)), ("b", None), ("c", Some(30))]), // c overflows
+            None,                                                      // null map
+            Some(vec![]),                                              // empty map
+            Some(vec![("b", Some(40)), ("a", Some(50))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+        let (path, file_io, file_size, fields) = write_map_shredding_file(&rows, &ids, 2).await;
+
+        // Raw physical layout: "tags" is a struct with the shared-shredding
+        // child columns, proving the writer applied the plan.
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches = parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(
+            raw_bytes.clone(),
+            1024,
+        )
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+        let raw_tags = raw_batches[0].column_by_name("tags").unwrap();
+        let ArrowDataType::Struct(raw_fields) = raw_tags.data_type() else {
+            panic!("physical tags column must be a struct")
+        };
+        let names: Vec<&str> = raw_fields.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["__field_mapping", "__col_0", "__col_1", "__overflow"]
+        );
+
+        // The footer carries two ARROW:schema entries: the construction-time
+        // schema and the one re-encoded at close with the shredding metadata.
+        let metadata = load_metadata_with_page_index(&raw_bytes, false);
+        let kv = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .expect("footer must carry key-value metadata");
+        let arrow_schema_entries = kv
+            .iter()
+            .filter(|kv| kv.key == parquet::arrow::ARROW_SCHEMA_META_KEY)
+            .count();
+        assert_eq!(
+            arrow_schema_entries, 2,
+            "close must append a second ARROW:schema carrying the shredding metadata"
+        );
+
+        // The format reader surfaces the logical MAP column back.
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let id = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            id.iter().collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+        let tags = batches[0]
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_int64_map_rows(tags, &rows);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_residual_path_assembles_before_filter() {
+        // An `Or` predicate is not fully enforced by the parquet row filter, so
+        // the reader takes the residual branch: the shredded MAP column must be
+        // assembled back to its logical type *before* the residual filter runs,
+        // and only matching rows survive.
+        let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
+            Some(vec![("a", Some(10))]),
+            Some(vec![("b", Some(20))]),
+            Some(vec![("c", Some(30))]),
+            Some(vec![("d", Some(40))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+        let (path, file_io, file_size, fields) = write_map_shredding_file(&rows, &ids, 2).await;
+
+        let predicates = vec![Predicate::Or(vec![
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: super::PredicateOperator::Eq,
+                literals: vec![Datum::Int(2)],
+            },
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: super::PredicateOperator::Eq,
+                literals: vec![Datum::Int(4)],
+            },
+        ])];
+        let file_predicates = FilePredicates {
+            predicates,
+            file_fields: fields.clone(),
+        };
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &fields,
+                Some(&file_predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let id = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id.iter().collect::<Vec<_>>(), vec![Some(2), Some(4)]);
+        let tags = batches[0]
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_int64_map_rows(tags, &[rows[1].clone(), rows[3].clone()]);
     }
 }

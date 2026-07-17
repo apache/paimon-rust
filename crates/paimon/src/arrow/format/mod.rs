@@ -102,6 +102,22 @@ pub(crate) trait FormatFileWriter: Send {
     /// Flush the current row group to storage without closing the file.
     async fn flush(&mut self) -> crate::Result<()>;
 
+    /// Commit per-field metadata into the file footer, called by the shredding
+    /// wrapper just before [`close`](FormatFileWriter::close).
+    ///
+    /// Only formats whose footer can carry per-field key/value metadata
+    /// (Parquet) implement this; the default errors, mirroring Java's
+    /// `FormatFileWriter.commitShreddingMetadata` support matrix.
+    fn commit_field_metadata(
+        &mut self,
+        _field_metadata: &crate::arrow::shredding::FieldMetadata,
+    ) -> crate::Result<()> {
+        Err(Error::Unsupported {
+            message: "committing shredding field metadata is not supported by this format"
+                .to_string(),
+        })
+    }
+
     /// Flush and close the writer, finalizing the file on storage.
     async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult>;
 }
@@ -220,6 +236,7 @@ pub(crate) async fn create_format_writer(
             schema,
             write_fields,
             format_options,
+            compression,
         )
         .await
     } else if lower.ends_with(".blob") {

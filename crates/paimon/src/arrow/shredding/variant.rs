@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{option_bool, option_f64, option_usize, FieldMetadata, ShreddingWritePlan};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
 };
@@ -214,44 +215,6 @@ fn add_missing_field_ids(value: &mut serde_json::Value) {
     }
 }
 
-fn option_bool(
-    options: &HashMap<String, String>,
-    keys: &[&str],
-    default_value: bool,
-) -> Result<bool> {
-    let Some(value) = keys.iter().find_map(|key| options.get(*key)) else {
-        return Ok(default_value);
-    };
-    value.parse::<bool>().map_err(|e| Error::DataInvalid {
-        message: format!("Invalid boolean option value '{value}'"),
-        source: Some(Box::new(e)),
-    })
-}
-
-fn option_usize(
-    options: &HashMap<String, String>,
-    key: &str,
-    default_value: usize,
-) -> Result<usize> {
-    let Some(value) = options.get(key) else {
-        return Ok(default_value);
-    };
-    value.parse::<usize>().map_err(|e| Error::DataInvalid {
-        message: format!("Invalid integer option {key}={value}"),
-        source: Some(Box::new(e)),
-    })
-}
-
-fn option_f64(options: &HashMap<String, String>, key: &str, default_value: f64) -> Result<f64> {
-    let Some(value) = options.get(key) else {
-        return Ok(default_value);
-    };
-    value.parse::<f64>().map_err(|e| Error::DataInvalid {
-        message: format!("Invalid double option {key}={value}"),
-        source: Some(Box::new(e)),
-    })
-}
-
 pub(crate) fn contains_variant_fields(fields: &[DataField]) -> bool {
     fields.iter().any(|field| match field.data_type() {
         DataType::Variant(_) => true,
@@ -430,6 +393,43 @@ fn physical_fields_for_configured_shredding(
 fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
     DataField::new(field.id(), field.name().to_string(), data_type)
         .with_description(field.description().map(ToString::to_string))
+}
+
+/// [`ShreddingWritePlan`] for Variant shredding.
+///
+/// The physical schema is fully known when the plan is created (from a
+/// configured shredding schema or inferred from sampled rows), so conversion
+/// is stateless and no footer metadata is committed at close.
+pub(crate) struct VariantWritePlan {
+    logical_fields: Vec<DataField>,
+    physical_fields: Vec<DataField>,
+}
+
+impl VariantWritePlan {
+    pub(crate) fn new(logical_fields: Vec<DataField>, physical_fields: Vec<DataField>) -> Self {
+        Self {
+            logical_fields,
+            physical_fields,
+        }
+    }
+}
+
+impl ShreddingWritePlan for VariantWritePlan {
+    fn logical_fields(&self) -> &[DataField] {
+        &self.logical_fields
+    }
+
+    fn physical_fields(&self) -> &[DataField] {
+        &self.physical_fields
+    }
+
+    fn to_physical_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        batch_to_shredded_physical(batch, &self.logical_fields, &self.physical_fields)
+    }
+
+    fn field_metadata(&self, _compression: Option<&str>) -> Result<FieldMetadata> {
+        Ok(HashMap::new())
+    }
 }
 
 pub(crate) fn batch_to_shredded_physical(
