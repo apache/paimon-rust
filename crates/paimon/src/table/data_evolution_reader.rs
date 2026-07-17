@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::blob_resolver::{BlobReadLimiter, BLOB_DESCRIPTOR_READ_CONCURRENCY};
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
     DataFileReader,
@@ -33,9 +34,10 @@ use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
 use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
 use async_stream::try_stream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 /// Whether a file name denotes a dedicated vector-store file (`*.vector.<format>`).
@@ -106,6 +108,7 @@ pub(crate) struct DataEvolutionReader {
     blob_view_fields: HashSet<String>,
     blob_view_resolve_enabled: bool,
     blob_view_rest_env: Option<RESTEnv>,
+    blob_read_limiter: BlobReadLimiter,
 }
 
 impl DataEvolutionReader {
@@ -165,6 +168,7 @@ impl DataEvolutionReader {
             blob_view_fields,
             blob_view_resolve_enabled,
             blob_view_rest_env,
+            blob_read_limiter: BlobReadLimiter::new(),
         })
     }
 
@@ -411,7 +415,13 @@ impl DataEvolutionReader {
 
         batch = self.resolve_blob_view_columns(batch, blob_view_lookup)?;
         let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
-            resolve_descriptor_columns(batch, descriptor_fields, &self.file_io).await?
+            resolve_descriptor_columns(
+                batch,
+                descriptor_fields,
+                &self.file_io,
+                &self.blob_read_limiter,
+            )
+            .await?
         } else {
             batch
         };
@@ -726,10 +736,28 @@ async fn resolve_descriptor_columns(
     batch: RecordBatch,
     blob_descriptor_fields: &HashSet<String>,
     file_io: &FileIO,
+    limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
+    resolve_descriptor_columns_with(batch, blob_descriptor_fields, |column| {
+        let file_io = file_io.clone();
+        let limiter = limiter.clone();
+        async move { super::blob_resolver::resolve_blob_column(&column, &file_io, limiter).await }
+    })
+    .await
+}
+
+async fn resolve_descriptor_columns_with<F, Fut>(
+    batch: RecordBatch,
+    blob_descriptor_fields: &HashSet<String>,
+    resolve: F,
+) -> crate::Result<RecordBatch>
+where
+    F: Fn(BinaryArray) -> Fut,
+    Fut: Future<Output = crate::Result<BinaryArray>>,
+{
     let schema = batch.schema();
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
-    let mut changed = false;
+    let mut columns = batch.columns().to_vec();
+    let mut descriptor_columns = Vec::new();
 
     for (idx, field) in schema.fields().iter().enumerate() {
         if blob_descriptor_fields.contains(field.name()) {
@@ -738,17 +766,26 @@ async fn resolve_descriptor_columns(
                 .as_any()
                 .downcast_ref::<arrow_array::BinaryArray>()
             {
-                let resolved = super::blob_resolver::resolve_blob_column(bin_col, file_io).await?;
-                columns.push(Arc::new(resolved));
-                changed = true;
-                continue;
+                descriptor_columns.push((idx, bin_col.clone()));
             }
         }
-        columns.push(batch.column(idx).clone());
     }
 
-    if !changed {
+    if descriptor_columns.is_empty() {
         return Ok(batch);
+    }
+
+    let resolve = &resolve;
+    let resolved_columns: Vec<(usize, BinaryArray)> = futures::stream::iter(descriptor_columns)
+        .map(move |(idx, column)| {
+            let future = resolve(column);
+            async move { future.await.map(|resolved| (idx, resolved)) }
+        })
+        .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+        .try_collect()
+        .await?;
+    for (idx, resolved) in resolved_columns {
+        columns[idx] = Arc::new(resolved);
     }
 
     RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
@@ -2087,6 +2124,64 @@ mod tests {
 
     use blob_test_utils::write_blob_file;
     use test_utils::{local_file_path, write_int_parquet_file};
+
+    #[tokio::test]
+    async fn test_descriptor_columns_resolve_concurrently_and_preserve_order() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("blob_a", arrow_schema::DataType::Binary, true),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+            arrow_schema::Field::new("blob_b", arrow_schema::DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(b"a".as_slice())])),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(BinaryArray::from(vec![Some(b"b".as_slice())])),
+            ],
+        )
+        .unwrap();
+        let fields = HashSet::from(["blob_a".to_string(), "blob_b".to_string()]);
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let resolved = resolve_descriptor_columns_with(batch, &fields, |column| {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            async move {
+                let current = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(column)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.schema().field(0).name(), "blob_a");
+        assert_eq!(resolved.schema().field(1).name(), "id");
+        assert_eq!(resolved.schema().field(2).name(), "blob_b");
+        assert_eq!(
+            resolved
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            b"a"
+        );
+        assert_eq!(
+            resolved
+                .column(2)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            b"b"
+        );
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn test_build_source_plan_aggregates_same_key_vector_segments() {
