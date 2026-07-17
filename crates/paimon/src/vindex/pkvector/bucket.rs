@@ -28,11 +28,30 @@ use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
 use crate::spec::PkVectorSourceMeta;
 
-/// One ANN segment to be searched by the bucket kernel: the source metadata
-/// resolving segment ordinals back to physical `(data file, position)`. Only
-/// `source_meta` is needed for ordinal mapping and live-row masking.
+/// One ANN segment to be searched by the bucket kernel. `source_meta` resolves
+/// segment ordinals back to physical `(data file, position)` and drives live-row
+/// masking; the remaining fields address the segment's index file for the ANN
+/// scorer that reads it.
 pub(crate) struct BucketAnnSegment {
     pub source_meta: PkVectorSourceMeta,
+    /// Resolved index-file path (globally unique; the scorer's preload key).
+    pub path: String,
+    pub file_size: u64,
+    pub index_meta: Vec<u8>,
+}
+
+#[cfg(test)]
+impl BucketAnnSegment {
+    /// Build a segment with dummy index-file fields for tests that exercise only
+    /// `source_meta`-driven logic.
+    pub(crate) fn for_test(source_meta: PkVectorSourceMeta) -> Self {
+        Self {
+            source_meta,
+            path: "seg".to_string(),
+            file_size: 0,
+            index_meta: Vec::new(),
+        }
+    }
 }
 
 /// A data file participating in the bucket search, with its row count. Used by
@@ -89,6 +108,35 @@ fn add_candidate(heap: &mut BinaryHeap<WorstFirst>, candidate: PkVectorSearchRes
     }
 }
 
+/// Active data files whose rows are already covered by an ANN segment's source
+/// metadata, matched by both file name AND row count. The bucket exact fallback
+/// skips these files, so a caller that preloads exact readers should preload
+/// only the *uncovered* active files (`active_files` minus this set) rather than
+/// reading every active file's vector column up front. A source naming an
+/// inactive file, or one whose row count disagrees with the active file, is not
+/// covered here; `bucket_search` rejects the row-count mismatch separately.
+pub(crate) fn covered_source_files(
+    ann_segments: &[BucketAnnSegment],
+    active_files: &[BucketActiveFile],
+) -> HashSet<String> {
+    let row_counts: HashMap<&str, i64> = active_files
+        .iter()
+        .map(|f| (f.file_name.as_str(), f.row_count))
+        .collect();
+    let mut covered = HashSet::new();
+    for segment in ann_segments {
+        for source in segment.source_meta.source_files() {
+            if row_counts
+                .get(source.file_name())
+                .is_some_and(|&rc| rc == source.row_count())
+            {
+                covered.insert(source.file_name().to_string());
+            }
+        }
+    }
+    covered
+}
+
 /// ANN + exact data-file fallback search for one snapshot bucket. Mirrors Java
 /// `org.apache.paimon.index.pkvector.PrimaryKeyVectorBucketSearch.search`.
 ///
@@ -107,6 +155,7 @@ pub(crate) fn bucket_search(
     metric: VectorSearchMetric,
     limit: usize,
     search_options: &HashMap<String, String>,
+    skip_exact_fallback: bool,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
     if limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
@@ -131,29 +180,55 @@ pub(crate) fn bucket_search(
         }
     }
 
+    // Validate ANN segments mirror Java PkVectorBucketIndexState constructor checks:
+    // (1) payload file uniqueness, (2) no source file covered by multiple segments.
+    let mut segments_by_path: HashMap<&str, usize> = HashMap::new();
+    let mut source_to_segment: HashMap<&str, &str> = HashMap::new();
+    for (idx, segment) in ann_segments.iter().enumerate() {
+        if segments_by_path
+            .insert(segment.path.as_str(), idx)
+            .is_some()
+        {
+            return Err(data_invalid(format!(
+                "ANN segment payload {} appears more than once",
+                segment.path
+            )));
+        }
+        for source in segment.source_meta.source_files() {
+            if let Some(&prior_segment_path) = source_to_segment.get(source.file_name()) {
+                return Err(data_invalid(format!(
+                    "source data file {} is covered by both ANN segments {} and {}",
+                    source.file_name(),
+                    prior_segment_path,
+                    segment.path
+                )));
+            }
+            source_to_segment.insert(source.file_name(), segment.path.as_str());
+        }
+    }
+
     let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
     let active_source_files: HashSet<String> =
         files_by_name.keys().map(|name| name.to_string()).collect();
-    let mut covered: HashSet<String> = HashSet::new();
+    // Active files whose rows an ANN segment already covers; the exact fallback
+    // skips them. Same rule the caller's exact-reader preload uses, so both agree
+    // on which files still need an exact reader.
+    let covered = covered_source_files(ann_segments, active_files);
 
     for segment in ann_segments {
+        // An active ANN source with a mismatched row count is corruption (the
+        // ordinal-to-position mapping would be wrong). An inactive source (no
+        // matching active file) is skipped: it was compacted away and its ordinal
+        // range is masked out of the ANN live-row bitmap. Mirrors Java master
+        // `PrimaryKeyVectorBucketSearch` (`file == null` -> continue).
         for source in segment.source_meta.source_files() {
-            // An ANN source that is no longer an active file (e.g. compacted away)
-            // is skipped, not rejected: its ordinal range is masked out of the ANN
-            // live-row bitmap and the remaining active sources are still searched.
-            // Mirrors Java master `PrimaryKeyVectorBucketSearch` (`file == null`
-            // -> continue). Active sources still require a row-count match.
-            match files_by_name.get(source.file_name()) {
-                Some(active) if active.row_count == source.row_count() => {
-                    covered.insert(source.file_name().to_string());
-                }
-                Some(_) => {
+            if let Some(active) = files_by_name.get(source.file_name()) {
+                if active.row_count != source.row_count() {
                     return Err(data_invalid(format!(
                         "ANN source {} does not match the active data file",
                         source.file_name()
                     )));
                 }
-                None => continue,
             }
         }
         let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
@@ -170,29 +245,31 @@ pub(crate) fn bucket_search(
         }
     }
 
-    for file in active_files {
-        if covered.contains(&file.file_name) {
-            continue;
-        }
-        let dv = deletion_vectors.get(&file.file_name).cloned();
-        let is_excluded = move |position: i64| -> bool {
-            match &dv {
-                Some(dv) => u64::try_from(position)
-                    .map(|p| dv.is_deleted(p))
-                    .unwrap_or(false),
-                None => false,
+    if !skip_exact_fallback {
+        for file in active_files {
+            if covered.contains(&file.file_name) {
+                continue;
             }
-        };
-        let mut reader = exact_reader_factory(file)?;
-        for result in exact_search(
-            &file.file_name,
-            reader.as_mut(),
-            query,
-            metric,
-            limit,
-            &is_excluded,
-        )? {
-            add_candidate(&mut heap, result, limit);
+            let dv = deletion_vectors.get(&file.file_name).cloned();
+            let is_excluded = move |position: i64| -> bool {
+                match &dv {
+                    Some(dv) => u64::try_from(position)
+                        .map(|p| dv.is_deleted(p))
+                        .unwrap_or(false),
+                    None => false,
+                }
+            };
+            let mut reader = exact_reader_factory(file)?;
+            for result in exact_search(
+                &file.file_name,
+                reader.as_mut(),
+                query,
+                metric,
+                limit,
+                &is_excluded,
+            )? {
+                add_candidate(&mut heap, result, limit);
+            }
         }
     }
 
@@ -212,6 +289,7 @@ mod tests {
 
     fn meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
         PkVectorSourceMeta::new(
+            1,
             files
                 .iter()
                 .map(|(n, r)| PkVectorSourceFile::new((*n).into(), *r).unwrap())
@@ -260,6 +338,7 @@ mod tests {
             VectorSearchMetric::L2,
             0,
             &HashMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("positive"));
@@ -271,9 +350,7 @@ mod tests {
         // BEST_FIRST tie-break (data_file_name ASC, then row_position ASC). Feed
         // more than `limit` ANN hits and assert the kept set is the smallest
         // (file, position) pairs in that order. Locks the bounded-heap merge.
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 3)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 3)]));
         let hit = |file: &str, pos: i64| PkVectorSearchResult {
             data_file_name: file.into(),
             row_position: pos,
@@ -301,6 +378,7 @@ mod tests {
             VectorSearchMetric::L2,
             3,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         // Top-3 BEST_FIRST: (data-1,0), (data-1,1), (data-1,2) — the larger
@@ -322,9 +400,7 @@ mod tests {
         // candidate here in the bucket heap, before any cross-bucket merge.
         let negative_nan = f32::from_bits(0xffc00000);
         assert!(negative_nan.is_nan());
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 2)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
         let ann = FakeAnnSearcher {
             result: vec![
                 PkVectorSearchResult {
@@ -351,6 +427,7 @@ mod tests {
             VectorSearchMetric::L2,
             1,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -362,9 +439,7 @@ mod tests {
     fn test_merges_ann_and_exact_without_rescanning_covered_files() {
         // data-1 is ANN-covered; data-2 is exact fallback. Factory must never be
         // called for data-1.
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 2)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
         let ann = FakeAnnSearcher {
             result: vec![PkVectorSearchResult {
                 data_file_name: "data-1".into(),
@@ -391,6 +466,7 @@ mod tests {
             VectorSearchMetric::L2,
             2,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -439,6 +515,7 @@ mod tests {
             VectorSearchMetric::L2,
             2,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         // Candidates: data-2 pos0 {1,0} dist 1.0; data-1 pos1 {2,0} dist 4.0.
@@ -474,6 +551,7 @@ mod tests {
             VectorSearchMetric::L2,
             1,
             &HashMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("duplicate") || err.to_string().contains("Duplicate"));
@@ -484,9 +562,7 @@ mod tests {
         let ann = FakeAnnSearcher { result: vec![] };
         // Segment references data-1 with 2 rows, but the active file has 3 rows.
         // An active source with a mismatched row count is still a hard error.
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 2)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
         let mut factory =
             |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
         let err = bucket_search(
@@ -499,6 +575,7 @@ mod tests {
             VectorSearchMetric::L2,
             1,
             &HashMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -513,9 +590,7 @@ mod tests {
         // instead of failing the whole query; data-2 is neither covered (so it
         // is not treated as ANN-covered) nor an active file (so it is not exact
         // scanned). The ANN searcher still runs for the segment.
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 2), ("data-2", 2)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2), ("data-2", 2)]));
         let ann = FakeAnnSearcher {
             result: vec![PkVectorSearchResult {
                 data_file_name: "data-1".into(),
@@ -538,6 +613,7 @@ mod tests {
             VectorSearchMetric::L2,
             2,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -554,9 +630,7 @@ mod tests {
 
     #[test]
     fn test_rejects_segments_without_ann_searcher() {
-        let segment = BucketAnnSegment {
-            source_meta: meta(&[("data-1", 2)]),
-        };
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
         let mut factory =
             |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
         let err = bucket_search(
@@ -569,11 +643,108 @@ mod tests {
             VectorSearchMetric::L2,
             1,
             &HashMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("ANN search is not configured")
                 || err.to_string().contains("not configured")
+        );
+    }
+
+    #[test]
+    fn test_skip_exact_fallback_does_not_call_factory() {
+        // No ANN segments, two active files. With skip_exact_fallback = true the
+        // factory must never be called and the result is empty.
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let results = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            2,
+            &HashMap::new(),
+            true, // skip_exact_fallback
+        )
+        .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_duplicate_ann_segment_path() {
+        let seg1 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2)]),
+            path: "duplicate-path".to_string(),
+            file_size: 100,
+            index_meta: vec![1, 2, 3],
+        };
+        let seg2 = BucketAnnSegment {
+            source_meta: meta(&[("data-2", 2)]),
+            path: "duplicate-path".to_string(),
+            file_size: 200,
+            index_meta: vec![4, 5, 6],
+        };
+        let ann = FakeAnnSearcher { result: vec![] };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let err = bucket_search(
+            Some(&ann),
+            &[seg1, seg2],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            1,
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate-path")
+                && err.to_string().contains("appears more than once")
+        );
+    }
+
+    #[test]
+    fn test_rejects_source_file_covered_by_multiple_segments() {
+        let seg1 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2)]),
+            path: "segment-1".to_string(),
+            file_size: 100,
+            index_meta: vec![1, 2, 3],
+        };
+        let seg2 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2), ("data-2", 2)]),
+            path: "segment-2".to_string(),
+            file_size: 200,
+            index_meta: vec![4, 5, 6],
+        };
+        let ann = FakeAnnSearcher { result: vec![] };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let err = bucket_search(
+            Some(&ann),
+            &[seg1, seg2],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            1,
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("data-1")
+                && err.to_string().contains("covered by both")
+                && err.to_string().contains("segment-1")
+                && err.to_string().contains("segment-2")
         );
     }
 
@@ -591,8 +762,38 @@ mod tests {
             VectorSearchMetric::L2,
             1,
             &HashMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("row count") || err.to_string().contains("-1"));
+    }
+
+    #[test]
+    fn covered_source_files_matches_by_name_and_row_count() {
+        // "data-1" is an active ANN source with matching row count -> covered.
+        // "data-2" is active but its row count disagrees with the ANN source -> not
+        // covered (bucket_search rejects that separately). "data-3" is an active
+        // file with no ANN source -> not covered (it needs an exact reader).
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 3), ("data-2", 9)]));
+        let active = vec![
+            active("data-1", 3),
+            active("data-2", 2),
+            active("data-3", 5),
+        ];
+        let covered = covered_source_files(&[segment], &active);
+        assert!(covered.contains("data-1"));
+        assert!(!covered.contains("data-2"));
+        assert!(!covered.contains("data-3"));
+        assert_eq!(covered.len(), 1);
+    }
+
+    #[test]
+    fn covered_source_files_ignores_inactive_source() {
+        // ANN source names a file that is not active (compacted away) -> not
+        // covered, and no active file needs it.
+        let segment = BucketAnnSegment::for_test(meta(&[("gone", 4)]));
+        let active = vec![active("data-1", 3)];
+        let covered = covered_source_files(&[segment], &active);
+        assert!(covered.is_empty());
     }
 }

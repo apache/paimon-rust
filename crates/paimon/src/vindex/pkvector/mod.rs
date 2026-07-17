@@ -20,11 +20,6 @@
 //! Read-only bucket-local approximate-nearest-neighbour search over the
 //! primary-key vector index.
 
-// The kernel is crate-private and has no production caller yet, so its items
-// are unreachable outside their own tests. Suppress the resulting dead_code
-// lint at the module boundary until the read path wires it in.
-#![allow(dead_code)]
-
 pub(crate) mod ann;
 pub(crate) mod bucket;
 pub(crate) mod exact;

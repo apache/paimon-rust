@@ -17,7 +17,11 @@
 
 /// Sequential exact-scan source of vectors for one data file. Mirrors Java
 /// `org.apache.paimon.index.pkvector.PkVectorReader`.
-pub(crate) trait PkVectorReader {
+///
+/// `Send` so a boxed reader can be held across the `.await` points of the async
+/// search path (the returned future is spawned on a `Send` runtime by callers
+/// such as the DataFusion integration).
+pub(crate) trait PkVectorReader: Send {
     fn dimension(&self) -> usize;
 
     fn row_count(&self) -> i64;

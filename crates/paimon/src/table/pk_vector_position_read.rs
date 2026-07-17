@@ -15,18 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Primary-key vector position read (reader-kernel subset of apache/paimon#8576).
+//! Primary-key vector position read (Rust equivalent of Java
+//! `PrimaryKeyVectorPositionReader`).
 //!
 //! Materializes the selected physical rows of one data file and appends
 //! `_PKEY_VECTOR_POSITION` (+ optional `_PKEY_VECTOR_SCORE`) metadata columns.
-//! Rust equivalent of Java `PrimaryKeyVectorPositionReader`. This is the lowest
-//! layer of the PK-vector read kernel; the sibling `pk_vector_indexed_split_read`
-//! and `pk_vector_orchestrator` modules build the indexed-split contract and
-//! cross-bucket merge on top of it.
-
-// The read path that would call these items lives in a later change, so under
-// clippy -D warnings they read as dead_code. Suppress at the module boundary.
-#![allow(dead_code)]
+//! This is the lowest layer of the PK-vector read kernel; the sibling
+//! `pk_vector_indexed_split_read` and `pk_vector_orchestrator` modules build the
+//! indexed-split contract and cross-bucket merge on top of it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -93,7 +89,7 @@ fn positions_to_global_ranges(
 
 /// Reads selected physical rows of one data file, appending position (+ optional
 /// score) metadata columns. Rust equivalent of Java
-/// `PrimaryKeyVectorPositionReader` (apache/paimon#8576, reader-kernel subset).
+/// `PrimaryKeyVectorPositionReader`.
 pub(crate) struct PkVectorPositionRead<'a> {
     reader: &'a DataFileReader,
 }
@@ -164,8 +160,8 @@ impl<'a> PkVectorPositionRead<'a> {
             }
         }
 
-        // (4) predicate guard: a row-filtering predicate would desync positional
-        // row-id recovery, so reject a reader that carries one.
+        // (4) predicate guard: a residual row-filtering predicate would desync
+        // positional row-id assignment, so reject it here.
         if self.reader.has_row_filtering_predicate() {
             return Err(data_invalid(
                 "PK vector position read requires a predicate-free reader",

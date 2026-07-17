@@ -76,15 +76,28 @@ impl PkVectorSourceFile {
 /// Mirrors Java `org.apache.paimon.index.pkvector.PkVectorSourceMeta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkVectorSourceMeta {
+    data_level: i32,
     source_files: Vec<PkVectorSourceFile>,
 }
 
 impl PkVectorSourceMeta {
-    pub fn new(source_files: Vec<PkVectorSourceFile>) -> crate::Result<Self> {
+    pub fn new(data_level: i32, source_files: Vec<PkVectorSourceFile>) -> crate::Result<Self> {
+        if data_level <= 0 {
+            return Err(data_invalid(format!(
+                "source meta data level must be positive: {data_level}"
+            )));
+        }
         if source_files.is_empty() {
             return Err(data_invalid("a vector index must reference source files"));
         }
-        Ok(Self { source_files })
+        Ok(Self {
+            data_level,
+            source_files,
+        })
+    }
+
+    pub fn data_level(&self) -> i32 {
+        self.data_level
     }
 
     pub fn source_files(&self) -> &[PkVectorSourceFile] {
@@ -136,6 +149,12 @@ impl PkVectorSourceMeta {
                 "unsupported vector source version: {version}"
             )));
         }
+        let data_level = cursor.read_i32_be()?;
+        if data_level <= 0 {
+            return Err(data_invalid(format!(
+                "source meta data level must be positive: {data_level}"
+            )));
+        }
         let count = cursor.read_i32_be()?;
         if count <= 0 {
             return Err(data_invalid("a vector index must reference source files"));
@@ -152,7 +171,7 @@ impl PkVectorSourceMeta {
                 "unexpected trailing bytes in vector source metadata",
             ));
         }
-        Self::new(source_files)
+        Self::new(data_level, source_files)
     }
 }
 
@@ -270,9 +289,10 @@ mod tests {
         out
     }
 
-    fn frame(files: &[(&str, i64)]) -> Vec<u8> {
+    fn frame(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&1i32.to_be_bytes()); // version
+        out.extend_from_slice(&data_level.to_be_bytes());
         out.extend_from_slice(&(files.len() as i32).to_be_bytes());
         for (name, rows) in files {
             out.extend_from_slice(&java_write_utf(name));
@@ -319,8 +339,9 @@ mod tests {
 
     #[test]
     fn deserialize_single_source_file() {
-        let bytes = frame(&[("data-abc.parquet", 100)]);
+        let bytes = frame(1, &[("data-abc.parquet", 100)]);
         let meta = PkVectorSourceMeta::deserialize(&bytes).unwrap();
+        assert_eq!(meta.data_level(), 1);
         assert_eq!(meta.source_files().len(), 1);
         assert_eq!(meta.source_files()[0].file_name(), "data-abc.parquet");
         assert_eq!(meta.source_files()[0].row_count(), 100);
@@ -328,22 +349,30 @@ mod tests {
 
     #[test]
     fn deserialize_multi_source_files() {
-        let bytes = frame(&[("f0", 3), ("f1", 5)]);
+        let bytes = frame(2, &[("f0", 3), ("f1", 5)]);
         let meta = PkVectorSourceMeta::deserialize(&bytes).unwrap();
+        assert_eq!(meta.data_level(), 2);
         assert_eq!(meta.source_files().len(), 2);
         assert_eq!(meta.source_files()[1].row_count(), 5);
     }
 
     #[test]
     fn deserialize_rejects_bad_version() {
-        let mut bytes = frame(&[("f0", 1)]);
+        let mut bytes = frame(1, &[("f0", 1)]);
         bytes[0..4].copy_from_slice(&2i32.to_be_bytes());
         assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
+    fn deserialize_rejects_zero_or_negative_data_level() {
+        assert!(PkVectorSourceMeta::deserialize(&frame(0, &[("f0", 1)])).is_err());
+        assert!(PkVectorSourceMeta::deserialize(&frame(-1, &[("f0", 1)])).is_err());
+    }
+
+    #[test]
     fn deserialize_rejects_zero_count() {
         let mut out = Vec::new();
+        out.extend_from_slice(&1i32.to_be_bytes());
         out.extend_from_slice(&1i32.to_be_bytes());
         out.extend_from_slice(&0i32.to_be_bytes());
         assert!(PkVectorSourceMeta::deserialize(&out).is_err());
@@ -351,31 +380,36 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_trailing_bytes() {
-        let mut bytes = frame(&[("f0", 1)]);
+        let mut bytes = frame(1, &[("f0", 1)]);
         bytes.push(0xFF);
         assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
     fn deserialize_rejects_truncated_input() {
-        let bytes = frame(&[("f0", 1)]);
+        let bytes = frame(1, &[("f0", 1)]);
         assert!(PkVectorSourceMeta::deserialize(&bytes[..bytes.len() - 2]).is_err());
     }
 
     #[test]
     fn deserialize_rejects_negative_row_count() {
-        let bytes = frame(&[("f0", -1)]);
+        let bytes = frame(1, &[("f0", -1)]);
         assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
     fn new_rejects_empty() {
-        assert!(PkVectorSourceMeta::new(Vec::new()).is_err());
+        assert!(PkVectorSourceMeta::new(1, Vec::new()).is_err());
+        assert!(PkVectorSourceMeta::new(
+            0,
+            vec![PkVectorSourceFile::new("f0".to_string(), 1).unwrap()]
+        )
+        .is_err());
     }
 
     #[test]
     fn resolve_single_file() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert_eq!(meta.resolve(0).unwrap(), ("f0".to_string(), 0));
         assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2));
     }
@@ -383,7 +417,7 @@ mod tests {
     #[test]
     fn resolve_multi_file_prefix_sum_boundaries() {
         // f0 owns ordinals 0..=2, f1 owns 3..=7.
-        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3), ("f1", 5)])).unwrap();
+        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3), ("f1", 5)])).unwrap();
         assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2)); // last of f0
         assert_eq!(meta.resolve(3).unwrap(), ("f1".to_string(), 0)); // first of f1
         assert_eq!(meta.resolve(7).unwrap(), ("f1".to_string(), 4)); // last of f1
@@ -391,13 +425,13 @@ mod tests {
 
     #[test]
     fn resolve_rejects_negative_ordinal() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert!(meta.resolve(-1).is_err());
     }
 
     #[test]
     fn resolve_rejects_ordinal_at_or_past_total() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert!(meta.resolve(3).is_err()); // total == 3, valid range 0..=2
     }
 
@@ -422,9 +456,10 @@ mod tests {
             index_field_id: 0,
             extra_field_ids: None,
             index_meta: None,
-            source_meta: Some(frame(&[("f0", 3)])),
+            source_meta: Some(frame(1, &[("f0", 3)])),
         };
         let parsed = PkVectorSourceMeta::from_global_index_meta(&meta).unwrap();
+        assert_eq!(parsed.data_level(), 1);
         assert_eq!(parsed.source_files()[0].file_name(), "f0");
     }
 
@@ -432,10 +467,13 @@ mod tests {
     fn resolve_rejects_row_count_overflow() {
         // Two individually-valid row counts whose prefix sum overflows i64.
         // Resolving past the first file forces the checked_add on the second.
-        let meta = PkVectorSourceMeta::new(vec![
-            PkVectorSourceFile::new("f0".to_string(), i64::MAX).unwrap(),
-            PkVectorSourceFile::new("f1".to_string(), 1).unwrap(),
-        ])
+        let meta = PkVectorSourceMeta::new(
+            1,
+            vec![
+                PkVectorSourceFile::new("f0".to_string(), i64::MAX).unwrap(),
+                PkVectorSourceFile::new("f1".to_string(), 1).unwrap(),
+            ],
+        )
         .unwrap();
         assert!(meta.resolve(i64::MAX).is_err());
     }

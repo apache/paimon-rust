@@ -41,14 +41,6 @@ pub(crate) fn normalize_metric(metric: &str) -> String {
     metric.to_ascii_lowercase().replace('-', "_")
 }
 
-/// True if the (normalized) metric is one of the three supported metrics.
-pub(crate) fn is_supported_metric(metric: &str) -> bool {
-    matches!(
-        normalize_metric(metric).as_str(),
-        "l2" | "cosine" | "inner_product"
-    )
-}
-
 /// Numeric semantics for a supported vector search metric. Mirrors Java
 /// `org.apache.paimon.globalindex.VectorSearchMetric`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +51,17 @@ pub(crate) enum VectorSearchMetric {
 }
 
 impl VectorSearchMetric {
+    /// Map a vindex-core metric to this enum. Mirrors the build-side
+    /// `RawVectorMetric::from_vindex`; lets the read path compare the metric a
+    /// segment was trained with against the configured metric.
+    pub(crate) fn from_vindex(metric: paimon_vindex_core::distance::MetricType) -> Self {
+        match metric {
+            paimon_vindex_core::distance::MetricType::L2 => Self::L2,
+            paimon_vindex_core::distance::MetricType::Cosine => Self::Cosine,
+            paimon_vindex_core::distance::MetricType::InnerProduct => Self::InnerProduct,
+        }
+    }
+
     /// Normalize, validate, and map to the enum. Errors on an unsupported metric.
     pub(crate) fn parse(metric: &str) -> crate::Result<Self> {
         match normalize_metric(metric).as_str() {
@@ -71,12 +74,13 @@ impl VectorSearchMetric {
         }
     }
 
-    /// Higher-is-better score for exact vector search.
-    pub(crate) fn compute_score(&self, query: &[f32], stored: &[f32]) -> f32 {
+    /// Canonical lowercase name, matching the vindex-core `MetricType::as_str`
+    /// spelling so mismatch diagnostics read consistently on both sides.
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::L2 => 1.0 / (1.0 + squared_l2(query, stored)),
-            Self::Cosine => cosine_similarity(query, stored),
-            Self::InnerProduct => inner_product(query, stored),
+            Self::L2 => "l2",
+            Self::Cosine => "cosine",
+            Self::InnerProduct => "inner_product",
         }
     }
 
@@ -212,15 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_supported_only_for_three_metrics() {
-        assert!(is_supported_metric("L2"));
-        assert!(is_supported_metric("cosine"));
-        assert!(is_supported_metric("inner-product"));
-        assert!(!is_supported_metric("manhattan"));
-        assert!(!is_supported_metric(" l2 "));
-    }
-
-    #[test]
     fn test_parse_rejects_unsupported_metric() {
         assert!(VectorSearchMetric::parse("l2").is_ok());
         assert!(VectorSearchMetric::parse("cosine").is_ok());
@@ -243,19 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_score_higher_is_better() {
-        let q = [2.0f32, 0.0];
-        let s = [1.0f32, 0.0];
-        assert_eq!(VectorSearchMetric::L2.compute_score(&q, &s), 0.5); // 1/(1+1)
-        assert_eq!(VectorSearchMetric::Cosine.compute_score(&q, &s), 1.0); // parallel
-        assert_eq!(VectorSearchMetric::InnerProduct.compute_score(&q, &s), 2.0);
-    }
-
-    #[test]
     fn test_cosine_zero_norm_similarity_is_zero() {
         let zero = [0.0f32, 0.0];
         let s = [1.0f32, 0.0];
-        assert_eq!(VectorSearchMetric::Cosine.compute_score(&zero, &s), 0.0);
         assert_eq!(VectorSearchMetric::Cosine.compute_distance(&zero, &s), 1.0);
     }
 
@@ -264,15 +249,19 @@ mod tests {
         // query [0,3] -> norm 9, stored [1,2] -> norm 5; sqrt(5) is irrational
         // so the f32-sqrt path (each sqrt taken in f32, then widened) and the
         // f64-sqrt path (widen first, sqrt in f64) produce different f32 bits:
-        // buggy score 0.8944271 vs correct 0.8944272. Encode the f64 contract in
-        // the expected value (dot / (sqrt(9.0f64) * sqrt(5.0f64)) as f32) rather
-        // than a magic literal, so this pins the Java-matching f64 arithmetic.
+        // buggy similarity 0.8944271 vs correct 0.8944272. Encode the f64 contract
+        // in the expected value (dot / (sqrt(9.0f64) * sqrt(5.0f64)) as f32) rather
+        // than a magic literal, so this pins the Java-matching f64 arithmetic. The
+        // cosine distance is `1 - similarity`, so the sqrt path is exercised here.
         let q = [0.0f32, 3.0];
         let s = [1.0f32, 2.0];
         let dot = 6.0f32;
         let denominator = ((9.0f64).sqrt() * (5.0f64).sqrt()) as f32;
-        let expected = dot / denominator;
-        assert_eq!(VectorSearchMetric::Cosine.compute_score(&q, &s), expected);
+        let expected_similarity = dot / denominator;
+        assert_eq!(
+            VectorSearchMetric::Cosine.compute_distance(&q, &s),
+            1.0 - expected_similarity
+        );
     }
 
     #[test]
@@ -313,5 +302,22 @@ mod tests {
             let d = metric.score_to_distance(s);
             assert_eq!(metric.distance_to_score(d), s, "metric {metric:?}");
         }
+    }
+
+    #[test]
+    fn test_from_vindex_maps_every_variant() {
+        use paimon_vindex_core::distance::MetricType;
+        assert_eq!(
+            VectorSearchMetric::from_vindex(MetricType::L2),
+            VectorSearchMetric::L2
+        );
+        assert_eq!(
+            VectorSearchMetric::from_vindex(MetricType::Cosine),
+            VectorSearchMetric::Cosine
+        );
+        assert_eq!(
+            VectorSearchMetric::from_vindex(MetricType::InnerProduct),
+            VectorSearchMetric::InnerProduct
+        );
     }
 }

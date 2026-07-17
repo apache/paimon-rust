@@ -117,6 +117,7 @@ pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
+const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 
 /// Merge engine for primary-key tables.
 ///
@@ -1067,6 +1068,72 @@ impl<'a> CoreOptions<'a> {
             })
             .unwrap_or_default()
     }
+
+    /// True when the PK-vector index column option key is present (regardless of value).
+    pub fn primary_key_vector_index_enabled(&self) -> bool {
+        self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
+    }
+
+    /// The configured PK-vector index columns, split on ',' and trimmed. Errors when
+    /// the key is present but resolves to no non-blank column.
+    pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
+        let raw = self
+            .options
+            .get(PK_VECTOR_INDEX_COLUMNS_OPTION)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "pk-vector.index.columns is not set".to_string(),
+            })?;
+        let columns: Vec<String> = raw
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if columns.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "pk-vector.index.columns is set but names no column".to_string(),
+            });
+        }
+        Ok(columns)
+    }
+
+    /// The single PK-vector index column. The first release supports exactly one.
+    pub fn primary_key_vector_index_column(&self) -> crate::Result<String> {
+        let mut columns = self.primary_key_vector_index_columns()?;
+        if columns.len() != 1 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-vector.index.columns must name exactly one column, got {}",
+                    columns.len()
+                ),
+            });
+        }
+        Ok(columns.remove(0))
+    }
+
+    /// The index type for a PK-vector column. Required — planning and the index reader
+    /// both need it, so an absent value is a hard error rather than a guessed default.
+    pub fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
+        self.options
+            .get(&format!("fields.{col}.pk-vector.index.type"))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!("fields.{col}.pk-vector.index.type is required but not set"),
+            })
+    }
+
+    /// The distance metric name for a PK-vector column, defaulting to inner_product.
+    /// Validated against the supported metrics; an unknown value is a hard error.
+    pub fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
+        let raw = self
+            .options
+            .get(&format!("fields.{col}.pk-vector.distance.metric"))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| "inner_product".to_string());
+        // Validate now (fail-loud) without exposing the crate-private metric enum.
+        crate::vindex::pkvector::metric::VectorSearchMetric::parse(&raw)?;
+        Ok(raw)
+    }
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics.
@@ -1855,5 +1922,89 @@ mod tests {
         let options = HashMap::new();
         let opts = CoreOptions::new(&options);
         assert!(!opts.ignore_update_before());
+    }
+
+    #[test]
+    fn test_pk_vector_index_disabled_by_default() {
+        let opts = HashMap::new();
+        assert!(!CoreOptions::new(&opts).primary_key_vector_index_enabled());
+    }
+
+    #[test]
+    fn test_pk_vector_single_column_and_type_and_metric() {
+        let opts = HashMap::from([
+            (
+                "pk-vector.index.columns".to_string(),
+                " embedding ".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                "ivf-flat".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.distance.metric".to_string(),
+                "Inner-Product".to_string(),
+            ),
+        ]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_vector_index_enabled());
+        assert_eq!(co.primary_key_vector_index_column().unwrap(), "embedding");
+        assert_eq!(
+            co.primary_key_vector_index_type("embedding").unwrap(),
+            "ivf-flat"
+        );
+        assert_eq!(
+            co.primary_key_vector_distance_metric("embedding").unwrap(),
+            "Inner-Product"
+        );
+    }
+
+    #[test]
+    fn test_pk_vector_metric_defaults_to_inner_product() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&opts)
+                .primary_key_vector_distance_metric("e")
+                .unwrap(),
+            "inner_product"
+        );
+    }
+
+    #[test]
+    fn test_pk_vector_unknown_metric_errors() {
+        let opts = HashMap::from([
+            ("pk-vector.index.columns".to_string(), "e".to_string()),
+            (
+                "fields.e.pk-vector.distance.metric".to_string(),
+                "manhattan".to_string(),
+            ),
+        ]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_distance_metric("e")
+            .is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_empty_columns_errors() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "  ,  ".to_string())]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_vector_index_enabled()); // key present
+        assert!(co.primary_key_vector_index_columns().is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_multiple_columns_unsupported() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "a,b".to_string())]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_index_column()
+            .is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_index_type_absent_errors() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_index_type("e")
+            .is_err());
     }
 }

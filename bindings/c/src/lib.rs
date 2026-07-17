@@ -24,7 +24,10 @@ mod error;
 mod identifier;
 mod result;
 mod table;
+#[cfg(test)]
+mod tests;
 mod types;
+mod write;
 
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;

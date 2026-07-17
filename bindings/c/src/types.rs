@@ -16,9 +16,11 @@
 // under the License.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
+use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
-use paimon::table::Table;
+use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -155,6 +157,7 @@ pub struct paimon_predicate {
 /// - `Timestamp`/`LocalZonedTimestamp` → `int_val` (millis) + `int_val2` (nanos)
 /// - `Decimal` → `int_val` + `int_val2` (unscaled i128) + `uint_val` (precision) + `uint_val2` (scale)
 #[repr(C)]
+#[derive(Default)]
 pub struct paimon_datum {
     pub tag: i32,
     pub int_val: i64,
@@ -177,4 +180,53 @@ pub struct paimon_arrow_batch {
     pub array: *mut c_void,
     /// Pointer to a heap-allocated ArrowSchema.
     pub schema: *mut c_void,
+}
+
+// === Write/Commit opaque types ===
+
+/// Internal state for WriteBuilder that stores table, shared commit_user, and overwrite flag.
+pub(crate) struct WriteBuilderState {
+    pub table: Table,
+    pub commit_user: String,
+    pub overwrite: bool,
+}
+
+pub(crate) struct TableWriteState {
+    pub write: TableWrite,
+    pub target_schema: Arc<ArrowSchema>,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct TableCommitState {
+    pub commit: TableCommit,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct CommitMessagesState {
+    pub messages: Vec<CommitMessage>,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+#[repr(C)]
+pub struct paimon_write_builder {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_table_write {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_table_commit {
+    pub inner: *mut c_void,
+}
+
+/// Opaque container for commit messages and their originating write context.
+#[repr(C)]
+pub struct paimon_commit_messages {
+    pub inner: *mut c_void,
 }

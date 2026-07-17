@@ -128,7 +128,11 @@ pub(crate) fn map_ann_results(
 
 /// One ANN segment's search dependency for the bucket kernel. Bucket tests fake
 /// this (mirroring Java's mock of `PkVectorAnnSegmentSearcher`).
-pub(crate) trait PkVectorAnnSearcher {
+///
+/// `Send + Sync` so a `&dyn PkVectorAnnSearcher` can be held across the `.await`
+/// points of the async search path (the returned future is spawned on a `Send`
+/// runtime by callers such as the DataFusion integration).
+pub(crate) trait PkVectorAnnSearcher: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
@@ -152,7 +156,11 @@ pub(crate) trait PkVectorAnnSearcher {
 /// with a segment's index bytes; tests inject a synthetic scorer. The adapter's
 /// own logic (live-row masking, ordinal mapping, deletion checks, ordering) is
 /// exercised independently of the scorer.
-type Scorer = Box<dyn Fn(&VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>>;
+pub(crate) type Scorer = Box<
+    dyn Fn(&BucketAnnSegment, &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>
+        + Send
+        + Sync,
+>;
 
 /// Structural vindex-backed `PkVectorAnnSearcher`. Composes the pure helpers
 /// (`build_live_row_ids`, `map_ann_results`) around the scorer seam.
@@ -188,7 +196,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         {
             search = search.with_include_row_ids(live);
         }
-        let scored = match (self.scorer)(&search)? {
+        let scored = match (self.scorer)(segment, &search)? {
             Some(map) => map,
             None => return Ok(Vec::new()),
         };
@@ -213,7 +221,7 @@ mod tests {
             .iter()
             .map(|(name, rows)| PkVectorSourceFile::new((*name).to_string(), *rows).unwrap())
             .collect();
-        PkVectorSourceMeta::new(files).unwrap()
+        PkVectorSourceMeta::new(1, files).unwrap()
     }
 
     fn dv(deleted: &[u32]) -> Arc<DeletionVector> {
@@ -350,35 +358,36 @@ mod tests {
     #[test]
     fn test_vindex_adapter_composes_live_rows_and_maps_results() {
         // Scorer records the VectorSearch it received and returns synthetic ordinals.
-        // The scorer must be `'static`, so share the recording cells via `Rc` moved
-        // into the closure rather than borrowing locals.
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        let seen_limit = Rc::new(RefCell::new(0usize));
-        let seen_has_filter = Rc::new(RefCell::new(false));
-        let scorer_limit = Rc::clone(&seen_limit);
-        let scorer_has_filter = Rc::clone(&seen_has_filter);
+        // The scorer must be `'static` and `Send + Sync`, so share the recording
+        // cells via `Arc<Mutex<..>>` moved into the closure rather than borrowing
+        // locals.
+        use std::sync::{Arc, Mutex};
+        let seen_limit = Arc::new(Mutex::new(0usize));
+        let seen_has_filter = Arc::new(Mutex::new(false));
+        let scorer_limit = Arc::clone(&seen_limit);
+        let scorer_has_filter = Arc::clone(&seen_has_filter);
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(move |search: &VectorSearch| {
-                *scorer_limit.borrow_mut() = search.limit;
-                *scorer_has_filter.borrow_mut() = search.include_row_ids.is_some();
+            Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
+                *scorer_limit.lock().unwrap() = search.limit;
+                *scorer_has_filter.lock().unwrap() = search.include_row_ids.is_some();
                 let mut scores = HashMap::new();
                 scores.insert(3u64, 0.5f32); // -> (f1, 0)
                 scores.insert(0u64, 0.25f32); // -> (f0, 0), l2 dist 3.0
                 Ok(Some(scores))
             }),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(
+                1,
+                vec![
                     PkVectorSourceFile::new("f0".into(), 3).unwrap(),
                     PkVectorSourceFile::new("f1".into(), 5).unwrap(),
-                ])
-                .unwrap()
-            },
-        };
+                ],
+            )
+            .unwrap()
+        });
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let results = searcher
@@ -395,9 +404,9 @@ mod tests {
         // Sorted BEST_FIRST by distance: (f1,0) dist 1.0 then (f0,0) dist 3.0.
         assert_eq!(results[0].data_file_name, "f1");
         assert_eq!(results[1].data_file_name, "f0");
-        assert_eq!(*seen_limit.borrow(), 2);
+        assert_eq!(*seen_limit.lock().unwrap(), 2);
         assert!(
-            *seen_has_filter.borrow(),
+            *seen_has_filter.lock().unwrap(),
             "DV present -> include_row_ids set"
         );
     }
@@ -406,15 +415,13 @@ mod tests {
     fn test_vindex_adapter_rejects_non_positive_limit() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                    .unwrap()
-            },
-        };
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
+                .unwrap()
+        });
         let err = searcher
             .search(
                 &segment,
@@ -433,15 +440,13 @@ mod tests {
     fn test_vindex_adapter_empty_scorer_result_is_empty() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                    .unwrap()
-            },
-        };
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
+                .unwrap()
+        });
         let results = searcher
             .search(
                 &segment,
