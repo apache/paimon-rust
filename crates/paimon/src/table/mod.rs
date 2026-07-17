@@ -196,6 +196,39 @@ impl Table {
         WriteBuilder::new(self)
     }
 
+    // Perform full compaction by scanning live data. Merge + dedup happen during scan.
+    // Than rewrite it through dynamic OVERWRITE.
+    //
+    // This is whole table operation. When called, it will scan and potentially overwrite all partitions and buckets.
+    // Use with caution.
+    pub async fn full_compaction(&self) -> Result<()> {
+        use futures::StreamExt;
+        let read_builder = self.new_read_builder();
+        let splits = read_builder.new_scan().plan().await?.splits().to_vec();
+        if splits.is_empty() {
+            return Ok(());
+        }
+        let read = read_builder.new_read()?;
+        let mut stream = read.to_arrow(&splits)?;
+        let mut write = self.new_write_builder().with_overwrite().new_write()?;
+        let mut wrote_any = false;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            write.write_arrow_batch(&batch).await?;
+            wrote_any = true;
+        }
+        if !wrote_any {
+            return Ok(());
+        }
+        let msgs = write.prepare_commit().await?;
+        let commit = self.new_write_builder().new_commit();
+        // None partitions are used for dynamic overwrite.
+        commit.overwrite(msgs, None).await
+    }
+
     /// Create a copy of this table with extra options merged into the schema.
     ///
     /// This never switches the schema version; it corresponds to Java

@@ -113,7 +113,9 @@ impl PyTable {
         })
     }
 
-    fn trigger_compaction(&self, _full_compact: bool) -> PyResult<()> {
-        todo!()
+    fn trigger_compaction(&self, py: Python<'_>, full_compact: bool) -> PyResult<()> {
+        let _ = full_compact;
+        let rt = runtime();
+        py.detach(|| rt.block_on(async { self.inner.full_compact().await.map_err(to_py_err) }))
     }
 }
