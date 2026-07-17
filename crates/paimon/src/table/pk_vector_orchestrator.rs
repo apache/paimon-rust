@@ -34,9 +34,10 @@ use crate::table::data_file_reader::DataFileReader;
 use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, RowRange};
 use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
-use crate::vindex::pkvector::bucket::{bucket_search, BucketActiveFile, BucketAnnSegment};
+use crate::vindex::pkvector::bucket::{
+    bucket_search, BucketActiveFile, BucketAnnSegment, ExactReaderFuture,
+};
 use crate::vindex::pkvector::metric::{java_float_compare, VectorSearchMetric};
-use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::pkvector::result::PkVectorSearchResult;
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
@@ -44,6 +45,33 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
         message: message.into(),
         source: None,
     }
+}
+
+/// Coerce a closure into the higher-ranked per-file exact-reader factory shape so
+/// its returned future borrows for exactly the file argument's lifetime. Closure
+/// return types cannot express this borrow through inference alone, so the bound
+/// is supplied here.
+fn as_bucket_factory<F>(f: F) -> F
+where
+    F: for<'f> FnMut(&'f BucketActiveFile) -> ExactReaderFuture<'f> + Send,
+{
+    f
+}
+
+/// Coerce a closure into the split-scoped exact-reader factory shape expected by
+/// [`PkVectorOrchestrator::search_candidates`], binding the returned future's
+/// borrow to the file argument's lifetime. Callers building a factory closure use
+/// this so the higher-ranked bound is supplied where inference cannot.
+pub(crate) fn as_split_exact_reader_factory<F>(f: F) -> F
+where
+    F: for<'s, 'f> FnMut(
+            usize,
+            &'s PkVectorSearchSplit,
+            &'f BucketActiveFile,
+        ) -> ExactReaderFuture<'f>
+        + Send,
+{
+    f
 }
 
 /// Validate a hit's physical row position against its data file, mirroring the
@@ -293,11 +321,11 @@ impl PkVectorOrchestrator {
         metric: VectorSearchMetric,
         limit: usize,
         ann_searcher: Option<&dyn PkVectorAnnSearcher>,
-        exact_reader_factory: &mut (dyn FnMut(
+        exact_reader_factory: &mut (dyn for<'s, 'f> FnMut(
             usize,
-            &PkVectorSearchSplit,
-            &BucketActiveFile,
-        ) -> crate::Result<Box<dyn PkVectorReader>>
+            &'s PkVectorSearchSplit,
+            &'f BucketActiveFile,
+        ) -> ExactReaderFuture<'f>
                   + Send),
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
@@ -323,8 +351,11 @@ impl PkVectorOrchestrator {
         for (split_index, split) in splits.iter().enumerate() {
             let dvs = build_bucket_dv_map(&self.reader, split).await?;
             // Wrap the split-scoped factory into bucket_search's per-file signature.
-            let mut bucket_factory =
-                |file: &BucketActiveFile| exact_reader_factory(split_index, split, file);
+            // The coercion helper ties the produced future's borrow to the file
+            // argument, which closure inference cannot express on its own.
+            let mut bucket_factory = as_bucket_factory(|file: &BucketActiveFile| {
+                exact_reader_factory(split_index, split, file)
+            });
             let residual_ranges = residual_by_split.map(|per_split| &per_split[split_index]);
             let results = bucket_search(
                 ann_searcher,
@@ -338,7 +369,8 @@ impl PkVectorOrchestrator {
                 search_options,
                 skip_exact_fallback,
                 residual_ranges,
-            )?;
+            )
+            .await?;
             for PkVectorSearchResult {
                 data_file_name,
                 row_position,
@@ -634,6 +666,7 @@ mod e2e_tests {
     use crate::table::schema_manager::SchemaManager;
     use crate::table::source::DeletionFile;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
+    use crate::vindex::pkvector::reader::PkVectorReader;
     use arrow_array::{Array, Float32Array, Int32Array, Int64Array, RecordBatch};
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -800,6 +833,30 @@ mod e2e_tests {
         }
     }
 
+    /// Coerce a closure into the higher-ranked split-scoped exact-reader factory
+    /// shape so its returned future borrows for exactly the file argument's
+    /// lifetime. Closure return types cannot express this borrow through inference
+    /// alone, so the bound is supplied here.
+    fn as_split_factory<F>(f: F) -> F
+    where
+        F: for<'s, 'f> FnMut(
+                usize,
+                &'s PkVectorSearchSplit,
+                &'f BucketActiveFile,
+            ) -> ExactReaderFuture<'f>
+            + Send,
+    {
+        as_split_exact_reader_factory(f)
+    }
+
+    /// Same coercion for the per-file factory used by `materialize_via_splits`.
+    fn as_file_factory<F>(f: F) -> F
+    where
+        F: for<'f> FnMut(&'f BucketActiveFile) -> ExactReaderFuture<'f> + Send,
+    {
+        f
+    }
+
     fn column_by_name<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Arc<dyn Array>> {
         batch
             .schema()
@@ -886,14 +943,14 @@ mod e2e_tests {
         metric: VectorSearchMetric,
         limit: usize,
         ann: Option<&dyn PkVectorAnnSearcher>,
-        factory: &mut (dyn FnMut(&BucketActiveFile) -> crate::Result<Box<dyn PkVectorReader>>
-                  + Send),
+        factory: &mut (dyn for<'f> FnMut(&'f BucketActiveFile) -> ExactReaderFuture<'f> + Send),
         opts: &HashMap<String, String>,
     ) -> crate::Result<Vec<RecordBatch>> {
         let orch = PkVectorOrchestrator::new(reader.clone());
         // Wrap the per-file factory into the split-scoped shape search_candidates
         // expects; the split index/split are unused here.
-        let mut wrapped = |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| factory(f);
+        let mut wrapped =
+            as_split_factory(|_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| factory(f));
         let survivors = orch
             .search_candidates(
                 splits,
@@ -924,12 +981,11 @@ mod e2e_tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let reader = make_reader(file_io, "memory:/pkvo_zero");
         let splits: Vec<PkVectorSearchSplit> = Vec::new();
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           _: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            unreachable!("no bucket search on eager-rejected input")
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, _: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                Box::pin(async { unreachable!("no bucket search on eager-rejected input") })
+            },
+        );
         let opts = HashMap::new();
         let err = PkVectorOrchestrator::new(reader)
             .search_candidates(
@@ -954,12 +1010,11 @@ mod e2e_tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let reader = make_reader(file_io, "memory:/pkvo_empty_query");
         let splits: Vec<PkVectorSearchSplit> = Vec::new();
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           _: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            unreachable!("no bucket search on eager-rejected input")
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, _: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                Box::pin(async { unreachable!("no bucket search on eager-rejected input") })
+            },
+        );
         let opts = HashMap::new();
         let err = PkVectorOrchestrator::new(reader)
             .search_candidates(
@@ -1013,13 +1068,15 @@ mod e2e_tests {
             }],
         };
         // Exact fallback scans only "exact.mosaic": pos0 {1,0} d=1.0, pos1 {2,0} d=4.0.
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = as_file_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
             let vectors = match f.file_name.as_str() {
                 "exact.mosaic" => vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
                 other => panic!("unexpected exact scan of covered file {other}"),
             };
-            Ok(Box::new(ArrayReader::new(2, vectors)))
-        };
+            Box::pin(async move {
+                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
+            })
+        });
         let opts = HashMap::new();
         let batches = materialize_via_splits(
             make_reader(file_io, table_path),
@@ -1094,7 +1151,7 @@ mod e2e_tests {
 
         // b0: x = 1,4,6 -> d = 1,16,36. b1: x = 2,3,5 -> d = 4,9,25.
         // Global best 3: d1 (b0 pos0 id10), d4 (b1 pos0 id20), d9 (b1 pos1 id21).
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = as_file_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
             let vectors = match f.file_name.as_str() {
                 "b0.mosaic" => vec![
                     Some(vec![1.0, 0.0]),
@@ -1108,8 +1165,10 @@ mod e2e_tests {
                 ],
                 other => panic!("unexpected file {other}"),
             };
-            Ok(Box::new(ArrayReader::new(2, vectors)))
-        };
+            Box::pin(async move {
+                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
+            })
+        });
         let opts = HashMap::new();
         let batches = materialize_via_splits(
             make_reader(file_io, table_path),
@@ -1163,7 +1222,7 @@ mod e2e_tests {
         };
 
         // pos0 {1,0} d=1, pos1 {2,0} d=4 (DELETED), pos2 {3,0} d=9, pos3 {0,0} d=0.
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = as_file_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
             let vectors = match f.file_name.as_str() {
                 "d.mosaic" => vec![
                     Some(vec![1.0, 0.0]),
@@ -1173,8 +1232,10 @@ mod e2e_tests {
                 ],
                 other => panic!("unexpected file {other}"),
             };
-            Ok(Box::new(ArrayReader::new(2, vectors)))
-        };
+            Box::pin(async move {
+                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
+            })
+        });
         let opts = HashMap::new();
         let batches = materialize_via_splits(
             make_reader(file_io, table_path),
@@ -1224,7 +1285,7 @@ mod e2e_tests {
         };
 
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4. Best-first = [1,2,0].
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = as_file_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
             let vectors = match f.file_name.as_str() {
                 "o.mosaic" => vec![
                     Some(vec![3.0, 0.0]),
@@ -1233,8 +1294,10 @@ mod e2e_tests {
                 ],
                 other => panic!("unexpected file {other}"),
             };
-            Ok(Box::new(ArrayReader::new(2, vectors)))
-        };
+            Box::pin(async move {
+                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
+            })
+        });
         let opts = HashMap::new();
         let batches = materialize_via_splits(
             make_reader(file_io, table_path),
@@ -1283,20 +1346,21 @@ mod e2e_tests {
             active_files: vec![active("c.mosaic", 3)],
         };
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           f: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            assert_eq!(f.file_name, "c.mosaic");
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![
-                    Some(vec![3.0, 0.0]),
-                    Some(vec![1.0, 0.0]),
-                    Some(vec![2.0, 0.0]),
-                ],
-            )))
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                assert_eq!(f.file_name, "c.mosaic");
+                Box::pin(async {
+                    Ok(Box::new(ArrayReader::new(
+                        2,
+                        vec![
+                            Some(vec![3.0, 0.0]),
+                            Some(vec![1.0, 0.0]),
+                            Some(vec![2.0, 0.0]),
+                        ],
+                    )) as Box<dyn PkVectorReader>)
+                })
+            },
+        );
         let opts = HashMap::new();
         let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(
@@ -1348,20 +1412,21 @@ mod e2e_tests {
             active_files: vec![active("r.mosaic", 3)],
         };
         // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           f: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            assert_eq!(f.file_name, "r.mosaic");
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![
-                    Some(vec![3.0, 0.0]),
-                    Some(vec![1.0, 0.0]),
-                    Some(vec![2.0, 0.0]),
-                ],
-            )))
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                assert_eq!(f.file_name, "r.mosaic");
+                Box::pin(async {
+                    Ok(Box::new(ArrayReader::new(
+                        2,
+                        vec![
+                            Some(vec![3.0, 0.0]),
+                            Some(vec![1.0, 0.0]),
+                            Some(vec![2.0, 0.0]),
+                        ],
+                    )) as Box<dyn PkVectorReader>)
+                })
+            },
+        );
         // Allow only positions 0 and 2 for "r.mosaic"; pos1 (the best hit) is
         // excluded by the residual.
         let mut allowed = RoaringTreemap::new();
@@ -1415,12 +1480,11 @@ mod e2e_tests {
             ann_segments: Vec::new(),
             active_files: vec![active("m.mosaic", 2)],
         };
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           _: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            unreachable!("length guard must fire before any bucket search")
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, _: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                Box::pin(async { unreachable!("length guard must fire before any bucket search") })
+            },
+        );
         // Two residual maps for a single split.
         let residual_by_split: Vec<HashMap<String, RoaringTreemap>> =
             vec![HashMap::new(), HashMap::new()];
@@ -1465,12 +1529,11 @@ mod e2e_tests {
             ann_segments: Vec::new(),
             active_files: vec![active("f.mosaic", 2)],
         };
-        let mut factory = |_: usize,
-                           _: &PkVectorSearchSplit,
-                           _: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            unreachable!("fast mode must not read exact")
-        };
+        let mut factory = as_split_factory(
+            |_: usize, _: &PkVectorSearchSplit, _: &BucketActiveFile| -> ExactReaderFuture<'_> {
+                Box::pin(async { unreachable!("fast mode must not read exact") })
+            },
+        );
         let opts = HashMap::new();
         let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(

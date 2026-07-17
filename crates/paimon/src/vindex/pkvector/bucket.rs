@@ -19,6 +19,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
+
 use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
 use super::exact::exact_search;
@@ -27,6 +29,10 @@ use super::reader::PkVectorReader;
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
 use crate::spec::PkVectorSourceMeta;
+
+/// Future returned by the exact-fallback reader factory: builds the sequential
+/// vector reader for one data file on demand.
+pub(crate) type ExactReaderFuture<'a> = BoxFuture<'a, crate::Result<Box<dyn PkVectorReader>>>;
 
 /// One ANN segment to be searched by the bucket kernel. `source_meta` resolves
 /// segment ordinals back to physical `(data file, position)` and drives live-row
@@ -110,11 +116,10 @@ fn add_candidate(heap: &mut BinaryHeap<WorstFirst>, candidate: PkVectorSearchRes
 
 /// Active data files whose rows are already covered by an ANN segment's source
 /// metadata, matched by both file name AND row count. The bucket exact fallback
-/// skips these files, so a caller that preloads exact readers should preload
-/// only the *uncovered* active files (`active_files` minus this set) rather than
-/// reading every active file's vector column up front. A source naming an
-/// inactive file, or one whose row count disagrees with the active file, is not
-/// covered here; `bucket_search` rejects the row-count mismatch separately.
+/// skips these files (an ANN segment already covers their rows), so they never
+/// need an exact reader. A source naming an inactive file, or one whose row
+/// count disagrees with the active file, is not covered here; `bucket_search`
+/// rejects the row-count mismatch separately.
 pub(crate) fn covered_source_files(
     ann_segments: &[BucketAnnSegment],
     active_files: &[BucketActiveFile],
@@ -150,14 +155,13 @@ pub(crate) fn covered_source_files(
 /// with an empty set) has no allowed rows and produces no candidates. Mirrors Java
 /// `rowRangesByFile`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bucket_search(
+pub(crate) async fn bucket_search(
     ann_searcher: Option<&dyn PkVectorAnnSearcher>,
     ann_segments: &[BucketAnnSegment],
     active_files: &[BucketActiveFile],
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    exact_reader_factory: &mut dyn FnMut(
-        &BucketActiveFile,
-    ) -> crate::Result<Box<dyn PkVectorReader>>,
+    exact_reader_factory: &mut (dyn for<'a> FnMut(&'a BucketActiveFile) -> ExactReaderFuture<'a>
+              + Send),
     query: &[f32],
     metric: VectorSearchMetric,
     limit: usize,
@@ -219,8 +223,7 @@ pub(crate) fn bucket_search(
     let active_source_files: HashSet<String> =
         files_by_name.keys().map(|name| name.to_string()).collect();
     // Active files whose rows an ANN segment already covers; the exact fallback
-    // skips them. Same rule the caller's exact-reader preload uses, so both agree
-    // on which files still need an exact reader.
+    // skips them, so the lazy exact-reader factory is never invoked for those files.
     let covered = covered_source_files(ann_segments, active_files);
 
     for segment in ann_segments {
@@ -290,7 +293,7 @@ pub(crate) fn bucket_search(
                     },
                 }
             };
-            let mut reader = exact_reader_factory(file)?;
+            let mut reader = exact_reader_factory(file).await?;
             for result in exact_search(
                 &file.file_name,
                 reader.as_mut(),
@@ -316,7 +319,6 @@ mod tests {
     use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
     use roaring::RoaringBitmap;
-    use std::cell::RefCell;
 
     fn meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
         PkVectorSourceMeta::new(
@@ -334,6 +336,17 @@ mod tests {
             file_name: name.into(),
             row_count: rows,
         }
+    }
+
+    /// Coerce a closure into the higher-ranked exact-reader factory shape so its
+    /// returned future borrows for exactly the argument's lifetime. Closure return
+    /// types cannot express this borrow through inference alone, so the bound is
+    /// supplied here.
+    fn as_factory<F>(f: F) -> F
+    where
+        F: for<'a> FnMut(&'a BucketActiveFile) -> ExactReaderFuture<'a> + Send,
+    {
+        f
     }
 
     /// Fake ANN searcher returning preset results and recording calls.
@@ -356,10 +369,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_rejects_non_positive_limit() {
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+    #[tokio::test]
+    async fn test_rejects_non_positive_limit() {
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             None,
             &[],
@@ -373,12 +387,13 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("positive"));
     }
 
-    #[test]
-    fn test_bounded_heap_evicts_by_best_first_tiebreak_over_limit() {
+    #[tokio::test]
+    async fn test_bounded_heap_evicts_by_best_first_tiebreak_over_limit() {
         // All candidates share distance 1.0, so eviction is decided purely by the
         // BEST_FIRST tie-break (data_file_name ASC, then row_position ASC). Feed
         // more than `limit` ANN hits and assert the kept set is the smallest
@@ -399,8 +414,9 @@ mod tests {
                 hit("data-1", 1),
             ],
         };
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let results = bucket_search(
             Some(&ann),
             &[segment],
@@ -414,6 +430,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
         // Top-3 BEST_FIRST: (data-1,0), (data-1,1), (data-1,2) — the larger
         // data_file_name "data-2" entries are evicted despite equal distance.
@@ -426,8 +443,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nan_ann_hit_never_evicts_finite_candidate_from_top1() {
+    #[tokio::test]
+    async fn nan_ann_hit_never_evicts_finite_candidate_from_top1() {
         // The core failure mode: an ANN hit with a negative-NaN distance must not
         // win the single bucket Top-1 slot over a finite hit. Under f32::total_cmp
         // the -NaN would rank best and evict the finite candidate here in the
@@ -449,8 +466,9 @@ mod tests {
                 },
             ],
         };
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let results = bucket_search(
             Some(&ann),
             &[segment],
@@ -464,14 +482,15 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_position, 1);
         assert_eq!(results[0].distance, -1.0);
     }
 
-    #[test]
-    fn test_merges_ann_and_exact_without_rescanning_covered_files() {
+    #[tokio::test]
+    async fn test_merges_ann_and_exact_without_rescanning_covered_files() {
         // data-1 is ANN-covered; data-2 is exact fallback. Factory must never be
         // called for data-1.
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
@@ -482,15 +501,17 @@ mod tests {
                 distance: 0.5,
             }],
         };
-        let calls = RefCell::new(Vec::<String>::new());
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            calls.borrow_mut().push(f.file_name.clone());
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            calls.lock().unwrap().push(f.file_name.clone());
             // data-2 vectors: pos0 {1,0} dist 1.0, pos1 {3,0} dist 9.0
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![Some(vec![1.0, 0.0]), Some(vec![3.0, 0.0])],
-            )))
-        };
+            Box::pin(async {
+                Ok(Box::new(ArrayReader::new(
+                    2,
+                    vec![Some(vec![1.0, 0.0]), Some(vec![3.0, 0.0])],
+                )) as Box<dyn PkVectorReader>)
+            })
+        });
         let results = bucket_search(
             Some(&ann),
             &[segment],
@@ -504,6 +525,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(
             results,
@@ -520,22 +542,24 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(calls.borrow().as_slice(), &["data-2".to_string()]);
+        assert_eq!(calls.lock().unwrap().as_slice(), &["data-2".to_string()]);
     }
 
-    #[test]
-    fn test_exact_fallback_merges_files_and_applies_deletion_vectors() {
+    #[tokio::test]
+    async fn test_exact_fallback_merges_files_and_applies_deletion_vectors() {
         // No ANN. data-1 pos0 {0,0} deleted; remaining candidates merge across files.
-        let calls = RefCell::new(0);
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            *calls.borrow_mut() += 1;
+        let calls = std::sync::Mutex::new(0usize);
+        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            *calls.lock().unwrap() += 1;
             let vectors = match f.file_name.as_str() {
                 "data-1" => vec![Some(vec![0.0, 0.0]), Some(vec![2.0, 0.0])],
                 "data-2" => vec![Some(vec![1.0, 0.0]), None],
                 _ => unreachable!(),
             };
-            Ok(Box::new(ArrayReader::new(2, vectors)))
-        };
+            Box::pin(async move {
+                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
+            })
+        });
         let mut dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // data-1 position 0 deleted
@@ -554,6 +578,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
         // Candidates: data-2 pos0 {1,0} dist 1.0; data-1 pos1 {2,0} dist 4.0.
         // (data-1 pos0 deleted, data-2 pos1 null.)
@@ -574,10 +599,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rejects_duplicate_active_file_name() {
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+    #[tokio::test]
+    async fn test_rejects_duplicate_active_file_name() {
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             None,
             &[],
@@ -591,18 +617,20 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("duplicate") || err.to_string().contains("Duplicate"));
     }
 
-    #[test]
-    fn test_rejects_ann_source_row_count_mismatch_for_active_file() {
+    #[tokio::test]
+    async fn test_rejects_ann_source_row_count_mismatch_for_active_file() {
         let ann = FakeAnnSearcher { result: vec![] };
         // Segment references data-1 with 2 rows, but the active file has 3 rows.
         // An active source with a mismatched row count is still a hard error.
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             Some(&ann),
             &[segment],
@@ -616,14 +644,15 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("does not match") || err.to_string().contains("ANN source")
         );
     }
 
-    #[test]
-    fn test_skips_inactive_ann_source_and_searches_active_ones() {
+    #[tokio::test]
+    async fn test_skips_inactive_ann_source_and_searches_active_ones() {
         // Segment covers [data-1, data-2] but only data-1 is still active
         // (data-2 was compacted away). Java master skips the inactive source
         // instead of failing the whole query; data-2 is neither covered (so it
@@ -637,11 +666,11 @@ mod tests {
                 distance: 0.5,
             }],
         };
-        let calls = RefCell::new(Vec::<String>::new());
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            calls.borrow_mut().push(f.file_name.clone());
-            unreachable!("only data-1 is active and it is ANN-covered")
-        };
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            calls.lock().unwrap().push(f.file_name.clone());
+            Box::pin(async { unreachable!("only data-1 is active and it is ANN-covered") })
+        });
         let results = bucket_search(
             Some(&ann),
             &[segment],
@@ -655,6 +684,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(
             results,
@@ -665,14 +695,15 @@ mod tests {
             }]
         );
         // No exact fallback ran: data-1 is ANN-covered, data-2 is not active.
-        assert!(calls.borrow().is_empty());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn test_rejects_segments_without_ann_searcher() {
+    #[tokio::test]
+    async fn test_rejects_segments_without_ann_searcher() {
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             None,
             &[segment],
@@ -686,6 +717,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("ANN search is not configured")
@@ -693,12 +725,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_skip_exact_fallback_does_not_call_factory() {
+    #[tokio::test]
+    async fn test_skip_exact_fallback_does_not_call_factory() {
         // No ANN segments, two active files. With skip_exact_fallback = true the
         // factory must never be called and the result is empty.
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let results = bucket_search(
             None,
             &[],
@@ -712,12 +745,13 @@ mod tests {
             true, // skip_exact_fallback
             None,
         )
+        .await
         .unwrap();
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_rejects_duplicate_ann_segment_path() {
+    #[tokio::test]
+    async fn test_rejects_duplicate_ann_segment_path() {
         let seg1 = BucketAnnSegment {
             source_meta: meta(&[("data-1", 2)]),
             path: "duplicate-path".to_string(),
@@ -731,8 +765,9 @@ mod tests {
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             Some(&ann),
             &[seg1, seg2],
@@ -746,6 +781,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("duplicate-path")
@@ -753,8 +789,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rejects_source_file_covered_by_multiple_segments() {
+    #[tokio::test]
+    async fn test_rejects_source_file_covered_by_multiple_segments() {
         let seg1 = BucketAnnSegment {
             source_meta: meta(&[("data-1", 2)]),
             path: "segment-1".to_string(),
@@ -768,8 +804,9 @@ mod tests {
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             Some(&ann),
             &[seg1, seg2],
@@ -783,6 +820,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(
             err.to_string().contains("data-1")
@@ -792,10 +830,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_negative_active_row_count_rejected() {
-        let mut factory =
-            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+    #[tokio::test]
+    async fn test_negative_active_row_count_rejected() {
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async { unreachable!() })
+        });
         let err = bucket_search(
             None,
             &[],
@@ -809,6 +848,7 @@ mod tests {
             false,
             None,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("row count") || err.to_string().contains("-1"));
     }
@@ -850,21 +890,23 @@ mod tests {
         t
     }
 
-    #[test]
-    fn test_exact_residual_allow_list_restricts_positions() {
+    #[tokio::test]
+    async fn test_exact_residual_allow_list_restricts_positions() {
         // No ANN. data-1 has 3 rows: pos0 {1,0} dist 1.0, pos1 {2,0} dist 4.0,
         // pos2 {3,0} dist 9.0. residual allows only {0, 2} -> pos1 excluded even
         // though it is not deletion-vector deleted.
-        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![
-                    Some(vec![1.0, 0.0]),
-                    Some(vec![2.0, 0.0]),
-                    Some(vec![3.0, 0.0]),
-                ],
-            )))
-        };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async {
+                Ok(Box::new(ArrayReader::new(
+                    2,
+                    vec![
+                        Some(vec![1.0, 0.0]),
+                        Some(vec![2.0, 0.0]),
+                        Some(vec![3.0, 0.0]),
+                    ],
+                )) as Box<dyn PkVectorReader>)
+            })
+        });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 2]));
         let results = bucket_search(
@@ -880,6 +922,7 @@ mod tests {
             false,
             Some(&residual),
         )
+        .await
         .unwrap();
         assert_eq!(
             results,
@@ -898,18 +941,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_exact_residual_file_absent_from_map_is_skipped_without_reading() {
+    #[tokio::test]
+    async fn test_exact_residual_file_absent_from_map_is_skipped_without_reading() {
         // residual covers only data-1; data-2 has no entry -> no allowed rows, so
         // data-2 is skipped entirely (its factory reader is never built).
-        let calls = RefCell::new(Vec::<String>::new());
-        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            calls.borrow_mut().push(f.file_name.clone());
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
-            )))
-        };
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            calls.lock().unwrap().push(f.file_name.clone());
+            Box::pin(async {
+                Ok(Box::new(ArrayReader::new(
+                    2,
+                    vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
+                )) as Box<dyn PkVectorReader>)
+            })
+        });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 1]));
         let results = bucket_search(
@@ -925,21 +970,22 @@ mod tests {
             false,
             Some(&residual),
         )
+        .await
         .unwrap();
         // Only data-1 rows appear; data-2 was never read.
         assert!(results.iter().all(|r| r.data_file_name == "data-1"));
-        assert_eq!(calls.borrow().as_slice(), &["data-1".to_string()]);
+        assert_eq!(calls.lock().unwrap().as_slice(), &["data-1".to_string()]);
     }
 
-    #[test]
-    fn test_exact_residual_empty_set_file_is_skipped_without_reading() {
+    #[tokio::test]
+    async fn test_exact_residual_empty_set_file_is_skipped_without_reading() {
         // data-1 has an entry but it is empty -> no allowed rows, skipped without
         // reading. Mirrors a file with no residual matches.
-        let calls = RefCell::new(0);
-        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            *calls.borrow_mut() += 1;
-            unreachable!("data-1 has an empty allow set and must not be read")
-        };
+        let calls = std::sync::Mutex::new(0usize);
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            *calls.lock().unwrap() += 1;
+            Box::pin(async { unreachable!("data-1 has an empty allow set and must not be read") })
+        });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[]));
         let results = bucket_search(
@@ -955,25 +1001,28 @@ mod tests {
             false,
             Some(&residual),
         )
+        .await
         .unwrap();
         assert!(results.is_empty());
-        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 
-    #[test]
-    fn test_exact_residual_intersects_with_deletion_vector() {
+    #[tokio::test]
+    async fn test_exact_residual_intersects_with_deletion_vector() {
         // residual allows {0, 1, 2} but the deletion vector deletes pos0; the
         // surviving candidates are the residual-allowed AND not-deleted rows.
-        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
-            Ok(Box::new(ArrayReader::new(
-                2,
-                vec![
-                    Some(vec![1.0, 0.0]),
-                    Some(vec![2.0, 0.0]),
-                    Some(vec![3.0, 0.0]),
-                ],
-            )))
-        };
+        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            Box::pin(async {
+                Ok(Box::new(ArrayReader::new(
+                    2,
+                    vec![
+                        Some(vec![1.0, 0.0]),
+                        Some(vec![2.0, 0.0]),
+                        Some(vec![3.0, 0.0]),
+                    ],
+                )) as Box<dyn PkVectorReader>)
+            })
+        });
         let mut dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // pos0 deleted
@@ -993,6 +1042,7 @@ mod tests {
             false,
             Some(&residual),
         )
+        .await
         .unwrap();
         assert_eq!(
             results.iter().map(|r| r.row_position).collect::<Vec<_>>(),

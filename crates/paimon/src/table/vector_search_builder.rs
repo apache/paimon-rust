@@ -32,8 +32,8 @@ use crate::table::global_index_scanner::{
 use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
 use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
 use crate::table::pk_vector_orchestrator::{
-    build_indexed_splits, validate_row_position, PkVectorCandidate, PkVectorOrchestrator,
-    PkVectorSearchSplit,
+    as_split_exact_reader_factory, build_indexed_splits, validate_row_position, PkVectorCandidate,
+    PkVectorOrchestrator, PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
@@ -47,9 +47,8 @@ use crate::table::{
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
-use crate::vindex::pkvector::bucket::{covered_source_files, BucketActiveFile, BucketAnnSegment};
+use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactReaderFuture};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
-use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
@@ -425,8 +424,8 @@ impl<'a> VectorSearchBuilder<'a> {
         // when a filter is set; otherwise `None` leaves the search unfiltered. The
         // residual reader projects the predicate columns plus `_ROW_ID` (used to
         // recover file-local physical positions) and carries no pushdown, matching
-        // `residual_positions_by_file`. Computed before the exact-reader preload so
-        // the preload can skip files the residual allow-list leaves empty.
+        // `residual_positions_by_file`. A file the allow-list leaves empty is
+        // skipped by the bucket search without opening an exact reader.
         let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match &self.filter {
             Some(filter) => {
                 let file_predicates = FilePredicates {
@@ -465,50 +464,32 @@ impl<'a> VectorSearchBuilder<'a> {
             None => None,
         };
 
-        // Exact-fallback readers, keyed by (split_index, file_name). In FAST mode
-        // the kernel never invokes the factory, so skip the in-memory column read
-        // entirely. Otherwise preload only the *uncovered* active files: files an
-        // ANN segment already covers never reach the exact fallback, so reading
-        // their vector column here would be wasted IO/memory. Mirrors Java, which
-        // creates a `PkVectorReader` lazily only for uncovered files. When a
-        // residual filter leaves a file's allow-list empty (or absent) the bucket
-        // search skips it, so its reader is not preloaded either.
-        let mut exact_readers: HashMap<(usize, String), Box<dyn PkVectorReader>> = HashMap::new();
-        if !skip_exact_fallback {
-            for (split_index, split) in plan.splits.iter().enumerate() {
-                let covered = covered_source_files(&split.ann_segments, &split.active_files);
-                let factory = DataFilePkVectorReaderFactory::new(
-                    reader.clone(),
-                    split.data_split.clone(),
-                    vector_field.clone(),
-                )?;
-                for active in &split.active_files {
-                    if covered.contains(&active.file_name) {
-                        continue;
-                    }
-                    if !should_preload_exact_reader(
-                        residual_by_split.as_deref(),
-                        split_index,
-                        &active.file_name,
-                    ) {
-                        continue;
-                    }
-                    let r = factory.create(active).await?;
-                    exact_readers.insert((split_index, active.file_name.clone()), r);
-                }
-            }
-        }
-        let mut factory = |split_index: usize,
-                           _split: &PkVectorSearchSplit,
-                           file: &BucketActiveFile|
-         -> crate::Result<Box<dyn PkVectorReader>> {
-            exact_readers
-                .remove(&(split_index, file.file_name.clone()))
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!("no preloaded exact reader for {}", file.file_name),
-                    source: None,
+        // Build the exact-fallback vector reader on demand: the kernel calls this
+        // only for a file it actually searches (uncovered by ANN, residual-allowed,
+        // and only when the search mode is not FAST). Everything the future needs is
+        // cloned/owned up front so it borrows neither the split nor the file across
+        // the await.
+        let reader_for_factory = reader.clone();
+        let vector_field_for_factory = vector_field.clone();
+        let mut factory = as_split_exact_reader_factory(
+            move |_split_index: usize,
+                  split: &PkVectorSearchSplit,
+                  file: &BucketActiveFile|
+                  -> ExactReaderFuture<'_> {
+                let reader = reader_for_factory.clone();
+                let vector_field = vector_field_for_factory.clone();
+                let data_split = split.data_split.clone();
+                let active = BucketActiveFile {
+                    file_name: file.file_name.clone(),
+                    row_count: file.row_count,
+                };
+                Box::pin(async move {
+                    let factory =
+                        DataFilePkVectorReaderFactory::new(reader, data_split, vector_field)?;
+                    factory.create(&active).await
                 })
-        };
+            },
+        );
 
         let candidates = PkVectorOrchestrator::new(reader)
             .search_candidates(
@@ -1020,24 +1001,6 @@ async fn evaluate_batch_vector_search(
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
-}
-
-/// Whether the exact-fallback reader for `file_name` in split `split_index`
-/// should be preloaded. With a residual filter, a file absent from the split's
-/// allow-list or with an empty allow-list has no candidate rows, so the bucket
-/// search skips it and preloading its vector column would be wasted IO.
-fn should_preload_exact_reader(
-    residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
-    split_index: usize,
-    file_name: &str,
-) -> bool {
-    match residual_by_split {
-        None => true,
-        Some(per_split) => per_split
-            .get(split_index)
-            .and_then(|m| m.get(file_name))
-            .is_some_and(|allowed| !allowed.is_empty()),
-    }
 }
 
 /// Compute, per data file in `split`, the set of physical row positions whose
@@ -2230,26 +2193,6 @@ mod tests {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         assert_eq!(find_field_id_by_name(&fields, "embedding"), Some(2));
         assert_eq!(find_field_id_by_name(&fields, "nonexistent"), None);
-    }
-
-    #[test]
-    fn should_preload_skips_empty_or_absent_residual_files() {
-        use roaring::RoaringTreemap;
-        use std::collections::HashMap;
-        // No filter -> always preload.
-        assert!(should_preload_exact_reader(None, 0, "f0"));
-        // Filter present: file with a non-empty allow-list -> preload.
-        let mut m0: HashMap<String, RoaringTreemap> = HashMap::new();
-        m0.insert("f0".to_string(), RoaringTreemap::from_iter([0u64]));
-        let per_split = vec![m0];
-        assert!(should_preload_exact_reader(Some(&per_split), 0, "f0"));
-        // Filter present: file absent -> skip.
-        assert!(!should_preload_exact_reader(Some(&per_split), 0, "missing"));
-        // Filter present: file with empty allow-list -> skip.
-        let mut m1: HashMap<String, RoaringTreemap> = HashMap::new();
-        m1.insert("f1".to_string(), RoaringTreemap::new());
-        let per_split2 = vec![m1];
-        assert!(!should_preload_exact_reader(Some(&per_split2), 0, "f1"));
     }
 
     #[test]
