@@ -519,8 +519,9 @@ mod tests {
     async fn test_blob_range_reads_overlap_across_uris() {
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let groups = [b'a', b'b']
-            .into_iter()
+        let groups = b"ab"
+            .iter()
+            .copied()
             .enumerate()
             .map(|(row, value)| BlobReadGroup {
                 uri: format!("memory:/blob-{row}.bin"),
