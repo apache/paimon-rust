@@ -29,7 +29,10 @@ use crate::spec::{
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::DataSplit;
-use arrow_array::{builder::StringBuilder, Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{
+    builder::StringBuilder, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringArray,
+    UInt32Array,
+};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
@@ -145,6 +148,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
@@ -163,6 +167,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
@@ -260,16 +265,7 @@ impl<'a> PaimonTableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let pairs: Vec<(Vec<DataSplit>, Vec<DataSplit>)> = plan
-            .splits()
-            .iter()
-            .filter_map(|s| match s {
-                IncrementalSplit::DiffPair { before, after } => {
-                    Some((before.clone(), after.clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        let pairs = diff_pairs(plan)?;
         let parallel = CoreOptions::new(self.table.schema().options()).diff_parallelism();
         let table = self.table.clone();
         let read_type = self.read_type.clone();
@@ -280,18 +276,19 @@ impl<'a> PaimonTableRead<'a> {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
-                async move {
+                let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read =
                         PaimonTableRead::new(&table, read_type, data_predicates);
-                    pair_read.to_diff_after_image_stream(&before, &after)
-                }
+                    let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
+                    while let Some(batch) = pair_stream.next().await {
+                        yield batch?;
+                    }
+                });
+                worker
             }))
-            .buffer_unordered(parallel);
-            while let Some(stream_result) = workers.next().await {
-                let mut pair_stream = stream_result?;
-                while let Some(batch) = pair_stream.next().await {
-                    yield batch?;
-                }
+            .flatten_unordered(parallel);
+            while let Some(batch) = workers.next().await {
+                yield batch?;
             }
         }))
     }
@@ -307,7 +304,11 @@ impl<'a> PaimonTableRead<'a> {
                 self.audit_raw_stream(plan, !self.table.schema().primary_keys().is_empty())
             }
             IncrementalScanMode::Changelog => self.audit_raw_stream(plan, true),
-            IncrementalScanMode::Auto => unreachable!("Auto resolved during plan()"),
+            IncrementalScanMode::Auto => Err(crate::Error::DataInvalid {
+                message: "Incremental plan mode Auto must be resolved before consumption"
+                    .to_string(),
+                source: None,
+            }),
         }
     }
 
@@ -316,6 +317,7 @@ impl<'a> PaimonTableRead<'a> {
         plan: &IncrementalPlan,
         has_value_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        plan.validate()?;
         let data_splits = plan.data_splits();
         let user_read_type = self.read_type.clone();
         let include_sequence = audit_sequence_number_enabled(self.table);
@@ -401,16 +403,7 @@ impl<'a> PaimonTableRead<'a> {
     }
 
     fn audit_diff_stream(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
-        let pairs: Vec<(Vec<DataSplit>, Vec<DataSplit>)> = plan
-            .splits()
-            .iter()
-            .filter_map(|s| match s {
-                IncrementalSplit::DiffPair { before, after } => {
-                    Some((before.clone(), after.clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        let pairs = diff_pairs(plan)?;
         let parallel = CoreOptions::new(self.table.schema().options()).diff_parallelism();
         let table = self.table.clone();
         let read_type = self.read_type.clone();
@@ -421,17 +414,19 @@ impl<'a> PaimonTableRead<'a> {
                 let table = table.clone();
                 let read_type = read_type.clone();
                 let data_predicates = data_predicates.clone();
-                async move {
+                let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
-                    pair_read.to_audit_log_arrow_for_diff(&before, &after)
-                }
+                    let mut pair_stream =
+                        pair_read.to_audit_log_arrow_for_diff(&before, &after)?;
+                    while let Some(batch) = pair_stream.next().await {
+                        yield batch?;
+                    }
+                });
+                worker
             }))
-            .buffer_unordered(parallel);
-            while let Some(stream_result) = workers.next().await {
-                let mut pair_stream = stream_result?;
-                while let Some(batch) = pair_stream.next().await {
-                    yield batch?;
-                }
+            .flatten_unordered(parallel);
+            while let Some(batch) = workers.next().await {
+                yield batch?;
             }
         }))
     }
@@ -441,11 +436,11 @@ impl<'a> PaimonTableRead<'a> {
         before: &[DataSplit],
         after: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        ensure_diff_supported_read_type(&self.read_type)?;
         let include_sequence = audit_sequence_number_enabled(self.table);
         let audit_schema = audit_schema_for_read_type(&self.read_type, include_sequence)?;
 
-        let mut diff_read_type = self.read_type.clone();
+        let mut diff_read_type = self.table.schema().fields().to_vec();
+        ensure_diff_supported_read_type(&diff_read_type)?;
         if include_sequence {
             diff_read_type.insert(
                 0,
@@ -526,23 +521,43 @@ impl<'a> PaimonTableRead<'a> {
         before: &[DataSplit],
         after: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        ensure_diff_supported_read_type(&self.read_type)?;
-        let key_indices = primary_key_indices(self.table, &self.read_type)?;
-        let value_indices = value_indices_for_diff(self.table, &self.read_type);
+        let diff_read_type = self.table.schema().fields().to_vec();
+        ensure_diff_supported_read_type(&diff_read_type)?;
+        let key_indices = primary_key_indices(self.table, &diff_read_type)?;
+        let value_indices = value_indices_for_diff(self.table, &diff_read_type);
         let output_schema = build_target_arrow_schema(&self.read_type)?;
-        let output_col_indices: Vec<usize> = (0..self.read_type.len()).collect();
+        let output_col_indices = self
+            .read_type
+            .iter()
+            .map(|field| {
+                diff_read_type
+                    .iter()
+                    .position(|candidate| candidate.id() == field.id())
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Diff read missing projected column '{}'", field.name()),
+                        source: None,
+                    })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
 
         let table = self.table.clone();
-        let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let before = before.to_vec();
         let after = after.to_vec();
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
-            let pair_read = PaimonTableRead::new(&table, read_type, data_predicates);
-            let before_stream = pair_read.read_pk_sorted_for_diff(&before, &core_options)?;
-            let after_stream = pair_read.read_pk_sorted_for_diff(&after, &core_options)?;
+            let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates);
+            let before_stream = pair_read.read_pk_sorted_for_diff_with_type(
+                &before,
+                &core_options,
+                &diff_read_type,
+            )?;
+            let after_stream = pair_read.read_pk_sorted_for_diff_with_type(
+                &after,
+                &core_options,
+                &diff_read_type,
+            )?;
             let mut bc = ArrowCursor::new(before_stream).await?;
             let mut ac = ArrowCursor::new(after_stream).await?;
             let mut builder =
@@ -575,14 +590,6 @@ impl<'a> PaimonTableRead<'a> {
                 yield builder.flush()?;
             }
         }))
-    }
-
-    fn read_pk_sorted_for_diff(
-        &self,
-        splits: &[DataSplit],
-        core_options: &CoreOptions,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        self.read_pk_sorted_for_diff_with_type(splits, core_options, &self.read_type)
     }
 
     fn read_pk_sorted_for_diff_with_type(
@@ -621,6 +628,8 @@ impl<'a> PaimonTableRead<'a> {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                read_batch_size: core_options.read_batch_size()?,
+                merge_splits: true,
             },
         );
         reader.read(splits)
@@ -755,6 +764,7 @@ impl<'a> PaimonTableRead<'a> {
                     .map(|s| s.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
+                merge_splits: false,
             },
         );
         reader.read(splits)
@@ -1069,6 +1079,7 @@ impl DiffAfterImageBatchBuilder {
     }
 
     fn flush(&mut self) -> crate::Result<RecordBatch> {
+        let row_count = self.len;
         let mut columns = Vec::with_capacity(self.col_indices.len());
         for &col_idx in &self.col_indices {
             let taken: Vec<ArrayRef> = self
@@ -1097,13 +1108,34 @@ impl DiffAfterImageBatchBuilder {
         self.row_indices.clear();
         self.pinned_batches.clear();
         self.len = 0;
-        RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| {
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        RecordBatch::try_new_with_options(self.schema.clone(), columns, &options).map_err(|e| {
             crate::Error::UnexpectedError {
                 message: format!("Failed to build diff after-image batch: {e}"),
                 source: Some(Box::new(e)),
             }
         })
     }
+}
+
+fn diff_pairs(plan: &IncrementalPlan) -> crate::Result<Vec<(Vec<DataSplit>, Vec<DataSplit>)>> {
+    plan.validate()?;
+    if plan.mode() != IncrementalScanMode::Diff {
+        return Err(crate::Error::DataInvalid {
+            message: "Diff reader requires a Diff incremental plan".to_string(),
+            source: None,
+        });
+    }
+    plan.splits()
+        .iter()
+        .map(|split| match split {
+            IncrementalSplit::DiffPair { before, after } => Ok((before.clone(), after.clone())),
+            IncrementalSplit::Data(_) => Err(crate::Error::DataInvalid {
+                message: "Diff incremental plan contains a Data split".to_string(),
+                source: None,
+            }),
+        })
+        .collect()
 }
 
 fn diff_output_col_indices(
@@ -1155,7 +1187,7 @@ fn primary_key_indices(table: &Table, read_type: &[DataField]) -> crate::Result<
             .iter()
             .position(|field| field.name() == pk)
             .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("Primary key column '{pk}' missing from read projection"),
+                message: format!("Primary key column '{pk}' missing from Diff comparison schema"),
                 source: None,
             })?;
         indices.push(idx);
@@ -1168,8 +1200,9 @@ fn ensure_diff_supported_read_type(read_type: &[DataField]) -> crate::Result<()>
         if !is_diff_supported_type(field.data_type()) {
             return Err(crate::Error::Unsupported {
                 message: format!(
-                    "Batch incremental Diff does not support nested or decimal column '{}'",
-                    field.name()
+                    "Batch incremental Diff does not support column '{}' of type {:?}",
+                    field.name(),
+                    field.data_type()
                 ),
             });
         }
@@ -1178,9 +1211,18 @@ fn ensure_diff_supported_read_type(read_type: &[DataField]) -> crate::Result<()>
 }
 
 fn is_diff_supported_type(data_type: &DataType) -> bool {
-    !matches!(
+    matches!(
         data_type,
-        DataType::Decimal(_) | DataType::Array(_) | DataType::Map(_) | DataType::Row(_)
+        DataType::Boolean(_)
+            | DataType::TinyInt(_)
+            | DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::BigInt(_)
+            | DataType::Float(_)
+            | DataType::Double(_)
+            | DataType::Char(_)
+            | DataType::VarChar(_)
+            | DataType::Date(_)
     )
 }
 
@@ -1260,6 +1302,13 @@ fn scalar_compare(
         Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
+    match (left.is_null(left_row), right.is_null(right_row)) {
+        (true, true) => return Ok(Ordering::Equal),
+        (true, false) => return Ok(Ordering::Less),
+        (false, true) => return Ok(Ordering::Greater),
+        (false, false) => {}
+    }
+
     macro_rules! compare {
         ($ty:ty, $getter:expr) => {
             if let (Some(a), Some(b)) = (
@@ -1293,19 +1342,23 @@ fn scalar_compare(
         left.as_any().downcast_ref::<Float32Array>(),
         right.as_any().downcast_ref::<Float32Array>(),
     ) {
-        return Ok(a
-            .value(left_row)
-            .partial_cmp(&b.value(right_row))
-            .unwrap_or(Ordering::Equal));
+        let (left, right) = (a.value(left_row), b.value(right_row));
+        return Ok(if left.is_nan() && right.is_nan() {
+            Ordering::Equal
+        } else {
+            left.total_cmp(&right)
+        });
     }
     if let (Some(a), Some(b)) = (
         left.as_any().downcast_ref::<Float64Array>(),
         right.as_any().downcast_ref::<Float64Array>(),
     ) {
-        return Ok(a
-            .value(left_row)
-            .partial_cmp(&b.value(right_row))
-            .unwrap_or(Ordering::Equal));
+        let (left, right) = (a.value(left_row), b.value(right_row));
+        return Ok(if left.is_nan() && right.is_nan() {
+            Ordering::Equal
+        } else {
+            left.total_cmp(&right)
+        });
     }
 
     Err(crate::Error::Unsupported {
@@ -1440,8 +1493,8 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_rejects_nested_and_decimal_types() {
-        use crate::spec::{ArrayType, DecimalType, IntType};
+    fn test_diff_rejects_types_without_comparator_support() {
+        use crate::spec::{ArrayType, DecimalType, IntType, TimestampType};
 
         let decimal = DataField::new(
             1,
@@ -1453,13 +1506,58 @@ mod tests {
             "tags".to_string(),
             DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
         );
+        let timestamp = DataField::new(
+            3,
+            "created_at".to_string(),
+            DataType::Timestamp(TimestampType::new(6).unwrap()),
+        );
         assert!(matches!(
             ensure_diff_supported_read_type(&[decimal]),
-            Err(crate::Error::Unsupported { message }) if message.contains("nested or decimal")
+            Err(crate::Error::Unsupported { message }) if message.contains("amount")
         ));
         assert!(matches!(
             ensure_diff_supported_read_type(&[nested]),
-            Err(crate::Error::Unsupported { message }) if message.contains("nested or decimal")
+            Err(crate::Error::Unsupported { message }) if message.contains("tags")
         ));
+        assert!(matches!(
+            ensure_diff_supported_read_type(&[timestamp]),
+            Err(crate::Error::Unsupported { message }) if message.contains("created_at")
+        ));
+    }
+
+    #[test]
+    fn test_diff_scalar_compare_distinguishes_null_and_nan_values() {
+        use arrow_array::{Float32Array, Int32Array};
+
+        let null = Int32Array::from(vec![None]);
+        let zero = Int32Array::from(vec![Some(0)]);
+        assert_eq!(
+            scalar_compare(&null, 0, &zero, 0).unwrap(),
+            Ordering::Less,
+            "NULL -> 0 must be reported as a changed value"
+        );
+
+        let nan = Float32Array::from(vec![f32::NAN]);
+        let one = Float32Array::from(vec![1.0]);
+        assert_ne!(
+            scalar_compare(&nan, 0, &one, 0).unwrap(),
+            Ordering::Equal,
+            "NaN must not hide a change to a finite value"
+        );
+
+        let negative_nan = Float32Array::from(vec![f32::from_bits(0xffc0_0001)]);
+        assert_eq!(
+            scalar_compare(&nan, 0, &negative_nan, 0).unwrap(),
+            Ordering::Equal,
+            "all NaN representations must compare equal like Java Float.compare"
+        );
+
+        let negative_zero = Float32Array::from(vec![-0.0]);
+        let positive_zero = Float32Array::from(vec![0.0]);
+        assert_ne!(
+            scalar_compare(&negative_zero, 0, &positive_zero, 0).unwrap(),
+            Ordering::Equal,
+            "signed zero must remain distinguishable like Java Float.compare"
+        );
     }
 }

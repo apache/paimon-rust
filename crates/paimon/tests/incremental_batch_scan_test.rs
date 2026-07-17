@@ -17,7 +17,7 @@
 
 mod common;
 
-use arrow_array::{Array, Int32Array, RecordBatch};
+use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::table::IncrementalScanMode;
 
@@ -472,6 +472,330 @@ async fn diff_identical_rows_are_skipped_from_after_image() {
 }
 
 #[tokio::test]
+async fn diff_projection_without_primary_key_still_compares_full_rows() {
+    let table_path = "memory:/incremental_batch/diff_projection_without_pk";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&["value"]).unwrap();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(values, vec![20]);
+}
+
+#[tokio::test]
+async fn diff_change_outside_projection_is_not_missed() {
+    let table_path = "memory:/incremental_batch/diff_unprojected_change";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&["id"]).unwrap();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn diff_null_to_zero_is_reported_as_change() {
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let table_path = "memory:/incremental_batch/diff_null_to_zero";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::with_nullable(true)))
+        .primary_key(["id"])
+        .option("changelog-producer", "none")
+        .option("merge-engine", "deduplicate")
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(table_path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let make_nullable_batch = |value| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("value", ArrowDataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    write_batch(&table, &make_nullable_batch(None)).await;
+    write_batch(&table, &make_nullable_batch(Some(0))).await;
+
+    let rows = read_incremental_pairs(&table, IncrementalScanMode::Diff, 1, 2).await;
+    assert_eq!(rows, vec![(1, 0)]);
+}
+
+#[tokio::test]
+async fn diff_ignores_scan_limit_when_planning_full_states() {
+    let table_path = "memory:/incremental_batch/diff_limit";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "4"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1, 8], vec![10, 80])).await;
+    write_batch(&table, &make_batch(vec![1, 8], vec![11, 81])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_limit(1);
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let pair_count = plan
+        .splits()
+        .iter()
+        .filter(|split| matches!(split, paimon::table::IncrementalSplit::DiffPair { .. }))
+        .count();
+    assert!(pair_count >= 2, "limit must not truncate Diff state pairs");
+
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(1, 11), (8, 81)]);
+}
+
+#[tokio::test]
+async fn diff_empty_projection_preserves_changed_row_count() {
+    let table_path = "memory:/incremental_batch/diff_empty_projection";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&[]).unwrap();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+}
+
+#[tokio::test]
+async fn diff_ignores_row_ranges_when_planning_full_states() {
+    use paimon::table::{AuditLogTable, RowRange};
+
+    let table_path = "memory:/incremental_batch/diff_row_ranges";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+            ("row-tracking.enabled", "true"),
+            ("target-file-size", "1b"),
+            ("source.split.target-size", "1b"),
+            ("source.split.open-file-cost", "1b"),
+            ("num-sorted-run.compaction-trigger", "100"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![3], vec![30])).await;
+    write_batch(&table, &make_batch(vec![1], vec![11])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_row_ranges(vec![RowRange::new(1, 2)]);
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 2, 3)
+        .plan()
+        .await
+        .unwrap();
+    assert!(plan.splits().iter().all(|split| match split {
+        paimon::table::IncrementalSplit::DiffPair { before, after } => before
+            .iter()
+            .chain(after)
+            .all(|split| split.row_ranges().is_none()),
+        paimon::table::IncrementalSplit::Data(_) => false,
+    }));
+    let batches: Vec<RecordBatch> = AuditLogTable::new(table.clone())
+        .to_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let rowkinds: Vec<&str> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect();
+    assert_eq!(
+        rowkinds,
+        vec!["-U", "+U"],
+        "Diff must compare complete states rather than physical row ranges"
+    );
+}
+
+#[tokio::test]
+async fn diff_reads_more_than_128_files_in_one_side() {
+    let table_path = "memory:/incremental_batch/diff_many_files";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+            ("target-file-size", "1b"),
+            ("source.split.target-size", "1b"),
+            ("source.split.open-file-cost", "1b"),
+            ("num-sorted-run.compaction-trigger", "1000"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    for id in 0..129 {
+        write_batch(&table, &make_batch(vec![id], vec![10])).await;
+    }
+    write_batch(&table, &make_batch(vec![0], vec![11])).await;
+
+    let plan = plan_incremental(&table, IncrementalScanMode::Diff, 129, 130)
+        .await
+        .unwrap();
+    let file_count = plan
+        .splits()
+        .iter()
+        .map(|split| match split {
+            paimon::table::IncrementalSplit::DiffPair { before, .. } => before
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            paimon::table::IncrementalSplit::Data(_) => 0,
+        })
+        .sum::<usize>();
+    assert!(file_count > 128, "test requires more than 128 before files");
+
+    assert_eq!(
+        read_incremental_pairs(&table, IncrementalScanMode::Diff, 129, 130).await,
+        vec![(0, 11)]
+    );
+}
+
+#[tokio::test]
 async fn diff_rejects_start_before_earliest_snapshot() {
     let table_path = "memory:/incremental_batch/diff_earliest";
     let (file_io, table) = memory_table(
@@ -520,6 +844,155 @@ async fn diff_rejects_non_deduplicate_merge_engine() {
             "merge-engine={merge_engine} expected Unsupported, got {err:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn diff_rejects_table_without_primary_keys() {
+    use paimon::spec::{DataType, IntType, Schema, TableSchema};
+
+    let table_path = "memory:/incremental_batch/diff_without_primary_keys";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("changelog-producer", "none")
+        .option("merge-engine", "deduplicate")
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(table_path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![2], vec![20])).await;
+
+    let err = plan_incremental(&table, IncrementalScanMode::Diff, 1, 2)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message } if message.contains("primary keys")),
+        "expected Unsupported for a table without primary keys, got {err:?}"
+    );
+}
+
+#[test]
+fn incremental_plan_rejects_data_split_in_diff_mode() {
+    use paimon::spec::BinaryRow;
+    use paimon::table::{DataSplitBuilder, IncrementalPlan, IncrementalSplit};
+
+    let split = DataSplitBuilder::new()
+        .with_snapshot(1)
+        .with_partition(BinaryRow::new(0))
+        .with_bucket(0)
+        .with_bucket_path("memory:/incremental_batch/bucket-0".to_string())
+        .with_total_buckets(1)
+        .with_data_files(Vec::new())
+        .build()
+        .unwrap();
+    let err = IncrementalPlan::try_new(
+        IncrementalScanMode::Diff,
+        vec![IncrementalSplit::Data(split)],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("Data split")),
+        "Diff plan must reject Data splits instead of silently skipping them: {err:?}"
+    );
+}
+
+#[test]
+fn incremental_plan_rejects_diff_pair_with_mismatched_bucket_metadata() {
+    use paimon::spec::BinaryRow;
+    use paimon::table::{DataSplitBuilder, IncrementalPlan, IncrementalSplit};
+
+    let split = |bucket| {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(bucket)
+            .with_bucket_path(format!("memory:/incremental_batch/bucket-{bucket}"))
+            .with_total_buckets(2)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap()
+    };
+    let err = IncrementalPlan::try_new(
+        IncrementalScanMode::Diff,
+        vec![IncrementalSplit::DiffPair {
+            before: vec![split(0)],
+            after: vec![split(1)],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("partition buckets")),
+        "Diff plan must reject pairs that cross partition buckets: {err:?}"
+    );
+}
+
+#[test]
+fn incremental_plan_rejects_partial_or_inconsistent_diff_states() {
+    use paimon::spec::BinaryRow;
+    use paimon::table::{DataSplitBuilder, IncrementalPlan, IncrementalSplit, RowRange};
+
+    let split = |snapshot, with_row_ranges| {
+        let mut builder = DataSplitBuilder::new()
+            .with_snapshot(snapshot)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/incremental_batch/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new());
+        if with_row_ranges {
+            builder = builder.with_row_ranges(vec![RowRange::new(0, 1)]);
+        }
+        builder.build().unwrap()
+    };
+
+    let err = IncrementalPlan::try_new(
+        IncrementalScanMode::Diff,
+        vec![IncrementalSplit::DiffPair {
+            before: vec![split(1, true)],
+            after: vec![split(2, false)],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("row ranges")),
+        "Diff plan must reject partial physical row ranges: {err:?}"
+    );
+
+    let err = IncrementalPlan::try_new(
+        IncrementalScanMode::Diff,
+        vec![IncrementalSplit::DiffPair {
+            before: vec![split(2, false)],
+            after: vec![split(1, false)],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("earlier")),
+        "Diff plan must reject reversed snapshot states: {err:?}"
+    );
+
+    let err = IncrementalPlan::try_new(
+        IncrementalScanMode::Diff,
+        vec![
+            IncrementalSplit::DiffPair {
+                before: vec![split(1, false)],
+                after: Vec::new(),
+            },
+            IncrementalSplit::DiffPair {
+                before: vec![split(2, false)],
+                after: Vec::new(),
+            },
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("before snapshots")),
+        "Diff plan must reject mixed before snapshots: {err:?}"
+    );
 }
 
 #[tokio::test]

@@ -81,6 +81,7 @@ impl AuditLogTable {
     }
 
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
+        plan.validate()?;
         let read = self.wrapped.new_read_builder().new_read()?;
         read.to_audit_log_arrow(plan)
     }

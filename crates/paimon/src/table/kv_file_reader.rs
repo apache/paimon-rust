@@ -73,6 +73,8 @@ pub(crate) struct KeyValueReadConfig {
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
+    /// Merge files from all supplied splits into one globally key-sorted stream.
+    pub merge_splits: bool,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -368,7 +370,15 @@ impl KeyValueFileReader {
             }
         }
 
-        let splits: Vec<DataSplit> = data_splits.to_vec();
+        let split_groups: Vec<Vec<DataSplit>> = if self.config.merge_splits {
+            vec![data_splits.to_vec()]
+        } else {
+            data_splits
+                .iter()
+                .cloned()
+                .map(|split| vec![split])
+                .collect()
+        };
         let file_io = self.file_io;
         let merge_engine = self.config.merge_engine;
         let schema_manager = self.config.schema_manager;
@@ -391,21 +401,23 @@ impl KeyValueFileReader {
         let merge_output_schema = build_target_arrow_schema(&merge_output_fields)?;
 
         Ok(try_stream! {
-            for split in &splits {
+            for split_group in &split_groups {
                 // DV mode should not reach KeyValueFileReader.
-                if split
-                    .data_deletion_files()
-                    .is_some_and(|files| files.iter().any(Option::is_some))
-                {
-                    Err(Error::Unsupported {
-                        message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                    })?;
+                for split in split_group {
+                    if split
+                        .data_deletion_files()
+                        .is_some_and(|files| files.iter().any(Option::is_some))
+                    {
+                        Err(Error::Unsupported {
+                            message: "KeyValueFileReader does not support deletion vectors".to_string(),
+                        })?;
+                    }
                 }
-
                 // Create one stream per data file.
                 let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
-                for file_meta in split.data_files().to_vec() {
+                for split in split_group {
+                    for file_meta in split.data_files().to_vec() {
                     let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
                         let data_schema = schema_manager.schema(file_meta.schema_id).await?;
                         Some(data_schema.fields().to_vec())
@@ -428,7 +440,7 @@ impl KeyValueFileReader {
                         file_meta,
                         data_fields,
                         None,
-                        None,
+                        split.row_ranges().map(|ranges| ranges.to_vec()),
                     )?;
                     #[cfg(test)]
                     let stream = if let Some(batch_sizes) = input_batch_sizes.clone() {
@@ -443,6 +455,7 @@ impl KeyValueFileReader {
                         stream
                     };
                     file_streams.push(stream);
+                    }
                 }
 
                 if file_streams.is_empty() {
@@ -809,6 +822,7 @@ mod tests {
                     .map(|field| field.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());

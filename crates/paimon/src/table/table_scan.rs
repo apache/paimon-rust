@@ -1023,6 +1023,9 @@ struct PaimonTableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Diff compares complete logical states, so it must not accept physical
+    /// row-range pruning from an explicit range or a global-index lookup.
+    row_range_optimization_disabled: bool,
     /// When true, disables level-0 filtering so all files are visible.
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
@@ -1046,6 +1049,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
+            row_range_optimization_disabled: false,
             scan_all_files: false,
             projected_read_field_ids: None,
         }
@@ -1071,6 +1075,12 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             Some(ranges)
         };
+        self
+    }
+
+    fn without_row_range_optimization(mut self) -> Self {
+        self.row_ranges = None;
+        self.row_range_optimization_disabled = true;
         self
     }
 
@@ -1552,34 +1562,30 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan before/after full-snapshot states for Diff incremental scan.
     ///
     /// Loads full manifest entries for both snapshots, rejects bucket rescale,
-    /// prunes files that are identical and unaffected by exclusive changes, then
-    /// builds splits via the shared snapshot planning path.
+    /// then builds splits via the shared snapshot planning path. Diff keeps the
+    /// complete state on both sides because serialized key bytes do not preserve
+    /// the logical ordering required for safe overlap pruning.
     pub(crate) async fn plan_snapshot_diff(
         &self,
         before: &Snapshot,
         after: &Snapshot,
     ) -> crate::Result<(Plan, Plan)> {
         self.ensure_query_auth_allowed()?;
-        let mut before_entries = self.plan_manifest_entries(before).await?;
-        let mut after_entries = self.plan_manifest_entries(after).await?;
+        let before_entries = self.plan_manifest_entries(before).await?;
+        let after_entries = self.plan_manifest_entries(after).await?;
         Self::validate_diff_bucket_layout(&before_entries, &after_entries)?;
-        Self::prune_unchanged_diff_files(&mut before_entries, &mut after_entries);
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let before_plan = self
-            .plan_snapshot_from_entries(
-                before.clone(),
-                before_entries,
-                data_evolution_read_field_ids.as_ref(),
-                None,
-            )
+        // A limit hint cannot be pushed into either side of a Diff: truncating
+        // the states independently can both hide changes and invent them.
+        let mut full_state_scan = self.clone();
+        full_state_scan.limit = None;
+        // Row ranges identify physical positions in individual files, whereas
+        // Diff compares complete logical states across both snapshots.
+        full_state_scan = full_state_scan.without_row_range_optimization();
+        let before_plan = full_state_scan
+            .plan_snapshot_from_entries(before.clone(), before_entries, None, None)
             .await?;
-        let after_plan = self
-            .plan_snapshot_from_entries(
-                after.clone(),
-                after_entries,
-                data_evolution_read_field_ids.as_ref(),
-                None,
-            )
+        let after_plan = full_state_scan
+            .plan_snapshot_from_entries(after.clone(), after_entries, None, None)
             .await?;
         Ok((before_plan, after_plan))
     }
@@ -1616,49 +1622,6 @@ impl<'a> PaimonTableScan<'a> {
             }
         }
         Ok(())
-    }
-
-    fn prune_unchanged_diff_files(before: &mut Vec<ManifestEntry>, after: &mut Vec<ManifestEntry>) {
-        // Common files (byte-equal manifest entries) that do not overlap any
-        // exclusive before/after file key-range can be dropped from both sides.
-        let mut common: Vec<ManifestEntry> = before
-            .iter()
-            .filter(|entry| after.iter().any(|other| other == *entry))
-            .cloned()
-            .collect();
-        if common.is_empty() {
-            return;
-        }
-
-        let exclusive_after: Vec<&ManifestEntry> = after
-            .iter()
-            .filter(|entry| !common.iter().any(|c| c == *entry))
-            .collect();
-        let exclusive_before: Vec<&ManifestEntry> = before
-            .iter()
-            .filter(|entry| !common.iter().any(|c| c == *entry))
-            .collect();
-        common.retain(|entry| {
-            let overlaps_exclusive = |other: &&ManifestEntry| {
-                Self::key_ranges_overlap_bytes(
-                    &entry.file().min_key,
-                    &entry.file().max_key,
-                    &other.file().min_key,
-                    &other.file().max_key,
-                )
-            };
-            !exclusive_after.iter().any(overlaps_exclusive)
-                && !exclusive_before.iter().any(overlaps_exclusive)
-        });
-        if common.is_empty() {
-            return;
-        }
-        before.retain(|entry| !common.iter().any(|c| c == entry));
-        after.retain(|entry| !common.iter().any(|c| c == entry));
-    }
-
-    fn key_ranges_overlap_bytes(min_a: &[u8], max_a: &[u8], min_b: &[u8], max_b: &[u8]) -> bool {
-        min_a <= max_b && min_b <= max_a
     }
 
     /// Read entries from a single manifest list (delta or changelog) with
@@ -4324,5 +4287,15 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"
         );
+    }
+
+    #[test]
+    fn diff_full_state_disables_global_index_row_range_optimization() {
+        assert!(!super::should_use_global_index_row_range_optimization(
+            true, true, true, true,
+        ));
+        assert!(super::should_use_global_index_row_range_optimization(
+            false, true, true, true,
+        ));
     }
 }

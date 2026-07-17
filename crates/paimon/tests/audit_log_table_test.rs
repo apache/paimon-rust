@@ -23,7 +23,7 @@ use paimon::spec::{
     DataType, IntType, Schema, TableSchema, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_NAME,
 };
-use paimon::table::{AuditLogTable, IncrementalScanMode};
+use paimon::table::{AuditLogTable, IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, memory_table, persist_table_schema, pk_schema, setup_dirs,
@@ -553,6 +553,62 @@ async fn audit_log_diff_processes_multiple_bucket_pairs() {
 }
 
 #[tokio::test]
+async fn audit_log_diff_merges_multiple_splits_per_bucket_by_primary_key() {
+    let table_path = "memory:/audit_log/diff_multi_split_bucket";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "none"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+            ("target-file-size", "1b"),
+            ("source.split.target-size", "1b"),
+            ("source.split.open-file-cost", "1b"),
+            ("num-sorted-run.compaction-trigger", "100"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![3], vec![30])).await;
+    write_batch(&table, &make_batch(vec![1], vec![11])).await;
+
+    let audit = AuditLogTable::new(table.clone());
+    let plan = audit
+        .new_incremental_scan(IncrementalScanMode::Diff, 2, 3)
+        .plan()
+        .await
+        .unwrap();
+    let scrambled = plan
+        .splits()
+        .iter()
+        .cloned()
+        .map(|split| match split {
+            IncrementalSplit::DiffPair { mut before, after } => {
+                assert!(before.len() >= 2, "test requires multiple before splits");
+                assert!(after.len() >= 2, "test requires multiple after splits");
+                before.reverse();
+                IncrementalSplit::DiffPair { before, after }
+            }
+            other => other,
+        })
+        .collect();
+    let scrambled = IncrementalPlan::try_new(IncrementalScanMode::Diff, scrambled).unwrap();
+
+    let batches: Vec<RecordBatch> = audit
+        .to_arrow(&scrambled)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_audit_rows(&batches),
+        vec![("+U".to_string(), 1, 11), ("-U".to_string(), 1, 10),]
+    );
+}
+
+#[tokio::test]
 async fn audit_log_diff_with_sequence_number_enabled_exposes_ordered_columns() {
     use std::collections::HashMap;
 
@@ -608,4 +664,58 @@ async fn audit_log_diff_with_sequence_number_enabled_exposes_ordered_columns() {
         &[("-U", 1, 10), ("+U", 1, 20)],
     );
     assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
+}
+
+#[tokio::test]
+async fn audit_log_rejects_invalid_incremental_plan_at_consumption() {
+    let table_path = "memory:/audit_log/invalid_incremental_plan";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[("merge-engine", "deduplicate"), ("bucket", "1")]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+    let audit = AuditLogTable::new(table.clone());
+
+    let invalid_kind = IncrementalPlan::new(
+        IncrementalScanMode::Delta,
+        vec![IncrementalSplit::DiffPair {
+            before: Vec::new(),
+            after: Vec::new(),
+        }],
+    );
+    let err = match audit.to_arrow(&invalid_kind) {
+        Ok(_) => panic!("invalid plans must fail instead of producing an empty audit stream"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("DiffPair")),
+        "invalid plans must fail instead of producing an empty audit stream: {err:?}"
+    );
+
+    let auto = IncrementalPlan::new(IncrementalScanMode::Auto, Vec::new());
+    let err = match audit.to_arrow(&auto) {
+        Ok(_) => panic!("Auto plans must fail at consumption"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("Auto")),
+        "Auto plans must fail at consumption: {err:?}"
+    );
+
+    let err = IncrementalPlan::try_new(IncrementalScanMode::Auto, Vec::new()).unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("Auto")),
+        "try_new must reject unresolved Auto plans: {err:?}"
+    );
+
+    let read = table.new_read_builder().new_read().unwrap();
+    let err = match read.to_incremental_arrow(&auto) {
+        Ok(_) => panic!("the direct incremental reader must validate plans too"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. } if message.contains("Auto")),
+        "the direct incremental reader must validate plans too: {err:?}"
+    );
 }
