@@ -29,13 +29,75 @@ use arrow_array::builder::BinaryBuilder;
 use arrow_array::RecordBatch;
 use async_stream::try_stream;
 use futures::StreamExt;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 const BATCH_SIZE: usize = 1024;
 
-struct OpenBlobFile {
+struct LazyBlobFile {
     range: RowRange,
-    reader: IndexedBlobReader,
+    file_name: String,
+    path: String,
+    file_size: i64,
+    row_count: i64,
+    reader: Option<IndexedBlobReader>,
+}
+
+impl LazyBlobFile {
+    async fn read_positions(
+        &mut self,
+        positions: &[usize],
+        file_io: &FileIO,
+        blob_as_descriptor: bool,
+    ) -> crate::Result<Vec<BlobReadValue>> {
+        if self.reader.is_none() {
+            let file_size = u64::try_from(self.file_size).map_err(|e| Error::DataInvalid {
+                message: format!(
+                    "Blob file '{}' has negative file size {}",
+                    self.file_name, self.file_size
+                ),
+                source: Some(Box::new(e)),
+            })?;
+            let input = file_io.new_input(&self.path)?;
+            let reader = input.reader().await?;
+            let reader = IndexedBlobReader::open(
+                Box::new(reader),
+                file_size,
+                self.path.clone(),
+                blob_as_descriptor,
+            )
+            .await?;
+            let indexed_rows =
+                i64::try_from(reader.num_rows()).map_err(|e| Error::DataInvalid {
+                    message: format!(
+                        "Blob file '{}' index row count {} exceeds i64",
+                        self.file_name,
+                        reader.num_rows()
+                    ),
+                    source: Some(Box::new(e)),
+                })?;
+            if indexed_rows != self.row_count {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Blob file '{}' index contains {indexed_rows} rows but metadata declares {}",
+                        self.file_name, self.row_count
+                    ),
+                    source: None,
+                });
+            }
+            self.reader = Some(reader);
+        }
+
+        self.reader
+            .as_ref()
+            .expect("blob reader is initialized above")
+            .read_positions(positions)
+            .await
+    }
+
+    fn release_reader(&mut self) {
+        self.reader = None;
+    }
 }
 
 pub(super) fn read(
@@ -72,78 +134,78 @@ pub(super) fn read(
 
         let mut sequence_groups = Vec::new();
         for files in bunch.sequence_groups() {
-            let mut group = Vec::with_capacity(files.len());
+            let mut group = VecDeque::with_capacity(files.len());
             for file in files {
                 let range = blob_file_row_range(&file)?;
                 if !row_range_overlaps_any(&range, &selected_ranges) {
                     continue;
                 }
                 let path = split.data_file_path(&file);
-                let input = file_io.new_input(&path)?;
-                let reader = input.reader().await?;
-                let file_size = u64::try_from(file.file_size).map_err(|e| Error::DataInvalid {
-                    message: format!(
-                        "Blob file '{}' has negative file size {}",
-                        file.file_name, file.file_size
-                    ),
-                    source: Some(Box::new(e)),
-                })?;
-                let reader = IndexedBlobReader::open(
-                    Box::new(reader),
-                    file_size,
+                group.push_back(LazyBlobFile {
+                    range,
+                    file_name: file.file_name,
                     path,
-                    blob_as_descriptor,
-                )
-                .await?;
-                let indexed_rows = i64::try_from(reader.num_rows()).map_err(|e| {
-                    Error::DataInvalid {
-                        message: format!(
-                            "Blob file '{}' index row count {} exceeds i64",
-                            file.file_name,
-                            reader.num_rows()
-                        ),
-                        source: Some(Box::new(e)),
-                    }
-                })?;
-                if indexed_rows != file.row_count {
-                    Err(Error::DataInvalid {
-                        message: format!(
-                            "Blob file '{}' index contains {indexed_rows} rows but metadata declares {}",
-                            file.file_name, file.row_count
-                        ),
-                        source: None,
-                    })?;
-                }
-                group.push(OpenBlobFile { range, reader });
+                    file_size: file.file_size,
+                    row_count: file.row_count,
+                    reader: None,
+                });
             }
-            sequence_groups.push(group);
+            if !group.is_empty() {
+                sequence_groups.push(group);
+            }
         }
 
         let mut row_cursor = RowIdBatchCursor::new(selected_ranges);
         while let Some(row_ids) = row_cursor.next_batch(BATCH_SIZE) {
-            yield resolve_batch(&sequence_groups, &row_ids, target_schema.clone()).await?;
+            yield resolve_batch(
+                &mut sequence_groups,
+                &row_ids,
+                target_schema.clone(),
+                &file_io,
+                blob_as_descriptor,
+            ).await?;
         }
     }
     .boxed())
 }
 
 async fn resolve_batch(
-    sequence_groups: &[Vec<OpenBlobFile>],
+    sequence_groups: &mut [VecDeque<LazyBlobFile>],
     row_ids: &[i64],
     target_schema: Arc<arrow_schema::Schema>,
+    file_io: &FileIO,
+    blob_as_descriptor: bool,
 ) -> crate::Result<RecordBatch> {
     let mut resolved = (0..row_ids.len())
         .map(|_| BlobReadValue::Placeholder)
         .collect::<Vec<_>>();
+    let mut unresolved_count = resolved.len();
+    let batch_from = row_ids[0];
+    let batch_to = *row_ids.last().expect("row id batch is non-empty");
+
+    for group in sequence_groups.iter_mut() {
+        while group
+            .front()
+            .is_some_and(|file| file.range.to() < batch_from)
+        {
+            group.pop_front();
+        }
+    }
 
     // Groups are newest first. A missing row or placeholder leaves the row unresolved;
-    // an explicit NULL or value stops fallback. Older payloads are still read to keep
-    // this compatibility path free of stale-read optimizations.
-    for group in sequence_groups {
-        for file in group {
+    // an explicit NULL or value stops fallback.
+    for group in sequence_groups.iter_mut() {
+        for file in group.iter_mut() {
+            if unresolved_count == 0 || file.range.from() > batch_to {
+                break;
+            }
+
             let mut output_positions = Vec::new();
             let mut file_positions = Vec::new();
             for (output_position, row_id) in row_ids.iter().copied().enumerate() {
+                if !matches!(&resolved[output_position], BlobReadValue::Placeholder) {
+                    continue;
+                }
                 if row_id < file.range.from() || row_id > file.range.to() {
                     continue;
                 }
@@ -158,18 +220,34 @@ async fn resolve_batch(
                 })?);
             }
 
-            if file_positions.is_empty() {
-                continue;
-            }
-
-            let values = file.reader.read_positions(&file_positions).await?;
-            for (output_position, value) in output_positions.into_iter().zip(values) {
-                if matches!(&resolved[output_position], BlobReadValue::Placeholder)
-                    && !matches!(&value, BlobReadValue::Placeholder)
-                {
-                    resolved[output_position] = value;
+            if !file_positions.is_empty() {
+                let values = file
+                    .read_positions(&file_positions, file_io, blob_as_descriptor)
+                    .await?;
+                for (output_position, value) in output_positions.into_iter().zip(values) {
+                    if !matches!(&value, BlobReadValue::Placeholder) {
+                        resolved[output_position] = value;
+                        unresolved_count -= 1;
+                    }
                 }
             }
+
+            if file.range.to() <= batch_to {
+                file.release_reader();
+            }
+        }
+
+        if unresolved_count == 0 {
+            break;
+        }
+    }
+
+    for group in sequence_groups.iter_mut() {
+        while group
+            .front()
+            .is_some_and(|file| file.range.to() <= batch_to)
+        {
+            group.pop_front();
         }
     }
 
@@ -221,5 +299,134 @@ impl RowIdBatchCursor {
             }
         }
         (!row_ids.is_empty()).then_some(row_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileRead;
+    use crate::spec::{BlobType, DataType};
+    use arrow_array::{Array, BinaryArray};
+    use bytes::Bytes;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[allow(dead_code)]
+    mod blob_test_utils {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../blob_test_utils.rs"
+        ));
+    }
+
+    use blob_test_utils::{build_blob_file_bytes_with_values, BlobFixtureValue};
+
+    #[derive(Clone)]
+    struct TrackingFileRead {
+        bytes: Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    async fn tracking_blob_file(
+        file_name: &str,
+        first_row_id: i64,
+        values: &[BlobFixtureValue<'_>],
+    ) -> (LazyBlobFile, Arc<AtomicUsize>) {
+        let bytes = Bytes::from(build_blob_file_bytes_with_values(values));
+        let file_size = bytes.len() as u64;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = IndexedBlobReader::open(
+            Box::new(TrackingFileRead {
+                bytes,
+                reads: reads.clone(),
+            }),
+            file_size,
+            file_name.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        reads.store(0, Ordering::SeqCst);
+
+        let last_row_id = first_row_id + i64::try_from(values.len()).unwrap() - 1;
+        (
+            LazyBlobFile {
+                range: RowRange::new(first_row_id, last_row_id),
+                file_name: file_name.to_string(),
+                path: file_name.to_string(),
+                file_size: i64::try_from(file_size).unwrap(),
+                row_count: i64::try_from(values.len()).unwrap(),
+                reader: Some(reader),
+            },
+            reads,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_resolve_batch_skips_payloads_for_resolved_rows() {
+        use BlobFixtureValue::{Null, Placeholder, Value};
+
+        let (latest, latest_reads) =
+            tracking_blob_file("latest.blob", 0, &[Value(b"new-0"), Null, Placeholder]).await;
+        let (older, older_reads) = tracking_blob_file(
+            "older.blob",
+            0,
+            &[
+                Value(b"old-0"),
+                Value(b"old-1"),
+                Value(b"old-2"),
+                Value(b"old-3"),
+            ],
+        )
+        .await;
+        let (oldest, oldest_reads) = tracking_blob_file(
+            "oldest.blob",
+            0,
+            &[
+                Value(b"ancient-0"),
+                Value(b"ancient-1"),
+                Value(b"ancient-2"),
+                Value(b"ancient-3"),
+            ],
+        )
+        .await;
+        let schema = build_target_arrow_schema(&[DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )])
+        .unwrap();
+
+        let mut groups = vec![
+            VecDeque::from([latest]),
+            VecDeque::from([older]),
+            VecDeque::from([oldest]),
+        ];
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        let batch = resolve_batch(&mut groups, &[0, 1, 2, 3], schema, &file_io, false)
+            .await
+            .unwrap();
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        assert_eq!(values.value(0), b"new-0");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), b"old-2");
+        assert_eq!(values.value(3), b"old-3");
+        assert_eq!(latest_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(older_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(oldest_reads.load(Ordering::SeqCst), 0);
     }
 }

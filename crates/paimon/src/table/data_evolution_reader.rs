@@ -3432,6 +3432,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_fallback_defers_later_files_until_their_batch() {
+        use BlobFixtureValue::{Placeholder, Value};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", (0..2048).collect::<Vec<_>>())],
+            None,
+        );
+
+        let latest_path = bucket_dir.join("blob-latest-first.blob");
+        let older_path = bucket_dir.join("blob-older-first.blob");
+        let latest_values = vec![Placeholder; 1024];
+        let older_values = vec![Value(b"old"); 1024];
+        write_blob_file_with_values(&latest_path, &latest_values);
+        write_blob_file_with_values(&older_path, &older_values);
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "blob_lazy_fallback_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    2048,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-latest-first.blob",
+                    0,
+                    1024,
+                    2,
+                    latest_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-older-first.blob",
+                    0,
+                    1024,
+                    1,
+                    older_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ),
+                data_file_meta_with_path(
+                    "blob-older-missing.blob",
+                    1024,
+                    1024,
+                    1,
+                    5,
+                    Some(vec!["payload"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let mut stream = read.to_arrow(&[split]).unwrap();
+        let first_batch = stream.try_next().await.unwrap().unwrap();
+
+        assert_eq!(first_batch.num_rows(), 1024);
+        let ids = collect_int_values(std::slice::from_ref(&first_batch), "id");
+        assert_eq!(ids.first(), Some(&0));
+        assert_eq!(ids.last(), Some(&1023));
+        assert!(
+            collect_binary_values(std::slice::from_ref(&first_batch), "payload")
+                .into_iter()
+                .all(|value| value.as_deref() == Some(&b"old"[..]))
+        );
+
+        assert!(stream.try_next().await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_table_read_merges_multiple_blob_columns_with_row_ranges() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
@@ -4592,21 +4693,14 @@ mod tests {
         path: &str,
         deleted_rows: &[u32],
     ) -> DeletionFile {
-        const MAGIC_NUMBER: i32 = 1581511376;
-
         let mut bitmap = RoaringBitmap::new();
         for row in deleted_rows {
             bitmap.insert(*row);
         }
-        let mut bitmap_bytes = Vec::new();
-        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
-
-        let bitmap_length = 4 + bitmap_bytes.len() as i32;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&bitmap_length.to_be_bytes());
-        bytes.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
-        bytes.extend_from_slice(&bitmap_bytes);
-        bytes.extend_from_slice(&0i32.to_be_bytes());
+        let bytes = DeletionVector::from_bitmap(bitmap)
+            .serialize_to_bytes()
+            .unwrap();
+        let bitmap_length = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
         file_io
             .new_output(path)
             .unwrap()
