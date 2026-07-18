@@ -261,18 +261,19 @@ fn build_physical_struct_type(
     value_type: &DataType,
     num_columns: usize,
     include_overflow: bool,
-) -> DataType {
+) -> Result<DataType> {
     let mut fields = Vec::with_capacity(num_columns + 2);
     fields.push(DataField::new(
         0,
         FIELD_MAPPING_NAME.to_string(),
         DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
     ));
+    let direct_value_type = value_type.copy_with_nullable(true)?;
     for i in 0..num_columns {
         fields.push(DataField::new(
             (i + 1) as i32,
             physical_column_name(i),
-            value_type.clone(),
+            direct_value_type.clone(),
         ));
     }
     if include_overflow {
@@ -285,7 +286,7 @@ fn build_physical_struct_type(
             )),
         ));
     }
-    DataType::Row(RowType::new(fields))
+    Ok(DataType::Row(RowType::new(fields)))
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +679,7 @@ impl MapShreddingWritePlan {
             };
             let num_columns = infer_num_columns(config, sample_batches)?;
             let physical_type =
-                build_physical_struct_type(map_type.value_type(), num_columns, true)
+                build_physical_struct_type(map_type.value_type(), num_columns, true)?
                     .copy_with_nullable(field.data_type().is_nullable())?;
             let struct_fields = match paimon_type_to_arrow(&physical_type)? {
                 ArrowDataType::Struct(fields) => fields,
@@ -1045,7 +1046,7 @@ impl MapShreddingReadPlan {
                         map_type.value_type(),
                         field_meta.num_columns,
                         !field_meta.overflow_set.is_empty(),
-                    )
+                    )?
                     .copy_with_nullable(field.data_type().is_nullable())?;
                     physical_fields.push(
                         DataField::new(field.id(), field.name().to_string(), physical_type)
@@ -1234,7 +1235,8 @@ mod metadata_security_tests {
         let mut metadata = metadata();
         metadata.insert(NUM_COLUMNS_KEY.to_string(), "2".to_string());
         metadata.insert(MAX_ROW_WIDTH_KEY.to_string(), "2".to_string());
-        let physical_type = build_physical_struct_type(&DataType::Int(IntType::new()), 1, false);
+        let physical_type =
+            build_physical_struct_type(&DataType::Int(IntType::new()), 1, false).unwrap();
         let file_schema = ArrowSchema::new(vec![ArrowField::new(
             "metrics",
             paimon_type_to_arrow(&physical_type).unwrap(),
@@ -1615,6 +1617,45 @@ mod tests {
         )
     }
 
+    fn build_non_nullable_map_array(rows: &[Vec<(&str, i64)>]) -> MapArray {
+        let value_type = bigint_type().copy_with_nullable(false).unwrap();
+        let map_type = DataType::Map(MapType::new(string_type(), value_type));
+        let ArrowDataType::Map(entries_field, ordered) = paimon_type_to_arrow(&map_type).unwrap()
+        else {
+            panic!("map type must convert to Arrow Map")
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type().clone() else {
+            panic!("map entries must be Struct")
+        };
+
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut offsets = vec![0i32];
+        for entries in rows {
+            for (key, value) in entries {
+                keys.push(*key);
+                values.push(*value);
+            }
+            offsets.push(*offsets.last().unwrap() + entries.len() as i32);
+        }
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(Int64Array::from(values)),
+            ],
+            None,
+        )
+        .unwrap();
+        MapArray::new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            entries,
+            None,
+            ordered,
+        )
+    }
+
     fn map_array_to_rows(map: &MapArray) -> Vec<Option<Vec<(String, Option<i64>)>>> {
         let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
         let values = map.values().as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1646,11 +1687,9 @@ mod tests {
         num_columns: usize,
         include_overflow: bool,
     ) -> Fields {
-        match paimon_type_to_arrow(&build_physical_struct_type(
-            value_type,
-            num_columns,
-            include_overflow,
-        ))
+        match paimon_type_to_arrow(
+            &build_physical_struct_type(value_type, num_columns, include_overflow).unwrap(),
+        )
         .unwrap()
         {
             ArrowDataType::Struct(fields) => fields,
@@ -2070,7 +2109,7 @@ mod tests {
     #[test]
     fn test_build_physical_struct_type() {
         let value_type = DataType::Double(DoubleType::new());
-        let physical = build_physical_struct_type(&value_type, 2, true);
+        let physical = build_physical_struct_type(&value_type, 2, true).unwrap();
         let DataType::Row(row) = &physical else {
             panic!("physical type must be Row")
         };
@@ -2090,7 +2129,7 @@ mod tests {
             ))
         );
 
-        let physical = build_physical_struct_type(&value_type, 2, false);
+        let physical = build_physical_struct_type(&value_type, 2, false).unwrap();
         let DataType::Row(row) = &physical else {
             panic!("physical type must be Row")
         };
@@ -2486,7 +2525,7 @@ mod tests {
             num_columns: 3,
             max_row_width: 2,
         };
-        let physical_type = build_physical_struct_type(&bigint_type(), 3, false);
+        let physical_type = build_physical_struct_type(&bigint_type(), 3, false).unwrap();
         let struct_fields = physical_struct_fields(&bigint_type(), 3, false);
         let ArrowDataType::List(mapping_element) = struct_fields[0].data_type().clone() else {
             panic!("__field_mapping must be List")
@@ -2529,7 +2568,7 @@ mod tests {
             num_columns: 1,
             max_row_width: 1,
         };
-        let physical_type = build_physical_struct_type(&bigint_type(), 1, true);
+        let physical_type = build_physical_struct_type(&bigint_type(), 1, true).unwrap();
         let struct_fields = physical_struct_fields(&bigint_type(), 1, true);
         let ArrowDataType::List(mapping_element) = struct_fields[0].data_type().clone() else {
             panic!("__field_mapping must be List")
@@ -2590,7 +2629,7 @@ mod tests {
             num_columns: 3,
             max_row_width: 2,
         };
-        let physical_type = build_physical_struct_type(&bigint_type(), 3, false);
+        let physical_type = build_physical_struct_type(&bigint_type(), 3, false).unwrap();
         let struct_fields = physical_struct_fields(&bigint_type(), 3, false);
         let ArrowDataType::List(mapping_element) = struct_fields[0].data_type().clone() else {
             panic!("__field_mapping must be List")
@@ -2624,6 +2663,57 @@ mod tests {
     }
 
     // -- End-to-end write -> metadata -> read roundtrip --
+
+    #[test]
+    fn test_sparse_rows_with_non_nullable_values_roundtrip() {
+        let value_type = bigint_type().copy_with_nullable(false).unwrap();
+        let logical_fields = vec![map_field(0, "tags", value_type)];
+        let configs = vec![MapShreddingFieldConfig {
+            field_index: 0,
+            field_name: "tags".to_string(),
+            max_columns: 2,
+        }];
+        let rows = vec![vec![("a", 10), ("b", 20)], vec![("a", 30)]];
+        let batch = logical_batch(
+            &logical_fields,
+            vec![Arc::new(build_non_nullable_map_array(&rows))],
+        );
+
+        let mut plan = MapShreddingWritePlan::infer(&logical_fields, &configs, &[]).unwrap();
+        let physical = plan.to_physical_batch(&batch).unwrap();
+        let field_metadata = plan.field_metadata(Some("zstd")).unwrap();
+        let file_fields: Vec<ArrowField> = physical
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| match field_metadata.get(field.name()) {
+                Some(extra) => field.as_ref().clone().with_metadata(extra.clone()),
+                None => field.as_ref().clone(),
+            })
+            .collect();
+        let read_plan =
+            MapShreddingReadPlan::create(&logical_fields, &ArrowSchema::new(file_fields))
+                .unwrap()
+                .expect("read plan expected");
+        let assembled = read_plan.assemble_batch(&physical).unwrap();
+
+        assert_eq!(
+            map_array_to_rows(
+                assembled
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .unwrap()
+            ),
+            vec![
+                Some(vec![
+                    ("a".to_string(), Some(10)),
+                    ("b".to_string(), Some(20)),
+                ]),
+                Some(vec![("a".to_string(), Some(30))]),
+            ]
+        );
+    }
 
     #[test]
     fn test_write_read_roundtrip() {
