@@ -120,7 +120,6 @@ pub(super) fn read(
     let split = split.clone();
 
     Ok(try_stream! {
-        bunch.validate_logical_range()?;
         let expected_range = bunch.expected_range()?;
         let selected_ranges = selected_absolute_row_ranges_for_file(
             bunch.expected_first_row_id,
@@ -133,7 +132,7 @@ pub(super) fn read(
         .unwrap_or_else(|| vec![expected_range]);
 
         let mut sequence_groups = Vec::new();
-        for files in bunch.sequence_groups() {
+        for files in bunch.into_sequence_groups() {
             let mut group = VecDeque::with_capacity(files.len());
             for file in files {
                 let range = blob_file_row_range(&file)?;
