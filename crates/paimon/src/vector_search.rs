@@ -203,13 +203,32 @@ impl SearchResult {
         if k == 0 {
             return Self::empty();
         }
-        if self.row_ids.len() <= k {
-            return self.clone();
+
+        let mut best_by_row_id = HashMap::with_capacity(self.row_ids.len());
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let entry = ScoredRow { row_id, score };
+            best_by_row_id
+                .entry(row_id)
+                .and_modify(|best| {
+                    if entry.is_stronger_than(best) {
+                        *best = entry;
+                    }
+                })
+                .or_insert(entry);
+        }
+
+        if best_by_row_id.len() <= k {
+            // Keep the original row order when no truncation is needed.
+            let rows = self
+                .row_ids
+                .iter()
+                .filter_map(|row_id| best_by_row_id.remove(row_id))
+                .collect();
+            return Self::from_scored_rows(rows);
         }
 
         let mut heap = BinaryHeap::with_capacity(k + 1);
-        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
-            let entry = ScoredRow { row_id, score };
+        for entry in best_by_row_id.into_values() {
             if heap.len() < k {
                 heap.push(entry);
             } else if heap
@@ -337,6 +356,38 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!(top.row_ids.contains(&2));
         assert!(top.row_ids.contains(&4));
+    }
+
+    #[test]
+    fn test_search_result_top_k_deduplicates_overlapping_rows() {
+        let indexed = SearchResult::new(vec![1], vec![0.9]);
+        let fallback = SearchResult::new(vec![1, 2], vec![0.8, 0.7]);
+
+        let merged = indexed.or(&fallback);
+        assert_eq!(merged.row_ids, vec![1, 1, 2]);
+        assert_eq!(merged.scores, vec![0.9, 0.8, 0.7]);
+
+        let top = merged.top_k(2);
+        assert_eq!(top.row_ids, vec![1, 2]);
+        assert_eq!(top.scores, vec![0.9, 0.7]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_keeps_highest_duplicate_score() {
+        let result = SearchResult::new(vec![1, 2, 1, 3], vec![0.5, 0.8, 0.9, 0.7]);
+
+        let top = result.top_k(2);
+        assert_eq!(top.row_ids, vec![1, 2]);
+        assert_eq!(top.scores, vec![0.9, 0.8]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_preserves_order_without_truncation() {
+        let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
+
+        let top = result.top_k(3);
+        assert_eq!(top.row_ids, result.row_ids);
+        assert_eq!(top.scores, result.scores);
     }
 
     #[test]
