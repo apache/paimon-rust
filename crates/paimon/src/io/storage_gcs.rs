@@ -33,34 +33,31 @@ const GCS_SERVICE_ACCOUNT: &str = "gcs.service-account";
 const GCS_ALLOW_ANONYMOUS: &str = "gcs.allow-anonymous";
 
 const CONFIG_PREFIXES: &[&str] = &["fs.gs.", "fs.gcs.", "gs.", "gcs."];
-const MIRRORED_KEYS: &[(&str, &str)] = &[
-    ("gcs.credential-path", "gcs.google_application_credentials"),
-    ("gcs.credential-path", "gcs.google-application-credentials"),
-    ("gcs.credential-path", "gcs.application-credentials"),
-    ("gcs.credential", "gcs.google_service_account_key"),
-    ("gcs.credential", "gcs.google-service-account-key"),
-    ("gcs.credential", "gcs.service-account-key"),
-    ("gcs.credential", "gcs.service_account_key"),
-    ("gcs.service-account", "gcs.google_service_account"),
-    ("gcs.service-account", "gcs.google-service-account"),
-    ("gcs.service-account", "gcs.service_account"),
-    ("gcs.predefined-acl", "gcs.predefined_acl"),
-    ("gcs.default-storage-class", "gcs.default_storage_class"),
-    ("gcs.allow-anonymous", "gcs.google_skip_signature"),
-    ("gcs.allow-anonymous", "gcs.google-skip-signature"),
-    ("gcs.allow_anonymous", "gcs.google_skip_signature"),
-    ("gcs.allow-anonymous", "gcs.allow_anonymous"),
-    ("gcs.allow-anonymous", "gcs.skip-signature"),
-    ("gcs.allow-anonymous", "gcs.skip_signature"),
-    ("gcs.skip-signature", "gcs.google_skip_signature"),
-    ("gcs.skip_signature", "gcs.google_skip_signature"),
-    ("gcs.disable-vm-metadata", "gcs.disable_vm_metadata"),
-    ("gcs.disable-config-load", "gcs.disable_config_load"),
+const KEY_ALIASES: &[(&str, &str)] = &[
+    ("gcs.google_application_credentials", "gcs.credential-path"),
+    ("gcs.google-application-credentials", "gcs.credential-path"),
+    ("gcs.application-credentials", "gcs.credential-path"),
+    ("gcs.google_service_account_key", "gcs.credential"),
+    ("gcs.google-service-account-key", "gcs.credential"),
+    ("gcs.service-account-key", "gcs.credential"),
+    ("gcs.service_account_key", "gcs.credential"),
+    ("gcs.google_service_account", "gcs.service-account"),
+    ("gcs.google-service-account", "gcs.service-account"),
+    ("gcs.service_account", "gcs.service-account"),
+    ("gcs.predefined_acl", "gcs.predefined-acl"),
+    ("gcs.default_storage_class", "gcs.default-storage-class"),
+    ("gcs.google_skip_signature", "gcs.allow-anonymous"),
+    ("gcs.google-skip-signature", "gcs.allow-anonymous"),
+    ("gcs.allow_anonymous", "gcs.allow-anonymous"),
+    ("gcs.skip-signature", "gcs.allow-anonymous"),
+    ("gcs.skip_signature", "gcs.allow-anonymous"),
+    ("gcs.disable_vm_metadata", "gcs.disable-vm-metadata"),
+    ("gcs.disable_config_load", "gcs.disable-config-load"),
 ];
 
 #[allow(clippy::field_reassign_with_default)]
 pub(crate) fn gcs_config_parse(props: HashMap<String, String>) -> Result<GcsConfig> {
-    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "gcs.", MIRRORED_KEYS);
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "gcs.", KEY_ALIASES);
 
     let mut cfg = GcsConfig::default();
     cfg.endpoint = normalized.get(GCS_ENDPOINT).cloned();

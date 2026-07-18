@@ -32,21 +32,23 @@ const AZURE_ACCOUNT_KEY: &str = "azure.account-key";
 const AZURE_SAS_TOKEN: &str = "azure.sas-token";
 
 const CONFIG_PREFIXES: &[&str] = &["fs.azure.", "fs.abfs.", "abfs.", "abfss.", "azure."];
-const MIRRORED_KEYS: &[(&str, &str)] = &[
-    ("azure.account-name", "azure.account.name"),
-    ("azure.account_name", "azure.account.name"),
-    ("azure.account-key", "azure.account.key"),
-    ("azure.account_key", "azure.account.key"),
-    ("azure.sas-token", "azure.sas.token"),
-    ("azure.sas_token", "azure.sas.token"),
-    ("azure.client-id", "azure.client.id"),
-    ("azure.client_id", "azure.client.id"),
-    ("azure.client-secret", "azure.client.secret"),
-    ("azure.client_secret", "azure.client.secret"),
-    ("azure.tenant-id", "azure.tenant.id"),
-    ("azure.tenant_id", "azure.tenant.id"),
-    ("azure.authority-host", "azure.authority.host"),
-    ("azure.authority_host", "azure.authority.host"),
+// Aliases for each canonical key are ordered from highest to lowest priority.
+// An explicitly supplied canonical key always takes precedence over its aliases.
+const KEY_ALIASES: &[(&str, &str)] = &[
+    ("azure.account.name", "azure.account-name"),
+    ("azure.account_name", "azure.account-name"),
+    ("azure.account.key", "azure.account-key"),
+    ("azure.account_key", "azure.account-key"),
+    ("azure.sas.token", "azure.sas-token"),
+    ("azure.sas_token", "azure.sas-token"),
+    ("azure.client.id", "azure.client-id"),
+    ("azure.client_id", "azure.client-id"),
+    ("azure.client.secret", "azure.client-secret"),
+    ("azure.client_secret", "azure.client-secret"),
+    ("azure.tenant.id", "azure.tenant-id"),
+    ("azure.tenant_id", "azure.tenant-id"),
+    ("azure.authority.host", "azure.authority-host"),
+    ("azure.authority_host", "azure.authority-host"),
 ];
 
 #[derive(Debug, Clone)]
@@ -56,7 +58,7 @@ pub struct AzdlsStorageConfig {
 }
 
 pub(crate) fn azdls_config_parse(props: HashMap<String, String>) -> Result<AzdlsStorageConfig> {
-    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "azure.", MIRRORED_KEYS);
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "azure.", KEY_ALIASES);
     let config = config_from_normalized(&normalized);
 
     Ok(AzdlsStorageConfig { config, normalized })
@@ -316,6 +318,44 @@ mod tests {
         assert_eq!(cfg.config.account_name.as_deref(), Some("account"));
         assert_eq!(cfg.config.client_secret.as_deref(), Some("secret"));
         assert_eq!(cfg.config.tenant_id.as_deref(), Some("tenant"));
+    }
+
+    #[test]
+    fn test_azdls_config_parse_underscore_aliases() {
+        type ConfigValue = for<'a> fn(&'a AzdlsConfig) -> Option<&'a str>;
+
+        let cases: &[(&str, ConfigValue)] = &[
+            ("azure.account_name", |cfg| cfg.account_name.as_deref()),
+            ("azure.account_key", |cfg| cfg.account_key.as_deref()),
+            ("azure.sas_token", |cfg| cfg.sas_token.as_deref()),
+            ("azure.client_id", |cfg| cfg.client_id.as_deref()),
+            ("azure.client_secret", |cfg| cfg.client_secret.as_deref()),
+            ("azure.tenant_id", |cfg| cfg.tenant_id.as_deref()),
+            ("azure.authority_host", |cfg| cfg.authority_host.as_deref()),
+        ];
+
+        for (alias, config_value) in cases {
+            let cfg = azdls_config_parse(make_props(&[(alias, "alias-value")])).unwrap();
+            assert_eq!(config_value(&cfg.config), Some("alias-value"), "{alias}");
+        }
+    }
+
+    #[test]
+    fn test_azdls_config_alias_priority() {
+        let cfg = azdls_config_parse(make_props(&[
+            ("azure.account-name", "canonical"),
+            ("azure.account.name", "dotted"),
+            ("azure.account_name", "underscore"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.config.account_name.as_deref(), Some("canonical"));
+
+        let cfg = azdls_config_parse(make_props(&[
+            ("azure.account.name", "dotted"),
+            ("azure.account_name", "underscore"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.config.account_name.as_deref(), Some("dotted"));
     }
 
     #[test]

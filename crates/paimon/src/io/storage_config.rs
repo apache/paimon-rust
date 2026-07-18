@@ -21,7 +21,7 @@ pub(super) fn normalize_storage_config(
     props: HashMap<String, String>,
     config_prefixes: &[&str],
     canonical_prefix: &str,
-    mirrored_keys: &[(&str, &str)],
+    key_aliases: &[(&str, &str)],
 ) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
@@ -33,27 +33,15 @@ pub(super) fn normalize_storage_config(
         }
     }
 
-    let mirrored_additions: Vec<(String, String)> = mirrored_keys
-        .iter()
-        .flat_map(|(a, b)| {
-            let mut pairs = Vec::new();
-
-            if !result.contains_key(*b) {
-                if let Some(v) = result.get(*a) {
-                    pairs.push((b.to_string(), v.clone()));
-                }
-            }
-            if !result.contains_key(*a) {
-                if let Some(v) = result.get(*b) {
-                    pairs.push((a.to_string(), v.clone()));
-                }
-            }
-            pairs
-        })
-        .collect();
-
-    for (k, v) in mirrored_additions {
-        result.insert(k, v);
+    // Canonical keys always win. Aliases for the same canonical key are
+    // checked in declaration order, so callers can define their priority.
+    for (alias, canonical) in key_aliases {
+        if result.contains_key(*canonical) {
+            continue;
+        }
+        if let Some(value) = result.get(*alias).cloned() {
+            result.insert(canonical.to_string(), value);
+        }
     }
 
     result

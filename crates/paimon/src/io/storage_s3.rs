@@ -63,14 +63,13 @@ const S3_REGION: &str = "s3.region";
 /// Reference: `S3FileIO.CONFIG_PREFIXES` in Java Paimon.
 const JAVA_CONFIG_PREFIXES: &[&str] = &["fs.s3a.", "s3a.", "s3."];
 
-/// Mirrored config keys — Java Paimon maps these interchangeably.
-/// Both directions are applied so users can use either form.
+/// External aliases mapped to the canonical keys read by [`S3Config`].
 ///
 /// Reference: `S3FileIO.MIRRORED_CONFIG_KEYS` in Java Paimon.
-const MIRRORED_KEYS: &[(&str, &str)] = &[
-    ("s3.access-key", "s3.access.key"),
-    ("s3.secret-key", "s3.secret.key"),
-    ("s3.path-style-access", "s3.path.style.access"),
+const KEY_ALIASES: &[(&str, &str)] = &[
+    ("s3.access.key", "s3.access-key"),
+    ("s3.secret.key", "s3.secret-key"),
+    ("s3.path.style.access", "s3.path-style-access"),
 ];
 
 /// Parse paimon catalog options into an [`S3Config`].
@@ -83,7 +82,7 @@ const MIRRORED_KEYS: &[(&str, &str)] = &[
 /// to path-style for S3-compatible stores like MinIO.
 #[allow(clippy::field_reassign_with_default)]
 pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config> {
-    let normalized = normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", MIRRORED_KEYS);
+    let normalized = normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", KEY_ALIASES);
 
     let mut cfg = S3Config::default();
 
@@ -186,7 +185,7 @@ mod tests {
             cfg.endpoint.as_deref(),
             Some("https://s3.eu-west-1.amazonaws.com")
         );
-        // `fs.s3a.access.key` → `s3.access.key`, then mirrored → `s3.access-key`
+        // `fs.s3a.access.key` → `s3.access.key`, then aliased → `s3.access-key`
         assert_eq!(cfg.access_key_id.as_deref(), Some("AKID2"));
         assert_eq!(cfg.secret_access_key.as_deref(), Some("SECRET2"));
     }
@@ -340,11 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mirrored_keys() {
-        // `s3.access.key` (dot form) should be mirrored from `s3.access-key` (dash form)
-        let props = make_props(&[("s3.access-key", "AKID")]);
-        let normalized =
-            normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", MIRRORED_KEYS);
+    fn test_key_aliases() {
+        let props = make_props(&[("s3.access.key", "AKID")]);
+        let normalized = normalize_storage_config(props, JAVA_CONFIG_PREFIXES, "s3.", KEY_ALIASES);
         assert_eq!(
             normalized.get("s3.access.key").map(|s| s.as_str()),
             Some("AKID")
