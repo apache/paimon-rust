@@ -270,10 +270,17 @@ impl FormatFileReader for ParquetFormatReader {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
         let empty_predicates = Vec::new();
-        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
-            Some(fp) => (&fp.predicates, &fp.file_fields),
-            None => (&empty_predicates, &[]),
-        };
+        let (preds, pruning_only, file_fields): (&[Predicate], &[Predicate], &[DataField]) =
+            match predicates {
+                Some(fp) => (&fp.predicates, &fp.pruning_predicates, &fp.file_fields),
+                None => (&empty_predicates, &empty_predicates, &[]),
+            };
+        let pruning_predicates = preds
+            .iter()
+            .chain(pruning_only)
+            .cloned()
+            .collect::<Vec<_>>();
+        let pruning_preds = pruning_predicates.as_slice();
 
         // Only load the Parquet page index (ColumnIndex + OffsetIndex) when a
         // predicate can use it for page-level pruning — matching Java Paimon,
@@ -284,7 +291,7 @@ impl FormatFileReader for ParquetFormatReader {
         // skip it. `Optional` lets files without a page index fall through to
         // row-group-level pruning instead of erroring.
         let mut arrow_options = ArrowReaderOptions::new();
-        if !preds.is_empty() {
+        if !pruning_preds.is_empty() {
             arrow_options = arrow_options.with_page_index_policy(PageIndexPolicy::Optional);
         }
         let mut batch_stream_builder =
@@ -338,7 +345,7 @@ impl FormatFileReader for ParquetFormatReader {
 
         let predicate_row_selection = build_predicate_row_selection(
             batch_stream_builder.metadata().row_groups(),
-            preds,
+            pruning_preds,
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
@@ -346,8 +353,11 @@ impl FormatFileReader for ParquetFormatReader {
         // Page-level selection. Returns `None` when ColumnIndex / OffsetIndex are
         // absent (page index not loaded, older files, writer without page index)
         // or when no page could be skipped, so intersecting is a no-op then.
-        let page_selection =
-            build_predicate_page_selection(batch_stream_builder.metadata(), preds, file_fields)?;
+        let page_selection = build_predicate_page_selection(
+            batch_stream_builder.metadata(),
+            pruning_preds,
+            file_fields,
+        )?;
         combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
 
         if let Some(ref ranges) = row_selection {
@@ -396,6 +406,7 @@ impl FormatFileReader for ParquetFormatReader {
         // projects the filtered batch to `read_fields` by name.
         let residual_predicates = FilePredicates {
             predicates: preds.to_vec(),
+            pruning_predicates: Vec::new(),
             file_fields: file_fields.to_vec(),
         };
         let stream = batch_stream.map(move |result| {
@@ -3009,6 +3020,7 @@ mod tests {
 
         let predicates = FilePredicates {
             predicates: vec![predicate],
+            pruning_predicates: Vec::new(),
             file_fields: id_name_age_file_fields(),
         };
 
@@ -3163,6 +3175,7 @@ mod tests {
         let reader_input = input.reader().await.unwrap();
         let predicates = FilePredicates {
             predicates: vec![leaf_gt, leaf_lt],
+            pruning_predicates: Vec::new(),
             file_fields,
         };
         let reader = ParquetFormatReader;
@@ -3480,6 +3493,7 @@ mod tests {
         ])];
         let file_predicates = FilePredicates {
             predicates,
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
 

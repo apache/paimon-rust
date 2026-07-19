@@ -43,6 +43,9 @@ use std::collections::HashMap;
 pub(crate) struct FilePredicates {
     /// Predicates with indices already remapped to file-level fields.
     pub predicates: Vec<Predicate>,
+    /// Predicates used only for conservative file, row-group, or page pruning.
+    /// They must never remove individual rows from emitted batches.
+    pub pruning_predicates: Vec<Predicate>,
     /// File-level fields (full file schema), used for stats access and row filtering.
     pub file_fields: Vec<DataField>,
 }

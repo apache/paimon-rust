@@ -300,6 +300,7 @@ impl FormatFileReader for RowFormatReader {
         let blocks_to_read = blocks_to_read(&index, total_rows, row_selection.as_deref());
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
+            pruning_predicates: fp.pruning_predicates.clone(),
             file_fields: fp.file_fields.clone(),
         });
         Ok(try_stream! {
@@ -2417,6 +2418,7 @@ mod tests {
                 op: PredicateOperator::Gt,
                 literals: vec![Datum::Int(25)],
             }],
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
 
@@ -2493,6 +2495,7 @@ mod tests {
                 op: PredicateOperator::Gt,
                 literals: vec![Datum::Int(25)],
             }],
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
 

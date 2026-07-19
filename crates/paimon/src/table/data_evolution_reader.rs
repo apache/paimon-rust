@@ -145,6 +145,7 @@ impl DataEvolutionReader {
         // point into the table schema, so `file_fields` = `table_fields`.
         let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
             predicates: predicates.clone(),
+            pruning_predicates: Vec::new(),
             file_fields: table_fields.clone(),
         });
         let wide_file_read_type =

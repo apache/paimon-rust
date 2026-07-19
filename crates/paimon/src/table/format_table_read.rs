@@ -38,6 +38,7 @@ pub(crate) struct FormatTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    pruning_predicates: Vec<Predicate>,
     limit: Option<usize>,
 }
 
@@ -52,6 +53,7 @@ impl<'a> FormatTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            pruning_predicates: Vec::new(),
             limit,
         }
     }
@@ -73,6 +75,11 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
+    pub(crate) fn with_pruning_filter(mut self, filter: Predicate) -> Self {
+        self.pruning_predicates = split_scan_predicates(self.table, filter).1;
+        self
+    }
+
     pub(crate) fn to_arrow(
         &self,
         data_splits: &[DataSplit],
@@ -88,6 +95,8 @@ impl<'a> FormatTableRead<'a> {
         let table_fields = self.table.schema().fields().to_vec();
         let (data_table_fields, data_predicates) =
             split_format_table_fields(&table_fields, &partition_keys, &self.data_predicates);
+        let (_, pruning_predicates) =
+            split_format_table_fields(&table_fields, &partition_keys, &self.pruning_predicates);
 
         let splits = data_splits.to_vec();
         let file_io = self.table.file_io().clone();
@@ -110,6 +119,7 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
+                .with_pruning_predicates(pruning_predicates.clone())
                 .with_batch_size(batch_size)
                 .read(std::slice::from_ref(&split))?;
 

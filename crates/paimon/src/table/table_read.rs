@@ -110,6 +110,22 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Set a conservative file-format pruning predicate.
+    ///
+    /// This may skip files, row groups, or pages whose statistics prove they
+    /// cannot match, but it does not remove individual rows. The caller must
+    /// still enforce the predicate exactly after reading.
+    pub fn with_pruning_filter(self, filter: Predicate) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => {
+                Self(TableReadKind::Paimon(read.with_pruning_filter(filter)))
+            }
+            TableReadKind::Format(read) => {
+                Self(TableReadKind::Format(read.with_pruning_filter(filter)))
+            }
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.0 {
@@ -158,6 +174,7 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    pruning_predicates: Vec<Predicate>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -171,6 +188,7 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            pruning_predicates: Vec::new(),
         }
     }
 
@@ -201,6 +219,12 @@ impl<'a> PaimonTableRead<'a> {
         // residual pass applies the full predicate exactly. Pruning here would
         // drop compound predicates before the residual could enforce them.
         self.data_predicates = data_predicates;
+        self
+    }
+
+    fn with_pruning_filter(mut self, filter: Predicate) -> Self {
+        let (_, data_predicates) = split_scan_predicates(self.table, filter);
+        self.pruning_predicates = data_predicates;
         self
     }
 
@@ -484,6 +508,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_pruning_predicates(self.pruning_predicates.clone())
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?)))
     }
 }

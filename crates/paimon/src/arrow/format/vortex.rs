@@ -76,6 +76,7 @@ impl FormatFileReader for VortexFormatReader {
         let read_fields = read_fields.to_vec();
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
+            pruning_predicates: fp.pruning_predicates.clone(),
             file_fields: fp.file_fields.clone(),
         });
         let scan_fields = widen_scan_fields(&read_fields, predicates.as_ref());
@@ -1139,6 +1140,7 @@ mod tests {
         let pred = builder.equal("id", Datum::Int(3)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
         let ids =
@@ -1153,6 +1155,7 @@ mod tests {
         let pred = builder.greater_than("id", Datum::Int(3)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
         let ids =
@@ -1169,6 +1172,7 @@ mod tests {
             .unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
         let ids =
@@ -1185,6 +1189,7 @@ mod tests {
         let pred2 = builder.less_than("value", Datum::Int(50)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred1, pred2],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
         let ids =
@@ -1201,6 +1206,7 @@ mod tests {
         let pred = builder.equal("id", Datum::Int(99)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
         let ids =
@@ -1236,6 +1242,7 @@ mod tests {
         let pred = builder.greater_than("value", Datum::Int(30)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
         let read_fields = vec![fields[0].clone()];
@@ -1277,6 +1284,7 @@ mod tests {
         let pred = builder.greater_than("id", Datum::Int(3)).unwrap();
         let fp = FilePredicates {
             predicates: vec![pred],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
 
@@ -1294,10 +1302,12 @@ mod tests {
         let builder = PredicateBuilder::new(&fields);
         let eq = FilePredicates {
             predicates: vec![builder.equal("id", Datum::Int(3)).unwrap()],
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
         let gt = FilePredicates {
             predicates: vec![builder.greater_than("id", Datum::Int(3)).unwrap()],
+            pruning_predicates: Vec::new(),
             file_fields: fields.clone(),
         };
         let combined = FilePredicates {
@@ -1305,6 +1315,7 @@ mod tests {
                 builder.greater_or_equal("id", Datum::Int(2)).unwrap(),
                 builder.less_than("value", Datum::Int(50)).unwrap(),
             ],
+            pruning_predicates: Vec::new(),
             file_fields: fields,
         };
 
