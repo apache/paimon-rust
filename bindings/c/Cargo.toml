@@ -35,3 +35,9 @@ futures = "0.3"
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+
+[dev-dependencies]
+# Test-only: the vector-search integration tests build a real primary-key vindex
+# IVF-flat ANN segment fixture in-process. Versions match crates/paimon.
+bytes = "1.7.1"
+paimon-vindex-core = "0.2.0"

@@ -127,6 +127,24 @@ pub struct paimon_predicate {
     pub inner: *mut c_void,
 }
 
+/// Opaque wrapper around a vector-search builder.
+#[repr(C)]
+pub struct paimon_vector_search_builder {
+    pub inner: *mut c_void,
+}
+
+/// Internal state for a vector-search builder: the table plus the query
+/// parameters accumulated by the setters before the search is run.
+pub(crate) struct VectorSearchState {
+    // Read by the search terminal that runs the accumulated query.
+    pub table: Table,
+    pub vector_column: Option<String>,
+    pub query_vector: Option<Vec<f32>>,
+    pub limit: Option<usize>,
+    pub options: std::collections::HashMap<String, String>,
+    pub filter: Option<Predicate>,
+}
+
 /// A typed literal value for predicate comparison, passed across FFI.
 ///
 /// # Design

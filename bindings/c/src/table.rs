@@ -658,7 +658,8 @@ pub unsafe extern "C" fn paimon_record_batch_reader_next(
 /// Free a paimon_record_batch_reader.
 ///
 /// # Safety
-/// Only call with a reader returned from `paimon_table_read_to_arrow`.
+/// Only call with a reader returned from `paimon_table_read_to_arrow` or
+/// `paimon_vector_search_builder_execute_read`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_record_batch_reader_free(reader: *mut paimon_record_batch_reader) {
     if !reader.is_null() {

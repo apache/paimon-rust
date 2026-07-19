@@ -27,6 +27,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 mod types;
+mod vector_search;
 mod write;
 
 use std::sync::OnceLock;

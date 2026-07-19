@@ -19,7 +19,8 @@
 //!
 //! Covers: read path (table, scan, plan, predicates, record batch streaming),
 //! write path (write builder, write_arrow_batch, prepare_commit, commit,
-//! overwrite, truncate, abort), and full write->read roundtrip.
+//! overwrite, truncate, abort), full write->read roundtrip, and vector search
+//! materialized reads across primary-key and data-evolution (append) tables.
 //!
 //! IMPORTANT: C FFI functions internally use `runtime().block_on()`. Tests
 //! must NOT wrap C FFI calls inside another `block_on`. Use the global
@@ -43,6 +44,7 @@ use paimon::table::{SnapshotManager, Table};
 use crate::error::*;
 use crate::table::*;
 use crate::types::*;
+use crate::vector_search::*;
 use crate::write::*;
 
 // =========================================================================
@@ -1503,6 +1505,850 @@ fn test_two_commits_same_builder() {
         let rows = read_rows_ffi(handle);
         assert_eq!(rows, vec![(1, "a".into()), (2, "b".into())]);
 
+        unwrap_table(handle);
+    }
+}
+
+// =========================================================================
+//  Vector search tests (materialized reads)
+// =========================================================================
+//
+// Two storage shapes are exercised end-to-end through the C `execute_read`
+// terminal, each compared against an independent core Rust
+// `VectorSearchBuilder::execute_read()` reference:
+//
+//   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
+//     built in-process (bucket-local ANN search, residual filter supported).
+//   * A data-evolution (append) vector table whose global index is produced by
+//     the public `new_vindex_index_build_builder(...).execute()` path.
+//
+// Both fixtures live entirely on the in-memory FileIO, so no temp dirs or
+// on-disk schema files are needed: the written data file keeps `schema_id == 0`,
+// matching the table, so the read path never reloads a schema from disk.
+//
+// The materialized stream carries the user table columns plus a unified
+// `__paimon_search_score` Float32 column; row order is best-first.
+
+use std::collections::HashMap;
+
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+use arrow_array::{ArrayRef, Float32Array};
+use bytes::Bytes;
+use futures::TryStreamExt;
+use paimon::io::FileIO;
+use paimon::spec::{
+    ArrayType, DataFileMeta, Datum, FloatType, GlobalIndexMeta, IndexFileMeta, Predicate,
+    PredicateBuilder, VectorType,
+};
+use paimon::table::{CommitMessage, TableCommit};
+
+use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+use paimon_vindex_core::io::PosWriter;
+
+/// Unified score column materialized by `execute_read` (Float32).
+const SCORE_COLUMN: &str = "__paimon_search_score";
+/// Vector dimension for the primary-key fixtures.
+const PK_DIM: usize = 4;
+/// Primary-key vector column name (shared by both storage fixtures).
+const VECTOR_COLUMN: &str = "embedding";
+/// vindex index type used for both the PK ANN segment and the DE global index.
+const INDEX_TYPE: &str = "ivf-flat";
+
+// --- Primary-key vector fixture ------------------------------------------
+
+/// Table options routing searches into the primary-key vector branch. A single
+/// bucket keeps one data file; `deletion-vectors.enabled` satisfies the residual
+/// guard (`with_filter`) without any row actually being deleted.
+fn pk_vector_options() -> Vec<(String, String)> {
+    vec![
+        ("bucket".to_string(), "1".to_string()),
+        ("deletion-vectors.enabled".to_string(), "true".to_string()),
+        (
+            "pk-vector.index.columns".to_string(),
+            VECTOR_COLUMN.to_string(),
+        ),
+        (
+            format!("fields.{VECTOR_COLUMN}.pk-vector.index.type"),
+            INDEX_TYPE.to_string(),
+        ),
+        (
+            format!("fields.{VECTOR_COLUMN}.pk-vector.distance.metric"),
+            "l2".to_string(),
+        ),
+    ]
+}
+
+/// Primary-key schema `(id INT PRIMARY KEY, embedding VECTOR<FLOAT>)`.
+fn pk_vector_schema() -> TableSchema {
+    let mut builder = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            VECTOR_COLUMN,
+            DataType::Vector(
+                VectorType::try_new(true, PK_DIM as u32, DataType::Float(FloatType::new()))
+                    .unwrap(),
+            ),
+        )
+        .primary_key(["id"]);
+    for (k, v) in pk_vector_options() {
+        builder = builder.option(k, v);
+    }
+    TableSchema::new(0, &builder.build().unwrap())
+}
+
+/// Arrow batch matching the PK schema: `id` (== physical position) plus a
+/// `FixedSizeList<Float32>` vector column.
+fn pk_data_batch(vectors: &[[f32; PK_DIM]]) -> RecordBatch {
+    let ids: Vec<i32> = (0..vectors.len() as i32).collect();
+    let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut vector_builder = FixedSizeListBuilder::new(Float32Builder::new(), PK_DIM as i32)
+        .with_field(element_field.clone());
+    for vector in vectors {
+        for &value in vector {
+            vector_builder.values().append_value(value);
+        }
+        vector_builder.append(true);
+    }
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new(
+            VECTOR_COLUMN,
+            ArrowDataType::FixedSizeList(element_field, PK_DIM as i32),
+            true,
+        ),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(vector_builder.finish()) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+/// Encode one Java `DataOutput#writeUTF` value (u16-BE length + modified UTF-8),
+/// as `PkVectorSourceMeta` expects.
+fn java_write_utf(s: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for c in s.encode_utf16() {
+        if (0x0001..=0x007F).contains(&c) {
+            body.push(c as u8);
+        } else if c > 0x07FF {
+            body.push(0xE0 | (c >> 12) as u8);
+            body.push(0x80 | ((c >> 6) & 0x3F) as u8);
+            body.push(0x80 | (c & 0x3F) as u8);
+        } else {
+            body.push(0xC0 | (c >> 6) as u8);
+            body.push(0x80 | (c & 0x3F) as u8);
+        }
+    }
+    let mut out = (body.len() as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Assemble the `_SOURCE_META` frame the way Java `PkVectorSourceMeta` writes it:
+/// `i32-BE version=1`, `i32-BE data_level`, `i32-BE count`, then per source file a
+/// `writeUTF` name and an `i64-BE` row count.
+fn source_meta_bytes(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1i32.to_be_bytes());
+    out.extend_from_slice(&data_level.to_be_bytes());
+    out.extend_from_slice(&(files.len() as i32).to_be_bytes());
+    for (name, rows) in files {
+        out.extend_from_slice(&java_write_utf(name));
+        out.extend_from_slice(&rows.to_be_bytes());
+    }
+    out
+}
+
+/// Build a real vindex IVF-flat ANN segment over `vectors` (label == physical
+/// position) and write it into `{table}/index/{file_name}`. `nlist = 1` keeps the
+/// single inverted list exhaustive, so the search is exact.
+async fn write_ann_segment(
+    file_io: &FileIO,
+    table_location: &str,
+    file_name: &str,
+    vectors: &[[f32; PK_DIM]],
+) -> u64 {
+    let n = vectors.len();
+    let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+    let ids: Vec<i64> = (0..n as i64).collect();
+
+    let native_options = HashMap::from([
+        ("index.type".to_string(), "ivf_flat".to_string()),
+        ("dimension".to_string(), PK_DIM.to_string()),
+        ("nlist".to_string(), "1".to_string()),
+        ("metric".to_string(), "l2".to_string()),
+    ]);
+    let config = VectorIndexConfig::from_options(&native_options).unwrap();
+    let training = VectorIndexTrainer::train(config, &flat, n).unwrap();
+    let mut writer = VectorIndexWriter::new(training);
+    writer.add_vectors(&ids, &flat, n).unwrap();
+    let mut bytes = Vec::new();
+    {
+        let mut output = PosWriter::new(&mut bytes);
+        writer.write(&mut output).unwrap();
+    }
+
+    let index_dir = format!("{}/index", table_location.trim_end_matches('/'));
+    file_io.mkdirs(&index_dir).await.unwrap();
+    let index_path = format!("{index_dir}/{file_name}");
+    let file_size = bytes.len() as u64;
+    file_io
+        .new_output(&index_path)
+        .unwrap()
+        .write(Bytes::from(bytes))
+        .await
+        .unwrap();
+    file_size
+}
+
+/// Build a complete, self-contained primary-key vector table over `vectors` on
+/// the in-memory FileIO: write a real data file, apply the two PK-vector
+/// constraints to its meta (compacted, non-level-0; Java source-meta frame),
+/// build+commit a real vindex ANN segment, and return the opened table.
+fn build_pk_vector_table(path: &str, vectors: &[[f32; PK_DIM]]) -> Table {
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "pkvector"),
+        path.to_string(),
+        pk_vector_schema(),
+        None,
+    );
+
+    crate::runtime().block_on(async {
+        // Write a real data file via the public write path to obtain a genuine
+        // DataFileMeta (name, row count, stats, file size).
+        let write_builder = table.new_write_builder();
+        let mut writer = write_builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&pk_data_batch(vectors))
+            .await
+            .unwrap();
+        let write_messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(write_messages.len(), 1, "single bucket -> one message");
+        let written = &write_messages[0];
+        assert_eq!(written.new_files.len(), 1, "single data file expected");
+        let base_meta = written.new_files[0].clone();
+        let bucket = written.bucket;
+        let partition = written.partition.clone();
+        let data_file_name = base_meta.file_name.clone();
+        let row_count = base_meta.row_count;
+
+        // Constraint 1: only a compacted, non-level-0 file backs the PK-vector
+        // index. Pin first_row_id = 0 so global row id == physical position.
+        let indexed_meta = DataFileMeta {
+            level: 1,
+            file_source: Some(1),
+            first_row_id: Some(0),
+            ..base_meta
+        };
+
+        // Build and persist the real vindex ANN segment.
+        let index_file_name = "vector-ivf-flat-pk-c.index".to_string();
+        let index_file_size = write_ann_segment(&file_io, path, &index_file_name, vectors).await;
+
+        // Constraint 2: GlobalIndexMeta.source_meta is the Java PkVectorSourceMeta
+        // frame naming the backing data file in ordinal order.
+        let vector_field_id = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| f.name() == VECTOR_COLUMN)
+            .expect("vector field present")
+            .id();
+        let index_file = IndexFileMeta {
+            index_type: INDEX_TYPE.to_string(),
+            file_name: index_file_name,
+            file_size: i32::try_from(index_file_size).unwrap(),
+            row_count: i32::try_from(row_count).unwrap(),
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: 0,
+                row_range_end: row_count - 1,
+                index_field_id: vector_field_id,
+                extra_field_ids: None,
+                source_meta: Some(source_meta_bytes(
+                    indexed_meta.level,
+                    &[(&data_file_name, row_count)],
+                )),
+                index_meta: None,
+            }),
+        };
+
+        // Commit the indexed data file together with the ANN segment.
+        let mut message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+        message.new_index_files = vec![index_file];
+        TableCommit::new(table.clone(), "pkvector-c".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+    });
+
+    table
+}
+
+/// Empty primary-key vector table (options set, no data): the PK branch resolves
+/// but the plan is empty, so a search returns an empty (EOF) stream.
+fn build_pk_vector_table_empty(path: &str) -> Table {
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    Table::new(
+        file_io,
+        Identifier::new("default", "pkvector_empty"),
+        path.to_string(),
+        pk_vector_schema(),
+        None,
+    )
+}
+
+/// Fixture: distances 1 < 41 < 67 < 181; top-3 = rows 0, 4, 5.
+fn pk_fixture_smoke() -> ([f32; PK_DIM], Vec<[f32; PK_DIM]>) {
+    let query = [9.0, 0.0, 0.0, 0.0];
+    let vectors = vec![
+        [10.0, 0.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0, 0.0],
+        [0.0, 0.0, 10.0, 0.0],
+        [0.0, 0.0, 0.0, 10.0],
+        [5.0, 5.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ];
+    (query, vectors)
+}
+
+/// Residual fixture: unfiltered top-3 = [0, 1, 2]; with `id >= 3` the top-3
+/// becomes [4, 5, 3], disjoint from the unfiltered set.
+fn pk_fixture_residual() -> ([f32; PK_DIM], Vec<[f32; PK_DIM]>) {
+    let query = [10.0, 0.0, 0.0, 0.0];
+    let vectors = vec![
+        [10.0, 0.0, 0.0, 0.0], // pos 0 -> 0
+        [9.0, 0.0, 0.0, 0.0],  // pos 1 -> 1
+        [8.0, 0.0, 0.0, 0.0],  // pos 2 -> 4
+        [5.0, 0.0, 0.0, 0.0],  // pos 3 -> 25
+        [7.0, 0.0, 0.0, 0.0],  // pos 4 -> 9
+        [6.0, 0.0, 0.0, 0.0],  // pos 5 -> 16
+    ];
+    (query, vectors)
+}
+
+// --- Data-evolution (append) vector fixture ------------------------------
+
+/// Options enabling the data-evolution global-index vindex build/search path.
+fn append_vector_options() -> HashMap<String, String> {
+    HashMap::from([
+        ("row-tracking.enabled".to_string(), "true".to_string()),
+        ("data-evolution.enabled".to_string(), "true".to_string()),
+        ("global-index.enabled".to_string(), "true".to_string()),
+        (
+            "global-index.row-count-per-shard".to_string(),
+            "10".to_string(),
+        ),
+        ("ivf-flat.dimension".to_string(), "2".to_string()),
+        // Single inverted list keeps the ANN search exhaustive (exact, stable
+        // ordering), so the C result matches the Rust reference deterministically.
+        ("ivf-flat.nlist".to_string(), "1".to_string()),
+    ])
+}
+
+/// Arrow batch for the DE table: `id` INT plus an `embedding` `List<Float32>`.
+fn append_vector_batch(ids: Vec<i32>, vectors: Vec<[f32; 2]>) -> RecordBatch {
+    let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut vector_builder =
+        ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+    for vector in vectors {
+        for value in vector {
+            vector_builder.values().append_value(value);
+        }
+        vector_builder.append(true);
+    }
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(vector_builder.finish()) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+/// Build a data-evolution vector table: write vectors via the public write path,
+/// then build the global vindex index via `new_vindex_index_build_builder`.
+fn build_append_vector_table(path: &str) -> Table {
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .options(append_vector_options())
+        .build()
+        .unwrap();
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "devector"),
+        path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+
+    crate::runtime().block_on(async {
+        let write_builder = table.new_write_builder();
+        let mut writer = write_builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&append_vector_batch(
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.9, 0.1],
+                    [0.1, 0.9],
+                    [0.8, 0.2],
+                    [0.2, 0.8],
+                ],
+            ))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        write_builder.new_commit().commit(messages).await.unwrap();
+
+        let built = table
+            .new_vindex_index_build_builder(INDEX_TYPE)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap();
+        assert!(built > 0, "DE fixture must build at least one index shard");
+    });
+
+    table
+}
+
+// --- Shared harness: core Rust reference + C read bridges ----------------
+
+/// Import one `paimon_arrow_batch` (Arrow C Data Interface) into a RecordBatch,
+/// mirroring `collect_rows`: take ownership of the FFI structs via `ptr::read`,
+/// hand the array to `from_ffi`, then neutralize the originals so the caller's
+/// `paimon_arrow_batch_free` release is a no-op. The imported schema's memory is
+/// released when the local `ffi_schema` drops at the end of this call.
+unsafe fn import_batch(batch: &paimon_arrow_batch) -> RecordBatch {
+    let ffi_array = ptr::read(batch.array as *const FFI_ArrowArray);
+    let ffi_schema = ptr::read(batch.schema as *const FFI_ArrowSchema);
+    let data = arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).unwrap();
+    ptr::write(batch.array as *mut FFI_ArrowArray, FFI_ArrowArray::empty());
+    ptr::write(
+        batch.schema as *mut FFI_ArrowSchema,
+        FFI_ArrowSchema::empty(),
+    );
+    RecordBatch::from(StructArray::from(data))
+}
+
+/// `(id INT32, score FLOAT32)` pairs from a materialized search batch. Panics if
+/// the unified score column is missing, pinning the read contract.
+fn batch_id_score_pairs(batch: &RecordBatch) -> Vec<(i32, f32)> {
+    let ids = batch
+        .column_by_name("id")
+        .expect("id column present")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id is Int32");
+    let score_idx = batch
+        .schema()
+        .index_of(SCORE_COLUMN)
+        .expect("unified score column present");
+    let scores = batch
+        .column(score_idx)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("score is Float32");
+    (0..batch.num_rows())
+        .map(|i| (ids.value(i), scores.value(i)))
+        .collect()
+}
+
+/// Core Rust reference: run `execute_read` and return (row count, score-column
+/// present) — the shape the C path is compared against. Runs on the global
+/// runtime.
+fn rust_execute_read_rows(
+    table: &Table,
+    column: &str,
+    query: Vec<f32>,
+    limit: usize,
+) -> (usize, bool) {
+    crate::runtime().block_on(async {
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(column)
+            .with_query_vector(query)
+            .with_limit(limit);
+        let mut stream = builder.execute_read().await.unwrap();
+        let (mut rows, mut has_score) = (0usize, false);
+        while let Some(b) = stream.try_next().await.unwrap() {
+            rows += b.num_rows();
+            has_score |= b.schema().index_of(SCORE_COLUMN).is_ok();
+        }
+        (rows, has_score)
+    })
+}
+
+/// Core Rust reference: sorted `(id, score)` pairs materialized by `execute_read`.
+fn rust_execute_read_pairs(
+    table: &Table,
+    column: &str,
+    query: Vec<f32>,
+    limit: usize,
+    filter: Option<Predicate>,
+) -> Vec<(i32, f32)> {
+    crate::runtime().block_on(async {
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(column)
+            .with_query_vector(query)
+            .with_limit(limit);
+        if let Some(f) = filter {
+            builder.with_filter(f);
+        }
+        let mut stream = builder.execute_read().await.unwrap();
+        let mut pairs = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            pairs.extend(batch_id_score_pairs(&b));
+        }
+        pairs.sort_by_key(|p| p.0);
+        pairs
+    })
+}
+
+/// Build a `>=` predicate on an integer column via the public C predicate API.
+unsafe fn build_predicate_ge(
+    table: *const paimon_table,
+    column: &str,
+    int_val: i32,
+) -> *mut paimon_predicate {
+    let col = CString::new(column).unwrap();
+    let datum = paimon_datum {
+        tag: 3,
+        int_val: int_val as i64,
+        double_val: 0.0,
+        str_data: ptr::null(),
+        str_len: 0,
+        int_val2: 0,
+        uint_val: 0,
+        uint_val2: 0,
+    };
+    let result = paimon_predicate_greater_or_equal(table, col.as_ptr(), datum);
+    assert!(result.error.is_null());
+    result.predicate
+}
+
+/// Construct + configure a C vector-search builder (column, query, limit, and an
+/// optional filter that `with_filter` consumes on success). The caller drives the
+/// terminal and frees the builder.
+unsafe fn c_vector_builder(
+    handle: *const paimon_table,
+    column: &str,
+    query: &[f32],
+    limit: usize,
+    filter: *mut paimon_predicate,
+) -> *mut paimon_vector_search_builder {
+    let builder_result = paimon_table_new_vector_search_builder(handle);
+    assert!(builder_result.error.is_null());
+    let builder = builder_result.builder;
+
+    let col = CString::new(column).unwrap();
+    assert!(paimon_vector_search_builder_with_vector_column(builder, col.as_ptr()).is_null());
+    assert!(
+        paimon_vector_search_builder_with_query_vector(builder, query.as_ptr(), query.len())
+            .is_null()
+    );
+    assert!(paimon_vector_search_builder_with_limit(builder, limit).is_null());
+    if !filter.is_null() {
+        assert!(paimon_vector_search_builder_with_filter(builder, filter).is_null());
+    }
+    builder
+}
+
+/// C path: run `execute_read` on a configured builder, drain the reader, and
+/// return (row count, score-column present). Frees the builder and reader.
+unsafe fn c_execute_read_rows(builder: *mut paimon_vector_search_builder) -> (usize, bool) {
+    let result = paimon_vector_search_builder_execute_read(builder);
+    paimon_vector_search_builder_free(builder);
+    assert!(result.error.is_null(), "execute_read should not error");
+    assert!(!result.reader.is_null());
+
+    let mut rows = 0usize;
+    let mut has_score = false;
+    loop {
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        if next.batch.array.is_null() {
+            break; // EOF
+        }
+        let batch = import_batch(&next.batch);
+        rows += batch.num_rows();
+        has_score |= batch.schema().index_of(SCORE_COLUMN).is_ok();
+        paimon_arrow_batch_free(next.batch);
+    }
+    paimon_record_batch_reader_free(result.reader);
+    (rows, has_score)
+}
+
+/// C path: sorted `(id, score)` pairs materialized by a configured builder's
+/// `execute_read`. Frees the builder and reader.
+unsafe fn c_execute_read_pairs(builder: *mut paimon_vector_search_builder) -> Vec<(i32, f32)> {
+    let result = paimon_vector_search_builder_execute_read(builder);
+    paimon_vector_search_builder_free(builder);
+    assert!(result.error.is_null(), "execute_read should not error");
+    assert!(!result.reader.is_null());
+
+    let mut pairs = Vec::new();
+    loop {
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        if next.batch.array.is_null() {
+            break; // EOF
+        }
+        let batch = import_batch(&next.batch);
+        pairs.extend(batch_id_score_pairs(&batch));
+        paimon_arrow_batch_free(next.batch);
+    }
+    paimon_record_batch_reader_free(result.reader);
+    pairs.sort_by_key(|p| p.0);
+    pairs
+}
+
+/// Read a `paimon_error`'s UTF-8 message.
+unsafe fn error_message(err: *mut paimon_error) -> String {
+    let bytes = &(*err).message;
+    let slice = std::slice::from_raw_parts(bytes.data, bytes.len);
+    String::from_utf8_lossy(slice).to_string()
+}
+
+// --- Tests ----------------------------------------------------------------
+
+#[test]
+fn vector_search_pk_table_read_matches_rust() {
+    let path = "memory:/vsearch_pk_read";
+    let (query, vectors) = pk_fixture_smoke();
+    let table = build_pk_vector_table(path, &vectors);
+
+    // Independent core reference: row count + score column presence and the
+    // materialized (id, score) pairs.
+    let (rust_rows, rust_has_score) =
+        rust_execute_read_rows(&table, VECTOR_COLUMN, query.to_vec(), 3);
+    let rust_pairs = rust_execute_read_pairs(&table, VECTOR_COLUMN, query.to_vec(), 3, None);
+    assert_eq!(rust_rows, 3, "PK fixture top-3 must materialize 3 rows");
+    assert!(
+        rust_has_score,
+        "reference must carry the unified score column"
+    );
+
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let (c_rows, c_has_score) = c_execute_read_rows(builder);
+        assert_eq!(
+            c_rows, rust_rows,
+            "C row count must match the Rust reference"
+        );
+        assert_eq!(
+            c_has_score, rust_has_score,
+            "score-column presence must match"
+        );
+
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let c_pairs = c_execute_read_pairs(builder);
+        assert_eq!(c_pairs.len(), rust_pairs.len());
+        for ((c_id, c_score), (r_id, r_score)) in c_pairs.iter().zip(&rust_pairs) {
+            assert_eq!(c_id, r_id, "C row ids must match the Rust reference");
+            assert!(
+                (c_score - r_score).abs() < 1e-6,
+                "score diverges: {c_score} vs {r_score}"
+            );
+        }
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_append_table_read_matches_rust() {
+    let path = "memory:/vsearch_append_read";
+    let table = build_append_vector_table(path);
+    let query = vec![1.0f32, 0.0];
+
+    let (rust_rows, rust_has_score) = rust_execute_read_rows(&table, "embedding", query.clone(), 3);
+    let rust_pairs = rust_execute_read_pairs(&table, "embedding", query.clone(), 3, None);
+    assert!(rust_rows > 0, "DE fixture must materialize hits");
+    assert!(
+        rust_has_score,
+        "reference must carry the unified score column"
+    );
+
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder = c_vector_builder(handle, "embedding", &query, 3, ptr::null_mut());
+        let (c_rows, c_has_score) = c_execute_read_rows(builder);
+        assert_eq!(
+            c_rows, rust_rows,
+            "C row count must match the Rust reference"
+        );
+        assert_eq!(
+            c_has_score, rust_has_score,
+            "score-column presence must match"
+        );
+
+        // The data-evolution global-index path does not promise a stable order
+        // across two separate reads, so compare the (id, score) hits as an
+        // id-keyed set rather than over-asserting an order neither read promises.
+        let builder = c_vector_builder(handle, "embedding", &query, 3, ptr::null_mut());
+        let c_pairs = c_execute_read_pairs(builder);
+        assert_eq!(c_pairs.len(), rust_pairs.len());
+        for ((c_id, c_score), (r_id, r_score)) in c_pairs.iter().zip(&rust_pairs) {
+            assert_eq!(c_id, r_id, "C row ids must match the Rust reference set");
+            assert!(
+                (c_score - r_score).abs() < 1e-6,
+                "score diverges: {c_score} vs {r_score}"
+            );
+        }
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_pk_filter_excludes_neighbor() {
+    let path = "memory:/vsearch_pk_filter_read";
+    let (query, vectors) = pk_fixture_residual();
+    let table = build_pk_vector_table(path, &vectors);
+
+    // Guard: the nearest neighbor (id 0) is present in the unfiltered top-3, so a
+    // working residual filter of `id >= 3` must exclude it.
+    let unfiltered = rust_execute_read_pairs(&table, VECTOR_COLUMN, query.to_vec(), 3, None);
+    let unfiltered_ids: Vec<i32> = unfiltered.iter().map(|(id, _)| *id).collect();
+    assert!(
+        unfiltered_ids.contains(&0),
+        "fixture guard: id 0 must be an unfiltered neighbor"
+    );
+
+    // Independent filtered reference via the core Rust path.
+    let rust_filter = PredicateBuilder::new(table.schema().fields())
+        .greater_or_equal("id", Datum::Int(3))
+        .unwrap();
+    let rust_pairs =
+        rust_execute_read_pairs(&table, VECTOR_COLUMN, query.to_vec(), 3, Some(rust_filter));
+
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let predicate = build_predicate_ge(handle, "id", 3);
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, predicate);
+        let c_pairs = c_execute_read_pairs(builder);
+
+        let c_ids: Vec<i32> = c_pairs.iter().map(|(id, _)| *id).collect();
+        for excluded in [0i32, 1, 2] {
+            assert!(
+                !c_ids.contains(&excluded),
+                "filtered read must exclude neighbor {excluded}"
+            );
+        }
+        assert_eq!(
+            c_pairs, rust_pairs,
+            "filtered pairs must match the reference"
+        );
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_append_filter_returns_invalid_input() {
+    let path = "memory:/vsearch_append_filter_err";
+    let table = build_append_vector_table(path);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let predicate = build_predicate_ge(handle, "id", 1);
+        let builder = c_vector_builder(handle, "embedding", &[1.0f32, 0.0], 3, predicate);
+        let result = paimon_vector_search_builder_execute_read(builder);
+        paimon_vector_search_builder_free(builder);
+
+        assert!(
+            result.reader.is_null(),
+            "errored read must not yield a reader"
+        );
+        assert!(!result.error.is_null(), "DE filter must fail loud");
+        assert_eq!(
+            (*result.error).code,
+            PaimonErrorCode::InvalidInput as i32,
+            "DE filter error must map to InvalidInput"
+        );
+        let message = error_message(result.error);
+        assert!(
+            message.contains("primary-key vector path"),
+            "unexpected error message: {message}"
+        );
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_rejects_invalid_query_vector() {
+    let path = "memory:/vsearch_setter_validation";
+    let table = build_pk_vector_table_empty(path);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder_result = paimon_table_new_vector_search_builder(handle);
+        assert!(builder_result.error.is_null());
+        let builder = builder_result.builder;
+
+        // Null data with a non-zero length is rejected at the setter.
+        let err_null = paimon_vector_search_builder_with_query_vector(builder, ptr::null(), 5);
+        assert!(!err_null.is_null());
+        assert_eq!((*err_null).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(err_null);
+
+        // A zero-length query is rejected even with a valid pointer.
+        let data = [1.0f32];
+        let err_empty = paimon_vector_search_builder_with_query_vector(builder, data.as_ptr(), 0);
+        assert!(!err_empty.is_null());
+        assert_eq!((*err_empty).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(err_empty);
+
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_empty_result_is_eof_stream() {
+    let path = "memory:/vsearch_empty_read";
+    let table = build_pk_vector_table_empty(path);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder = c_vector_builder(
+            handle,
+            VECTOR_COLUMN,
+            &[1.0f32, 2.0, 3.0, 4.0],
+            5,
+            ptr::null_mut(),
+        );
+        let result = paimon_vector_search_builder_execute_read(builder);
+        paimon_vector_search_builder_free(builder);
+
+        // An empty table is a normal EOF stream, not an error: a reader is
+        // returned and the first `_next` yields a null batch with no error.
+        assert!(result.error.is_null());
+        assert!(!result.reader.is_null());
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        assert!(next.batch.array.is_null());
+        assert!(next.batch.schema.is_null());
+        paimon_record_batch_reader_free(result.reader);
         unwrap_table(handle);
     }
 }
