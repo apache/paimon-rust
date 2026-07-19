@@ -176,6 +176,25 @@ pub(crate) fn map_ann_results(
 /// points of the async search path (the returned future is spawned on a `Send`
 /// runtime by callers such as the DataFusion integration).
 pub(crate) trait PkVectorAnnSearcher: Send + Sync {
+    /// Search one ANN segment for a batch of query vectors, returning one
+    /// BEST_FIRST result list per query (outer index aligned to `queries`). The
+    /// live-row mask (residual ∩ DV) is query-independent, so it is built once and
+    /// shared across all queries; only the per-query scores differ.
+    #[allow(clippy::too_many_arguments)]
+    fn search_batch(
+        &self,
+        segment: &BucketAnnSegment,
+        queries: &[&[f32]],
+        metric: VectorSearchMetric,
+        limit: usize,
+        active_source_files: &HashSet<String>,
+        deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
+        search_options: &HashMap<String, String>,
+        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>>;
+
+    /// Single-query wrapper over `search_batch`: searches the one query and
+    /// returns its result list. Asserts the batch produced exactly one list.
     #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
@@ -187,77 +206,119 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
         residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-    ) -> crate::Result<Vec<PkVectorSearchResult>>;
+    ) -> crate::Result<Vec<PkVectorSearchResult>> {
+        let mut results = self.search_batch(
+            segment,
+            &[query],
+            metric,
+            limit,
+            active_source_files,
+            deletion_vectors,
+            search_options,
+            residual_ranges,
+        )?;
+        if results.len() != 1 {
+            return Err(data_invalid(format!(
+                "ANN batch search returned {} result lists for a single query",
+                results.len()
+            )));
+        }
+        Ok(results.pop().expect("length checked to be 1"))
+    }
 }
 
-/// Scorer seam: drives the underlying vindex ANN reader. Returns `ordinal ->
-/// score` (higher-is-better). Any negative labels are skipped by the existing
-/// `vindex` reader (`collect_results` drops `row_id < 0`), so this seam only
-/// ever yields non-negative `u64` ordinals — no signed-label handling is needed
-/// downstream.
+/// Batch scorer seam: drives the underlying vindex ANN reader for a batch of
+/// searches over ONE segment, opening the reader once and searching each query
+/// against it (mirroring Java's shared-reader `visitBatchVectorSearch`). Returns
+/// one `ordinal -> score` map (higher-is-better) per input search, aligned to the
+/// `searches` slice. Any negative labels are skipped by the existing `vindex`
+/// reader (`collect_results` drops `row_id < 0`), so this seam only ever yields
+/// non-negative `u64` ordinals — no signed-label handling is needed downstream.
 ///
-/// The production scorer drives `VindexVectorGlobalIndexReader::visit_vector_search`
+/// The production scorer drives `VindexVectorGlobalIndexReader::visit_batch_vector_search`
 /// with a segment's index bytes; tests inject a synthetic scorer. The adapter's
 /// own logic (live-row masking, ordinal mapping, deletion checks, ordering) is
 /// exercised independently of the scorer.
-pub(crate) type Scorer = Box<
-    dyn Fn(&BucketAnnSegment, &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>
+pub(crate) type BatchScorer = Box<
+    dyn Fn(&BucketAnnSegment, &[VectorSearch]) -> crate::Result<Vec<Option<HashMap<u64, f32>>>>
         + Send
         + Sync,
 >;
 
 /// Structural vindex-backed `PkVectorAnnSearcher`. Composes the pure helpers
-/// (`build_live_row_ids`, `map_ann_results`) around the scorer seam.
+/// (`build_live_row_ids`, `map_ann_results`) around the batch scorer seam.
 pub(crate) struct VindexAnnSearcher {
     field_name: String,
-    scorer: Scorer,
+    scorer: BatchScorer,
 }
 
 impl VindexAnnSearcher {
-    pub(crate) fn new(field_name: String, scorer: Scorer) -> Self {
+    pub(crate) fn new(field_name: String, scorer: BatchScorer) -> Self {
         Self { field_name, scorer }
     }
 }
 
 impl PkVectorAnnSearcher for VindexAnnSearcher {
-    fn search(
+    fn search_batch(
         &self,
         segment: &BucketAnnSegment,
-        query: &[f32],
+        queries: &[&[f32]],
         metric: VectorSearchMetric,
         limit: usize,
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
         residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-    ) -> crate::Result<Vec<PkVectorSearchResult>> {
+    ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         if limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
         }
         let source_files = segment.source_meta.source_files();
-        let mut search = VectorSearch::new(query.to_vec(), limit, self.field_name.clone())?
-            .with_options(search_options.clone());
-        if let Some(live) = build_live_row_ids(
+        // The live-row mask depends only on the segment's sources, the active set,
+        // the deletion vectors, and the residual — none of which vary by query —
+        // so it is built once and shared across every query's search.
+        let live = build_live_row_ids(
             source_files,
             active_source_files,
             deletion_vectors,
             residual_ranges,
-        )? {
-            search = search.with_include_row_ids(live);
+        )?;
+        let mut searches = Vec::with_capacity(queries.len());
+        for query in queries {
+            let mut search = VectorSearch::new(query.to_vec(), limit, self.field_name.clone())?
+                .with_options(search_options.clone());
+            if let Some(live) = &live {
+                search = search.with_include_row_ids(live.clone());
+            }
+            searches.push(search);
         }
-        let scored = match (self.scorer)(segment, &search)? {
-            Some(map) => map,
-            None => return Ok(Vec::new()),
-        };
-        let scored: Vec<(u64, f32)> = scored.into_iter().collect();
-        map_ann_results(
-            &scored,
-            &segment.source_meta,
-            active_source_files,
-            deletion_vectors,
-            residual_ranges,
-            metric,
-        )
+        let scored_batch = (self.scorer)(segment, &searches)?;
+        if scored_batch.len() != queries.len() {
+            return Err(data_invalid(format!(
+                "ANN batch scorer returned {} result maps for {} queries",
+                scored_batch.len(),
+                queries.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(queries.len());
+        for scored in scored_batch {
+            let results = match scored {
+                Some(map) => {
+                    let scored: Vec<(u64, f32)> = map.into_iter().collect();
+                    map_ann_results(
+                        &scored,
+                        &segment.source_meta,
+                        active_source_files,
+                        deletion_vectors,
+                        residual_ranges,
+                        metric,
+                    )?
+                }
+                None => Vec::new(),
+            };
+            out.push(results);
+        }
+        Ok(out)
     }
 }
 
@@ -424,14 +485,17 @@ mod tests {
         let scorer_has_filter = Arc::clone(&seen_has_filter);
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
-                *scorer_limit.lock().unwrap() = search.limit;
-                *scorer_has_filter.lock().unwrap() = search.include_row_ids.is_some();
-                let mut scores = HashMap::new();
-                scores.insert(3u64, 0.5f32); // -> (f1, 0)
-                scores.insert(0u64, 0.25f32); // -> (f0, 0), l2 dist 3.0
-                Ok(Some(scores))
-            }),
+            Box::new(
+                move |_segment: &BucketAnnSegment, searches: &[VectorSearch]| {
+                    let search = &searches[0];
+                    *scorer_limit.lock().unwrap() = search.limit;
+                    *scorer_has_filter.lock().unwrap() = search.include_row_ids.is_some();
+                    let mut scores = HashMap::new();
+                    scores.insert(3u64, 0.5f32); // -> (f1, 0)
+                    scores.insert(0u64, 0.25f32); // -> (f0, 0), l2 dist 3.0
+                    Ok(vec![Some(scores)])
+                },
+            ),
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
@@ -472,7 +536,9 @@ mod tests {
     fn test_vindex_adapter_rejects_non_positive_limit() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, searches: &[VectorSearch]| {
+                Ok(vec![None; searches.len()])
+            }),
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
@@ -498,7 +564,9 @@ mod tests {
     fn test_vindex_adapter_empty_scorer_result_is_empty() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, searches: &[VectorSearch]| {
+                Ok(vec![None; searches.len()])
+            }),
         );
         let segment = BucketAnnSegment::for_test({
             use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
@@ -633,13 +701,15 @@ mod tests {
         let scorer_rows = Arc::clone(&seen_rows);
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
-                *scorer_rows.lock().unwrap() = search
-                    .include_row_ids
-                    .as_ref()
-                    .map(|t| t.iter().collect::<Vec<u64>>());
-                Ok(None)
-            }),
+            Box::new(
+                move |_segment: &BucketAnnSegment, searches: &[VectorSearch]| {
+                    *scorer_rows.lock().unwrap() = searches[0]
+                        .include_row_ids
+                        .as_ref()
+                        .map(|t| t.iter().collect::<Vec<u64>>());
+                    Ok(vec![None; searches.len()])
+                },
+            ),
         );
         let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
         let mut residual = HashMap::new();
@@ -657,5 +727,125 @@ mod tests {
             )
             .unwrap();
         assert_eq!(seen_rows.lock().unwrap().clone(), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn test_search_batch_of_one_equals_single_query() {
+        // The single-query `search` wrapper must return exactly what
+        // `search_batch(&[q])[0]` returns for the same inputs.
+        let make = || {
+            VindexAnnSearcher::new(
+                "embedding".to_string(),
+                Box::new(|_: &BucketAnnSegment, searches: &[VectorSearch]| {
+                    let mut out = Vec::with_capacity(searches.len());
+                    for _ in searches {
+                        let mut scores = HashMap::new();
+                        scores.insert(3u64, 0.5f32); // -> (f1, 0)
+                        scores.insert(0u64, 0.25f32); // -> (f0, 0)
+                        out.push(Some(scores));
+                    }
+                    Ok(out)
+                }),
+            )
+        };
+        let meta = source_meta(&[("f0", 3), ("f1", 5)]);
+        let single = make()
+            .search(
+                &BucketAnnSegment::for_test(meta.clone()),
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0", "f1"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        let query: &[f32] = &[0.0, 0.0];
+        let batch = make()
+            .search_batch(
+                &BucketAnnSegment::for_test(meta),
+                &[query],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0", "f1"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0], single);
+    }
+
+    #[test]
+    fn test_search_batch_returns_independent_per_query_results() {
+        // Two queries route to different synthetic scores; each result list is
+        // mapped from that query's own scores, with a shared live-row mask.
+        let searcher = VindexAnnSearcher::new(
+            "embedding".to_string(),
+            Box::new(|_: &BucketAnnSegment, searches: &[VectorSearch]| {
+                let mut out = Vec::with_capacity(searches.len());
+                for (i, _) in searches.iter().enumerate() {
+                    let mut scores = HashMap::new();
+                    // Query 0 -> ordinal 0 (f0,0); query 1 -> ordinal 3 (f1,0).
+                    if i == 0 {
+                        scores.insert(0u64, 0.5f32);
+                    } else {
+                        scores.insert(3u64, 0.5f32);
+                    }
+                    out.push(Some(scores));
+                }
+                Ok(out)
+            }),
+        );
+        let q0: &[f32] = &[0.0, 0.0];
+        let q1: &[f32] = &[1.0, 1.0];
+        let results = searcher
+            .search_batch(
+                &BucketAnnSegment::for_test(source_meta(&[("f0", 3), ("f1", 5)])),
+                &[q0, q1],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0", "f1"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0][0].data_file_name, "f0");
+        assert_eq!(results[1][0].data_file_name, "f1");
+    }
+
+    #[test]
+    fn test_search_batch_fails_loud_on_result_count_mismatch() {
+        // A batch scorer that returns the wrong number of result maps is corruption
+        // and must fail loud, not be silently padded/truncated.
+        let searcher = VindexAnnSearcher::new(
+            "embedding".to_string(),
+            Box::new(|_: &BucketAnnSegment, _: &[VectorSearch]| {
+                // Only one map returned regardless of query count.
+                Ok(vec![None])
+            }),
+        );
+        let q0: &[f32] = &[0.0, 0.0];
+        let q1: &[f32] = &[1.0, 1.0];
+        let err = searcher
+            .search_batch(
+                &BucketAnnSegment::for_test(source_meta(&[("f0", 3)])),
+                &[q0, q1],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("2 queries") || err.to_string().contains("result maps"),
+            "got: {err}"
+        );
     }
 }

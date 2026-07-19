@@ -1100,18 +1100,18 @@ mod e2e_tests {
         hits: Vec<PkVectorSearchResult>,
     }
     impl PkVectorAnnSearcher for FakeAnn {
-        fn search(
+        fn search_batch(
             &self,
             _segment: &BucketAnnSegment,
-            _query: &[f32],
+            queries: &[&[f32]],
             _metric: VectorSearchMetric,
             _limit: usize,
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
             _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-        ) -> crate::Result<Vec<PkVectorSearchResult>> {
-            Ok(self.hits.clone())
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            Ok(queries.iter().map(|_| self.hits.clone()).collect())
         }
     }
 

@@ -493,7 +493,9 @@ impl<'a> VectorSearchBuilder<'a> {
         );
 
         // Real ANN scorer: preload each segment's bytes (keyed by resolved,
-        // globally unique path) and drive the vindex reader from memory.
+        // globally unique path) and drive the vindex reader from memory. The reader
+        // is opened once per segment and every query in the batch is searched
+        // against it, mirroring the shared-reader batch search.
         let segment_bytes = preload_segment_bytes(self.table.file_io(), &plan.splits).await?;
         // Fail loud on a config/segment metric mismatch before scoring, mirroring
         // Java `PkVectorAnnSegmentSearcher.search`.
@@ -505,8 +507,8 @@ impl<'a> VectorSearchBuilder<'a> {
         };
         let search_options = options.clone();
         let field_name = pk_col.to_string();
-        let scorer: crate::vindex::pkvector::ann::Scorer =
-            Box::new(move |segment: &BucketAnnSegment, search: &VectorSearch| {
+        let scorer: crate::vindex::pkvector::ann::BatchScorer = Box::new(
+            move |segment: &BucketAnnSegment, searches: &[VectorSearch]| {
                 let data = segment_bytes
                     .get(&segment.path)
                     .ok_or_else(|| crate::Error::DataInvalid {
@@ -523,15 +525,16 @@ impl<'a> VectorSearchBuilder<'a> {
                     VectorIndexBackend::Lumina => {
                         let mut reader =
                             LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
-                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+                        reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
                     }
                     VectorIndexBackend::Vindex => {
                         let mut reader =
                             VindexVectorGlobalIndexReader::new(io_meta, options.clone());
-                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+                        reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
                     }
                 }
-            });
+            },
+        );
         let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
 
         // Residual (post-recall) filtering: for each candidate file, re-read its

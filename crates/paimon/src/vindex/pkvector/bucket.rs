@@ -355,6 +355,246 @@ pub(crate) async fn bucket_search(
     Ok(BucketSearchResult { indexed, exact })
 }
 
+/// Multi-query ANN + exact fallback search for one snapshot bucket, returning one
+/// [`BucketSearchResult`] per query (outer index aligned to `queries`). N queries
+/// share one pass over the ANN segments (the reader is opened once per segment and
+/// every query is searched against it) and one stream per uncovered exact file (the
+/// stream is opened once and every query is scored from it), with independent
+/// per-query bounded heaps so no query's candidates bleed into another's.
+///
+/// `queries.len() == 1` short-circuits to the single-query [`bucket_search`] and
+/// wraps its result in a one-element `Vec`, so a batch-of-one is byte-identical to
+/// the single-query path (including tie ordering). The remaining arguments match
+/// [`bucket_search`].
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+#[allow(dead_code)]
+pub(crate) async fn bucket_search_batch(
+    ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+    ann_segments: &[BucketAnnSegment],
+    active_files: &[BucketActiveFile],
+    deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
+    exact_file_search: &(dyn for<'a> Fn(
+        &'a BucketActiveFile,
+        &'a [&'a [f32]],
+        VectorSearchMetric,
+        usize,
+        &'a (dyn Fn(i64) -> bool + Sync),
+    ) -> ExactFileSearchFuture<'a>
+          + Send
+          + Sync),
+    queries: &[&[f32]],
+    metric: VectorSearchMetric,
+    indexed_limit: usize,
+    exact_limit: usize,
+    search_options: &HashMap<String, String>,
+    skip_exact_fallback: bool,
+    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+) -> crate::Result<Vec<BucketSearchResult>> {
+    if queries.is_empty() {
+        return Err(data_invalid("vector search requires at least one query"));
+    }
+    // A batch-of-one routes to the single-query body so its tie ordering is
+    // byte-identical to the pre-batch path (the multi-query heaps could in
+    // principle differ).
+    if queries.len() == 1 {
+        let single = bucket_search(
+            ann_searcher,
+            ann_segments,
+            active_files,
+            deletion_vectors,
+            exact_file_search,
+            queries[0],
+            metric,
+            indexed_limit,
+            exact_limit,
+            search_options,
+            skip_exact_fallback,
+            residual_ranges,
+        )
+        .await?;
+        return Ok(vec![single]);
+    }
+
+    if indexed_limit == 0 {
+        return Err(data_invalid("vector search limit must be positive"));
+    }
+    if exact_limit == 0 {
+        return Err(data_invalid("vector search limit must be positive"));
+    }
+    // Validate-before-OPEN: any non-finite query element fails loud before any
+    // exact-file search closure is invoked (so before any file stream is opened).
+    // The per-file closure additionally validates the query dimension before it
+    // polls its stream (validate-before-POLL).
+    for query in queries {
+        if let Some(i) = query.iter().position(|v| !v.is_finite()) {
+            return Err(data_invalid(format!(
+                "query vector element at position {i} must be finite"
+            )));
+        }
+    }
+
+    let mut files_by_name: HashMap<&str, &BucketActiveFile> = HashMap::new();
+    for file in active_files {
+        if file.row_count < 0 {
+            return Err(data_invalid(format!(
+                "active data file {} row count must not be negative: {}",
+                file.file_name, file.row_count
+            )));
+        }
+        if files_by_name
+            .insert(file.file_name.as_str(), file)
+            .is_some()
+        {
+            return Err(data_invalid(format!(
+                "duplicate data file: {}",
+                file.file_name
+            )));
+        }
+    }
+
+    // Validate ANN segments mirror Java PkVectorBucketIndexState constructor checks:
+    // (1) payload file uniqueness, (2) no source file covered by multiple segments.
+    let mut segments_by_path: HashMap<&str, usize> = HashMap::new();
+    let mut source_to_segment: HashMap<&str, &str> = HashMap::new();
+    for (idx, segment) in ann_segments.iter().enumerate() {
+        if segments_by_path
+            .insert(segment.path.as_str(), idx)
+            .is_some()
+        {
+            return Err(data_invalid(format!(
+                "ANN segment payload {} appears more than once",
+                segment.path
+            )));
+        }
+        for source in segment.source_meta.source_files() {
+            if let Some(&prior_segment_path) = source_to_segment.get(source.file_name()) {
+                return Err(data_invalid(format!(
+                    "source data file {} is covered by both ANN segments {} and {}",
+                    source.file_name(),
+                    prior_segment_path,
+                    segment.path
+                )));
+            }
+            source_to_segment.insert(source.file_name(), segment.path.as_str());
+        }
+    }
+
+    let mut indexed_heaps: Vec<BinaryHeap<WorstFirst>> = (0..queries.len())
+        .map(|_| BinaryHeap::with_capacity(indexed_limit + 1))
+        .collect();
+    let mut exact_heaps: Vec<BinaryHeap<WorstFirst>> = (0..queries.len())
+        .map(|_| BinaryHeap::with_capacity(exact_limit + 1))
+        .collect();
+    let active_source_files: HashSet<String> =
+        files_by_name.keys().map(|name| name.to_string()).collect();
+    let covered = covered_source_files(ann_segments, active_files);
+
+    for segment in ann_segments {
+        for source in segment.source_meta.source_files() {
+            if let Some(active) = files_by_name.get(source.file_name()) {
+                if active.row_count != source.row_count() {
+                    return Err(data_invalid(format!(
+                        "ANN source {} does not match the active data file",
+                        source.file_name()
+                    )));
+                }
+            }
+        }
+        let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
+        // One shared reader per segment searches all queries; fan the per-query
+        // hits into their own bounded heaps.
+        let per_query = searcher.search_batch(
+            segment,
+            queries,
+            metric,
+            indexed_limit,
+            &active_source_files,
+            deletion_vectors,
+            search_options,
+            residual_ranges,
+        )?;
+        if per_query.len() != queries.len() {
+            return Err(data_invalid(format!(
+                "ANN batch search returned {} result lists for {} queries",
+                per_query.len(),
+                queries.len()
+            )));
+        }
+        for (results, heap) in per_query.into_iter().zip(indexed_heaps.iter_mut()) {
+            for result in results {
+                add_candidate(heap, result, indexed_limit);
+            }
+        }
+    }
+
+    if !skip_exact_fallback {
+        for file in active_files {
+            if covered.contains(&file.file_name) {
+                continue;
+            }
+            let residual_allowed: Option<&roaring::RoaringTreemap> = match residual_ranges {
+                Some(ranges) => match ranges.get(&file.file_name) {
+                    Some(allowed) if !allowed.is_empty() => Some(allowed),
+                    _ => continue,
+                },
+                None => None,
+            };
+            let dv = deletion_vectors.get(&file.file_name).cloned();
+            let is_excluded = move |position: i64| -> bool {
+                let dv_deleted = match &dv {
+                    Some(dv) => u64::try_from(position)
+                        .map(|p| dv.is_deleted(p))
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if dv_deleted {
+                    return true;
+                }
+                match residual_allowed {
+                    None => false,
+                    Some(allowed) => match u64::try_from(position) {
+                        Ok(p) => !allowed.contains(p),
+                        Err(_) => true,
+                    },
+                }
+            };
+            // One shared stream per file scores every query into its own heap.
+            let per_query = exact_file_search(
+                file,
+                queries,
+                metric,
+                exact_limit,
+                &is_excluded as &(dyn Fn(i64) -> bool + Sync),
+            )
+            .await?;
+            if per_query.len() != queries.len() {
+                return Err(data_invalid(format!(
+                    "exact file search returned {} result lists for {} queries",
+                    per_query.len(),
+                    queries.len()
+                )));
+            }
+            for (results, heap) in per_query.into_iter().zip(exact_heaps.iter_mut()) {
+                for result in results {
+                    add_candidate(heap, result, exact_limit);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(queries.len());
+    for (indexed_heap, exact_heap) in indexed_heaps.into_iter().zip(exact_heaps) {
+        let mut indexed: Vec<PkVectorSearchResult> =
+            indexed_heap.into_iter().map(|w| w.0).collect();
+        indexed.sort_by(best_first);
+        let mut exact: Vec<PkVectorSearchResult> = exact_heap.into_iter().map(|w| w.0).collect();
+        exact.sort_by(best_first);
+        out.push(BucketSearchResult { indexed, exact });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,18 +714,18 @@ mod tests {
         result: Vec<PkVectorSearchResult>,
     }
     impl PkVectorAnnSearcher for FakeAnnSearcher {
-        fn search(
+        fn search_batch(
             &self,
             _segment: &BucketAnnSegment,
-            _query: &[f32],
+            queries: &[&[f32]],
             _metric: VectorSearchMetric,
             _limit: usize,
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
             _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-        ) -> crate::Result<Vec<PkVectorSearchResult>> {
-            Ok(self.result.clone())
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            Ok(queries.iter().map(|_| self.result.clone()).collect())
         }
     }
 
@@ -1350,6 +1590,266 @@ mod tests {
         assert!(
             !called.load(std::sync::atomic::Ordering::SeqCst),
             "the exact-file search closure must not be invoked for a malformed query"
+        );
+    }
+
+    /// Build a per-file exact-search closure that runs the reference `exact_search`
+    /// over an in-memory `ArrayReader` of `vectors`, looping ALL queries into one
+    /// list per query (the outer `Vec` is aligned to `queries`). Used by the
+    /// multi-query `bucket_search_batch` tests.
+    #[allow(clippy::type_complexity)]
+    fn array_search_batch(
+        vectors: Vec<Option<Vec<f32>>>,
+    ) -> impl for<'a> Fn(
+        &'a BucketActiveFile,
+        &'a [&'a [f32]],
+        VectorSearchMetric,
+        usize,
+        &'a (dyn Fn(i64) -> bool + Sync),
+    ) -> ExactFileSearchFuture<'a>
+           + Send
+           + Sync {
+        let vectors = Arc::new(vectors);
+        as_search(
+            move |file: &BucketActiveFile,
+                  queries: &[&[f32]],
+                  metric: VectorSearchMetric,
+                  exact_limit: usize,
+                  is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let dimension = vectors
+                    .first()
+                    .and_then(|v| v.as_ref())
+                    .map_or(0, |v| v.len());
+                let file_name = file.file_name.clone();
+                let owned_queries: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
+                let vectors = Arc::clone(&vectors);
+                Box::pin(async move {
+                    let mut out = Vec::with_capacity(owned_queries.len());
+                    for query in &owned_queries {
+                        let mut reader = ArrayReader::new(dimension, (*vectors).clone());
+                        out.push(exact_search(
+                            &file_name,
+                            &mut reader,
+                            query,
+                            metric,
+                            exact_limit,
+                            is_excluded,
+                        )?);
+                    }
+                    Ok(out)
+                })
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_bucket_search_batch_of_one_equals_single_query() {
+        // A batch-of-one must equal the single-query `bucket_search` exactly.
+        let segment = BucketAnnSegment::for_test(meta(&[("ann.mosaic", 3)]));
+        let ann = FakeAnnSearcher {
+            result: vec![
+                PkVectorSearchResult {
+                    data_file_name: "ann.mosaic".into(),
+                    row_position: 0,
+                    distance: 0.1,
+                },
+                PkVectorSearchResult {
+                    data_file_name: "ann.mosaic".into(),
+                    row_position: 1,
+                    distance: 0.2,
+                },
+            ],
+        };
+        let active_files = vec![active("ann.mosaic", 3), active("exact.mosaic", 3)];
+        let dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
+        let opts = HashMap::new();
+        let query = [1.0f32, 0.0];
+
+        let single = {
+            let factory = array_search(vec![
+                Some(vec![1.0, 0.0]),
+                Some(vec![9.0, 0.0]),
+                Some(vec![8.0, 0.0]),
+            ]);
+            bucket_search(
+                Some(&ann),
+                &[BucketAnnSegment::for_test(meta(&[("ann.mosaic", 3)]))],
+                &active_files,
+                &dvs,
+                &factory,
+                &query,
+                VectorSearchMetric::L2,
+                3,
+                2,
+                &opts,
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+
+        let factory = array_search_batch(vec![
+            Some(vec![1.0, 0.0]),
+            Some(vec![9.0, 0.0]),
+            Some(vec![8.0, 0.0]),
+        ]);
+        let query_ref: &[f32] = &query;
+        let batch = bucket_search_batch(
+            Some(&ann),
+            &[segment],
+            &active_files,
+            &dvs,
+            &factory,
+            &[query_ref],
+            VectorSearchMetric::L2,
+            3,
+            2,
+            &opts,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].indexed, single.indexed);
+        assert_eq!(batch[0].exact, single.exact);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_search_batch_per_query_heaps_independent() {
+        // Two queries over one exact file with a shared residual/DV; each query's
+        // Top-K comes from its own heap (no cross-query bleed). Query 0 is nearest
+        // pos 0; query 1 is nearest pos 3.
+        let factory = array_search_batch(vec![
+            Some(vec![0.0, 0.0]),
+            Some(vec![1.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+            Some(vec![3.0, 0.0]),
+        ]);
+        let q0: &[f32] = &[0.0, 0.0];
+        let q1: &[f32] = &[3.0, 0.0];
+        let out = bucket_search_batch(
+            None,
+            &[],
+            &[active("data-1", 4)],
+            &HashMap::new(),
+            &factory,
+            &[q0, q1],
+            VectorSearchMetric::L2,
+            1,
+            1,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].exact.len(), 1);
+        assert_eq!(out[0].exact[0].row_position, 0);
+        assert_eq!(out[1].exact.len(), 1);
+        assert_eq!(out[1].exact[0].row_position, 3);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_search_batch_shares_one_read_per_file_across_queries() {
+        // The exact-file closure is invoked ONCE per uncovered file regardless of
+        // the query count (the shared stream scores all queries).
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                calls.lock().unwrap().push(file.file_name.clone());
+                let file_name = file.file_name.clone();
+                let owned: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
+                Box::pin(async move {
+                    let mut out = Vec::with_capacity(owned.len());
+                    for query in &owned {
+                        let mut reader =
+                            ArrayReader::new(2, vec![Some(vec![1.0, 0.0]), Some(vec![3.0, 0.0])]);
+                        out.push(exact_search(
+                            &file_name,
+                            &mut reader,
+                            query,
+                            metric,
+                            exact_limit,
+                            is_excluded,
+                        )?);
+                    }
+                    Ok(out)
+                })
+            },
+        );
+        let q0: &[f32] = &[0.0, 0.0];
+        let q1: &[f32] = &[4.0, 0.0];
+        let out = bucket_search_batch(
+            None,
+            &[],
+            &[active("data-1", 2)],
+            &HashMap::new(),
+            &factory,
+            &[q0, q1],
+            VectorSearchMetric::L2,
+            2,
+            2,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["data-1".to_string()],
+            "one shared read per file for the whole batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_search_batch_malformed_query_fails_before_opening_any_file() {
+        // A non-finite element in ANY query fails loud before the exact-file search
+        // closure is ever invoked (validate-before-OPEN).
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let factory = as_search(
+            |_: &BucketActiveFile,
+             _: &[&[f32]],
+             _: VectorSearchMetric,
+             _: usize,
+             _: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { unreachable!("closure must not run for a malformed query") })
+            },
+        );
+        let good: &[f32] = &[0.0, 0.0];
+        let bad: &[f32] = &[f32::NAN, 0.0];
+        let err = bucket_search_batch(
+            None,
+            &[],
+            &[active("data-1", 2)],
+            &HashMap::new(),
+            &factory,
+            &[good, bad],
+            VectorSearchMetric::L2,
+            2,
+            2,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("finite"), "got: {err}");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "the exact-file search closure must not be invoked for a malformed batch"
         );
     }
 }

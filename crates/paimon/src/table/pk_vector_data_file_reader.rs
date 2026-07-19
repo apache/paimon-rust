@@ -519,6 +519,60 @@ mod integration_tests {
         assert_eq!(streamed[0][1].row_position, 3);
     }
 
+    /// A multi-query `search_file` returns independent per-query Top-K lists: the
+    /// slot for a query in a batch is identical to that query searched alone (no
+    /// cross-query bleed), and a shared `is_excluded` applies to every query.
+    #[tokio::test]
+    async fn search_file_multi_query_returns_independent_per_query_top_k() {
+        let rows = vec![
+            Some(vec![0.0, 0.0]),
+            Some(vec![1.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+            Some(vec![3.0, 0.0]),
+        ];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_multiquery").await;
+        let active = BucketActiveFile {
+            file_name,
+            row_count: rows.len() as i64,
+        };
+        // Exclude physical position 1 for all queries (shared predicate).
+        let is_excluded = |pos: i64| pos == 1;
+        let q0 = [0.0f32, 0.0]; // nearest is pos 0
+        let q1 = [3.0f32, 0.0]; // nearest is pos 3
+
+        let batch = factory
+            .search_file(
+                &active,
+                &[&q0, &q1],
+                VectorSearchMetric::L2,
+                2,
+                &is_excluded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2, "one result list per query");
+
+        // Each query searched alone must equal its slot in the batch.
+        let only_q0 = factory
+            .search_file(&active, &[&q0], VectorSearchMetric::L2, 2, &is_excluded)
+            .await
+            .unwrap();
+        let only_q1 = factory
+            .search_file(&active, &[&q1], VectorSearchMetric::L2, 2, &is_excluded)
+            .await
+            .unwrap();
+        assert_eq!(batch[0], only_q0[0]);
+        assert_eq!(batch[1], only_q1[0]);
+
+        // Sanity: distinct nearest neighbours, and the excluded position is absent.
+        assert_eq!(batch[0][0].row_position, 0);
+        assert_eq!(batch[1][0].row_position, 3);
+        assert!(batch
+            .iter()
+            .all(|list| list.iter().all(|r| r.row_position != 1)));
+    }
+
     /// A `DataFileMeta.row_count` larger than the file's real row count means the
     /// stream ends early; the search must fail loud rather than return a short
     /// result.
