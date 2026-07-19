@@ -21,9 +21,12 @@
 //! join on `_ROW_ID`, and error path validation.
 //! Reference: Java Paimon's `RowTrackingTestBase`.
 
+mod common;
+
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array, StringArray};
+use arrow_array::{Int32Array, Int64Array};
+use common::string_value;
 use paimon::catalog::Identifier;
 use paimon::table::SnapshotManager;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -80,18 +83,18 @@ async fn collect_rows_3col(sql_context: &SQLContext, sql: &str) -> Vec<(i32, Str
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let names = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = batch.column(1);
         let values = batch
             .column(2)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), names.value(i).to_string(), values.value(i)));
+            rows.push((
+                ids.value(i),
+                string_value(names.as_ref(), i).to_string(),
+                values.value(i),
+            ));
         }
     }
     rows
@@ -1241,26 +1244,18 @@ async fn test_merge_insert_reordered_columns_on_partitioned_table() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let dts = batch.column(0);
         let ids = batch
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let names = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = batch.column(2);
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }

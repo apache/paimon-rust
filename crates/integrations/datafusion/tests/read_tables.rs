@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 mod common;
 
-use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use common::string_value;
+use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
@@ -164,13 +165,12 @@ fn extract_id_name_rows(
             .expect("Expected Int32Array for id column");
         let name_array = batch
             .column_by_name("name")
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-            .expect("Expected StringArray for name column");
+            .expect("Expected string array for name column");
 
         for row_index in 0..batch.num_rows() {
             rows.push((
                 id_array.value(row_index),
-                name_array.value(row_index).to_string(),
+                string_value(name_array.as_ref(), row_index).to_string(),
             ));
         }
     }
@@ -1081,20 +1081,22 @@ async fn test_data_evolution_drop_column_null_fill() {
             .expect("Expected Int32Array for id");
         let name_array = batch
             .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .expect("Expected StringArray for name");
+            .expect("Expected string array for name");
         let extra_array = batch
             .column_by_name("extra")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .expect("Expected StringArray for extra");
+            .expect("Expected string array for extra");
 
         for i in 0..batch.num_rows() {
             let extra = if extra_array.is_null(i) {
                 None
             } else {
-                Some(extra_array.value(i).to_string())
+                Some(string_value(extra_array.as_ref(), i).to_string())
             };
-            rows.push((id_array.value(i), name_array.value(i).to_string(), extra));
+            rows.push((
+                id_array.value(i),
+                string_value(name_array.as_ref(), i).to_string(),
+                extra,
+            ));
         }
     }
     rows.sort_by_key(|(id, _, _)| *id);
@@ -1447,11 +1449,13 @@ async fn test_case_insensitive_column_not_supported_via_sql() {
 mod fulltext_tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::Int32Array;
     use paimon::catalog::Identifier;
     use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_full_text_search, SQLContext};
+
+    use super::common::string_value;
 
     /// Extract the bundled tar.gz into a temp dir and return (tempdir, warehouse_path).
     fn extract_test_warehouse() -> (tempfile::TempDir, String) {
@@ -1496,10 +1500,12 @@ mod fulltext_tests {
                 .expect("Expected Int32Array for id");
             let content_array = batch
                 .column_by_name("content")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .expect("Expected StringArray for content");
+                .expect("Expected string array for content");
             for i in 0..batch.num_rows() {
-                rows.push((id_array.value(i), content_array.value(i).to_string()));
+                rows.push((
+                    id_array.value(i),
+                    string_value(content_array.as_ref(), i).to_string(),
+                ));
             }
         }
         rows.sort_by_key(|(id, _)| *id);
@@ -1618,6 +1624,8 @@ mod vector_search_tests {
     use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_vector_search, SQLContext};
+
+    use super::common::string_value;
 
     fn extract_test_warehouse(archive_name: &str) -> (tempfile::TempDir, String) {
         let archive_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1791,11 +1799,7 @@ mod vector_search_tests {
         for batch in batches {
             let index_type_array = batch
                 .column_by_name("index_type")
-                .and_then(|c| {
-                    c.as_any()
-                        .downcast_ref::<datafusion::arrow::array::StringArray>()
-                })
-                .expect("Expected StringArray for index_type");
+                .expect("Expected string array for index_type");
             let row_count_array = batch
                 .column_by_name("row_count")
                 .and_then(|c| {
@@ -1819,19 +1823,15 @@ mod vector_search_tests {
                 .expect("Expected Int64Array for row_range_end");
             let index_field_name_array = batch
                 .column_by_name("index_field_name")
-                .and_then(|c| {
-                    c.as_any()
-                        .downcast_ref::<datafusion::arrow::array::StringArray>()
-                })
-                .expect("Expected StringArray for index_field_name");
+                .expect("Expected string array for index_field_name");
 
             for row_index in 0..batch.num_rows() {
                 rows.push((
-                    index_type_array.value(row_index).to_string(),
+                    string_value(index_type_array.as_ref(), row_index).to_string(),
                     row_count_array.value(row_index),
                     row_range_start_array.value(row_index),
                     row_range_end_array.value(row_index),
-                    index_field_name_array.value(row_index).to_string(),
+                    string_value(index_field_name_array.as_ref(), row_index).to_string(),
                 ));
             }
         }

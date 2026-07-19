@@ -21,8 +21,8 @@
 
 mod common;
 
-use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
-use common::{assert_sql_error, create_sql_context, create_test_env, exec};
+use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch};
+use common::{assert_sql_error, create_sql_context, create_test_env, exec, string_value};
 use paimon::catalog::Identifier;
 use paimon::spec::{BlobDescriptor, BlobViewStruct};
 use paimon::table::BranchManager;
@@ -54,11 +54,7 @@ fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let names = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = batch.column(1);
         let pics = batch
             .column(2)
             .as_any()
@@ -70,7 +66,11 @@ fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<
             } else {
                 Some(pics.value(i).to_vec())
             };
-            rows.push((ids.value(i), names.value(i).to_string(), pic));
+            rows.push((
+                ids.value(i),
+                string_value(names.as_ref(), i).to_string(),
+                pic,
+            ));
         }
     }
     rows.sort_by_key(|(id, _, _)| *id);
@@ -93,13 +93,9 @@ fn collect_id_name(batches: &[RecordBatch]) -> Vec<(i32, String)> {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let names = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = batch.column(1);
         for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), names.value(i).to_string()));
+            rows.push((ids.value(i), string_value(names.as_ref(), i).to_string()));
         }
     }
     rows.sort_by_key(|(id, _)| *id);

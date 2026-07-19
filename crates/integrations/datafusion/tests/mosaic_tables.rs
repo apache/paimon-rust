@@ -17,13 +17,17 @@
 
 //! Mosaic file format read compatibility tests.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Int32Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
+
+use common::string_value;
 
 const FIXTURE_TABLE: &str = "test_mosaic_read";
 
@@ -74,10 +78,7 @@ fn collect_id_name_score(batches: &[RecordBatch]) -> Vec<(i32, String, i64)> {
             .column_by_name("id")
             .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
             .expect("id column");
-        let names = batch
-            .column_by_name("name")
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-            .expect("name column");
+        let names = batch.column_by_name("name").expect("name column");
         let scores = batch
             .column_by_name("score")
             .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
@@ -86,7 +87,7 @@ fn collect_id_name_score(batches: &[RecordBatch]) -> Vec<(i32, String, i64)> {
         for row in 0..batch.num_rows() {
             rows.push((
                 ids.value(row),
-                names.value(row).to_string(),
+                string_value(names.as_ref(), row).to_string(),
                 scores.value(row),
             ));
         }
@@ -97,11 +98,7 @@ fn collect_id_name_score(batches: &[RecordBatch]) -> Vec<(i32, String, i64)> {
 fn collect_name_id(batches: &[RecordBatch]) -> Vec<(String, i32)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let names = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("first column should be name");
+        let names = batch.column(0);
         let ids = batch
             .column(1)
             .as_any()
@@ -109,7 +106,10 @@ fn collect_name_id(batches: &[RecordBatch]) -> Vec<(String, i32)> {
             .expect("second column should be id");
 
         for row in 0..batch.num_rows() {
-            rows.push((names.value(row).to_string(), ids.value(row)));
+            rows.push((
+                string_value(names.as_ref(), row).to_string(),
+                ids.value(row),
+            ));
         }
     }
     rows

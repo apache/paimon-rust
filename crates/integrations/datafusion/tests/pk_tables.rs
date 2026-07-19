@@ -30,9 +30,9 @@ mod common;
 
 use common::{
     collect_id_name, collect_id_value, collect_int_int_str, create_sql_context, create_test_env,
-    row_count, setup_sql_context,
+    row_count, setup_sql_context, string_value,
 };
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array};
 use paimon::catalog::Identifier;
 use paimon::Catalog;
 
@@ -146,10 +146,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
             .column_by_name("v_int")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let strs = batch
-            .column_by_name("v_str")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let strs = batch.column_by_name("v_str").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
                 ids.value(i),
@@ -161,7 +158,7 @@ async fn test_pk_partial_update_fixed_bucket_e2e() {
                 if strs.is_null(i) {
                     None
                 } else {
-                    Some(strs.value(i).to_string())
+                    Some(string_value(strs.as_ref(), i).to_string())
                 },
             ));
         }
@@ -474,23 +471,17 @@ async fn test_pk_partitioned_dedup_across_commits() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -646,13 +637,9 @@ async fn test_pk_column_projection() {
 
     let mut names = Vec::new();
     for batch in &batches {
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let arr = batch.column(0);
         for i in 0..batch.num_rows() {
-            names.push(arr.value(i).to_string());
+            names.push(string_value(arr.as_ref(), i).to_string());
         }
     }
     names.sort();
@@ -766,23 +753,17 @@ async fn test_pk_insert_overwrite_partitioned() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -848,23 +829,17 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -934,28 +909,19 @@ async fn test_pk_insert_overwrite_partial_partition_clause() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
-        let regions = batch
-            .column_by_name("region")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
+        let regions = batch.column_by_name("region").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
-                regions.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
+                string_value(regions.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -1032,23 +998,17 @@ async fn test_pk_insert_overwrite_partition_truncate() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -1142,23 +1102,17 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -1254,23 +1208,17 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
-                names.value(i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
             ));
         }
     }
@@ -1332,10 +1280,7 @@ async fn test_pk_composite_key() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let regions = batch
-            .column_by_name("region")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let regions = batch.column_by_name("region").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -1345,7 +1290,11 @@ async fn test_pk_composite_key() {
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((regions.value(i).to_string(), ids.value(i), vals.value(i)));
+            rows.push((
+                string_value(regions.as_ref(), i).to_string(),
+                ids.value(i),
+                vals.value(i),
+            ));
         }
     }
 
@@ -1492,10 +1441,7 @@ async fn test_pk_partitioned_multi_bucket() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -1505,7 +1451,11 @@ async fn test_pk_partitioned_multi_bucket() {
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((dts.value(i).to_string(), ids.value(i), vals.value(i)));
+            rows.push((
+                string_value(dts.as_ref(), i).to_string(),
+                ids.value(i),
+                vals.value(i),
+            ));
         }
     }
 
@@ -1606,16 +1556,13 @@ async fn test_pk_string_key() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let codes = batch
-            .column_by_name("code")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let codes = batch.column_by_name("code").unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((codes.value(i).to_string(), names.value(i).to_string()));
+            rows.push((
+                string_value(codes.as_ref(), i).to_string(),
+                string_value(names.as_ref(), i).to_string(),
+            ));
         }
     }
 
@@ -1680,10 +1627,7 @@ async fn test_pk_multiple_value_columns() {
             .column_by_name("col_a")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let bs = batch
-            .column_by_name("col_b")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let bs = batch.column_by_name("col_b").unwrap();
         let cs = batch
             .column_by_name("col_c")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -1692,7 +1636,7 @@ async fn test_pk_multiple_value_columns() {
             rows.push((
                 ids.value(i),
                 as_.value(i),
-                bs.value(i).to_string(),
+                string_value(bs.as_ref(), i).to_string(),
                 cs.value(i),
             ));
         }
@@ -2343,10 +2287,7 @@ async fn test_pk_aggregation_sum_and_listagg_fixed_multi_bucket_e2e() {
             .column_by_name("amount")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let tags = batch
-            .column_by_name("tag")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let tags = batch.column_by_name("tag").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
                 ids.value(i),
@@ -2358,7 +2299,7 @@ async fn test_pk_aggregation_sum_and_listagg_fixed_multi_bucket_e2e() {
                 if tags.is_null(i) {
                     None
                 } else {
-                    Some(tags.value(i).to_string())
+                    Some(string_value(tags.as_ref(), i).to_string())
                 },
             ));
         }
@@ -2437,13 +2378,10 @@ async fn test_pk_aggregation_default_function() {
         .column_by_name("a")
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
         .unwrap();
-    let b = batch
-        .column_by_name("b")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .unwrap();
+    let b = batch.column_by_name("b").unwrap();
     assert_eq!(id.value(0), 1);
     assert_eq!(a.value(0), 99); // latest non-null int across the three commits
-    assert_eq!(b.value(0), "new"); // latest non-null string
+    assert_eq!(string_value(b.as_ref(), 0), "new"); // latest non-null string
 }
 
 /// Mixed aggregators in a single table: sum / max / bool_or / first_non_null_value.
@@ -2504,14 +2442,11 @@ async fn test_pk_aggregation_mixed_aggregators() {
         .column_by_name("ok")
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
         .unwrap();
-    let first_seen = batch
-        .column_by_name("first_seen")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .unwrap();
+    let first_seen = batch.column_by_name("first_seen").unwrap();
     assert_eq!(total.value(0), 18); // 10 + 5 + 3
     assert_eq!(peak.value(0), 8); // max(5, 8, 7)
     assert!(ok.value(0)); // bool_or = true if any is true
-    assert_eq!(first_seen.value(0), "a"); // first non-null wins
+    assert_eq!(string_value(first_seen.as_ref(), 0), "a"); // first non-null wins
 }
 
 /// `sequence.field` forces the named column to `last_value`, even when a

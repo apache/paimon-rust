@@ -21,7 +21,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Schema, SchemaRef as ArrowSchemaRef,
+};
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::datasource::sink::DataSink;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SendableRecordBatchStream;
@@ -31,6 +35,49 @@ use futures::StreamExt;
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
+
+fn to_paimon_batch(batch: RecordBatch) -> DFResult<RecordBatch> {
+    if !batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|field| field.data_type() == &ArrowDataType::Utf8View)
+    {
+        return Ok(batch);
+    }
+
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.data_type() == &ArrowDataType::Utf8View {
+                Arc::new(field.as_ref().clone().with_data_type(ArrowDataType::Utf8))
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column.as_ref(), field.data_type()).map_err(Into::into)
+            }
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(Into::into)
+}
 
 /// DataSink that writes RecordBatches to a Paimon table.
 ///
@@ -84,7 +131,7 @@ impl DataSink for PaimonDataSink {
         let mut row_count = 0u64;
 
         while let Some(batch) = data.next().await {
-            let batch = batch?;
+            let batch = to_paimon_batch(batch?)?;
             row_count += batch.num_rows() as u64;
             tw.write_arrow_batch(&batch)
                 .await

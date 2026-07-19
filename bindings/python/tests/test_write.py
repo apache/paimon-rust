@@ -56,9 +56,9 @@ def test_write_commit_read_roundtrip():
         messages = write.prepare_commit()
         assert len(messages) >= 1                # cover API shape in the first test
         wb.new_commit().commit(messages)   # same wb → shared commit_user
-        result = pa.Table.from_batches(
-            ctx.sql("SELECT id, name FROM paimon.wdb.t")
-        ).sort_by("id").to_pydict()
+        batches = ctx.sql("SELECT id, name FROM paimon.wdb.t")
+        assert batches[0].schema.field("name").type == pa.string()
+        result = pa.Table.from_batches(batches).sort_by("id").to_pydict()
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 

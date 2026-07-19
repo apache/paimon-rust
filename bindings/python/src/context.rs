@@ -18,8 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::compute::cast;
 use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::CatalogProvider;
 use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
@@ -36,6 +38,47 @@ use crate::error::{df_to_py_err, to_py_err};
 use crate::table::PyTable;
 use crate::udf::{build_python_scalar_udf, udf, PyPythonScalarUDFObject};
 use paimon_datafusion::runtime::runtime;
+
+fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordBatch> {
+    let mut changed = false;
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.data_type() == &ArrowDataType::Utf8View {
+                changed = true;
+                Arc::new(field.as_ref().clone().with_data_type(ArrowDataType::Utf8))
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return Ok(batch.clone());
+    }
+
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column.as_ref(), field.data_type())
+            }
+        })
+        .collect::<arrow::error::Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+
+    RecordBatch::try_new_with_options(schema, columns, &options)
+}
 
 fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
     let rt = runtime();
@@ -365,7 +408,14 @@ impl PySQLContext {
         })?;
         batches
             .iter()
-            .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
+            .map(|batch| {
+                let batch = pyarrow_compatible_batch(batch).map_err(|err| {
+                    PyValueError::new_err(format!(
+                        "Failed to convert query result for PyArrow compatibility: {err}"
+                    ))
+                })?;
+                Ok(batch.to_pyarrow(py)?.unbind())
+            })
             .collect()
     }
 }

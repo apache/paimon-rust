@@ -19,12 +19,25 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::array::{Int32Array, LargeStringArray, StringArray, StringViewArray};
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
 use tempfile::TempDir;
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
+
+#[allow(dead_code)]
+pub fn string_value(array: &dyn Array, row: usize) -> &str {
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        array.value(row)
+    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        array.value(row)
+    } else if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        array.value(row)
+    } else {
+        panic!("expected a string array, got {}", array.data_type())
+    }
+}
 
 pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -76,12 +89,9 @@ pub fn collect_id_name_from_batches_in_order(batches: &[RecordBatch]) -> Vec<(i3
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .expect("id column");
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .expect("name column");
+        let names = batch.column_by_name("name").expect("name column");
         for i in 0..batch.num_rows() {
-            rows.push((ids.value(i), names.value(i).to_string()));
+            rows.push((ids.value(i), string_value(names.as_ref(), i).to_string()));
         }
     }
     rows
@@ -168,13 +178,13 @@ pub fn collect_int_int_str(batches: &[RecordBatch]) -> Vec<(i32, i32, String)> {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let col2 = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let col2 = batch.column(2);
         for i in 0..batch.num_rows() {
-            rows.push((col0.value(i), col1.value(i), col2.value(i).to_string()));
+            rows.push((
+                col0.value(i),
+                col1.value(i),
+                string_value(col2.as_ref(), i).to_string(),
+            ));
         }
     }
     rows.sort_by_key(|r| (r.0, r.1));
@@ -191,13 +201,9 @@ pub fn collect_int_str(batches: &[RecordBatch]) -> Vec<(i32, String)> {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let col1 = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let col1 = batch.column(1);
         for i in 0..batch.num_rows() {
-            rows.push((col0.value(i), col1.value(i).to_string()));
+            rows.push((col0.value(i), string_value(col1.as_ref(), i).to_string()));
         }
     }
     rows.sort_by_key(|r| r.0);
@@ -242,18 +248,18 @@ pub fn collect_int_str_int(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let col1 = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let col1 = batch.column(1);
         let col2 = batch
             .column(2)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((col0.value(i), col1.value(i).to_string(), col2.value(i)));
+            rows.push((
+                col0.value(i),
+                string_value(col1.as_ref(), i).to_string(),
+                col2.value(i),
+            ));
         }
     }
     rows.sort_by_key(|r| r.0);

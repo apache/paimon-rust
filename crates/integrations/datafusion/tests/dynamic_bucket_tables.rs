@@ -21,8 +21,9 @@ mod common;
 
 use common::{
     collect_id_name, collect_id_value, create_sql_context, create_test_env, setup_sql_context,
+    string_value,
 };
-use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array};
 use paimon::catalog::Identifier;
 use paimon::spec::{IndexManifest, IndexManifestEntry};
 use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options, SnapshotManager};
@@ -97,10 +98,7 @@ async fn collect_partial_update_rows(
             .column_by_name("v_int")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let strs = batch
-            .column_by_name("v_str")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let strs = batch.column_by_name("v_str").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
                 ids.value(i),
@@ -112,7 +110,7 @@ async fn collect_partial_update_rows(
                 if strs.is_null(i) {
                     None
                 } else {
-                    Some(strs.value(i).to_string())
+                    Some(string_value(strs.as_ref(), i).to_string())
                 },
             ));
         }
@@ -136,14 +134,8 @@ async fn collect_aggregation_rows(
             .column_by_name("amount")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let tags = batch
-            .column_by_name("tag")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
-        let notes = batch
-            .column_by_name("note")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let tags = batch.column_by_name("tag").unwrap();
+        let notes = batch.column_by_name("note").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
                 ids.value(i),
@@ -155,12 +147,12 @@ async fn collect_aggregation_rows(
                 if tags.is_null(i) {
                     None
                 } else {
-                    Some(tags.value(i).to_string())
+                    Some(string_value(tags.as_ref(), i).to_string())
                 },
                 if notes.is_null(i) {
                     None
                 } else {
-                    Some(notes.value(i).to_string())
+                    Some(string_value(notes.as_ref(), i).to_string())
                 },
             ));
         }
@@ -573,10 +565,7 @@ async fn test_pk_dynamic_bucket_partitioned() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -586,7 +575,11 @@ async fn test_pk_dynamic_bucket_partitioned() {
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
         for i in 0..batch.num_rows() {
-            rows.push((dts.value(i).to_string(), ids.value(i), vals.value(i)));
+            rows.push((
+                string_value(dts.as_ref(), i).to_string(),
+                ids.value(i),
+                vals.value(i),
+            ));
         }
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -655,10 +648,7 @@ async fn test_pk_dynamic_bucket_partitioned_partial_update() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let dts = batch
-            .column_by_name("dt")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let dts = batch.column_by_name("dt").unwrap();
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
@@ -667,13 +657,10 @@ async fn test_pk_dynamic_bucket_partitioned_partial_update() {
             .column_by_name("v_int")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let strs = batch
-            .column_by_name("v_str")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let strs = batch.column_by_name("v_str").unwrap();
         for i in 0..batch.num_rows() {
             rows.push((
-                dts.value(i).to_string(),
+                string_value(dts.as_ref(), i).to_string(),
                 ids.value(i),
                 if ints.is_null(i) {
                     None
@@ -683,7 +670,7 @@ async fn test_pk_dynamic_bucket_partitioned_partial_update() {
                 if strs.is_null(i) {
                     None
                 } else {
-                    Some(strs.value(i).to_string())
+                    Some(string_value(strs.as_ref(), i).to_string())
                 },
             ));
         }
@@ -1066,12 +1053,9 @@ async fn test_read_spark_dynamic_bucket_and_compare_index() {
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
             .unwrap();
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .unwrap();
+        let names = batch.column_by_name("name").unwrap();
         for i in 0..batch.num_rows() {
-            all_rows.push((ids.value(i), names.value(i).to_string()));
+            all_rows.push((ids.value(i), string_value(names.as_ref(), i).to_string()));
         }
     }
     all_rows.sort_by_key(|(id, _)| *id);

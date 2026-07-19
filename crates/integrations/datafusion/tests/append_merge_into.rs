@@ -22,12 +22,12 @@
 
 mod common;
 
-use arrow_array::{Array, Int32Array, StringArray};
+use arrow_array::{Array, Int32Array};
 use paimon_datafusion::SQLContext;
 
 use common::{
     collect_int_int_str, collect_int_str, collect_three_ints, create_sql_context, create_test_env,
-    exec,
+    exec, string_value,
 };
 
 // ======================= Helpers =======================
@@ -278,11 +278,7 @@ async fn test_partial_insert_with_null() {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let c = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let c = batch.column(2);
         for i in 0..batch.num_rows() {
             rows.push((
                 a.value(i),
@@ -290,7 +286,7 @@ async fn test_partial_insert_with_null() {
                 if c.is_null(i) {
                     None
                 } else {
-                    Some(c.value(i).to_string())
+                    Some(string_value(c.as_ref(), i).to_string())
                 },
             ));
         }
