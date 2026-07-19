@@ -64,6 +64,7 @@ pub struct PaimonCatalogProvider {
     temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
+    schema_force_view_types: bool,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -88,7 +89,18 @@ impl PaimonCatalogProvider {
             temp_tables: Arc::new(RwLock::new(HashMap::new())),
             blob_reader_registry,
             session_state,
+            schema_force_view_types: true,
         }
+    }
+
+    /// Configure whether table schemas use Arrow view types when available.
+    ///
+    /// Disable this for consumers that cannot operate on Arrow view arrays. This changes the
+    /// schema exposed to DataFusion, so query operators above the table scan will use the classic
+    /// Arrow types as well.
+    pub fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
+        self.schema_force_view_types = schema_force_view_types;
+        self
     }
 }
 
@@ -112,6 +124,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         let blob_reader_registry = self.blob_reader_registry.clone();
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
+        let schema_force_view_types = self.schema_force_view_types;
         let name = name.to_string();
 
         let temp_provider = {
@@ -122,26 +135,32 @@ impl CatalogProvider for PaimonCatalogProvider {
         block_on_with_runtime(
             async move {
                 match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
-                        catalog_name,
-                        Arc::clone(&catalog),
-                        name,
-                        dynamic_options,
-                        temp_provider,
-                        blob_reader_registry,
-                        session_state,
-                    )) as Arc<dyn SchemaProvider>),
+                    Ok(_) => Some(Arc::new(
+                        PaimonSchemaProvider::new(
+                            catalog_name,
+                            Arc::clone(&catalog),
+                            name,
+                            dynamic_options,
+                            temp_provider,
+                            blob_reader_registry,
+                            session_state,
+                        )
+                        .with_schema_force_view_types(schema_force_view_types),
+                    ) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
-                            Some(Arc::new(PaimonSchemaProvider::new(
-                                catalog_name,
-                                Arc::clone(&catalog),
-                                name,
-                                dynamic_options,
-                                temp_provider,
-                                blob_reader_registry,
-                                session_state,
-                            )) as Arc<dyn SchemaProvider>)
+                            Some(Arc::new(
+                                PaimonSchemaProvider::new(
+                                    catalog_name,
+                                    Arc::clone(&catalog),
+                                    name,
+                                    dynamic_options,
+                                    temp_provider,
+                                    blob_reader_registry,
+                                    session_state,
+                                )
+                                .with_schema_force_view_types(schema_force_view_types),
+                            ) as Arc<dyn SchemaProvider>)
                         } else {
                             None
                         }
@@ -166,6 +185,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         let blob_reader_registry = self.blob_reader_registry.clone();
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
+        let schema_force_view_types = self.schema_force_view_types;
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -173,15 +193,18 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::new(
-                    catalog_name,
-                    Arc::clone(&catalog),
-                    name,
-                    dynamic_options,
-                    None,
-                    blob_reader_registry,
-                    session_state,
-                )) as Arc<dyn SchemaProvider>))
+                Ok(Some(Arc::new(
+                    PaimonSchemaProvider::new(
+                        catalog_name,
+                        Arc::clone(&catalog),
+                        name,
+                        dynamic_options,
+                        None,
+                        blob_reader_registry,
+                        session_state,
+                    )
+                    .with_schema_force_view_types(schema_force_view_types),
+                ) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
         )
@@ -197,6 +220,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         let blob_reader_registry = self.blob_reader_registry.clone();
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
+        let schema_force_view_types = self.schema_force_view_types;
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -204,15 +228,18 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                Ok(Some(Arc::new(PaimonSchemaProvider::new(
-                    catalog_name,
-                    Arc::clone(&catalog),
-                    name,
-                    dynamic_options,
-                    None,
-                    blob_reader_registry,
-                    session_state,
-                )) as Arc<dyn SchemaProvider>))
+                Ok(Some(Arc::new(
+                    PaimonSchemaProvider::new(
+                        catalog_name,
+                        Arc::clone(&catalog),
+                        name,
+                        dynamic_options,
+                        None,
+                        blob_reader_registry,
+                        session_state,
+                    )
+                    .with_schema_force_view_types(schema_force_view_types),
+                ) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
         )
@@ -313,6 +340,7 @@ pub struct PaimonSchemaProvider {
     temp_provider: Option<Arc<MemorySchemaProvider>>,
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
+    schema_force_view_types: bool,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -343,7 +371,13 @@ impl PaimonSchemaProvider {
             temp_provider,
             blob_reader_registry,
             session_state,
+            schema_force_view_types: true,
         }
+    }
+
+    fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
+        self.schema_force_view_types = schema_force_view_types;
+        self
     }
 }
 
@@ -409,6 +443,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         let blob_reader_registry = self.blob_reader_registry.clone();
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
+        let schema_force_view_types = self.schema_force_view_types;
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
         await_with_runtime(async move {
@@ -440,7 +475,8 @@ impl SchemaProvider for PaimonSchemaProvider {
                             blob_reader_registry,
                             table_definition,
                         )?
-                    };
+                    }
+                    .with_schema_force_view_types(schema_force_view_types)?;
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }
                 Err(paimon::Error::TableNotExist { .. }) => {

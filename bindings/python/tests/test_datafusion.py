@@ -478,6 +478,27 @@ def test_query_simple_table_via_catalog_provider():
     ]
 
 
+def test_catalog_provider_returns_pyarrow_compatible_strings():
+    with tempfile.TemporaryDirectory() as warehouse:
+        writer = SQLContext()
+        writer.register_catalog("paimon", {"warehouse": warehouse})
+        writer.sql("CREATE TABLE paimon.default.users (id INT, name STRING)")
+        writer.sql(
+            "INSERT INTO paimon.default.users VALUES (2, 'bob'), (1, 'alice')"
+        )
+
+        ctx = SessionContext()
+        ctx.register_catalog_provider(
+            "paimon", PaimonCatalog({"warehouse": warehouse})
+        )
+
+        batches = ctx.sql("SELECT id, name FROM paimon.default.users").collect()
+        assert batches[0].schema.field("name").type == pa.string()
+        assert pa.Table.from_batches(batches).sort_by("id").to_pylist() == [
+            {"id": 1, "name": "alice"},
+            {"id": 2, "name": "bob"},
+        ]
+
 
 def test_sql_context_ddl_dml():
     with tempfile.TemporaryDirectory() as warehouse:

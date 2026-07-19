@@ -60,7 +60,10 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
     fields
 }
 
-fn datafusion_arrow_schema(fields: &[DataField]) -> DFResult<ArrowSchemaRef> {
+fn datafusion_arrow_schema(
+    fields: &[DataField],
+    schema_force_view_types: bool,
+) -> DFResult<ArrowSchemaRef> {
     let paimon_schema =
         paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
     let fields = paimon_schema
@@ -70,7 +73,7 @@ fn datafusion_arrow_schema(fields: &[DataField]) -> DFResult<ArrowSchemaRef> {
             let mut metadata = field.metadata().clone();
             metadata.remove(PARQUET_FIELD_ID_META_KEY);
             let data_type = match field.data_type() {
-                ArrowDataType::Utf8 => ArrowDataType::Utf8View,
+                ArrowDataType::Utf8 if schema_force_view_types => ArrowDataType::Utf8View,
                 data_type => data_type.clone(),
             };
             Arc::new(
@@ -119,7 +122,7 @@ impl PaimonTableProvider {
         table_definition: Option<String>,
     ) -> DFResult<Self> {
         let fields = datafusion_read_fields(&table);
-        let schema = datafusion_arrow_schema(&fields)?;
+        let schema = datafusion_arrow_schema(&fields, true)?;
         Ok(Self {
             table,
             schema,
@@ -144,6 +147,18 @@ impl PaimonTableProvider {
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)
+    }
+
+    pub(crate) fn with_schema_force_view_types(
+        mut self,
+        schema_force_view_types: bool,
+    ) -> DFResult<Self> {
+        if schema_force_view_types {
+            return Ok(self);
+        }
+        let fields = datafusion_read_fields(&self.table);
+        self.schema = datafusion_arrow_schema(&fields, schema_force_view_types)?;
+        Ok(self)
     }
 
     pub fn table(&self) -> &Table {
@@ -798,28 +813,31 @@ mod tests {
     #[test]
     fn test_datafusion_schema_uses_views_only_for_top_level_strings() {
         let string_type = || DataType::VarChar(VarCharType::string_type());
-        let schema = datafusion_arrow_schema(&[
-            DataField::new(0, "plain".to_string(), string_type()),
-            DataField::new(
-                1,
-                "array".to_string(),
-                DataType::Array(ArrayType::new(string_type())),
-            ),
-            DataField::new(
-                2,
-                "map".to_string(),
-                DataType::Map(MapType::new(string_type(), string_type())),
-            ),
-            DataField::new(
-                3,
-                "row".to_string(),
-                DataType::Row(RowType::new(vec![DataField::new(
-                    4,
-                    "nested".to_string(),
-                    string_type(),
-                )])),
-            ),
-        ])
+        let schema = datafusion_arrow_schema(
+            &[
+                DataField::new(0, "plain".to_string(), string_type()),
+                DataField::new(
+                    1,
+                    "array".to_string(),
+                    DataType::Array(ArrayType::new(string_type())),
+                ),
+                DataField::new(
+                    2,
+                    "map".to_string(),
+                    DataType::Map(MapType::new(string_type(), string_type())),
+                ),
+                DataField::new(
+                    3,
+                    "row".to_string(),
+                    DataType::Row(RowType::new(vec![DataField::new(
+                        4,
+                        "nested".to_string(),
+                        string_type(),
+                    )])),
+                ),
+            ],
+            true,
+        )
         .expect("DataFusion schema should be created");
 
         assert_eq!(schema.field(0).data_type(), &ArrowDataType::Utf8View);

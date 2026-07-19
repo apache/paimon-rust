@@ -118,13 +118,16 @@ impl PaimonCatalog {
     #[new]
     fn new(catalog_options: HashMap<String, String>) -> PyResult<Self> {
         let catalog = build_paimon_catalog(catalog_options)?;
-        let provider = Arc::new(PaimonCatalogProvider::new(
-            None,
-            Arc::clone(&catalog),
-            Default::default(),
-            Default::default(),
-            None,
-        ));
+        let provider = Arc::new(
+            PaimonCatalogProvider::new(
+                None,
+                Arc::clone(&catalog),
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .with_schema_force_view_types(false),
+        );
         Ok(Self { catalog, provider })
     }
 
