@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{serialize_binary_array_str, BinaryRowBuilder};
+use crate::spec::{
+    extract_datum, serialize_binary_array_str, BinaryRow, BinaryRowBuilder, DataField, Datum,
+};
 use chrono::serde::ts_milliseconds_option::deserialize as from_millis_opt;
 use chrono::serde::ts_milliseconds_option::serialize as to_millis_opt;
 use chrono::{DateTime, Utc};
@@ -25,6 +27,14 @@ use std::fmt::{Display, Formatter};
 
 /// Suffix for sidecar file-index files, matching Java `DataFilePathFactory.INDEX_PATH_SUFFIX`.
 pub const DATA_FILE_INDEX_SUFFIX: &str = ".index";
+
+/// Manifest value statistics for one column in one data file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataFileColumnStats {
+    pub min_value: Option<Datum>,
+    pub max_value: Option<Datum>,
+    pub null_count: Option<i64>,
+}
 
 /// Metadata of a data file.
 ///
@@ -160,6 +170,73 @@ fn opt_str_array(b: &mut BinaryRowBuilder, pos: usize, v: &Option<Vec<String>>) 
 }
 
 impl DataFileMeta {
+    /// Decode this file's manifest value statistics for a field in the current schema.
+    ///
+    /// Returns `None` when statistics are missing, malformed, or belong to a different
+    /// schema version. Callers must treat `None` as unknown rather than excluding data.
+    pub fn value_stats_for_field(
+        &self,
+        current_schema_id: i64,
+        current_fields: &[DataField],
+        field: &DataField,
+    ) -> Option<DataFileColumnStats> {
+        if self.schema_id != current_schema_id {
+            return None;
+        }
+
+        let (schema_index, schema_field) = current_fields
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.id() == field.id())?;
+        if schema_field.name() != field.name() || schema_field.data_type() != field.data_type() {
+            return None;
+        }
+        let stats_index = if let Some(columns) = &self.value_stats_cols {
+            columns.iter().position(|name| name == field.name())?
+        } else if let Some(columns) = &self.write_cols {
+            columns.iter().position(|name| name == field.name())?
+        } else {
+            schema_index
+        };
+
+        let min_values = BinaryRow::from_serialized_bytes(self.value_stats.min_values()).ok()?;
+        let max_values = BinaryRow::from_serialized_bytes(self.value_stats.max_values()).ok()?;
+        if stats_index >= usize::try_from(min_values.arity()).ok()?
+            || stats_index >= usize::try_from(max_values.arity()).ok()?
+        {
+            return None;
+        }
+        let min_value = extract_datum(&min_values, stats_index, field.data_type()).ok()?;
+        let max_value = extract_datum(&max_values, stats_index, field.data_type()).ok()?;
+        let null_count = self
+            .value_stats
+            .null_counts()
+            .get(stats_index)
+            .copied()
+            .flatten();
+
+        if self.row_count < 0 || null_count.is_some_and(|count| count < 0 || count > self.row_count)
+        {
+            return None;
+        }
+        let all_null = null_count == Some(self.row_count);
+        if all_null && (min_value.is_some() || max_value.is_some()) {
+            return None;
+        }
+        if let (Some(min), Some(max)) = (&min_value, &max_value) {
+            match min.partial_cmp(max) {
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {}
+                Some(std::cmp::Ordering::Greater) | None => return None,
+            }
+        }
+
+        Some(DataFileColumnStats {
+            min_value,
+            max_value,
+            null_count,
+        })
+    }
+
     /// Returns the row ID range `[first_row_id, first_row_id + row_count - 1]` if `first_row_id` is set.
     pub fn row_id_range(&self) -> Option<(i64, i64)> {
         self.first_row_id.map(|fid| (fid, fid + self.row_count - 1))
@@ -295,6 +372,7 @@ fn parent_path(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::{DataType, IntType};
 
     fn data_file(file_name: &str) -> DataFileMeta {
         let stats = BinaryTableStats::empty();
@@ -320,6 +398,79 @@ mod tests {
             first_row_id: Some(100),
             write_cols: Some(vec!["k".to_string(), "v".to_string()]),
         }
+    }
+
+    fn int_stats(min: Option<i32>, max: Option<i32>, null_count: Option<i64>) -> BinaryTableStats {
+        let data_type = DataType::Int(IntType::new());
+        let min = min.map(Datum::Int);
+        let max = max.map(Datum::Int);
+        BinaryTableStats::new(
+            BinaryRow::from_datums(&[(min.as_ref(), &data_type)]).to_serialized_bytes(),
+            BinaryRow::from_datums(&[(max.as_ref(), &data_type)]).to_serialized_bytes(),
+            vec![null_count],
+        )
+    }
+
+    fn int_field(id: i32, name: &str) -> DataField {
+        DataField::new(id, name.to_string(), DataType::Int(IntType::new()))
+    }
+
+    #[test]
+    fn value_stats_for_field_resolves_dense_columns_and_schema() {
+        let fields = vec![int_field(0, "id"), int_field(1, "v")];
+        let mut file = data_file("data.parquet");
+        file.value_stats = int_stats(Some(3), Some(9), Some(2));
+
+        let stats = file.value_stats_for_field(11, &fields, &fields[1]).unwrap();
+        assert_eq!(stats.min_value, Some(Datum::Int(3)));
+        assert_eq!(stats.max_value, Some(Datum::Int(9)));
+        assert_eq!(stats.null_count, Some(2));
+
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
+        assert!(file
+            .value_stats_for_field(12, &fields, &fields[1])
+            .is_none());
+        assert!(file
+            .value_stats_for_field(11, &fields, &int_field(1, "other"))
+            .is_none());
+    }
+
+    #[test]
+    fn value_stats_for_field_rejects_inconsistent_or_malformed_stats() {
+        let fields = vec![int_field(1, "v")];
+        let mut file = data_file("data.parquet");
+        file.row_count = 4;
+
+        file.value_stats = int_stats(Some(1), Some(4), Some(5));
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
+
+        file.value_stats = int_stats(Some(4), Some(1), Some(0));
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
+
+        file.value_stats = int_stats(Some(1), Some(4), Some(4));
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
+
+        file.value_stats = BinaryTableStats::new(vec![0], vec![0], vec![Some(0)]);
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
+
+        file.value_stats = BinaryTableStats::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            BinaryRow::new(0).to_serialized_bytes(),
+            vec![Some(4)],
+        );
+        assert!(file
+            .value_stats_for_field(11, &fields, &fields[0])
+            .is_none());
     }
 
     #[test]

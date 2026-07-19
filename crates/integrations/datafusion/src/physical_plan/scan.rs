@@ -18,10 +18,12 @@
 use std::sync::Arc;
 
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
+};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
-use datafusion::common::Statistics;
+use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -29,7 +31,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::{DataField, Predicate};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
@@ -60,6 +62,186 @@ fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
 
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(Into::into)
+}
+
+#[derive(Debug)]
+struct ColumnStatsAccumulator {
+    min_value: Option<Datum>,
+    max_value: Option<Datum>,
+    null_count: usize,
+    min_valid: bool,
+    max_valid: bool,
+    null_valid: bool,
+}
+
+impl Default for ColumnStatsAccumulator {
+    fn default() -> Self {
+        Self {
+            min_value: None,
+            max_value: None,
+            null_count: 0,
+            min_valid: true,
+            max_valid: true,
+            null_valid: true,
+        }
+    }
+}
+
+impl ColumnStatsAccumulator {
+    fn add_file(&mut self, file: &paimon::spec::DataFileMeta, field: &DataField, table: &Table) {
+        if file.row_count == 0 {
+            return;
+        }
+        let Some(stats) =
+            file.value_stats_for_field(table.schema().id(), table.schema().fields(), field)
+        else {
+            self.min_valid = false;
+            self.max_valid = false;
+            self.null_valid = false;
+            return;
+        };
+
+        let all_null = stats.null_count == Some(file.row_count);
+        match stats.min_value {
+            Some(value) => match &self.min_value {
+                Some(current) => match value.partial_cmp(current) {
+                    Some(std::cmp::Ordering::Less) => self.min_value = Some(value),
+                    Some(_) => {}
+                    None => self.min_valid = false,
+                },
+                None => self.min_value = Some(value),
+            },
+            None if !all_null => self.min_valid = false,
+            None => {}
+        }
+        match stats.max_value {
+            Some(value) => match &self.max_value {
+                Some(current) => match value.partial_cmp(current) {
+                    Some(std::cmp::Ordering::Greater) => self.max_value = Some(value),
+                    Some(_) => {}
+                    None => self.max_valid = false,
+                },
+                None => self.max_value = Some(value),
+            },
+            None if !all_null => self.max_valid = false,
+            None => {}
+        }
+        match stats
+            .null_count
+            .and_then(|count| usize::try_from(count).ok())
+            .and_then(|count| self.null_count.checked_add(count))
+        {
+            Some(count) => self.null_count = count,
+            None => self.null_valid = false,
+        }
+    }
+
+    fn finish(self, data_type: &ArrowDataType, exact_null_count: bool) -> ColumnStatistics {
+        let min_value = if self.min_valid {
+            self.min_value
+                .and_then(|value| datum_to_scalar(value, data_type))
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent)
+        } else {
+            Precision::Absent
+        };
+        let max_value = if self.max_valid {
+            self.max_value
+                .and_then(|value| datum_to_scalar(value, data_type))
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent)
+        } else {
+            Precision::Absent
+        };
+        let null_count = if exact_null_count && self.null_valid {
+            Precision::Exact(self.null_count)
+        } else {
+            Precision::Absent
+        };
+
+        ColumnStatistics {
+            null_count,
+            min_value,
+            max_value,
+            distinct_count: Precision::Absent,
+            sum_value: Precision::Absent,
+            byte_size: Precision::Absent,
+        }
+    }
+}
+
+fn datum_to_scalar(value: Datum, data_type: &ArrowDataType) -> Option<ScalarValue> {
+    match (value, data_type) {
+        (Datum::Bool(value), ArrowDataType::Boolean) => Some(ScalarValue::Boolean(Some(value))),
+        (Datum::TinyInt(value), ArrowDataType::Int8) => Some(ScalarValue::Int8(Some(value))),
+        (Datum::SmallInt(value), ArrowDataType::Int16) => Some(ScalarValue::Int16(Some(value))),
+        (Datum::Int(value), ArrowDataType::Int32) => Some(ScalarValue::Int32(Some(value))),
+        (Datum::Long(value), ArrowDataType::Int64) => Some(ScalarValue::Int64(Some(value))),
+        (Datum::Float(value), ArrowDataType::Float32) => Some(ScalarValue::Float32(Some(value))),
+        (Datum::Double(value), ArrowDataType::Float64) => Some(ScalarValue::Float64(Some(value))),
+        (Datum::String(value), ArrowDataType::Utf8) => Some(ScalarValue::Utf8(Some(value))),
+        (Datum::String(value), ArrowDataType::Utf8View) => Some(ScalarValue::Utf8View(Some(value))),
+        (Datum::String(value), ArrowDataType::LargeUtf8) => {
+            Some(ScalarValue::LargeUtf8(Some(value)))
+        }
+        (Datum::Date(value), ArrowDataType::Date32) => Some(ScalarValue::Date32(Some(value))),
+        (Datum::Time(value), ArrowDataType::Time32(TimeUnit::Millisecond)) => {
+            Some(ScalarValue::Time32Millisecond(Some(value)))
+        }
+        (Datum::Timestamp { millis, nanos }, ArrowDataType::Timestamp(unit, timezone))
+        | (
+            Datum::LocalZonedTimestamp { millis, nanos },
+            ArrowDataType::Timestamp(unit, timezone),
+        ) => {
+            let value = match unit {
+                TimeUnit::Second => millis.checked_div(1_000)?,
+                TimeUnit::Millisecond => millis,
+                TimeUnit::Microsecond => millis
+                    .checked_mul(1_000)?
+                    .checked_add(i64::from(nanos / 1_000))?,
+                TimeUnit::Nanosecond => millis
+                    .checked_mul(1_000_000)?
+                    .checked_add(i64::from(nanos))?,
+            };
+            match unit {
+                TimeUnit::Second => {
+                    Some(ScalarValue::TimestampSecond(Some(value), timezone.clone()))
+                }
+                TimeUnit::Millisecond => Some(ScalarValue::TimestampMillisecond(
+                    Some(value),
+                    timezone.clone(),
+                )),
+                TimeUnit::Microsecond => Some(ScalarValue::TimestampMicrosecond(
+                    Some(value),
+                    timezone.clone(),
+                )),
+                TimeUnit::Nanosecond => Some(ScalarValue::TimestampNanosecond(
+                    Some(value),
+                    timezone.clone(),
+                )),
+            }
+        }
+        (
+            Datum::Decimal {
+                unscaled,
+                precision,
+                scale,
+            },
+            ArrowDataType::Decimal128(_, _),
+        ) => Some(ScalarValue::Decimal128(
+            Some(unscaled),
+            u8::try_from(precision).ok()?,
+            i8::try_from(scale).ok()?,
+        )),
+        // Paimon compares bytes using Java's signed-byte ordering, while Arrow compares
+        // binary values using unsigned lexicographic ordering. Publishing the manifest
+        // bounds would therefore be unsound for values crossing 0x7f/0x80.
+        (
+            Datum::Bytes(_),
+            ArrowDataType::Binary | ArrowDataType::BinaryView | ArrowDataType::LargeBinary,
+        ) => None,
+        _ => None,
+    }
 }
 
 /// Execution plan that scans a Paimon table with optional column projection.
@@ -150,6 +332,55 @@ impl PaimonTableScan {
     pub fn limit(&self) -> Option<usize> {
         self.limit
     }
+
+    fn manifest_column_statistics(&self, partitions: &[Arc<[DataSplit]>]) -> Vec<ColumnStatistics> {
+        if self.read_type.len() != self.schema().fields().len() {
+            return Statistics::unknown_column(&self.schema());
+        }
+
+        let Ok(merge_engine) = self.table.schema().core_options().merge_engine() else {
+            return Statistics::unknown_column(&self.schema());
+        };
+        if merge_engine == MergeEngine::Aggregation {
+            // Aggregate functions such as SUM can produce logical values outside every
+            // physical file's min/max bounds.
+            return Statistics::unknown_column(&self.schema());
+        }
+
+        let exact_null_counts = (self.table.schema().primary_keys().is_empty()
+            || merge_engine == MergeEngine::Deduplicate)
+            && self.pushed_predicate.is_none()
+            && self.limit.is_none()
+            && partitions
+                .iter()
+                .flat_map(|splits| splits.iter())
+                .all(|split| {
+                    split.raw_convertible()
+                        && split.row_ranges().is_none()
+                        && split
+                            .data_deletion_files()
+                            .is_none_or(|files| files.iter().all(Option::is_none))
+                });
+        let mut accumulators = (0..self.read_type.len())
+            .map(|_| ColumnStatsAccumulator::default())
+            .collect::<Vec<_>>();
+
+        for file in partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .flat_map(|split| split.data_files())
+        {
+            for (accumulator, field) in accumulators.iter_mut().zip(&self.read_type) {
+                accumulator.add_file(file, field, &self.table);
+            }
+        }
+
+        accumulators
+            .into_iter()
+            .zip(self.schema().fields())
+            .map(|(accumulator, field)| accumulator.finish(field.data_type(), exact_null_counts))
+            .collect()
+    }
 }
 
 impl ExecutionPlan for PaimonTableScan {
@@ -227,7 +458,6 @@ impl ExecutionPlan for PaimonTableScan {
         };
 
         let mut total_rows: usize = 0;
-        let mut total_bytes: usize = 0;
         let mut all_row_counts_known = true;
         for splits in partitions {
             for split in splits.iter() {
@@ -236,9 +466,6 @@ impl ExecutionPlan for PaimonTableScan {
                 } else {
                     all_row_counts_known = false;
                     total_rows += split.row_count() as usize;
-                }
-                for file in split.data_files() {
-                    total_bytes += file.file_size as usize;
                 }
             }
         }
@@ -256,8 +483,8 @@ impl ExecutionPlan for PaimonTableScan {
 
         Ok(Arc::new(Statistics {
             num_rows: num_rows_precision,
-            total_byte_size: Precision::Inexact(total_bytes),
-            column_statistics: Statistics::unknown_column(&self.schema()),
+            total_byte_size: Precision::Absent,
+            column_statistics: self.manifest_column_statistics(partitions),
         }))
     }
 }
@@ -320,9 +547,10 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        BinaryRow, DataType, Datum, IntType, PredicateBuilder, Schema as PaimonSchema, TableSchema,
+        BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
+        Schema as PaimonSchema, TableSchema,
     };
-    use paimon::table::Table;
+    use paimon::table::{DeletionFile, RowRange, Table};
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
@@ -341,6 +569,20 @@ mod tests {
             "id".to_string(),
             DataType::Int(IntType::new()),
         )]
+    }
+
+    #[test]
+    fn test_binary_manifest_bounds_are_not_exposed() {
+        for data_type in [
+            ArrowDataType::Binary,
+            ArrowDataType::BinaryView,
+            ArrowDataType::LargeBinary,
+        ] {
+            assert_eq!(
+                datum_to_scalar(Datum::Bytes(vec![0x7f, 0x80]), &data_type),
+                None
+            );
+        }
     }
 
     #[test]
@@ -388,7 +630,10 @@ mod tests {
     /// only test PlanProperties, not actual reads).
     fn dummy_table() -> Table {
         let file_io = FileIOBuilder::new("file").build().unwrap();
-        let schema = PaimonSchema::builder().build().unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
         let table_schema = TableSchema::new(0, &schema);
         Table::new(
             file_io,
@@ -397,6 +642,218 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    fn data_file_with_int_stats(
+        file_name: &str,
+        row_count: i64,
+        min: i32,
+        max: i32,
+        null_count: i64,
+    ) -> DataFileMeta {
+        let data_type = DataType::Int(IntType::new());
+        let min = Datum::Int(min);
+        let max = Datum::Int(max);
+        let mut file =
+            serde_json::to_value(test_data_file::<DataFileMeta>(file_name, row_count, 100))
+                .unwrap();
+        file["_VALUE_STATS"] = serde_json::json!({
+            "_MIN_VALUES": BinaryRow::from_datums(&[(Some(&min), &data_type)]).to_serialized_bytes(),
+            "_MAX_VALUES": BinaryRow::from_datums(&[(Some(&max), &data_type)]).to_serialized_bytes(),
+            "_NULL_COUNTS": [null_count],
+        });
+        serde_json::from_value(file).unwrap()
+    }
+
+    fn split_with_int_stats(
+        row_ranges: Option<Vec<RowRange>>,
+        deletion_file: Option<DeletionFile>,
+    ) -> DataSplit {
+        let mut builder = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/test-table/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_with_int_stats("data.parquet", 4, 1, 4, 1)]);
+        if let Some(row_ranges) = row_ranges {
+            builder = builder.with_row_ranges(row_ranges);
+        }
+        if let Some(deletion_file) = deletion_file {
+            builder = builder.with_data_deletion_files(vec![Some(deletion_file)]);
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_partition_statistics_include_manifest_column_bounds() {
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/test-table/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_with_int_stats("a.parquet", 4, 2, 8, 1),
+                data_file_with_int_stats("b.parquet", 6, 1, 10, 2),
+            ])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split])],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+
+        let statistics = scan.partition_statistics(None).unwrap();
+        let id = &statistics.column_statistics[0];
+
+        assert_eq!(
+            id.min_value,
+            Precision::Inexact(ScalarValue::Int32(Some(1)))
+        );
+        assert_eq!(
+            id.max_value,
+            Precision::Inexact(ScalarValue::Int32(Some(10)))
+        );
+        assert_eq!(id.null_count, Precision::Exact(3));
+    }
+
+    #[test]
+    fn test_partition_statistics_omit_compressed_file_size() {
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/test-table/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_with_int_stats("data.parquet", 4, 1, 4, 0)])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split])],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+
+        let statistics = scan.partition_statistics(None).unwrap();
+
+        assert_eq!(statistics.num_rows, Precision::Exact(4));
+        assert_eq!(statistics.total_byte_size, Precision::Absent);
+    }
+
+    #[test]
+    fn test_partition_statistics_downgrade_unsafe_null_counts() {
+        let table = dummy_table();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_than("id", Datum::Int(1))
+            .unwrap();
+        let cases = vec![
+            (split_with_int_stats(None, None), Some(predicate), None),
+            (split_with_int_stats(None, None), None, Some(2)),
+            (
+                split_with_int_stats(Some(vec![RowRange::new(1, 2)]), None),
+                None,
+                None,
+            ),
+            (
+                split_with_int_stats(
+                    None,
+                    Some(DeletionFile::new("dv.bin".to_string(), 0, 16, Some(1))),
+                ),
+                None,
+                None,
+            ),
+        ];
+
+        for (split, predicate, limit) in cases {
+            let scan = PaimonTableScan::new(
+                test_schema(),
+                table.clone(),
+                test_read_type(),
+                predicate,
+                vec![Arc::from(vec![split])],
+                limit,
+                true,
+                None,
+                None,
+                true,
+            );
+            assert_eq!(
+                scan.partition_statistics(None).unwrap().column_statistics[0].null_count,
+                Precision::Absent
+            );
+        }
+    }
+
+    #[test]
+    fn test_partition_statistics_hide_aggregation_value_bounds() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+        let value_field = table_schema.fields()[1].clone();
+        let table = Table::new(
+            file_io,
+            Identifier::new("test_db", "aggregation_table"),
+            "/tmp/aggregation-table".to_string(),
+            table_schema,
+            None,
+        );
+        let mut file = data_file_with_int_stats("data.parquet", 2, 1, 2, 0);
+        file.value_stats_cols = Some(vec!["value".to_string()]);
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/aggregation-table/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                ArrowDataType::Int32,
+                true,
+            )])),
+            table,
+            vec![value_field],
+            None,
+            vec![Arc::from(vec![split])],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+
+        let value_stats = &scan.partition_statistics(None).unwrap().column_statistics[0];
+        assert_eq!(value_stats.min_value, Precision::Absent);
+        assert_eq!(value_stats.max_value, Precision::Absent);
+        assert_eq!(value_stats.null_count, Precision::Absent);
     }
 
     #[tokio::test]
