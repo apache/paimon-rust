@@ -19,7 +19,7 @@
 //! `PrimaryKeyVectorPositionReader`).
 //!
 //! Materializes the selected physical rows of one data file and appends
-//! `_PKEY_VECTOR_POSITION` (+ optional `_PKEY_VECTOR_SCORE`) metadata columns.
+//! `_PKEY_VECTOR_POSITION` (+ optional `__paimon_search_score`) metadata columns.
 //! This is the lowest layer of the PK-vector read kernel; the sibling
 //! `pk_vector_indexed_split_read` and `pk_vector_orchestrator` modules build the
 //! indexed-split contract and cross-bucket merge on top of it.
@@ -38,7 +38,9 @@ use crate::table::source::DataSplit;
 use crate::table::ArrowRecordBatchStream;
 
 pub(crate) const PKEY_VECTOR_POSITION_COLUMN: &str = "_PKEY_VECTOR_POSITION";
-pub(crate) const PKEY_VECTOR_SCORE_COLUMN: &str = "_PKEY_VECTOR_SCORE";
+// Unified user-visible vector-search score column (matches the engine metadata
+// column name used by Spark and the DataFusion table function).
+pub(crate) const SEARCH_SCORE_COLUMN: &str = "__paimon_search_score";
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -104,9 +106,7 @@ impl<'a> PkVectorPositionRead<'a> {
 
         // (3) reserved-column-name check against the requested output fields
         for field in self.reader.read_type() {
-            if field.name() == PKEY_VECTOR_POSITION_COLUMN
-                || field.name() == PKEY_VECTOR_SCORE_COLUMN
-            {
+            if field.name() == PKEY_VECTOR_POSITION_COLUMN || field.name() == SEARCH_SCORE_COLUMN {
                 return Err(data_invalid(format!(
                     "Reserved metadata column name conflicts with a table column: {}",
                     field.name()
@@ -185,7 +185,7 @@ impl<'a> PkVectorPositionRead<'a> {
     }
 }
 
-/// Append `_PKEY_VECTOR_POSITION` (and, when `want_score_col`, `_PKEY_VECTOR_SCORE`)
+/// Append `_PKEY_VECTOR_POSITION` (and, when `want_score_col`, `__paimon_search_score`)
 /// to `batch`. `positions` are the file-LOCAL physical positions of the batch's
 /// rows, supplied by the caller's cursor into the effective (DV-filtered)
 /// selection, so they align 1:1 with the batch rows in order. Scores are looked
@@ -232,7 +232,7 @@ fn append_metadata_columns(
     columns.push(Arc::new(Int64Array::from(positions.to_vec())));
     if let Some(sv) = score_vals {
         fields.push(ArrowField::new(
-            PKEY_VECTOR_SCORE_COLUMN,
+            SEARCH_SCORE_COLUMN,
             ArrowDataType::Float32,
             false,
         ));
@@ -557,7 +557,7 @@ mod tests {
     async fn test_reads_selected_positions_with_position_column() {
         // rows id=[10,11,12,13,14], first_row_id=0, select positions [0,2,4]
         // -> output ids [10,12,14], _PKEY_VECTOR_POSITION [0,2,4], ascending;
-        // no _ROW_ID leak and no _PKEY_VECTOR_SCORE column.
+        // no _ROW_ID leak and no __paimon_search_score column.
         let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13, 14]));
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_basic",
@@ -594,7 +594,7 @@ mod tests {
                 "_ROW_ID must not leak into output"
             );
             assert!(
-                column_by_name(batch, PKEY_VECTOR_SCORE_COLUMN).is_none(),
+                column_by_name(batch, SEARCH_SCORE_COLUMN).is_none(),
                 "_PKEY_VECTOR_SCORE must be absent when no scores are supplied"
             );
         }
@@ -603,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn test_score_alignment_non_contiguous() {
         // select [0,2,5] with scores {0:0.9, 2:0.5, 5:0.1}
-        // -> _PKEY_VECTOR_SCORE aligned by returned position: [0.9,0.5,0.1].
+        // -> __paimon_search_score aligned by returned position: [0.9,0.5,0.1].
         let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12, 13, 14, 15]));
         let (reader, split, _dv) = build_reader_and_split(
             "memory:/pkvpr_scores",
@@ -636,7 +636,7 @@ mod tests {
             vec![0, 2, 5]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.9, 0.5, 0.1]
         );
     }
@@ -669,7 +669,7 @@ mod tests {
             .unwrap();
 
         for batch in &batches {
-            assert!(column_by_name(batch, PKEY_VECTOR_SCORE_COLUMN).is_none());
+            assert!(column_by_name(batch, SEARCH_SCORE_COLUMN).is_none());
         }
     }
 
@@ -704,7 +704,7 @@ mod tests {
             vec![0, 2, 3]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.4, 0.2, 0.1]
         );
     }
@@ -755,7 +755,7 @@ mod tests {
             vec![1, 2, 4]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.9, 0.5, 0.1]
         );
     }
@@ -814,7 +814,7 @@ mod tests {
             vec![1, 3, 4, 5]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.9, 0.5, 0.3, 0.1]
         );
     }

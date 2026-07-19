@@ -200,7 +200,7 @@ async fn reads_back_java_written_pk_vector_table() {
 
     // execute_read() materializes rows by physical position, so it MUST succeed
     // and emit the top-k best-first. The `id` column cross-checks the
-    // position->id mapping (the fixture pins them equal) and `_PKEY_VECTOR_SCORE`
+    // position->id mapping (the fixture pins them equal) and `__paimon_search_score`
     // carries the metric score.
     let mut builder = table.new_vector_search_builder();
     builder
@@ -222,7 +222,7 @@ async fn reads_back_java_written_pk_vector_table() {
         "materialized `id` column must be best-first and match the analytic top-k"
     );
 
-    let scores = batch_f32(&batches, "_PKEY_VECTOR_SCORE");
+    let scores = batch_f32(&batches, "__paimon_search_score");
     assert_eq!(scores.len(), k);
     for (got, want) in scores.iter().zip(&expected_scores) {
         assert!(

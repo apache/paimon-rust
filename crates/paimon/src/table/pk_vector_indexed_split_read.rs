@@ -367,9 +367,7 @@ mod e2e_tests {
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataField, DataFileMeta, DataType, IntType};
     use crate::table::data_file_reader::DataFileReader;
-    use crate::table::pk_vector_position_read::{
-        PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
-    };
+    use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
     use crate::table::schema_manager::SchemaManager;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
     use arrow_array::{Array, Float32Array, Int32Array, Int64Array, RecordBatch};
@@ -632,7 +630,7 @@ mod e2e_tests {
                 column_by_name(batch, "_ROW_ID").is_none(),
                 "_ROW_ID must not leak"
             );
-            assert!(column_by_name(batch, PKEY_VECTOR_SCORE_COLUMN).is_none());
+            assert!(column_by_name(batch, SEARCH_SCORE_COLUMN).is_none());
         }
     }
 
@@ -659,7 +657,7 @@ mod e2e_tests {
             vec![0, 2, 3]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.9, 0.5, 0.1]
         );
     }
@@ -689,7 +687,7 @@ mod e2e_tests {
             vec![0, 2, 3]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.4, 0.2, 0.1]
         );
     }
@@ -729,7 +727,7 @@ mod e2e_tests {
             vec![1, 2, 4]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![0.9, 0.5, 0.1]
         );
     }

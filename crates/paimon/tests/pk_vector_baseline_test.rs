@@ -22,7 +22,7 @@
 //! the snapshot/manifest/index-manifest metadata — then reads it back through the
 //! public `new_vector_search_builder()` API and asserts both the search result
 //! (`execute_scored()` -> `row_ids`/`scores`) and the materialized rows
-//! (`execute_read()` -> Arrow batches, best-first order, `_PKEY_VECTOR_SCORE`).
+//! (`execute_read()` -> Arrow batches, best-first order, `__paimon_search_score`).
 //!
 //! Why Rust-built rather than a committed cross-language fixture: the Java
 //! primary-key vector ANN segment is an opaque native Lumina format that cannot
@@ -491,7 +491,7 @@ async fn read_id_and_scores(
     let scores: Vec<f32> = batches
         .iter()
         .flat_map(|b| {
-            let idx = b.schema().index_of("_PKEY_VECTOR_SCORE").unwrap();
+            let idx = b.schema().index_of("__paimon_search_score").unwrap();
             b.column(idx)
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -601,7 +601,7 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     );
 
     // Search-and-read: execute_read() materializes the matching rows best-first
-    // with a `_PKEY_VECTOR_SCORE` column, hiding `_ROW_ID`/`_PKEY_VECTOR_POSITION`.
+    // with a `__paimon_search_score` column, hiding `_ROW_ID`/`_PKEY_VECTOR_POSITION`.
     // Projection ['id'] excludes the vector column.
     let (ids, scores, batches) = read_id_and_scores(&table, query.to_vec(), 3, Some(&["id"])).await;
 
@@ -634,7 +634,7 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
 /// back a fixture whose nearest neighbours are at physical positions 5, 1, 3 (in
 /// that order) and asserts the materialized output is emitted best-first
 /// [5, 1, 3], not in ascending physical position [1, 3, 5]. Also asserts the full
-/// row content (id + vector values) and the aligned `_PKEY_VECTOR_SCORE`, with no
+/// row content (id + vector values) and the aligned `__paimon_search_score`, with no
 /// `_ROW_ID`/`_PKEY_VECTOR_POSITION` leaking.
 // Gated off Windows for the same `file://` tempdir reason as the test above.
 #[cfg(not(windows))]
@@ -680,7 +680,7 @@ async fn pk_vector_read_orders_rows_best_first_not_by_position() {
         );
     }
 
-    // Score alignment: `_PKEY_VECTOR_SCORE` matches metric.distance_to_score for
+    // Score alignment: `__paimon_search_score` matches metric.distance_to_score for
     // each emitted row, in best-first order.
     assert_eq!(scores.len(), 3);
     for (got, (_, distance)) in scores.iter().zip(&expected) {
@@ -712,7 +712,7 @@ async fn pk_vector_read_orders_rows_best_first_not_by_position() {
 /// Shared body for the two physical-coordinate contract tests below. Builds the
 /// discriminating fixture with the caller's `first_row_id`, reads it back with the
 /// default projection, and asserts the materialized rows are the file-LOCAL
-/// best-first top-k (id column, vector content, aligned `_PKEY_VECTOR_SCORE`),
+/// best-first top-k (id column, vector content, aligned `__paimon_search_score`),
 /// invariant to `first_row_id`. The discriminating fixture makes best-first order
 /// [5, 1, 3] distinct from ascending physical position [1, 3, 5], so a
 /// position/global-id confusion cannot pass by coincidence.
@@ -862,7 +862,7 @@ async fn read_id_and_scores_filtered(
     let scores: Vec<f32> = batches
         .iter()
         .flat_map(|b| {
-            let idx = b.schema().index_of("_PKEY_VECTOR_SCORE").unwrap();
+            let idx = b.schema().index_of("__paimon_search_score").unwrap();
             b.column(idx)
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -954,7 +954,7 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
     );
 
     // Search-and-read with the residual: default projection materializes id +
-    // vector column, best-first, with an aligned `_PKEY_VECTOR_SCORE`.
+    // vector column, best-first, with an aligned `__paimon_search_score`.
     let (ids, scores, batches) =
         read_id_and_scores_filtered(&table, query.to_vec(), 3, residual).await;
 

@@ -21,8 +21,8 @@ use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
 use crate::spec::{
-    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
-    IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
+    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
@@ -35,9 +35,7 @@ use crate::table::pk_vector_orchestrator::{
     as_split_exact_reader_factory, build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator,
     PkVectorSearchSplit,
 };
-use crate::table::pk_vector_position_read::{
-    PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
-};
+use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::source::DataSplit;
@@ -59,6 +57,7 @@ use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
 const INDEX_DIR: &str = "index";
 
@@ -159,7 +158,7 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     /// Restrict the columns materialized by [`execute_read`](Self::execute_read)
-    /// to `cols` (plus the always-appended `_PKEY_VECTOR_SCORE`). Without this
+    /// to `cols` (plus the always-appended `__paimon_search_score`). Without this
     /// call `execute_read` materializes every user table column. Only affects
     /// `execute_read`; the search-only paths ignore it.
     pub fn with_projection(&mut self, cols: &[&str]) -> &mut Self {
@@ -241,11 +240,11 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     /// Run the vector search and materialize the matching rows as Arrow batches,
-    /// ordered best-first. Only supported for primary-key vector indexes; a
-    /// data-evolution table or a query targeting a non-PK-vector column fails
-    /// loud. Output columns are the projected user table columns (all user
-    /// columns by default, or those set via
-    /// [`with_projection`](Self::with_projection)) plus `_PKEY_VECTOR_SCORE`;
+    /// ordered best-first. Supported for both primary-key vector indexes and
+    /// data-evolution (global-index) vector search; a query targeting a column
+    /// that is neither fails loud. Output columns are the projected user table
+    /// columns (all user columns by default, or those set via
+    /// [`with_projection`](Self::with_projection)) plus `__paimon_search_score`;
     /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
@@ -283,10 +282,58 @@ impl<'a> VectorSearchBuilder<'a> {
             }
         }
 
-        Err(crate::Error::DataInvalid {
-            message: "vector search read is only supported for primary-key vector indexes".into(),
-            source: None,
-        })
+        // Data-evolution (global-index) vector search: materialize rows from the
+        // scored global row-ids and attach the unified score column. A non-vector
+        // column or a set filter fails loud inside execute_scored below.
+        self.execute_de_vector_read().await
+    }
+
+    /// Materialize the best-first data-evolution vector search hits into Arrow
+    /// rows. The global-index search returns global `_ROW_ID`s and their scores; a
+    /// subsequent row-range read materializes those rows, and each row's score is
+    /// joined back by `_ROW_ID`. Output columns are the projected user table
+    /// columns (all user columns by default) plus `__paimon_search_score`; `_ROW_ID`
+    /// is always hidden. A filter is unsupported here and fails loud inside
+    /// `execute_scored`.
+    async fn execute_de_vector_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+        let sr = self.execute_scored().await?;
+
+        // Resolve the projected user columns up front so an invalid projection
+        // fails loud even when the result is empty.
+        let mut read_type = self.resolve_materialize_read_type()?;
+
+        if sr.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // rank = ordinal in the best-first scored result; score = the aligned score.
+        // Build ranges first (validates ids fit in i64::MAX) before constructing the map.
+        let ranges = sr.to_row_ranges()?;
+        let mut rank_score_of: HashMap<i64, (usize, f32)> = HashMap::new();
+        for (rank, (&id, &score)) in sr.row_ids.iter().zip(sr.scores.iter()).enumerate() {
+            rank_score_of.insert(id as i64, (rank, score));
+        }
+
+        // Add _ROW_ID as the join key for score alignment; it is stripped before output.
+        if !read_type.iter().any(|f| f.name() == ROW_ID_FIELD_NAME) {
+            read_type.push(row_id_data_field());
+        }
+
+        let mut read_builder = self.table.new_read_builder();
+        read_builder
+            .with_read_type(read_type)
+            .with_row_ranges(ranges);
+        let scan = read_builder.new_scan();
+        let plan = scan.plan().await?;
+        let table_read = read_builder.new_read()?;
+        let mut stream = table_read.to_arrow(plan.splits())?;
+
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            batches.push(batch);
+        }
+        let output = attach_scores_by_row_id(&batches, &rank_score_of, sr.len())?;
+        Ok(Box::pin(stream::iter(output.into_iter().map(Ok))))
     }
 
     /// Shared PK-vector search core for both the search-only and search-and-read
@@ -492,7 +539,7 @@ impl<'a> VectorSearchBuilder<'a> {
     ///
     /// Output columns are the projected user table columns (all user columns when
     /// [`with_projection`](Self::with_projection) was not called) plus
-    /// `_PKEY_VECTOR_SCORE`; `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always
+    /// `__paimon_search_score`; `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always
     /// hidden. Rows are emitted best-first (the candidate order), which differs
     /// from the file/position order the orchestrator materializes in.
     async fn execute_primary_key_vector_read(
@@ -588,8 +635,9 @@ impl<'a> VectorSearchBuilder<'a> {
             Some(names) => {
                 for name in names {
                     if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == PKEY_VECTOR_SCORE_COLUMN
+                        || name == SEARCH_SCORE_COLUMN
                         || name == ROW_ID_FIELD_NAME
+                        || name == "_PKEY_VECTOR_SCORE"
                     {
                         return Err(crate::Error::DataInvalid {
                             message: format!(
@@ -1194,7 +1242,7 @@ fn collect_ranked_rows(
 
 /// Reorder the materialized rows into best-first order and drop the internal
 /// `_PKEY_VECTOR_POSITION` column, yielding a single output batch (empty input
-/// yields no batches). The projected user columns and `_PKEY_VECTOR_SCORE` are
+/// yields no batches). The projected user columns and `__paimon_search_score` are
 /// retained.
 fn reorder_and_strip_position(
     batches: &[RecordBatch],
@@ -1216,7 +1264,7 @@ fn reorder_and_strip_position(
         })?;
 
     // Drop the internal position column; keep every other column (projected user
-    // columns + _PKEY_VECTOR_SCORE) in order.
+    // columns + __paimon_search_score) in order.
     let position_idx = reordered
         .schema()
         .index_of(PKEY_VECTOR_POSITION_COLUMN)
@@ -1234,6 +1282,132 @@ fn reorder_and_strip_position(
             source: None,
         })?;
     Ok(vec![projected])
+}
+
+/// The `_ROW_ID` field to append to a data-evolution read type so the reader
+/// fills each row's global id. Mirrors the field the `DataEvolutionReader`
+/// recognizes (Int64 / `BigInt`, nullable): a data file lacking `first_row_id`
+/// yields nulls here, which `attach_scores_by_row_id` then fails loud on rather
+/// than mis-aligning scores.
+fn row_id_data_field() -> DataField {
+    DataField::new(
+        ROW_ID_FIELD_ID,
+        ROW_ID_FIELD_NAME.to_string(),
+        DataType::BigInt(BigIntType::with_nullable(true)),
+    )
+}
+
+/// Collect materialized DE rows, join each row's `(rank, score)` by its global
+/// `_ROW_ID`, reorder to the search rank order, append the `__paimon_search_score`
+/// column, and drop `_ROW_ID`. Every row must map to a search candidate and the
+/// total materialized count must equal `expected_len`; a miss or count mismatch
+/// fails loud rather than silently dropping or NaN-scoring a row. Empty input
+/// yields no batches.
+fn attach_scores_by_row_id(
+    batches: &[RecordBatch],
+    rank_score_of: &HashMap<i64, (usize, f32)>,
+    expected_len: usize,
+) -> crate::Result<Vec<RecordBatch>> {
+    // (rank, batch_index, row_index, score) per materialized row.
+    let mut ranked: Vec<(usize, usize, usize, f32)> = Vec::new();
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let row_id_idx =
+            batch
+                .schema()
+                .index_of(ROW_ID_FIELD_NAME)
+                .map_err(|_| crate::Error::DataInvalid {
+                    message: format!("materialized batch missing {ROW_ID_FIELD_NAME} column"),
+                    source: None,
+                })?;
+        let col = batch.column(row_id_idx);
+        let ids =
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!("{ROW_ID_FIELD_NAME} column is not Int64"),
+                    source: None,
+                })?;
+        for row_index in 0..batch.num_rows() {
+            if ids.is_null(row_index) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "materialized DE vector row has null {ROW_ID_FIELD_NAME}; cannot align score"
+                    ),
+                    source: None,
+                });
+            }
+            let id = ids.value(row_index);
+            let (rank, score) =
+                *rank_score_of
+                    .get(&id)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!(
+                        "materialized DE vector row (row id {id}) has no matching search candidate"
+                    ),
+                        source: None,
+                    })?;
+            ranked.push((rank, batch_index, row_index, score));
+        }
+    }
+
+    if ranked.len() != expected_len {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "DE vector materialization produced {} rows but search returned {expected_len}",
+                ranked.len()
+            ),
+            source: None,
+        });
+    }
+    if ranked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    ranked.sort_by_key(|r| r.0);
+    let indices: Vec<(usize, usize)> = ranked.iter().map(|r| (r.1, r.2)).collect();
+    let refs: Vec<&RecordBatch> = batches.iter().collect();
+    let reordered =
+        interleave_record_batch(&refs, &indices).map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to reorder DE vector search rows: {e}"),
+            source: None,
+        })?;
+
+    // Drop _ROW_ID.
+    let row_id_idx = reordered
+        .schema()
+        .index_of(ROW_ID_FIELD_NAME)
+        .map_err(|_| crate::Error::DataInvalid {
+            message: format!("reordered batch missing {ROW_ID_FIELD_NAME} column"),
+            source: None,
+        })?;
+    let keep: Vec<usize> = (0..reordered.num_columns())
+        .filter(|i| *i != row_id_idx)
+        .collect();
+    let stripped = reordered
+        .project(&keep)
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to drop {ROW_ID_FIELD_NAME} column: {e}"),
+            source: None,
+        })?;
+
+    // Append the score column in rank order.
+    let scores: Vec<f32> = ranked.iter().map(|r| r.3).collect();
+    let score_array: Arc<dyn Array> = Arc::new(Float32Array::from(scores));
+    let mut fields: Vec<Arc<arrow_schema::Field>> =
+        stripped.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        SEARCH_SCORE_COLUMN,
+        arrow_schema::DataType::Float32,
+        false,
+    )));
+    let out_schema = Arc::new(arrow_schema::Schema::new(fields));
+    let mut columns = stripped.columns().to_vec();
+    columns.push(score_array);
+    let out = RecordBatch::try_new(out_schema, columns).map_err(|e| crate::Error::DataInvalid {
+        message: format!("failed to append DE vector score column: {e}"),
+        source: None,
+    })?;
+    Ok(vec![out])
 }
 
 fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
@@ -2047,8 +2221,9 @@ mod tests {
         IndexFileMeta, IndexManifestEntry, IntType, PredicateBuilder, Schema, TableSchema,
     };
     use crate::table::source::DataSplitBuilder;
+    use crate::table::{TableCommit, TableWrite};
     use crate::vindex::IVF_FLAT_IDENTIFIER;
-    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
     use arrow_array::ArrayRef;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -2732,6 +2907,87 @@ mod tests {
         )
     }
 
+    /// A data-evolution (global-index) vector table with a committed IVF-flat
+    /// index over the `embedding` column: row-tracking + data-evolution +
+    /// global-index enabled so committed data files carry `first_row_id` and the
+    /// search returns global row-ids that `execute_read` can materialize. The
+    /// returned table has one committed batch of `(id, embedding)` rows and a real
+    /// vindex index built end-to-end.
+    async fn de_vector_table() -> Table {
+        let table_path = "memory:/de_vector_search_test";
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("global-index.enabled", "true")
+            .option("global-index.row-count-per-shard", "10")
+            .option("ivf-flat.dimension", "2")
+            .option("ivf-flat.nlist", "2")
+            .build()
+            .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "de_vector_test"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+
+        let ids = vec![1, 2, 3];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+        for vector in vectors {
+            for value in vector {
+                vector_builder.values().append_value(value);
+            }
+            vector_builder.append(true);
+        }
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(vector_builder.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let built = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap();
+        assert!(built > 0, "DE fixture must build a global vector index");
+        table
+    }
+
     #[tokio::test]
     async fn pk_branch_disabled_falls_through_to_de_path() {
         // No pk-vector.index.columns: behaves exactly as the DE path. With no
@@ -2977,13 +3233,13 @@ mod tests {
     // ---- Task B: search-and-read (`execute_read`) tests ----
 
     /// Build a small materialization batch: user column `id: Int32`, the internal
-    /// `_PKEY_VECTOR_POSITION: Int64`, and `_PKEY_VECTOR_SCORE: Float32` (mirroring
+    /// `_PKEY_VECTOR_POSITION: Int64`, and `__paimon_search_score: Float32` (mirroring
     /// what `PkVectorIndexedSplitRead` emits for a single file).
     fn materialized_batch(rows: &[(i32, i64, f32)]) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new(PKEY_VECTOR_POSITION_COLUMN, ArrowDataType::Int64, false),
-            ArrowField::new(PKEY_VECTOR_SCORE_COLUMN, ArrowDataType::Float32, false),
+            ArrowField::new(SEARCH_SCORE_COLUMN, ArrowDataType::Float32, false),
         ]));
         let ids = Int32Array::from(rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>());
         let positions = Int64Array::from(rows.iter().map(|(_, pos, _)| *pos).collect::<Vec<_>>());
@@ -3045,7 +3301,7 @@ mod tests {
         assert_eq!(i32_col(out, "id"), vec![41, 42, 40]);
         // Score column preserved and aligned to the reordered rows.
         assert_eq!(
-            f32_col(out, PKEY_VECTOR_SCORE_COLUMN),
+            f32_col(out, SEARCH_SCORE_COLUMN),
             vec![l2_score(1.0), l2_score(4.0), l2_score(9.0)]
         );
         // Position column dropped; _ROW_ID never present.
@@ -3073,7 +3329,7 @@ mod tests {
         let out = reorder_and_strip_position(&batches, ranked).unwrap();
         assert_eq!(i32_col(&out[0], "id"), vec![20, 11, 10]);
         assert_eq!(
-            f32_col(&out[0], PKEY_VECTOR_SCORE_COLUMN),
+            f32_col(&out[0], SEARCH_SCORE_COLUMN),
             vec![l2_score(0.5), l2_score(1.0), l2_score(9.0)]
         );
     }
@@ -3100,50 +3356,185 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attach_scores_reorders_by_rank_not_score() {
+        use arrow_array::{Int32Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Two rows materialized in row-id order [10, 20]; ranks say 20 is best (rank 0),
+        // 10 is rank 1. Scores tie at 0.5 to prove ordering follows rank, not score.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID_FIELD_NAME, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(20i64, (0usize, 0.5f32));
+        map.insert(10i64, (1usize, 0.5f32));
+
+        let out = attach_scores_by_row_id(&[batch], &map, 2).unwrap();
+        assert_eq!(out.len(), 1);
+        let b = &out[0];
+        // _ROW_ID stripped, score appended.
+        assert!(b.schema().index_of(ROW_ID_FIELD_NAME).is_err());
+        let score_idx = b.schema().index_of("__paimon_search_score").unwrap();
+        assert_eq!(
+            b.schema().field(score_idx).data_type(),
+            &arrow_schema::DataType::Float32
+        );
+        // Row order is rank order: id 200 (rank 0) first, then id 100 (rank 1).
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(ids.values(), &[200, 100]);
+    }
+
+    #[test]
+    fn attach_scores_fails_on_unknown_row_id() {
+        use arrow_array::{Int32Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID_FIELD_NAME, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![99])),
+            ],
+        )
+        .unwrap();
+        let map: HashMap<i64, (usize, f32)> = HashMap::new(); // no entry for 99
+        let err = attach_scores_by_row_id(&[batch], &map, 1).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn attach_scores_fails_on_count_mismatch() {
+        use arrow_array::{Int32Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID_FIELD_NAME, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(10i64, (0usize, 0.5f32));
+        // expected_len 2 but only 1 row materialized.
+        let err = attach_scores_by_row_id(&[batch], &map, 2).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn attach_scores_fails_on_null_row_id() {
+        use arrow_array::{Int32Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        // _ROW_ID column has a NULL at row 1; the map contains the non-null id, so
+        // the failure is specifically the null (not an unknown id).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID_FIELD_NAME, DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![Some(10i64), None])),
+            ],
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(10i64, (0usize, 0.5f32));
+        let err = attach_scores_by_row_id(&[batch], &map, 2).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn attach_scores_fails_on_wrong_type_row_id() {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        // _ROW_ID column is Int32, not Int64: the downcast fails loud.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID_FIELD_NAME, DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert(10i64, (0usize, 0.5f32));
+        let err = attach_scores_by_row_id(&[batch], &map, 1).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
     #[tokio::test]
-    async fn execute_read_de_table_fails_loud() {
-        // No pk-vector index configured: execute_read must fail loud (the DE path
-        // has no row materialization).
+    async fn execute_read_de_table_empty_snapshot_yields_empty_stream() {
+        // No pk-vector index configured and no snapshot: execute_read routes to the
+        // data-evolution path, whose search finds nothing and returns an empty
+        // stream (not an error).
         let table = pk_vector_table(&[]);
-        let err = table
+        let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .execute_read()
             .await
-            .map(|_| ())
-            .expect_err("DE read must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supported for primary-key")),
-            "unexpected error: {err:?}"
-        );
+            .expect("DE read over an empty table must succeed with no rows");
+        let mut rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 0, "empty DE table must yield no rows");
     }
 
     #[tokio::test]
-    async fn execute_read_non_pk_column_fails_loud() {
+    async fn execute_read_non_pk_column_empty_snapshot_yields_empty_stream() {
         // pk-vector index configured for "embedding", but the query targets a
-        // different column -> read is unsupported.
+        // different column, so the PK branch does not intercept and the query
+        // falls through to the data-evolution path. With no snapshot the search
+        // finds nothing and returns an empty stream.
         let table = pk_vector_table(&[
             ("pk-vector.index.columns", "embedding"),
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
         ]);
-        let err = table
+        let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("other")
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .execute_read()
             .await
-            .map(|_| ())
-            .expect_err("non-PK column read must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supported for primary-key")),
-            "unexpected error: {err:?}"
-        );
+            .expect("non-PK column DE read over an empty table must succeed with no rows");
+        let mut rows = 0usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 0, "empty DE table must yield no rows");
     }
 
     #[tokio::test]
@@ -3161,7 +3552,8 @@ mod tests {
         for reserved in [
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
-            PKEY_VECTOR_SCORE_COLUMN,
+            SEARCH_SCORE_COLUMN,
+            "_PKEY_VECTOR_SCORE",
         ] {
             let mut builder = table.new_vector_search_builder();
             builder
@@ -3195,7 +3587,8 @@ mod tests {
         for reserved in [
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
-            PKEY_VECTOR_SCORE_COLUMN,
+            SEARCH_SCORE_COLUMN,
+            "_PKEY_VECTOR_SCORE",
         ] {
             let mut builder = table.new_vector_search_builder();
             builder
@@ -3240,6 +3633,73 @@ mod tests {
         let fields = builder.resolve_materialize_read_type().unwrap();
         let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id"]);
+    }
+
+    #[tokio::test]
+    async fn de_execute_read_materializes_rows_with_score() {
+        // A data-evolution vector table with a committed global index: execute_read
+        // must materialize one row per scored hit and carry the unified score
+        // column, in best-first rank order.
+        let table = de_vector_table().await;
+        let query = vec![1.0, 0.0];
+
+        let scored = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(query.clone())
+            .with_limit(3)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(!scored.is_empty(), "DE search must return hits");
+
+        let mut stream = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(query)
+            .with_limit(3)
+            .execute_read()
+            .await
+            .unwrap();
+
+        let mut rows = 0usize;
+        let mut saw_score = false;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            rows += batch.num_rows();
+            saw_score |= batch.schema().index_of(SEARCH_SCORE_COLUMN).is_ok();
+        }
+        assert_eq!(
+            rows,
+            scored.len(),
+            "DE read must emit exactly the scored result count"
+        );
+        assert!(
+            saw_score,
+            "DE read output must carry the search score column"
+        );
+    }
+
+    #[tokio::test]
+    async fn de_execute_read_with_filter_fails_loud() {
+        // A filter on the data-evolution path is unsupported (the DE path never
+        // reads physical rows), so execute_read must fail loud rather than drop the
+        // predicate. The guard lives in execute_scored.
+        let table = de_vector_table().await;
+        let filter = id_gt_filter(&table, 1);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(3)
+            .with_filter(filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("DE read with a filter must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "unexpected error: {err:?}"
+        );
     }
 }
 
