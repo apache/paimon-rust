@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::common::Statistics;
 use datafusion::error::Result as DFResult;
@@ -32,6 +34,33 @@ use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
+
+fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(datafusion::error::DataFusionError::Execution(format!(
+            "Paimon reader returned {} columns for DataFusion schema with {} fields",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+
+    let row_count = batch.num_rows();
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column.as_ref(), field.data_type()).map_err(Into::into)
+            }
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+
+    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(Into::into)
+}
 
 /// Execution plan that scans a Paimon table with optional column projection.
 ///
@@ -172,7 +201,12 @@ impl ExecutionPlan for PaimonTableScan {
 
             let read = read_builder.new_read().map_err(to_datafusion_error)?;
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
-            let stream = stream.map(|r| r.map_err(to_datafusion_error));
+            let batch_schema = Arc::clone(&schema);
+            let stream = stream.map(move |result| {
+                result
+                    .map_err(to_datafusion_error)
+                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))
+            });
 
             Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
                 schema,

@@ -3272,6 +3272,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use datafusion::arrow::array::StringViewArray;
     use paimon::catalog::Database;
     use paimon::spec::{
         DataField as PaimonDataField, DataType as PaimonDataType, IntType, Schema as PaimonSchema,
@@ -6691,7 +6692,7 @@ mod tests {
             let pts = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<StringViewArray>()
                 .unwrap();
             let ids = batch
                 .column(1)
@@ -6739,7 +6740,7 @@ mod tests {
             let pts = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<StringViewArray>()
                 .unwrap();
             let ids = batch
                 .column(1)

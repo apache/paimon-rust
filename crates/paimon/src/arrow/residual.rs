@@ -571,6 +571,8 @@ fn evaluate_column_predicate(
     scalar: &Scalar<ArrayRef>,
     op: PredicateOperator,
 ) -> Result<BooleanArray, ArrowError> {
+    let scalar = string_scalar_for_column(scalar, column.data_type())?;
+
     // Binary ordering must match Paimon's Datum::Bytes semantics (Java signed-byte
     // order, 0xFF < 0x00), which Arrow's unsigned byte comparison does not. Route
     // ordering ops on Binary/VarBinary columns through the signed comparator.
@@ -585,28 +587,25 @@ fn evaluate_column_predicate(
             | PredicateOperator::Gt
             | PredicateOperator::GtEq
     ) {
-        return evaluate_binary_ordering_predicate(column, scalar, op);
+        return evaluate_binary_ordering_predicate(column, &scalar, op);
     }
     match op {
-        PredicateOperator::Eq => arrow_eq(column, scalar),
-        PredicateOperator::NotEq => arrow_neq(column, scalar),
-        PredicateOperator::Lt => arrow_lt(column, scalar),
-        PredicateOperator::LtEq => arrow_lt_eq(column, scalar),
-        PredicateOperator::Gt => arrow_gt(column, scalar),
-        PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
+        PredicateOperator::Eq => arrow_eq(column, &scalar),
+        PredicateOperator::NotEq => arrow_neq(column, &scalar),
+        PredicateOperator::Lt => arrow_lt(column, &scalar),
+        PredicateOperator::LtEq => arrow_lt_eq(column, &scalar),
+        PredicateOperator::Gt => arrow_gt(column, &scalar),
+        PredicateOperator::GtEq => arrow_gt_eq(column, &scalar),
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
-        | PredicateOperator::Like => {
-            let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
-            match op {
-                PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
-                PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
-                PredicateOperator::Contains => arrow_contains(column, &pattern),
-                PredicateOperator::Like => arrow_like(column, &pattern),
-                _ => unreachable!(),
-            }
-        }
+        | PredicateOperator::Like => match op {
+            PredicateOperator::StartsWith => arrow_starts_with(column, &scalar),
+            PredicateOperator::EndsWith => arrow_ends_with(column, &scalar),
+            PredicateOperator::Contains => arrow_contains(column, &scalar),
+            PredicateOperator::Like => arrow_like(column, &scalar),
+            _ => unreachable!(),
+        },
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
@@ -665,11 +664,11 @@ fn evaluate_binary_ordering_predicate(
     Ok(mask)
 }
 
-/// `arrow_string::like::*` kernels reject mismatched string types — Utf8 column
-/// against Utf8 pattern is fine, but a LargeUtf8 / Utf8View column needs a
-/// pattern of the same flavour. The shared scalar built upstream is always
-/// `StringArray` (Utf8); promote it to match the column when needed.
-fn pattern_scalar_for_string_kernel(
+/// Arrow comparison and pattern kernels reject mismatched string types. The
+/// shared scalar built from Paimon's logical Char/VarChar type is Utf8, while a
+/// decoded file column may be Utf8, LargeUtf8, or Utf8View. Promote the scalar
+/// to the actual column representation before invoking any string kernel.
+fn string_scalar_for_column(
     scalar: &Scalar<ArrayRef>,
     column_type: &arrow_schema::DataType,
 ) -> Result<Scalar<ArrayRef>, ArrowError> {

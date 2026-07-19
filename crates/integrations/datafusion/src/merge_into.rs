@@ -1782,7 +1782,7 @@ mod tests {
             let names = batch
                 .column(1)
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
                 .unwrap();
             let values = batch
                 .column(2)
@@ -1925,7 +1925,7 @@ mod tests {
             let names = batch
                 .column(1)
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
                 .unwrap();
             let values = batch
                 .column(2)

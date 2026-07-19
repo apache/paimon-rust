@@ -95,6 +95,44 @@ async fn parquet_fixture_loads_into_paimon() {
 }
 
 #[tokio::test]
+async fn loaded_paimon_varchar_is_exposed_as_utf8_view() {
+    let data = TempDir::new().unwrap();
+    let warehouse = TempDir::new().unwrap();
+    write_fixture(&data, "store_sales");
+    let session = open_catalog_session(
+        &BenchmarkRuntimeConfig::default(),
+        warehouse.path(),
+        "tpcds",
+    )
+    .await
+    .unwrap();
+    load_parquet_table(
+        &session,
+        data.path(),
+        "store_sales",
+        ExistingTablePolicy::Error,
+    )
+    .await
+    .unwrap();
+
+    let batches = session
+        .sql
+        .sql("SELECT arrow_typeof(name) FROM paimon.tpcds.store_sales LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let types = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(types.value(0), "Utf8View");
+}
+
+#[tokio::test]
 async fn loaded_paimon_table_runs_warmups_and_measured_iterations() {
     let data = TempDir::new().unwrap();
     let warehouse = TempDir::new().unwrap();

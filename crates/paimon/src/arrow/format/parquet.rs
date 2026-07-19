@@ -1965,6 +1965,92 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_string_view_comparison_families() {
+        use crate::spec::VarCharType;
+        use arrow_array::{ArrayRef, BooleanArray, StringViewArray};
+
+        let column: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            None,
+        ]));
+        let data_type = DataType::VarChar(VarCharType::default());
+        let cases = [
+            (
+                super::PredicateOperator::Eq,
+                vec![Datum::String("b".to_string())],
+                vec![false, true, false, false],
+            ),
+            (
+                super::PredicateOperator::NotEq,
+                vec![Datum::String("b".to_string())],
+                vec![true, false, true, false],
+            ),
+            (
+                super::PredicateOperator::Lt,
+                vec![Datum::String("b".to_string())],
+                vec![true, false, false, false],
+            ),
+            (
+                super::PredicateOperator::LtEq,
+                vec![Datum::String("b".to_string())],
+                vec![true, true, false, false],
+            ),
+            (
+                super::PredicateOperator::Gt,
+                vec![Datum::String("b".to_string())],
+                vec![false, false, true, false],
+            ),
+            (
+                super::PredicateOperator::GtEq,
+                vec![Datum::String("b".to_string())],
+                vec![false, true, true, false],
+            ),
+            (
+                super::PredicateOperator::In,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("c".to_string()),
+                ],
+                vec![true, false, true, false],
+            ),
+            (
+                super::PredicateOperator::NotIn,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("c".to_string()),
+                ],
+                vec![false, true, false, false],
+            ),
+            (
+                super::PredicateOperator::Between,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("b".to_string()),
+                ],
+                vec![true, true, false, false],
+            ),
+            (
+                super::PredicateOperator::NotBetween,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("b".to_string()),
+                ],
+                vec![false, false, true, false],
+            ),
+        ];
+
+        for (op, literals, expected) in cases {
+            let mask = crate::arrow::residual::evaluate_exact_leaf_predicate(
+                &column, &data_type, op, &literals,
+            )
+            .unwrap_or_else(|error| panic!("{op:?} should evaluate: {error}"));
+            assert_eq!(mask, BooleanArray::from(expected), "operator {op:?}");
+        }
+    }
+
+    #[test]
     fn test_evaluate_like_pattern_with_underscore_and_percent() {
         use arrow_array::StringArray;
         let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![

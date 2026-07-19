@@ -21,7 +21,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::catalog::Session;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -44,6 +46,8 @@ use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
 
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
 pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
     let mut fields = table.schema().fields().to_vec();
     if CoreOptions::new(table.schema().options()).data_evolution_enabled() {
@@ -54,6 +58,35 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
         ));
     }
     fields
+}
+
+fn datafusion_arrow_schema(fields: &[DataField]) -> DFResult<ArrowSchemaRef> {
+    let paimon_schema =
+        paimon::arrow::build_target_arrow_schema(fields).map_err(to_datafusion_error)?;
+    let fields = paimon_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut metadata = field.metadata().clone();
+            metadata.remove(PARQUET_FIELD_ID_META_KEY);
+            let data_type = match field.data_type() {
+                ArrowDataType::Utf8 => ArrowDataType::Utf8View,
+                data_type => data_type.clone(),
+            };
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(data_type)
+                    .with_metadata(metadata),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        paimon_schema.metadata().clone(),
+    )))
 }
 
 /// Read-only table provider for a Paimon table.
@@ -86,8 +119,7 @@ impl PaimonTableProvider {
         table_definition: Option<String>,
     ) -> DFResult<Self> {
         let fields = datafusion_read_fields(&table);
-        let schema =
-            paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
+        let schema = datafusion_arrow_schema(&fields)?;
         Ok(Self {
             table,
             schema,
@@ -749,6 +781,19 @@ mod tests {
         PaimonTableProvider::try_new(table).expect("provider should be created")
     }
 
+    #[tokio::test]
+    async fn test_datafusion_schema_hides_paimon_field_ids() {
+        let provider = data_evolution_projection_pruning_provider().await;
+
+        for field in provider.schema().fields() {
+            assert!(
+                !field.metadata().contains_key("PARQUET:field_id"),
+                "storage field id leaked through DataFusion schema for {}",
+                field.name()
+            );
+        }
+    }
+
     fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {
         let mut names = scan
             .planned_partitions()
@@ -1107,7 +1152,7 @@ mod tests {
             let pts = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
                 .unwrap();
             let ids = batch
                 .column(1)

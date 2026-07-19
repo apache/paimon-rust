@@ -335,7 +335,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{Int32Array, StringArray, UInt64Array};
+    use datafusion::arrow::array::{Int32Array, StringViewArray, UInt64Array};
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use paimon::catalog::{Catalog, Identifier};
@@ -412,7 +412,7 @@ mod tests {
             let names = batch
                 .column(1)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<StringViewArray>()
                 .unwrap();
             let values = batch
                 .column(2)
