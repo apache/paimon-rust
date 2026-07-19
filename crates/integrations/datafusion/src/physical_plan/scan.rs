@@ -486,4 +486,73 @@ mod tests {
 
         assert_eq!(actual_ids, vec![2, 3, 4]);
     }
+
+    #[tokio::test]
+    async fn test_execute_uses_read_batch_size_option() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        write_int_parquet_file(
+            &bucket_dir.join("data.parquet"),
+            vec![("id", vec![1, 2, 3, 4, 5])],
+            None,
+        );
+        let file_size = fs::metadata(bucket_dir.join("data.parquet")).unwrap().len() as i64;
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("read.batch-size", "2")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 5, file_size)])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            table,
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split])],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+
+        let ctx = SessionContext::new();
+        let batches = scan
+            .execute(0, ctx.task_ctx())
+            .expect("execute should succeed")
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+    }
 }

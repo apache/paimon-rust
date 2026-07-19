@@ -229,7 +229,7 @@ impl<'a> PaimonTableRead<'a> {
         }
         // Delta / Changelog rows are read as-is from planned files (no full-table
         // merge against historical base versions).
-        self.new_data_file_reader().read(&data_splits)
+        self.new_data_file_reader()?.read(&data_splits)
     }
 
     /// Returns an audit-log stream for a planned incremental scan.
@@ -285,7 +285,8 @@ impl<'a> PaimonTableRead<'a> {
             self.table.schema.fields().to_vec(),
             read_type,
             self.data_predicates.clone(),
-        );
+        )
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
         let raw_stream = reader.read(&data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
@@ -340,7 +341,7 @@ impl<'a> PaimonTableRead<'a> {
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
-        let core_options = CoreOptions::new(self.table.schema.options());
+        let core_options = self.table.schema.core_options();
         // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
         core_options.ensure_read_authorized()?;
         let merge_engine = core_options.merge_engine()?;
@@ -440,6 +441,7 @@ impl<'a> PaimonTableRead<'a> {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                read_batch_size: core_options.read_batch_size()?,
             },
         );
         reader.read(splits)
@@ -463,17 +465,18 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_fields(),
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
-        )?;
+        )?
+        .with_batch_size(Some(core_options.read_batch_size()?));
         reader.read(data_splits)
     }
 
     /// Read raw data files without dedup or evolution.
     fn read_raw(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        self.new_data_file_reader().read(data_splits)
+        self.new_data_file_reader()?.read(data_splits)
     }
 
-    fn new_data_file_reader(&self) -> DataFileReader {
-        DataFileReader::new(
+    fn new_data_file_reader(&self) -> crate::Result<DataFileReader> {
+        Ok(DataFileReader::new(
             self.table.file_io.clone(),
             self.table.schema_manager().clone(),
             self.table.schema().id(),
@@ -481,6 +484,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?)))
     }
 }
 

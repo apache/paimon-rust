@@ -55,6 +55,8 @@ pub(crate) struct KeyValueFileReader {
     /// of a key survives); they are enforced by the post-merge residual
     /// filter using the full `config.predicates` instead.
     pushdown_predicates: Vec<Predicate>,
+    #[cfg(test)]
+    input_batch_sizes: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
 }
 
 /// Configuration for [`KeyValueFileReader`], grouping table schema and
@@ -70,6 +72,7 @@ pub(crate) struct KeyValueReadConfig {
     pub primary_keys: Vec<String>,
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
+    pub read_batch_size: usize,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -115,7 +118,18 @@ impl KeyValueFileReader {
             file_io,
             config,
             pushdown_predicates,
+            #[cfg(test)]
+            input_batch_sizes: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_input_batch_sizes(
+        mut self,
+        input_batch_sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Self {
+        self.input_batch_sizes = Some(input_batch_sizes);
+        self
     }
 
     fn new_merge_function(
@@ -313,6 +327,9 @@ impl KeyValueFileReader {
         let residual_predicates = self.config.predicates;
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
+        let read_batch_size = self.config.read_batch_size;
+        #[cfg(test)]
+        let input_batch_sizes = self.input_batch_sizes;
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -350,7 +367,8 @@ impl KeyValueFileReader {
                         table_fields.clone(),
                         internal_read_type.clone(),
                         pushdown_predicates.clone(),
-                    );
+                    )
+                    .with_batch_size(Some(read_batch_size));
 
                     let stream = reader.read_single_file_stream(
                         split,
@@ -359,6 +377,18 @@ impl KeyValueFileReader {
                         None,
                         None,
                     )?;
+                    #[cfg(test)]
+                    let stream = if let Some(batch_sizes) = input_batch_sizes.clone() {
+                        stream
+                            .inspect(move |batch| {
+                                if let Ok(batch) = batch {
+                                    batch_sizes.lock().unwrap().push(batch.num_rows());
+                                }
+                            })
+                            .boxed()
+                    } else {
+                        stream
+                    };
                     file_streams.push(stream);
                 }
 
@@ -454,6 +484,7 @@ mod tests {
     use crate::table::{Table, TableWrite};
     use arrow_array::{Array, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use std::sync::Arc;
 
     fn test_file_io() -> FileIO {
@@ -644,6 +675,70 @@ mod tests {
         let kept = retain_primary_key_conjuncts(&[Predicate::AlwaysTrue], &fields, &pks);
         assert_eq!(kept.len(), 1);
         assert!(matches!(&kept[0], Predicate::AlwaysTrue));
+    }
+
+    #[tokio::test]
+    async fn kv_input_decode_honors_read_batch_size_without_changing_merge_batching() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_read_batch_size";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[("read.batch-size", "2")]);
+
+        write_commit(
+            &table,
+            &int_batch(
+                vec![1, 2, 3, 4, 5],
+                vec![Some(10), Some(20), Some(30), Some(40), Some(50)],
+            ),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(
+                vec![1, 2, 3, 4, 5],
+                vec![Some(11), Some(21), Some(31), Some(41), Some(51)],
+            ),
+        )
+        .await;
+
+        let read_builder = table.new_read_builder();
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let core_options = table.schema().core_options();
+        let input_batch_sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: core_options
+                    .sequence_fields()
+                    .iter()
+                    .map(|field| field.to_string())
+                    .collect(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+            },
+        )
+        .with_input_batch_sizes(input_batch_sizes.clone());
+        let batches = reader
+            .read(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let mut decoded_batch_sizes = input_batch_sizes.lock().unwrap().clone();
+        decoded_batch_sizes.sort_unstable();
+        assert_eq!(decoded_batch_sizes, vec![1, 1, 2, 2, 2, 2]);
+        assert_eq!(batches.len(), 1, "merge output batching stays independent");
+        assert_eq!(batches[0].num_rows(), 5);
+        assert_eq!(int_column(&batches, "value"), vec![11, 21, 31, 41, 51]);
     }
 
     /// Non-PK equality filter on a dedup PK table read through the sort-merge

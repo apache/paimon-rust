@@ -73,6 +73,7 @@ const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
+const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
@@ -109,6 +110,7 @@ const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
@@ -303,6 +305,32 @@ pub(crate) enum TimeTravelSelector<'a> {
 impl<'a> CoreOptions<'a> {
     pub fn new(options: &'a HashMap<String, String>) -> Self {
         Self { options }
+    }
+
+    /// Preferred number of rows emitted by file-format readers.
+    ///
+    /// Mirrors Java Paimon's `CoreOptions.READ_BATCH_SIZE`.
+    pub fn read_batch_size(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(READ_BATCH_SIZE_OPTION) else {
+            return Ok(DEFAULT_READ_BATCH_SIZE);
+        };
+        let value = raw
+            .parse::<i32>()
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{READ_BATCH_SIZE_OPTION}' must be a positive integer, got: {raw}"
+                ),
+                source: Some(Box::new(error)),
+            })?;
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{READ_BATCH_SIZE_OPTION}' must be greater than 0, got: {value}"
+                ),
+                source: None,
+            });
+        }
+        Ok(value as usize)
     }
 
     /// Reject scan options whose semantics the Rust core does not yet implement.
@@ -1181,6 +1209,20 @@ fn parse_memory_size(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_batch_size() {
+        let options = HashMap::new();
+        assert_eq!(CoreOptions::new(&options).read_batch_size().unwrap(), 1024);
+
+        let options = HashMap::from([("read.batch-size".to_string(), "8192".to_string())]);
+        assert_eq!(CoreOptions::new(&options).read_batch_size().unwrap(), 8192);
+
+        for value in ["0", "-1", "invalid"] {
+            let options = HashMap::from([("read.batch-size".to_string(), value.to_string())]);
+            assert!(CoreOptions::new(&options).read_batch_size().is_err());
+        }
+    }
 
     #[test]
     fn test_source_split_defaults() {

@@ -450,7 +450,8 @@ impl<'a> PaimonReadBuilder<'a> {
     pub fn new_read(&self) -> Result<TableRead<'a>> {
         // Fail closed at read construction so bindings that short-circuit before
         // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
-        CoreOptions::new(self.table.schema.options()).ensure_read_authorized()?;
+        let core_options = self.table.schema.core_options();
+        core_options.ensure_read_authorized()?;
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,

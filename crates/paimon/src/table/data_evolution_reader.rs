@@ -112,6 +112,7 @@ pub(crate) struct DataEvolutionReader {
     blob_view_resolve_enabled: bool,
     blob_view_rest_env: Option<RESTEnv>,
     blob_read_limiter: BlobReadLimiter,
+    batch_size: Option<usize>,
 }
 
 impl DataEvolutionReader {
@@ -172,7 +173,13 @@ impl DataEvolutionReader {
             blob_view_resolve_enabled,
             blob_view_rest_env,
             blob_read_limiter: BlobReadLimiter::new(),
+            batch_size: None,
         })
+    }
+
+    pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
+        self.batch_size = batch_size;
+        self
     }
 
     /// Read data files in data evolution mode.
@@ -198,7 +205,8 @@ impl DataEvolutionReader {
                 self.table_fields.clone(),
                 self.wide_file_read_type.clone(),
                 Vec::new(),
-            );
+            )
+            .with_batch_size(self.batch_size);
 
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
@@ -495,7 +503,8 @@ impl DataEvolutionReader {
             HashSet::new(),
             false,
             None,
-        )?;
+        )?
+        .with_batch_size(self.batch_size);
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
         while let Some(batch) = stream.next().await {
@@ -557,6 +566,7 @@ impl DataEvolutionReader {
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let batch_size = self.batch_size;
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
         const MERGE_BATCH_SIZE: usize = 1024;
@@ -623,6 +633,7 @@ impl DataEvolutionReader {
                             schema_manager.clone(),
                             table_schema_id,
                             table_fields.clone(),
+                            batch_size,
                             blob_as_descriptor,
                             anchor_deletion_vector.as_ref(),
                         )
@@ -1109,6 +1120,7 @@ fn open_source_stream(
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
+    batch_size: Option<usize>,
     blob_as_descriptor: bool,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
@@ -1135,6 +1147,7 @@ fn open_source_stream(
         source.read_fields().to_vec(),
         Vec::new(),
     )
+    .with_batch_size(batch_size)
     .with_blob_as_descriptor(blob_as_descriptor);
 
     match source {
@@ -5073,6 +5086,114 @@ mod tests {
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["id"]);
         }
+    }
+
+    #[tokio::test]
+    async fn test_evolution_input_decode_honors_read_batch_size_on_all_file_paths() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let raw_path = bucket_dir.join("raw.parquet");
+        write_int_parquet_file(
+            &raw_path,
+            vec![
+                ("id", vec![1, 2, 3, 4, 5]),
+                ("value", vec![10, 20, 30, 40, 50]),
+            ],
+            None,
+        );
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![6, 7, 8, 9, 10])], None);
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(
+            &value_path,
+            vec![("value", vec![60, 70, 80, 90, 100])],
+            None,
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .option("read.batch-size", "2")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "evolution_batch_size_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let raw_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "raw.parquet",
+                0,
+                5,
+                1,
+                raw_path.metadata().unwrap().len() as i64,
+                Some(vec!["id", "value"]),
+            )])
+            .build()
+            .unwrap();
+        let merge_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    5,
+                    5,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    5,
+                    5,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[raw_split, merge_split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1, 2, 2, 1]
+        );
+        assert_eq!(
+            collect_int_values(&batches, "id"),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
     }
 
     /// _ROW_ID + predicate, raw branch: surviving rows keep their ORIGINAL row

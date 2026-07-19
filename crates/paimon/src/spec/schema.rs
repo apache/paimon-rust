@@ -135,11 +135,16 @@ impl TableSchema {
         &self.options
     }
 
+    /// Typed view over this schema's table options.
+    pub fn core_options(&self) -> CoreOptions<'_> {
+        CoreOptions::new(&self.options)
+    }
+
     /// Create a copy of this schema with extra options merged in.
     ///
     /// A stored `query-auth.enabled = true` can't be turned off by a dynamic override.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
-        if CoreOptions::new(&self.options).query_auth_enabled() {
+        if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
         }
         let mut new_schema = self.clone();
@@ -475,6 +480,7 @@ impl TableSchema {
             &new_schema.primary_keys,
             &new_schema.fields,
         )?;
+        Schema::validate_read_batch_size(&new_schema.options)?;
         Ok(new_schema)
     }
 
@@ -921,6 +927,7 @@ impl Schema {
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
         Self::validate_rowkind_field(&options, &primary_keys, &fields)?;
+        Self::validate_read_batch_size(&options)?;
 
         Ok(Self {
             fields,
@@ -1344,6 +1351,13 @@ impl Schema {
         }
     }
 
+    fn validate_read_batch_size(options: &HashMap<String, String>) -> crate::Result<()> {
+        CoreOptions::new(options)
+            .read_batch_size()
+            .map(|_| ())
+            .map_err(Self::options_error_to_config_invalid)
+    }
+
     /// Returns top-level Blob field names for create-time Blob contract checks.
     fn top_level_blob_field_names(fields: &[DataField]) -> Vec<&str> {
         fields
@@ -1667,6 +1681,43 @@ mod tests {
         assert!(
             !id_field.data_type().is_nullable(),
             "primary key column should be normalized to NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_schema_rejects_invalid_read_batch_size() {
+        for value in ["0", "-1", "invalid"] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("read.batch-size", value)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains("read.batch-size")),
+                "got {err:?} for read.batch-size={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_rejects_invalid_read_batch_size() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema);
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "read.batch-size".to_string(),
+                "0".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("read.batch-size")),
+            "got {err:?}"
         );
     }
 

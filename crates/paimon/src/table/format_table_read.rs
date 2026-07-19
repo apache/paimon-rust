@@ -21,7 +21,7 @@ use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
-use crate::spec::{extract_datum, BinaryRow, CoreOptions, DataField, DataType, Datum, Predicate};
+use crate::spec::{extract_datum, BinaryRow, DataField, DataType, Datum, Predicate};
 use crate::{DataSplit, Error};
 use arrow_array::{
     new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
@@ -77,7 +77,8 @@ impl<'a> FormatTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let core_options = self.table.schema().core_options();
+        core_options.ensure_read_authorized()?;
         let read_type = self.read_type.clone();
         let output_schema = build_target_arrow_schema(&read_type)?;
         let partition_keys = self.table.schema().partition_keys().to_vec();
@@ -93,6 +94,7 @@ impl<'a> FormatTableRead<'a> {
         let schema_manager = self.table.schema_manager().clone();
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
+        let batch_size = Some(core_options.read_batch_size()?);
 
         Ok(try_stream! {
             for split in splits {
@@ -108,6 +110,7 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
+                .with_batch_size(batch_size)
                 .read(std::slice::from_ref(&split))?;
 
                 while let Some(batch) = stream.next().await {

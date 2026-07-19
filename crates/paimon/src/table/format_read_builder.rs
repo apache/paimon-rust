@@ -21,7 +21,7 @@ use super::partition_filter::PartitionFilter;
 use super::read_builder::split_scan_predicates;
 use super::read_builder::{resolve_projected_fields, validate_projection_possible};
 use super::{Table, TableRead, TableScan};
-use crate::spec::{CoreOptions, DataField, Predicate};
+use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::Result;
 
@@ -114,7 +114,8 @@ impl<'a> FormatReadBuilder<'a> {
     }
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let core_options = self.table.schema().core_options();
+        core_options.ensure_read_authorized()?;
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema().fields().to_vec(),
             Some(fields) => fields,

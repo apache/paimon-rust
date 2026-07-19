@@ -6627,6 +6627,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dynamic_read_batch_size_overrides_table_option() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+
+        sql_context
+            .sql(
+                "CREATE TABLE paimon.test_db.batch_size_t (id INT) \
+                 WITH ('read.batch-size' = '3')",
+            )
+            .await
+            .unwrap();
+        sql_context
+            .sql("INSERT INTO paimon.test_db.batch_size_t VALUES (1), (2), (3), (4), (5)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        sql_context
+            .sql("SET 'paimon.read.batch-size' = '2'")
+            .await
+            .unwrap();
+        let batches = sql_context
+            .sql("SELECT id FROM paimon.test_db.batch_size_t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+
+        sql_context
+            .sql("RESET 'paimon.read.batch-size'")
+            .await
+            .unwrap();
+        let batches = sql_context
+            .sql("SELECT id FROM paimon.test_db.batch_size_t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    #[tokio::test]
     async fn test_truncate_table() {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
 
