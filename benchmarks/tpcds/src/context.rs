@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::SessionConfig;
+use datafusion::execution::SessionStateBuilder;
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,6 @@ impl Default for BenchmarkRuntimeConfig {
 }
 
 pub fn build_sql_context(config: &BenchmarkRuntimeConfig) -> DataFusionResult<SQLContext> {
-    let session_config =
-        SessionConfig::new().with_target_partitions(config.target_partitions.max(1));
     let mut runtime = RuntimeEnvBuilder::new();
     if let Some(memory_limit) = config.memory_limit_bytes {
         runtime = runtime.with_memory_limit(memory_limit, 1.0);
@@ -59,10 +57,20 @@ pub fn build_sql_context(config: &BenchmarkRuntimeConfig) -> DataFusionResult<SQ
     if let Some(max_spill_bytes) = config.max_spill_bytes {
         runtime = runtime.with_max_temp_directory_size(max_spill_bytes);
     }
-    Ok(SQLContext::new_with_config_and_runtime(
-        session_config,
-        Arc::new(runtime.build()?),
-    ))
+    let sql = SQLContext::new();
+    let state_ref = sql.ctx().state_ref();
+    let current_state = state_ref.read().clone();
+    let session_config = current_state
+        .config()
+        .clone()
+        .with_target_partitions(config.target_partitions.max(1));
+    let state = SessionStateBuilder::from(current_state)
+        .with_config(session_config)
+        .with_runtime_env(Arc::new(runtime.build()?))
+        .build();
+    *state_ref.write() = state;
+    drop(state_ref);
+    Ok(sql)
 }
 
 pub struct CatalogSession {

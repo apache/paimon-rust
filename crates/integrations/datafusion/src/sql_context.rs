@@ -50,10 +50,9 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
-use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateFunction,
@@ -106,30 +105,8 @@ impl Default for SQLContext {
 impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
-        Self::new_with_config(crate::lateral_vector_search::session_config())
-    }
-
-    /// Creates an empty SQL context with a custom DataFusion session config.
-    ///
-    /// Information-schema support remains enabled because Paimon's SQL layer
-    /// relies on it for `SHOW` and metadata queries.
-    pub fn new_with_config(config: SessionConfig) -> Self {
-        Self::new_with_config_and_runtime(config, Arc::new(RuntimeEnv::default()))
-    }
-
-    /// Creates an empty SQL context with custom DataFusion session and runtime
-    /// configuration.
-    ///
-    /// This constructor is intended for applications that need explicit
-    /// memory pools, spill directories, object-store registries, or execution
-    /// parallelism while retaining Paimon's relation and query planners.
-    pub fn new_with_config_and_runtime(
-        config: SessionConfig,
-        runtime_env: Arc<RuntimeEnv>,
-    ) -> Self {
         let state = SessionStateBuilder::new()
-            .with_config(config.with_information_schema(true))
-            .with_runtime_env(runtime_env)
+            .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_relation_planners(vec![Arc::new(
                 crate::relation_planner::PaimonRelationPlanner::new(),

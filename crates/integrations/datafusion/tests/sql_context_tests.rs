@@ -24,8 +24,6 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::SessionConfig;
 use paimon::catalog::{list_partitions_from_file_system, Identifier};
 use paimon::spec::{
     ArrayType, BinaryType, BlobType, CharType, DataType, FloatType, IntType,
@@ -50,31 +48,6 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     let mut ctx = SQLContext::new();
     ctx.register_catalog("paimon", catalog).await.unwrap();
     ctx
-}
-
-#[test]
-fn test_custom_runtime_config_is_preserved() {
-    let runtime = Arc::new(RuntimeEnvBuilder::new().build().unwrap());
-    let config = SessionConfig::new().with_target_partitions(7);
-
-    let ctx = SQLContext::new_with_config_and_runtime(config, Arc::clone(&runtime));
-
-    assert_eq!(
-        ctx.ctx()
-            .state()
-            .config_options()
-            .execution
-            .target_partitions,
-        7
-    );
-    assert!(Arc::ptr_eq(&ctx.ctx().runtime_env(), &runtime));
-    assert!(
-        ctx.ctx()
-            .state()
-            .config_options()
-            .catalog
-            .information_schema
-    );
 }
 
 struct PartitionCatalog {
