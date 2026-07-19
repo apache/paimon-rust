@@ -17,7 +17,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/paimon", "crates/paimon-rest-server", "crates/integration_tests", "bindings/c", "bindings/python", "crates/integrations/datafusion"]
+members = ["crates/paimon", "crates/paimon-rest-server", "crates/integration_tests", "bindings/c", "bindings/python", "crates/integrations/datafusion", "benchmarks/tpcds"]
 
 [workspace.package]
 version = "0.3.0"
