@@ -368,7 +368,6 @@ pub(crate) async fn bucket_search(
 /// [`bucket_search`].
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
-#[allow(dead_code)]
 pub(crate) async fn bucket_search_batch(
     ann_searcher: Option<&dyn PkVectorAnnSearcher>,
     ann_segments: &[BucketAnnSegment],
