@@ -629,6 +629,9 @@ async fn plan_and_search_pk_candidates_batch(
     // `primary_key_vector_distance_metric` returns a validated name; re-parse into
     // the enum for the numeric semantics.
     let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
+    // Fan-out limit for the per-bucket and per-exact-file search (Java
+    // `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
+    let concurrency = core.global_index_thread_num()?;
     let index_type = core.primary_key_vector_index_type(pk_col)?;
     let field_id = find_field_id_by_name(table.schema().fields(), pk_col).ok_or_else(|| {
         crate::Error::DataInvalid {
@@ -862,6 +865,7 @@ async fn plan_and_search_pk_candidates_batch(
             &search_options,
             skip_exact_fallback,
             residual_by_split.as_deref(),
+            concurrency,
         )
         .await?;
 

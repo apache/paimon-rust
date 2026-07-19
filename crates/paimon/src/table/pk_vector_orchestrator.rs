@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 use roaring::RoaringTreemap;
 
+use futures::stream::{self, StreamExt, TryStreamExt};
+
 use crate::deletion_vector::DeletionVector;
 use crate::spec::BinaryRow;
 use crate::table::data_file_reader::DataFileReader;
@@ -391,6 +393,7 @@ impl PkVectorOrchestrator {
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
         residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
+        concurrency: usize,
     ) -> crate::Result<OrchestratorSearchResult> {
         let mut results = self
             .search_candidates_batch(
@@ -404,6 +407,7 @@ impl PkVectorOrchestrator {
                 search_options,
                 skip_exact_fallback,
                 residual_by_split,
+                concurrency,
             )
             .await?;
         debug_assert_eq!(results.len(), 1);
@@ -422,8 +426,15 @@ impl PkVectorOrchestrator {
     /// The residual allow-list depends only on the filter and the plan, not the
     /// query vector, so the SAME `residual_by_split` slice is shared across every
     /// query. Input-shape validation (positive limits, non-empty query, residual
-    /// count) is applied per query / once as appropriate. Kept a sequential
-    /// per-split loop.
+    /// count) is applied per query / once as appropriate.
+    ///
+    /// `concurrency` bounds how many buckets are searched at once (Java
+    /// `GLOBAL_INDEX_THREAD_NUM`): `1` runs the buckets strictly sequentially,
+    /// larger values fan them out with `buffer_unordered`. Each bucket's per-query
+    /// results feed per-query cross-bucket global Top-K heaps, which are
+    /// order-independent, so the output does not depend on which bucket finished
+    /// first; results are collected and merged into the correct per-query slot after
+    /// the parallel stage.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn search_candidates_batch(
@@ -448,6 +459,7 @@ impl PkVectorOrchestrator {
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
         residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
+        concurrency: usize,
     ) -> crate::Result<Vec<OrchestratorSearchResult>> {
         // Eager input-shape validation (Java checkArgument parity).
         if queries.is_empty() {
@@ -478,68 +490,111 @@ impl PkVectorOrchestrator {
             (0..queries.len()).map(|_| Vec::new()).collect();
         let mut exact_candidates: Vec<Vec<PkVectorCandidate>> =
             (0..queries.len()).map(|_| Vec::new()).collect();
-        for (split_index, split) in splits.iter().enumerate() {
-            let dvs = build_bucket_dv_map(&self.reader, split).await?;
-            // Adapt the split-scoped search closure to bucket_search's per-file
-            // closure by binding the current split index/split. The coercion helper
-            // ties the produced future's borrow to the arguments, which closure
-            // inference cannot express on its own.
-            let bucket_search_closure = as_bucket_exact_file_search(
-                |file: &BucketActiveFile,
-                 queries: &[&[f32]],
-                 metric: VectorSearchMetric,
-                 exact_limit: usize,
-                 is_excluded: &(dyn Fn(i64) -> bool + Sync)|
-                 -> ExactFileSearchFuture<'_> {
-                    exact_file_search(
-                        split_index,
-                        split,
-                        file,
-                        queries,
-                        metric,
-                        exact_limit,
-                        is_excluded,
-                    )
-                },
-            );
-            let residual_ranges = residual_by_split.map(|per_split| &per_split[split_index]);
-            let per_query = bucket_search_batch(
-                ann_searcher,
-                &split.ann_segments,
-                &split.active_files,
-                &dvs,
-                &bucket_search_closure,
-                queries,
-                metric,
-                indexed_limit,
-                limit,
-                search_options,
-                skip_exact_fallback,
-                residual_ranges,
-            )
-            .await?;
-            if per_query.len() != queries.len() {
-                return Err(data_invalid(format!(
-                    "bucket search returned {} result lists for {} queries",
-                    per_query.len(),
-                    queries.len()
-                )));
-            }
-            let tag = |PkVectorSearchResult {
-                           data_file_name,
-                           row_position,
-                           distance,
-                       }: PkVectorSearchResult| PkVectorCandidate {
-                split_index,
-                partition: split.data_split.partition().clone(),
-                bucket: split.data_split.bucket(),
-                data_file_name,
-                row_position,
-                distance,
+
+        // One lazy future per bucket. Each builds its own DV map + per-file search
+        // closure, searches all queries against the bucket, and returns per-query
+        // (indexed, exact) candidate lists already tagged with the bucket's
+        // partition/bucket/split_index. The futures are not polled until driven
+        // below, so the sequential branch observes buckets in strict split order.
+        let per_bucket = splits
+            .iter()
+            .enumerate()
+            .map(|(split_index, split)| async move {
+                let dvs = build_bucket_dv_map(&self.reader, split).await?;
+                // Adapt the split-scoped search closure to bucket_search's per-file
+                // closure by binding the current split index/split. The coercion helper
+                // ties the produced future's borrow to the arguments, which closure
+                // inference cannot express on its own.
+                let bucket_search_closure = as_bucket_exact_file_search(
+                    |file: &BucketActiveFile,
+                     queries: &[&[f32]],
+                     metric: VectorSearchMetric,
+                     exact_limit: usize,
+                     is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+                     -> ExactFileSearchFuture<'_> {
+                        exact_file_search(
+                            split_index,
+                            split,
+                            file,
+                            queries,
+                            metric,
+                            exact_limit,
+                            is_excluded,
+                        )
+                    },
+                );
+                let residual_ranges = residual_by_split.map(|per_split| &per_split[split_index]);
+                let per_query = bucket_search_batch(
+                    ann_searcher,
+                    &split.ann_segments,
+                    &split.active_files,
+                    &dvs,
+                    &bucket_search_closure,
+                    queries,
+                    metric,
+                    indexed_limit,
+                    limit,
+                    search_options,
+                    skip_exact_fallback,
+                    residual_ranges,
+                    concurrency,
+                )
+                .await?;
+                if per_query.len() != queries.len() {
+                    return Err(data_invalid(format!(
+                        "bucket search returned {} result lists for {} queries",
+                        per_query.len(),
+                        queries.len()
+                    )));
+                }
+                let tag = |PkVectorSearchResult {
+                               data_file_name,
+                               row_position,
+                               distance,
+                           }: PkVectorSearchResult| PkVectorCandidate {
+                    split_index,
+                    partition: split.data_split.partition().clone(),
+                    bucket: split.data_split.bucket(),
+                    data_file_name,
+                    row_position,
+                    distance,
+                };
+                let tagged: Vec<(Vec<PkVectorCandidate>, Vec<PkVectorCandidate>)> = per_query
+                    .into_iter()
+                    .map(|result| {
+                        (
+                            result.indexed.into_iter().map(&tag).collect(),
+                            result.exact.into_iter().map(&tag).collect(),
+                        )
+                    })
+                    .collect();
+                Ok::<_, crate::Error>(tagged)
+            });
+
+        // Drive the per-bucket futures. `concurrency == 1` uses a strictly
+        // sequential loop so buckets are searched in split order; larger values fan
+        // them out with `buffer_unordered`. Either way each bucket's per-query lists
+        // are collected and only then folded into the per-query candidate
+        // accumulators, and the final per-query `global_top_k` is order-independent
+        // (deterministic `candidate_cmp`), so the result does not depend on bucket
+        // completion order.
+        let collected: Vec<Vec<(Vec<PkVectorCandidate>, Vec<PkVectorCandidate>)>> =
+            if concurrency <= 1 {
+                let mut out = Vec::with_capacity(splits.len());
+                for fut in per_bucket {
+                    out.push(fut.await?);
+                }
+                out
+            } else {
+                stream::iter(per_bucket)
+                    .buffer_unordered(concurrency)
+                    .try_collect::<Vec<_>>()
+                    .await?
             };
-            for (query_index, result) in per_query.into_iter().enumerate() {
-                indexed_candidates[query_index].extend(result.indexed.into_iter().map(&tag));
-                exact_candidates[query_index].extend(result.exact.into_iter().map(&tag));
+        for tagged in collected {
+            for (query_index, (indexed, exact)) in tagged.into_iter().enumerate() {
+                indexed_candidates[query_index].extend(indexed);
+                exact_candidates[query_index].extend(exact);
             }
         }
 
@@ -1240,7 +1295,7 @@ mod e2e_tests {
         );
         let result = orch
             .search_candidates(
-                splits, query, metric, limit, limit, ann, &wrapped, opts, false, None,
+                splits, query, metric, limit, limit, ann, &wrapped, opts, false, None, 1,
             )
             .await?;
         // Merge the two bounded lists into the best-first survivors the
@@ -1277,6 +1332,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .map(|_| ())
@@ -1303,6 +1359,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .map(|_| ())
@@ -1647,6 +1704,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .unwrap();
@@ -1739,6 +1797,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 Some(&residual_by_split),
+                1,
             )
             .await
             .unwrap();
@@ -1793,6 +1852,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 Some(&residual_by_split),
+                1,
             )
             .await
             .map(|_| ())
@@ -1836,6 +1896,7 @@ mod e2e_tests {
                 &opts,
                 true,
                 None,
+                1,
             )
             .await
             .unwrap();
@@ -1950,6 +2011,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .unwrap();
@@ -1966,6 +2028,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .unwrap();
@@ -2027,6 +2090,7 @@ mod e2e_tests {
                 &opts,
                 false,
                 None,
+                1,
             )
             .await
             .unwrap();
@@ -2037,5 +2101,205 @@ mod e2e_tests {
         assert_eq!(m0[0].row_position, 1);
         assert_eq!(m1.len(), 1);
         assert_eq!(m1[0].row_position, 0);
+    }
+
+    #[tokio::test]
+    async fn search_candidates_bucket_order_is_sequential_at_concurrency_one() {
+        // At concurrency == 1 the per-bucket loop must search buckets in strict
+        // split order. A split-scoped recording closure captures the visited
+        // split_index sequence; it must match the split order deterministically.
+        let table_path = "memory:/pkvo_bucket_order";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut splits = Vec::new();
+        for bucket in 0..4i32 {
+            let bucket_path = format!("{table_path}/bucket-{bucket}");
+            let meta = write_file(&file_io, &bucket_path, "d.mosaic", vec![bucket]).await;
+            splits.push(PkVectorSearchSplit {
+                data_split: DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(bucket)
+                    .with_bucket_path(bucket_path)
+                    .with_total_buckets(4)
+                    .with_data_files(vec![meta])
+                    .build()
+                    .unwrap(),
+                ann_segments: Vec::new(),
+                active_files: vec![active("d.mosaic", 1)],
+            });
+        }
+        let visited = std::sync::Mutex::new(Vec::<usize>::new());
+        let factory = as_split_search(
+            |split_index: usize,
+             _: &PkVectorSearchSplit,
+             file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                visited.lock().unwrap().push(split_index);
+                let file_name = file.file_name.clone();
+                let query = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader = ArrayReader::new(2, vec![Some(vec![1.0, 0.0])]);
+                    Ok(vec![exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?])
+                })
+            },
+        );
+        let opts = HashMap::new();
+        PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &splits,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                None,
+                &factory,
+                &opts,
+                false,
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            visited.lock().unwrap().as_slice(),
+            &[0usize, 1, 2, 3],
+            "concurrency == 1 must search buckets in strict split order"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_serial_equals_parallel_with_ties() {
+        // Multiple buckets whose exact candidates share a distance (a tie decided by
+        // the cross-bucket candidate_cmp) plus NaN-distance candidates that must sort
+        // last. Running at concurrency == 1 and concurrency > 1 must yield the same
+        // deterministic best-first survivors regardless of bucket completion order.
+        let table_path = "memory:/pkvo_serial_parallel";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let negative_nan = f32::from_bits(0xffc00000);
+        let mut splits = Vec::new();
+        for bucket in 0..4i32 {
+            let bucket_path = format!("{table_path}/bucket-{bucket}");
+            let meta = write_file(&file_io, &bucket_path, "d.mosaic", vec![bucket, bucket]).await;
+            splits.push(PkVectorSearchSplit {
+                data_split: DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(bucket)
+                    .with_bucket_path(bucket_path)
+                    .with_total_buckets(4)
+                    .with_data_files(vec![meta])
+                    .build()
+                    .unwrap(),
+                ann_segments: Vec::new(),
+                active_files: vec![active("d.mosaic", 2)],
+            });
+        }
+        // Each bucket's exact file yields the same two candidates: pos0 distance 1.0
+        // (tied across buckets) and pos1 a NaN distance (must sort last). Lower
+        // split_index buckets yield more, so they complete last under
+        // buffer_unordered.
+        let factory = as_split_search(
+            move |split_index: usize,
+                  _: &PkVectorSearchSplit,
+                  file: &BucketActiveFile,
+                  _: &[&[f32]],
+                  _: VectorSearchMetric,
+                  _: usize,
+                  _: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let file_name = file.file_name.clone();
+                let yields = (4 - split_index) * 2;
+                Box::pin(async move {
+                    for _ in 0..yields {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(vec![vec![
+                        PkVectorSearchResult {
+                            data_file_name: file_name.clone(),
+                            row_position: 0,
+                            distance: 1.0,
+                        },
+                        PkVectorSearchResult {
+                            data_file_name: file_name,
+                            row_position: 1,
+                            distance: negative_nan,
+                        },
+                    ]])
+                })
+            },
+        );
+        let opts = HashMap::new();
+        let serial_result = PkVectorOrchestrator::new(make_reader(file_io.clone(), table_path))
+            .search_candidates(
+                &splits,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                None,
+                &factory,
+                &opts,
+                false,
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        let serial: Vec<(i32, i64, bool)> =
+            merge_candidates(serial_result.indexed, serial_result.exact, 8)
+                .iter()
+                .map(|c| (c.bucket, c.row_position, c.distance.is_nan()))
+                .collect();
+        let parallel_result = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &splits,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                None,
+                &factory,
+                &opts,
+                false,
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        let parallel: Vec<(i32, i64, bool)> =
+            merge_candidates(parallel_result.indexed, parallel_result.exact, 8)
+                .iter()
+                .map(|c| (c.bucket, c.row_position, c.distance.is_nan()))
+                .collect();
+        // Deterministic order: four tied distance-1.0 candidates by bucket asc, then
+        // four NaN candidates by bucket asc.
+        assert_eq!(
+            serial,
+            vec![
+                (0, 0, false),
+                (1, 0, false),
+                (2, 0, false),
+                (3, 0, false),
+                (0, 1, true),
+                (1, 1, true),
+                (2, 1, true),
+                (3, 1, true),
+            ]
+        );
+        assert_eq!(
+            parallel, serial,
+            "parallel survivors must equal serial survivors"
+        );
     }
 }

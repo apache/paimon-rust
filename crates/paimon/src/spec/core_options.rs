@@ -24,6 +24,7 @@ const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
+const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
@@ -114,6 +115,7 @@ const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
+const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
@@ -572,6 +574,28 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value)
+    }
+
+    /// Maximum number of concurrent tasks for global-index I/O, mirroring Java
+    /// `CoreOptions.GLOBAL_INDEX_THREAD_NUM` (key `global-index.thread-num`,
+    /// default 32). Used as the fan-out limit for the primary-key vector search
+    /// (per-bucket and per-exact-file). A value of `1` reproduces strict
+    /// sequential execution. A non-positive value is a misconfiguration and fails
+    /// loud rather than being silently clamped.
+    pub fn global_index_thread_num(&self) -> crate::Result<usize> {
+        let value = self
+            .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_THREAD_NUM);
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than 0, got: {}",
+                    GLOBAL_INDEX_THREAD_NUM_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value as usize)
     }
 
     pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
@@ -1235,6 +1259,7 @@ mod tests {
             core_options.global_index_row_count_per_shard().unwrap(),
             100_000
         );
+        assert_eq!(core_options.global_index_thread_num().unwrap(), 32);
         assert_eq!(
             core_options.sorted_index_records_per_range().unwrap(),
             100_000
@@ -1362,6 +1387,39 @@ mod tests {
                 .expect_err("invalid rows-per-shard should fail");
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION)));
+        }
+    }
+
+    #[test]
+    fn test_global_index_thread_num_default_and_custom() {
+        // Default mirrors Java (32) when unset.
+        let empty = HashMap::new();
+        let core = CoreOptions::new(&empty);
+        assert_eq!(core.global_index_thread_num().unwrap(), 32);
+
+        // Explicit value is read back verbatim.
+        let options =
+            HashMap::from([(GLOBAL_INDEX_THREAD_NUM_OPTION.to_string(), "8".to_string())]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.global_index_thread_num().unwrap(), 8);
+    }
+
+    #[test]
+    fn test_global_index_thread_num_rejects_invalid_values() {
+        // Non-positive values are a misconfiguration and must fail loud (never
+        // clamped to 1); an unparsable value is likewise rejected.
+        for value in ["0", "-1", "abc"] {
+            let options = HashMap::from([(
+                GLOBAL_INDEX_THREAD_NUM_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            let core = CoreOptions::new(&options);
+
+            let err = core
+                .global_index_thread_num()
+                .expect_err("invalid thread-num should fail");
+            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                    if message.contains(GLOBAL_INDEX_THREAD_NUM_OPTION)));
         }
     }
 
