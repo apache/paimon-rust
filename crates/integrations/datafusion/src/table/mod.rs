@@ -511,6 +511,7 @@ mod tests {
     use datafusion::logical_expr::{col, lit, Expr};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
+    use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
     use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
 
     use crate::physical_plan::PaimonTableScan;
@@ -792,6 +793,55 @@ mod tests {
                 field.name()
             );
         }
+    }
+
+    #[test]
+    fn test_datafusion_schema_uses_views_only_for_top_level_strings() {
+        let string_type = || DataType::VarChar(VarCharType::string_type());
+        let schema = datafusion_arrow_schema(&[
+            DataField::new(0, "plain".to_string(), string_type()),
+            DataField::new(
+                1,
+                "array".to_string(),
+                DataType::Array(ArrayType::new(string_type())),
+            ),
+            DataField::new(
+                2,
+                "map".to_string(),
+                DataType::Map(MapType::new(string_type(), string_type())),
+            ),
+            DataField::new(
+                3,
+                "row".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    4,
+                    "nested".to_string(),
+                    string_type(),
+                )])),
+            ),
+        ])
+        .expect("DataFusion schema should be created");
+
+        assert_eq!(schema.field(0).data_type(), &ArrowDataType::Utf8View);
+
+        let ArrowDataType::List(element) = schema.field(1).data_type() else {
+            panic!("array field should map to an Arrow List");
+        };
+        assert_eq!(element.data_type(), &ArrowDataType::Utf8);
+
+        let ArrowDataType::Map(entries, _) = schema.field(2).data_type() else {
+            panic!("map field should map to an Arrow Map");
+        };
+        let ArrowDataType::Struct(map_fields) = entries.data_type() else {
+            panic!("map entries should map to an Arrow Struct");
+        };
+        assert_eq!(map_fields[0].data_type(), &ArrowDataType::Utf8);
+        assert_eq!(map_fields[1].data_type(), &ArrowDataType::Utf8);
+
+        let ArrowDataType::Struct(row_fields) = schema.field(3).data_type() else {
+            panic!("row field should map to an Arrow Struct");
+        };
+        assert_eq!(row_fields[0].data_type(), &ArrowDataType::Utf8);
     }
 
     fn planned_file_names(scan: &PaimonTableScan) -> Vec<String> {
