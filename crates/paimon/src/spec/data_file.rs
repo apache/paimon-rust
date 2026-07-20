@@ -169,6 +169,24 @@ fn opt_str_array(b: &mut BinaryRowBuilder, pos: usize, v: &Option<Vec<String>>) 
     }
 }
 
+fn data_file_err(msg: &str) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: msg.to_string(),
+        source: None,
+    }
+}
+
+/// Reverse of `BinaryRowBuilder::write_timestamp_compact`: read the compact
+/// (precision-3) timestamp at `pos` back as epoch-millis and map it to `Utc`.
+fn read_compact_millis_as_utc(
+    row: &BinaryRow,
+    pos: usize,
+) -> crate::Result<chrono::DateTime<chrono::Utc>> {
+    let (millis, _nanos) = row.get_timestamp_raw(pos, 3)?;
+    chrono::DateTime::from_timestamp_millis(millis)
+        .ok_or_else(|| data_file_err("creation_time out of range"))
+}
+
 impl DataFileMeta {
     /// Decode this file's manifest value statistics for a field in the current schema.
     ///
@@ -286,6 +304,93 @@ impl DataFileMeta {
         opt_long(&mut b, 18, self.first_row_id);
         opt_str_array(&mut b, 19, &self.write_cols);
         Ok(b.build_row_data())
+    }
+
+    /// Reverse of [`DataFileMeta::to_serialized_row_data`]: decode the fixed
+    /// 20-field `DataFileMeta` BinaryRow (version 8 layout).
+    pub fn from_serialized_row_data(data: &[u8]) -> crate::Result<DataFileMeta> {
+        use crate::spec::deserialize_binary_array_str;
+        let row = BinaryRow::from_bytes(20, data.to_vec());
+
+        let file_name = String::from_utf8(row.get_binary(0)?.to_vec())
+            .map_err(|_| data_file_err("file_name is not valid UTF-8"))?;
+        let file_size = row.get_long(1)?;
+        let row_count = row.get_long(2)?;
+        let min_key = row.get_binary(3)?.to_vec();
+        let max_key = row.get_binary(4)?.to_vec();
+        let key_stats = BinaryTableStats::from_simple_stats_row_data(row.get_binary(5)?)?;
+        let value_stats = BinaryTableStats::from_simple_stats_row_data(row.get_binary(6)?)?;
+        let min_sequence_number = row.get_long(7)?;
+        let max_sequence_number = row.get_long(8)?;
+        let schema_id = row.get_long(9)?;
+        let level = row.get_int(10)?;
+        let extra_files = deserialize_binary_array_str(row.get_binary(11)?)?;
+        let creation_time = if row.is_null_at(12) {
+            None
+        } else {
+            Some(read_compact_millis_as_utc(&row, 12)?)
+        };
+        let delete_row_count = if row.is_null_at(13) {
+            None
+        } else {
+            Some(row.get_long(13)?)
+        };
+        let embedded_index = if row.is_null_at(14) {
+            None
+        } else {
+            Some(row.get_binary(14)?.to_vec())
+        };
+        let file_source = if row.is_null_at(15) {
+            None
+        } else {
+            Some(row.get_byte(15)? as i32)
+        };
+        let value_stats_cols = if row.is_null_at(16) {
+            None
+        } else {
+            Some(deserialize_binary_array_str(row.get_binary(16)?)?)
+        };
+        let external_path = if row.is_null_at(17) {
+            None
+        } else {
+            Some(
+                String::from_utf8(row.get_binary(17)?.to_vec())
+                    .map_err(|_| data_file_err("external_path is not valid UTF-8"))?,
+            )
+        };
+        let first_row_id = if row.is_null_at(18) {
+            None
+        } else {
+            Some(row.get_long(18)?)
+        };
+        let write_cols = if row.is_null_at(19) {
+            None
+        } else {
+            Some(deserialize_binary_array_str(row.get_binary(19)?)?)
+        };
+
+        Ok(DataFileMeta {
+            file_name,
+            file_size,
+            row_count,
+            min_key,
+            max_key,
+            key_stats,
+            value_stats,
+            min_sequence_number,
+            max_sequence_number,
+            schema_id,
+            level,
+            extra_files,
+            creation_time,
+            delete_row_count,
+            embedded_index,
+            file_source,
+            value_stats_cols,
+            external_path,
+            first_row_id,
+            write_cols,
+        })
     }
 
     /// Full path for this data file.
@@ -413,6 +518,70 @@ mod tests {
 
     fn int_field(id: i32, name: &str) -> DataField {
         DataField::new(id, name.to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn sample_full_data_file_meta() -> DataFileMeta {
+        let stats = BinaryTableStats::empty();
+        DataFileMeta {
+            file_name: "data-full.parquet".to_string(),
+            file_size: 1024,
+            row_count: 42,
+            min_key: vec![1, 2, 3],
+            max_key: vec![9, 8, 7],
+            key_stats: stats.clone(),
+            value_stats: stats,
+            min_sequence_number: 10,
+            max_sequence_number: 20,
+            schema_id: 5,
+            level: 3,
+            extra_files: vec!["extra-1".to_string(), "extra-2".to_string()],
+            creation_time: DateTime::from_timestamp_millis(1_700_000_000_123),
+            delete_row_count: Some(4),
+            embedded_index: Some(vec![7, 8, 9]),
+            file_source: Some(0),
+            value_stats_cols: Some(vec!["a".to_string(), "b".to_string()]),
+            external_path: Some("s3://bucket/data-full.parquet".to_string()),
+            first_row_id: Some(1_000),
+            write_cols: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+        }
+    }
+
+    fn sample_minimal_data_file_meta() -> DataFileMeta {
+        let stats = BinaryTableStats::empty();
+        DataFileMeta {
+            file_name: "data-min.parquet".to_string(),
+            file_size: 0,
+            row_count: 0,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: stats.clone(),
+            value_stats: stats,
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    #[test]
+    fn data_file_meta_row_data_round_trips() {
+        for meta in [
+            sample_full_data_file_meta(),
+            sample_minimal_data_file_meta(),
+        ] {
+            let bytes = meta.to_serialized_row_data().unwrap();
+            let back = DataFileMeta::from_serialized_row_data(&bytes).unwrap();
+            assert_eq!(back, meta);
+        }
     }
 
     #[test]

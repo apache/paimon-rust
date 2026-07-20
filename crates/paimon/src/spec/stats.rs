@@ -123,6 +123,17 @@ impl BinaryTableStats {
         b.write_bytes(2, &serialize_binary_array_long(&self.null_counts));
         b.build_row_data()
     }
+
+    /// Reverse of [`BinaryTableStats::to_simple_stats_row_data`]: a 3-field
+    /// `SimpleStats` BinaryRow body (min_values bytes, max_values bytes,
+    /// null_counts array<bigint>).
+    pub fn from_simple_stats_row_data(data: &[u8]) -> crate::Result<BinaryTableStats> {
+        let row = crate::spec::BinaryRow::from_bytes(3, data.to_vec());
+        let min_values = row.get_binary(0)?.to_vec();
+        let max_values = row.get_binary(1)?.to_vec();
+        let null_counts = crate::spec::deserialize_binary_array_long(row.get_binary(2)?)?;
+        Ok(BinaryTableStats::new(min_values, max_values, null_counts))
+    }
 }
 
 impl Display for BinaryTableStats {
@@ -216,5 +227,13 @@ mod tests {
             .expect("max_values must decode as a BinaryRow");
         assert_eq!(min_row.arity(), 0);
         assert_eq!(max_row.arity(), 0);
+    }
+
+    #[test]
+    fn simple_stats_row_data_round_trips() {
+        let stats = BinaryTableStats::empty();
+        let bytes = stats.to_simple_stats_row_data();
+        let back = BinaryTableStats::from_simple_stats_row_data(&bytes).unwrap();
+        assert_eq!(back.to_simple_stats_row_data(), bytes);
     }
 }
