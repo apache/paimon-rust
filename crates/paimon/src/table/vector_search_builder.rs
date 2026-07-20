@@ -430,7 +430,7 @@ impl<'a> VectorSearchBuilder<'a> {
             Some(filter) => {
                 let file_predicates = FilePredicates {
                     predicates: vec![filter.clone()],
-                    pruning_predicates: Vec::new(),
+                    apply_row_filter: true,
                     file_fields: self.table.schema().fields().to_vec(),
                 };
                 let row_id_field = DataField::new(
@@ -3602,7 +3602,7 @@ mod residual_positions_tests {
             .unwrap();
         FilePredicates {
             predicates: vec![pred],
-            pruning_predicates: Vec::new(),
+            apply_row_filter: true,
             file_fields: vec![id_field()],
         }
     }

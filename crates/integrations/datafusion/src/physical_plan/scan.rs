@@ -28,6 +28,7 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::config::ConfigOptions;
+use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Operator;
@@ -675,16 +676,31 @@ impl ExecutionPlan for PaimonTableScan {
             ));
         }
 
-        let support = vec![
-            if config.execution.parquet.pushdown_filters {
-                PushedDown::Yes
-            } else {
-                PushedDown::No
-            };
-            filters.len()
-        ];
+        let schema = self.schema();
+        let mut accepted = Vec::new();
+        let support = filters
+            .into_iter()
+            .map(|filter| {
+                if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
+                    accepted.push(filter);
+                    if config.execution.parquet.pushdown_filters {
+                        PushedDown::Yes
+                    } else {
+                        PushedDown::No
+                    }
+                } else {
+                    PushedDown::No
+                }
+            })
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                support,
+            ));
+        }
+
         let mut scan = self.clone();
-        scan.runtime_filters.extend(filters);
+        scan.runtime_filters.extend(accepted);
         Ok(
             FilterPushdownPropagation::with_parent_pushdown_result(support)
                 .with_updated_node(Arc::new(scan)),
@@ -732,14 +748,19 @@ impl ExecutionPlan for PaimonTableScan {
                 runtime_filter_wait_timeout(estimated_rows),
             )
             .await;
-            if let Some(filter) = pushed_predicate {
+            let read_predicate = match (pushed_predicate, runtime_pruning) {
+                (Some(pushed), Some(runtime)) => Some(Predicate::and(vec![pushed, runtime])),
+                (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
+                (None, None) => None,
+            };
+            if let Some(filter) = read_predicate {
                 read_builder.with_filter(filter);
             }
 
-            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-            if let Some(filter) = runtime_pruning {
-                read = read.with_pruning_filter(filter);
-            }
+            let read = read_builder
+                .new_read()
+                .map_err(to_datafusion_error)?
+                .with_row_filter(apply_runtime_filters);
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
@@ -1243,6 +1264,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_scan_rejects_filter_outside_output_schema() {
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("missing", 1)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = true;
+
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &config,
+            )
+            .unwrap();
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+        assert!(result.updated_node.is_none());
+    }
+
     #[tokio::test]
     async fn test_scan_uses_retained_runtime_filter_for_pruning_only() {
         let tempdir = tempdir().unwrap();
@@ -1457,7 +1518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_applies_pushed_filter_during_read() {
+    async fn test_execute_uses_pushed_filter_only_for_pruning_by_default() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -1541,7 +1602,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(actual_ids, vec![2, 3, 4]);
+        assert_eq!(actual_ids, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]

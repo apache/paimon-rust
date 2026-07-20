@@ -76,6 +76,10 @@ pub(crate) fn filter_record_batch_by_predicates(
     predicates: &FilePredicates,
     scan_fields: &[DataField],
 ) -> crate::Result<RecordBatch> {
+    if !predicates.apply_row_filter {
+        return Ok(batch);
+    }
+
     let Some(mask) = evaluate_predicates_mask(
         &batch,
         &predicates.predicates,
@@ -250,7 +254,7 @@ pub(crate) fn widen_scan_fields(
 ) -> Vec<DataField> {
     let mut fields = read_fields.to_vec();
 
-    if let Some(fp) = predicates {
+    if let Some(fp) = predicates.filter(|fp| fp.apply_row_filter) {
         let mut predicate_indices = Vec::new();
         for predicate in &fp.predicates {
             collect_predicate_field_indices(predicate, &mut predicate_indices);
@@ -943,7 +947,7 @@ mod tests {
     fn file_predicates(predicates: Vec<Predicate>, file_fields: Vec<DataField>) -> FilePredicates {
         FilePredicates {
             predicates,
-            pruning_predicates: Vec::new(),
+            apply_row_filter: true,
             file_fields,
         }
     }

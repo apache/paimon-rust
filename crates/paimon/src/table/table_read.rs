@@ -110,18 +110,18 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Set a conservative file-format pruning predicate.
+    /// Configure whether data predicates may remove rows from emitted batches.
     ///
-    /// This may skip files, row groups, or pages whose statistics prove they
-    /// cannot match, but it does not remove individual rows. The caller must
-    /// still enforce the predicate exactly after reading.
-    pub fn with_pruning_filter(self, filter: Predicate) -> Self {
+    /// When disabled, predicates remain available for conservative scan and
+    /// file-format pruning, and the caller must enforce them exactly. Merge and
+    /// data-evolution readers do not push such predicates below materialization.
+    pub fn with_row_filter(self, row_filter: bool) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
-                Self(TableReadKind::Paimon(read.with_pruning_filter(filter)))
+                Self(TableReadKind::Paimon(read.with_row_filter(row_filter)))
             }
             TableReadKind::Format(read) => {
-                Self(TableReadKind::Format(read.with_pruning_filter(filter)))
+                Self(TableReadKind::Format(read.with_row_filter(row_filter)))
             }
         }
     }
@@ -174,7 +174,7 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
-    pruning_predicates: Vec<Predicate>,
+    row_filter: bool,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -188,7 +188,7 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
-            pruning_predicates: Vec::new(),
+            row_filter: true,
         }
     }
 
@@ -207,9 +207,9 @@ impl<'a> PaimonTableRead<'a> {
         self.table
     }
 
-    /// Set a filter predicate. Used conservatively for read-side pruning and
-    /// enforced exactly by residual filtering on append, data-evolution, and
-    /// primary-key merge read paths (see
+    /// Set a filter predicate. Used conservatively for read-side pruning and,
+    /// unless row filtering is disabled, enforced exactly by residual filtering
+    /// on append, data-evolution, and primary-key merge read paths (see
     /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
@@ -222,10 +222,17 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn with_pruning_filter(mut self, filter: Predicate) -> Self {
-        let (_, data_predicates) = split_scan_predicates(self.table, filter);
-        self.pruning_predicates = data_predicates;
+    fn with_row_filter(mut self, row_filter: bool) -> Self {
+        self.row_filter = row_filter;
         self
+    }
+
+    fn merge_predicates(&self) -> &[Predicate] {
+        if self.row_filter {
+            &self.data_predicates
+        } else {
+            &[]
+        }
     }
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
@@ -310,6 +317,7 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             self.data_predicates.clone(),
         )
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
         let raw_stream = reader.read(&data_splits)?;
 
@@ -457,7 +465,7 @@ impl<'a> PaimonTableRead<'a> {
                 table_schema_id: self.table.schema().id(),
                 table_fields: self.table.schema.fields().to_vec(),
                 read_type: self.read_type().to_vec(),
-                predicates: self.data_predicates.clone(),
+                predicates: self.merge_predicates().to_vec(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
                 merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
@@ -483,7 +491,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
-            self.data_predicates.clone(),
+            self.merge_predicates().to_vec(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
             core_options.blob_view_fields(),
@@ -508,7 +516,7 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
-        .with_pruning_predicates(self.pruning_predicates.clone())
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?)))
     }
 }
@@ -664,6 +672,19 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_row_filter_disabled_omits_merge_predicates() {
+        let table = query_auth_table();
+        let read = PaimonTableRead::new(
+            &table,
+            table.schema.fields().to_vec(),
+            vec![Predicate::AlwaysFalse],
+        )
+        .with_row_filter(false);
+
+        assert!(read.merge_predicates().is_empty());
     }
 
     #[test]

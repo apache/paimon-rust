@@ -43,9 +43,8 @@ use std::collections::HashMap;
 pub(crate) struct FilePredicates {
     /// Predicates with indices already remapped to file-level fields.
     pub predicates: Vec<Predicate>,
-    /// Predicates used only for conservative file, row-group, or page pruning.
-    /// They must never remove individual rows from emitted batches.
-    pub pruning_predicates: Vec<Predicate>,
+    /// Whether predicates may remove individual rows from emitted batches.
+    pub apply_row_filter: bool,
     /// File-level fields (full file schema), used for stats access and row filtering.
     pub file_fields: Vec<DataField>,
 }
@@ -65,13 +64,17 @@ pub(crate) trait FormatFileReader: Send + Sync {
     /// for residual filtering); the caller (`DataFileReader`) projects to the
     /// requested output by name, so extra columns are harmless.
     ///
-    /// Predicate exactness is per-format, NOT a blanket guarantee:
+    /// When `FilePredicates::apply_row_filter` is true, predicate exactness is
+    /// per-format, NOT a blanket guarantee:
     /// - Parquet, ORC, Avro, Row, and Vortex apply the predicate **exactly** —
     ///   each emitted batch contains only rows matching the pushed-down predicate
     ///   (native pushdown for pruning + a row-level residual pass for the rest).
     /// - Blob does not evaluate predicates at all; Mosaic applies only
     ///   stats-level (row-group) pruning. For those, non-matching rows may
     ///   survive and the caller must not assume exactness.
+    /// - When `apply_row_filter` is false, formats may still use predicates for
+    ///   conservative file, row-group, stripe, or page pruning, but must not
+    ///   remove individual rows from a retained unit.
     ///
     /// `row_selection` is a pre-merged list of 0-based inclusive row ranges
     /// (DV + row_ranges already combined by the caller).
