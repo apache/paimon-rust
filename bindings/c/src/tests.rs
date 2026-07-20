@@ -2418,3 +2418,59 @@ fn vector_search_empty_result_is_eof_stream() {
         unwrap_table(handle);
     }
 }
+
+// =========================================================================
+//  paimon_plan_from_split_bytes
+// =========================================================================
+
+#[test]
+fn plan_from_split_bytes_round_trips() {
+    let path = "memory:/test_plan_from_split_bytes";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1, 2, 3], vec!["a", "b", "c"])]);
+
+    // Obtain a real DataSplit from a plan via the Rust API, then serialize it.
+    let splits = crate::runtime().block_on(async {
+        let rb = table.new_read_builder();
+        let scan = rb.new_scan();
+        scan.plan().await.unwrap().splits().to_vec()
+    });
+    assert!(!splits.is_empty(), "expected at least one planned split");
+    let bytes = splits[0].serialize().unwrap();
+
+    let result = unsafe { paimon_plan_from_split_bytes(bytes.as_ptr(), bytes.len()) };
+    assert!(result.error.is_null());
+    assert_eq!(unsafe { paimon_plan_num_splits(result.plan) }, 1);
+    unsafe { paimon_plan_free(result.plan) };
+}
+
+#[test]
+fn plan_from_split_bytes_rejects_null_and_empty() {
+    let r = unsafe { paimon_plan_from_split_bytes(std::ptr::null(), 0) };
+    assert!(r.plan.is_null());
+    assert!(!r.error.is_null());
+    unsafe { paimon_error_free(r.error) };
+
+    let dummy = [0u8; 1];
+    let r2 = unsafe { paimon_plan_from_split_bytes(dummy.as_ptr(), 0) };
+    assert!(r2.plan.is_null());
+    assert!(!r2.error.is_null());
+    unsafe { paimon_error_free(r2.error) };
+}
+
+#[test]
+fn plan_from_split_bytes_rejects_garbage() {
+    let garbage = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let r = unsafe { paimon_plan_from_split_bytes(garbage.as_ptr(), garbage.len()) };
+    assert!(r.plan.is_null());
+    assert!(!r.error.is_null());
+    unsafe { paimon_error_free(r.error) };
+}

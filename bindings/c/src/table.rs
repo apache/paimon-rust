@@ -22,7 +22,7 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, StructArray};
 use futures::StreamExt;
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
-use paimon::table::{ArrowRecordBatchStream, Table};
+use paimon::table::{ArrowRecordBatchStream, DataSplit, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
@@ -472,10 +472,54 @@ pub unsafe extern "C" fn paimon_table_scan_plan(
 
 // ======================= Plan ===============================
 
+/// Build a one-split `paimon_plan` from a serialized Paimon-native `DataSplit`
+/// byte buffer (the wire form produced by `DataSplit::serialize` / Java
+/// `DataSplit#serialize`). `data` must be raw bytes (Base64 already decoded by
+/// the caller).
+///
+/// The returned plan is usable with `paimon_table_read_to_arrow` and must be
+/// freed with `paimon_plan_free`.
+///
+/// # Safety
+/// `data` must point to `len` valid bytes, or be null when `len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_plan_from_split_bytes(
+    data: *const u8,
+    len: usize,
+) -> paimon_result_plan {
+    if data.is_null() || len == 0 {
+        return paimon_result_plan {
+            plan: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "paimon_plan_from_split_bytes: null or empty buffer".to_string(),
+            ),
+        };
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    match DataSplit::deserialize(bytes) {
+        Ok(split) => {
+            let plan = Plan::new(vec![split]);
+            let wrapper = Box::new(paimon_plan {
+                inner: Box::into_raw(Box::new(plan)) as *mut c_void,
+            });
+            paimon_result_plan {
+                plan: Box::into_raw(wrapper),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(e) => paimon_result_plan {
+            plan: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
 /// Free a paimon_plan.
 ///
 /// # Safety
 /// Only call with a plan returned from `paimon_table_scan_plan`.
+/// A plan returned from `paimon_plan_from_split_bytes` is also a valid source.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_plan_free(plan: *mut paimon_plan) {
     if !plan.is_null() {
@@ -490,6 +534,7 @@ pub unsafe extern "C" fn paimon_plan_free(plan: *mut paimon_plan) {
 ///
 /// # Safety
 /// `plan` must be a valid pointer from `paimon_table_scan_plan`, or null (returns 0).
+/// A plan returned from `paimon_plan_from_split_bytes` is also a valid source.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_plan_num_splits(plan: *const paimon_plan) -> usize {
     if plan.is_null() {
@@ -1735,6 +1780,12 @@ const _: unsafe extern "C" fn(
     *const paimon_option,
     usize,
 ) -> paimon_result_read_builder = paimon_table_new_read_builder_with_options;
+
+// Plan constructor ABI signature guard. Pins the symbol that builds a plan from
+// serialized split bytes so an accidental signature change fails to compile
+// rather than silently breaking header consumers.
+const _: unsafe extern "C" fn(*const u8, usize) -> paimon_result_plan =
+    paimon_plan_from_split_bytes;
 
 #[cfg(test)]
 mod tests {
