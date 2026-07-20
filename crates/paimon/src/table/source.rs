@@ -471,7 +471,7 @@ impl PartitionBucket {
 /// Input split for reading: partition + bucket + list of data files and optional deletion files.
 ///
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataSplit {
     snapshot_id: i64,
     partition: BinaryRow,
@@ -664,6 +664,112 @@ impl DataSplit {
         Ok(out)
     }
 
+    /// Reverse of [`DataSplit::serialize`]: parse a raw v8 `DataSplit#serialize` body.
+    /// Consumes the entire buffer; trailing bytes are an error.
+    pub fn deserialize(data: &[u8]) -> crate::Result<DataSplit> {
+        let mut cur = data;
+        let split = Self::read_v8_body(&mut cur)?;
+        if !cur.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: format!("{} trailing bytes after DataSplit", cur.len()),
+                source: None,
+            });
+        }
+        Ok(split)
+    }
+
+    /// Read a v8 `DataSplit` body from the cursor, leaving it positioned after the body
+    /// (used both by `deserialize` and the SPLIT_V1 frame reader).
+    fn read_v8_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+        let magic = read_i64(cur)?;
+        if magic != SPLIT_MAGIC {
+            return Err(crate::Error::DataInvalid {
+                message: format!("invalid DataSplit magic: {magic:#018x}"),
+                source: None,
+            });
+        }
+        match read_i32(cur)? {
+            SPLIT_VERSION => Self::read_v8_body_after_version(cur),
+            version => Err(crate::Error::Unsupported {
+                message: format!(
+                    "DataSplit version {version} not supported (only v{SPLIT_VERSION})"
+                ),
+            }),
+        }
+    }
+
+    /// Read the fields following the magic + version header of a v8 `DataSplit` body.
+    fn read_v8_body_after_version(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+        let snapshot_id = read_i64(cur)?;
+
+        let part_len = read_i32(cur)?;
+        if part_len < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "negative partition length".into(),
+                source: None,
+            });
+        }
+        let part_bytes = take(cur, part_len as usize)?;
+        let partition = BinaryRow::from_serialized_bytes(part_bytes)?;
+
+        let bucket = read_i32(cur)?;
+        let bucket_path = read_java_utf(cur)?;
+
+        let total_buckets = if read_u8(cur)? == 0 {
+            None
+        } else {
+            Some(read_i32(cur)?)
+        };
+
+        let before_files_n = read_i32(cur)?; // deprecated, always 0 on write
+        if before_files_n != 0 {
+            return Err(crate::Error::Unsupported {
+                message: format!("non-empty beforeFiles ({before_files_n}) not supported"),
+            });
+        }
+        let _before_deletion = read_deletion_list(cur)?; // discard (always null on write)
+
+        let data_files_n = read_i32(cur)?;
+        if data_files_n < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "negative data_files count".into(),
+                source: None,
+            });
+        }
+        // Bound the eager reservation by the remaining bytes: each entry is at least a
+        // 4-byte length prefix, so a crafted huge count cannot reserve more than the
+        // buffer could ever hold. Underrun is still caught per-element below.
+        let mut data_files = Vec::with_capacity((data_files_n as usize).min(cur.len() / 4));
+        for _ in 0..data_files_n {
+            let len = read_i32(cur)?;
+            if len < 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: "negative DataFileMeta length".into(),
+                    source: None,
+                });
+            }
+            let row = take(cur, len as usize)?;
+            data_files.push(DataFileMeta::from_serialized_row_data(row)?);
+        }
+
+        let data_deletion_files = read_deletion_list(cur)?;
+        let _is_streaming = read_u8(cur)?;
+        let raw_convertible = read_u8(cur)? != 0;
+
+        let mut builder = DataSplitBuilder::new()
+            .with_snapshot(snapshot_id)
+            .with_partition(partition)
+            .with_bucket(bucket)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(total_buckets.unwrap_or(1))
+            .with_data_files(data_files)
+            .with_raw_convertible(raw_convertible);
+        if let Some(dels) = data_deletion_files {
+            builder = builder.with_data_deletion_files(dels);
+        }
+        builder.build()
+    }
+
     /// Java `SplitSerializer#serialize` frame: magic + version + type id + body. The cross-language
     /// entry point. A plain split serializes as `DataSplit` (type 1); a split carrying row ranges as
     /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
@@ -692,6 +798,88 @@ impl DataSplit {
             }
         }
         Ok(out)
+    }
+
+    /// Reverse of [`DataSplit::serialize_split_v1`]: parse a Java `SplitSerializer` frame into a
+    /// `DataSplit` (type 1) or an `IndexedSplit` (type 3, which carries `row_ranges`). Other split
+    /// type ids, and IndexedSplit vector scores, are unsupported. Consumes the entire buffer.
+    pub fn deserialize_split_v1(data: &[u8]) -> crate::Result<DataSplit> {
+        let mut cur = data;
+        let magic = read_i64(&mut cur)?;
+        if magic != SPLIT_SER_MAGIC {
+            return Err(crate::Error::DataInvalid {
+                message: format!("invalid SPLIT_V1 magic: {magic:#018x}"),
+                source: None,
+            });
+        }
+        let version = read_i32(&mut cur)?;
+        if version != SPLIT_SER_VERSION {
+            return Err(crate::Error::Unsupported {
+                message: format!("SplitSerializer version {version} not supported"),
+            });
+        }
+        let type_id = read_i32(&mut cur)?;
+        let split = match type_id {
+            SPLIT_SER_TYPE_DATA_SPLIT => Self::read_v8_body(&mut cur)?,
+            SPLIT_SER_TYPE_INDEXED_SPLIT => {
+                let im = read_i64(&mut cur)?;
+                if im != INDEXED_SPLIT_MAGIC {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("invalid IndexedSplit magic: {im:#018x}"),
+                        source: None,
+                    });
+                }
+                let iv = read_i32(&mut cur)?;
+                if iv != INDEXED_SPLIT_VERSION {
+                    return Err(crate::Error::Unsupported {
+                        message: format!("IndexedSplit version {iv} not supported"),
+                    });
+                }
+                let body = Self::read_v8_body(&mut cur)?;
+                let ranges_n = read_i32(&mut cur)?;
+                if ranges_n < 0 {
+                    return Err(crate::Error::DataInvalid {
+                        message: "negative row_ranges count".into(),
+                        source: None,
+                    });
+                }
+                // Bound the eager reservation by the remaining bytes: each RowRange is
+                // 16 bytes (two i64), so a crafted huge count cannot over-reserve.
+                let mut ranges = Vec::with_capacity((ranges_n as usize).min(cur.len() / 16));
+                for _ in 0..ranges_n {
+                    let from = read_i64(&mut cur)?;
+                    let to = read_i64(&mut cur)?;
+                    if from > to {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!("row range from {from} > to {to}"),
+                            source: None,
+                        });
+                    }
+                    ranges.push(RowRange::new(from, to));
+                }
+                let scores_flag = read_u8(&mut cur)?;
+                if scores_flag != 0 {
+                    return Err(crate::Error::Unsupported {
+                        message: "IndexedSplit scores are not supported".into(),
+                    });
+                }
+                let mut body = body;
+                body.row_ranges = Some(ranges);
+                body
+            }
+            other => {
+                return Err(crate::Error::Unsupported {
+                    message: format!("unsupported split type id: {other}"),
+                });
+            }
+        };
+        if !cur.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: format!("{} trailing bytes after SPLIT_V1 frame", cur.len()),
+                source: None,
+            });
+        }
+        Ok(split)
     }
 }
 
@@ -773,6 +961,116 @@ fn write_deletion_list(
         }
     }
     Ok(())
+}
+
+/// Advances `cur` by `n` bytes, returning the consumed slice. Errors on underrun.
+fn take<'a>(cur: &mut &'a [u8], n: usize) -> crate::Result<&'a [u8]> {
+    if cur.len() < n {
+        return Err(crate::Error::DataInvalid {
+            message: format!("split buffer underrun: need {n}, have {}", cur.len()),
+            source: None,
+        });
+    }
+    let (head, tail) = cur.split_at(n);
+    *cur = tail;
+    Ok(head)
+}
+
+fn read_u8(cur: &mut &[u8]) -> crate::Result<u8> {
+    Ok(take(cur, 1)?[0])
+}
+
+fn read_i16(cur: &mut &[u8]) -> crate::Result<i16> {
+    Ok(i16::from_be_bytes(take(cur, 2)?.try_into().unwrap()))
+}
+
+fn read_i32(cur: &mut &[u8]) -> crate::Result<i32> {
+    Ok(i32::from_be_bytes(take(cur, 4)?.try_into().unwrap()))
+}
+
+fn read_i64(cur: &mut &[u8]) -> crate::Result<i64> {
+    Ok(i64::from_be_bytes(take(cur, 8)?.try_into().unwrap()))
+}
+
+fn utf_err() -> crate::Error {
+    crate::Error::DataInvalid {
+        message: "invalid modified UTF-8 in split".into(),
+        source: None,
+    }
+}
+
+/// Reverse of [`write_java_utf`]: `u16` byte-length prefix + modified UTF-8. Each UTF-16 code
+/// unit is encoded independently, so a supplementary char arrives as two 3-byte surrogate units;
+/// collect the raw `u16` units and let [`String::from_utf16`] pair the surrogates.
+fn read_java_utf(cur: &mut &[u8]) -> crate::Result<String> {
+    let len = read_i16(cur)? as u16 as usize;
+    let bytes = take(cur, len)?;
+    let mut units: Vec<u16> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let (unit, adv) = if b & 0x80 == 0 {
+            // 1-byte: 0xxxxxxx (includes raw 0x00)
+            (b as u16, 1)
+        } else if b & 0xE0 == 0xC0 {
+            // 2-byte: 110xxxxx 10xxxxxx (0xC0 0x80 is Java's encoding of '\0')
+            if i + 1 >= bytes.len() || bytes[i + 1] & 0xC0 != 0x80 {
+                return Err(utf_err());
+            }
+            ((((b & 0x1F) as u16) << 6) | (bytes[i + 1] & 0x3F) as u16, 2)
+        } else if b & 0xF0 == 0xE0 {
+            // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+            if i + 2 >= bytes.len() || bytes[i + 1] & 0xC0 != 0x80 || bytes[i + 2] & 0xC0 != 0x80 {
+                return Err(utf_err());
+            }
+            (
+                (((b & 0x0F) as u16) << 12)
+                    | (((bytes[i + 1] & 0x3F) as u16) << 6)
+                    | (bytes[i + 2] & 0x3F) as u16,
+                3,
+            )
+        } else {
+            return Err(utf_err());
+        };
+        units.push(unit);
+        i += adv;
+    }
+    String::from_utf16(&units).map_err(|_| utf_err())
+}
+
+/// Reverse of [`write_deletion_list`]: `0` = null list; else `1` + count + per entry
+/// (`0` = null, or `1` + path + offset + length + cardinality, where `-1` decodes to `None`).
+fn read_deletion_list(cur: &mut &[u8]) -> crate::Result<Option<Vec<Option<DeletionFile>>>> {
+    if read_u8(cur)? == 0 {
+        return Ok(None);
+    }
+    let count = read_i32(cur)?;
+    if count < 0 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("deletion list count {count} < 0"),
+            source: None,
+        });
+    }
+    // Bound the eager reservation by the remaining bytes: each entry is at least a
+    // 1-byte null flag, so a crafted huge count cannot over-reserve.
+    let mut out = Vec::with_capacity((count as usize).min(cur.len()));
+    for _ in 0..count {
+        if read_u8(cur)? == 0 {
+            out.push(None);
+        } else {
+            let path = read_java_utf(cur)?;
+            let offset = read_i64(cur)?;
+            let length = read_i64(cur)?;
+            let cardinality = read_i64(cur)?;
+            let cardinality = if cardinality == -1 {
+                None
+            } else {
+                Some(cardinality)
+            };
+            out.push(Some(DeletionFile::new(path, offset, length, cardinality)));
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Builder for [DataSplit].
@@ -1192,9 +1490,16 @@ mod tests {
 
     #[test]
     fn serialize_matches_datasplit_v8() {
-        use chrono::DateTime;
         // Golden generated by Java (paimon-core DataSplitCompatibleTest) for cross-language parity.
         let expected = include_bytes!("goldens/datasplit_v8.bin");
+        let split = sample_v8_split();
+        assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
+    }
+
+    /// The fixture split whose Java-generated bytes live in `goldens/datasplit_v8.bin`.
+    /// Shared by the serialize and deserialize golden tests.
+    fn sample_v8_split() -> DataSplit {
+        use chrono::DateTime;
 
         let mut pb = crate::spec::BinaryRowBuilder::new(1);
         pb.write_bytes(0, b"aaaaa");
@@ -1235,7 +1540,7 @@ mod tests {
             ),
         };
 
-        let split = DataSplitBuilder::new()
+        DataSplitBuilder::new()
             .with_snapshot(18)
             .with_partition(pb.build())
             .with_bucket(20)
@@ -1250,9 +1555,91 @@ mod tests {
             ))])
             .with_raw_convertible(false)
             .build()
-            .unwrap();
+            .unwrap()
+    }
 
-        assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
+    #[test]
+    fn deserialize_matches_datasplit_v8_golden() {
+        let golden = include_bytes!("goldens/datasplit_v8.bin");
+        let split = DataSplit::deserialize(golden).unwrap();
+        assert_eq!(split, sample_v8_split());
+    }
+
+    #[test]
+    fn deserialize_round_trips_serialize() {
+        let split = sample_v8_split();
+        assert_eq!(
+            DataSplit::deserialize(&split.serialize().unwrap()).unwrap(),
+            split
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_trailing_bytes() {
+        let mut bytes = sample_v8_split().serialize().unwrap();
+        bytes.push(0xFF);
+        assert!(DataSplit::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_magic() {
+        let bytes = [0u8; 12];
+        assert!(DataSplit::deserialize(&bytes).is_err());
+    }
+
+    // A valid v8 header followed by a huge data_files count must return an error, not
+    // abort the process via an unbounded `Vec::with_capacity` reservation.
+    #[test]
+    fn deserialize_rejects_huge_data_files_count_without_aborting() {
+        // Build a well-formed split with an empty data-file list so the trailing layout
+        // after `data_files_n` is fixed: deletion-null (1) + isStreaming (1) +
+        // raw_convertible (1) = 3 bytes. Thus `data_files_n` (i32) sits at `len - 7`.
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
+            .with_bucket(0)
+            .with_bucket_path("p".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+        let mut bytes = split.serialize().unwrap();
+        // Sanity: unpatched buffer round-trips.
+        assert!(DataSplit::deserialize(&bytes).is_ok());
+
+        let pos = bytes.len() - 7;
+        bytes[pos..pos + 4].copy_from_slice(&i32::MAX.to_be_bytes());
+        match DataSplit::deserialize(&bytes) {
+            Err(crate::Error::DataInvalid { .. }) => {}
+            other => panic!("expected DataInvalid, got {other:?}"),
+        }
+    }
+
+    // Same hardening for the IndexedSplit row-ranges count in the SPLIT_V1 frame.
+    #[test]
+    fn deserialize_split_v1_rejects_huge_ranges_count_without_aborting() {
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
+            .with_bucket(0)
+            .with_bucket_path("p".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .with_row_ranges(vec![RowRange::new(0, 5)])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+        let mut bytes = split.serialize_split_v1().unwrap();
+        assert!(DataSplit::deserialize_split_v1(&bytes).is_ok());
+
+        // Trailing after `ranges_n` (i32): one RowRange (16) + scores flag (1) = 17 bytes.
+        let pos = bytes.len() - 21;
+        bytes[pos..pos + 4].copy_from_slice(&i32::MAX.to_be_bytes());
+        match DataSplit::deserialize_split_v1(&bytes) {
+            Err(crate::Error::DataInvalid { .. }) => {}
+            other => panic!("expected DataInvalid, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1278,6 +1665,74 @@ mod tests {
         // Overlong -> error (like Java UTFDataFormatException).
         let mut sink = Vec::new();
         assert!(write_java_utf(&mut sink, &"a".repeat(70000)).is_err());
+    }
+
+    #[test]
+    fn java_utf_round_trips() {
+        for s in [
+            "",
+            "ascii",
+            "caf\u{e9}",
+            "\0",
+            "\u{800}",
+            "\u{1F600}emoji",
+            &"x".repeat(1000),
+        ] {
+            let mut out = Vec::new();
+            write_java_utf(&mut out, s).unwrap();
+            let mut cur = out.as_slice();
+            assert_eq!(read_java_utf(&mut cur).unwrap(), s);
+            assert!(cur.is_empty(), "should consume exactly the encoded bytes");
+        }
+    }
+
+    #[test]
+    fn java_utf_rejects_truncated() {
+        let mut out = Vec::new();
+        write_java_utf(&mut out, "hello").unwrap();
+        out.truncate(out.len() - 2); // drop tail bytes
+        let mut cur = out.as_slice();
+        assert!(read_java_utf(&mut cur).is_err());
+    }
+
+    #[test]
+    fn java_utf_rejects_malformed_continuation() {
+        // len=2, lead 0xC0 (2-byte form) followed by 0x41 ('A'), which is NOT a
+        // 10xxxxxx continuation byte. Must error, not silently decode to "\u{1}".
+        let bytes = [0x00u8, 0x02, 0xC0, 0x41];
+        let mut cur = bytes.as_slice();
+        assert!(read_java_utf(&mut cur).is_err());
+    }
+
+    #[test]
+    fn deletion_list_round_trips() {
+        for list in [
+            None,
+            Some(vec![None]),
+            Some(vec![
+                Some(DeletionFile::new("f.idx".into(), 1, 2, Some(3))),
+                None,
+            ]),
+        ] {
+            let mut out = Vec::new();
+            write_deletion_list(&mut out, list.as_deref()).unwrap();
+            let mut cur = out.as_slice();
+            assert_eq!(read_deletion_list(&mut cur).unwrap(), list);
+            assert!(cur.is_empty());
+        }
+    }
+
+    #[test]
+    fn deletion_list_cardinality_sentinel_maps_to_none() {
+        // A -1 cardinality on the wire must decode back to `None`, matching the
+        // forward `unwrap_or(-1)`.
+        let list = Some(vec![Some(DeletionFile::new("f.idx".into(), 4, 5, None))]);
+        let mut out = Vec::new();
+        write_deletion_list(&mut out, list.as_deref()).unwrap();
+        let mut cur = out.as_slice();
+        let back = read_deletion_list(&mut cur).unwrap().unwrap();
+        assert_eq!(back[0].as_ref().unwrap().cardinality(), None);
+        assert!(cur.is_empty());
     }
 
     #[test]
@@ -1394,5 +1849,106 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(split.serialize_split_v1().unwrap(), expected);
+    }
+
+    // The scores-stripped IndexedSplit frame the Rust serializer emits (see
+    // `serialize_indexed_split_v1_matches_golden`): the Java golden's trailing vector scores are
+    // replaced by a `false` scores flag, which is the exact byte form `deserialize_split_v1` supports.
+    fn indexed_split_v1_no_scores() -> Vec<u8> {
+        let golden = include_bytes!("goldens/split_v1_indexed.bin");
+        let scores_len = 1 + 4 + 3 * 4; // writeBoolean(true) + count + 3 floats
+        let mut bytes = golden[..golden.len() - scores_len].to_vec();
+        bytes.push(0); // scores = false
+        bytes
+    }
+
+    #[test]
+    fn deserialize_split_v1_data_golden() {
+        // `split_v1_data.bin` is the SPLIT_V1 (type 1) frame produced by `v1_data_split_builder`.
+        let golden = include_bytes!("goldens/split_v1_data.bin");
+        assert_eq!(
+            DataSplit::deserialize_split_v1(golden).unwrap(),
+            v1_data_split_builder().build().unwrap()
+        );
+        // Round-trip gate: bytes -> split -> bytes.
+        assert_eq!(
+            DataSplit::deserialize_split_v1(golden)
+                .unwrap()
+                .serialize_split_v1()
+                .unwrap()
+                .as_slice(),
+            &golden[..]
+        );
+    }
+
+    #[test]
+    fn deserialize_split_v1_indexed_golden() {
+        // IndexedSplit (type 3) without vector scores, carrying row_ranges.
+        let frame = indexed_split_v1_no_scores();
+        let split = DataSplit::deserialize_split_v1(&frame).unwrap();
+        assert_eq!(
+            split.row_ranges(),
+            Some([RowRange::new(1, 4), RowRange::new(11, 13)].as_slice())
+        );
+        // Round-trips back to the same bytes.
+        assert_eq!(split.serialize_split_v1().unwrap(), frame);
+    }
+
+    #[test]
+    fn deserialize_split_v1_rejects_indexed_scores() {
+        // The raw Java golden carries vector scores, which the Rust split cannot model.
+        let golden = include_bytes!("goldens/split_v1_indexed.bin");
+        assert!(matches!(
+            DataSplit::deserialize_split_v1(golden),
+            Err(crate::Error::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_split_v1_rejects_unsupported_type() {
+        // hand-build a frame with type id 2
+        let mut b = Vec::new();
+        b.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+        b.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+        b.extend_from_slice(&2i32.to_be_bytes());
+        assert!(matches!(
+            DataSplit::deserialize_split_v1(&b),
+            Err(crate::Error::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_split_v1_rejects_trailing_bytes() {
+        let golden = include_bytes!("goldens/split_v1_data.bin");
+        let mut b = golden.to_vec();
+        b.push(0xff); // one trailing byte after a complete frame
+        assert!(matches!(
+            DataSplit::deserialize_split_v1(&b),
+            Err(crate::Error::DataInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn deserialize_split_v1_rejects_inverted_row_range() {
+        // Take a valid IndexedSplit frame (first range [1,4]) and flip its bounds to from=5,to=2.
+        // `RowRange::new` asserts from <= to, so the loop must reject this before constructing it.
+        let mut frame = indexed_split_v1_no_scores();
+        let needle: Vec<u8> = 1i64
+            .to_be_bytes()
+            .iter()
+            .chain(4i64.to_be_bytes().iter())
+            .copied()
+            .collect();
+        let pos = frame
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("range [1,4] present in indexed frame");
+        let mut replacement = 5i64.to_be_bytes().to_vec();
+        replacement.extend_from_slice(&2i64.to_be_bytes());
+        frame[pos..pos + needle.len()].copy_from_slice(&replacement);
+        assert!(matches!(
+            DataSplit::deserialize_split_v1(&frame),
+            Err(crate::Error::DataInvalid { .. })
+        ));
     }
 }
