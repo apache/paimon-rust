@@ -643,6 +643,10 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        // Fail closed before validation and empty-table fast paths: batch search
+        // returns data-derived results outside `TableScan`/`TableRead`.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -2361,6 +2365,55 @@ mod tests {
             err.to_string().contains("Limit must be between 1"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_auth_check_precedes_validation() {
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "batch vector search must check query auth before validating parameters"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_empty_table_fails_closed_when_query_auth_enabled() {
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("id")
+            .with_query_vectors(vec![vec![1.0]])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "batch vector search must fail closed before the empty-table fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_empty_table_unchanged_without_query_auth() {
+        let table = vector_test_table();
+        let results = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0]])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_empty());
     }
 
     #[tokio::test]
