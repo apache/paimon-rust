@@ -227,14 +227,6 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn merge_predicates(&self) -> &[Predicate] {
-        if self.row_filter {
-            &self.data_predicates
-        } else {
-            &[]
-        }
-    }
-
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
     pub fn to_incremental_arrow(
         &self,
@@ -465,7 +457,7 @@ impl<'a> PaimonTableRead<'a> {
                 table_schema_id: self.table.schema().id(),
                 table_fields: self.table.schema.fields().to_vec(),
                 read_type: self.read_type().to_vec(),
-                predicates: self.merge_predicates().to_vec(),
+                predicates: self.data_predicates.clone(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
                 merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
@@ -475,7 +467,8 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
             },
-        );
+        )
+        .with_row_filter(self.row_filter);
         reader.read(splits)
     }
 
@@ -491,13 +484,14 @@ impl<'a> PaimonTableRead<'a> {
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
-            self.merge_predicates().to_vec(),
+            self.data_predicates.clone(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
             core_options.blob_view_fields(),
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
+        .with_row_filter(self.row_filter)
         .with_batch_size(Some(core_options.read_batch_size()?));
         reader.read(data_splits)
     }
@@ -675,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_filter_disabled_omits_merge_predicates() {
+    fn test_row_filter_disabled_keeps_data_predicates() {
         let table = query_auth_table();
         let read = PaimonTableRead::new(
             &table,
@@ -684,7 +678,7 @@ mod tests {
         )
         .with_row_filter(false);
 
-        assert!(read.merge_predicates().is_empty());
+        assert_eq!(read.data_predicates(), &[Predicate::AlwaysFalse]);
     }
 
     #[test]
