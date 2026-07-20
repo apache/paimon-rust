@@ -103,9 +103,10 @@ fn analytic_topk(query: &[f32], vectors: &[[f32; DIM]], k: usize) -> Vec<(u64, f
     scored
 }
 
-/// Table options that route searches into the primary-key vector branch
-/// (`VectorSearchBuilder::execute_primary_key_vector_search`). Default search
-/// mode is FAST, so only the ANN segment is consulted (no exact fallback).
+/// Table options that route searches into the primary-key vector branch (the
+/// `VectorSearchBuilder` detects a primary-key table with a PK-vector index and
+/// takes the bucket-local ANN path). Default search mode is FAST, so only the ANN
+/// segment is consulted (no exact fallback).
 ///
 /// `deletion-vectors.enabled = true` (and merge-on-read left at its default
 /// `false`) is what makes the table expose physical rows directly, the
@@ -325,6 +326,23 @@ async fn build_table(
     vectors: &[[f32; DIM]],
     k: usize,
 ) -> (tempfile::TempDir, Table) {
+    // Default fixture: `first_row_id = Some(0)`, so a global row id equals its
+    // physical position. Tests that must decouple the two use
+    // `build_table_with_first_row_id` directly.
+    build_table_with_first_row_id(query, vectors, k, Some(0)).await
+}
+
+/// As `build_table`, but pins the indexed data file's `first_row_id` to the
+/// caller's value. A non-zero (or absent) `first_row_id` breaks the "global row
+/// id == physical position" coincidence, so the read path must key candidate
+/// selection, position recovery, and score alignment off the file-local physical
+/// position rather than a global row id.
+async fn build_table_with_first_row_id(
+    query: &[f32],
+    vectors: &[[f32; DIM]],
+    k: usize,
+    first_row_id: Option<i64>,
+) -> (tempfile::TempDir, Table) {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let location = format!("file://{}", tmp.path().display());
     let file_io = FileIOBuilder::new("file").build().unwrap();
@@ -368,12 +386,14 @@ async fn build_table(
 
     // Constraint 1 (PrimaryKeyIndexSourcePolicy.shouldRead): only a compacted,
     // non-level-0 file backs the PK-vector index. Clone the real meta and set
-    // level > 0 + file_source == COMPACT (1). Pin first_row_id = 0 so the global
-    // row id equals the physical position.
+    // level > 0 + file_source == COMPACT (1). `first_row_id` is caller-controlled:
+    // real Java PK tables never write it (row-tracking is forbidden), so a correct
+    // read path must not depend on `first_row_id == 0` for physical-position
+    // recovery.
     let indexed_meta = DataFileMeta {
         level: 1,
         file_source: Some(1),
-        first_row_id: Some(0),
+        first_row_id,
         ..base_meta
     };
 
@@ -564,31 +584,21 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     let expected_row_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
     let expected_scores: Vec<f32> = expected.iter().map(|(_, d)| l2_score(*d)).collect();
 
-    // Search path: execute_scored() -> row ids + scores.
-    let result = table
+    // A primary-key vector table exposes no global row ids, so the search-only
+    // `execute_scored()` path is unsupported and must fail loud, directing callers
+    // to the materialized `execute_read()` path exercised below.
+    let scored_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
         .execute_scored()
         .await
-        .expect("primary-key vector search failed");
-
-    assert_eq!(
-        result.row_ids, expected_row_ids,
-        "row ids diverge from the analytic expectation"
+        .expect_err("primary-key execute_scored must fail loud");
+    assert!(
+        format!("{scored_err:?}").contains("execute_read"),
+        "primary-key execute_scored should point at execute_read, got: {scored_err:?}"
     );
-    assert_eq!(
-        result.scores.len(),
-        expected_scores.len(),
-        "score count diverges from the analytic expectation"
-    );
-    for (got, want) in result.scores.iter().zip(&expected_scores) {
-        assert!(
-            (got - want).abs() < 1e-4,
-            "score diverges from the analytic expectation: got {got}, want {want}"
-        );
-    }
 
     // Search-and-read: execute_read() materializes the matching rows best-first
     // with a `_PKEY_VECTOR_SCORE` column, hiding `_ROW_ID`/`_PKEY_VECTOR_POSITION`.
@@ -697,6 +707,88 @@ async fn pk_vector_read_orders_rows_best_first_not_by_position() {
             "default projection must materialize the vector column"
         );
     }
+}
+
+/// Shared body for the two physical-coordinate contract tests below. Builds the
+/// discriminating fixture with the caller's `first_row_id`, reads it back with the
+/// default projection, and asserts the materialized rows are the file-LOCAL
+/// best-first top-k (id column, vector content, aligned `_PKEY_VECTOR_SCORE`),
+/// invariant to `first_row_id`. The discriminating fixture makes best-first order
+/// [5, 1, 3] distinct from ascending physical position [1, 3, 5], so a
+/// position/global-id confusion cannot pass by coincidence.
+#[cfg(not(windows))]
+async fn assert_discriminating_local_read(first_row_id: Option<i64>) {
+    let (query, vectors) = fixture_discriminating();
+    let (_tmp, table) = build_table_with_first_row_id(&query, &vectors, 3, first_row_id).await;
+
+    let expected = analytic_topk(&query, &vectors, 3);
+    let expected_ids: Vec<i32> = expected.iter().map(|(id, _)| *id as i32).collect();
+    assert_eq!(
+        expected_ids,
+        vec![5, 1, 3],
+        "fixture must produce best-first order distinct from physical position order"
+    );
+    let expected_scores: Vec<f32> = expected.iter().map(|(_, d)| l2_score(*d)).collect();
+
+    // Default projection: id + vector column materialize. The read path must
+    // return the correct FILE-LOCAL rows regardless of `first_row_id`.
+    let (ids, scores, batches) = read_id_and_scores(&table, query.to_vec(), 3, None).await;
+
+    assert_eq!(
+        ids, expected_ids,
+        "materialized `id` column must be file-local best-first [5, 1, 3] and \
+         independent of the data file's first_row_id"
+    );
+
+    // Row content: each emitted row's vector equals the source vector at that
+    // file-local physical position (a global-id offset would fetch the wrong row).
+    let got_vectors = collect_vectors(&batches);
+    assert_eq!(got_vectors.len(), 3, "three rows expected");
+    for (row_idx, (id, _)) in expected.iter().enumerate() {
+        assert_eq!(
+            got_vectors[row_idx],
+            vectors[*id as usize].to_vec(),
+            "materialized vector for row id {id} diverges from source data"
+        );
+    }
+
+    // Score alignment must also key off the file-local position.
+    assert_eq!(scores.len(), 3);
+    for (got, want) in scores.iter().zip(&expected_scores) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "materialized score diverges: got {got}, want {want}"
+        );
+    }
+}
+
+/// Physical-coordinate contract: a primary-key vector read must select rows,
+/// recover positions, and align scores by the file-LOCAL physical position, and
+/// must NOT require the data file to carry a `first_row_id`. Real Java primary-key
+/// tables never write `first_row_id` (row-tracking is forbidden for PK tables), so
+/// this fixture pins the indexed data file's `first_row_id = None` — the same
+/// shape the committed Java fixture has, but over a Rust-built table with a
+/// discriminating dataset (best-first [5, 1, 3] != ascending position [1, 3, 5]).
+/// A read path that keys candidate selection or position recovery off a global row
+/// id (rather than the file-local physical position) cannot satisfy this.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn execute_read_without_first_row_id_selects_local_positions() {
+    assert_discriminating_local_read(None).await;
+}
+
+/// Regression pin for the same physical-coordinate contract with a present but
+/// deliberately NON-aligned `first_row_id = Some(100)`: recovering the file-local
+/// physical position must not be offset by `first_row_id`. This holds on the
+/// current code (the global-range round-trip is symmetric) and must keep holding
+/// after the read path switches to file-local coordinates, so a fix that reads
+/// local positions yet leaves a stray `first_row_id` offset would surface here.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn execute_read_ignores_nonzero_first_row_id() {
+    assert_discriminating_local_read(Some(100)).await;
 }
 
 /// Fixture #3 (residual): the unrestricted nearest neighbours sit at low ids
@@ -831,22 +923,23 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         .greater_or_equal("id", Datum::Int(residual_threshold as i32))
         .expect("build residual predicate on id");
 
-    // Search-only: unfiltered vs residual must differ, and every residual hit
-    // must satisfy the predicate (id >= 3), disjoint from the unfiltered set.
-    let unfiltered_result = table
+    // A primary-key vector table exposes no global row ids, so `execute_scored()`
+    // is unsupported on this path — with or without a residual filter — and must
+    // fail loud, directing callers to the materialized `execute_read()` used below.
+    let unfiltered_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
         .execute_scored()
         .await
-        .expect("unfiltered primary-key vector search failed");
-    assert_eq!(
-        unfiltered_result.row_ids, unfiltered_ids,
-        "unfiltered search must return [0, 1, 2]"
+        .expect_err("primary-key execute_scored must fail loud");
+    assert!(
+        format!("{unfiltered_err:?}").contains("execute_read"),
+        "got: {unfiltered_err:?}"
     );
 
-    let residual_result = table
+    let residual_scored_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
@@ -854,22 +947,11 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         .with_filter(residual.clone())
         .execute_scored()
         .await
-        .expect("residual primary-key vector search failed");
-    let residual_row_ids: Vec<u64> = expected_ids.iter().map(|&id| id as u64).collect();
-    assert_eq!(
-        residual_result.row_ids, residual_row_ids,
-        "residual search must return best-first [4, 5, 3]"
+        .expect_err("primary-key execute_scored must fail loud with a residual too");
+    assert!(
+        format!("{residual_scored_err:?}").contains("execute_read"),
+        "got: {residual_scored_err:?}"
     );
-    assert_ne!(
-        residual_result.row_ids, unfiltered_result.row_ids,
-        "residual must change the result set relative to no filter"
-    );
-    for &id in &residual_result.row_ids {
-        assert!(
-            id >= residual_threshold,
-            "residual search returned id {id} that fails the predicate id >= {residual_threshold}"
-        );
-    }
 
     // Search-and-read with the residual: default projection materializes id +
     // vector column, best-first, with an aligned `_PKEY_VECTOR_SCORE`.

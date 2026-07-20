@@ -524,6 +524,30 @@ fn leaf_to_predicate(
             };
             pb.like(&field, ds.pop().unwrap(), escape)
         }
+        "between" => {
+            let mut ds = to_datums(literals_obj)?;
+            if ds.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "'between' expects exactly 2 literals (low, high), got {}",
+                    ds.len()
+                )));
+            }
+            let high = ds.pop().unwrap();
+            let low = ds.pop().unwrap();
+            pb.between(&field, low, high)
+        }
+        "notBetween" => {
+            let mut ds = to_datums(literals_obj)?;
+            if ds.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "'notBetween' expects exactly 2 literals (low, high), got {}",
+                    ds.len()
+                )));
+            }
+            let high = ds.pop().unwrap();
+            let low = ds.pop().unwrap();
+            pb.not_between(&field, low, high)
+        }
         other => {
             return Err(PyNotImplementedError::new_err(format!(
                 "unknown or unsupported predicate operator '{other}'"
@@ -1563,6 +1587,91 @@ value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
             let v = 9_999_999_999i64.into_pyobject(py).unwrap();
             let err = py_to_datum(&v, &DataType::Int(Default::default())).unwrap_err();
             assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
+    }
+
+    // ---- between / notBetween ----
+
+    #[test]
+    fn between_leaf_converts() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = leaf_dict(py, "between", "id", &[10, 20]);
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
+            match &pred {
+                Predicate::Leaf { op, literals, .. } => {
+                    assert_eq!(*op, PredicateOperator::Between);
+                    assert_eq!(literals, &[Datum::Int(10), Datum::Int(20)]);
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn not_between_leaf_converts() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = leaf_dict(py, "notBetween", "id", &[10, 20]);
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
+            match &pred {
+                Predicate::Leaf { op, literals, .. } => {
+                    assert_eq!(*op, PredicateOperator::NotBetween);
+                    assert_eq!(literals, &[Datum::Int(10), Datum::Int(20)]);
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn between_rejects_wrong_literal_count() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for n in [0, 1, 3] {
+                let lits: Vec<i64> = (0..n).collect();
+                let dict = leaf_dict(py, "between", "id", &lits);
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
+                assert!(
+                    err.is_instance_of::<PyValueError>(py),
+                    "between with {n} lits"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn not_between_rejects_wrong_literal_count() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for n in [0, 1, 3] {
+                let lits: Vec<i64> = (0..n).collect();
+                let dict = leaf_dict(py, "notBetween", "id", &lits);
+                let err = dict_to_predicate(&dict, &fields, true).unwrap_err();
+                assert!(
+                    err.is_instance_of::<PyValueError>(py),
+                    "notBetween with {n} lits"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn between_with_string_field_accepts_string_literals() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "between", "name", &["alpha", "omega"]);
+            let pred = dict_to_predicate(&dict, &fields, true).unwrap();
+            match &pred {
+                Predicate::Leaf { op, literals, .. } => {
+                    assert_eq!(*op, PredicateOperator::Between);
+                    assert_eq!(
+                        literals,
+                        &[Datum::String("alpha".into()), Datum::String("omega".into())]
+                    );
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
         });
     }
 }

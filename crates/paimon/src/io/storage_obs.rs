@@ -31,7 +31,7 @@ const OBS_ACCESS_KEY_ID: &str = "fs.obs.access.key";
 const OBS_SECRET_ACCESS_KEY: &str = "fs.obs.secret.key";
 
 const CONFIG_PREFIXES: &[&str] = &["fs.obs.", "obs."];
-const MIRRORED_KEYS: &[(&str, &str)] = &[
+const KEY_ALIASES: &[(&str, &str)] = &[
     ("fs.obs.access-key-id", "fs.obs.access.key"),
     ("fs.obs.access_key_id", "fs.obs.access.key"),
     ("fs.obs.secret-access-key", "fs.obs.secret.key"),
@@ -40,7 +40,7 @@ const MIRRORED_KEYS: &[(&str, &str)] = &[
 
 #[allow(clippy::field_reassign_with_default)]
 pub(crate) fn obs_config_parse(props: HashMap<String, String>) -> Result<ObsConfig> {
-    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.obs.", MIRRORED_KEYS);
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.obs.", KEY_ALIASES);
 
     let mut cfg = ObsConfig::default();
     cfg.endpoint = normalized.get(OBS_ENDPOINT).cloned();

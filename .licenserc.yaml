@@ -26,6 +26,7 @@ header:
     - ".gitattributes"
     - ".github/PULL_REQUEST_TEMPLATE.md"
     - "crates/paimon/tests/**/*.json"
+    - "crates/paimon/testdata/**"
     - "**/go.sum"
     - "**/DEPENDENCIES.*.tsv"
     - ".devcontainer/devcontainer.json"

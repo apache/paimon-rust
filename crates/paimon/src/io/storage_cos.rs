@@ -31,8 +31,8 @@ const COS_SECRET_ID: &str = "fs.cosn.userinfo.secretId";
 const COS_SECRET_KEY: &str = "fs.cosn.userinfo.secretKey";
 
 const CONFIG_PREFIXES: &[&str] = &["fs.cosn.", "cosn.", "cos."];
-const MIRRORED_KEYS: &[(&str, &str)] = &[
-    ("fs.cosn.endpoint", "fs.cosn.userinfo.endpoint"),
+const KEY_ALIASES: &[(&str, &str)] = &[
+    ("fs.cosn.userinfo.endpoint", "fs.cosn.endpoint"),
     ("fs.cosn.secret_id", "fs.cosn.userinfo.secretId"),
     ("fs.cosn.secret-id", "fs.cosn.userinfo.secretId"),
     ("fs.cosn.secret_key", "fs.cosn.userinfo.secretKey"),
@@ -40,7 +40,7 @@ const MIRRORED_KEYS: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn cos_config_parse(props: HashMap<String, String>) -> Result<CosConfig> {
-    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.cosn.", MIRRORED_KEYS);
+    let normalized = normalize_storage_config(props, CONFIG_PREFIXES, "fs.cosn.", KEY_ALIASES);
 
     let cfg = CosConfig {
         endpoint: normalized.get(COS_ENDPOINT).cloned(),

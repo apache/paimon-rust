@@ -429,6 +429,212 @@ impl DataFileReader {
         }
         .boxed())
     }
+
+    /// Read one data file selecting rows by their file-LOCAL 0-based physical
+    /// positions. Unlike [`Self::read_single_file_stream`], the selection is
+    /// interpreted directly in file-local coordinates: it never consults
+    /// `first_row_id` (real primary-key tables never write one) and never emits
+    /// `_ROW_ID`. A deletion vector, when present, is folded into the selection so
+    /// any selected-but-deleted position is dropped; surviving rows are returned in
+    /// ascending physical-position order. `local_positions` must be sorted
+    /// ascending, de-duplicated, and within `[0, file_meta.row_count)`.
+    ///
+    /// Used by `pk_vector_position_read` to recover rows by physical position on
+    /// primary-key data files that carry no `first_row_id`.
+    pub(super) fn read_single_file_stream_local(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        local_positions: Vec<i64>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        // Local-position selection is only sound against a predicate-free reader: a
+        // row-filtering predicate drops arbitrary selected rows and desyncs the
+        // caller's position/score cursor. Guard the invariant here (not only at the
+        // PK-vector caller) so this `pub(super)` entry cannot be misused within the
+        // module. This path never projects `_ROW_ID`, so a `_ROW_ID`-only guard
+        // would be a no-op — check for any row-filtering predicate instead.
+        if self.has_row_filtering_predicate() {
+            return Err(crate::Error::DataInvalid {
+                message: "read_single_file_stream_local requires a predicate-free reader: a \
+                 row-filtering predicate would desync local-position selection"
+                    .to_string(),
+                source: None,
+            });
+        }
+
+        let read_type = self.read_type.clone();
+        let table_fields = self.table_fields.clone();
+        let predicates = self.predicates.clone();
+        let file_io = self.file_io.clone();
+        let split = split.clone();
+        let blob_as_descriptor = self.blob_as_descriptor;
+
+        let target_schema = build_target_arrow_schema(&read_type)?;
+        let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
+        let is_row_file = is_row_file(&file_meta);
+
+        // Compute index mapping and determine which columns to read from the file.
+        let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
+            let mapping = create_index_mapping(&read_type, df);
+            let fields_to_read = read_data_fields(df, &read_type)?;
+            (fields_to_read, mapping)
+        } else {
+            (
+                read_type
+                    .iter()
+                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                    .cloned()
+                    .collect(),
+                None,
+            )
+        };
+        let format_read_fields = if is_row_file {
+            file_fields.clone()
+        } else {
+            projected_read_fields
+        };
+
+        // Remap predicates from table-level to file-level indices.
+        let file_predicates = {
+            let remapped = crate::arrow::filtering::remap_predicates_to_file(
+                &predicates,
+                &table_fields,
+                &file_fields,
+            );
+            if remapped.is_empty() {
+                None
+            } else {
+                Some(crate::arrow::format::FilePredicates {
+                    predicates: remapped,
+                    file_fields: file_fields.clone(),
+                })
+            }
+        };
+
+        // Interpret `local_positions` directly as file-local ranges (no
+        // `to_local_row_ranges`, no `first_row_id`), then fold the DV in.
+        // `merge_row_selection` intersects the selection with the file's
+        // non-deleted ranges, so the reader emits exactly the selected, non-deleted
+        // rows in ascending physical order.
+        let local_ranges = coalesce_positions_to_local_ranges(&local_positions);
+        let row_selection =
+            merge_row_selection(file_meta.row_count, dv.as_deref(), Some(&local_ranges));
+
+        Ok(try_stream! {
+            let path_to_read = split.data_file_path(&file_meta);
+            let format_reader =
+                create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
+            let input_file = file_io.new_input(&path_to_read)?;
+            let file_reader = input_file.reader().await?;
+
+            let mut batch_stream = format_reader
+                .read_batch_stream(
+                    Box::new(file_reader),
+                    file_meta.file_size as u64,
+                    &format_read_fields,
+                    file_predicates.as_ref(),
+                    None,
+                    row_selection,
+                )
+                .await?;
+
+            while let Some(batch) = batch_stream.next().await {
+                let batch = batch?;
+                let result = project_file_batch(
+                    &batch,
+                    &target_schema,
+                    index_mapping.as_deref(),
+                    data_fields.as_deref(),
+                )?;
+                yield result;
+            }
+        }
+        .boxed())
+    }
+}
+
+/// Project one decoded file `batch` onto `target_schema`, resolving each target
+/// column through the field-ID `index_mapping` (or by name when the file schema
+/// matches the table schema), casting on type mismatch and null-filling absent
+/// columns. Unlike the inline projection in
+/// [`DataFileReader::read_single_file_stream`], this never materializes `_ROW_ID`:
+/// the local-selection PK-vector read path never projects it.
+fn project_file_batch(
+    batch: &RecordBatch,
+    target_schema: &Arc<arrow_schema::Schema>,
+    index_mapping: Option<&[i32]>,
+    data_fields: Option<&[DataField]>,
+) -> crate::Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let batch_schema = batch.schema();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(target_schema.fields().len());
+    for (i, target_field) in target_schema.fields().iter().enumerate() {
+        let source_col = if let Some(idx_map) = index_mapping {
+            let data_idx = idx_map[i];
+            if data_idx == NULL_FIELD_INDEX {
+                None
+            } else {
+                let data_field = &data_fields.unwrap()[data_idx as usize];
+                batch_schema
+                    .index_of(data_field.name())
+                    .ok()
+                    .map(|col_idx| batch.column(col_idx))
+            }
+        } else if let Some(df) = data_fields {
+            batch_schema
+                .index_of(df[i].name())
+                .ok()
+                .map(|col_idx| batch.column(col_idx))
+        } else {
+            batch_schema
+                .index_of(target_field.name())
+                .ok()
+                .map(|col_idx| batch.column(col_idx))
+        };
+
+        match source_col {
+            Some(col) => {
+                if col.data_type() == target_field.data_type() {
+                    columns.push(col.clone());
+                } else {
+                    let casted = cast(col, target_field.data_type()).map_err(|e| {
+                        Error::UnexpectedError {
+                            message: format!(
+                                "Failed to cast column '{}' from {:?} to {:?}: {e}",
+                                target_field.name(),
+                                col.data_type(),
+                                target_field.data_type()
+                            ),
+                            source: Some(Box::new(e)),
+                        }
+                    })?;
+                    columns.push(casted);
+                }
+            }
+            None => {
+                columns.push(arrow_array::new_null_array(
+                    target_field.data_type(),
+                    num_rows,
+                ));
+            }
+        }
+    }
+
+    if columns.is_empty() {
+        RecordBatch::try_new_with_options(
+            target_schema.clone(),
+            columns,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+    } else {
+        RecordBatch::try_new(target_schema.clone(), columns)
+    }
+    .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build schema-evolved RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 fn read_data_fields(
@@ -518,6 +724,30 @@ fn to_local_row_ranges(
             Some(RowRange::new(local_from, local_to))
         })
         .collect()
+}
+
+/// Coalesce sorted, de-duplicated 0-based physical positions into contiguous
+/// file-LOCAL inclusive `RowRange`s. Unlike a global-range build, there is no
+/// `first_row_id` offset: the positions are already file-local coordinates.
+fn coalesce_positions_to_local_ranges(sorted_positions: &[i64]) -> Vec<RowRange> {
+    let mut ranges = Vec::new();
+    let mut iter = sorted_positions.iter().copied();
+    let Some(first) = iter.next() else {
+        return ranges;
+    };
+    let mut start = first;
+    let mut end = first;
+    for pos in iter {
+        if end + 1 == pos {
+            end = pos;
+        } else {
+            ranges.push(RowRange::new(start, end));
+            start = pos;
+            end = pos;
+        }
+    }
+    ranges.push(RowRange::new(start, end));
+    ranges
 }
 
 /// Merge DV and row_ranges into a unified list of 0-based inclusive RowRanges.

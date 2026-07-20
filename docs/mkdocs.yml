@@ -50,6 +50,7 @@ nav:
   - Getting Started: getting-started.md
   - SQL Integration: sql.md
   - Go Integration: go-binding.md
+  - Python Integration: python-binding.md
   - Architecture: architecture.md
   - Contributing: contributing.md
   - Releases:
