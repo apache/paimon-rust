@@ -467,6 +467,7 @@ impl DataFileReader {
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
+        let row_filter = self.row_filter;
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -508,6 +509,7 @@ impl DataFileReader {
             } else {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
+                    apply_row_filter: row_filter,
                     file_fields: file_fields.clone(),
                 })
             }
