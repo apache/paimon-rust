@@ -240,6 +240,18 @@ fn translate_runtime_comparison(
     })?;
 
     let (op, field, datum) = comparison;
+    if matches!(
+        field.data_type(),
+        paimon::spec::DataType::Binary(_) | paimon::spec::DataType::VarBinary(_)
+    ) && matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    ) {
+        // Arrow compares binary values as unsigned bytes, while Paimon follows
+        // Java's signed-byte ordering. Range predicates could therefore prune
+        // rows that DataFusion would keep; equality predicates remain safe.
+        return None;
+    }
     match op {
         Operator::Eq => predicate_builder.equal(field.name(), datum).ok(),
         Operator::NotEq => predicate_builder.not_equal(field.name(), datum).ok(),
@@ -536,6 +548,10 @@ pub struct PaimonTableScan {
     /// They are always available for conservative reader pruning and are
     /// evaluated exactly only when Paimon row filtering is enabled.
     runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Planning-time decision that this scan evaluates `runtime_filters`
+    /// exactly. Stored on the plan so execution cannot observe a different
+    /// session setting after the parent FilterExec has been removed.
+    apply_row_filter: bool,
 }
 
 impl PaimonTableScan {
@@ -570,6 +586,7 @@ impl PaimonTableScan {
             pushed_variants,
             case_sensitive,
             runtime_filters: Vec::new(),
+            apply_row_filter: false,
         }
     }
 
@@ -685,6 +702,7 @@ impl ExecutionPlan for PaimonTableScan {
         }
 
         let schema = self.schema();
+        let apply_row_filter = scan_applies_row_filter(config);
         let mut accepted = Vec::new();
         let parent_filter_handled = filters
             .into_iter()
@@ -694,7 +712,7 @@ impl ExecutionPlan for PaimonTableScan {
                     // `PushedDown` reports whether this scan evaluates the predicate
                     // exactly so the parent FilterExec can be removed. The predicate is
                     // retained above for pruning regardless of this result.
-                    if scan_applies_row_filter(config) {
+                    if apply_row_filter {
                         PushedDown::Yes
                     } else {
                         PushedDown::No
@@ -712,6 +730,7 @@ impl ExecutionPlan for PaimonTableScan {
 
         let mut scan = self.clone();
         scan.runtime_filters.extend(accepted);
+        scan.apply_row_filter = apply_row_filter;
         Ok(
             FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
                 .with_updated_node(Arc::new(scan)),
@@ -721,7 +740,7 @@ impl ExecutionPlan for PaimonTableScan {
     fn execute(
         &self,
         partition: usize,
-        context: Arc<TaskContext>,
+        _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(format!(
@@ -736,7 +755,7 @@ impl ExecutionPlan for PaimonTableScan {
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
-        let apply_row_filter = scan_applies_row_filter(context.session_config().options());
+        let apply_row_filter = self.apply_row_filter;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -915,13 +934,13 @@ mod tests {
         ChildFilterPushdownResult, ChildPushdownResult,
     };
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion::prelude::SessionContext;
     use futures::TryStreamExt;
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
-        Schema as PaimonSchema, TableSchema,
+        BinaryRow, BinaryType, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
+        Schema as PaimonSchema, TableSchema, VarBinaryType,
     };
     use paimon::table::{DeletionFile, RowRange, Table};
     use std::fs;
@@ -954,6 +973,41 @@ mod tests {
             assert_eq!(
                 datum_to_scalar(Datum::Bytes(vec![0x7f, 0x80]), &data_type),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_runtime_ranges_are_not_translated() {
+        for data_type in [
+            DataType::Binary(BinaryType::new(1).unwrap()),
+            DataType::VarBinary(VarBinaryType::new(1).unwrap()),
+        ] {
+            let fields = vec![DataField::new(0, "bytes".to_string(), data_type)];
+            let predicate_builder = PredicateBuilder::new(&fields);
+            for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
+                let expression = BinaryExpr::new(
+                    Arc::new(Column::new("bytes", 0)),
+                    op,
+                    Arc::new(Literal::new(ScalarValue::Binary(Some(vec![0xff])))),
+                );
+
+                assert!(
+                    translate_runtime_comparison(&expression, &fields, &predicate_builder, true,)
+                        .is_none(),
+                    "binary {op} must remain with DataFusion"
+                );
+            }
+
+            let equality = BinaryExpr::new(
+                Arc::new(Column::new("bytes", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Binary(Some(vec![0xff])))),
+            );
+            assert!(
+                translate_runtime_comparison(&equality, &fields, &predicate_builder, true)
+                    .is_some(),
+                "binary equality is ordering-independent"
             );
         }
     }
@@ -1408,12 +1462,12 @@ mod tests {
             Operator::Gt,
             lit(2_i32),
         ));
-        let result = scan
+        let pruning_result = scan
             .handle_child_pushdown_result(
                 FilterPushdownPhase::Post,
                 ChildPushdownResult {
                     parent_filters: vec![ChildFilterPushdownResult {
-                        filter,
+                        filter: Arc::clone(&filter),
                         child_results: Vec::new(),
                     }],
                     self_filters: Vec::new(),
@@ -1421,9 +1475,13 @@ mod tests {
                 &ConfigOptions::default(),
             )
             .unwrap();
-        let scan = result.updated_node.unwrap();
+        assert!(matches!(
+            pruning_result.filters.as_slice(),
+            [PushedDown::No]
+        ));
+        let pruning_scan = pruning_result.updated_node.unwrap();
         let ctx = SessionContext::new();
-        let batches = scan
+        let batches = pruning_scan
             .execute(0, ctx.task_ctx())
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -1439,10 +1497,28 @@ mod tests {
 
         let mut paimon_config = PaimonConfig::default();
         paimon_config.read.row_filter = true;
-        let exact_config = SessionConfig::new().with_option_extension(paimon_config);
-        let exact_ctx = SessionContext::new_with_config(exact_config);
-        let exact_batches = scan
-            .execute(0, exact_ctx.task_ctx())
+        let mut exact_config = ConfigOptions::default();
+        exact_config.extensions.insert(paimon_config);
+        let exact_result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &exact_config,
+            )
+            .unwrap();
+        assert!(matches!(exact_result.filters.as_slice(), [PushedDown::Yes]));
+
+        // Execution deliberately uses the default context. The scan must honor
+        // the planning-time decision that allowed the parent FilterExec to be removed.
+        let exact_scan = exact_result.updated_node.unwrap();
+        let exact_batches = exact_scan
+            .execute(0, SessionContext::new().task_ctx())
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
