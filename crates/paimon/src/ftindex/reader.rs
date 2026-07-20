@@ -138,4 +138,27 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(hits.scores.len(), hits.row_ids.len());
     }
+
+    #[tokio::test]
+    async fn test_search_with_include_restricts_to_allow_list() {
+        let bytes = build_archive(&[
+            (0, "shared token here"),
+            (1, "shared token here"),
+            (2, "shared token here"),
+        ]);
+        let input = archive_input(bytes).await;
+        let reader = FullTextArchiveReader::from_input_file(&input).await.unwrap();
+
+        // All three match, but restrict to row-ids {0, 2}.
+        let mut include = roaring::RoaringTreemap::new();
+        include.insert(0);
+        include.insert(2);
+
+        let hits = reader
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, include)
+            .unwrap();
+        let mut ids = hits.row_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 2]);
+    }
 }
