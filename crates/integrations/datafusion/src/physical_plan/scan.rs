@@ -55,21 +55,6 @@ use crate::filter_pushdown::scalar_to_datum;
 const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
 const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn requires_row_filter_before_blob_materialization(table: &Table, read_type: &[DataField]) -> bool {
-    let core_options = table.schema().core_options();
-    if core_options.blob_as_descriptor() {
-        return false;
-    }
-
-    let mut resolved_fields = core_options.blob_descriptor_fields();
-    if core_options.blob_view_resolve_enabled() && table.rest_env().is_some() {
-        resolved_fields.extend(core_options.blob_view_fields());
-    }
-    read_type
-        .iter()
-        .any(|field| resolved_fields.contains(field.name()))
-}
-
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
         return Err(datafusion::error::DataFusionError::Execution(format!(
@@ -746,13 +731,6 @@ impl ExecutionPlan for PaimonTableScan {
             .execution
             .parquet
             .pushdown_filters;
-        // Blob materialization can perform fallible external reads. Enable the
-        // exact reader path so DataEvolutionReader can apply eligible filters
-        // before resolving descriptors/views. The parent filter is still
-        // retained when pushdown is disabled, so this only adds an internal
-        // correctness barrier.
-        let apply_reader_row_filter = apply_runtime_filters
-            || requires_row_filter_before_blob_materialization(&table, &read_type);
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -782,7 +760,7 @@ impl ExecutionPlan for PaimonTableScan {
             let read = read_builder
                 .new_read()
                 .map_err(to_datafusion_error)?
-                .with_row_filter(apply_reader_row_filter);
+                .with_row_filter(apply_runtime_filters);
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {

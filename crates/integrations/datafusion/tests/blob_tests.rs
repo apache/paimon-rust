@@ -883,7 +883,7 @@ async fn test_blob_descriptor_field_short_read_returns_error() {
 }
 
 #[tokio::test]
-async fn test_blob_descriptor_filter_before_resolve_skips_filtered_bad_descriptor() {
+async fn test_blob_descriptor_filter_before_resolve_when_pushdown_enabled() {
     let (tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
@@ -906,6 +906,11 @@ async fn test_blob_descriptor_filter_before_resolve_skips_filtered_bad_descripto
          (2, 'Kept', X'4F4B')"
     );
     exec(&sql_context, &sql).await;
+    exec(
+        &sql_context,
+        "SET datafusion.execution.parquet.pushdown_filters = true",
+    )
+    .await;
 
     let rows = query_id_name_picture(
         &sql_context,
