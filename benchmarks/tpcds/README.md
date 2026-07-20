@@ -175,9 +175,8 @@ the physical files, so it is not a pure measurement of catalog or manifest
 overhead.
 
 `--parquet-pushdown-filters` only controls DataFusion's Parquet reader. Paimon
-always receives supported predicates for conservative pruning, while this
-benchmark leaves `paimon.read.row_filter` disabled so exact row filtering stays
-in the parent DataFusion operator.
+always receives supported predicates for conservative pruning, while exact row
+filtering stays in the parent DataFusion operator for benchmark runs.
 
 ## Cache Protocol
 
