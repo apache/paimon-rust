@@ -32,6 +32,15 @@ Key features:
 - REST Catalog integration
 - Apache DataFusion integration for SQL queries
 
+## Performance
+
+In the TPC-DS SF100 benchmark, Paimon Rust completes the 96-query workload
+within 9.3% of DataFusion's native Parquet reader. The gap narrows to 3.1% for
+queries whose native-Parquet median is at least five seconds, while Paimon's
+ZSTD data files use 23.25% less physical storage than the SNAPPY source files.
+
+[Read the full TPC-DS SF100 performance report](benchmark.md)
+
 ## Status
 
 The project is under active development (0.3.0 in development).

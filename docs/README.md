@@ -53,3 +53,16 @@ mkdocs build
 ```
 
 The output will be in the `docs/site/` directory.
+
+## Performance Report
+
+The TPC-DS SF100 performance report is maintained as
+`docs/src/benchmark.md` and is included in the MkDocs navigation. Preview it
+as part of the documentation site:
+
+```bash
+cd docs
+mkdocs serve
+```
+
+Then open <http://127.0.0.1:8000/benchmark/>.
