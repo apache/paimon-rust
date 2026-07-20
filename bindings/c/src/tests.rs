@@ -2297,6 +2297,72 @@ fn vector_search_append_filter_returns_invalid_input() {
 }
 
 #[test]
+fn vector_search_unknown_column_returns_invalid_input() {
+    // A typo'd vector column must surface as an input error through the C API,
+    // not a silent empty (EOF) reader.
+    let path = "memory:/vsearch_unknown_col_err";
+    let table = build_append_vector_table(path);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder =
+            c_vector_builder(handle, "does_not_exist", &[1.0f32, 0.0], 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read(builder);
+        paimon_vector_search_builder_free(builder);
+
+        assert!(
+            result.reader.is_null(),
+            "errored read must not yield a reader"
+        );
+        assert!(!result.error.is_null(), "unknown column must fail loud");
+        assert_eq!(
+            (*result.error).code,
+            PaimonErrorCode::InvalidInput as i32,
+            "unknown column error must map to InvalidInput"
+        );
+        let message = error_message(result.error);
+        assert!(
+            message.contains("does not exist"),
+            "unexpected error message: {message}"
+        );
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_scalar_column_returns_invalid_input() {
+    // A scalar (non-vector) column must surface as an input error, not an empty
+    // reader.
+    let path = "memory:/vsearch_scalar_col_err";
+    let table = build_append_vector_table(path);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        // "id" is a scalar Int column on the append vector table.
+        let builder = c_vector_builder(handle, "id", &[1.0f32, 0.0], 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read(builder);
+        paimon_vector_search_builder_free(builder);
+
+        assert!(
+            result.reader.is_null(),
+            "errored read must not yield a reader"
+        );
+        assert!(!result.error.is_null(), "scalar column must fail loud");
+        assert_eq!(
+            (*result.error).code,
+            PaimonErrorCode::InvalidInput as i32,
+            "scalar column error must map to InvalidInput"
+        );
+        let message = error_message(result.error);
+        assert!(
+            message.contains("must be a FLOAT vector column"),
+            "unexpected error message: {message}"
+        );
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn vector_search_rejects_invalid_query_vector() {
     let path = "memory:/vsearch_setter_validation";
     let table = build_pk_vector_table_empty(path);

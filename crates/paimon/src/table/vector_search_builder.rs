@@ -296,6 +296,47 @@ impl<'a> VectorSearchBuilder<'a> {
     /// is always hidden. A filter is unsupported here and fails loud inside
     /// `execute_scored`.
     async fn execute_de_vector_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+        // Validate the target column exists and is a vector-bearing type before any
+        // work. The data-evolution search returns an empty result for an unknown
+        // field (its scored-path behavior), which would make a typo'd or scalar
+        // column look like a normal empty read here — violating `execute_read`'s
+        // fail-loud contract (a C/Doris caller would see EOF, not an input error).
+        // Reject it up front instead.
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let field = self
+            .table
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| f.name() == vector_column)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("vector search column '{vector_column}' does not exist"),
+                source: None,
+            })?;
+        // Require a FLOAT-element vector column: `ARRAY<FLOAT>` or `VECTOR<FLOAT>`,
+        // matching the element type the vector index/search operates on. An
+        // `ARRAY<INT>` (or any non-float element) is not a searchable vector column.
+        let is_float_vector = match field.data_type() {
+            DataType::Vector(t) => matches!(t.element_type(), DataType::Float(_)),
+            DataType::Array(t) => matches!(t.element_type(), DataType::Float(_)),
+            _ => false,
+        };
+        if !is_float_vector {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "vector search column '{vector_column}' must be a FLOAT vector column \
+                     (ARRAY<FLOAT> or VECTOR<FLOAT>), got {:?}",
+                    field.data_type()
+                ),
+                source: None,
+            });
+        }
+
         let sr = self.execute_scored().await?;
 
         // Resolve the projected user columns up front so an invalid projection
@@ -630,21 +671,27 @@ impl<'a> VectorSearchBuilder<'a> {
     /// names resolved via `resolve_projected_fields`. Rejects reserved metadata
     /// names and `_ROW_ID` so a user cannot request a hidden column.
     fn resolve_materialize_read_type(&self) -> crate::Result<Vec<DataField>> {
+        let is_reserved = |name: &str| {
+            name == PKEY_VECTOR_POSITION_COLUMN
+                || name == SEARCH_SCORE_COLUMN
+                || name == ROW_ID_FIELD_NAME
+                || name == "_PKEY_VECTOR_SCORE"
+        };
+        let reserved_err = |name: &str| crate::Error::DataInvalid {
+            message: format!(
+                "vector search read projection must not request reserved column '{name}'"
+            ),
+            source: None,
+        };
         let fields = match &self.projection {
             None => self.table.schema().fields().to_vec(),
             Some(names) => {
+                // Reject a requested reserved name on the raw list first: these
+                // names are not real table columns, so `resolve_projected_fields`
+                // would otherwise fail with a confusing "not found" error.
                 for name in names {
-                    if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == SEARCH_SCORE_COLUMN
-                        || name == ROW_ID_FIELD_NAME
-                        || name == "_PKEY_VECTOR_SCORE"
-                    {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "vector search read projection must not request reserved column '{name}'"
-                            ),
-                            source: None,
-                        });
+                    if is_reserved(name) {
+                        return Err(reserved_err(name));
                     }
                 }
                 resolve_projected_fields(
@@ -655,6 +702,17 @@ impl<'a> VectorSearchBuilder<'a> {
                 )?
             }
         };
+        // Reject reserved output-column names on the RESOLVED field list too — this
+        // is what catches the default (no `with_projection`) case where a user table
+        // column is literally named `__paimon_search_score` (or the legacy
+        // `_PKEY_VECTOR_SCORE` alias): it would otherwise survive and collide with
+        // the score column appended during materialization, producing two
+        // identically named output columns.
+        for field in &fields {
+            if is_reserved(field.name()) {
+                return Err(reserved_err(field.name()));
+            }
+        }
         Ok(fields)
     }
 }
@@ -3512,29 +3570,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_non_pk_column_empty_snapshot_yields_empty_stream() {
+    async fn execute_read_unknown_column_fails_loud() {
         // pk-vector index configured for "embedding", but the query targets a
-        // different column, so the PK branch does not intercept and the query
-        // falls through to the data-evolution path. With no snapshot the search
-        // finds nothing and returns an empty stream.
+        // column that does not exist. The read path must fail loud rather than
+        // fall through to the data-evolution path and return an empty stream (a
+        // typo must not look like a normal empty read through the C API).
         let table = pk_vector_table(&[
             ("pk-vector.index.columns", "embedding"),
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
         ]);
-        let mut stream = table
+        let err = match table
             .new_vector_search_builder()
             .with_vector_column("other")
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .execute_read()
             .await
-            .expect("non-PK column DE read over an empty table must succeed with no rows");
-        let mut rows = 0usize;
-        while let Some(batch) = stream.try_next().await.unwrap() {
-            rows += batch.num_rows();
-        }
-        assert_eq!(rows, 0, "empty DE table must yield no rows");
+        {
+            Ok(_) => panic!("unknown vector column must fail loud on execute_read"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("does not exist")),
+            "expected a does-not-exist error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_scalar_column_fails_loud() {
+        // A scalar (non-vector) column targeted by a vector read must fail loud,
+        // not return an empty data-evolution stream.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("id") // scalar Int column
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("scalar vector column must fail loud on execute_read"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("must be a FLOAT vector column")),
+            "expected a not-a-vector-column error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_non_float_vector_column_fails_loud() {
+        // An ARRAY<INT> column is not a searchable vector column (the index/search
+        // operates on FLOAT elements). It must fail loud rather than fall through
+        // to the DE path and return an empty stream.
+        use crate::spec::{ArrayType, IntType, Schema, TableSchema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "de_non_float_vector"),
+            "memory:/de_non_float_vector".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("ARRAY<INT> vector column must fail loud on execute_read"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("must be a FLOAT vector column")),
+            "expected a FLOAT-vector-column error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_default_projection_rejects_reserved_score_column_name() {
+        // A user table column literally named `__paimon_search_score` must be
+        // rejected even under the default (no `with_projection`) projection —
+        // otherwise it survives and collides with the score column appended during
+        // materialization, producing two identically named output columns.
+        use crate::spec::{FloatType, IntType, Schema, TableSchema, VectorType};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Vector(
+                    VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap(),
+                ),
+            )
+            .column(SEARCH_SCORE_COLUMN, DataType::Float(FloatType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("pk-vector.index.columns", "embedding")
+            .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
+            .option("fields.embedding.pk-vector.distance.metric", "l2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "pk_vector_collision"),
+            "memory:/pk_vector_collision".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("default projection over a reserved-named column must fail loud"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("reserved column")),
+            "expected a reserved-column error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_de_default_projection_rejects_reserved_score_column_name() {
+        // Same collision, on the data-evolution path: a table with no PK-vector
+        // index (so the query falls through to DE materialization) but a user
+        // column named `__paimon_search_score` must fail loud under the default
+        // projection rather than emit two identically named columns.
+        use crate::spec::{ArrayType, FloatType, IntType, Schema, TableSchema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .column(SEARCH_SCORE_COLUMN, DataType::Float(FloatType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "de_vector_collision"),
+            "memory:/de_vector_collision".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("DE default projection over a reserved-named column must fail loud"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("reserved column")),
+            "expected a reserved-column error, got: {err}"
+        );
     }
 
     #[tokio::test]
