@@ -130,7 +130,9 @@ mod tests {
             (2, "echo foxtrot"),
         ]);
         let input = archive_input(bytes).await;
-        let reader = FullTextArchiveReader::from_input_file(&input).await.unwrap();
+        let reader = FullTextArchiveReader::from_input_file(&input)
+            .await
+            .unwrap();
 
         let hits = reader.search(r#"{"match":{"query":"bravo"}}"#, 10).unwrap();
         let mut ids = hits.row_ids.clone();
@@ -147,7 +149,9 @@ mod tests {
             (2, "shared token here"),
         ]);
         let input = archive_input(bytes).await;
-        let reader = FullTextArchiveReader::from_input_file(&input).await.unwrap();
+        let reader = FullTextArchiveReader::from_input_file(&input)
+            .await
+            .unwrap();
 
         // All three match, but restrict to row-ids {0, 2}.
         let mut include = roaring::RoaringTreemap::new();
