@@ -31,6 +31,25 @@ pub struct BlobReaderRegistry {
     readers: Arc<RwLock<Vec<BlobFileIO>>>,
 }
 
+fn allows_backslash_boundary(location: &str) -> bool {
+    let bytes = location.as_bytes();
+    location.starts_with("file:/")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+fn matches_location(uri: &str, location: &str) -> bool {
+    uri == location
+        || uri.strip_prefix(location).is_some_and(|suffix| {
+            location.ends_with('/')
+                || suffix.starts_with('/')
+                || (allows_backslash_boundary(location)
+                    && (location.ends_with('\\') || suffix.starts_with('\\')))
+        })
+}
+
 impl BlobReaderRegistry {
     pub fn register(&self, prefix: impl Into<String>, file_io: FileIO) {
         let prefix = prefix.into();
@@ -55,7 +74,7 @@ impl BlobReaderRegistry {
         let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
         readers
             .iter()
-            .filter(|reader| uri.starts_with(&reader.prefix))
+            .filter(|reader| matches_location(uri, &reader.prefix))
             .max_by_key(|reader| reader.prefix.len())
             .map(|reader| reader.file_io.clone())
     }
@@ -69,6 +88,113 @@ mod tests {
     use paimon::spec::BlobDescriptor;
 
     use super::*;
+
+    fn memory_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    async fn write_file(file_io: &FileIO, uri: &str, contents: &[u8]) {
+        file_io
+            .new_output(uri)
+            .unwrap()
+            .write(contents.to_vec().into())
+            .await
+            .unwrap();
+    }
+
+    async fn assert_resolves_to(registry: &BlobReaderRegistry, uri: &str, expected: &[u8]) {
+        let file_io = registry
+            .resolve(uri)
+            .unwrap_or_else(|| panic!("expected registered FileIO for {uri}"));
+        let bytes = file_io.new_input(uri).unwrap().read().await.unwrap();
+        assert_eq!(&bytes[..], expected);
+    }
+
+    #[test]
+    fn resolves_only_same_location_or_descendants() {
+        let cases = [
+            ("memory:/foo", "memory:/foo", true),
+            ("memory:/foo", "memory:/foo/blob.bin", true),
+            ("memory:/foo", "memory:/foo/nested/blob.bin", true),
+            ("memory:/foo", "memory:/foobar/private.bin", false),
+            ("s3://bucket", "s3://bucket-other/blob.bin", false),
+            ("s3://bucket/table", "gs://bucket/table/blob.bin", false),
+            ("memory:/foo/", "memory:/foo/", true),
+            ("memory:/foo/", "memory:/foo/blob.bin", true),
+            ("memory:/foo/", "memory:/foo", false),
+            (r"C:\warehouse\table", r"C:\warehouse\table\blob.bin", true),
+            (
+                r"C:\warehouse\table",
+                r"C:\warehouse\table-other\blob.bin",
+                false,
+            ),
+            (
+                "C:\\warehouse\\table\\",
+                r"C:\warehouse\table\blob.bin",
+                true,
+            ),
+            ("C:\\warehouse\\table\\", r"C:\warehouse\table", false),
+            (
+                r"file:/C:\warehouse\table",
+                r"file:/C:\warehouse\table\blob.bin",
+                true,
+            ),
+            (
+                r"file:/C:\warehouse\table",
+                r"file:/C:\warehouse\table-other\blob.bin",
+                false,
+            ),
+            ("s3://bucket/table", r"s3://bucket/table\blob.bin", false),
+        ];
+
+        for (location, uri, expected) in cases {
+            let registry = BlobReaderRegistry::default();
+            registry.register(location, memory_file_io());
+            assert_eq!(
+                registry.resolve(uri).is_some(),
+                expected,
+                "location={location}, uri={uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_with_longest_valid_location() {
+        let parent_file_io = memory_file_io();
+        let child_file_io = memory_file_io();
+        let registry = BlobReaderRegistry::default();
+        registry.register("memory:/warehouse/db", parent_file_io.clone());
+        registry.register("memory:/warehouse/db/foo", child_file_io.clone());
+
+        let child_uri = "memory:/warehouse/db/foo/blob.bin";
+        write_file(&parent_file_io, child_uri, b"parent").await;
+        write_file(&child_file_io, child_uri, b"child").await;
+        assert_resolves_to(&registry, child_uri, b"child").await;
+
+        let sibling_uri = "memory:/warehouse/db/foobar/private.bin";
+        write_file(&parent_file_io, sibling_uri, b"parent").await;
+        write_file(&child_file_io, sibling_uri, b"child").await;
+        assert_resolves_to(&registry, sibling_uri, b"parent").await;
+    }
+
+    #[tokio::test]
+    async fn preserves_registration_semantics() {
+        let uri = "memory:/warehouse/db/foo";
+        let initial_file_io = memory_file_io();
+        let replacement_file_io = memory_file_io();
+        write_file(&initial_file_io, uri, b"initial").await;
+        write_file(&replacement_file_io, uri, b"replacement").await;
+
+        let registry = BlobReaderRegistry::default();
+        registry.register(uri, initial_file_io.clone());
+        registry.register(uri, replacement_file_io.clone());
+        assert_resolves_to(&registry, uri, b"replacement").await;
+
+        let registry = BlobReaderRegistry::default();
+        registry.register(uri, initial_file_io);
+        registry.register_if_absent(uri, replacement_file_io);
+        assert_resolves_to(&registry, uri, b"initial").await;
+    }
 
     #[tokio::test]
     async fn resolves_file_blob_descriptor_with_file_io() {
