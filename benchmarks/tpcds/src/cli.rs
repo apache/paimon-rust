@@ -113,7 +113,7 @@ pub struct RuntimeArgs {
     /// DataFusion execution partitions. Defaults to available CPUs.
     #[arg(long)]
     pub target_partitions: Option<usize>,
-    /// Evaluate pushed filters during Parquet/Paimon scans, in addition to statistics pruning.
+    /// Evaluate pushed filters during Parquet scans, in addition to statistics pruning.
     #[arg(long)]
     pub parquet_pushdown_filters: bool,
     /// DataFusion memory limit in GiB. Omit for an unbounded pool.

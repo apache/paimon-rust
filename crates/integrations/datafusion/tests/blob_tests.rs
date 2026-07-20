@@ -906,11 +906,7 @@ async fn test_blob_descriptor_filter_before_resolve_when_pushdown_enabled() {
          (2, 'Kept', X'4F4B')"
     );
     exec(&sql_context, &sql).await;
-    exec(
-        &sql_context,
-        "SET datafusion.execution.parquet.pushdown_filters = true",
-    )
-    .await;
+    exec(&sql_context, "SET paimon.read.row_filter = true").await;
 
     let rows = query_id_name_picture(
         &sql_context,

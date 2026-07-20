@@ -49,11 +49,19 @@ use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
+use crate::config::PaimonConfig;
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::scalar_to_datum;
 
 const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
 const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn row_filter_enabled(config: &ConfigOptions) -> bool {
+    config
+        .extensions
+        .get::<PaimonConfig>()
+        .is_some_and(|config| config.read.row_filter)
+}
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -526,7 +534,7 @@ pub struct PaimonTableScan {
     case_sensitive: bool,
     /// Physical filters retained from DataFusion's runtime filter-pushdown pass.
     /// They are always available for conservative reader pruning and are
-    /// evaluated exactly only when Parquet filter pushdown is enabled.
+    /// evaluated exactly only when Paimon row filtering is enabled.
     runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
@@ -683,7 +691,7 @@ impl ExecutionPlan for PaimonTableScan {
             .map(|filter| {
                 if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
                     accepted.push(filter);
-                    if config.execution.parquet.pushdown_filters {
+                    if row_filter_enabled(config) {
                         PushedDown::Yes
                     } else {
                         PushedDown::No
@@ -725,12 +733,7 @@ impl ExecutionPlan for PaimonTableScan {
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
-        let apply_runtime_filters = context
-            .session_config()
-            .options()
-            .execution
-            .parquet
-            .pushdown_filters;
+        let apply_row_filter = row_filter_enabled(context.session_config().options());
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -760,14 +763,14 @@ impl ExecutionPlan for PaimonTableScan {
             let read = read_builder
                 .new_read()
                 .map_err(to_datafusion_error)?
-                .with_row_filter(apply_runtime_filters);
+                .with_row_filter(apply_row_filter);
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
                 let mut batch = result
                     .map_err(to_datafusion_error)
                     .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
-                if apply_runtime_filters {
+                if apply_row_filter {
                     for filter in &runtime_filters {
                         let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
                         let predicate = predicate
@@ -892,6 +895,7 @@ impl DisplayAs for PaimonTableScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PaimonConfig;
     mod test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_utils.rs"));
     }
@@ -1265,6 +1269,48 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_reports_filter_pushed_down_with_paimon_config() {
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let mut paimon_config = PaimonConfig::default();
+        paimon_config.read.row_filter = true;
+        let mut config = ConfigOptions::default();
+        config.extensions.insert(paimon_config);
+
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &config,
+            )
+            .unwrap();
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::Yes]));
+        assert!(result.updated_node.is_some());
+    }
+
+    #[test]
     fn test_scan_rejects_filter_outside_output_schema() {
         let scan = PaimonTableScan::new(
             test_schema(),
@@ -1283,8 +1329,10 @@ mod tests {
             Operator::Gt,
             lit(1_i32),
         ));
+        let mut paimon_config = PaimonConfig::default();
+        paimon_config.read.row_filter = true;
         let mut config = ConfigOptions::default();
-        config.execution.parquet.pushdown_filters = true;
+        config.extensions.insert(paimon_config);
 
         let result = scan
             .handle_child_pushdown_result(
@@ -1386,12 +1434,9 @@ mod tests {
             "unsupported physical filters may prune row groups but must not remove rows"
         );
 
-        let mut exact_config = SessionConfig::new();
-        exact_config
-            .options_mut()
-            .execution
-            .parquet
-            .pushdown_filters = true;
+        let mut paimon_config = PaimonConfig::default();
+        paimon_config.read.row_filter = true;
+        let exact_config = SessionConfig::new().with_option_extension(paimon_config);
         let exact_ctx = SessionContext::new_with_config(exact_config);
         let exact_batches = scan
             .execute(0, exact_ctx.task_ctx())

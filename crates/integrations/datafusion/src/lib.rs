@@ -40,6 +40,7 @@ mod blob_descriptor_functions;
 mod blob_reader;
 mod blob_view;
 mod catalog;
+pub mod config;
 mod delete;
 mod error;
 mod filter_pushdown;
