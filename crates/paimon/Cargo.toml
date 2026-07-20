@@ -43,7 +43,7 @@ storage-all = [
     "storage-gcs",
     "storage-hdfs",
 ]
-fulltext = ["tantivy", "tempfile"]
+fulltext = ["tantivy", "tempfile", "dep:paimon-ftindex-core"]
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]
@@ -115,6 +115,7 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2.1"
 tantivy = { version = "0.22", optional = true }
 tempfile = { version = "3", optional = true }
+paimon-ftindex-core = { git = "https://github.com/apache/paimon-full-text", tag = "v0.1.0-rc4", optional = true }
 paimon-mosaic-core = "0.2.0"
 paimon-vindex-core = "0.2.0"
 vortex = { version = "0.75.0", features = ["tokio"], optional = true }

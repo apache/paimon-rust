@@ -30,6 +30,8 @@ pub mod btree;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
+#[cfg(feature = "fulltext")]
+pub mod ftindex;
 pub mod io;
 pub mod lumina;
 mod predicate_stats;
