@@ -410,7 +410,7 @@ fn reverse_comparison_operator(op: Operator) -> Option<Operator> {
     }
 }
 
-fn scalar_to_datum(scalar: &ScalarValue, data_type: &DataType) -> Option<Datum> {
+pub(crate) fn scalar_to_datum(scalar: &ScalarValue, data_type: &DataType) -> Option<Datum> {
     match data_type {
         DataType::Boolean(_) => match scalar {
             ScalarValue::Boolean(Some(value)) => Some(Datum::Bool(*value)),

@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkRuntimeConfig {
     pub target_partitions: usize,
+    #[serde(default)]
+    pub parquet_pushdown_filters: bool,
     pub memory_limit_bytes: Option<usize>,
     pub spill_dir: Option<PathBuf>,
     pub max_spill_bytes: Option<u64>,
@@ -39,6 +41,7 @@ impl Default for BenchmarkRuntimeConfig {
             target_partitions: std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(1),
+            parquet_pushdown_filters: false,
             memory_limit_bytes: None,
             spill_dir: None,
             max_spill_bytes: None,
@@ -60,10 +63,15 @@ pub fn build_sql_context(config: &BenchmarkRuntimeConfig) -> DataFusionResult<SQ
     let sql = SQLContext::new();
     let state_ref = sql.ctx().state_ref();
     let current_state = state_ref.read().clone();
-    let session_config = current_state
+    let mut session_config = current_state
         .config()
         .clone()
         .with_target_partitions(config.target_partitions.max(1));
+    session_config
+        .options_mut()
+        .execution
+        .parquet
+        .pushdown_filters = config.parquet_pushdown_filters;
     let state = SessionStateBuilder::from(current_state)
         .with_config(session_config)
         .with_runtime_env(Arc::new(runtime.build()?))

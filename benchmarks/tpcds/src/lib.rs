@@ -183,6 +183,7 @@ mod tests {
         let spill_dir = TempDir::new().unwrap();
         let ctx = build_sql_context(&BenchmarkRuntimeConfig {
             target_partitions: 3,
+            parquet_pushdown_filters: true,
             memory_limit_bytes: Some(32 * 1024 * 1024),
             spill_dir: Some(spill_dir.path().to_path_buf()),
             max_spill_bytes: Some(64 * 1024 * 1024),
@@ -196,6 +197,14 @@ mod tests {
                 .execution
                 .target_partitions,
             3
+        );
+        assert!(
+            ctx.ctx()
+                .state()
+                .config_options()
+                .execution
+                .parquet
+                .pushdown_filters
         );
         assert!(matches!(
             ctx.ctx().runtime_env().memory_pool.memory_limit(),

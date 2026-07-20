@@ -15,27 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::array::BooleanArray;
+use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
+use crate::filter_pushdown::scalar_to_datum;
+
+const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
+const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -62,6 +79,238 @@ fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
 
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(Into::into)
+}
+
+async fn runtime_pruning_predicate(
+    filters: &[Arc<dyn PhysicalExpr>],
+    fields: &[DataField],
+    case_sensitive: bool,
+    wait_timeout: Duration,
+) -> Option<Predicate> {
+    let mut pending = filters.to_vec();
+    let mut dynamic_filters = Vec::new();
+    while let Some(expr) = pending.pop() {
+        pending.extend(expr.children().into_iter().cloned());
+        if expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+            dynamic_filters.push(expr);
+        }
+    }
+
+    let mut waiters = FuturesUnordered::new();
+    for expr in dynamic_filters {
+        waiters.push(async move {
+            let dynamic = expr
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .expect("only dynamic filters are queued");
+            dynamic.wait_complete().await;
+            dynamic.expression_id()
+        });
+    }
+
+    let deadline = tokio::time::Instant::now() + wait_timeout;
+    let mut completed_dynamic_filters = HashSet::new();
+    while !waiters.is_empty() {
+        match tokio::time::timeout_at(deadline, waiters.next()).await {
+            Ok(Some(Some(expression_id))) => {
+                completed_dynamic_filters.insert(expression_id);
+            }
+            Ok(Some(None)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    let predicate_builder = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+    let mut predicates = Vec::new();
+    for filter in filters {
+        collect_runtime_pruning_predicates(
+            filter.as_ref(),
+            fields,
+            &predicate_builder,
+            case_sensitive,
+            &completed_dynamic_filters,
+            &mut predicates,
+        );
+    }
+    (!predicates.is_empty()).then(|| Predicate::and(predicates))
+}
+
+fn runtime_filter_wait_timeout(estimated_rows: usize) -> Duration {
+    if estimated_rows > RUNTIME_FILTER_WAIT_MIN_ROWS {
+        RUNTIME_FILTER_WAIT_TIMEOUT
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn collect_runtime_pruning_predicates(
+    expr: &dyn PhysicalExpr,
+    fields: &[DataField],
+    predicate_builder: &PredicateBuilder,
+    case_sensitive: bool,
+    completed_dynamic_filters: &HashSet<u64>,
+    predicates: &mut Vec<Predicate>,
+) {
+    if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        if dynamic
+            .expression_id()
+            .is_none_or(|id| !completed_dynamic_filters.contains(&id))
+        {
+            return;
+        }
+        if let Ok(current) = dynamic.current() {
+            collect_runtime_pruning_predicates(
+                current.as_ref(),
+                fields,
+                predicate_builder,
+                case_sensitive,
+                completed_dynamic_filters,
+                predicates,
+            );
+        }
+        return;
+    }
+
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        if binary.op() == &Operator::And {
+            collect_runtime_pruning_predicates(
+                binary.left().as_ref(),
+                fields,
+                predicate_builder,
+                case_sensitive,
+                completed_dynamic_filters,
+                predicates,
+            );
+            collect_runtime_pruning_predicates(
+                binary.right().as_ref(),
+                fields,
+                predicate_builder,
+                case_sensitive,
+                completed_dynamic_filters,
+                predicates,
+            );
+        } else if let Some(predicate) =
+            translate_runtime_comparison(binary, fields, predicate_builder, case_sensitive)
+        {
+            predicates.push(predicate);
+        }
+        return;
+    }
+
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        if let Some(predicate) =
+            translate_runtime_in_list(in_list, fields, predicate_builder, case_sensitive)
+        {
+            predicates.push(predicate);
+        }
+    }
+}
+
+fn translate_runtime_comparison(
+    binary: &BinaryExpr,
+    fields: &[DataField],
+    predicate_builder: &PredicateBuilder,
+    case_sensitive: bool,
+) -> Option<Predicate> {
+    let direct = runtime_column_literal(
+        binary.left().as_ref(),
+        binary.right().as_ref(),
+        fields,
+        case_sensitive,
+    )
+    .map(|(field, datum)| (*binary.op(), field, datum));
+    let comparison = direct.or_else(|| {
+        runtime_column_literal(
+            binary.right().as_ref(),
+            binary.left().as_ref(),
+            fields,
+            case_sensitive,
+        )
+        .and_then(|(field, datum)| {
+            reverse_runtime_comparison(*binary.op()).map(|op| (op, field, datum))
+        })
+    })?;
+
+    let (op, field, datum) = comparison;
+    match op {
+        Operator::Eq => predicate_builder.equal(field.name(), datum).ok(),
+        Operator::NotEq => predicate_builder.not_equal(field.name(), datum).ok(),
+        Operator::Lt => predicate_builder.less_than(field.name(), datum).ok(),
+        Operator::LtEq => predicate_builder.less_or_equal(field.name(), datum).ok(),
+        Operator::Gt => predicate_builder.greater_than(field.name(), datum).ok(),
+        Operator::GtEq => predicate_builder.greater_or_equal(field.name(), datum).ok(),
+        _ => None,
+    }
+}
+
+fn translate_runtime_in_list(
+    in_list: &InListExpr,
+    fields: &[DataField],
+    predicate_builder: &PredicateBuilder,
+    case_sensitive: bool,
+) -> Option<Predicate> {
+    let column = in_list.expr().downcast_ref::<Column>()?;
+    let field = resolve_runtime_field(column.name(), fields, case_sensitive)?;
+    let literals = in_list
+        .list()
+        .iter()
+        .map(|expr| {
+            let literal = expr.downcast_ref::<Literal>()?;
+            if literal.value().is_null() {
+                return None;
+            }
+            scalar_to_datum(literal.value(), field.data_type())
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    if in_list.negated() {
+        predicate_builder.is_not_in(field.name(), literals).ok()
+    } else {
+        predicate_builder.is_in(field.name(), literals).ok()
+    }
+}
+
+fn runtime_column_literal<'a>(
+    column: &dyn PhysicalExpr,
+    literal: &dyn PhysicalExpr,
+    fields: &'a [DataField],
+    case_sensitive: bool,
+) -> Option<(&'a DataField, Datum)> {
+    let column = column.downcast_ref::<Column>()?;
+    let literal = literal.downcast_ref::<Literal>()?;
+    if literal.value().is_null() {
+        return None;
+    }
+    let field = resolve_runtime_field(column.name(), fields, case_sensitive)?;
+    let datum = scalar_to_datum(literal.value(), field.data_type())?;
+    Some((field, datum))
+}
+
+fn resolve_runtime_field<'a>(
+    name: &str,
+    fields: &'a [DataField],
+    case_sensitive: bool,
+) -> Option<&'a DataField> {
+    if case_sensitive {
+        fields.iter().find(|field| field.name() == name)
+    } else {
+        let mut matches = fields
+            .iter()
+            .filter(|field| field.name().eq_ignore_ascii_case(name));
+        let field = matches.next()?;
+        matches.next().is_none().then_some(field)
+    }
+}
+
+fn reverse_runtime_comparison(op: Operator) -> Option<Operator> {
+    match op {
+        Operator::Eq => Some(Operator::Eq),
+        Operator::NotEq => Some(Operator::NotEq),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -249,7 +498,7 @@ fn datum_to_scalar(value: Datum, data_type: &ArrowDataType) -> Option<ScalarValu
 /// Planning is performed eagerly in [`super::super::table::PaimonTableProvider::scan`],
 /// and the resulting splits are distributed across DataFusion execution partitions
 /// so that DataFusion can schedule them in parallel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PaimonTableScan {
     table: Table,
     /// Full Paimon read type for nested or connector-defined projections.
@@ -274,6 +523,10 @@ pub struct PaimonTableScan {
     /// Column-name case sensitivity carried from planning to execution so the
     /// read path resolves names the same way the scan was planned.
     case_sensitive: bool,
+    /// Physical filters retained from DataFusion's runtime filter-pushdown pass.
+    /// They are always available for conservative reader pruning and are
+    /// evaluated exactly only when Parquet filter pushdown is enabled.
+    runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl PaimonTableScan {
@@ -307,6 +560,7 @@ impl PaimonTableScan {
             scan_trace,
             pushed_variants,
             case_sensitive,
+            runtime_filters: Vec::new(),
         }
     }
 
@@ -347,8 +601,9 @@ impl PaimonTableScan {
             return Statistics::unknown_column(&self.schema());
         }
 
-        let exact_null_counts = (self.table.schema().primary_keys().is_empty()
-            || merge_engine == MergeEngine::Deduplicate)
+        let exact_null_counts = self.runtime_filters.is_empty()
+            && (self.table.schema().primary_keys().is_empty()
+                || merge_engine == MergeEngine::Deduplicate)
             && self.pushed_predicate.is_none()
             && self.limit.is_none()
             && partitions
@@ -403,10 +658,43 @@ impl ExecutionPlan for PaimonTableScan {
         Ok(self)
     }
 
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let filters = child_pushdown_result
+            .parent_filters
+            .into_iter()
+            .map(|result| result.filter)
+            .collect::<Vec<_>>();
+        if filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                Vec::new(),
+            ));
+        }
+
+        let support = vec![
+            if config.execution.parquet.pushdown_filters {
+                PushedDown::Yes
+            } else {
+                PushedDown::No
+            };
+            filters.len()
+        ];
+        let mut scan = self.clone();
+        scan.runtime_filters.extend(filters);
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(support)
+                .with_updated_node(Arc::new(scan)),
+        )
+    }
+
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(format!(
@@ -420,23 +708,60 @@ impl ExecutionPlan for PaimonTableScan {
         let read_type = self.read_type.clone();
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
+        let runtime_filters = self.runtime_filters.clone();
+        let apply_runtime_filters = context
+            .session_config()
+            .options()
+            .execution
+            .parquet
+            .pushdown_filters;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
 
             read_builder.with_case_sensitive(case_sensitive);
             read_builder.with_read_type(read_type);
+            let estimated_rows = splits
+                .iter()
+                .filter_map(|split| usize::try_from(split.row_count()).ok())
+                .fold(0usize, usize::saturating_add);
+            let runtime_pruning = runtime_pruning_predicate(
+                &runtime_filters,
+                table.schema().fields(),
+                case_sensitive,
+                runtime_filter_wait_timeout(estimated_rows),
+            )
+            .await;
             if let Some(filter) = pushed_predicate {
                 read_builder.with_filter(filter);
             }
 
-            let read = read_builder.new_read().map_err(to_datafusion_error)?;
+            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
+            if let Some(filter) = runtime_pruning {
+                read = read.with_pruning_filter(filter);
+            }
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
-                result
+                let mut batch = result
                     .map_err(to_datafusion_error)
-                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))
+                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
+                if apply_runtime_filters {
+                    for filter in &runtime_filters {
+                        let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
+                        let predicate = predicate
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| {
+                                datafusion::error::DataFusionError::Execution(format!(
+                                    "Paimon runtime filter must return Boolean, got {}",
+                                    predicate.data_type()
+                                ))
+                            })?;
+                        batch = filter_record_batch(&batch, predicate)?;
+                    }
+                }
+                Ok(batch)
             });
 
             Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
@@ -474,12 +799,15 @@ impl ExecutionPlan for PaimonTableScan {
         // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
         // 2. No limit is applied (limit would make row count inexact)
         // 3. Filter is exact (no residual filtering needed above the scan)
-        let num_rows_precision =
-            if all_row_counts_known && self.limit.is_none() && self.filter_exact {
-                Precision::Exact(total_rows)
-            } else {
-                Precision::Inexact(total_rows)
-            };
+        let num_rows_precision = if all_row_counts_known
+            && self.limit.is_none()
+            && self.filter_exact
+            && self.runtime_filters.is_empty()
+        {
+            Precision::Exact(total_rows)
+        } else {
+            Precision::Inexact(total_rows)
+        };
 
         Ok(Arc::new(Statistics {
             num_rows: num_rows_precision,
@@ -528,6 +856,14 @@ impl DisplayAs for PaimonTableScan {
         if let Some(ref pushed_variants) = self.pushed_variants {
             write!(f, ", PushedVariants=[{pushed_variants}]")?;
         }
+        if !self.runtime_filters.is_empty() {
+            let filters = self
+                .runtime_filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            write!(f, ", runtime_filters=[{}]", filters.join(" AND "))?;
+        }
         Ok(())
     }
 }
@@ -541,8 +877,17 @@ mod tests {
 
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use datafusion::config::ConfigOptions;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{
+        lit, BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr,
+    };
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::filter_pushdown::{
+        ChildFilterPushdownResult, ChildPushdownResult,
+    };
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use futures::TryStreamExt;
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
@@ -854,6 +1199,261 @@ mod tests {
         assert_eq!(value_stats.min_value, Precision::Absent);
         assert_eq!(value_stats.max_value, Precision::Absent);
         assert_eq!(value_stats.null_count, Precision::Absent);
+    }
+
+    #[test]
+    fn test_scan_retains_dynamic_filter_for_runtime_evaluation() {
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+        let dynamic_filter: Arc<dyn PhysicalExpr> =
+            Arc::new(DynamicFilterPhysicalExpr::new(Vec::new(), lit(true)));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter: dynamic_filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        let updated = result
+            .updated_node
+            .expect("the scan must retain physical filters so dynamic join filters remain active");
+        let statistics = updated.partition_statistics(None).unwrap();
+        assert_eq!(statistics.num_rows, Precision::Inexact(0));
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Absent,
+            "runtime-filtered scans must not expose unfiltered exact null counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_uses_retained_runtime_filter_for_pruning_only() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        write_int_parquet_file(
+            &bucket_dir.join("data.parquet"),
+            vec![("id", vec![1, 2, 3, 4, 5])],
+            None,
+        );
+        let file_size = fs::metadata(bucket_dir.join("data.parquet")).unwrap().len() as i64;
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 5, file_size)])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            table,
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split])],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(2_i32),
+        ));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+        let scan = result.updated_node.unwrap();
+        let ctx = SessionContext::new();
+        let batches = scan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let ids = collect_ids(&batches);
+
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "unsupported physical filters may prune row groups but must not remove rows"
+        );
+
+        let mut exact_config = SessionConfig::new();
+        exact_config
+            .options_mut()
+            .execution
+            .parquet
+            .pushdown_filters = true;
+        let exact_ctx = SessionContext::new_with_config(exact_config);
+        let exact_batches = scan
+            .execute(0, exact_ctx.task_ctx())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&exact_batches), vec![3, 4, 5]);
+    }
+
+    fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_filter_builds_reader_pruning_predicate() {
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        dynamic_filter
+            .update(Arc::new(BinaryExpr::new(
+                column,
+                Operator::GtEq,
+                lit(3_i32),
+            )))
+            .unwrap();
+        dynamic_filter.mark_complete();
+        let filter: Arc<dyn PhysicalExpr> = dynamic_filter;
+
+        let predicate =
+            runtime_pruning_predicate(&[filter], &test_read_type(), true, Duration::ZERO)
+                .await
+                .expect("a completed column/literal dynamic filter should prune the reader");
+
+        assert_eq!(predicate.to_string(), "id >= 3");
+    }
+
+    #[tokio::test]
+    async fn test_runtime_in_list_builds_reader_pruning_predicate() {
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(
+            InListExpr::try_new(
+                Arc::new(Column::new("id", 0)),
+                vec![lit(1_i32), lit(3_i32)],
+                false,
+                test_schema().as_ref(),
+            )
+            .unwrap(),
+        );
+
+        let predicate =
+            runtime_pruning_predicate(&[filter], &test_read_type(), true, Duration::ZERO)
+                .await
+                .expect("a literal IN list should prune the reader");
+
+        assert_eq!(predicate.to_string(), "id IN (1, 3)");
+    }
+
+    #[test]
+    fn test_runtime_filter_wait_is_cost_aware() {
+        assert_eq!(runtime_filter_wait_timeout(204_000), Duration::ZERO);
+        assert_eq!(runtime_filter_wait_timeout(250_000), Duration::ZERO);
+        assert_eq!(runtime_filter_wait_timeout(250_001), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_dynamic_filter_does_not_materially_delay_scan_startup() {
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let dynamic_filter: Arc<dyn PhysicalExpr> =
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
+
+        let predicate = tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime_pruning_predicate(&[dynamic_filter], &test_read_type(), true, Duration::ZERO),
+        )
+        .await
+        .expect("an incomplete dynamic filter must not delay scan startup");
+
+        assert!(predicate.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_completed_dynamic_filter_still_prunes_when_another_times_out() {
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let completed = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        completed
+            .update(Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::GtEq,
+                lit(3_i32),
+            )))
+            .unwrap();
+        completed.mark_complete();
+        let incomplete: Arc<dyn PhysicalExpr> =
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
+        let completed: Arc<dyn PhysicalExpr> = completed;
+
+        let predicate = runtime_pruning_predicate(
+            &[completed, incomplete],
+            &test_read_type(),
+            true,
+            Duration::ZERO,
+        )
+        .await
+        .expect("completed filters should survive another filter timing out");
+
+        assert_eq!(predicate.to_string(), "id >= 3");
     }
 
     #[tokio::test]

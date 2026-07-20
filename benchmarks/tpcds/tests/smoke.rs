@@ -225,6 +225,7 @@ async fn command_orchestration_loads_and_writes_a_run_report() {
     .unwrap();
     let runtime = RuntimeArgs {
         target_partitions: Some(2),
+        parquet_pushdown_filters: false,
         memory_limit_gib: None,
         spill_dir: None,
         max_spill_gib: None,

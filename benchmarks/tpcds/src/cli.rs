@@ -113,6 +113,9 @@ pub struct RuntimeArgs {
     /// DataFusion execution partitions. Defaults to available CPUs.
     #[arg(long)]
     pub target_partitions: Option<usize>,
+    /// Evaluate pushed filters during Parquet/Paimon scans, in addition to statistics pruning.
+    #[arg(long)]
+    pub parquet_pushdown_filters: bool,
     /// DataFusion memory limit in GiB. Omit for an unbounded pool.
     #[arg(long)]
     pub memory_limit_gib: Option<u64>,
@@ -132,6 +135,7 @@ impl RuntimeArgs {
                 .target_partitions
                 .unwrap_or(defaults.target_partitions)
                 .max(1),
+            parquet_pushdown_filters: self.parquet_pushdown_filters,
             memory_limit_bytes: self.memory_limit_gib.map(gib_to_usize).transpose()?,
             spill_dir: self.spill_dir.clone(),
             max_spill_bytes: self.max_spill_gib.map(gib_to_u64).transpose()?,

@@ -142,6 +142,7 @@ target/release/paimon-tpcds-bench run \
   --warmup 1 \
   --iterations 3 \
   --target-partitions 64 \
+  --parquet-pushdown-filters \
   --memory-limit-gib 192 \
   --spill-dir /nvme/datafusion-spill \
   --max-spill-gib 1024
@@ -164,6 +165,7 @@ target/release/paimon-tpcds-bench run \
   --warmup 1 \
   --iterations 3 \
   --target-partitions 64 \
+  --parquet-pushdown-filters \
   --memory-limit-gib 192 \
   --spill-dir /nvme/datafusion-spill \
   --max-spill-gib 1024
@@ -172,6 +174,10 @@ target/release/paimon-tpcds-bench run \
 This is an end-to-end source comparison. Loading the data into Paimon rewrites
 the physical files, so it is not a pure measurement of catalog or manifest
 overhead.
+
+Use the same `--parquet-pushdown-filters` setting for both sources. When the
+flag is absent, runtime filters are used only for conservative statistics
+pruning; when present, both Parquet and Paimon also evaluate them during scan.
 
 ## Cache Protocol
 
