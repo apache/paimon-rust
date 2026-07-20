@@ -56,7 +56,7 @@ use crate::filter_pushdown::scalar_to_datum;
 const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
 const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn row_filter_enabled(config: &ConfigOptions) -> bool {
+fn scan_applies_row_filter(config: &ConfigOptions) -> bool {
     config
         .extensions
         .get::<PaimonConfig>()
@@ -686,12 +686,15 @@ impl ExecutionPlan for PaimonTableScan {
 
         let schema = self.schema();
         let mut accepted = Vec::new();
-        let support = filters
+        let parent_filter_handled = filters
             .into_iter()
             .map(|filter| {
                 if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
                     accepted.push(filter);
-                    if row_filter_enabled(config) {
+                    // `PushedDown` reports whether this scan evaluates the predicate
+                    // exactly so the parent FilterExec can be removed. The predicate is
+                    // retained above for pruning regardless of this result.
+                    if scan_applies_row_filter(config) {
                         PushedDown::Yes
                     } else {
                         PushedDown::No
@@ -703,14 +706,14 @@ impl ExecutionPlan for PaimonTableScan {
             .collect::<Vec<_>>();
         if accepted.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                support,
+                parent_filter_handled,
             ));
         }
 
         let mut scan = self.clone();
         scan.runtime_filters.extend(accepted);
         Ok(
-            FilterPushdownPropagation::with_parent_pushdown_result(support)
+            FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
                 .with_updated_node(Arc::new(scan)),
         )
     }
@@ -733,7 +736,7 @@ impl ExecutionPlan for PaimonTableScan {
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
-        let apply_row_filter = row_filter_enabled(context.session_config().options());
+        let apply_row_filter = scan_applies_row_filter(context.session_config().options());
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -1269,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reports_filter_pushed_down_with_paimon_config() {
+    fn test_scan_reports_filter_handled_when_row_filter_is_enabled() {
         let scan = PaimonTableScan::new(
             test_schema(),
             dummy_table(),
