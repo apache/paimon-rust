@@ -595,7 +595,7 @@ mod tests {
             );
             assert!(
                 column_by_name(batch, SEARCH_SCORE_COLUMN).is_none(),
-                "_PKEY_VECTOR_SCORE must be absent when no scores are supplied"
+                "__paimon_search_score must be absent when no scores are supplied"
             );
         }
     }

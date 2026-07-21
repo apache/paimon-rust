@@ -47,7 +47,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// on both ends, required strictly ascending and non-overlapping. Adjacent
 /// (touching) ranges are allowed and need not be coalesced by the producer.
 /// `scores`, when present, is aligned to the expanded-range order (ascending
-/// position); `None` means no `_PKEY_VECTOR_SCORE` column in the output.
+/// position); `None` means no `__paimon_search_score` column in the output.
 ///
 /// Deliberately NOT reusing `DataSplit.row_ranges`, whose ranges mean stable/global
 /// row ids on the append/data-evolution path. Not serialized.
@@ -604,7 +604,7 @@ mod e2e_tests {
     #[tokio::test]
     async fn reads_ranges_with_position_column_no_scores() {
         // rows id=[10,11,12], ranges [0..=0, 2..=2] -> ids [10,12], positions [0,2];
-        // no _ROW_ID leak, no _PKEY_VECTOR_SCORE.
+        // no _ROW_ID leak, no __paimon_search_score.
         let data = write_mosaic_single_group(&id_batch(vec![10, 11, 12]));
         let (reader, split) = build_reader_and_split("memory:/pkvisr_basic", &data, 3, &[]).await;
         let indexed = PkVectorIndexedSplit {

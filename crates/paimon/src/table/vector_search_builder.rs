@@ -554,13 +554,10 @@ impl<'a> VectorSearchBuilder<'a> {
 }
 
 /// Names a read injects as metadata columns — `__paimon_search_score`,
-/// `_PKEY_VECTOR_POSITION`, `_ROW_ID`, and `_PKEY_VECTOR_SCORE` — that a
-/// materialized read type must not reuse for a user column.
+/// `_PKEY_VECTOR_POSITION`, and `_ROW_ID` — that a materialized read type must
+/// not reuse for a user column.
 fn is_reserved_read_column(name: &str) -> bool {
-    name == PKEY_VECTOR_POSITION_COLUMN
-        || name == SEARCH_SCORE_COLUMN
-        || name == ROW_ID_FIELD_NAME
-        || name == "_PKEY_VECTOR_SCORE"
+    name == PKEY_VECTOR_POSITION_COLUMN || name == SEARCH_SCORE_COLUMN || name == ROW_ID_FIELD_NAME
 }
 
 /// Reject a materialized read type whose resolved fields contain a reserved
@@ -5022,7 +5019,6 @@ mod tests {
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
             SEARCH_SCORE_COLUMN,
-            "_PKEY_VECTOR_SCORE",
         ] {
             let mut builder = table.new_vector_search_builder();
             builder
@@ -5088,7 +5084,6 @@ mod tests {
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
             SEARCH_SCORE_COLUMN,
-            "_PKEY_VECTOR_SCORE",
         ] {
             let mut builder = table.new_vector_search_builder();
             builder
