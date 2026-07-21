@@ -760,7 +760,14 @@ impl DataSplit {
         }
 
         let data_deletion_files = read_deletion_list(cur)?;
-        let _is_streaming = read_u8(cur)?;
+        // Rust only produces and serves batch splits (isStreaming = false); a
+        // streaming split carries a semantic bit that Java readers branch on, so
+        // reject it rather than silently dropping it.
+        if read_u8(cur)? != 0 {
+            return Err(crate::Error::Unsupported {
+                message: "streaming DataSplit (isStreaming = true) not supported".to_string(),
+            });
+        }
         let raw_convertible = read_u8(cur)? != 0;
 
         let mut builder = DataSplitBuilder::new()
@@ -1628,8 +1635,28 @@ mod tests {
         }
     }
 
-    // A valid v8 header followed by a huge data_files count must return an error, not
-    // abort the process via an unbounded `Vec::with_capacity` reservation.
+    // A streaming split (isStreaming = true) is rejected rather than silently
+    // dropping the bit: Rust only writes/serves batch splits (isStreaming =
+    // false), and Java readers branch on this flag. The isStreaming byte is the
+    // second-to-last byte on the wire (isStreaming, then raw_convertible).
+    #[test]
+    fn deserialize_rejects_streaming_split() {
+        let bytes = sample_v8_split().serialize().unwrap();
+        assert!(DataSplit::deserialize(&bytes).is_ok());
+
+        let mut patched = bytes.clone();
+        let pos = patched.len() - 2; // isStreaming flag
+        assert_eq!(
+            patched[pos], 0,
+            "fixture must serialize isStreaming = false"
+        );
+        patched[pos] = 1;
+        match DataSplit::deserialize(&patched) {
+            Err(crate::Error::Unsupported { .. }) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
     #[test]
     fn deserialize_rejects_huge_data_files_count_without_aborting() {
         // Build a well-formed split with an empty data-file list so the trailing layout
