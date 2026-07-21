@@ -761,11 +761,12 @@ pub fn serialize_binary_array_long(values: &[Option<i64>]) -> Vec<u8> {
 pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
     let n = read_binary_array_len(data)?;
     let header = binary_array_header(n);
-    // Bound the preallocation to what the buffer could actually hold (8 bytes per
-    // element slot) so an attacker-controlled length prefix cannot trigger a huge
-    // reservation (capacity-overflow panic / OOM) before per-element validation.
-    let cap = n.min(data.len().saturating_sub(header) / 8);
-    let mut out = Vec::with_capacity(cap);
+    // The fixed element region is `n * 8` bytes after the header; reject any
+    // count whose slots cannot fit in the buffer up front. This bounds both the
+    // reservation and the loop, so a forged large count (with or without
+    // element slots) cannot amplify memory before per-element validation.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let eo = header + k * 8;
         let slot = data
@@ -799,11 +800,12 @@ pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
 pub fn deserialize_binary_array_long(data: &[u8]) -> crate::Result<Vec<Option<i64>>> {
     let n = read_binary_array_len(data)?;
     let header = binary_array_header(n);
-    // Bound the preallocation to what the buffer could actually hold (8 bytes per
-    // element slot) so an attacker-controlled length prefix cannot trigger a huge
-    // reservation (capacity-overflow panic / OOM) before per-element validation.
-    let cap = n.min(data.len().saturating_sub(header) / 8);
-    let mut out = Vec::with_capacity(cap);
+    // See `deserialize_binary_array_str`: reject a count whose fixed element
+    // region overflows the buffer before allocating. Null elements skip the
+    // per-slot read, so this up-front check is what prevents a forged
+    // "large count + all-null bitmap + no slots" input from amplifying memory.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let null = data
             .get(4 + k / 8)
@@ -831,6 +833,19 @@ fn read_binary_array_len(data: &[u8]) -> crate::Result<usize> {
         return Err(bin_arr_err("binary array has negative length"));
     }
     Ok(n as usize)
+}
+
+/// Reject a binary array whose `n` fixed 8-byte element slots cannot fit in the
+/// buffer after its `header`. Computed without overflow so a forged count
+/// cannot wrap; guards allocation and iteration for both decoders (`None`
+/// elements otherwise skip the per-slot bounds check).
+fn check_binary_array_fits(n: usize, header: usize, data_len: usize) -> crate::Result<()> {
+    if n > data_len.saturating_sub(header) / 8 {
+        return Err(bin_arr_err(
+            "binary array element region exceeds buffer length",
+        ));
+    }
+    Ok(())
 }
 
 fn bin_arr_err(msg: &str) -> crate::Error {
@@ -2038,5 +2053,21 @@ mod tests {
         let huge = [0xFF, 0xFF, 0xFF, 0x7F];
         assert!(deserialize_binary_array_str(&huge).is_err());
         assert!(deserialize_binary_array_long(&huge).is_err());
+    }
+
+    #[test]
+    fn binary_array_long_rejects_all_null_amplification() {
+        // Forged input: a large element count with an all-ones null bitmap and
+        // NO element slots. Null elements skip the per-slot bounds check, so
+        // without an up-front `count * 8 <= remaining` guard the loop would
+        // push `count` `None`s from a tiny buffer (~128x memory amplification),
+        // reachable through the C entry point (OOM risk). Must error, not
+        // allocate.
+        let count: i32 = 8000;
+        let bitmap_len = ((count as usize) + 7) / 8; // 1000 bytes
+        let mut buf = Vec::with_capacity(4 + bitmap_len);
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xFFu8, bitmap_len)); // every element null
+        assert!(deserialize_binary_array_long(&buf).is_err());
     }
 }

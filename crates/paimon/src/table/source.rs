@@ -727,7 +727,14 @@ impl DataSplit {
                 message: format!("non-empty beforeFiles ({before_files_n}) not supported"),
             });
         }
-        let _before_deletion = read_deletion_list(cur)?; // discard (always null on write)
+        // `beforeDeletionFiles` is always a null list on write; a non-null list
+        // is rejected rather than silently dropped (Java treats such a split as
+        // invalid), matching the `beforeFiles` handling above.
+        if read_deletion_list(cur)?.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "non-null beforeDeletionFiles not supported".to_string(),
+            });
+        }
 
         let data_files_n = read_i32(cur)?;
         if data_files_n < 0 {
@@ -1585,6 +1592,40 @@ mod tests {
     fn deserialize_rejects_bad_magic() {
         let bytes = [0u8; 12];
         assert!(DataSplit::deserialize(&bytes).is_err());
+    }
+
+    // A non-null `beforeDeletionFiles` list is rejected rather than silently
+    // discarded (Java treats such a split as invalid). Walk the wire layout with
+    // the same readers to locate the null-list flag, then flip it to a non-null
+    // (empty) list and confirm deserialize fails loudly.
+    #[test]
+    fn deserialize_rejects_non_null_before_deletion_files() {
+        let split = sample_v8_split();
+        let bytes = split.serialize().unwrap();
+        assert!(DataSplit::deserialize(&bytes).is_ok());
+
+        let mut cur = bytes.as_slice();
+        read_i64(&mut cur).unwrap(); // magic
+        read_i32(&mut cur).unwrap(); // version
+        read_i64(&mut cur).unwrap(); // snapshot_id
+        let part_len = read_i32(&mut cur).unwrap() as usize;
+        take(&mut cur, part_len).unwrap(); // partition bytes
+        read_i32(&mut cur).unwrap(); // bucket
+        read_java_utf(&mut cur).unwrap(); // bucket_path
+        if read_u8(&mut cur).unwrap() != 0 {
+            read_i32(&mut cur).unwrap(); // total_buckets
+        }
+        read_i32(&mut cur).unwrap(); // beforeFiles count (0)
+                                     // `cur` now points at the beforeDeletionFiles null-list flag byte.
+        let offset = bytes.len() - cur.len();
+
+        let mut patched = bytes.clone();
+        // null-list marker (0x00) -> non-null empty list (0x01 + i32 count 0).
+        patched.splice(offset..offset + 1, [1u8, 0, 0, 0, 0]);
+        match DataSplit::deserialize(&patched) {
+            Err(crate::Error::Unsupported { .. }) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     // A valid v8 header followed by a huge data_files count must return an error, not
