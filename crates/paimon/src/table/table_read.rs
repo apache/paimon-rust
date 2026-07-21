@@ -110,19 +110,38 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Configure whether data predicates may remove rows from emitted batches.
+    /// Set a predicate used only for conservative file-format pruning.
     ///
-    /// When disabled, predicates remain available for conservative scan and
-    /// file-format pruning, and the caller must enforce them exactly. Merge and
-    /// data-evolution readers do not push such predicates below materialization.
-    pub fn with_row_filter(self, row_filter: bool) -> Self {
+    /// Unlike [`Self::with_filter`], this predicate may skip whole row groups or
+    /// pages but never removes individual matching-file rows. The caller remains
+    /// responsible for exact row-level filtering.
+    pub fn with_pruning_filter(self, filter: Predicate) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
-                Self(TableReadKind::Paimon(read.with_row_filter(row_filter)))
+                Self(TableReadKind::Paimon(read.with_pruning_filter(filter)))
             }
             TableReadKind::Format(read) => {
-                Self(TableReadKind::Format(read.with_row_filter(row_filter)))
+                Self(TableReadKind::Format(read.with_pruning_filter(filter)))
             }
+        }
+    }
+
+    /// Attach an engine-specific Parquet decoder-filter factory.
+    ///
+    /// The hook is used only by schema-identical raw reads. Callers must still
+    /// enforce the expression after the scan because an individual file may not
+    /// be able to build a decoder filter.
+    pub fn with_parquet_row_filter_factory(
+        self,
+        factory: Arc<dyn crate::arrow::ParquetRowFilterFactory>,
+    ) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_parquet_row_filter_factory(factory),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(
+                read.with_parquet_row_filter_factory(factory),
+            )),
         }
     }
 
@@ -174,7 +193,8 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
-    row_filter: bool,
+    pruning_predicates: Vec<Predicate>,
+    parquet_row_filter_factory: Option<Arc<dyn crate::arrow::ParquetRowFilterFactory>>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -188,7 +208,8 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
-            row_filter: true,
+            pruning_predicates: Vec::new(),
+            parquet_row_filter_factory: None,
         }
     }
 
@@ -207,9 +228,9 @@ impl<'a> PaimonTableRead<'a> {
         self.table
     }
 
-    /// Set a filter predicate. Used conservatively for read-side pruning and,
-    /// unless row filtering is disabled, enforced exactly by residual filtering
-    /// on append, data-evolution, and primary-key merge read paths (see
+    /// Set a filter predicate. Used conservatively for read-side pruning and
+    /// enforced exactly by residual filtering on append, data-evolution, and
+    /// primary-key merge read paths (see
     /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
@@ -222,8 +243,16 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn with_row_filter(mut self, row_filter: bool) -> Self {
-        self.row_filter = row_filter;
+    fn with_pruning_filter(mut self, filter: Predicate) -> Self {
+        self.pruning_predicates = split_scan_predicates(self.table, filter).1;
+        self
+    }
+
+    fn with_parquet_row_filter_factory(
+        mut self,
+        factory: Arc<dyn crate::arrow::ParquetRowFilterFactory>,
+    ) -> Self {
+        self.parquet_row_filter_factory = Some(factory);
         self
     }
 
@@ -309,7 +338,6 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             self.data_predicates.clone(),
         )
-        .with_row_filter(self.row_filter)
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
         let raw_stream = reader.read(&data_splits)?;
 
@@ -467,8 +495,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
             },
-        )
-        .with_row_filter(self.row_filter);
+        );
         reader.read(splits)
     }
 
@@ -491,7 +518,6 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_view_resolve_enabled(),
             self.table.rest_env().cloned(),
         )?
-        .with_row_filter(self.row_filter)
         .with_batch_size(Some(core_options.read_batch_size()?));
         reader.read(data_splits)
     }
@@ -502,7 +528,7 @@ impl<'a> PaimonTableRead<'a> {
     }
 
     fn new_data_file_reader(&self) -> crate::Result<DataFileReader> {
-        Ok(DataFileReader::new(
+        let mut reader = DataFileReader::new(
             self.table.file_io.clone(),
             self.table.schema_manager().clone(),
             self.table.schema().id(),
@@ -510,8 +536,17 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
-        .with_row_filter(self.row_filter)
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?)))
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
+        // Metadata pruning is safe only on the plain append/raw path. This
+        // constructor is also used by raw-convertible primary-key splits, where
+        // positional merge semantics must remain untouched.
+        if self.table.schema().primary_keys().is_empty() {
+            reader = reader.with_pruning_predicates(self.pruning_predicates.clone());
+            if let Some(factory) = &self.parquet_row_filter_factory {
+                reader = reader.with_parquet_row_filter_factory(Arc::clone(factory));
+            }
+        }
+        Ok(reader)
     }
 }
 
@@ -666,19 +701,6 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
-    }
-
-    #[test]
-    fn test_row_filter_disabled_keeps_data_predicates() {
-        let table = query_auth_table();
-        let read = PaimonTableRead::new(
-            &table,
-            table.schema.fields().to_vec(),
-            vec![Predicate::AlwaysFalse],
-        )
-        .with_row_filter(false);
-
-        assert_eq!(read.data_predicates(), &[Predicate::AlwaysFalse]);
     }
 
     #[test]

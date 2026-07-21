@@ -76,10 +76,6 @@ pub(crate) fn filter_record_batch_by_predicates(
     predicates: &FilePredicates,
     scan_fields: &[DataField],
 ) -> crate::Result<RecordBatch> {
-    if !predicates.apply_row_filter {
-        return Ok(batch);
-    }
-
     let Some(mask) = evaluate_predicates_mask(
         &batch,
         &predicates.predicates,
@@ -254,7 +250,7 @@ pub(crate) fn widen_scan_fields(
 ) -> Vec<DataField> {
     let mut fields = read_fields.to_vec();
 
-    if let Some(fp) = predicates.filter(|fp| fp.apply_row_filter) {
+    if let Some(fp) = predicates {
         let mut predicate_indices = Vec::new();
         for predicate in &fp.predicates {
             collect_predicate_field_indices(predicate, &mut predicate_indices);
@@ -713,20 +709,20 @@ pub(crate) fn sanitize_filter_mask(mask: BooleanArray) -> BooleanArray {
         return mask;
     }
 
-    boolean_mask_from_predicate(mask.len(), |row_index| {
-        mask.is_valid(row_index) && mask.value(row_index)
-    })
+    let values = mask.values() & mask.nulls().expect("mask has nulls").inner();
+    BooleanArray::new(values, None)
 }
 
 fn combine_filter_masks(left: &BooleanArray, right: &BooleanArray, use_or: bool) -> BooleanArray {
     debug_assert_eq!(left.len(), right.len());
-    boolean_mask_from_predicate(left.len(), |row_index| {
-        if use_or {
-            left.value(row_index) || right.value(row_index)
-        } else {
-            left.value(row_index) && right.value(row_index)
-        }
-    })
+    debug_assert_eq!(left.null_count(), 0);
+    debug_assert_eq!(right.null_count(), 0);
+    let values = if use_or {
+        left.values() | right.values()
+    } else {
+        left.values() & right.values()
+    };
+    BooleanArray::new(values, None)
 }
 
 fn boolean_mask_from_predicate(
@@ -947,7 +943,8 @@ mod tests {
     fn file_predicates(predicates: Vec<Predicate>, file_fields: Vec<DataField>) -> FilePredicates {
         FilePredicates {
             predicates,
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields,
         }
     }

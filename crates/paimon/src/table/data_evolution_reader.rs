@@ -103,11 +103,9 @@ pub(crate) struct DataEvolutionReader {
     /// Arrow schema of wide batches at the _ROW_ID attach point: the original
     /// read_type columns in caller order, then the extra predicate columns.
     wide_output_schema: Arc<arrow_schema::Schema>,
-    /// Data predicates (table-schema leaf indices). Available for pruning and,
-    /// when `apply_row_filter` is enabled, applied exactly after `_ROW_ID`
-    /// attachment before yielding.
+    /// Data predicates (table-schema leaf indices). Available for pruning and
+    /// applied exactly after `_ROW_ID` attachment before yielding.
     predicates: Vec<Predicate>,
-    apply_row_filter: bool,
     blob_as_descriptor: bool,
     blob_descriptor_fields: HashSet<String>,
     blob_view_fields: HashSet<String>,
@@ -145,10 +143,10 @@ impl DataEvolutionReader {
         // at the END: `project_output` relies on that to project the
         // final batch back to `read_type` by prefix. Predicate leaf indices
         // point into the table schema, so `file_fields` = `table_fields`.
-        let apply_row_filter = true;
         let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
             predicates: predicates.clone(),
-            apply_row_filter,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields: table_fields.clone(),
         });
         let wide_file_read_type =
@@ -171,7 +169,6 @@ impl DataEvolutionReader {
             output_schema,
             wide_output_schema,
             predicates,
-            apply_row_filter,
             blob_as_descriptor,
             blob_descriptor_fields,
             blob_view_fields,
@@ -180,11 +177,6 @@ impl DataEvolutionReader {
             blob_read_limiter: BlobReadLimiter::new(),
             batch_size: None,
         })
-    }
-
-    pub(crate) fn with_row_filter(mut self, apply_row_filter: bool) -> Self {
-        self.apply_row_filter = apply_row_filter;
-        self
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
@@ -209,11 +201,11 @@ impl DataEvolutionReader {
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
 
             // Raw-convertible files can safely use predicates for conservative
-            // row-group/page pruning. Keep row filtering disabled here because
-            // the exact residual runs after schema evolution and `_ROW_ID`
-            // attachment. Positional row IDs cannot currently be reconciled
-            // with pruned row groups, so that projection falls back to no
-            // predicate pushdown.
+            // row-group/page pruning. The exact residual runs after schema
+            // evolution and `_ROW_ID` attachment, so the nested file reader
+            // receives these through its pruning-only channel. Positional row
+            // IDs cannot currently be reconciled with pruned row groups, so
+            // that projection falls back to no predicate pushdown.
             let pruning_predicates = if self.row_id_index.is_none() {
                 self.predicates.clone()
             } else {
@@ -225,9 +217,9 @@ impl DataEvolutionReader {
                 self.table_schema_id,
                 self.table_fields.clone(),
                 self.wide_file_read_type.clone(),
-                pruning_predicates,
+                Vec::new(),
             )
-            .with_row_filter(false)
+            .with_pruning_predicates(pruning_predicates)
             .with_batch_size(self.batch_size);
 
             for split in splits {
@@ -382,7 +374,7 @@ impl DataEvolutionReader {
     /// `_ROW_ID` correctness: ids are attached before this filter, so surviving
     /// rows keep their original ids.
     fn filter_wide_batch(&self, batch: RecordBatch) -> crate::Result<RecordBatch> {
-        if !self.apply_row_filter || self.predicates.is_empty() {
+        if self.predicates.is_empty() {
             return Ok(batch);
         }
 
@@ -470,9 +462,6 @@ impl DataEvolutionReader {
         resolve_blob_views: bool,
         descriptor_fields: &HashSet<String>,
     ) -> bool {
-        if !self.apply_row_filter {
-            return false;
-        }
         let mut transformed_fields = HashSet::new();
         if resolve_blob_views {
             transformed_fields.extend(self.blob_view_fields.iter().cloned());
@@ -529,7 +518,6 @@ impl DataEvolutionReader {
             false,
             None,
         )?
-        .with_row_filter(self.apply_row_filter)
         .with_batch_size(self.batch_size);
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
@@ -5108,55 +5096,6 @@ mod tests {
 
         assert_eq!(collect_int_values(&batches, "id"), vec![2, 3, 4]);
         assert_eq!(collect_int_values(&batches, "value"), vec![20, 30, 40]);
-    }
-
-    #[tokio::test]
-    async fn test_evolution_read_row_filter_disabled_still_prunes_row_groups() {
-        let tempdir = tempdir().unwrap();
-        let table_path = local_file_path(tempdir.path());
-        let bucket_dir = tempdir.path().join("bucket-0");
-        fs::create_dir_all(&bucket_dir).unwrap();
-
-        let parquet_path = bucket_dir.join("data.parquet");
-        write_int_parquet_file(
-            &parquet_path,
-            vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 10, 30, 40])],
-            Some(2),
-        );
-
-        let table = two_col_evolution_table(table_path);
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(local_file_path(&bucket_dir))
-            .with_total_buckets(1)
-            .with_data_files(vec![data_file_meta_with_path(
-                "data.parquet",
-                0,
-                4,
-                1,
-                parquet_path.metadata().unwrap().len() as i64,
-                Some(vec!["id", "value"]),
-            )])
-            .build()
-            .unwrap();
-
-        let predicate = PredicateBuilder::new(table.schema().fields())
-            .greater_than("id", Datum::Int(3))
-            .unwrap();
-        let mut builder = table.new_read_builder();
-        builder.with_filter(predicate);
-        let read = builder.new_read().unwrap().with_row_filter(false);
-        let batches = read
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
-        assert_eq!(collect_int_values(&batches, "value"), vec![30, 40]);
     }
 
     /// Raw-convertible branch: a compound `Or` predicate referencing a

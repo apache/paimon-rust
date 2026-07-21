@@ -16,7 +16,9 @@
 // under the License.
 
 use super::shredding::PhysicalFormatWriterFactory;
-use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use super::{
+    FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult, ParquetRowFilterContext,
+};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
@@ -270,12 +272,17 @@ impl FormatFileReader for ParquetFormatReader {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
         let empty_predicates = Vec::new();
-        let (preds, apply_row_filter, file_fields): (&[Predicate], bool, &[DataField]) =
+        let (preds, pruning_only_preds, file_fields): (&[Predicate], &[Predicate], &[DataField]) =
             match predicates {
-                Some(fp) => (&fp.predicates, fp.apply_row_filter, &fp.file_fields),
-                None => (&empty_predicates, true, &[]),
+                Some(fp) => (&fp.predicates, &fp.pruning_predicates, &fp.file_fields),
+                None => (&empty_predicates, &empty_predicates, &[]),
             };
-        let pruning_preds = preds;
+        let pruning_preds = preds
+            .iter()
+            .chain(pruning_only_preds)
+            .cloned()
+            .collect::<Vec<_>>();
+        let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
 
         // Only load the Parquet page index (ColumnIndex + OffsetIndex) when a
         // predicate can use it for page-level pruning — matching Java Paimon,
@@ -305,10 +312,9 @@ impl FormatFileReader for ParquetFormatReader {
         // predicate is fully enforced, so we decode exactly `read_fields`, skip
         // the residual pass entirely, and return the stream as before — zero
         // added overhead.
-        let all_enforced = !apply_row_filter
-            || preds
-                .iter()
-                .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
+        let all_enforced = preds
+            .iter()
+            .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
 
         // Residual branch must decode the predicate columns too, or the residual
         // pass could not see a predicate on a non-projected column (Gap A). The
@@ -334,16 +340,35 @@ impl FormatFileReader for ParquetFormatReader {
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
-        if apply_row_filter {
-            let parquet_row_filter = build_parquet_row_filter(&parquet_schema, preds, file_fields)?;
-            if let Some(f) = parquet_row_filter {
-                batch_stream_builder = batch_stream_builder.with_row_filter(f);
+        let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
+            .map(RowFilter::into_predicates)
+            .unwrap_or_default();
+
+        if let Some(factory) = row_filter_factory {
+            let file_schema = batch_stream_builder.schema();
+            match factory.create(ParquetRowFilterContext {
+                file_schema,
+                metadata: batch_stream_builder.metadata(),
+            }) {
+                Ok(Some(filter)) => decoder_predicates.extend(filter.into_predicates()),
+                Ok(None) => {}
+                Err(error) => {
+                    // The hook is an optimization. The integration keeps its
+                    // exact post-filter, so a per-file adaptation failure is
+                    // safe to fall back from.
+                    log::warn!("failed to build external Parquet row filter: {error}");
+                }
             }
+        }
+
+        if !decoder_predicates.is_empty() {
+            batch_stream_builder =
+                batch_stream_builder.with_row_filter(RowFilter::new(decoder_predicates));
         }
 
         let predicate_row_selection = build_predicate_row_selection(
             batch_stream_builder.metadata().row_groups(),
-            pruning_preds,
+            &pruning_preds,
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
@@ -353,7 +378,7 @@ impl FormatFileReader for ParquetFormatReader {
         // or when no page could be skipped, so intersecting is a no-op then.
         let page_selection = build_predicate_page_selection(
             batch_stream_builder.metadata(),
-            pruning_preds,
+            &pruning_preds,
             file_fields,
         )?;
         combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
@@ -404,7 +429,8 @@ impl FormatFileReader for ParquetFormatReader {
         // projects the filtered batch to `read_fields` by name.
         let residual_predicates = FilePredicates {
             predicates: preds.to_vec(),
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields: file_fields.to_vec(),
         };
         let stream = batch_stream.map(move |result| {
@@ -457,38 +483,72 @@ fn build_parquet_arrow_predicate(
     predicate: &Predicate,
     file_fields: &[DataField],
 ) -> crate::Result<Option<Box<dyn ArrowPredicate>>> {
-    let Predicate::Leaf {
+    if !parquet_predicate_row_filter_accepted(parquet_schema, predicate, file_fields)? {
+        return Ok(None);
+    }
+
+    if let Predicate::Leaf {
         index,
-        data_type: _,
         op,
         literals,
         ..
     } = predicate
-    else {
-        return Ok(None);
-    };
-    // Gate on the shared acceptance test so this builder and
-    // `predicate_fully_enforced_by_row_filter` cannot disagree about which
-    // leaves the row filter enforces.
-    if !parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields)? {
-        return Ok(None);
+    {
+        // Keep the allocation-minimal single-column fast path for a leaf.
+        let file_field = &file_fields[*index];
+        let root_index = parquet_root_index(parquet_schema, file_field.name())
+            .expect("root index resolvable for accepted leaf");
+        let projection = ProjectionMask::roots(parquet_schema, [root_index]);
+        let op = *op;
+        let data_type = file_field.data_type().clone();
+        let literals = literals.to_vec();
+        return Ok(Some(Box::new(ArrowPredicateFn::new(
+            projection,
+            move |batch: RecordBatch| {
+                let Some(column) = batch.columns().first() else {
+                    return Ok(BooleanArray::new_null(batch.num_rows()));
+                };
+                crate::arrow::residual::evaluate_exact_leaf_predicate(
+                    column, &data_type, op, &literals,
+                )
+            },
+        ))));
     }
-    // Accepted: the field and its root column are guaranteed present.
-    let file_field = &file_fields[*index];
-    let root_index = parquet_root_index(parquet_schema, file_field.name())
-        .expect("root index resolvable for accepted leaf");
 
-    let projection = ProjectionMask::roots(parquet_schema, [root_index]);
-    let op = *op;
-    let data_type = file_field.data_type().clone();
-    let literals = literals.to_vec();
+    // Evaluate a compound predicate as one decoder predicate. Its projection is
+    // the union of referenced Parquet roots, ordered exactly as the projected
+    // RecordBatch. This preserves OR/NOT semantics; splitting it into leaf
+    // RowFilters would incorrectly turn the expression into a conjunction.
+    let mut field_indices = Vec::new();
+    crate::arrow::residual::collect_predicate_field_indices(predicate, &mut field_indices);
+    let mut projected = field_indices
+        .into_iter()
+        .filter_map(|index| {
+            let field = file_fields.get(index)?;
+            parquet_root_index(parquet_schema, field.name()).map(|root| (root, field.clone()))
+        })
+        .collect::<Vec<_>>();
+    projected.sort_unstable_by_key(|(root, _)| *root);
+    projected.dedup_by_key(|(root, _)| *root);
+
+    let projection = ProjectionMask::roots(parquet_schema, projected.iter().map(|(root, _)| *root));
+    let scan_fields = projected
+        .into_iter()
+        .map(|(_, field)| field)
+        .collect::<Vec<_>>();
+    let predicate = predicate.clone();
+    let file_fields = file_fields.to_vec();
     Ok(Some(Box::new(ArrowPredicateFn::new(
         projection,
         move |batch: RecordBatch| {
-            let Some(column) = batch.columns().first() else {
-                return Ok(BooleanArray::new_null(batch.num_rows()));
-            };
-            crate::arrow::residual::evaluate_exact_leaf_predicate(column, &data_type, op, &literals)
+            let mask = crate::arrow::residual::evaluate_predicates_mask(
+                &batch,
+                std::slice::from_ref(&predicate),
+                &file_fields,
+                &scan_fields,
+            )
+            .map_err(|e| arrow_schema::ArrowError::ComputeError(e.to_string()))?;
+            Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()])))
         },
     ))))
 }
@@ -499,26 +559,42 @@ fn build_parquet_arrow_predicate(
 /// is applied exactly during decode by the [`RowFilter`], so it needs no
 /// residual backstop.
 ///
-/// Shares the leaf-acceptance test with `build_parquet_arrow_predicate` (via
-/// `parquet_leaf_row_filter_accepted`) so the two cannot drift: whatever the
-/// builder accepts, this reports as fully enforced, and vice versa. Any
-/// non-`Leaf` node (`Or`, `Not`, `And`, ...) is NOT fully enforced.
+/// Shares the recursive acceptance test with `build_parquet_arrow_predicate` so
+/// the two cannot drift: a compound expression is exact only when all leaves
+/// can be evaluated by the decoder predicate.
 fn predicate_fully_enforced_by_row_filter(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
     predicate: &Predicate,
     file_fields: &[DataField],
 ) -> bool {
-    let Predicate::Leaf {
-        index,
-        op,
-        literals,
-        ..
-    } = predicate
-    else {
-        return false;
-    };
-    parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields)
-        .unwrap_or(false)
+    parquet_predicate_row_filter_accepted(parquet_schema, predicate, file_fields).unwrap_or(false)
+}
+
+fn parquet_predicate_row_filter_accepted(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+) -> crate::Result<bool> {
+    match predicate {
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(true),
+        Predicate::Leaf {
+            index,
+            op,
+            literals,
+            ..
+        } => parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields),
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                if !parquet_predicate_row_filter_accepted(parquet_schema, child, file_fields)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Not(inner) => {
+            parquet_predicate_row_filter_accepted(parquet_schema, inner, file_fields)
+        }
+    }
 }
 
 /// Shared leaf-acceptance test for the Parquet Arrow row filter: a leaf is
@@ -2965,6 +3041,82 @@ mod tests {
         buf
     }
 
+    #[tokio::test]
+    async fn test_pruning_predicate_skips_row_group_without_filtering_rows() {
+        use futures::StreamExt;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 40, 100]))],
+        )
+        .unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_pruning_only.parquet";
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let file_fields = vec![residual_test_field(0, "id", DataType::Int(IntType::new()))];
+        let pruning_predicate = residual_leaf(
+            "id",
+            0,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(50)],
+        );
+        let predicates = FilePredicates {
+            predicates: Vec::new(),
+            pruning_predicates: vec![pruning_predicate],
+            row_filter_factory: None,
+            file_fields: file_fields.clone(),
+        };
+
+        let mut stream = ParquetFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &file_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let id = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend(id.iter().flatten());
+        }
+
+        assert_eq!(ids, vec![40, 100]);
+    }
+
     fn residual_test_field(index: i32, name: &str, data_type: DataType) -> DataField {
         DataField::new(index, name.to_string(), data_type)
     }
@@ -3018,7 +3170,8 @@ mod tests {
 
         let predicates = FilePredicates {
             predicates: vec![predicate],
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields: id_name_age_file_fields(),
         };
 
@@ -3101,6 +3254,45 @@ mod tests {
         assert_eq!(names, vec!["a", "b"]);
     }
 
+    #[test]
+    fn test_supported_compound_predicate_is_enforced_by_row_filter() {
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message test_schema {
+                  OPTIONAL INT32 id;
+                  OPTIONAL BYTE_ARRAY name (UTF8);
+                  OPTIONAL INT32 age;
+                }
+                ",
+            )
+            .expect("test schema should parse"),
+        ));
+        let file_fields = id_name_age_file_fields();
+        let predicate = Predicate::Or(vec![
+            residual_leaf(
+                "age",
+                2,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Int(25)],
+            ),
+            Predicate::Not(Box::new(residual_leaf(
+                "id",
+                0,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Eq,
+                vec![Datum::Int(2)],
+            ))),
+        ]);
+
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &predicate,
+            &file_fields,
+        ));
+    }
+
     #[tokio::test]
     async fn test_parquet_and_of_supported_leaves_takes_fast_path() {
         use crate::spec::VarCharType;
@@ -3151,9 +3343,10 @@ mod tests {
             &leaf_lt,
             &file_fields
         ));
-        // An Or is NOT fully enforced -> residual pass would engage.
+        // A supported OR is evaluated as one decoder predicate, preserving its
+        // compound semantics without a residual pass.
         let or_pred = Predicate::Or(vec![leaf_gt.clone(), leaf_lt.clone()]);
-        assert!(!super::predicate_fully_enforced_by_row_filter(
+        assert!(super::predicate_fully_enforced_by_row_filter(
             &parquet_schema,
             &or_pred,
             &file_fields
@@ -3173,7 +3366,8 @@ mod tests {
         let reader_input = input.reader().await.unwrap();
         let predicates = FilePredicates {
             predicates: vec![leaf_gt, leaf_lt],
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields,
         };
         let reader = ParquetFormatReader;
@@ -3491,7 +3685,8 @@ mod tests {
         ])];
         let file_predicates = FilePredicates {
             predicates,
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields: fields.clone(),
         };
 

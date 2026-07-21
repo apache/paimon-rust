@@ -21,6 +21,8 @@ pub(crate) mod residual;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
 
+pub use format::{ParquetRowFilterContext, ParquetRowFilterFactory};
+
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
     DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,

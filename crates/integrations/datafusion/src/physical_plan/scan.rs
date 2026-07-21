@@ -28,19 +28,27 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
+use datafusion::datasource::physical_plan::parquet::{
+    build_row_filter, can_expr_be_pushed_down_with_schemas,
+};
+use datafusion::datasource::physical_plan::ParquetFileMetrics;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
 };
+use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::stream::FuturesUnordered;
@@ -49,19 +57,11 @@ use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
-use crate::config::PaimonConfig;
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::scalar_to_datum;
 
 const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
 const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
-
-fn scan_applies_row_filter(config: &ConfigOptions) -> bool {
-    config
-        .extensions
-        .get::<PaimonConfig>()
-        .is_some_and(|config| config.read.row_filter)
-}
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -88,6 +88,59 @@ fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
 
     RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(Into::into)
+}
+
+#[derive(Debug)]
+struct DataFusionParquetRowFilterFactory {
+    predicate: Arc<dyn PhysicalExpr>,
+    logical_schema: ArrowSchemaRef,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DataFusionParquetRowFilterFactory {
+    fn new(predicate: Arc<dyn PhysicalExpr>, logical_schema: ArrowSchemaRef) -> Self {
+        Self {
+            predicate,
+            logical_schema,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl paimon::arrow::ParquetRowFilterFactory for DataFusionParquetRowFilterFactory {
+    fn create(
+        &self,
+        context: paimon::arrow::ParquetRowFilterContext<'_>,
+    ) -> paimon::Result<Option<datafusion::parquet::arrow::arrow_reader::RowFilter>> {
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(
+                Arc::clone(&self.logical_schema),
+                Arc::clone(context.file_schema),
+            )
+            .map_err(datafusion_row_filter_error)?;
+        let predicate = adapter
+            .rewrite(Arc::clone(&self.predicate))
+            .and_then(|predicate| {
+                PhysicalExprSimplifier::new(context.file_schema).simplify(predicate)
+            })
+            .map_err(datafusion_row_filter_error)?;
+        let file_metrics = ParquetFileMetrics::new(0, "paimon", &self.metrics);
+        build_row_filter(
+            &predicate,
+            context.file_schema,
+            context.metadata,
+            true,
+            &file_metrics,
+        )
+        .map_err(datafusion_row_filter_error)
+    }
+}
+
+fn datafusion_row_filter_error(error: datafusion::error::DataFusionError) -> paimon::Error {
+    paimon::Error::UnexpectedError {
+        message: format!("failed to adapt DataFusion Parquet row filter: {error}"),
+        source: Some(Box::new(error)),
+    }
 }
 
 async fn runtime_pruning_predicate(
@@ -545,13 +598,9 @@ pub struct PaimonTableScan {
     /// read path resolves names the same way the scan was planned.
     case_sensitive: bool,
     /// Physical filters retained from DataFusion's runtime filter-pushdown pass.
-    /// They are always available for conservative reader pruning and are
-    /// evaluated exactly only when Paimon row filtering is enabled.
+    /// They are used for conservative reader pruning and evaluated exactly by
+    /// this scan.
     runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
-    /// Planning-time decision that this scan evaluates `runtime_filters`
-    /// exactly. Stored on the plan so execution cannot observe a different
-    /// session setting after the parent FilterExec has been removed.
-    apply_row_filter: bool,
 }
 
 impl PaimonTableScan {
@@ -586,7 +635,6 @@ impl PaimonTableScan {
             pushed_variants,
             case_sensitive,
             runtime_filters: Vec::new(),
-            apply_row_filter: false,
         }
     }
 
@@ -688,7 +736,7 @@ impl ExecutionPlan for PaimonTableScan {
         &self,
         _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
-        config: &ConfigOptions,
+        _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         let filters = child_pushdown_result
             .parent_filters
@@ -702,21 +750,15 @@ impl ExecutionPlan for PaimonTableScan {
         }
 
         let schema = self.schema();
-        let apply_row_filter = scan_applies_row_filter(config);
         let mut accepted = Vec::new();
         let parent_filter_handled = filters
             .into_iter()
             .map(|filter| {
                 if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
                     accepted.push(filter);
-                    // `PushedDown` reports whether this scan evaluates the predicate
-                    // exactly so the parent FilterExec can be removed. The predicate is
-                    // retained above for pruning regardless of this result.
-                    if apply_row_filter {
-                        PushedDown::Yes
-                    } else {
-                        PushedDown::No
-                    }
+                    // This scan evaluates accepted expressions exactly, so the
+                    // parent FilterExec can be removed.
+                    PushedDown::Yes
                 } else {
                     PushedDown::No
                 }
@@ -730,7 +772,6 @@ impl ExecutionPlan for PaimonTableScan {
 
         let mut scan = self.clone();
         scan.runtime_filters.extend(accepted);
-        scan.apply_row_filter = apply_row_filter;
         Ok(
             FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
                 .with_updated_node(Arc::new(scan)),
@@ -755,7 +796,6 @@ impl ExecutionPlan for PaimonTableScan {
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
-        let apply_row_filter = self.apply_row_filter;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -773,39 +813,42 @@ impl ExecutionPlan for PaimonTableScan {
                 runtime_filter_wait_timeout(estimated_rows),
             )
             .await;
-            let read_predicate = match (pushed_predicate, runtime_pruning) {
-                (Some(pushed), Some(runtime)) => Some(Predicate::and(vec![pushed, runtime])),
-                (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
-                (None, None) => None,
-            };
-            if let Some(filter) = read_predicate {
+            if let Some(filter) = pushed_predicate {
                 read_builder.with_filter(filter);
             }
 
-            let read = read_builder
-                .new_read()
-                .map_err(to_datafusion_error)?
-                .with_row_filter(apply_row_filter);
+            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
+            if let Some(predicate) = runtime_pruning {
+                read = read.with_pruning_filter(predicate);
+            }
+            if !runtime_filters.is_empty() {
+                let predicate = conjunction(runtime_filters.iter().cloned());
+                read = read.with_parquet_row_filter_factory(Arc::new(
+                    DataFusionParquetRowFilterFactory::new(predicate, Arc::clone(&schema)),
+                ));
+            }
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
                 let mut batch = result
                     .map_err(to_datafusion_error)
                     .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
-                if apply_row_filter {
-                    for filter in &runtime_filters {
-                        let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
-                        let predicate = predicate
-                            .as_any()
-                            .downcast_ref::<BooleanArray>()
-                            .ok_or_else(|| {
-                                datafusion::error::DataFusionError::Execution(format!(
-                                    "Paimon runtime filter must return Boolean, got {}",
-                                    predicate.data_type()
-                                ))
-                            })?;
-                        batch = filter_record_batch(&batch, predicate)?;
-                    }
+                // The decoder hook is an optimization and may be unavailable
+                // for a file/path. Retain every original live expression as
+                // the exact fallback; evaluating it on decoder survivors is
+                // idempotent.
+                for filter in &runtime_filters {
+                    let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
+                    let predicate = predicate
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution(format!(
+                                "Paimon runtime filter must return Boolean, got {}",
+                                predicate.data_type()
+                            ))
+                        })?;
+                    batch = filter_record_batch(&batch, predicate)?;
                 }
                 Ok(batch)
             });
@@ -917,7 +960,6 @@ impl DisplayAs for PaimonTableScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PaimonConfig;
     mod test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_utils.rs"));
     }
@@ -1326,7 +1368,41 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reports_filter_handled_when_row_filter_is_enabled() {
+    fn test_scan_pushes_dynamic_filter_into_scan() {
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+        let dynamic_filter: Arc<dyn PhysicalExpr> =
+            Arc::new(DynamicFilterPhysicalExpr::new(Vec::new(), lit(true)));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter: dynamic_filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::Yes]));
+        assert!(result.updated_node.is_some());
+    }
+
+    #[test]
+    fn test_scan_reports_supported_filter_as_handled() {
         let scan = PaimonTableScan::new(
             test_schema(),
             dummy_table(),
@@ -1344,11 +1420,6 @@ mod tests {
             Operator::Gt,
             lit(1_i32),
         ));
-        let mut paimon_config = PaimonConfig::default();
-        paimon_config.read.row_filter = true;
-        let mut config = ConfigOptions::default();
-        config.extensions.insert(paimon_config);
-
         let result = scan
             .handle_child_pushdown_result(
                 FilterPushdownPhase::Post,
@@ -1359,12 +1430,92 @@ mod tests {
                     }],
                     self_filters: Vec::new(),
                 },
-                &config,
+                &ConfigOptions::default(),
             )
             .unwrap();
 
         assert!(matches!(result.filters.as_slice(), [PushedDown::Yes]));
         assert!(result.updated_node.is_some());
+    }
+
+    #[test]
+    fn test_datafusion_factory_builds_parquet_decoder_filter() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tempdir = tempdir().unwrap();
+        let parquet_path = tempdir.path().join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3])], None);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&parquet_path).unwrap())
+                .unwrap();
+        let file_schema = Arc::clone(builder.schema());
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let factory = DataFusionParquetRowFilterFactory::new(predicate, test_schema());
+
+        let row_filter = paimon::arrow::ParquetRowFilterFactory::create(
+            &factory,
+            paimon::arrow::ParquetRowFilterContext {
+                file_schema: &file_schema,
+                metadata: builder.metadata(),
+            },
+        )
+        .unwrap();
+
+        assert!(row_filter.is_some());
+    }
+
+    #[test]
+    fn test_datafusion_decoder_filter_observes_live_dynamic_update() {
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let tempdir = tempdir().unwrap();
+        let parquet_path = tempdir.path().join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3])], None);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&parquet_path).unwrap())
+                .unwrap();
+        let file_schema = Arc::clone(builder.schema());
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = dynamic.clone();
+        let factory = DataFusionParquetRowFilterFactory::new(predicate, test_schema());
+        let row_filter = paimon::arrow::ParquetRowFilterFactory::create(
+            &factory,
+            paimon::arrow::ParquetRowFilterContext {
+                file_schema: &file_schema,
+                metadata: builder.metadata(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        dynamic
+            .update(Arc::new(BinaryExpr::new(
+                column,
+                Operator::GtEq,
+                lit(2_i32),
+            )))
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            test_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut predicates = row_filter.into_predicates();
+        let mask = predicates[0].evaluate(batch).unwrap();
+
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(true)]
+        );
     }
 
     #[test]
@@ -1386,11 +1537,6 @@ mod tests {
             Operator::Gt,
             lit(1_i32),
         ));
-        let mut paimon_config = PaimonConfig::default();
-        paimon_config.read.row_filter = true;
-        let mut config = ConfigOptions::default();
-        config.extensions.insert(paimon_config);
-
         let result = scan
             .handle_child_pushdown_result(
                 FilterPushdownPhase::Post,
@@ -1401,7 +1547,7 @@ mod tests {
                     }],
                     self_filters: Vec::new(),
                 },
-                &config,
+                &ConfigOptions::default(),
             )
             .unwrap();
 
@@ -1410,7 +1556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_uses_retained_runtime_filter_for_pruning_only() {
+    async fn test_scan_applies_retained_runtime_filter_by_default() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -1462,44 +1608,7 @@ mod tests {
             Operator::Gt,
             lit(2_i32),
         ));
-        let pruning_result = scan
-            .handle_child_pushdown_result(
-                FilterPushdownPhase::Post,
-                ChildPushdownResult {
-                    parent_filters: vec![ChildFilterPushdownResult {
-                        filter: Arc::clone(&filter),
-                        child_results: Vec::new(),
-                    }],
-                    self_filters: Vec::new(),
-                },
-                &ConfigOptions::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            pruning_result.filters.as_slice(),
-            [PushedDown::No]
-        ));
-        let pruning_scan = pruning_result.updated_node.unwrap();
-        let ctx = SessionContext::new();
-        let batches = pruning_scan
-            .execute(0, ctx.task_ctx())
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let ids = collect_ids(&batches);
-
-        assert_eq!(
-            ids,
-            vec![1, 2, 3, 4, 5],
-            "unsupported physical filters may prune row groups but must not remove rows"
-        );
-
-        let mut paimon_config = PaimonConfig::default();
-        paimon_config.read.row_filter = true;
-        let mut exact_config = ConfigOptions::default();
-        exact_config.extensions.insert(paimon_config);
-        let exact_result = scan
+        let result = scan
             .handle_child_pushdown_result(
                 FilterPushdownPhase::Post,
                 ChildPushdownResult {
@@ -1509,21 +1618,19 @@ mod tests {
                     }],
                     self_filters: Vec::new(),
                 },
-                &exact_config,
+                &ConfigOptions::default(),
             )
             .unwrap();
-        assert!(matches!(exact_result.filters.as_slice(), [PushedDown::Yes]));
+        assert!(matches!(result.filters.as_slice(), [PushedDown::Yes]));
 
-        // Execution deliberately uses the default context. The scan must honor
-        // the planning-time decision that allowed the parent FilterExec to be removed.
-        let exact_scan = exact_result.updated_node.unwrap();
-        let exact_batches = exact_scan
+        let filtered_scan = result.updated_node.unwrap();
+        let batches = filtered_scan
             .execute(0, SessionContext::new().task_ctx())
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(collect_ids(&exact_batches), vec![3, 4, 5]);
+        assert_eq!(collect_ids(&batches), vec![3, 4, 5]);
     }
 
     fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
@@ -1642,7 +1749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_uses_pushed_filter_only_for_pruning_by_default() {
+    async fn test_execute_applies_pushed_filter_by_default() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -1726,7 +1833,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(actual_ids, vec![1, 2, 3, 4]);
+        assert_eq!(actual_ids, vec![2, 3, 4]);
     }
 
     #[tokio::test]

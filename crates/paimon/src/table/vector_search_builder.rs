@@ -548,7 +548,8 @@ impl<'a> VectorSearchBuilder<'a> {
             Some(filter) => {
                 let file_predicates = FilePredicates {
                     predicates: vec![filter.clone()],
-                    apply_row_filter: true,
+                    pruning_predicates: Vec::new(),
+                    row_filter_factory: None,
                     file_fields: self.table.schema().fields().to_vec(),
                 };
                 let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
@@ -5096,7 +5097,8 @@ mod residual_positions_tests {
             .unwrap();
         FilePredicates {
             predicates: vec![pred],
-            apply_row_filter: true,
+            pruning_predicates: Vec::new(),
+            row_filter_factory: None,
             file_fields: vec![id_field()],
         }
     }

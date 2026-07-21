@@ -883,7 +883,7 @@ async fn test_blob_descriptor_field_short_read_returns_error() {
 }
 
 #[tokio::test]
-async fn test_blob_descriptor_filter_before_resolve_when_pushdown_enabled() {
+async fn test_blob_descriptor_filter_before_resolve_by_default() {
     let (tmp, sql_context) = setup(
         "CREATE TABLE paimon.test_db.t (\
             id INT, \
@@ -906,8 +906,6 @@ async fn test_blob_descriptor_filter_before_resolve_when_pushdown_enabled() {
          (2, 'Kept', X'4F4B')"
     );
     exec(&sql_context, &sql).await;
-    exec(&sql_context, "SET paimon.read.row_filter = true").await;
-
     let rows = query_id_name_picture(
         &sql_context,
         "SELECT id, name, picture FROM paimon.test_db.t WHERE id = 2",

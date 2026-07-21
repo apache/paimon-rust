@@ -55,8 +55,6 @@ pub(crate) struct KeyValueFileReader {
     /// of a key survives); they are enforced by the post-merge residual
     /// filter using the full `config.predicates` instead.
     pushdown_predicates: Vec<Predicate>,
-    /// Whether predicates may remove rows before or after the key-value merge.
-    apply_row_filter: bool,
     #[cfg(test)]
     input_batch_sizes: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
 }
@@ -120,15 +118,9 @@ impl KeyValueFileReader {
             file_io,
             config,
             pushdown_predicates,
-            apply_row_filter: true,
             #[cfg(test)]
             input_batch_sizes: None,
         }
-    }
-
-    pub(crate) fn with_row_filter(mut self, apply_row_filter: bool) -> Self {
-        self.apply_row_filter = apply_row_filter;
-        self
     }
 
     #[cfg(test)]
@@ -243,7 +235,8 @@ impl KeyValueFileReader {
         let residual_file_predicates =
             (!self.config.predicates.is_empty()).then(|| crate::arrow::format::FilePredicates {
                 predicates: self.config.predicates.clone(),
-                apply_row_filter: self.apply_row_filter,
+                pruning_predicates: Vec::new(),
+                row_filter_factory: None,
                 file_fields: self.config.table_fields.clone(),
             });
         let user_fields = crate::arrow::residual::widen_scan_fields(
@@ -334,7 +327,6 @@ impl KeyValueFileReader {
         let table_options = self.config.table_options;
         let pushdown_predicates = self.pushdown_predicates;
         let residual_predicates = self.config.predicates;
-        let apply_row_filter = self.apply_row_filter;
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
@@ -378,7 +370,6 @@ impl KeyValueFileReader {
                         internal_read_type.clone(),
                         pushdown_predicates.clone(),
                     )
-                    .with_row_filter(apply_row_filter)
                     .with_batch_size(Some(read_batch_size));
 
                     let stream = reader.read_single_file_stream(
@@ -432,15 +423,15 @@ impl KeyValueFileReader {
 
                 while let Some(batch) = merge_stream.next().await {
                     let batch = batch?;
-                    // When row filtering is enabled, the post-merge residual
-                    // enforces the FULL data predicate on merged rows. PK
+                    // The post-merge residual enforces the FULL data predicate
+                    // on merged rows. PK
                     // conjuncts are also in this set (they were already pushed
                     // down pre-merge); re-evaluating them on already-matching
                     // rows is a no-op and keeps one shared evaluator instead of
                     // deriving a non-PK subset. Runs on the merge-output batch
                     // (keys + values, including widened predicate columns); the
                     // reorder below projects the output back to read_type.
-                    let batch = if !apply_row_filter || residual_predicates.is_empty() {
+                    let batch = if residual_predicates.is_empty() {
                         batch
                     } else {
                         match crate::arrow::residual::evaluate_predicates_mask(
@@ -783,42 +774,6 @@ mod tests {
 
         assert_eq!(int_column(&batches, "id"), vec![2]);
         assert_eq!(int_column(&batches, "value"), vec![21]);
-    }
-
-    #[tokio::test]
-    async fn kv_read_row_filter_disabled_keeps_merged_rows() {
-        let file_io = test_file_io();
-        let table_path = "memory:/kv_pruning_only";
-        setup_dirs(&file_io, table_path).await;
-        let table = pk_table(&file_io, table_path, &[]);
-
-        write_commit(
-            &table,
-            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
-        )
-        .await;
-        write_commit(
-            &table,
-            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
-        )
-        .await;
-
-        let filter = PredicateBuilder::new(table.schema().fields())
-            .equal("value", Datum::Int(21))
-            .unwrap();
-        let mut builder = table.new_read_builder();
-        builder.with_filter(filter);
-        let plan = builder.new_scan().plan().await.unwrap();
-        let read = builder.new_read().unwrap().with_row_filter(false);
-        let batches = read
-            .to_arrow(plan.splits())
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
-        assert_eq!(int_column(&batches, "value"), vec![11, 21, 31]);
     }
 
     /// Gap-A: the predicate column is NOT in the projection. The merge read

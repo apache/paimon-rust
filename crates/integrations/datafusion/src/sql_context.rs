@@ -106,10 +106,7 @@ impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
         let state = SessionStateBuilder::new()
-            .with_config(
-                crate::lateral_vector_search::session_config()
-                    .with_option_extension(crate::config::PaimonConfig::default()),
-            )
+            .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_relation_planners(vec![Arc::new(
                 crate::relation_planner::PaimonRelationPlanner::new(),
@@ -415,9 +412,6 @@ impl SQLContext {
             }) => {
                 let key = variable.to_string();
                 let key = key.trim_matches('\'').trim_matches('"');
-                if key == crate::config::PAIMON_ROW_FILTER {
-                    return self.ctx.sql(sql).await;
-                }
                 if let Some(paimon_key) = key.strip_prefix("paimon.") {
                     let value = values
                         .first()
@@ -441,9 +435,6 @@ impl SQLContext {
             }) => {
                 let key = name.to_string();
                 let key = key.trim_matches('\'').trim_matches('"');
-                if key == crate::config::PAIMON_ROW_FILTER {
-                    return self.ctx.sql("SET paimon.read.row_filter = false").await;
-                }
                 if let Some(paimon_key) = key.strip_prefix("paimon.") {
                     self.dynamic_options.write().unwrap().remove(paimon_key);
                     return ok_result(&self.ctx);
@@ -6579,50 +6570,6 @@ mod tests {
             .await;
         let opts = sql_context.dynamic_options().read().unwrap();
         assert!(opts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_set_paimon_read_option_delegates_to_session_config() {
-        let catalog = Arc::new(MockCatalog::new());
-        let sql_context = make_sql_context(catalog).await;
-
-        sql_context
-            .sql("SET paimon.read.row_filter = true")
-            .await
-            .unwrap();
-
-        let state = sql_context.ctx().state();
-        let config = state
-            .config_options()
-            .extensions
-            .get::<crate::config::PaimonConfig>()
-            .unwrap();
-        assert!(config.read.row_filter);
-        assert!(sql_context.dynamic_options().read().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_reset_paimon_read_option_delegates_to_session_config() {
-        let catalog = Arc::new(MockCatalog::new());
-        let sql_context = make_sql_context(catalog).await;
-
-        sql_context
-            .sql("SET paimon.read.row_filter = true")
-            .await
-            .unwrap();
-        sql_context
-            .sql("RESET paimon.read.row_filter")
-            .await
-            .unwrap();
-
-        let state = sql_context.ctx().state();
-        let config = state
-            .config_options()
-            .extensions
-            .get::<crate::config::PaimonConfig>()
-            .unwrap();
-        assert!(!config.read.row_filter);
-        assert!(sql_context.dynamic_options().read().unwrap().is_empty());
     }
 
     #[tokio::test]

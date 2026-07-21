@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkRuntimeConfig {
     pub target_partitions: usize,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
     #[serde(default)]
     pub parquet_pushdown_filters: bool,
     pub memory_limit_bytes: Option<usize>,
@@ -41,12 +43,17 @@ impl Default for BenchmarkRuntimeConfig {
             target_partitions: std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(1),
+            batch_size: default_batch_size(),
             parquet_pushdown_filters: false,
             memory_limit_bytes: None,
             spill_dir: None,
             max_spill_bytes: None,
         }
     }
+}
+
+fn default_batch_size() -> usize {
+    8192
 }
 
 pub fn build_sql_context(config: &BenchmarkRuntimeConfig) -> DataFusionResult<SQLContext> {
@@ -66,7 +73,8 @@ pub fn build_sql_context(config: &BenchmarkRuntimeConfig) -> DataFusionResult<SQ
     let mut session_config = current_state
         .config()
         .clone()
-        .with_target_partitions(config.target_partitions.max(1));
+        .with_target_partitions(config.target_partitions.max(1))
+        .with_batch_size(config.batch_size.max(1));
     session_config
         .options_mut()
         .execution
@@ -100,6 +108,13 @@ pub async fn open_catalog_session(
     let mut sql = build_sql_context(runtime_config)?;
     sql.register_catalog_with_default_db("paimon", catalog.clone(), Some(database))
         .await?;
+    // Keep decoder batch boundaries identical for Parquet and Paimon. Paimon
+    // retains Java's table default, so use its supported session override.
+    sql.sql(&format!(
+        "SET 'paimon.read.batch-size' = '{}'",
+        runtime_config.batch_size
+    ))
+    .await?;
     Ok(CatalogSession {
         sql,
         catalog,

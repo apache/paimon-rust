@@ -113,6 +113,9 @@ pub struct RuntimeArgs {
     /// DataFusion execution partitions. Defaults to available CPUs.
     #[arg(long)]
     pub target_partitions: Option<usize>,
+    /// Record batch size used by both DataFusion and Paimon file readers.
+    #[arg(long, default_value_t = 8192)]
+    pub batch_size: usize,
     /// Evaluate pushed filters during Parquet scans, in addition to statistics pruning.
     #[arg(long)]
     pub parquet_pushdown_filters: bool,
@@ -129,12 +132,16 @@ pub struct RuntimeArgs {
 
 impl RuntimeArgs {
     pub fn to_config(&self) -> Result<BenchmarkRuntimeConfig, String> {
+        if self.batch_size == 0 {
+            return Err("--batch-size must be greater than zero".to_string());
+        }
         let defaults = BenchmarkRuntimeConfig::default();
         Ok(BenchmarkRuntimeConfig {
             target_partitions: self
                 .target_partitions
                 .unwrap_or(defaults.target_partitions)
                 .max(1),
+            batch_size: self.batch_size,
             parquet_pushdown_filters: self.parquet_pushdown_filters,
             memory_limit_bytes: self.memory_limit_gib.map(gib_to_usize).transpose()?,
             spill_dir: self.spill_dir.clone(),
