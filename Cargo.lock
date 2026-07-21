@@ -4426,6 +4426,7 @@ dependencies = [
  "hmac 0.12.1",
  "indexmap 2.14.0",
  "libloading 0.9.0",
+ "log",
  "lz4_flex 0.11.6",
  "md-5 0.10.6",
  "opendal-core",
