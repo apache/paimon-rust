@@ -2064,7 +2064,7 @@ mod tests {
         // reachable through the C entry point (OOM risk). Must error, not
         // allocate.
         let count: i32 = 8000;
-        let bitmap_len = ((count as usize) + 7) / 8; // 1000 bytes
+        let bitmap_len = (count as usize).div_ceil(8); // 1000 bytes
         let mut buf = Vec::with_capacity(4 + bitmap_len);
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend(std::iter::repeat_n(0xFFu8, bitmap_len)); // every element null
