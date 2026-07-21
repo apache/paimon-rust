@@ -4512,12 +4512,15 @@ mod tests {
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
             ("deletion-vectors.enabled", "true"),
+            // Pin the index dimension so the query vector below matches it; the
+            // up-front dimension guard runs before this test's residual guard.
+            ("fields.embedding.dimension", "4"),
         ]);
         let filter = id_gt_filter(&table, 2);
         let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
-            .with_query_vector(vec![1.0])
+            .with_query_vector(vec![1.0; 4])
             .with_limit(5)
             .with_filter(filter)
             .execute_read()
@@ -4939,6 +4942,10 @@ mod tests {
             ("pk-vector.index.columns", "embedding"),
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
+            // Pin the index dimension so the query vector below matches it; the
+            // up-front dimension guard runs before this test's reserved-projection
+            // guard, so a mismatched query would mask the error under test.
+            ("fields.embedding.dimension", "4"),
         ]);
         for reserved in [
             ROW_ID_FIELD_NAME,
@@ -4949,7 +4956,7 @@ mod tests {
             let mut builder = table.new_vector_search_builder();
             builder
                 .with_vector_column("embedding")
-                .with_query_vector(vec![1.0])
+                .with_query_vector(vec![1.0; 4])
                 .with_limit(5)
                 .with_projection(&["id", reserved]);
             let err = builder
