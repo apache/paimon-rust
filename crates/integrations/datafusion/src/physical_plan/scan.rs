@@ -29,11 +29,15 @@ use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+};
 use datafusion::physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns, split_conjunction,
 };
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
 };
@@ -44,11 +48,12 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
+use crate::filter_pushdown::scalar_to_datum;
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -184,6 +189,319 @@ fn datafusion_row_filter_arrow_error(error: datafusion::arrow::error::ArrowError
     paimon::Error::UnexpectedError {
         message: format!("failed to project DataFusion row filter columns: {error}"),
         source: Some(Box::new(error)),
+    }
+}
+
+fn paimon_predicate_covers_filter(
+    pushed_predicate: Option<&Predicate>,
+    filter: &Arc<dyn PhysicalExpr>,
+    fields: &[DataField],
+    case_sensitive: bool,
+) -> bool {
+    let Some(pushed_predicate) = pushed_predicate else {
+        return false;
+    };
+    let predicate_builder = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+    let Some(candidate) =
+        translate_physical_predicate(filter.as_ref(), fields, &predicate_builder, case_sensitive)
+    else {
+        return false;
+    };
+
+    predicate_contains_conjunct(pushed_predicate, &candidate)
+}
+
+fn translate_physical_predicate(
+    expr: &dyn PhysicalExpr,
+    fields: &[DataField],
+    predicate_builder: &PredicateBuilder,
+    case_sensitive: bool,
+) -> Option<Predicate> {
+    if let Some(predicate) =
+        translate_physical_comparison(expr, fields, predicate_builder, case_sensitive)
+    {
+        return Some(predicate);
+    }
+
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), Operator::And | Operator::Or) {
+            let left = translate_physical_predicate(
+                binary.left().as_ref(),
+                fields,
+                predicate_builder,
+                case_sensitive,
+            )?;
+            let right = translate_physical_predicate(
+                binary.right().as_ref(),
+                fields,
+                predicate_builder,
+                case_sensitive,
+            )?;
+            return Some(if *binary.op() == Operator::And {
+                Predicate::and(vec![left, right])
+            } else {
+                Predicate::or(vec![left, right])
+            });
+        }
+    }
+
+    if let Some(is_null) = expr.downcast_ref::<IsNullExpr>() {
+        let field = physical_field(is_null.arg().as_ref(), fields, case_sensitive)?;
+        return predicate_builder.is_null(field.name()).ok();
+    }
+
+    if let Some(is_not_null) = expr.downcast_ref::<IsNotNullExpr>() {
+        let field = physical_field(is_not_null.arg().as_ref(), fields, case_sensitive)?;
+        return predicate_builder.is_not_null(field.name()).ok();
+    }
+
+    if let Some(not) = expr.downcast_ref::<NotExpr>() {
+        let inner = translate_physical_predicate(
+            not.arg().as_ref(),
+            fields,
+            predicate_builder,
+            case_sensitive,
+        )?;
+        return Some(Predicate::negate(inner));
+    }
+
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        let field = physical_field(in_list.expr().as_ref(), fields, case_sensitive)?;
+        let literals = in_list
+            .list()
+            .iter()
+            .map(|literal| {
+                let literal = literal.downcast_ref::<Literal>()?;
+                if literal.value().is_null() {
+                    return None;
+                }
+                scalar_to_datum(literal.value(), field.data_type())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return if in_list.negated() {
+            predicate_builder.is_not_in(field.name(), literals).ok()
+        } else {
+            predicate_builder.is_in(field.name(), literals).ok()
+        };
+    }
+
+    if let Some(like) = expr.downcast_ref::<LikeExpr>() {
+        if like.case_insensitive() {
+            return None;
+        }
+        let field = physical_field(like.expr().as_ref(), fields, case_sensitive)?;
+        let pattern = like.pattern().downcast_ref::<Literal>()?;
+        if pattern.value().is_null() {
+            return None;
+        }
+        let pattern = scalar_to_datum(pattern.value(), field.data_type())?;
+        let predicate = predicate_builder.like(field.name(), pattern, None).ok()?;
+        return Some(if like.negated() {
+            Predicate::negate(predicate)
+        } else {
+            predicate
+        });
+    }
+
+    if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
+        if function.args().len() != 2 {
+            return None;
+        }
+        let field = physical_field(function.args()[0].as_ref(), fields, case_sensitive)?;
+        let pattern = function.args()[1].downcast_ref::<Literal>()?;
+        if pattern.value().is_null() {
+            return None;
+        }
+        let pattern = scalar_to_datum(pattern.value(), field.data_type())?;
+        return match function.name() {
+            "starts_with" => predicate_builder.starts_with(field.name(), pattern).ok(),
+            "ends_with" => predicate_builder.ends_with(field.name(), pattern).ok(),
+            "contains" => predicate_builder.contains(field.name(), pattern).ok(),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn predicate_contains_conjunct(predicate: &Predicate, candidate: &Predicate) -> bool {
+    match predicate {
+        Predicate::And(children) => children
+            .iter()
+            .any(|child| predicate_contains_conjunct(child, candidate)),
+        predicate => predicate_covers_candidate(predicate, candidate),
+    }
+}
+
+fn predicate_covers_candidate(predicate: &Predicate, candidate: &Predicate) -> bool {
+    if predicate == candidate {
+        return true;
+    }
+
+    match (predicate, candidate) {
+        (
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op: PredicateOperator::Between,
+                literals,
+            },
+            Predicate::Leaf {
+                column: candidate_column,
+                index: candidate_index,
+                data_type: candidate_data_type,
+                op,
+                literals: candidate_literals,
+            },
+        ) if column == candidate_column
+            && index == candidate_index
+            && data_type == candidate_data_type
+            && literals.len() == 2
+            && candidate_literals.len() == 1 =>
+        {
+            (*op == PredicateOperator::GtEq && candidate_literals[0] == literals[0])
+                || (*op == PredicateOperator::LtEq && candidate_literals[0] == literals[1])
+        }
+        (
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op: PredicateOperator::NotBetween,
+                literals,
+            },
+            Predicate::Not(inner),
+        ) if literals.len() == 2 => {
+            let Predicate::And(children) = inner.as_ref() else {
+                return false;
+            };
+            let matches_bound = |candidate: &Predicate,
+                                 expected_op: PredicateOperator,
+                                 expected_literal: &Datum| {
+                matches!(
+                    candidate,
+                    Predicate::Leaf {
+                        column: candidate_column,
+                        index: candidate_index,
+                        data_type: candidate_data_type,
+                        op,
+                        literals: candidate_literals,
+                    } if candidate_column == column
+                        && candidate_index == index
+                        && candidate_data_type == data_type
+                        && *op == expected_op
+                        && candidate_literals.len() == 1
+                        && candidate_literals[0] == *expected_literal
+                )
+            };
+            children
+                .iter()
+                .any(|child| matches_bound(child, PredicateOperator::GtEq, &literals[0]))
+                && children
+                    .iter()
+                    .any(|child| matches_bound(child, PredicateOperator::LtEq, &literals[1]))
+        }
+        _ => false,
+    }
+}
+
+fn translate_physical_comparison(
+    expr: &dyn PhysicalExpr,
+    fields: &[DataField],
+    predicate_builder: &PredicateBuilder,
+    case_sensitive: bool,
+) -> Option<Predicate> {
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    let direct = physical_column_literal(
+        binary.left().as_ref(),
+        binary.right().as_ref(),
+        fields,
+        case_sensitive,
+    )
+    .map(|(field, datum)| (*binary.op(), field, datum));
+    let (op, field, datum) = direct.or_else(|| {
+        physical_column_literal(
+            binary.right().as_ref(),
+            binary.left().as_ref(),
+            fields,
+            case_sensitive,
+        )
+        .and_then(|(field, datum)| {
+            reverse_physical_comparison(*binary.op()).map(|op| (op, field, datum))
+        })
+    })?;
+
+    if matches!(
+        field.data_type(),
+        paimon::spec::DataType::Binary(_) | paimon::spec::DataType::VarBinary(_)
+    ) && matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    ) {
+        return None;
+    }
+
+    match op {
+        Operator::Eq => predicate_builder.equal(field.name(), datum).ok(),
+        Operator::NotEq => predicate_builder.not_equal(field.name(), datum).ok(),
+        Operator::Lt => predicate_builder.less_than(field.name(), datum).ok(),
+        Operator::LtEq => predicate_builder.less_or_equal(field.name(), datum).ok(),
+        Operator::Gt => predicate_builder.greater_than(field.name(), datum).ok(),
+        Operator::GtEq => predicate_builder.greater_or_equal(field.name(), datum).ok(),
+        _ => None,
+    }
+}
+
+fn physical_column_literal<'a>(
+    column: &dyn PhysicalExpr,
+    literal: &dyn PhysicalExpr,
+    fields: &'a [DataField],
+    case_sensitive: bool,
+) -> Option<(&'a DataField, Datum)> {
+    let literal = literal.downcast_ref::<Literal>()?;
+    if literal.value().is_null() {
+        return None;
+    }
+    let field = physical_field(column, fields, case_sensitive)?;
+    let datum = scalar_to_datum(literal.value(), field.data_type())?;
+    Some((field, datum))
+}
+
+fn physical_field<'a>(
+    expr: &dyn PhysicalExpr,
+    fields: &'a [DataField],
+    case_sensitive: bool,
+) -> Option<&'a DataField> {
+    let column = expr.downcast_ref::<Column>()?;
+    resolve_physical_field(column.name(), fields, case_sensitive)
+}
+
+fn resolve_physical_field<'a>(
+    name: &str,
+    fields: &'a [DataField],
+    case_sensitive: bool,
+) -> Option<&'a DataField> {
+    if case_sensitive {
+        fields.iter().find(|field| field.name() == name)
+    } else {
+        let mut matches = fields
+            .iter()
+            .filter(|field| field.name().eq_ignore_ascii_case(name));
+        let field = matches.next()?;
+        matches.next().is_none().then_some(field)
+    }
+}
+
+fn reverse_physical_comparison(op: Operator) -> Option<Operator> {
+    match op {
+        Operator::Eq => Some(Operator::Eq),
+        Operator::NotEq => Some(Operator::NotEq),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        _ => None,
     }
 }
 
@@ -398,9 +716,12 @@ pub struct PaimonTableScan {
     /// read path resolves names the same way the scan was planned.
     case_sensitive: bool,
     /// Physical filters retained from DataFusion's runtime filter-pushdown pass.
-    /// They are used for conservative reader pruning and evaluated exactly by
-    /// this scan.
+    /// They are evaluated exactly by this scan.
     runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Physical filters that still need the format-neutral decoder hook.
+    /// Static filters already covered by `pushed_predicate` use Paimon's native
+    /// Parquet row filter instead, avoiding duplicate decoder evaluation.
+    decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl PaimonTableScan {
@@ -435,6 +756,7 @@ impl PaimonTableScan {
             pushed_variants,
             case_sensitive,
             runtime_filters: Vec::new(),
+            decoder_filters: Vec::new(),
         }
     }
 
@@ -455,6 +777,16 @@ impl PaimonTableScan {
     #[cfg(test)]
     pub(crate) fn filter_exact(&self) -> bool {
         self.filter_exact
+    }
+
+    #[cfg(test)]
+    fn runtime_filter_count(&self) -> usize {
+        self.runtime_filters.len()
+    }
+
+    #[cfg(test)]
+    fn decoder_filter_count(&self) -> usize {
+        self.decoder_filters.len()
     }
 
     pub fn limit(&self) -> Option<usize> {
@@ -571,7 +903,22 @@ impl ExecutionPlan for PaimonTableScan {
         }
 
         let mut scan = self.clone();
-        scan.runtime_filters.extend(accepted);
+        for filter in accepted {
+            scan.decoder_filters.extend(
+                split_conjunction(&filter)
+                    .into_iter()
+                    .filter(|conjunct| {
+                        !paimon_predicate_covers_filter(
+                            self.pushed_predicate.as_ref(),
+                            conjunct,
+                            self.table.schema().fields(),
+                            self.case_sensitive,
+                        )
+                    })
+                    .cloned(),
+            );
+            scan.runtime_filters.push(filter);
+        }
         Ok(
             FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
                 .with_updated_node(Arc::new(scan)),
@@ -596,6 +943,7 @@ impl ExecutionPlan for PaimonTableScan {
         let pushed_predicate = self.pushed_predicate.clone();
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
+        let decoder_filters = self.decoder_filters.clone();
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -607,8 +955,8 @@ impl ExecutionPlan for PaimonTableScan {
             }
 
             let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-            if !runtime_filters.is_empty() {
-                let predicate = conjunction(runtime_filters.iter().cloned());
+            if !decoder_filters.is_empty() {
+                let predicate = conjunction(decoder_filters);
                 read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
                     predicate,
                     Arc::clone(&schema),
@@ -753,12 +1101,15 @@ mod tests {
 
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use datafusion::common::DFSchema;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions::{
-        lit, BinaryExpr, Column, DynamicFilterPhysicalExpr,
+        lit, BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
+        LikeExpr, NotExpr,
     };
     use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::{create_physical_expr, execution_props::ExecutionProps};
     use datafusion::physical_plan::filter_pushdown::{
         ChildFilterPushdownResult, ChildPushdownResult,
     };
@@ -769,7 +1120,7 @@ mod tests {
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
         BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
-        Schema as PaimonSchema, TableSchema,
+        Schema as PaimonSchema, TableSchema, VarCharType,
     };
     use paimon::table::{DeletionFile, RowRange, Table};
     use std::fs;
@@ -1191,6 +1542,166 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_avoids_duplicate_decoder_filter_for_paimon_predicate() {
+        let fields = test_read_type();
+        let pushed = PredicateBuilder::new(&fields)
+            .greater_than("id", Datum::Int(1))
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            fields,
+            Some(pushed),
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        let updated = result.updated_node.unwrap();
+        let updated = updated.downcast_ref::<PaimonTableScan>().unwrap();
+        assert_eq!(updated.runtime_filter_count(), 1);
+        assert_eq!(updated.decoder_filter_count(), 0);
+    }
+
+    #[test]
+    fn test_scan_keeps_dynamic_part_of_mixed_filter_in_decoder() {
+        let fields = test_read_type();
+        let pushed = PredicateBuilder::new(&fields)
+            .greater_than("id", Datum::Int(1))
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            fields,
+            Some(pushed),
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        let static_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let dynamic_filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("id", 0))],
+            lit(true),
+        ));
+        let mixed: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            static_filter,
+            Operator::And,
+            dynamic_filter,
+        ));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter: mixed,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        let updated = result.updated_node.unwrap();
+        let updated = updated.downcast_ref::<PaimonTableScan>().unwrap();
+        assert_eq!(updated.runtime_filter_count(), 1);
+        assert_eq!(updated.decoder_filter_count(), 1);
+    }
+
+    #[test]
+    fn test_scan_matches_paimon_predicate_against_full_table_schema() {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "projected"),
+            "memory:/projected".to_string(),
+            table_schema,
+            None,
+        );
+        let pushed = PredicateBuilder::new(table.schema().fields())
+            .greater_than("value", Datum::Int(1))
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "value",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            table,
+            vec![DataField::new(
+                1,
+                "value".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            Some(pushed),
+            vec![Arc::from(Vec::<DataSplit>::new())],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("value", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+        let result = scan
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter,
+                        child_results: Vec::new(),
+                    }],
+                    self_filters: Vec::new(),
+                },
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        let updated = result.updated_node.unwrap();
+        let updated = updated.downcast_ref::<PaimonTableScan>().unwrap();
+        assert_eq!(updated.decoder_filter_count(), 0);
+    }
+
+    #[test]
     fn test_datafusion_factory_builds_format_neutral_row_filter() {
         use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -1226,6 +1737,216 @@ mod tests {
         .unwrap();
         let mask = row_filters[0].evaluate(batch).unwrap();
         assert_eq!(mask, BooleanArray::from(vec![false, true, true]));
+    }
+
+    #[test]
+    fn test_paimon_predicate_covers_equivalent_static_physical_filter() {
+        let fields = test_read_type();
+        let pushed = PredicateBuilder::new(&fields)
+            .greater_than("id", Datum::Int(1))
+            .unwrap();
+        let physical: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            lit(1_i32),
+        ));
+
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &physical,
+            &fields,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_paimon_predicate_covers_null_and_in_physical_filters() {
+        let fields = test_read_type();
+        let builder = PredicateBuilder::new(&fields);
+        let pushed = Predicate::and(vec![
+            builder.is_null("id").unwrap(),
+            builder
+                .is_in("id", vec![Datum::Int(1), Datum::Int(2)])
+                .unwrap(),
+        ]);
+        let is_null: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNullExpr::new(Arc::new(Column::new("id", 0))));
+        let in_list: Arc<dyn PhysicalExpr> = Arc::new(
+            InListExpr::try_new(
+                Arc::new(Column::new("id", 0)),
+                vec![lit(1_i32), lit(2_i32)],
+                false,
+                test_schema().as_ref(),
+            )
+            .unwrap(),
+        );
+
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &is_null,
+            &fields,
+            true,
+        ));
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &in_list,
+            &fields,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_paimon_between_covers_rewritten_physical_conjuncts() {
+        let fields = test_read_type();
+        let pushed = PredicateBuilder::new(&fields)
+            .between("id", Datum::Int(1), Datum::Int(3))
+            .unwrap();
+        let physical: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::GtEq,
+                lit(1_i32),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::LtEq,
+                lit(3_i32),
+            )),
+        ));
+
+        assert!(split_conjunction(&physical).into_iter().all(|conjunct| {
+            paimon_predicate_covers_filter(Some(&pushed), conjunct, &fields, true)
+        }));
+    }
+
+    #[test]
+    fn test_paimon_predicate_covers_or_null_and_like_physical_filters() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+        let builder = PredicateBuilder::new(&fields);
+        let pushed = Predicate::and(vec![
+            Predicate::or(vec![
+                builder.less_than("id", Datum::Int(1)).unwrap(),
+                builder.greater_than("id", Datum::Int(3)).unwrap(),
+            ]),
+            builder.is_not_null("name").unwrap(),
+            builder
+                .like("name", Datum::String("ab%".to_string()), None)
+                .unwrap(),
+        ]);
+        let or_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::Lt,
+                lit(1_i32),
+            )),
+            Operator::Or,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::Gt,
+                lit(3_i32),
+            )),
+        ));
+        let is_not_null: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("name", 1))));
+        let like: Arc<dyn PhysicalExpr> = Arc::new(LikeExpr::new(
+            false,
+            false,
+            Arc::new(Column::new("name", 1)),
+            lit("ab%"),
+        ));
+
+        for filter in [or_filter, is_not_null, like] {
+            assert!(paimon_predicate_covers_filter(
+                Some(&pushed),
+                &filter,
+                &fields,
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_paimon_predicate_covers_string_function_physical_filter() {
+        let fields = vec![DataField::new(
+            0,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let pushed = PredicateBuilder::new(&fields)
+            .starts_with("name", Datum::String("ab".to_string()))
+            .unwrap();
+        let arrow_schema = ArrowSchema::new(vec![Field::new("name", ArrowDataType::Utf8, true)]);
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let logical = datafusion::functions::string::expr_fn::starts_with(
+            datafusion::logical_expr::col("name"),
+            datafusion::logical_expr::lit("ab"),
+        );
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &physical,
+            &fields,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_paimon_predicate_covers_not_physical_filter() {
+        let fields = test_read_type();
+        let pushed = Predicate::negate(
+            PredicateBuilder::new(&fields)
+                .equal("id", Datum::Int(1))
+                .unwrap(),
+        );
+        let physical: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Eq,
+            lit(1_i32),
+        ))));
+
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &physical,
+            &fields,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_paimon_not_between_covers_rewritten_physical_filter() {
+        let fields = test_read_type();
+        let pushed = PredicateBuilder::new(&fields)
+            .not_between("id", Datum::Int(1), Datum::Int(3))
+            .unwrap();
+        let physical: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::GtEq,
+                lit(1_i32),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("id", 0)),
+                Operator::LtEq,
+                lit(3_i32),
+            )),
+        ))));
+
+        assert!(paimon_predicate_covers_filter(
+            Some(&pushed),
+            &physical,
+            &fields,
+            true,
+        ));
     }
 
     #[test]

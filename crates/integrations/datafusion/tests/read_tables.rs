@@ -455,8 +455,14 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
         "Temporal predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
     );
     assert!(
-        plan_text.contains("FilterExec"),
-        "Residual filter should remain above PaimonTableScan, plan:\n{plan_text}"
+        !plan_text.contains("FilterExec"),
+        "PaimonTableScan should evaluate accepted runtime filters exactly, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("runtime_filters=[")),
+        "Residual filter should be retained by PaimonTableScan, plan:\n{plan_text}"
     );
 
     let rows = common::collect_id_name(&sql_context, timestamp_sql).await;
@@ -488,8 +494,14 @@ async fn test_temporal_filter_pushdown_via_datafusion_scan() {
         "Local zoned timestamp predicate should be pushed into PaimonTableScan, plan:\n{plan_text}"
     );
     assert!(
-        plan_text.contains("FilterExec"),
-        "Residual filter should remain above PaimonTableScan, plan:\n{plan_text}"
+        !plan_text.contains("FilterExec"),
+        "PaimonTableScan should evaluate accepted runtime filters exactly, plan:\n{plan_text}"
+    );
+    assert!(
+        scan_lines
+            .iter()
+            .any(|line| line.contains("runtime_filters=[")),
+        "Residual filter should be retained by PaimonTableScan, plan:\n{plan_text}"
     );
 
     let rows = common::collect_id_name(&sql_context, local_zoned_sql).await;
