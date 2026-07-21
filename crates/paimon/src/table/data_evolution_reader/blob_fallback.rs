@@ -20,12 +20,13 @@ use super::{
     DeletionVectorContext,
 };
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::format::blob::{BlobReadValue, IndexedBlobReader};
+use crate::arrow::format::blob::{
+    build_blob_array_batch, build_blob_batch, BlobReadValue, IndexedBlobReader,
+};
 use crate::io::FileIO;
-use crate::spec::DataField;
+use crate::spec::{DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::{DataSplit, Error};
-use arrow_array::builder::BinaryBuilder;
 use arrow_array::RecordBatch;
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -49,6 +50,7 @@ impl LazyBlobFile {
         positions: &[usize],
         file_io: &FileIO,
         blob_as_descriptor: bool,
+        array_field: bool,
     ) -> crate::Result<Vec<BlobReadValue>> {
         if self.reader.is_none() {
             let file_size = u64::try_from(self.file_size).map_err(|e| Error::DataInvalid {
@@ -88,11 +90,15 @@ impl LazyBlobFile {
             self.reader = Some(reader);
         }
 
-        self.reader
+        let reader = self
+            .reader
             .as_ref()
-            .expect("blob reader is initialized above")
-            .read_positions(positions)
-            .await
+            .expect("blob reader is initialized above");
+        if array_field {
+            reader.read_array_positions(positions).await
+        } else {
+            reader.read_positions(positions).await
+        }
     }
 
     fn release_reader(&mut self) {
@@ -109,14 +115,15 @@ pub(super) fn read(
     blob_as_descriptor: bool,
     anchor_deletion_vector: Option<DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
-    if read_fields.len() != 1 || !read_fields[0].data_type().is_blob_type() {
+    if read_fields.len() != 1 || !read_fields[0].data_type().is_blob_file_field() {
         return Err(Error::DataInvalid {
-            message: "Blob bunch should provide exactly one BLOB field".to_string(),
+            message: "Blob bunch should provide exactly one BLOB or ARRAY<BLOB> field".to_string(),
             source: None,
         });
     }
 
     let target_schema = build_target_arrow_schema(&read_fields)?;
+    let array_field = matches!(read_fields[0].data_type(), DataType::Array(_));
     let split = split.clone();
 
     Ok(try_stream! {
@@ -162,6 +169,7 @@ pub(super) fn read(
                 target_schema.clone(),
                 &file_io,
                 blob_as_descriptor,
+                array_field,
             ).await?;
         }
     }
@@ -174,6 +182,7 @@ async fn resolve_batch(
     target_schema: Arc<arrow_schema::Schema>,
     file_io: &FileIO,
     blob_as_descriptor: bool,
+    array_field: bool,
 ) -> crate::Result<RecordBatch> {
     let mut resolved = (0..row_ids.len())
         .map(|_| BlobReadValue::Placeholder)
@@ -221,7 +230,7 @@ async fn resolve_batch(
 
             if !file_positions.is_empty() {
                 let values = file
-                    .read_positions(&file_positions, file_io, blob_as_descriptor)
+                    .read_positions(&file_positions, file_io, blob_as_descriptor, array_field)
                     .await?;
                 for (output_position, value) in output_positions.into_iter().zip(values) {
                     if !matches!(&value, BlobReadValue::Placeholder) {
@@ -250,19 +259,11 @@ async fn resolve_batch(
         }
     }
 
-    let mut builder = BinaryBuilder::new();
-    for value in resolved {
-        match value {
-            BlobReadValue::Value(bytes) => builder.append_value(bytes),
-            BlobReadValue::Null | BlobReadValue::Placeholder => builder.append_null(),
-        }
+    if array_field {
+        build_blob_array_batch(&target_schema, resolved)
+    } else {
+        build_blob_batch(&target_schema, resolved)
     }
-    RecordBatch::try_new(target_schema, vec![Arc::new(builder.finish())]).map_err(|e| {
-        Error::UnexpectedError {
-            message: format!("Failed to build blob fallback RecordBatch: {e}"),
-            source: Some(Box::new(e)),
-        }
-    })
 }
 
 struct RowIdBatchCursor {
@@ -411,7 +412,7 @@ mod tests {
             VecDeque::from([oldest]),
         ];
         let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
-        let batch = resolve_batch(&mut groups, &[0, 1, 2, 3], schema, &file_io, false)
+        let batch = resolve_batch(&mut groups, &[0, 1, 2, 3], schema, &file_io, false, false)
             .await
             .unwrap();
         let values = batch

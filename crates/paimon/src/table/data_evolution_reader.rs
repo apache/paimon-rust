@@ -1704,7 +1704,7 @@ fn build_source_plan(
 
     let mut column_plan = Vec::with_capacity(read_type.len());
     for field in read_type {
-        let source_idx = if matches!(field.data_type(), DataType::Blob(_))
+        let source_idx = if field.data_type().is_blob_file_field()
             && !blob_descriptor_fields.contains(field.name())
         {
             blob_source_indices.get(&field.id()).copied()
@@ -2275,12 +2275,13 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryRow, BlobType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema,
-        VectorType,
+        ArrayType, BinaryRow, BlobType, Datum, FloatType, IntType, PredicateBuilder, Schema,
+        TableSchema, VectorType,
     };
     use crate::table::{DataSplitBuilder, DeletionFile, Table, TableRead};
     use arrow_array::{
-        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
+        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
+        RecordBatch,
     };
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -3289,6 +3290,243 @@ mod tests {
                 Some(Vec::new()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_table_read_merges_java_array_blob_file() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let blob_path = bucket_dir.join("payloads.blob");
+        copy_blob_fixture("blob-array.blob", &blob_path);
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "payloads",
+                    DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+                )
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "blob_array_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    4,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "payloads.blob",
+                    0,
+                    4,
+                    1,
+                    blob_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payloads"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3, 4]);
+        assert_eq!(
+            collect_blob_array_values(&batches, "payloads"),
+            vec![
+                Some(vec![Some(b"hello".to_vec()), None, Some(b"world".to_vec())]),
+                None,
+                None,
+                Some(Vec::new()),
+            ]
+        );
+
+        let descriptor_table = table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            "true".to_string(),
+        )]));
+        let descriptor_read = TableRead::new(
+            &descriptor_table,
+            descriptor_table.schema().fields().to_vec(),
+            Vec::new(),
+        );
+        let descriptor_batches = descriptor_read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let descriptor_rows = collect_blob_array_values(&descriptor_batches, "payloads");
+        let first = descriptor_rows[0].as_ref().unwrap();
+        let hello = BlobDescriptor::deserialize(first[0].as_deref().unwrap()).unwrap();
+        let world = BlobDescriptor::deserialize(first[2].as_deref().unwrap()).unwrap();
+        assert!(hello.uri().ends_with("payloads.blob"));
+        assert_eq!((hello.offset(), hello.length()), (13, 5));
+        assert_eq!((world.offset(), world.length()), (18, 5));
+        assert_eq!(descriptor_rows[1], None);
+        assert_eq!(descriptor_rows[2], None);
+        assert_eq!(descriptor_rows[3], Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn test_table_read_falls_back_across_array_blob_sequence_groups() {
+        use BlobFixtureValue::{Null, Placeholder, Value};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let old_0 = build_blob_array_payload(&[Some(&b"old-0"[..]), None]);
+        let old_1 = build_blob_array_payload(&[Some(&b"old-1"[..])]);
+        let old_2 = build_blob_array_payload(&[Some(&b"old-2"[..])]);
+        let empty = build_blob_array_payload(&[]);
+        let new_2 = build_blob_array_payload(&[Some(&b"new-2"[..])]);
+
+        let base_path = bucket_dir.join("array-base.blob");
+        write_blob_file_with_values(
+            &base_path,
+            &[Value(&old_0), Value(&old_1), Value(&old_2), Value(&empty)],
+        );
+        let latest_path = bucket_dir.join("array-latest.blob");
+        write_blob_file_with_values(
+            &latest_path,
+            &[Placeholder, Null, Value(&new_2), Placeholder],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "payloads",
+                    DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+                )
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "blob_array_fallback_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    4,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "array-base.blob",
+                    0,
+                    4,
+                    1,
+                    base_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payloads"]),
+                ),
+                data_file_meta_with_path(
+                    "array-latest.blob",
+                    0,
+                    4,
+                    2,
+                    latest_path.metadata().unwrap().len() as i64,
+                    Some(vec!["payloads"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_blob_array_values(&batches, "payloads"),
+            vec![
+                Some(vec![Some(b"old-0".to_vec()), None]),
+                None,
+                Some(vec![Some(b"new-2".to_vec())]),
+                Some(Vec::new()),
+            ]
+        );
+
+        let descriptor_table = table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            "true".to_string(),
+        )]));
+        let descriptor_read = TableRead::new(
+            &descriptor_table,
+            descriptor_table.schema().fields().to_vec(),
+            Vec::new(),
+        );
+        let descriptor_batches = descriptor_read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let descriptor_rows = collect_blob_array_values(&descriptor_batches, "payloads");
+        let old_0 = descriptor_rows[0].as_ref().unwrap();
+        let old_0 = BlobDescriptor::deserialize(old_0[0].as_deref().unwrap()).unwrap();
+        let new_2 = descriptor_rows[2].as_ref().unwrap();
+        let new_2 = BlobDescriptor::deserialize(new_2[0].as_deref().unwrap()).unwrap();
+        assert!(old_0.uri().ends_with("array-base.blob"));
+        assert_eq!(descriptor_rows[0].as_ref().unwrap()[1], None);
+        assert_eq!(descriptor_rows[1], None);
+        assert!(new_2.uri().ends_with("array-latest.blob"));
+        assert_eq!(descriptor_rows[3], Some(Vec::new()));
     }
 
     #[tokio::test]
@@ -5037,6 +5275,60 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    fn collect_blob_array_values(
+        batches: &[RecordBatch],
+        column_name: &str,
+    ) -> Vec<Option<Vec<Option<Vec<u8>>>>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let idx = batch.schema().index_of(column_name).unwrap();
+                let array = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                (0..array.len())
+                    .map(|row| {
+                        if array.is_null(row) {
+                            return None;
+                        }
+                        let values = array.value(row);
+                        let values = values.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        Some(
+                            (0..values.len())
+                                .map(|idx| {
+                                    (!values.is_null(idx)).then(|| values.value(idx).to_vec())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn build_blob_array_payload(elements: &[Option<&[u8]>]) -> Vec<u8> {
+        const ARRAY_MAGIC_NUMBER: i32 = 1094861634;
+        const ARRAY_VERSION: u8 = 1;
+
+        let lengths = elements
+            .iter()
+            .map(|element| element.map_or(-1, |bytes| bytes.len() as i64))
+            .collect::<Vec<_>>();
+        let index = blob_test_utils::encode_delta_varints(&lengths);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&ARRAY_MAGIC_NUMBER.to_le_bytes());
+        payload.push(ARRAY_VERSION);
+        payload.extend_from_slice(&(elements.len() as i32).to_le_bytes());
+        for bytes in elements.iter().flatten() {
+            payload.extend_from_slice(bytes);
+        }
+        payload.extend_from_slice(&index);
+        payload.extend_from_slice(&(index.len() as i32).to_le_bytes());
+        payload
     }
 
     fn two_col_evolution_table(table_path: String) -> Table {

@@ -128,6 +128,15 @@ impl DataType {
         matches!(self, DataType::Blob(_))
     }
 
+    /// Returns whether this field is stored in a dedicated `.blob` file.
+    pub(crate) fn is_blob_file_field(&self) -> bool {
+        match self {
+            DataType::Blob(_) => true,
+            DataType::Array(array) => array.element_type().is_blob_type(),
+            _ => false,
+        }
+    }
+
     /// Returns whether this type is nullable.
     pub fn is_nullable(&self) -> bool {
         match self {
@@ -1956,6 +1965,18 @@ mod serde_utils {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_blob_file_field_classification() {
+        let blob = DataType::Blob(BlobType::new());
+        let array_blob = DataType::Array(ArrayType::new(blob.clone()));
+        let nested_array_blob = DataType::Array(ArrayType::new(array_blob.clone()));
+
+        assert!(blob.is_blob_file_field());
+        assert!(array_blob.is_blob_file_field());
+        assert!(!nested_array_blob.is_blob_file_field());
+        assert!(!DataType::Int(IntType::new()).is_blob_file_field());
+    }
 
     fn load_fixture(name: &str) -> String {
         let workdir =
