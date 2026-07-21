@@ -31,7 +31,8 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{
-    BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr,
+    Literal, NotExpr,
 };
 use datafusion::physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns, split_conjunction,
@@ -47,7 +48,7 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
@@ -209,6 +210,58 @@ fn paimon_predicate_covers_filter(
     };
 
     predicate_contains_conjunct(pushed_predicate, &candidate)
+}
+
+#[derive(Debug)]
+struct RuntimeDecoderFilterPlan {
+    paimon_predicates: Vec<Predicate>,
+    datafusion_filters: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+fn partition_runtime_decoder_filters(
+    decoder_filters: &[Arc<dyn PhysicalExpr>],
+    fields: &[DataField],
+    case_sensitive: bool,
+) -> RuntimeDecoderFilterPlan {
+    let predicate_builder = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
+    let mut plan = RuntimeDecoderFilterPlan {
+        paimon_predicates: Vec::new(),
+        datafusion_filters: Vec::new(),
+    };
+
+    for filter in decoder_filters {
+        let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() else {
+            plan.datafusion_filters.push(Arc::clone(filter));
+            continue;
+        };
+        // Join filters are complete before their probe-side scan is polled, while
+        // TopK filters evolve as the scan runs. Poll completion once so the scan
+        // never waits on a filter whose producer may depend on this same scan.
+        if dynamic.wait_complete().now_or_never().is_none() {
+            plan.datafusion_filters.push(Arc::clone(filter));
+            continue;
+        }
+        let Ok(snapshot) = dynamic.current() else {
+            plan.datafusion_filters.push(Arc::clone(filter));
+            continue;
+        };
+        // Only split top-level ANDs. Pulling a supported child out of OR, CASE,
+        // or another compound expression would strengthen the filter unsafely.
+        for conjunct in split_conjunction(&snapshot) {
+            if let Some(predicate) = translate_physical_predicate(
+                conjunct.as_ref(),
+                fields,
+                &predicate_builder,
+                case_sensitive,
+            ) {
+                plan.paimon_predicates.push(predicate);
+            } else {
+                plan.datafusion_filters.push(Arc::clone(conjunct));
+            }
+        }
+    }
+
+    plan
 }
 
 fn translate_physical_predicate(
@@ -947,16 +1000,23 @@ impl ExecutionPlan for PaimonTableScan {
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
+            let runtime_filter_plan = partition_runtime_decoder_filters(
+                &decoder_filters,
+                table.schema().fields(),
+                case_sensitive,
+            );
+            let mut paimon_predicates = pushed_predicate.into_iter().collect::<Vec<_>>();
+            paimon_predicates.extend(runtime_filter_plan.paimon_predicates);
 
             read_builder.with_case_sensitive(case_sensitive);
             read_builder.with_read_type(read_type);
-            if let Some(filter) = pushed_predicate {
-                read_builder.with_filter(filter);
+            if !paimon_predicates.is_empty() {
+                read_builder.with_filter(Predicate::and(paimon_predicates));
             }
 
             let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-            if !decoder_filters.is_empty() {
-                let predicate = conjunction(decoder_filters);
+            if !runtime_filter_plan.datafusion_filters.is_empty() {
+                let predicate = conjunction(runtime_filter_plan.datafusion_filters);
                 read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
                     predicate,
                     Arc::clone(&schema),
@@ -1993,6 +2053,104 @@ mod tests {
         assert_eq!(
             mask.iter().collect::<Vec<_>>(),
             vec![Some(false), Some(true), Some(true)]
+        );
+    }
+
+    #[test]
+    fn test_completed_dynamic_filter_moves_supported_snapshot_to_paimon() {
+        let fields = test_read_type();
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let comparison: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::GtEq,
+            lit(2_i32),
+        ));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
+        dynamic.update(Arc::clone(&comparison)).unwrap();
+        dynamic.mark_complete();
+        let decoder_filter: Arc<dyn PhysicalExpr> = dynamic;
+
+        let plan = partition_runtime_decoder_filters(&[decoder_filter], &fields, true);
+
+        assert_eq!(plan.paimon_predicates.len(), 1);
+        assert!(plan.datafusion_filters.is_empty());
+        assert!(paimon_predicate_covers_filter(
+            plan.paimon_predicates.first(),
+            &comparison,
+            &fields,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_incomplete_dynamic_filter_stays_live_in_datafusion() {
+        let fields = test_read_type();
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            lit(true),
+        ));
+        dynamic
+            .update(Arc::new(BinaryExpr::new(
+                column,
+                Operator::GtEq,
+                lit(2_i32),
+            )))
+            .unwrap();
+        let decoder_filter: Arc<dyn PhysicalExpr> = dynamic;
+
+        let plan =
+            partition_runtime_decoder_filters(std::slice::from_ref(&decoder_filter), &fields, true);
+
+        assert!(plan.paimon_predicates.is_empty());
+        assert_eq!(plan.datafusion_filters.len(), 1);
+        assert!(Arc::ptr_eq(
+            plan.datafusion_filters.first().unwrap(),
+            &decoder_filter
+        ));
+    }
+
+    #[test]
+    fn test_completed_dynamic_filter_splits_native_and_datafusion_conjuncts() {
+        let fields = test_read_type();
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let supported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::GtEq,
+            lit(2_i32),
+        ));
+        let unsupported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::Plus,
+                lit(1_i32),
+            )),
+            Operator::Gt,
+            lit(2_i32),
+        ));
+        let snapshot: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&supported),
+            Operator::And,
+            Arc::clone(&unsupported),
+        ));
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
+        dynamic.update(snapshot).unwrap();
+        dynamic.mark_complete();
+        let decoder_filter: Arc<dyn PhysicalExpr> = dynamic;
+
+        let plan = partition_runtime_decoder_filters(&[decoder_filter], &fields, true);
+
+        assert_eq!(plan.paimon_predicates.len(), 1);
+        assert_eq!(plan.datafusion_filters.len(), 1);
+        assert!(paimon_predicate_covers_filter(
+            plan.paimon_predicates.first(),
+            &supported,
+            &fields,
+            true,
+        ));
+        assert_eq!(
+            plan.datafusion_filters[0].to_string(),
+            unsupported.to_string()
         );
     }
 
