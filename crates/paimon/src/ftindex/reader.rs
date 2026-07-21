@@ -17,7 +17,7 @@
 
 //! Reader over the `paimon-ftindex-core` v1 archive format.
 
-use paimon_ftindex_core::io::SliceReader;
+use paimon_ftindex_core::io::{SeekRead, SliceReader};
 use paimon_ftindex_core::{FullTextIndexReader, FullTextSearchResult};
 use roaring::RoaringTreemap;
 
@@ -42,19 +42,22 @@ impl From<FullTextSearchResult> for FullTextHits {
 
 /// Reader over a single full-text index archive, backed by the shared
 /// `paimon-ftindex-core` engine (v1 archive format).
-pub struct FullTextArchiveReader {
-    inner: FullTextIndexReader<SliceReader>,
+///
+/// Generic over any `SeekRead` implementation, allowing both whole-file
+/// (via `SliceReader`) and streaming/range-read strategies.
+pub struct FullTextArchiveReader<R: SeekRead + 'static> {
+    inner: FullTextIndexReader<R>,
 }
 
-impl FullTextArchiveReader {
-    /// Read the whole archive from `input` into memory and open the engine
-    /// reader over it. Archives are single index files, so a whole-read keeps
-    /// peak memory at one archive.
-    pub async fn from_input_file(input: &InputFile) -> crate::Result<Self> {
-        let bytes = input.read().await?;
-        let reader =
-            FullTextIndexReader::open(SliceReader::new(bytes.to_vec())).map_err(map_ft_err)?;
-        Ok(Self { inner: reader })
+impl<R: SeekRead + 'static> FullTextArchiveReader<R> {
+    /// Open a full-text archive reader over any `SeekRead` implementation.
+    ///
+    /// Use this for streaming/range-read strategies (e.g., remote FileIO with
+    /// bounded concurrency). For convenience when reading whole files into
+    /// memory, see [`from_input_file`](Self::from_input_file).
+    pub fn from_seek_read(reader: R) -> crate::Result<Self> {
+        let inner = FullTextIndexReader::open(reader).map_err(map_ft_err)?;
+        Ok(Self { inner })
     }
 
     /// Search with a JSON DSL query (see the engine's query spec), returning up
@@ -85,6 +88,19 @@ impl FullTextArchiveReader {
             .search_with_roaring_filter(query_json, limit, &filter_bytes)
             .map(Into::into)
             .map_err(map_ft_err)
+    }
+}
+
+impl FullTextArchiveReader<SliceReader> {
+    /// Read the whole archive from `input` into memory and open the engine
+    /// reader over it. Archives are single index files, so a whole-read keeps
+    /// peak memory at one archive.
+    ///
+    /// This is a convenience wrapper over [`from_seek_read`](Self::from_seek_read)
+    /// for the common whole-file case.
+    pub async fn from_input_file(input: &InputFile) -> crate::Result<Self> {
+        let bytes = input.read().await?;
+        Self::from_seek_read(SliceReader::new(bytes.to_vec()))
     }
 }
 
