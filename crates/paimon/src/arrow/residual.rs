@@ -943,7 +943,6 @@ mod tests {
     fn file_predicates(predicates: Vec<Predicate>, file_fields: Vec<DataField>) -> FilePredicates {
         FilePredicates {
             predicates,
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields,
         }

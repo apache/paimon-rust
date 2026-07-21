@@ -235,7 +235,6 @@ impl KeyValueFileReader {
         let residual_file_predicates =
             (!self.config.predicates.is_empty()).then(|| crate::arrow::format::FilePredicates {
                 predicates: self.config.predicates.clone(),
-                pruning_predicates: Vec::new(),
                 row_filter_factory: None,
                 file_fields: self.config.table_fields.clone(),
             });

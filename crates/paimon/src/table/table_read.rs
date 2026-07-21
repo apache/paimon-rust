@@ -110,38 +110,19 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Set a predicate used only for conservative file-format pruning.
-    ///
-    /// Unlike [`Self::with_filter`], this predicate may skip whole row groups or
-    /// pages but never removes individual matching-file rows. The caller remains
-    /// responsible for exact row-level filtering.
-    pub fn with_pruning_filter(self, filter: Predicate) -> Self {
-        match self.0 {
-            TableReadKind::Paimon(read) => {
-                Self(TableReadKind::Paimon(read.with_pruning_filter(filter)))
-            }
-            TableReadKind::Format(read) => {
-                Self(TableReadKind::Format(read.with_pruning_filter(filter)))
-            }
-        }
-    }
-
     /// Attach an engine-specific Parquet decoder-filter factory.
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
     /// enforce the expression after the scan because an individual file may not
     /// be able to build a decoder filter.
-    pub fn with_parquet_row_filter_factory(
-        self,
-        factory: Arc<dyn crate::arrow::ParquetRowFilterFactory>,
-    ) -> Self {
+    pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
         match self.0 {
-            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
-                read.with_parquet_row_filter_factory(factory),
-            )),
-            TableReadKind::Format(read) => Self(TableReadKind::Format(
-                read.with_parquet_row_filter_factory(factory),
-            )),
+            TableReadKind::Paimon(read) => {
+                Self(TableReadKind::Paimon(read.with_row_filter_factory(factory)))
+            }
+            TableReadKind::Format(read) => {
+                Self(TableReadKind::Format(read.with_row_filter_factory(factory)))
+            }
         }
     }
 
@@ -193,8 +174,7 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
-    pruning_predicates: Vec<Predicate>,
-    parquet_row_filter_factory: Option<Arc<dyn crate::arrow::ParquetRowFilterFactory>>,
+    row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -208,8 +188,7 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
-            pruning_predicates: Vec::new(),
-            parquet_row_filter_factory: None,
+            row_filter_factory: None,
         }
     }
 
@@ -243,16 +222,8 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn with_pruning_filter(mut self, filter: Predicate) -> Self {
-        self.pruning_predicates = split_scan_predicates(self.table, filter).1;
-        self
-    }
-
-    fn with_parquet_row_filter_factory(
-        mut self,
-        factory: Arc<dyn crate::arrow::ParquetRowFilterFactory>,
-    ) -> Self {
-        self.parquet_row_filter_factory = Some(factory);
+    fn with_row_filter_factory(mut self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
+        self.row_filter_factory = Some(factory);
         self
     }
 
@@ -537,13 +508,12 @@ impl<'a> PaimonTableRead<'a> {
             self.data_predicates.clone(),
         )
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
-        // Metadata pruning is safe only on the plain append/raw path. This
-        // constructor is also used by raw-convertible primary-key splits, where
-        // positional merge semantics must remain untouched.
+        // The engine decoder filter is safe only on the plain append/raw path.
+        // This constructor is also used by raw-convertible primary-key splits,
+        // where positional merge semantics must remain untouched.
         if self.table.schema().primary_keys().is_empty() {
-            reader = reader.with_pruning_predicates(self.pruning_predicates.clone());
-            if let Some(factory) = &self.parquet_row_filter_factory {
-                reader = reader.with_parquet_row_filter_factory(Arc::clone(factory));
+            if let Some(factory) = &self.row_filter_factory {
+                reader = reader.with_row_filter_factory(Arc::clone(factory));
             }
         }
         Ok(reader)

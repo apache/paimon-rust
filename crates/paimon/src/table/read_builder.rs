@@ -1182,70 +1182,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_direct_table_read_with_pruning_filter_does_not_filter_rows() {
-        let tempdir = tempdir().unwrap();
-        let table_path = local_file_path(tempdir.path());
-        let bucket_dir = tempdir.path().join("bucket-0");
-        fs::create_dir_all(&bucket_dir).unwrap();
-
-        let parquet_path = bucket_dir.join("data.parquet");
-        write_int_parquet_file(
-            &parquet_path,
-            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 40, 100])],
-            Some(2),
-        );
-        let file_size = fs::metadata(&parquet_path).unwrap().len() as i64;
-
-        let file_io = FileIOBuilder::new("file").build().unwrap();
-        let table_schema = TableSchema::new(
-            0,
-            &Schema::builder()
-                .column("id", DataType::Int(IntType::new()))
-                .column("value", DataType::Int(IntType::new()))
-                .build()
-                .unwrap(),
-        );
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "t"),
-            table_path,
-            table_schema,
-            None,
-        );
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(local_file_path(&bucket_dir))
-            .with_total_buckets(1)
-            .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
-            .build()
-            .unwrap();
-        let predicate = PredicateBuilder::new(table.schema().fields())
-            .greater_than("value", crate::spec::Datum::Int(50))
-            .unwrap();
-
-        let batches = TableRead::new(&table, vec![table.schema().fields()[0].clone()], Vec::new())
-            .with_pruning_filter(predicate)
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
-    }
-
-    #[tokio::test]
-    async fn test_direct_raw_read_falls_back_when_external_parquet_row_filter_fails() {
+    async fn test_direct_raw_read_falls_back_when_external_row_filter_fails() {
         #[derive(Debug)]
         struct CountingFactory(Arc<AtomicUsize>);
 
-        impl crate::arrow::ParquetRowFilterFactory for CountingFactory {
+        impl crate::arrow::RowFilterFactory for CountingFactory {
             fn create(
                 &self,
-                _context: crate::arrow::ParquetRowFilterContext<'_>,
-            ) -> crate::Result<Option<parquet::arrow::arrow_reader::RowFilter>> {
+                _context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 Err(crate::Error::UnexpectedError {
                     message: "test decoder-filter failure".to_string(),
@@ -1289,7 +1234,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
 
         let batches = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
-            .with_parquet_row_filter_factory(Arc::new(CountingFactory(Arc::clone(&calls))))
+            .with_row_filter_factory(Arc::new(CountingFactory(Arc::clone(&calls))))
             .to_arrow(&[split])
             .unwrap()
             .try_collect::<Vec<_>>()

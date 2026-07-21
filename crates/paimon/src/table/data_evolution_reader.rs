@@ -145,7 +145,6 @@ impl DataEvolutionReader {
         // point into the table schema, so `file_fields` = `table_fields`.
         let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
             predicates: predicates.clone(),
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields: table_fields.clone(),
         });
@@ -200,17 +199,9 @@ impl DataEvolutionReader {
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
 
-            // Raw-convertible files can safely use predicates for conservative
-            // row-group/page pruning. The exact residual runs after schema
-            // evolution and `_ROW_ID` attachment, so the nested file reader
-            // receives these through its pruning-only channel. Positional row
-            // IDs cannot currently be reconciled with pruned row groups, so
-            // that projection falls back to no predicate pushdown.
-            let pruning_predicates = if self.row_id_index.is_none() {
-                self.predicates.clone()
-            } else {
-                Vec::new()
-            };
+            // The exact residual runs after schema evolution and `_ROW_ID`
+            // attachment, so the nested file reader must not receive data
+            // predicates.
             let file_reader = DataFileReader::new(
                 self.file_io.clone(),
                 self.schema_manager.clone(),
@@ -219,7 +210,6 @@ impl DataEvolutionReader {
                 self.wide_file_read_type.clone(),
                 Vec::new(),
             )
-            .with_pruning_predicates(pruning_predicates)
             .with_batch_size(self.batch_size);
 
             for split in splits {

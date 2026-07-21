@@ -38,8 +38,7 @@ pub(crate) struct FormatTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
-    pruning_predicates: Vec<Predicate>,
-    parquet_row_filter_factory: Option<Arc<dyn crate::arrow::ParquetRowFilterFactory>>,
+    row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     limit: Option<usize>,
 }
 
@@ -54,8 +53,7 @@ impl<'a> FormatTableRead<'a> {
             table,
             read_type,
             data_predicates,
-            pruning_predicates: Vec::new(),
-            parquet_row_filter_factory: None,
+            row_filter_factory: None,
             limit,
         }
     }
@@ -77,16 +75,11 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
-    pub(crate) fn with_pruning_filter(mut self, filter: Predicate) -> Self {
-        self.pruning_predicates = split_scan_predicates(self.table, filter).1;
-        self
-    }
-
-    pub(crate) fn with_parquet_row_filter_factory(
+    pub(crate) fn with_row_filter_factory(
         mut self,
-        factory: Arc<dyn crate::arrow::ParquetRowFilterFactory>,
+        factory: Arc<dyn crate::arrow::RowFilterFactory>,
     ) -> Self {
-        self.parquet_row_filter_factory = Some(factory);
+        self.row_filter_factory = Some(factory);
         self
     }
 
@@ -105,15 +98,13 @@ impl<'a> FormatTableRead<'a> {
         let table_fields = self.table.schema().fields().to_vec();
         let (data_table_fields, data_predicates) =
             split_format_table_fields(&table_fields, &partition_keys, &self.data_predicates);
-        let (_, pruning_predicates) =
-            split_format_table_fields(&table_fields, &partition_keys, &self.pruning_predicates);
         let splits = data_splits.to_vec();
         let file_io = self.table.file_io().clone();
         let schema_manager = self.table.schema_manager().clone();
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
-        let parquet_row_filter_factory = self.parquet_row_filter_factory.clone();
+        let row_filter_factory = self.row_filter_factory.clone();
 
         Ok(try_stream! {
             for split in splits {
@@ -129,10 +120,9 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
-                .with_pruning_predicates(pruning_predicates.clone())
                 .with_batch_size(batch_size);
-                if let Some(factory) = &parquet_row_filter_factory {
-                    reader = reader.with_parquet_row_filter_factory(Arc::clone(factory));
+                if let Some(factory) = &row_filter_factory {
+                    reader = reader.with_row_filter_factory(Arc::clone(factory));
                 }
                 let mut stream = reader.read(std::slice::from_ref(&split))?;
 

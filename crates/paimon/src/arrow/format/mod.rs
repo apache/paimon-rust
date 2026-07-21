@@ -28,47 +28,25 @@ mod vortex;
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
+use super::RowFilterFactory;
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use ::parquet::arrow::arrow_reader::RowFilter;
-use ::parquet::file::metadata::ParquetMetaData;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::sync::Arc;
-
-/// Per-file inputs for building an engine-specific Parquet decoder filter.
-pub struct ParquetRowFilterContext<'a> {
-    /// Physical Arrow schema decoded from this Parquet file.
-    pub file_schema: &'a SchemaRef,
-    /// Footer metadata for this Parquet file.
-    pub metadata: &'a ParquetMetaData,
-}
-
-/// Builds a fresh Parquet [`RowFilter`] for each file decoder.
-///
-/// Engine integrations can use this hook for expressions that Paimon's native
-/// [`Predicate`] cannot represent. The caller must retain an exact post-filter:
-/// this hook is an optimization and may return no filter for a particular file.
-pub trait ParquetRowFilterFactory: Debug + Send + Sync {
-    fn create(&self, context: ParquetRowFilterContext<'_>) -> crate::Result<Option<RowFilter>>;
-}
 
 /// Predicates with the file-level field context needed for pushdown.
 /// Only used by formats that support predicate pushdown (e.g. Parquet).
 pub(crate) struct FilePredicates {
     /// Predicates with indices already remapped to file-level fields.
     pub predicates: Vec<Predicate>,
-    /// Predicates used only for conservative file, row-group, or page pruning.
-    /// They must never remove individual rows from a retained unit.
-    pub pruning_predicates: Vec<Predicate>,
     /// Optional engine-specific decoder filter factory.
-    pub row_filter_factory: Option<Arc<dyn ParquetRowFilterFactory>>,
+    pub row_filter_factory: Option<Arc<dyn RowFilterFactory>>,
     /// File-level fields (full file schema), used for stats access and row filtering.
     pub file_fields: Vec<DataField>,
 }
@@ -95,9 +73,6 @@ pub(crate) trait FormatFileReader: Send + Sync {
     /// - Blob does not evaluate predicates at all; Mosaic applies only
     ///   stats-level (row-group) pruning. For those, non-matching rows may
     ///   survive and the caller must not assume exactness.
-    /// Predicates intended only for conservative file, row-group, stripe, or
-    /// page pruning must be passed through `pruning_predicates`.
-    ///
     /// `row_selection` is a pre-merged list of 0-based inclusive row ranges
     /// (DV + row_ranges already combined by the caller).
     async fn read_batch_stream(

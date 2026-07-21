@@ -16,12 +16,11 @@
 // under the License.
 
 use super::shredding::PhysicalFormatWriterFactory;
-use super::{
-    FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult, ParquetRowFilterContext,
-};
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
+use crate::arrow::{RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -36,7 +35,8 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter as ParquetRowFilter,
+    RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -53,6 +53,38 @@ use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) struct ParquetFormatReader;
+
+struct ParquetRowFilterPredicate {
+    inner: Box<dyn RowFilter>,
+    projection: ProjectionMask,
+}
+
+impl ArrowPredicate for ParquetRowFilterPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, arrow_schema::ArrowError> {
+        self.inner.evaluate(batch)
+    }
+}
+
+fn row_filter_required_bytes(
+    projection: &ProjectionMask,
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    metadata: &ParquetMetaData,
+) -> usize {
+    (0..parquet_schema.num_columns())
+        .filter(|leaf_index| projection.leaf_included(*leaf_index))
+        .flat_map(|leaf_index| {
+            metadata
+                .row_groups()
+                .iter()
+                .map(move |row_group| row_group.column(leaf_index).compressed_size())
+        })
+        .filter_map(|size| usize::try_from(size).ok())
+        .fold(0, usize::saturating_add)
+}
 
 /// Parquet implementation of [`FormatFileWriter`].
 /// Streams data directly to storage via `AsyncArrowWriter` + opendal.
@@ -272,16 +304,10 @@ impl FormatFileReader for ParquetFormatReader {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
         let empty_predicates = Vec::new();
-        let (preds, pruning_only_preds, file_fields): (&[Predicate], &[Predicate], &[DataField]) =
-            match predicates {
-                Some(fp) => (&fp.predicates, &fp.pruning_predicates, &fp.file_fields),
-                None => (&empty_predicates, &empty_predicates, &[]),
-            };
-        let pruning_preds = preds
-            .iter()
-            .chain(pruning_only_preds)
-            .cloned()
-            .collect::<Vec<_>>();
+        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
+            Some(fp) => (&fp.predicates, &fp.file_fields),
+            None => (&empty_predicates, &[]),
+        };
         let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
 
         // Only load the Parquet page index (ColumnIndex + OffsetIndex) when a
@@ -293,7 +319,7 @@ impl FormatFileReader for ParquetFormatReader {
         // skip it. `Optional` lets files without a page index fall through to
         // row-group-level pruning instead of erroring.
         let mut arrow_options = ArrowReaderOptions::new();
-        if !pruning_preds.is_empty() {
+        if !preds.is_empty() {
             arrow_options = arrow_options.with_page_index_policy(PageIndexPolicy::Optional);
         }
         let mut batch_stream_builder =
@@ -341,17 +367,53 @@ impl FormatFileReader for ParquetFormatReader {
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
         let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
-            .map(RowFilter::into_predicates)
+            .map(ParquetRowFilter::into_predicates)
             .unwrap_or_default();
 
         if let Some(factory) = row_filter_factory {
             let file_schema = batch_stream_builder.schema();
-            match factory.create(ParquetRowFilterContext {
-                file_schema,
-                metadata: batch_stream_builder.metadata(),
-            }) {
-                Ok(Some(filter)) => decoder_predicates.extend(filter.into_predicates()),
-                Ok(None) => {}
+            match factory.create(RowFilterContext { file_schema }) {
+                Ok(filters) => {
+                    let mut external_predicates = Vec::with_capacity(filters.len());
+                    for filter in filters {
+                        let root_indices = filter
+                            .projection()
+                            .fields()
+                            .iter()
+                            .map(|field| file_schema.index_of(field.name()))
+                            .collect::<Result<Vec<_>, _>>();
+                        let mut root_indices = match root_indices {
+                            Ok(indices) => indices,
+                            Err(error) => {
+                                log::warn!(
+                                    "external row-filter projection does not match Parquet schema: {error}"
+                                );
+                                continue;
+                            }
+                        };
+                        root_indices.sort_unstable();
+                        root_indices.dedup();
+                        let projection = ProjectionMask::roots(&parquet_schema, root_indices);
+                        let required_bytes = row_filter_required_bytes(
+                            &projection,
+                            &parquet_schema,
+                            batch_stream_builder.metadata(),
+                        );
+                        external_predicates.push((
+                            required_bytes,
+                            ParquetRowFilterPredicate {
+                                inner: filter,
+                                projection,
+                            },
+                        ));
+                    }
+                    external_predicates.sort_by_key(|(required_bytes, _)| *required_bytes);
+                    decoder_predicates.extend(
+                        external_predicates
+                            .into_iter()
+                            .map(|(_, predicate)| Box::new(predicate) as Box<dyn ArrowPredicate>),
+                    );
+                }
                 Err(error) => {
                     // The hook is an optimization. The integration keeps its
                     // exact post-filter, so a per-file adaptation failure is
@@ -363,12 +425,12 @@ impl FormatFileReader for ParquetFormatReader {
 
         if !decoder_predicates.is_empty() {
             batch_stream_builder =
-                batch_stream_builder.with_row_filter(RowFilter::new(decoder_predicates));
+                batch_stream_builder.with_row_filter(ParquetRowFilter::new(decoder_predicates));
         }
 
         let predicate_row_selection = build_predicate_row_selection(
             batch_stream_builder.metadata().row_groups(),
-            &pruning_preds,
+            preds,
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
@@ -376,11 +438,8 @@ impl FormatFileReader for ParquetFormatReader {
         // Page-level selection. Returns `None` when ColumnIndex / OffsetIndex are
         // absent (page index not loaded, older files, writer without page index)
         // or when no page could be skipped, so intersecting is a no-op then.
-        let page_selection = build_predicate_page_selection(
-            batch_stream_builder.metadata(),
-            &pruning_preds,
-            file_fields,
-        )?;
+        let page_selection =
+            build_predicate_page_selection(batch_stream_builder.metadata(), preds, file_fields)?;
         combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
 
         if let Some(ref ranges) = row_selection {
@@ -429,7 +488,6 @@ impl FormatFileReader for ParquetFormatReader {
         // projects the filtered batch to `read_fields` by name.
         let residual_predicates = FilePredicates {
             predicates: preds.to_vec(),
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields: file_fields.to_vec(),
         };
@@ -457,7 +515,7 @@ fn build_parquet_row_filter(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
     predicates: &[Predicate],
     file_fields: &[DataField],
-) -> crate::Result<Option<RowFilter>> {
+) -> crate::Result<Option<ParquetRowFilter>> {
     if predicates.is_empty() {
         return Ok(None);
     }
@@ -474,7 +532,7 @@ fn build_parquet_row_filter(
     if filters.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(RowFilter::new(filters)))
+        Ok(Some(ParquetRowFilter::new(filters)))
     }
 }
 
@@ -3041,82 +3099,6 @@ mod tests {
         buf
     }
 
-    #[tokio::test]
-    async fn test_pruning_predicate_skips_row_group_without_filtering_rows() {
-        use futures::StreamExt;
-
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            ArrowDataType::Int32,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 40, 100]))],
-        )
-        .unwrap();
-        let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_row_count(Some(2))
-            .build();
-        let mut bytes = Vec::new();
-        {
-            let mut writer =
-                AsyncArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).unwrap();
-            writer.write(&batch).await.unwrap();
-            writer.close().await.unwrap();
-        }
-
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let path = "memory:/test_parquet_pruning_only.parquet";
-        file_io
-            .new_output(path)
-            .unwrap()
-            .write(Bytes::from(bytes))
-            .await
-            .unwrap();
-        let input = file_io.new_input(path).unwrap();
-        let file_size = input.metadata().await.unwrap().size;
-        let file_fields = vec![residual_test_field(0, "id", DataType::Int(IntType::new()))];
-        let pruning_predicate = residual_leaf(
-            "id",
-            0,
-            DataType::Int(IntType::new()),
-            PredicateOperator::Gt,
-            vec![Datum::Int(50)],
-        );
-        let predicates = FilePredicates {
-            predicates: Vec::new(),
-            pruning_predicates: vec![pruning_predicate],
-            row_filter_factory: None,
-            file_fields: file_fields.clone(),
-        };
-
-        let mut stream = ParquetFormatReader
-            .read_batch_stream(
-                Box::new(input.reader().await.unwrap()),
-                file_size,
-                &file_fields,
-                Some(&predicates),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let mut ids = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.unwrap();
-            let id = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            ids.extend(id.iter().flatten());
-        }
-
-        assert_eq!(ids, vec![40, 100]);
-    }
-
     fn residual_test_field(index: i32, name: &str, data_type: DataType) -> DataField {
         DataField::new(index, name.to_string(), data_type)
     }
@@ -3147,6 +3129,210 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn test_external_row_filter_projection_failure_falls_back() {
+        #[derive(Debug)]
+        struct InvalidProjectionFactory;
+
+        struct InvalidProjectionFilter {
+            projection: Arc<ArrowSchema>,
+        }
+
+        impl crate::arrow::RowFilter for InvalidProjectionFilter {
+            fn projection(&self) -> &Arc<ArrowSchema> {
+                &self.projection
+            }
+
+            fn evaluate(
+                &mut self,
+                batch: RecordBatch,
+            ) -> Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+                Ok(arrow_array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
+            }
+        }
+
+        impl crate::arrow::RowFilterFactory for InvalidProjectionFactory {
+            fn create(
+                &self,
+                _context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                Ok(vec![Box::new(InvalidProjectionFilter {
+                    projection: Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "missing",
+                        ArrowDataType::Int32,
+                        true,
+                    )])),
+                })])
+            }
+        }
+
+        let bytes = write_id_name_age_parquet().await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_invalid_external_row_filter_projection.parquet";
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let fields = id_name_age_file_fields();
+        let predicates = FilePredicates {
+            predicates: Vec::new(),
+            row_filter_factory: Some(Arc::new(InvalidProjectionFactory)),
+            file_fields: fields.clone(),
+        };
+
+        let batches = ParquetFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &fields[..1],
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_external_row_filters_are_ordered_by_parquet_cost() {
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct RecordingFactory {
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        struct RecordingFilter {
+            name: &'static str,
+            order: Arc<Mutex<Vec<&'static str>>>,
+            projection: Arc<ArrowSchema>,
+        }
+
+        impl crate::arrow::RowFilter for RecordingFilter {
+            fn projection(&self) -> &Arc<ArrowSchema> {
+                &self.projection
+            }
+
+            fn evaluate(
+                &mut self,
+                batch: RecordBatch,
+            ) -> Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+                self.order.lock().unwrap().push(self.name);
+                Ok(arrow_array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
+            }
+        }
+
+        impl crate::arrow::RowFilterFactory for RecordingFactory {
+            fn create(
+                &self,
+                context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                let filter = |name, index| {
+                    Box::new(RecordingFilter {
+                        name,
+                        order: Arc::clone(&self.order),
+                        projection: Arc::new(context.file_schema.project(&[index]).unwrap()),
+                    }) as Box<dyn crate::arrow::RowFilter>
+                };
+                Ok(vec![filter("large", 1), filter("small", 0)])
+            }
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("small", ArrowDataType::Int32, false),
+            ArrowField::new("large", ArrowDataType::Utf8, false),
+        ]));
+        let large_values = (0..32)
+            .map(|index| format!("{index:04}-{}", "x".repeat(4096)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..32)),
+                Arc::new(StringArray::from(large_values)),
+            ],
+        )
+        .unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_external_row_filter_cost_order.parquet";
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let fields = vec![
+            residual_test_field(0, "small", DataType::Int(IntType::new())),
+            residual_test_field(1, "large", DataType::VarChar(VarCharType::string_type())),
+        ];
+        let predicates = FilePredicates {
+            predicates: Vec::new(),
+            row_filter_factory: Some(Arc::new(RecordingFactory {
+                order: Arc::clone(&order),
+            })),
+            file_fields: fields.clone(),
+        };
+
+        ParquetFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &fields[..1],
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["small", "large"]);
+    }
+
     /// Read `[name]` from the `(id, name, age)` parquet file under `predicates`
     /// and collect the surviving `name` values in row order. The reader-level
     /// batch may include extra (predicate) columns — we look `name` up by name.
@@ -3170,7 +3356,6 @@ mod tests {
 
         let predicates = FilePredicates {
             predicates: vec![predicate],
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields: id_name_age_file_fields(),
         };
@@ -3366,7 +3551,6 @@ mod tests {
         let reader_input = input.reader().await.unwrap();
         let predicates = FilePredicates {
             predicates: vec![leaf_gt, leaf_lt],
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields,
         };
@@ -3685,7 +3869,6 @@ mod tests {
         ])];
         let file_predicates = FilePredicates {
             predicates,
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields: fields.clone(),
         };

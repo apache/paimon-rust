@@ -64,7 +64,6 @@ impl FormatFileReader for AvroFormatReader {
         // caller's `&FilePredicates` (FilePredicates is not `Clone`; rebuild it).
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
-            pruning_predicates: fp.pruning_predicates.clone(),
             row_filter_factory: None,
             file_fields: fp.file_fields.clone(),
         });
@@ -1031,7 +1030,6 @@ mod tests {
                 PredicateOperator::Gt,
                 vec![Datum::Long(25)],
             )],
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields,
         };
@@ -1093,7 +1091,6 @@ mod tests {
                 PredicateOperator::Gt,
                 vec![Datum::Long(25)],
             )],
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields,
         };
@@ -1163,7 +1160,6 @@ mod tests {
                 PredicateOperator::Like,
                 vec![Datum::String("a%".to_string())],
             )],
-            pruning_predicates: Vec::new(),
             row_filter_factory: None,
             file_fields: vec![age, name],
         };

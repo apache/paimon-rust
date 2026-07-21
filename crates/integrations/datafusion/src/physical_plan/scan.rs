@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::{cast, filter_record_batch};
@@ -28,17 +26,12 @@ use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::config::ConfigOptions;
-use datafusion::datasource::physical_plan::parquet::{
-    build_row_filter, can_expr_be_pushed_down_with_schemas,
-};
-use datafusion::datasource::physical_plan::ParquetFileMetrics;
+use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+use datafusion::physical_expr::utils::{
+    collect_columns, conjunction, reassign_expr_columns, split_conjunction,
 };
-use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
 use datafusion::physical_expr_adapter::{
@@ -48,20 +41,14 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
-use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
-use crate::filter_pushdown::scalar_to_datum;
-
-const RUNTIME_FILTER_WAIT_MIN_ROWS: usize = 250_000;
-const RUNTIME_FILTER_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -91,27 +78,62 @@ fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<
 }
 
 #[derive(Debug)]
-struct DataFusionParquetRowFilterFactory {
+struct DataFusionRowFilterFactory {
     predicate: Arc<dyn PhysicalExpr>,
     logical_schema: ArrowSchemaRef,
-    metrics: ExecutionPlanMetricsSet,
 }
 
-impl DataFusionParquetRowFilterFactory {
+impl DataFusionRowFilterFactory {
     fn new(predicate: Arc<dyn PhysicalExpr>, logical_schema: ArrowSchemaRef) -> Self {
         Self {
             predicate,
             logical_schema,
-            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
 
-impl paimon::arrow::ParquetRowFilterFactory for DataFusionParquetRowFilterFactory {
+#[derive(Debug)]
+struct DataFusionRowFilter {
+    predicate: Arc<dyn PhysicalExpr>,
+    projection: ArrowSchemaRef,
+}
+
+impl paimon::arrow::RowFilter for DataFusionRowFilter {
+    fn projection(&self) -> &ArrowSchemaRef {
+        &self.projection
+    }
+
+    fn evaluate(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<BooleanArray, datafusion::arrow::error::ArrowError> {
+        let value = self
+            .predicate
+            .evaluate(&batch)
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .map_err(|error| {
+                datafusion::arrow::error::ArrowError::ComputeError(format!(
+                    "failed to evaluate DataFusion row filter: {error}"
+                ))
+            })?;
+        value
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::arrow::error::ArrowError::ComputeError(format!(
+                    "DataFusion row filter returned {}, expected Boolean",
+                    value.data_type()
+                ))
+            })
+    }
+}
+
+impl paimon::arrow::RowFilterFactory for DataFusionRowFilterFactory {
     fn create(
         &self,
-        context: paimon::arrow::ParquetRowFilterContext<'_>,
-    ) -> paimon::Result<Option<datafusion::parquet::arrow::arrow_reader::RowFilter>> {
+        context: paimon::arrow::RowFilterContext<'_>,
+    ) -> paimon::Result<Vec<Box<dyn paimon::arrow::RowFilter>>> {
         let adapter = DefaultPhysicalExprAdapterFactory
             .create(
                 Arc::clone(&self.logical_schema),
@@ -124,266 +146,44 @@ impl paimon::arrow::ParquetRowFilterFactory for DataFusionParquetRowFilterFactor
                 PhysicalExprSimplifier::new(context.file_schema).simplify(predicate)
             })
             .map_err(datafusion_row_filter_error)?;
-        let file_metrics = ParquetFileMetrics::new(0, "paimon", &self.metrics);
-        build_row_filter(
-            &predicate,
-            context.file_schema,
-            context.metadata,
-            true,
-            &file_metrics,
-        )
-        .map_err(datafusion_row_filter_error)
+
+        split_conjunction(&predicate)
+            .into_iter()
+            .map(|predicate| {
+                let mut indices = collect_columns(predicate)
+                    .into_iter()
+                    .map(|column| column.index())
+                    .collect::<Vec<_>>();
+                indices.sort_unstable();
+                indices.dedup();
+                let projection = Arc::new(
+                    context
+                        .file_schema
+                        .project(&indices)
+                        .map_err(datafusion_row_filter_arrow_error)?,
+                );
+                let predicate = reassign_expr_columns(Arc::clone(predicate), &projection)
+                    .map_err(datafusion_row_filter_error)?;
+                Ok(Box::new(DataFusionRowFilter {
+                    predicate,
+                    projection,
+                }) as Box<dyn paimon::arrow::RowFilter>)
+            })
+            .collect()
     }
 }
 
 fn datafusion_row_filter_error(error: datafusion::error::DataFusionError) -> paimon::Error {
     paimon::Error::UnexpectedError {
-        message: format!("failed to adapt DataFusion Parquet row filter: {error}"),
+        message: format!("failed to adapt DataFusion row filter: {error}"),
         source: Some(Box::new(error)),
     }
 }
 
-async fn runtime_pruning_predicate(
-    filters: &[Arc<dyn PhysicalExpr>],
-    fields: &[DataField],
-    case_sensitive: bool,
-    wait_timeout: Duration,
-) -> Option<Predicate> {
-    let mut pending = filters.to_vec();
-    let mut dynamic_filters = Vec::new();
-    while let Some(expr) = pending.pop() {
-        pending.extend(expr.children().into_iter().cloned());
-        if expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
-            dynamic_filters.push(expr);
-        }
-    }
-
-    let mut waiters = FuturesUnordered::new();
-    for expr in dynamic_filters {
-        waiters.push(async move {
-            let dynamic = expr
-                .downcast_ref::<DynamicFilterPhysicalExpr>()
-                .expect("only dynamic filters are queued");
-            dynamic.wait_complete().await;
-            dynamic.expression_id()
-        });
-    }
-
-    let deadline = tokio::time::Instant::now() + wait_timeout;
-    let mut completed_dynamic_filters = HashSet::new();
-    while !waiters.is_empty() {
-        match tokio::time::timeout_at(deadline, waiters.next()).await {
-            Ok(Some(Some(expression_id))) => {
-                completed_dynamic_filters.insert(expression_id);
-            }
-            Ok(Some(None)) => {}
-            Ok(None) | Err(_) => break,
-        }
-    }
-
-    let predicate_builder = PredicateBuilder::new_with_case_sensitive(fields, case_sensitive);
-    let mut predicates = Vec::new();
-    for filter in filters {
-        collect_runtime_pruning_predicates(
-            filter.as_ref(),
-            fields,
-            &predicate_builder,
-            case_sensitive,
-            &completed_dynamic_filters,
-            &mut predicates,
-        );
-    }
-    (!predicates.is_empty()).then(|| Predicate::and(predicates))
-}
-
-fn runtime_filter_wait_timeout(estimated_rows: usize) -> Duration {
-    if estimated_rows > RUNTIME_FILTER_WAIT_MIN_ROWS {
-        RUNTIME_FILTER_WAIT_TIMEOUT
-    } else {
-        Duration::ZERO
-    }
-}
-
-fn collect_runtime_pruning_predicates(
-    expr: &dyn PhysicalExpr,
-    fields: &[DataField],
-    predicate_builder: &PredicateBuilder,
-    case_sensitive: bool,
-    completed_dynamic_filters: &HashSet<u64>,
-    predicates: &mut Vec<Predicate>,
-) {
-    if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
-        if dynamic
-            .expression_id()
-            .is_none_or(|id| !completed_dynamic_filters.contains(&id))
-        {
-            return;
-        }
-        if let Ok(current) = dynamic.current() {
-            collect_runtime_pruning_predicates(
-                current.as_ref(),
-                fields,
-                predicate_builder,
-                case_sensitive,
-                completed_dynamic_filters,
-                predicates,
-            );
-        }
-        return;
-    }
-
-    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
-        if binary.op() == &Operator::And {
-            collect_runtime_pruning_predicates(
-                binary.left().as_ref(),
-                fields,
-                predicate_builder,
-                case_sensitive,
-                completed_dynamic_filters,
-                predicates,
-            );
-            collect_runtime_pruning_predicates(
-                binary.right().as_ref(),
-                fields,
-                predicate_builder,
-                case_sensitive,
-                completed_dynamic_filters,
-                predicates,
-            );
-        } else if let Some(predicate) =
-            translate_runtime_comparison(binary, fields, predicate_builder, case_sensitive)
-        {
-            predicates.push(predicate);
-        }
-        return;
-    }
-
-    if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
-        if let Some(predicate) =
-            translate_runtime_in_list(in_list, fields, predicate_builder, case_sensitive)
-        {
-            predicates.push(predicate);
-        }
-    }
-}
-
-fn translate_runtime_comparison(
-    binary: &BinaryExpr,
-    fields: &[DataField],
-    predicate_builder: &PredicateBuilder,
-    case_sensitive: bool,
-) -> Option<Predicate> {
-    let direct = runtime_column_literal(
-        binary.left().as_ref(),
-        binary.right().as_ref(),
-        fields,
-        case_sensitive,
-    )
-    .map(|(field, datum)| (*binary.op(), field, datum));
-    let comparison = direct.or_else(|| {
-        runtime_column_literal(
-            binary.right().as_ref(),
-            binary.left().as_ref(),
-            fields,
-            case_sensitive,
-        )
-        .and_then(|(field, datum)| {
-            reverse_runtime_comparison(*binary.op()).map(|op| (op, field, datum))
-        })
-    })?;
-
-    let (op, field, datum) = comparison;
-    if matches!(
-        field.data_type(),
-        paimon::spec::DataType::Binary(_) | paimon::spec::DataType::VarBinary(_)
-    ) && matches!(
-        op,
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-    ) {
-        // Arrow compares binary values as unsigned bytes, while Paimon follows
-        // Java's signed-byte ordering. Range predicates could therefore prune
-        // rows that DataFusion would keep; equality predicates remain safe.
-        return None;
-    }
-    match op {
-        Operator::Eq => predicate_builder.equal(field.name(), datum).ok(),
-        Operator::NotEq => predicate_builder.not_equal(field.name(), datum).ok(),
-        Operator::Lt => predicate_builder.less_than(field.name(), datum).ok(),
-        Operator::LtEq => predicate_builder.less_or_equal(field.name(), datum).ok(),
-        Operator::Gt => predicate_builder.greater_than(field.name(), datum).ok(),
-        Operator::GtEq => predicate_builder.greater_or_equal(field.name(), datum).ok(),
-        _ => None,
-    }
-}
-
-fn translate_runtime_in_list(
-    in_list: &InListExpr,
-    fields: &[DataField],
-    predicate_builder: &PredicateBuilder,
-    case_sensitive: bool,
-) -> Option<Predicate> {
-    let column = in_list.expr().downcast_ref::<Column>()?;
-    let field = resolve_runtime_field(column.name(), fields, case_sensitive)?;
-    let literals = in_list
-        .list()
-        .iter()
-        .map(|expr| {
-            let literal = expr.downcast_ref::<Literal>()?;
-            if literal.value().is_null() {
-                return None;
-            }
-            scalar_to_datum(literal.value(), field.data_type())
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    if in_list.negated() {
-        predicate_builder.is_not_in(field.name(), literals).ok()
-    } else {
-        predicate_builder.is_in(field.name(), literals).ok()
-    }
-}
-
-fn runtime_column_literal<'a>(
-    column: &dyn PhysicalExpr,
-    literal: &dyn PhysicalExpr,
-    fields: &'a [DataField],
-    case_sensitive: bool,
-) -> Option<(&'a DataField, Datum)> {
-    let column = column.downcast_ref::<Column>()?;
-    let literal = literal.downcast_ref::<Literal>()?;
-    if literal.value().is_null() {
-        return None;
-    }
-    let field = resolve_runtime_field(column.name(), fields, case_sensitive)?;
-    let datum = scalar_to_datum(literal.value(), field.data_type())?;
-    Some((field, datum))
-}
-
-fn resolve_runtime_field<'a>(
-    name: &str,
-    fields: &'a [DataField],
-    case_sensitive: bool,
-) -> Option<&'a DataField> {
-    if case_sensitive {
-        fields.iter().find(|field| field.name() == name)
-    } else {
-        let mut matches = fields
-            .iter()
-            .filter(|field| field.name().eq_ignore_ascii_case(name));
-        let field = matches.next()?;
-        matches.next().is_none().then_some(field)
-    }
-}
-
-fn reverse_runtime_comparison(op: Operator) -> Option<Operator> {
-    match op {
-        Operator::Eq => Some(Operator::Eq),
-        Operator::NotEq => Some(Operator::NotEq),
-        Operator::Lt => Some(Operator::Gt),
-        Operator::LtEq => Some(Operator::GtEq),
-        Operator::Gt => Some(Operator::Lt),
-        Operator::GtEq => Some(Operator::LtEq),
-        _ => None,
+fn datafusion_row_filter_arrow_error(error: datafusion::arrow::error::ArrowError) -> paimon::Error {
+    paimon::Error::UnexpectedError {
+        message: format!("failed to project DataFusion row filter columns: {error}"),
+        source: Some(Box::new(error)),
     }
 }
 
@@ -802,30 +602,17 @@ impl ExecutionPlan for PaimonTableScan {
 
             read_builder.with_case_sensitive(case_sensitive);
             read_builder.with_read_type(read_type);
-            let estimated_rows = splits
-                .iter()
-                .filter_map(|split| usize::try_from(split.row_count()).ok())
-                .fold(0usize, usize::saturating_add);
-            let runtime_pruning = runtime_pruning_predicate(
-                &runtime_filters,
-                table.schema().fields(),
-                case_sensitive,
-                runtime_filter_wait_timeout(estimated_rows),
-            )
-            .await;
             if let Some(filter) = pushed_predicate {
                 read_builder.with_filter(filter);
             }
 
             let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-            if let Some(predicate) = runtime_pruning {
-                read = read.with_pruning_filter(predicate);
-            }
             if !runtime_filters.is_empty() {
                 let predicate = conjunction(runtime_filters.iter().cloned());
-                read = read.with_parquet_row_filter_factory(Arc::new(
-                    DataFusionParquetRowFilterFactory::new(predicate, Arc::clone(&schema)),
-                ));
+                read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
+                    predicate,
+                    Arc::clone(&schema),
+                )));
             }
             let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
@@ -969,7 +756,7 @@ mod tests {
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions::{
-        lit, BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr,
+        lit, BinaryExpr, Column, DynamicFilterPhysicalExpr,
     };
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::filter_pushdown::{
@@ -981,8 +768,8 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        BinaryRow, BinaryType, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
-        Schema as PaimonSchema, TableSchema, VarBinaryType,
+        BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
+        Schema as PaimonSchema, TableSchema,
     };
     use paimon::table::{DeletionFile, RowRange, Table};
     use std::fs;
@@ -1015,41 +802,6 @@ mod tests {
             assert_eq!(
                 datum_to_scalar(Datum::Bytes(vec![0x7f, 0x80]), &data_type),
                 None
-            );
-        }
-    }
-
-    #[test]
-    fn test_binary_runtime_ranges_are_not_translated() {
-        for data_type in [
-            DataType::Binary(BinaryType::new(1).unwrap()),
-            DataType::VarBinary(VarBinaryType::new(1).unwrap()),
-        ] {
-            let fields = vec![DataField::new(0, "bytes".to_string(), data_type)];
-            let predicate_builder = PredicateBuilder::new(&fields);
-            for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-                let expression = BinaryExpr::new(
-                    Arc::new(Column::new("bytes", 0)),
-                    op,
-                    Arc::new(Literal::new(ScalarValue::Binary(Some(vec![0xff])))),
-                );
-
-                assert!(
-                    translate_runtime_comparison(&expression, &fields, &predicate_builder, true,)
-                        .is_none(),
-                    "binary {op} must remain with DataFusion"
-                );
-            }
-
-            let equality = BinaryExpr::new(
-                Arc::new(Column::new("bytes", 0)),
-                Operator::Eq,
-                Arc::new(Literal::new(ScalarValue::Binary(Some(vec![0xff])))),
-            );
-            assert!(
-                translate_runtime_comparison(&equality, &fields, &predicate_builder, true)
-                    .is_some(),
-                "binary equality is ordering-independent"
             );
         }
     }
@@ -1439,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_datafusion_factory_builds_parquet_decoder_filter() {
+    fn test_datafusion_factory_builds_format_neutral_row_filter() {
         use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let tempdir = tempdir().unwrap();
@@ -1454,18 +1206,26 @@ mod tests {
             Operator::Gt,
             lit(1_i32),
         ));
-        let factory = DataFusionParquetRowFilterFactory::new(predicate, test_schema());
+        let factory = DataFusionRowFilterFactory::new(predicate, test_schema());
 
-        let row_filter = paimon::arrow::ParquetRowFilterFactory::create(
+        let mut row_filters = paimon::arrow::RowFilterFactory::create(
             &factory,
-            paimon::arrow::ParquetRowFilterContext {
+            paimon::arrow::RowFilterContext {
                 file_schema: &file_schema,
-                metadata: builder.metadata(),
             },
         )
         .unwrap();
 
-        assert!(row_filter.is_some());
+        assert_eq!(row_filters.len(), 1);
+        assert_eq!(row_filters[0].projection().field(0).name(), "id");
+
+        let batch = RecordBatch::try_new(
+            test_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mask = row_filters[0].evaluate(batch).unwrap();
+        assert_eq!(mask, BooleanArray::from(vec![false, true, true]));
     }
 
     #[test]
@@ -1486,15 +1246,13 @@ mod tests {
             lit(true),
         ));
         let predicate: Arc<dyn PhysicalExpr> = dynamic.clone();
-        let factory = DataFusionParquetRowFilterFactory::new(predicate, test_schema());
-        let row_filter = paimon::arrow::ParquetRowFilterFactory::create(
+        let factory = DataFusionRowFilterFactory::new(predicate, test_schema());
+        let mut row_filters = paimon::arrow::RowFilterFactory::create(
             &factory,
-            paimon::arrow::ParquetRowFilterContext {
+            paimon::arrow::RowFilterContext {
                 file_schema: &file_schema,
-                metadata: builder.metadata(),
             },
         )
-        .unwrap()
         .unwrap();
 
         dynamic
@@ -1509,8 +1267,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
-        let mut predicates = row_filter.into_predicates();
-        let mask = predicates[0].evaluate(batch).unwrap();
+        let mask = row_filters[0].evaluate(batch).unwrap();
 
         assert_eq!(
             mask.iter().collect::<Vec<_>>(),
@@ -1647,105 +1404,6 @@ mod tests {
                     .copied()
             })
             .collect()
-    }
-
-    #[tokio::test]
-    async fn test_dynamic_filter_builds_reader_pruning_predicate() {
-        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
-            vec![Arc::clone(&column)],
-            lit(true),
-        ));
-        dynamic_filter
-            .update(Arc::new(BinaryExpr::new(
-                column,
-                Operator::GtEq,
-                lit(3_i32),
-            )))
-            .unwrap();
-        dynamic_filter.mark_complete();
-        let filter: Arc<dyn PhysicalExpr> = dynamic_filter;
-
-        let predicate =
-            runtime_pruning_predicate(&[filter], &test_read_type(), true, Duration::ZERO)
-                .await
-                .expect("a completed column/literal dynamic filter should prune the reader");
-
-        assert_eq!(predicate.to_string(), "id >= 3");
-    }
-
-    #[tokio::test]
-    async fn test_runtime_in_list_builds_reader_pruning_predicate() {
-        let filter: Arc<dyn PhysicalExpr> = Arc::new(
-            InListExpr::try_new(
-                Arc::new(Column::new("id", 0)),
-                vec![lit(1_i32), lit(3_i32)],
-                false,
-                test_schema().as_ref(),
-            )
-            .unwrap(),
-        );
-
-        let predicate =
-            runtime_pruning_predicate(&[filter], &test_read_type(), true, Duration::ZERO)
-                .await
-                .expect("a literal IN list should prune the reader");
-
-        assert_eq!(predicate.to_string(), "id IN (1, 3)");
-    }
-
-    #[test]
-    fn test_runtime_filter_wait_is_cost_aware() {
-        assert_eq!(runtime_filter_wait_timeout(204_000), Duration::ZERO);
-        assert_eq!(runtime_filter_wait_timeout(250_000), Duration::ZERO);
-        assert_eq!(runtime_filter_wait_timeout(250_001), Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn test_incomplete_dynamic_filter_does_not_materially_delay_scan_startup() {
-        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-        let dynamic_filter: Arc<dyn PhysicalExpr> =
-            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
-
-        let predicate = tokio::time::timeout(
-            Duration::from_millis(100),
-            runtime_pruning_predicate(&[dynamic_filter], &test_read_type(), true, Duration::ZERO),
-        )
-        .await
-        .expect("an incomplete dynamic filter must not delay scan startup");
-
-        assert!(predicate.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_completed_dynamic_filter_still_prunes_when_another_times_out() {
-        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-        let completed = Arc::new(DynamicFilterPhysicalExpr::new(
-            vec![Arc::clone(&column)],
-            lit(true),
-        ));
-        completed
-            .update(Arc::new(BinaryExpr::new(
-                Arc::clone(&column),
-                Operator::GtEq,
-                lit(3_i32),
-            )))
-            .unwrap();
-        completed.mark_complete();
-        let incomplete: Arc<dyn PhysicalExpr> =
-            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
-        let completed: Arc<dyn PhysicalExpr> = completed;
-
-        let predicate = runtime_pruning_predicate(
-            &[completed, incomplete],
-            &test_read_type(),
-            true,
-            Duration::ZERO,
-        )
-        .await
-        .expect("completed filters should survive another filter timing out");
-
-        assert_eq!(predicate.to_string(), "id >= 3");
     }
 
     #[tokio::test]
