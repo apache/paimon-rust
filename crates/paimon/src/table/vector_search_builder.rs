@@ -19,7 +19,9 @@ use crate::arrow::format::FilePredicates;
 use crate::arrow::residual::{evaluate_predicates_mask, widen_scan_fields};
 use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
+use crate::lumina::{
+    is_lumina_index_type, LuminaIndexMeta, LuminaVectorIndexOptions, LuminaVectorMetric,
+};
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
     IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
@@ -526,11 +528,7 @@ impl<'a> VectorSearchBuilder<'a> {
             None => self.table.schema().fields().to_vec(),
             Some(names) => {
                 for name in names {
-                    if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == SEARCH_SCORE_COLUMN
-                        || name == ROW_ID_FIELD_NAME
-                        || name == "_PKEY_VECTOR_SCORE"
-                    {
+                    if is_reserved_read_column(name) {
                         return Err(crate::Error::DataInvalid {
                             message: format!(
                                 "vector search read projection must not request reserved column '{name}'"
@@ -547,8 +545,40 @@ impl<'a> VectorSearchBuilder<'a> {
                 )?
             }
         };
+        // The default projection returns every user column, so a user column
+        // whose name collides with an injected metadata column must be rejected
+        // on the resolved field list too — not only when explicitly requested.
+        ensure_no_reserved_read_columns(&fields)?;
         Ok(fields)
     }
+}
+
+/// Names a read injects as metadata columns — `__paimon_search_score`,
+/// `_PKEY_VECTOR_POSITION`, `_ROW_ID`, and `_PKEY_VECTOR_SCORE` — that a
+/// materialized read type must not reuse for a user column.
+fn is_reserved_read_column(name: &str) -> bool {
+    name == PKEY_VECTOR_POSITION_COLUMN
+        || name == SEARCH_SCORE_COLUMN
+        || name == ROW_ID_FIELD_NAME
+        || name == "_PKEY_VECTOR_SCORE"
+}
+
+/// Reject a materialized read type whose resolved fields contain a reserved
+/// metadata column name. Applied to the RESOLVED field list so the default
+/// (all user columns) projection is covered, not only an explicit one.
+fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Result<()> {
+    for field in fields {
+        if is_reserved_read_column(field.name()) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "vector search read projection must not include reserved column '{}'",
+                    field.name()
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Batch PK-vector search core shared by the single and batch builders: plan ONE
@@ -931,6 +961,12 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        // Fail closed: like `execute_read` and the single-query builder, this
+        // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
+        // so it must refuse a `query-auth.enabled` table before any fast path
+        // (an empty snapshot would otherwise return empty results and bypass it).
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -965,7 +1001,6 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         // `execute_read`, mirroring the single-query builder's PK guard. Membership
         // is resolved via the non-erroring columns accessor so a malformed
         // PK-vector config cannot abort an unrelated DE query.
-        let core = CoreOptions::new(self.table.schema().options());
         if core.primary_key_vector_index_enabled() {
             let targets_pk_column = core
                 .primary_key_vector_index_columns()
@@ -1147,11 +1182,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             None => self.table.schema().fields().to_vec(),
             Some(names) => {
                 for name in names {
-                    if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == SEARCH_SCORE_COLUMN
-                        || name == ROW_ID_FIELD_NAME
-                        || name == "_PKEY_VECTOR_SCORE"
-                    {
+                    if is_reserved_read_column(name) {
                         return Err(crate::Error::DataInvalid {
                             message: format!(
                                 "vector search read projection must not request reserved column '{name}'"
@@ -1168,6 +1199,10 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 )?
             }
         };
+        // The default projection returns every user column, so a user column
+        // whose name collides with an injected metadata column must be rejected
+        // on the resolved field list too — not only when explicitly requested.
+        ensure_no_reserved_read_columns(&fields)?;
         Ok(fields)
     }
 }
@@ -1617,15 +1652,29 @@ fn pk_vector_query_dimension(
             Ok(Some(vector_type.length() as usize))
         }
         DataType::Array(array_type) if matches!(array_type.element_type(), DataType::Float(_)) => {
-            Ok(Some(
-                VindexVectorIndexOptions::new(
-                    table_options,
-                    query_options,
-                    index_type,
-                    vector_field,
-                )?
-                .dimension(),
-            ))
+            // Resolve the dimension per the configured backend. An `ARRAY<FLOAT>`
+            // column carries no dimension in its type, so it comes from options —
+            // but the option shape differs by backend. Lumina is not a vindex
+            // index type, so routing it through `VindexVectorIndexOptions` would
+            // reject it as unsupported before planning (even on an empty table).
+            if is_lumina_index_type(index_type) {
+                // Lumina reads `lumina.index.dimension` (default 128) from the
+                // merged table+query options, matching `resolve_lumina_options`.
+                let mut merged = table_options.clone();
+                merged.extend(query_options.clone());
+                let dimension = LuminaVectorIndexOptions::new(&merged)?.dimension;
+                Ok(Some(dimension as usize))
+            } else {
+                Ok(Some(
+                    VindexVectorIndexOptions::new(
+                        table_options,
+                        query_options,
+                        index_type,
+                        vector_field,
+                    )?
+                    .dimension(),
+                ))
+            }
         }
         _ => Ok(None),
     }
@@ -3389,6 +3438,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_batch_execute_fails_closed_when_query_auth_enabled() {
+        // The batch scored entry returns data-derived row ids/scores outside
+        // `TableScan`/`TableRead`, so it must fail closed under
+        // `query-auth.enabled` exactly like the single-query builder. Its config
+        // is otherwise valid, so without the guard the empty-snapshot fast path
+        // would return empty results and silently bypass authorization.
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0, 2.0]])
+            .with_limit(5)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "batch vector search must fail closed for a query-auth table, got: {err:?}"
+        );
+    }
+
     fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
@@ -4973,6 +5044,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_read_empty_plan_lumina_array_float_is_admitted() {
+        // A Lumina PK-vector `ARRAY<FLOAT>` column is a valid configuration, but
+        // batch query dimension validation routed every `ARRAY<FLOAT>` column
+        // through the vindex resolver, which rejects `lumina` as an unsupported
+        // index type before planning — failing even an empty table. The
+        // dimension must be resolved per the configured backend, so a
+        // well-formed Lumina query is admitted and (with no snapshot) yields an
+        // empty stream rather than an "Unsupported vindex index type" error.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            (
+                "fields.embedding.pk-vector.index.type",
+                crate::lumina::LUMINA_IDENTIFIER,
+            ),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("lumina.index.dimension", "4"),
+        ]);
+        let mut stream = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .execute_read()
+            .await
+            .expect(
+                "Lumina ARRAY<FLOAT> query must be admitted, not rejected as unsupported vindex",
+            );
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn execute_read_projection_reserved_name_fails_loud() {
         // Projecting a reserved metadata / row-id column must fail loud. The guard
         // lives in `resolve_materialize_read_type`, which `execute_read` invokes
@@ -5017,6 +5119,60 @@ mod tests {
         let fields = builder.resolve_materialize_read_type().unwrap();
         let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id", "embedding"]);
+    }
+
+    /// A PK-vector table whose user schema carries an extra column named
+    /// `reserved`, used to prove reserved metadata names are rejected even when
+    /// they arrive via the default (all-columns) projection.
+    fn pk_vector_table_with_extra_column(reserved: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .column(reserved, DataType::Int(IntType::new()))
+            .option("pk-vector.index.columns", "embedding")
+            .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
+            .option("fields.embedding.pk-vector.distance.metric", "l2")
+            .build()
+            .unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "reserved_col_test"),
+            "memory:/reserved_col_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[test]
+    fn resolve_materialize_read_type_default_rejects_reserved_user_column() {
+        // The default (all-columns) projection must reject a user column whose
+        // name collides with an injected metadata column, not only columns named
+        // in an explicit projection. Otherwise it silently passes on an empty
+        // result and collides with the metadata columns the read attaches.
+        let table = pk_vector_table_with_extra_column(SEARCH_SCORE_COLUMN);
+        let builder = table.new_vector_search_builder();
+        let err = builder.resolve_materialize_read_type().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("reserved column")),
+            "single-query default projection must reject reserved user column, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn batch_resolve_materialize_read_type_default_rejects_reserved_user_column() {
+        // Same guard on the batch resolver.
+        let table = pk_vector_table_with_extra_column(PKEY_VECTOR_POSITION_COLUMN);
+        let builder = table.new_batch_vector_search_builder();
+        let err = builder.resolve_materialize_read_type().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("reserved column")),
+            "batch default projection must reject reserved user column, got: {err:?}"
+        );
     }
 
     #[test]
