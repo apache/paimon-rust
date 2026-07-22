@@ -1,5 +1,6 @@
 crate	0BSD	Apache-2.0	Apache-2.0 WITH LLVM-exception	BSD-2-Clause	BSD-3-Clause	BSL-1.0	CC0-1.0	CDLA-Permissive-2.0	EPL-2.0	ISC	LGPL-2.1-or-later	MIT	MIT-0	MPL-2.0	Unicode-3.0	Unlicense	Zlib	bzip2-1.0.6	zlib-acknowledgement
 adler2@2.0.1	X	X										X							
+adler32@1.2.0																	X		
 aes@0.8.4		X										X							
 ahash@0.8.12		X										X							
 aho-corasick@1.1.4												X				X			
@@ -77,12 +78,14 @@ bon-macros@3.9.3		X										X
 brotli@8.0.4					X							X							
 brotli-decompressor@5.0.3					X							X							
 bumpalo@3.20.3		X										X							
+bytecount@0.6.9		X										X							
 bytemuck@1.25.2		X										X					X		
 byteorder@1.5.0												X				X			
 bytes@1.12.1												X							
 bzip2@0.6.1		X										X							
 cbc@0.1.2		X										X							
 cc@1.3.0		X										X							
+cedarwood@0.5.0				X															
 census@0.4.2												X							
 cexpr@0.6.0		X										X							
 cfg-if@1.0.4		X										X							
@@ -134,6 +137,7 @@ custom-labels@0.4.6		X
 darling@0.23.0												X							
 darling_core@0.23.0												X							
 darling_macro@0.23.0												X							
+dary_heap@0.3.9		X										X							
 dashmap@6.2.1												X							
 datafusion@54.0.0		X																	
 datafusion-catalog@54.0.0		X																	
@@ -169,6 +173,7 @@ datafusion-proto-common@54.0.0		X
 datafusion-pruning@54.0.0		X																	
 datafusion-session@54.0.0		X																	
 datafusion-sql@54.0.0		X																	
+datasketches@0.2.0		X																	
 der@0.7.10		X										X							
 deranged@0.5.8		X										X							
 des@0.8.1		X										X							
@@ -179,6 +184,7 @@ displaydoc@0.2.6		X										X
 dlv-list@0.5.2		X										X							
 dns-lookup@3.0.1		X										X							
 downcast-rs@1.2.1		X										X							
+downcast-rs@2.0.2		X										X							
 dtype_dispatch@0.2.1		X																	
 dunce@1.0.5		X					X						X						
 either@1.16.0		X										X							
@@ -186,6 +192,7 @@ encoding_rs@0.8.35		X			X							X
 enum-iterator@2.3.0	X																		
 enum-iterator-derive@1.5.0	X																		
 equivalent@1.0.2		X										X							
+erased-serde@0.4.10		X										X							
 errno@0.3.14		X										X							
 event-listener@5.4.1		X										X							
 event-listener-strategy@0.5.4		X										X							
@@ -206,6 +213,7 @@ foldhash@0.2.0																	X
 foreign-types@0.3.2		X										X							
 foreign-types-shared@0.1.1		X										X							
 form_urlencoded@1.2.2		X										X							
+fs4@0.13.1		X										X							
 fs4@0.8.4		X										X							
 fs_extra@1.3.0												X							
 fsst-rs@0.5.11		X																	
@@ -232,6 +240,7 @@ h2@0.4.15												X
 half@2.7.1		X										X							
 hashbrown@0.14.5		X										X							
 hashbrown@0.15.5		X										X							
+hashbrown@0.16.1		X										X							
 hashbrown@0.17.1		X										X							
 hdfs-native@0.13.5		X																	
 heck@0.5.0		X										X							
@@ -264,6 +273,9 @@ icu_provider@2.2.0															X
 ident_case@1.0.1		X										X							
 idna@1.1.0		X										X							
 idna_adapter@1.2.2		X										X							
+include-flate@0.3.4		X																	
+include-flate-codegen@0.3.4		X																	
+include-flate-compress@0.3.4		X																	
 indexmap@2.14.0		X										X							
 inout@0.1.4		X										X							
 instant@0.1.13					X														
@@ -275,6 +287,8 @@ itertools@0.12.1		X										X
 itertools@0.13.0		X										X							
 itertools@0.14.0		X										X							
 itoa@1.0.18		X										X							
+jieba-macros@0.10.3												X							
+jieba-rs@0.10.3												X							
 jiff@0.2.34												X				X			
 jiff-core@0.1.0												X				X			
 jiff-tzdb@0.1.8												X				X			
@@ -299,6 +313,8 @@ lexical-write-float@1.0.6		X										X
 lexical-write-integer@1.0.6		X										X							
 libbz2-rs-sys@0.2.5																		X	
 libc@0.2.186		X										X							
+libflate@2.3.0												X							
+libflate_lz77@2.3.0												X							
 libloading@0.8.9										X									
 libloading@0.9.0										X									
 liblzma@0.4.7		X										X							
@@ -311,6 +327,7 @@ litemap@0.8.2															X
 lock_api@0.4.14		X										X							
 log@0.4.33		X										X							
 lru@0.12.5												X							
+lru@0.16.4												X							
 lz4_flex@0.11.6												X							
 lz4_flex@0.13.1												X							
 lzokay-native@0.1.0												X							
@@ -322,6 +339,7 @@ md-5@0.10.6		X										X
 md-5@0.11.0		X										X							
 mea@0.6.4		X																	
 measure_time@0.8.3												X							
+measure_time@0.9.0												X							
 memchr@2.8.3												X				X			
 memmap2@0.9.11		X										X							
 mime@0.3.17		X										X							
@@ -334,6 +352,7 @@ nalgebra@0.33.3		X
 nalgebra-macros@0.2.2		X																	
 native-tls@0.2.18		X										X							
 never-say-never@6.6.666		X										X					X		
+no_std_io2@0.9.4		X										X							
 nom@7.1.3												X							
 nougat@0.2.4		X										X					X		
 nougat-proc_macros@0.2.4		X										X					X		
@@ -372,11 +391,14 @@ openssl-probe@0.2.1		X										X
 openssl-sys@0.9.117												X							
 orc-rust@0.8.0		X																	
 ordered-float@2.10.1												X							
+ordered-float@5.3.0												X							
 ordered-multimap@0.7.3												X							
 ownedbytes@0.7.0												X							
+ownedbytes@0.9.0												X							
 paimon@0.3.0		X																	
 paimon-c@0.3.0		X																	
 paimon-datafusion@0.3.0		X																	
+paimon-ftindex-core@0.1.0		X																	
 paimon-integration-tests@0.3.0		X																	
 paimon-mosaic-core@0.2.0		X																	
 paimon-rest-server@0.3.0		X																	
@@ -394,7 +416,11 @@ pem-rfc7468@0.7.0		X										X
 percent-encoding@2.3.2		X										X							
 petgraph@0.8.3		X										X							
 phf@0.12.1												X							
+phf@0.13.1												X							
+phf_codegen@0.13.1												X							
+phf_generator@0.13.1												X							
 phf_shared@0.12.1												X							
+phf_shared@0.13.1												X							
 pin-project@1.1.13		X										X							
 pin-project-internal@1.1.13		X										X							
 pin-project-lite@0.2.17		X										X							
@@ -414,6 +440,8 @@ ppv-lite86@0.2.21		X										X
 pretty_assertions@1.4.1		X										X							
 prettyplease@0.2.37		X										X							
 proc-macro-crate@3.5.0		X										X							
+proc-macro-error-attr3@3.0.2		X										X							
+proc-macro-error3@3.0.2		X										X							
 proc-macro2@1.0.107		X										X							
 prost@0.13.5		X																	
 prost@0.14.4		X																	
@@ -464,6 +492,7 @@ reqsign-huaweicloud-obs@3.0.2		X
 reqsign-tencent-cos@3.0.2		X																	
 reqwest@0.12.28		X										X							
 reqwest@0.13.4		X										X							
+rle-decode-fast@1.0.3		X										X							
 roaring@0.11.4		X										X							
 roxmltree@0.21.1		X										X							
 rsa@0.9.10		X										X							
@@ -551,14 +580,23 @@ system-configuration@0.7.0		X										X
 system-configuration-sys@0.6.0		X										X							
 tagptr@0.2.0		X										X							
 tantivy@0.22.1												X							
+tantivy@0.26.1												X							
+tantivy-bitpacker@0.10.0												X							
 tantivy-bitpacker@0.6.0												X							
 tantivy-columnar@0.3.0												X							
+tantivy-columnar@0.7.0												X							
+tantivy-common@0.11.0												X							
 tantivy-common@0.7.0												X							
 tantivy-fst@0.5.0												X				X			
+tantivy-jieba@0.20.0												X							
 tantivy-query-grammar@0.22.0												X							
+tantivy-query-grammar@0.26.0												X							
 tantivy-sstable@0.3.0												X							
+tantivy-sstable@0.7.0												X							
 tantivy-stacker@0.3.0												X							
+tantivy-stacker@0.7.0												X							
 tantivy-tokenizer-api@0.3.0												X							
+tantivy-tokenizer-api@0.7.0												X							
 tap@1.0.1												X							
 target-lexicon@0.13.5			X																
 tempfile@3.27.0		X										X							
@@ -592,7 +630,10 @@ try-lock@0.2.5												X
 twox-hash@2.1.3												X							
 typed-builder@0.19.1		X										X							
 typed-builder-macro@0.19.1		X										X							
+typeid@1.0.3		X										X							
 typenum@1.20.1		X										X							
+typetag@0.2.23		X										X							
+typetag-impl@0.2.23		X										X							
 unicode-ident@1.0.24		X										X			X				
 unicode-segmentation@1.13.2		X										X							
 unicode-width@0.2.2		X										X							
