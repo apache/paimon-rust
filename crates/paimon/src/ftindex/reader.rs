@@ -82,7 +82,7 @@ impl<R: SeekRead + 'static> FullTextArchiveReader<R> {
             .serialize_into(&mut filter_bytes)
             .map_err(|e| crate::Error::UnexpectedError {
                 message: format!("failed to serialize row-id filter: {e}"),
-                source: None,
+                source: Some(Box::new(e)),
             })?;
         self.inner
             .search_with_roaring_filter(query_json, limit, &filter_bytes)
@@ -107,7 +107,7 @@ impl FullTextArchiveReader<SliceReader> {
 fn map_ft_err(e: paimon_ftindex_core::FtIndexError) -> crate::Error {
     crate::Error::UnexpectedError {
         message: format!("full-text index engine error: {e}"),
-        source: None,
+        source: Some(Box::new(e)),
     }
 }
 
@@ -180,5 +180,39 @@ mod tests {
         let mut ids = hits.row_ids.clone();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_search_with_include_empty_or_disjoint_returns_no_hits() {
+        let bytes = build_archive(&[
+            (0, "shared token here"),
+            (1, "shared token here"),
+            (2, "shared token here"),
+        ]);
+        let input = archive_input(bytes).await;
+        let reader = FullTextArchiveReader::from_input_file(&input)
+            .await
+            .unwrap();
+
+        // Empty allow-list: an empty include-set admits no rows (not all rows).
+        let empty = roaring::RoaringTreemap::new();
+        let hits = reader
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, empty)
+            .unwrap();
+        assert!(
+            hits.row_ids.is_empty(),
+            "empty include-set must admit no rows"
+        );
+
+        // Allow-list disjoint from the matches (row 99 never indexed): still nothing.
+        let mut disjoint = roaring::RoaringTreemap::new();
+        disjoint.insert(99);
+        let hits = reader
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, disjoint)
+            .unwrap();
+        assert!(
+            hits.row_ids.is_empty(),
+            "include-set disjoint from matches must admit no rows"
+        );
     }
 }
