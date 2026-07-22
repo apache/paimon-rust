@@ -29,6 +29,7 @@ use std::sync::Arc;
 use roaring::RoaringTreemap;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
+use tokio::sync::Semaphore;
 
 use crate::deletion_vector::DeletionVector;
 use crate::spec::BinaryRow;
@@ -428,9 +429,14 @@ impl PkVectorOrchestrator {
     /// query. Input-shape validation (positive limits, non-empty query, residual
     /// count) is applied per query / once as appropriate.
     ///
-    /// `concurrency` bounds how many buckets are searched at once (Java
-    /// `GLOBAL_INDEX_THREAD_NUM`): `1` runs the buckets strictly sequentially,
-    /// larger values fan them out with `buffer_unordered`. Each bucket's per-query
+    /// `concurrency` is the global fan-out limit (Java `GLOBAL_INDEX_THREAD_NUM`):
+    /// `1` runs the buckets and their files strictly sequentially, larger values fan
+    /// them out with `buffer_unordered`. To match Java's single shared
+    /// `GlobalIndexReadThreadPool`, a single [`Semaphore`] budget of `concurrency`
+    /// permits is shared across BOTH the per-bucket and per-exact-file fan-outs and
+    /// acquired only around leaf exact-file I/O, so total in-flight exact-file
+    /// searches are capped at `concurrency` overall — not `concurrency` per bucket,
+    /// which would allow up to `concurrency * concurrency`. Each bucket's per-query
     /// results feed per-query cross-bucket global Top-K heaps, which are
     /// order-independent, so the output does not depend on which bucket finished
     /// first; results are collected and merged into the correct per-query slot after
@@ -491,15 +497,23 @@ impl PkVectorOrchestrator {
         let mut exact_candidates: Vec<Vec<PkVectorCandidate>> =
             (0..queries.len()).map(|_| Vec::new()).collect();
 
+        // One shared concurrency budget for the WHOLE search, mirroring Java's single
+        // `GlobalIndexReadThreadPool`: the per-bucket and per-exact-file fan-outs draw
+        // slots from the SAME N permits, so total in-flight exact-file I/O is capped at
+        // N across all buckets and files (not N per bucket, which would allow N*N).
+        // Only leaf exact-file work acquires a permit; bucket orchestration never holds
+        // one, so it cannot starve leaf work. `concurrency <= 1` takes the strictly
+        // sequential path at both levels and needs no budget.
+        let search_budget = (concurrency > 1).then(|| Arc::new(Semaphore::new(concurrency)));
+
         // One lazy future per bucket. Each builds its own DV map + per-file search
         // closure, searches all queries against the bucket, and returns per-query
         // (indexed, exact) candidate lists already tagged with the bucket's
         // partition/bucket/split_index. The futures are not polled until driven
         // below, so the sequential branch observes buckets in strict split order.
-        let per_bucket = splits
-            .iter()
-            .enumerate()
-            .map(|(split_index, split)| async move {
+        let per_bucket = splits.iter().enumerate().map(|(split_index, split)| {
+            let search_budget = search_budget.clone();
+            async move {
                 let dvs = build_bucket_dv_map(&self.reader, split).await?;
                 // Adapt the split-scoped search closure to bucket_search's per-file
                 // closure by binding the current split index/split. The coercion helper
@@ -538,6 +552,7 @@ impl PkVectorOrchestrator {
                     skip_exact_fallback,
                     residual_ranges,
                     concurrency,
+                    search_budget,
                 )
                 .await?;
                 if per_query.len() != queries.len() {
@@ -569,7 +584,8 @@ impl PkVectorOrchestrator {
                     })
                     .collect();
                 Ok::<_, crate::Error>(tagged)
-            });
+            }
+        });
 
         // Drive the per-bucket futures. `concurrency == 1` uses a strictly
         // sequential loop so buckets are searched in split order; larger values fan
@@ -2300,6 +2316,100 @@ mod e2e_tests {
         assert_eq!(
             parallel, serial,
             "parallel survivors must equal serial survivors"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_peak_concurrency_capped_across_buckets() {
+        // Reproduces the reviewer's scenario: 2 buckets x 2 exact files with
+        // concurrency = 2. The per-bucket and per-exact-file fan-outs draw from ONE
+        // shared budget, so at most `concurrency` (2) exact-file searches run at once
+        // across ALL buckets. Before the shared budget each level capped at N
+        // independently, so 2 buckets x 2 files = 4 file searches ran simultaneously.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let table_path = "memory:/pkvo_peak_concurrency";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut splits = Vec::new();
+        for bucket in 0..2i32 {
+            let bucket_path = format!("{table_path}/bucket-{bucket}");
+            let meta_a = write_file(&file_io, &bucket_path, "a.mosaic", vec![bucket]).await;
+            let meta_b = write_file(&file_io, &bucket_path, "b.mosaic", vec![bucket]).await;
+            splits.push(PkVectorSearchSplit {
+                data_split: DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(bucket)
+                    .with_bucket_path(bucket_path)
+                    .with_total_buckets(2)
+                    .with_data_files(vec![meta_a, meta_b])
+                    .build()
+                    .unwrap(),
+                ann_segments: Vec::new(),
+                active_files: vec![active("a.mosaic", 1), active("b.mosaic", 1)],
+            });
+        }
+
+        // Shared (current, peak) in-flight counters. Each exact-file search increments
+        // on entry (after acquiring its budget slot), yields so overlapping searches
+        // are observable, then decrements; `peak` is the max simultaneous count.
+        let counters = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let counters_in_closure = counters.clone();
+        let factory = as_split_search(
+            move |_: usize,
+                  _: &PkVectorSearchSplit,
+                  file: &BucketActiveFile,
+                  _: &[&[f32]],
+                  _: VectorSearchMetric,
+                  _: usize,
+                  _: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let counters = counters_in_closure.clone();
+                let file_name = file.file_name.clone();
+                Box::pin(async move {
+                    let current = counters.0.fetch_add(1, Ordering::SeqCst) + 1;
+                    counters.1.fetch_max(current, Ordering::SeqCst);
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    counters.0.fetch_sub(1, Ordering::SeqCst);
+                    Ok(vec![vec![PkVectorSearchResult {
+                        data_file_name: file_name,
+                        row_position: 0,
+                        distance: 1.0,
+                    }]])
+                })
+            },
+        );
+
+        let opts = HashMap::new();
+        PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &splits,
+                &[0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                None,
+                &factory,
+                &opts,
+                false,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+
+        let peak = counters.1.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "shared budget must cap concurrent exact-file searches at concurrency (2); \
+             observed peak {peak} (independent per-level fan-out would reach 4)"
+        );
+        assert!(
+            peak >= 2,
+            "test must actually exercise cross-bucket overlap; observed peak {peak}"
         );
     }
 }

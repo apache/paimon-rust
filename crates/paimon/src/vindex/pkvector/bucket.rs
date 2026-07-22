@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
@@ -204,6 +205,37 @@ pub(crate) fn covered_source_files(
     covered
 }
 
+/// Acquire one slot from the shared global-index search concurrency budget, if a
+/// budget is set. The returned guard holds the slot until it is dropped, so the
+/// caller must keep it alive for the duration of the leaf exact-file I/O it gates.
+///
+/// A `None` budget means the leaf runs ungated (no cap) — the function does not
+/// require any particular `concurrency` value; the orchestrator simply passes
+/// `None` on the strictly sequential `concurrency <= 1` path (which needs no
+/// gating). A `Some` budget is a single [`Semaphore`] shared across every bucket
+/// and every exact file of one search, so total in-flight exact-file I/O is capped
+/// at N regardless of how many buckets and files fan out — mirroring Java's single
+/// shared `GlobalIndexReadThreadPool`. Only leaf exact-file work acquires a permit;
+/// bucket orchestration never holds one, so it cannot starve leaf work (the async
+/// analogue of Java's "start from the caller" note in
+/// `PrimaryKeyVectorRead.searchBuckets`).
+async fn acquire_search_permit(
+    budget: &Option<Arc<Semaphore>>,
+) -> crate::Result<Option<OwnedSemaphorePermit>> {
+    match budget {
+        Some(semaphore) => {
+            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
+                crate::Error::UnexpectedError {
+                    message: "global-index search concurrency budget was closed".to_string(),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+            Ok(Some(permit))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Separately bounded approximate-index and exact-fallback candidates for one
 /// bucket. The approximate list may be over-fetched (for later exact reranking)
 /// while the exact-fallback list stays bounded to the caller's final limit.
@@ -249,6 +281,7 @@ pub(crate) async fn bucket_search(
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     concurrency: usize,
+    search_budget: Option<Arc<Semaphore>>,
 ) -> crate::Result<BucketSearchResult> {
     if indexed_limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
@@ -384,7 +417,8 @@ pub(crate) async fn bucket_search(
         // the merge does not depend on which file finished first. `concurrency == 1`
         // takes a plain sequential loop so the file visit order is strictly
         // deterministic; larger values fan the file searches out with
-        // `buffer_unordered`.
+        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
+        // so total in-flight exact-file I/O across all buckets is capped at N.
         let queries: [&[f32]; 1] = [query];
         let per_file: Vec<Vec<PkVectorSearchResult>> = if concurrency <= 1 {
             let mut out = Vec::with_capacity(tasks.len());
@@ -398,7 +432,9 @@ pub(crate) async fn bucket_search(
         } else {
             stream::iter(tasks.iter().map(|(file, is_excluded)| {
                 let queries = &queries;
+                let budget = search_budget.clone();
                 async move {
+                    let _permit = acquire_search_permit(&budget).await?;
                     let per_query =
                         exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
                             .await?;
@@ -458,6 +494,7 @@ pub(crate) async fn bucket_search_batch(
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     concurrency: usize,
+    search_budget: Option<Arc<Semaphore>>,
 ) -> crate::Result<Vec<BucketSearchResult>> {
     if queries.is_empty() {
         return Err(data_invalid("vector search requires at least one query"));
@@ -480,6 +517,7 @@ pub(crate) async fn bucket_search_batch(
             skip_exact_fallback,
             residual_ranges,
             concurrency,
+            search_budget,
         )
         .await?;
         return Ok(vec![single]);
@@ -626,7 +664,8 @@ pub(crate) async fn bucket_search_batch(
         // so the fan-in does not depend on which file finished first: collect every
         // file's per-query result, then merge. `concurrency == 1` uses a strictly
         // sequential loop; larger values fan the file searches out with
-        // `buffer_unordered`.
+        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
+        // so total in-flight exact-file I/O across all buckets is capped at N.
         let per_file: Vec<Vec<Vec<PkVectorSearchResult>>> = if concurrency <= 1 {
             let mut out = Vec::with_capacity(tasks.len());
             for (file, is_excluded) in &tasks {
@@ -637,11 +676,15 @@ pub(crate) async fn bucket_search_batch(
             }
             out
         } else {
-            stream::iter(tasks.iter().map(|(file, is_excluded)| async move {
-                let per_query =
-                    exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
-                        .await?;
-                validate_per_query_len(per_query, queries.len())
+            stream::iter(tasks.iter().map(|(file, is_excluded)| {
+                let budget = search_budget.clone();
+                async move {
+                    let _permit = acquire_search_permit(&budget).await?;
+                    let per_query =
+                        exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
+                            .await?;
+                    validate_per_query_len(per_query, queries.len())
+                }
             }))
             .buffer_unordered(concurrency)
             .try_collect::<Vec<_>>()
@@ -852,6 +895,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -883,6 +927,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -926,6 +971,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -982,6 +1028,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1046,6 +1093,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1122,6 +1170,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1165,6 +1214,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1192,6 +1242,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1241,6 +1292,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1278,6 +1330,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1306,6 +1359,7 @@ mod tests {
             true, // skip_exact_fallback
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1343,6 +1397,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1382,6 +1437,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1410,6 +1466,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1479,6 +1536,7 @@ mod tests {
             false,
             Some(&residual),
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1548,6 +1606,7 @@ mod tests {
             false,
             Some(&residual),
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1594,6 +1653,7 @@ mod tests {
             false,
             Some(&residual),
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1631,6 +1691,7 @@ mod tests {
             false,
             Some(&residual),
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1675,6 +1736,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1778,6 +1840,7 @@ mod tests {
                 false,
                 None,
                 1,
+                None,
             )
             .await
             .unwrap()
@@ -1803,6 +1866,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1838,6 +1902,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1897,6 +1962,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -1940,6 +2006,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1998,6 +2065,7 @@ mod tests {
             false,
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -2076,6 +2144,7 @@ mod tests {
                     false,
                     None,
                     concurrency,
+                    None,
                 )
                 .await
                 .unwrap();
