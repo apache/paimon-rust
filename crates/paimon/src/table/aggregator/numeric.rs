@@ -438,12 +438,18 @@ fn agg_minmax(
         ($acc:expr, $ty:ty) => {{
             let v = downcast::<$ty>(array, field_name)?.value(row_idx);
             // Match Java `Float.compare` / `Double.compare`, which order NaN
-            // greater than any other value (including +Infinity).  Using
-            // `total_cmp` makes that ordering explicit and deterministic.
+            // greater than any other value (including +Infinity) and compare
+            // all NaN representations as equal.  For non-NaN values,
+            // `total_cmp` preserves Java's ordering of -0.0 before +0.0.
             *$acc = Some(match *$acc {
                 None => v,
                 Some(prev) => {
-                    let cmp = v.total_cmp(&prev);
+                    let cmp = match (v.is_nan(), prev.is_nan()) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Less,
+                        (false, false) => v.total_cmp(&prev),
+                    };
                     let take_new = if keep_smaller {
                         cmp.is_lt()
                     } else {
@@ -926,25 +932,93 @@ mod tests {
     }
 
     #[test]
-    fn test_min_max_treat_nan_as_largest() {
-        // Match Java `Float.compare(NaN, x) > 0`: NaN is greater than every
-        // other value, so min skips it and max picks it.
-        let mut min = min_agg(DataType::Float(FloatType::new()));
-        let arr = Float32Array::from(vec![Some(f32::NAN), Some(1.0), Some(0.5)]);
-        for i in 0..arr.len() {
-            min.agg(&arr, i).unwrap();
-        }
-        let v = min.result().unwrap();
-        let v = v.as_any().downcast_ref::<Float32Array>().unwrap().value(0);
-        assert!((v - 0.5).abs() < 1e-6);
+    fn test_float32_min_max_matches_java_ordering() {
+        let aggregate = |values: &[f32], keep_smaller: bool| {
+            let arr = Float32Array::from_iter_values(values.iter().copied());
+            let mut agg: Box<dyn FieldAggregator> = if keep_smaller {
+                Box::new(min_agg(DataType::Float(FloatType::new())))
+            } else {
+                Box::new(max_agg(DataType::Float(FloatType::new())))
+            };
+            for i in 0..arr.len() {
+                agg.agg(&arr, i).unwrap();
+            }
+            let result = agg.result().unwrap();
+            result
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0)
+        };
 
-        let mut max = max_agg(DataType::Float(FloatType::new()));
-        for i in 0..arr.len() {
-            max.agg(&arr, i).unwrap();
+        let negative_nan = f32::from_bits(0xffc0_0001);
+        let positive_nan = f32::from_bits(0x7fc0_0002);
+        assert!(negative_nan.is_nan());
+        assert!(positive_nan.is_nan());
+
+        // Every NaN sorts after finite values, including when the accumulator
+        // already contains NaN before the finite value arrives.
+        for nan in [negative_nan, positive_nan] {
+            assert_eq!(aggregate(&[nan, 1.0], true).to_bits(), 1.0f32.to_bits());
+            assert_eq!(aggregate(&[nan, 1.0], false).to_bits(), nan.to_bits());
+            assert_eq!(aggregate(&[1.0, nan], true).to_bits(), 1.0f32.to_bits());
+            assert_eq!(aggregate(&[1.0, nan], false).to_bits(), nan.to_bits());
         }
-        let v = max.result().unwrap();
-        let v = v.as_any().downcast_ref::<Float32Array>().unwrap().value(0);
-        assert!(v.is_nan(), "max should pick NaN, got {v}");
+
+        assert_eq!(aggregate(&[0.0, -0.0], true).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(aggregate(&[-0.0, 0.0], false).to_bits(), 0.0f32.to_bits());
+        assert_eq!(aggregate(&[3.0, -2.0, 1.0], true), -2.0);
+        assert_eq!(aggregate(&[3.0, -2.0, 1.0], false), 3.0);
+
+        // Java canonicalizes NaNs for comparison only.  Equal NaNs must not
+        // replace the accumulator, so the first value's exact bits survive.
+        for values in [[negative_nan, positive_nan], [positive_nan, negative_nan]] {
+            assert_eq!(aggregate(&values, true).to_bits(), values[0].to_bits());
+            assert_eq!(aggregate(&values, false).to_bits(), values[0].to_bits());
+        }
+    }
+
+    #[test]
+    fn test_float64_min_max_matches_java_ordering() {
+        let aggregate = |values: &[f64], keep_smaller: bool| {
+            let arr = Float64Array::from_iter_values(values.iter().copied());
+            let mut agg: Box<dyn FieldAggregator> = if keep_smaller {
+                Box::new(min_agg(DataType::Double(DoubleType::new())))
+            } else {
+                Box::new(max_agg(DataType::Double(DoubleType::new())))
+            };
+            for i in 0..arr.len() {
+                agg.agg(&arr, i).unwrap();
+            }
+            let result = agg.result().unwrap();
+            result
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+        };
+
+        let negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
+        let positive_nan = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(negative_nan.is_nan());
+        assert!(positive_nan.is_nan());
+
+        for nan in [negative_nan, positive_nan] {
+            assert_eq!(aggregate(&[nan, 1.0], true).to_bits(), 1.0f64.to_bits());
+            assert_eq!(aggregate(&[nan, 1.0], false).to_bits(), nan.to_bits());
+            assert_eq!(aggregate(&[1.0, nan], true).to_bits(), 1.0f64.to_bits());
+            assert_eq!(aggregate(&[1.0, nan], false).to_bits(), nan.to_bits());
+        }
+
+        assert_eq!(aggregate(&[0.0, -0.0], true).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(aggregate(&[-0.0, 0.0], false).to_bits(), 0.0f64.to_bits());
+        assert_eq!(aggregate(&[3.0, -2.0, 1.0], true), -2.0);
+        assert_eq!(aggregate(&[3.0, -2.0, 1.0], false), 3.0);
+
+        for values in [[negative_nan, positive_nan], [positive_nan, negative_nan]] {
+            assert_eq!(aggregate(&values, true).to_bits(), values[0].to_bits());
+            assert_eq!(aggregate(&values, false).to_bits(), values[0].to_bits());
+        }
     }
 
     #[test]
