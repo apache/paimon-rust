@@ -271,8 +271,8 @@ mod tests {
         // Exercise the generic constructor directly (the key API the remote
         // FileIO path in #571 depends on), bypassing `from_input_file`.
         let bytes = build_archive(&[(0, "alpha bravo"), (1, "bravo charlie")]);
-        let reader = FullTextArchiveReader::from_seek_read(BytesReader::new(Bytes::from(bytes)))
-            .unwrap();
+        let reader =
+            FullTextArchiveReader::from_seek_read(BytesReader::new(Bytes::from(bytes))).unwrap();
 
         let hits = reader.search(r#"{"match":{"query":"bravo"}}"#, 10).unwrap();
         let mut ids = hits.row_ids.clone();
