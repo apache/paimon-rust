@@ -20,3 +20,10 @@
 //! archive format.
 
 pub mod reader;
+
+// Re-export the core I/O types that appear in this module's public API so that
+// consumers can implement `SeekRead` (e.g. a remote range-reader) or name the
+// in-memory reader while depending only on `paimon`, without pulling in
+// `paimon-ftindex-core` directly.
+pub use paimon_ftindex_core::io::{ReadRequest, SeekRead, SliceReader};
+pub use reader::{BytesReader, FullTextArchiveReader, FullTextHits};

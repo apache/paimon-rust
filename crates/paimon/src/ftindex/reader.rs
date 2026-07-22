@@ -17,7 +17,10 @@
 
 //! Reader over the `paimon-ftindex-core` v1 archive format.
 
-use paimon_ftindex_core::io::{SeekRead, SliceReader};
+use std::io;
+
+use bytes::Bytes;
+use paimon_ftindex_core::io::{ReadRequest, SeekRead};
 use paimon_ftindex_core::{FullTextIndexReader, FullTextSearchResult};
 use roaring::RoaringTreemap;
 
@@ -44,7 +47,7 @@ impl From<FullTextSearchResult> for FullTextHits {
 /// `paimon-ftindex-core` engine (v1 archive format).
 ///
 /// Generic over any `SeekRead` implementation, allowing both whole-file
-/// (via `SliceReader`) and streaming/range-read strategies.
+/// (via `BytesReader`/`SliceReader`) and streaming/range-read strategies.
 pub struct FullTextArchiveReader<R: SeekRead + 'static> {
     inner: FullTextIndexReader<R>,
 }
@@ -70,13 +73,22 @@ impl<R: SeekRead + 'static> FullTextArchiveReader<R> {
     }
 
     /// Like [`search`](Self::search) but restricts results to `include_row_ids`
-    /// (the live-row allow-list).
+    /// (the live-row allow-list). The bitmap is only serialized, never retained,
+    /// so it is borrowed to spare callers a clone when reusing an allow-list
+    /// across archives. An empty allow-list admits no rows, so this returns
+    /// empty hits immediately without running the query.
     pub fn search_with_include(
         &self,
         query_json: &str,
         limit: usize,
-        include_row_ids: RoaringTreemap,
+        include_row_ids: &RoaringTreemap,
     ) -> crate::Result<FullTextHits> {
+        if include_row_ids.is_empty() {
+            return Ok(FullTextHits {
+                row_ids: Vec::new(),
+                scores: Vec::new(),
+            });
+        }
         let mut filter_bytes = Vec::with_capacity(include_row_ids.serialized_size());
         include_row_ids
             .serialize_into(&mut filter_bytes)
@@ -91,16 +103,55 @@ impl<R: SeekRead + 'static> FullTextArchiveReader<R> {
     }
 }
 
-impl FullTextArchiveReader<SliceReader> {
+impl FullTextArchiveReader<BytesReader> {
     /// Read the whole archive from `input` into memory and open the engine
-    /// reader over it. Archives are single index files, so a whole-read keeps
-    /// peak memory at one archive.
+    /// reader over it. The bytes returned by `input.read()` are held directly
+    /// by a [`BytesReader`], so no second copy is made and peak memory stays at
+    /// roughly one archive.
     ///
     /// This is a convenience wrapper over [`from_seek_read`](Self::from_seek_read)
-    /// for the common whole-file case.
+    /// for the common whole-file case. For large or remote archives that should
+    /// not be fully buffered, call [`from_seek_read`](Self::from_seek_read) with
+    /// a range-reading [`SeekRead`] implementation instead.
     pub async fn from_input_file(input: &InputFile) -> crate::Result<Self> {
         let bytes = input.read().await?;
-        Self::from_seek_read(SliceReader::new(bytes.to_vec()))
+        Self::from_seek_read(BytesReader::new(bytes))
+    }
+}
+
+/// A whole-archive [`SeekRead`] backed by an in-memory [`Bytes`] buffer.
+///
+/// Unlike the core `SliceReader` (which owns a `Vec<u8>`), this holds the
+/// `Bytes` returned by `InputFile::read()` directly, so opening a reader from a
+/// whole-file read does not copy the archive a second time.
+pub struct BytesReader {
+    data: Bytes,
+}
+
+impl BytesReader {
+    /// Wrap an already-read archive buffer.
+    pub fn new(data: Bytes) -> Self {
+        Self { data }
+    }
+}
+
+impl SeekRead for BytesReader {
+    fn pread(&self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        for range in ranges {
+            let start = usize::try_from(range.pos)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+            let end = start
+                .checked_add(range.buf.len())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+            if end > self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read past end of archive",
+                ));
+            }
+            range.buf.copy_from_slice(&self.data[start..end]);
+        }
+        Ok(())
     }
 }
 
@@ -115,7 +166,6 @@ fn map_ft_err(e: paimon_ftindex_core::FtIndexError) -> crate::Error {
 mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
-    use bytes::Bytes;
     use paimon_ftindex_core::io::PosWriter;
     use paimon_ftindex_core::{FullTextIndexConfig, FullTextIndexWriter};
 
@@ -175,7 +225,7 @@ mod tests {
         include.insert(2);
 
         let hits = reader
-            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, include)
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, &include)
             .unwrap();
         let mut ids = hits.row_ids.clone();
         ids.sort_unstable();
@@ -197,7 +247,7 @@ mod tests {
         // Empty allow-list: an empty include-set admits no rows (not all rows).
         let empty = roaring::RoaringTreemap::new();
         let hits = reader
-            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, empty)
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, &empty)
             .unwrap();
         assert!(
             hits.row_ids.is_empty(),
@@ -208,11 +258,25 @@ mod tests {
         let mut disjoint = roaring::RoaringTreemap::new();
         disjoint.insert(99);
         let hits = reader
-            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, disjoint)
+            .search_with_include(r#"{"match":{"query":"token"}}"#, 10, &disjoint)
             .unwrap();
         assert!(
             hits.row_ids.is_empty(),
             "include-set disjoint from matches must admit no rows"
         );
+    }
+
+    #[test]
+    fn test_from_seek_read_opens_archive_directly() {
+        // Exercise the generic constructor directly (the key API the remote
+        // FileIO path in #571 depends on), bypassing `from_input_file`.
+        let bytes = build_archive(&[(0, "alpha bravo"), (1, "bravo charlie")]);
+        let reader = FullTextArchiveReader::from_seek_read(BytesReader::new(Bytes::from(bytes)))
+            .unwrap();
+
+        let hits = reader.search(r#"{"match":{"query":"bravo"}}"#, 10).unwrap();
+        let mut ids = hits.row_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1]);
     }
 }
