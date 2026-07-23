@@ -69,11 +69,8 @@ impl RESTTokenFileIO {
     /// * `identifier` - Table identifier for token requests.
     /// * `path` - Table path for FileIO construction.
     /// * `catalog_options` - Catalog options for RESTApi and FileIO.
-    pub fn new(identifier: Identifier, path: String, catalog_options: Options) -> Self {
-        Self::new_with_local_cache(identifier, path, catalog_options, None)
-    }
-
-    pub(crate) fn new_with_local_cache(
+    /// * `local_cache` - Catalog-scoped local cache shared across FileIO rebuilds.
+    pub(crate) fn new(
         identifier: Identifier,
         path: String,
         catalog_options: Options,
@@ -229,7 +226,7 @@ mod tests {
             cache_directory.path().to_string_lossy(),
         );
         let local_cache = create_local_cache(&options).unwrap();
-        let token_file_io = RESTTokenFileIO::new_with_local_cache(
+        let token_file_io = RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,

@@ -53,17 +53,7 @@ impl std::fmt::Debug for RESTEnv {
 
 impl RESTEnv {
     /// Create a new RESTEnv.
-    pub fn new(
-        identifier: Identifier,
-        uuid: String,
-        api: Arc<RESTApi>,
-        options: Options,
-        data_token_enabled: bool,
-    ) -> Self {
-        Self::new_with_local_cache(identifier, uuid, api, options, data_token_enabled, None)
-    }
-
-    pub(crate) fn new_with_local_cache(
+    pub(crate) fn new(
         identifier: Identifier,
         uuid: String,
         api: Arc<RESTApi>,
@@ -163,7 +153,7 @@ impl RESTEnv {
         })?;
 
         let file_io = if data_token_enabled && !is_external {
-            RESTTokenFileIO::new_with_local_cache(
+            RESTTokenFileIO::new(
                 identifier.clone(),
                 table_path.clone(),
                 options.clone(),
@@ -180,7 +170,7 @@ impl RESTEnv {
             builder.build()?
         };
 
-        let rest_env = RESTEnv::new_with_local_cache(
+        let rest_env = RESTEnv::new(
             identifier.clone(),
             uuid,
             api,
@@ -246,7 +236,7 @@ mod tests {
         let local_cache = create_local_cache(&options).unwrap();
         let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
 
-        let rest_env = RESTEnv::new_with_local_cache(
+        let rest_env = RESTEnv::new(
             Identifier::new("database", "table"),
             "uuid".to_string(),
             api,
