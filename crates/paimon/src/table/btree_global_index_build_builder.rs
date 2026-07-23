@@ -786,8 +786,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryType, DoubleType, FloatType, GlobalIndexSearchMode, IndexManifest, IntType,
-        ManifestEntry, Predicate, PredicateBuilder, Schema, TableSchema, VarBinaryType,
+        BinaryRowBuilder, BinaryType, DoubleType, FloatType, GlobalIndexSearchMode, IndexManifest,
+        IntType, ManifestEntry, Predicate, PredicateBuilder, Schema, TableSchema, VarBinaryType,
         VarCharType,
     };
     use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
@@ -1429,6 +1429,81 @@ mod tests {
                 trace.manifest_entries_after_manifest_filters,
                 expected_entries_read
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_global_index_ranges_skip_legacy_manifests() {
+        for search_mode in ["fast", "full"] {
+            let table_path = format!("memory:/test_empty_global_index_ranges_{search_mode}");
+            let mut options = table_options("10");
+            options.insert(
+                "global-index.search-mode".to_string(),
+                search_mode.to_string(),
+            );
+            let table = test_table_with_path(&table_path, options);
+            setup_dirs(&table).await;
+
+            let mut table_write = TableWrite::new(&table, "writer".to_string()).unwrap();
+            table_write
+                .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "writer".to_string())
+                .commit(table_write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_column("name")
+                .execute()
+                .await
+                .unwrap();
+
+            let mut legacy_file = data_file("legacy.parquet", None, 2);
+            legacy_file.level = 1;
+            legacy_file.file_source = Some(1); // FileSource.COMPACT
+            TableCommit::new(table.clone(), "legacy-writer".to_string())
+                .commit(vec![CommitMessage::new(
+                    BinaryRowBuilder::new(0).build_serialized(),
+                    0,
+                    vec![legacy_file],
+                )])
+                .await
+                .unwrap();
+
+            let snapshot = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.next_row_id(), Some(2));
+
+            let predicate = PredicateBuilder::new(table.schema().fields())
+                .equal(
+                    "name",
+                    crate::spec::Datum::String("not-present".to_string()),
+                )
+                .unwrap();
+            let mut read_builder = table.new_read_builder();
+            read_builder.with_filter(predicate);
+
+            let plan = read_builder.new_scan().plan().await.unwrap();
+            assert!(plan.splits().is_empty());
+
+            let (traced_plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+            let delta_plan = read_builder
+                .new_scan()
+                .plan_snapshot_delta(&snapshot)
+                .await
+                .unwrap();
+
+            assert!(traced_plan.splits().is_empty());
+            assert_eq!(trace.manifest_entries_read, 0);
+            assert_eq!(trace.final_splits, 0);
+            assert_eq!(trace.final_files, 0);
+            assert!(delta_plan.splits().is_empty());
         }
     }
 

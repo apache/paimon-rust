@@ -1504,6 +1504,9 @@ impl<'a> PaimonTableScan<'a> {
         let manifest_row_ranges = self
             .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
+        if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Plan::new(Vec::new()));
+        }
         let row_range_index = if data_evolution_enabled {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
@@ -1677,6 +1680,12 @@ impl<'a> PaimonTableScan<'a> {
         let manifest_row_ranges = self
             .manifest_row_ranges(&snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
+        if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
+            if let Some(trace) = trace {
+                trace.record_final_plan(0, 0, 0);
+            }
+            return Ok(Plan::new(Vec::new()));
+        }
         let row_range_index = if data_evolution_enabled {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
