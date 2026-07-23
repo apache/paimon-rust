@@ -451,8 +451,10 @@ fn agg_minmax(
                         (false, false) => v.total_cmp(&prev),
                     };
                     let take_new = if keep_smaller {
-                        cmp.is_lt()
+                        // Java `FieldMinAgg` returns the input on ties.
+                        cmp.is_le()
                     } else {
+                        // Java `FieldMaxAgg` retains the accumulator on ties.
                         cmp.is_gt()
                     };
                     if take_new {
@@ -970,10 +972,11 @@ mod tests {
         assert_eq!(aggregate(&[3.0, -2.0, 1.0], true), -2.0);
         assert_eq!(aggregate(&[3.0, -2.0, 1.0], false), 3.0);
 
-        // Java canonicalizes NaNs for comparison only.  Equal NaNs must not
-        // replace the accumulator, so the first value's exact bits survive.
+        // Java canonicalizes NaNs for comparison only.  On equal values,
+        // `FieldMinAgg` takes the new input while `FieldMaxAgg` retains the
+        // accumulator, without rewriting either NaN's exact bits.
         for values in [[negative_nan, positive_nan], [positive_nan, negative_nan]] {
-            assert_eq!(aggregate(&values, true).to_bits(), values[0].to_bits());
+            assert_eq!(aggregate(&values, true).to_bits(), values[1].to_bits());
             assert_eq!(aggregate(&values, false).to_bits(), values[0].to_bits());
         }
     }
@@ -1016,7 +1019,7 @@ mod tests {
         assert_eq!(aggregate(&[3.0, -2.0, 1.0], false), 3.0);
 
         for values in [[negative_nan, positive_nan], [positive_nan, negative_nan]] {
-            assert_eq!(aggregate(&values, true).to_bits(), values[0].to_bits());
+            assert_eq!(aggregate(&values, true).to_bits(), values[1].to_bits());
             assert_eq!(aggregate(&values, false).to_bits(), values[0].to_bits());
         }
     }
