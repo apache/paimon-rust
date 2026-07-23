@@ -22,6 +22,7 @@
 //! and automatic refresh.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::{OnceCell, RwLock};
 
@@ -29,6 +30,7 @@ use crate::api::rest_api::RESTApi;
 use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
+use crate::io::cache::LocalCache;
 use crate::io::FileIO;
 use crate::Result;
 
@@ -56,6 +58,8 @@ pub struct RESTTokenFileIO {
     api: OnceCell<RESTApi>,
     /// Cached token with RwLock for concurrent access.
     token: RwLock<Option<RESTToken>>,
+    /// Catalog-scoped cache preserved across token-driven FileIO rebuilds.
+    local_cache: Option<Arc<LocalCache>>,
 }
 
 impl RESTTokenFileIO {
@@ -66,12 +70,22 @@ impl RESTTokenFileIO {
     /// * `path` - Table path for FileIO construction.
     /// * `catalog_options` - Catalog options for RESTApi and FileIO.
     pub fn new(identifier: Identifier, path: String, catalog_options: Options) -> Self {
+        Self::new_with_local_cache(identifier, path, catalog_options, None)
+    }
+
+    pub(crate) fn new_with_local_cache(
+        identifier: Identifier,
+        path: String,
+        catalog_options: Options,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Self {
         Self {
             identifier,
             path,
             catalog_options,
             api: OnceCell::new(),
             token: RwLock::new(None),
+            local_cache,
         }
     }
 
@@ -98,11 +112,18 @@ impl RESTTokenFileIO {
                 // Build FileIO with merged properties
                 let mut builder = FileIO::from_path(&self.path)?;
                 builder = builder.with_props(merged_props);
+                if let Some(local_cache) = &self.local_cache {
+                    builder = builder.with_local_cache(local_cache.clone());
+                }
                 builder.build()
             }
             None => {
                 // No token available, build FileIO from path only
-                FileIO::from_path(&self.path)?.build()
+                let mut builder = FileIO::from_path(&self.path)?;
+                if let Some(local_cache) = &self.local_cache {
+                    builder = builder.with_local_cache(local_cache.clone());
+                }
+                builder.build()
             }
         }
     }
@@ -189,5 +210,40 @@ impl RESTTokenFileIO {
             }
         }
         merged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::cache::create_local_cache;
+
+    #[tokio::test]
+    async fn test_token_file_io_keeps_catalog_local_cache() {
+        let cache_directory = tempfile::tempdir().unwrap();
+        let table_directory = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_directory.path().to_string_lossy(),
+        );
+        let local_cache = create_local_cache(&options).unwrap();
+        let token_file_io = RESTTokenFileIO::new_with_local_cache(
+            Identifier::new("database", "table"),
+            table_directory.path().to_string_lossy().into_owned(),
+            options,
+            local_cache,
+        );
+        let valid_until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2;
+        *token_file_io.token.write().await = Some(RESTToken::new(HashMap::new(), valid_until));
+
+        let file_io = token_file_io.build_file_io().await.unwrap();
+
+        assert!(file_io.has_local_cache());
     }
 }

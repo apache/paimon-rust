@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
+use crate::io::cache::create_local_cache;
 use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
 use crate::table::{SchemaManager, Table};
@@ -101,9 +102,13 @@ impl FileSystemCatalog {
                     message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
                 })?;
 
-        let file_io = FileIO::from_path(&warehouse)?
-            .with_props(options.to_map().iter())
-            .build()?;
+        let local_cache = create_local_cache(&options)?;
+        let mut file_io_builder =
+            FileIO::from_path(&warehouse)?.with_props(options.to_map().iter());
+        if let Some(local_cache) = local_cache {
+            file_io_builder = file_io_builder.with_local_cache(local_cache);
+        }
+        let file_io = file_io_builder.build()?;
 
         Ok(Self { file_io, warehouse })
     }
@@ -500,6 +505,26 @@ mod tests {
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse");
         FileSystemCatalog::new(options).unwrap()
+    }
+
+    #[test]
+    fn test_filesystem_catalog_builds_local_cache_from_catalog_options() {
+        let warehouse = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let mut options = Options::new();
+        options.set(
+            CatalogOptions::WAREHOUSE,
+            warehouse.path().to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache.path().to_string_lossy(),
+        );
+
+        let catalog = FileSystemCatalog::new(options).unwrap();
+
+        assert!(catalog.file_io().has_local_cache());
     }
 
     fn testing_schema() -> Schema {

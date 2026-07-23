@@ -72,6 +72,21 @@ impl CatalogOptions {
 
     /// DLF OSS endpoint override.
     pub const DLF_OSS_ENDPOINT: &'static str = "dlf.oss-endpoint";
+
+    /// Whether to enable local block caching for file reads.
+    pub const LOCAL_CACHE_ENABLED: &'static str = "local-cache.enabled";
+
+    /// Directory for the local disk block cache.
+    pub const LOCAL_CACHE_DIR: &'static str = "local-cache.dir";
+
+    /// Maximum total encoded size of the local block cache.
+    pub const LOCAL_CACHE_MAX_SIZE: &'static str = "local-cache.max-size";
+
+    /// Block size used by the local cache.
+    pub const LOCAL_CACHE_BLOCK_SIZE: &'static str = "local-cache.block-size";
+
+    /// Comma-separated file types eligible for local caching.
+    pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
 }
 
 /// Configuration options container.
@@ -213,5 +228,20 @@ mod tests {
 
         assert_eq!(options1.get("key1"), Some(&"overwritten".to_string()));
         assert_eq!(options1.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_local_cache_catalog_option_keys() {
+        assert_eq!(CatalogOptions::LOCAL_CACHE_ENABLED, "local-cache.enabled");
+        assert_eq!(CatalogOptions::LOCAL_CACHE_DIR, "local-cache.dir");
+        assert_eq!(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "local-cache.max-size");
+        assert_eq!(
+            CatalogOptions::LOCAL_CACHE_BLOCK_SIZE,
+            "local-cache.block-size"
+        );
+        assert_eq!(
+            CatalogOptions::LOCAL_CACHE_WHITELIST,
+            "local-cache.whitelist"
+        );
     }
 }

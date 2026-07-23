@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod cache;
 mod file_io;
 pub use file_io::*;
 

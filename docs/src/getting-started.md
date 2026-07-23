@@ -140,6 +140,43 @@ Supported metastore types:
 | `filesystem`   | Local or remote filesystem (default) |
 | `rest`         | REST catalog server              |
 
+### Local Disk Cache
+
+Catalogs can cache immutable Paimon metadata and index file blocks on local
+disk. The cache works with both filesystem and REST catalogs:
+
+```rust
+let mut options = Options::new();
+options.set(CatalogOptions::WAREHOUSE, "s3://bucket/warehouse");
+options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+options.set(CatalogOptions::LOCAL_CACHE_DIR, "/var/cache/paimon/worker-1");
+options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "20 GiB");
+options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "1 MiB");
+options.set(
+    CatalogOptions::LOCAL_CACHE_WHITELIST,
+    "meta,global-index",
+);
+let catalog = CatalogFactory::create(options).await?;
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `local-cache.enabled` | `false` | Enable catalog-scoped local block caching. |
+| `local-cache.dir` | none | Base cache directory; required when caching is enabled. Paimon stores entries in a private versioned child directory. |
+| `local-cache.max-size` | unlimited | Maximum encoded disk usage. Values accept byte units such as `512 MiB` or `20 GiB`. |
+| `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
+| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`. |
+
+The cache is disk-only and is reused after process restarts. Cache keys include
+a catalog-configuration fingerprint and the canonical storage object path, so
+catalogs can safely use the same base directory without reading one another's
+entries. Runtime cache read, write, validation, and eviction failures are
+fail-open: the original storage remains the source of truth. Paimon mutable
+markers and temporary files always bypass the cache; other eligible files rely
+on Paimon's immutable-file convention. Use a separate `local-cache.dir` for
+each worker or process because processes do not share exact LRU or size
+accounting.
+
 ### Manage Databases
 
 ```rust

@@ -33,6 +33,7 @@ use crate::catalog::{
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
+use crate::io::cache::{create_local_cache, LocalCache};
 use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
@@ -52,6 +53,8 @@ pub struct RESTCatalog {
     warehouse: String,
     /// Whether data token is enabled for FileIO construction.
     data_token_enabled: bool,
+    /// Catalog-scoped cache shared by all table FileIO instances.
+    local_cache: Option<Arc<LocalCache>>,
 }
 
 impl RESTCatalog {
@@ -70,6 +73,7 @@ impl RESTCatalog {
             .ok_or_else(|| RestError::BadRequest {
                 message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
             })?;
+        let local_cache = create_local_cache(&options)?;
 
         let api = Arc::new(RESTApi::new(options.clone(), config_required).await?);
 
@@ -86,6 +90,7 @@ impl RESTCatalog {
             options: api_options,
             warehouse,
             data_token_enabled,
+            local_cache,
         })
     }
 
@@ -102,6 +107,11 @@ impl RESTCatalog {
     /// Whether data token is enabled.
     pub fn data_token_enabled(&self) -> bool {
         self.data_token_enabled
+    }
+
+    #[cfg(test)]
+    fn has_local_cache(&self) -> bool {
+        self.local_cache.is_some()
     }
 
     /// List databases with pagination.
@@ -201,6 +211,7 @@ impl Catalog for RESTCatalog {
             self.api.clone(),
             self.options.clone(),
             self.data_token_enabled,
+            self.local_cache.clone(),
         )
         .await
     }
@@ -530,4 +541,28 @@ where
             Err(err)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_rest_catalog_builds_local_cache_from_client_options() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache.path().to_string_lossy(),
+        );
+
+        let catalog = RESTCatalog::new(options, false).await.unwrap();
+
+        assert!(catalog.has_local_cache());
+    }
 }

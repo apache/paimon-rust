@@ -17,8 +17,11 @@
 
 use crate::error::*;
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -29,14 +32,21 @@ use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
+use super::cache::{CachedFileReader, LocalCache};
 use super::Storage;
 
 #[derive(Clone, Debug)]
 pub struct FileIO {
     storage: Arc<Storage>,
+    cache: Option<Arc<LocalCache>>,
 }
 
 impl FileIO {
+    #[cfg(test)]
+    pub(crate) fn has_local_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
     /// Try to infer file io scheme from path.
     ///
     /// The input HashMap is paimon-java's [`Options`](https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/options/Options.java#L60)
@@ -79,10 +89,17 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
         let (op, relative_path) = self.storage.create(path)?;
+        let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(InputFile {
             op,
             path: path.to_string(),
             relative_path: relative_path.into_owned(),
+            cache_path,
+            cache: self
+                .cache
+                .as_ref()
+                .filter(|cache| cache.is_cacheable(path))
+                .cloned(),
         })
     }
 
@@ -91,10 +108,17 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> Result<OutputFile> {
         let (op, relative_path) = self.storage.create(path)?;
+        let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(OutputFile {
             op,
             path: path.to_string(),
             relative_path: relative_path.into_owned(),
+            cache_path,
+            cache: self
+                .cache
+                .as_ref()
+                .filter(|cache| cache.is_cacheable(path))
+                .cloned(),
         })
     }
 
@@ -230,12 +254,16 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
+        let cache_path = cache_object_path(&op, relative_path.as_ref());
 
         op.delete(relative_path.as_ref())
             .await
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete file '{path}'"),
             })?;
+        if let Some(cache) = self.cache.as_ref().filter(|cache| cache.is_cacheable(path)) {
+            cache.invalidate_path(&cache_path).await;
+        }
 
         Ok(())
     }
@@ -245,6 +273,7 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
+        let cache_path = cache_object_path(&op, relative_path.as_ref());
 
         op.delete_with(relative_path.as_ref())
             .recursive(true)
@@ -252,6 +281,9 @@ impl FileIO {
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to delete directory '{path}'"),
             })?;
+        if let Some(cache) = &self.cache {
+            cache.invalidate_prefix(&cache_path).await;
+        }
 
         Ok(())
     }
@@ -288,7 +320,9 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let (op_src, relative_path_src) = self.storage.create(src)?;
-        let (_, relative_path_dst) = self.storage.create(dst)?;
+        let (op_dst, relative_path_dst) = self.storage.create(dst)?;
+        let cache_path_src = cache_object_path(&op_src, relative_path_src.as_ref());
+        let cache_path_dst = cache_object_path(&op_dst, relative_path_dst.as_ref());
 
         op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
@@ -296,6 +330,10 @@ impl FileIO {
             .context(IoUnexpectedSnafu {
                 message: format!("Failed to rename '{src}' to '{dst}'"),
             })?;
+        if let Some(cache) = &self.cache {
+            cache.invalidate_prefix(&cache_path_src).await;
+            cache.invalidate_prefix(&cache_path_dst).await;
+        }
 
         Ok(())
     }
@@ -307,6 +345,17 @@ fn status_path(base_path: &str, entry_path: &str) -> String {
     } else {
         format!("{base_path}/{entry_path}")
     }
+}
+
+fn cache_object_path(op: &Operator, relative_path: &str) -> String {
+    let info = op.info();
+    format!(
+        "{}\0{}\0{}\0{}",
+        info.scheme(),
+        info.name(),
+        info.root(),
+        relative_path.trim_start_matches('/')
+    )
 }
 
 /// Whether `path` begins with a Windows drive specifier such as `C:\` or `C:/`.
@@ -322,6 +371,7 @@ pub(crate) fn looks_like_windows_drive_path(path: &str) -> bool {
 pub struct FileIOBuilder {
     scheme_str: Option<String>,
     props: HashMap<String, String>,
+    cache: Option<Arc<LocalCache>>,
 }
 
 impl FileIOBuilder {
@@ -329,6 +379,7 @@ impl FileIOBuilder {
         Self {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
+            cache: None,
         }
     }
 
@@ -350,10 +401,17 @@ impl FileIOBuilder {
         self
     }
 
+    pub(crate) fn with_local_cache(mut self, cache: Arc<LocalCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     pub fn build(self) -> crate::Result<FileIO> {
+        let cache = self.cache.clone();
         let storage = Storage::build(self)?;
         Ok(FileIO {
             storage: Arc::new(storage),
+            cache,
         })
     }
 }
@@ -367,6 +425,21 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
 impl FileRead for opendal::Reader {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         Ok(opendal::Reader::read(self, range).await?.to_bytes())
+    }
+}
+
+enum InputFileReader {
+    Direct(opendal::Reader),
+    Cached(CachedFileReader),
+}
+
+#[async_trait::async_trait]
+impl FileRead for InputFileReader {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        match self {
+            Self::Direct(reader) => FileRead::read(reader, range).await,
+            Self::Cached(reader) => FileRead::read(reader, range).await,
+        }
     }
 }
 
@@ -389,10 +462,81 @@ impl FileWrite for opendal::Writer {
     }
 }
 
+struct CacheInvalidatingWriter {
+    delegate: Box<dyn FileWrite>,
+    cache: Arc<LocalCache>,
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl FileWrite for CacheInvalidatingWriter {
+    async fn write(&mut self, bs: Bytes) -> crate::Result<()> {
+        self.delegate.write(bs).await
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        self.delegate.close().await?;
+        self.cache.invalidate_path(&self.path).await;
+        Ok(())
+    }
+}
+
 /// Async streaming writer trait for format-level writers (e.g. parquet).
 pub trait AsyncFileWrite: tokio::io::AsyncWrite + Unpin + Send {}
 
 impl<T: tokio::io::AsyncWrite + Unpin + Send> AsyncFileWrite for T {}
+
+struct CacheInvalidatingAsyncWriter {
+    delegate: Box<dyn AsyncFileWrite>,
+    cache: Arc<LocalCache>,
+    path: String,
+    delegate_shutdown: bool,
+    invalidation: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+impl tokio::io::AsyncWrite for CacheInvalidatingAsyncWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.delegate).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.delegate).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.delegate_shutdown {
+            match Pin::new(&mut *self.delegate).poll_shutdown(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {
+                    self.delegate_shutdown = true;
+                    let cache = self.cache.clone();
+                    let path = self.path.clone();
+                    self.invalidation =
+                        Some(Box::pin(async move { cache.invalidate_path(&path).await }));
+                }
+            }
+        }
+
+        if let Some(invalidation) = &mut self.invalidation {
+            match invalidation.as_mut().poll(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => self.invalidation = None,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FileStatus {
@@ -409,6 +553,8 @@ pub struct InputFile {
     /// The opendal-relative path (see [`FileIO::new_input`]); not necessarily a
     /// suffix of `path`, since local paths are separator-normalized.
     relative_path: String,
+    cache_path: String,
+    cache: Option<Arc<LocalCache>>,
 }
 
 impl InputFile {
@@ -434,11 +580,40 @@ impl InputFile {
     }
 
     pub async fn read(&self) -> crate::Result<Bytes> {
-        Ok(self.op.read(&self.relative_path).await?.to_bytes())
+        let Some(cache) = &self.cache else {
+            return Ok(self.op.read(&self.relative_path).await?.to_bytes());
+        };
+        let size = if let Some(size) = cache.file_size(&self.cache_path) {
+            size
+        } else {
+            let size = self.op.stat(&self.relative_path).await?.content_length();
+            cache.put_file_size(&self.cache_path, size);
+            size
+        };
+        let delegate = Arc::new(self.op.reader(&self.relative_path).await?);
+        CachedFileReader::new(delegate, &self.cache_path, size, cache.clone())
+            .read_full()
+            .await
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
-        Ok(self.op.reader(&self.relative_path).await?)
+        let reader = self.op.reader(&self.relative_path).await?;
+        let Some(cache) = &self.cache else {
+            return Ok(InputFileReader::Direct(reader));
+        };
+        let size = if let Some(size) = cache.file_size(&self.cache_path) {
+            size
+        } else {
+            let size = self.op.stat(&self.relative_path).await?.content_length();
+            cache.put_file_size(&self.cache_path, size);
+            size
+        };
+        Ok(InputFileReader::Cached(CachedFileReader::new(
+            Arc::new(reader),
+            &self.cache_path,
+            size,
+            cache.clone(),
+        )))
     }
 }
 
@@ -449,6 +624,8 @@ pub struct OutputFile {
     /// The opendal-relative path (see [`FileIO::new_output`]); not necessarily a
     /// suffix of `path`, since local paths are separator-normalized.
     relative_path: String,
+    cache_path: String,
+    cache: Option<Arc<LocalCache>>,
 }
 
 impl OutputFile {
@@ -461,10 +638,13 @@ impl OutputFile {
     }
 
     pub fn to_input_file(self) -> InputFile {
+        let cache = self.cache.filter(|cache| cache.is_cacheable(&self.path));
         InputFile {
             op: self.op,
             path: self.path,
             relative_path: self.relative_path,
+            cache_path: self.cache_path,
+            cache,
         }
     }
 
@@ -475,17 +655,35 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        Ok(Box::new(self.opendal_writer().await?))
+        let writer: Box<dyn FileWrite> = Box::new(self.opendal_writer().await?);
+        let Some(cache) = &self.cache else {
+            return Ok(writer);
+        };
+        Ok(Box::new(CacheInvalidatingWriter {
+            delegate: writer,
+            cache: cache.clone(),
+            path: self.cache_path.clone(),
+        }))
     }
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
-        Ok(Box::new(
+        let writer: Box<dyn AsyncFileWrite> = Box::new(
             self.opendal_writer()
                 .await?
                 .into_futures_async_write()
                 .compat_write(),
-        ))
+        );
+        let Some(cache) = &self.cache else {
+            return Ok(writer);
+        };
+        Ok(Box::new(CacheInvalidatingAsyncWriter {
+            delegate: writer,
+            cache: cache.clone(),
+            path: self.cache_path.clone(),
+            delegate_shutdown: false,
+            invalidation: None,
+        }))
     }
 
     async fn opendal_writer(&self) -> crate::Result<opendal::Writer> {
@@ -896,7 +1094,11 @@ mod object_storage_path_test {
 
 #[cfg(test)]
 mod input_output_test {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::common::{CatalogOptions, Options};
+    use crate::io::cache::{LocalCache, LocalCacheConfig};
     use bytes::Bytes;
 
     fn setup_memory_file_io() -> FileIO {
@@ -905,6 +1107,23 @@ mod input_output_test {
 
     fn setup_fs_file_io() -> FileIO {
         FileIOBuilder::new("file").build().unwrap()
+    }
+
+    fn setup_cached_fs_file_io(cache_directory: &std::path::Path) -> FileIO {
+        let mut options = Options::new();
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_directory.to_string_lossy(),
+        );
+        options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap()).unwrap(),
+        );
+        FileIOBuilder::new("file")
+            .with_local_cache(cache)
+            .build()
+            .unwrap()
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
@@ -1008,5 +1227,362 @@ mod input_output_test {
     async fn test_input_file_partial_read_fs() {
         let file_io = setup_fs_file_io();
         common_test_input_file_partial_read(&file_io, "file:/tmp/test_file_read_fs").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_serves_full_read_after_source_disappears() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"cached metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"cached metadata")
+        );
+        std::fs::remove_file(&source_path).unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"cached metadata")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_serves_range_after_source_disappears() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"cached metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        let reader = file_io
+            .new_input(&location)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read(1..7).await.unwrap(),
+            Bytes::from_static(b"ached ")
+        );
+        std::fs::remove_file(&source_path).unwrap();
+        let reader = file_io
+            .new_input(&location)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read(1..7).await.unwrap(),
+            Bytes::from_static(b"ached ")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_after_successful_write() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"old metadata")
+        );
+        file_io
+            .new_output(&location)
+            .unwrap()
+            .write(Bytes::from_static(b"new metadata"))
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_equivalent_local_path_alias() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let file_location = format!("file:{}", source_path.display());
+        let absolute_location = source_path.to_string_lossy();
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io
+                .new_input(&file_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"old metadata")
+        );
+        file_io
+            .new_output(absolute_location.as_ref())
+            .unwrap()
+            .write(Bytes::from_static(b"new metadata"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_io
+                .new_input(&file_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_after_delete() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"old metadata")
+        );
+        file_io.delete_file(&location).await.unwrap();
+        std::fs::write(&source_path, b"new metadata").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_after_delete_directory() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let snapshot_directory = source_directory.path().join("snapshot");
+        std::fs::create_dir(&snapshot_directory).unwrap();
+        let source_path = snapshot_directory.join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let directory_location = format!("file:{}", snapshot_directory.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"old metadata")
+        );
+        file_io.delete_dir(&directory_location).await.unwrap();
+        std::fs::create_dir(&snapshot_directory).unwrap();
+        std::fs::write(&source_path, b"new metadata").unwrap();
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"new metadata")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_copy_target() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        let target_path = source_directory.path().join("snapshot-2");
+        std::fs::write(&source_path, b"source value").unwrap();
+        std::fs::write(&target_path, b"stale target").unwrap();
+        let source_location = format!("file:{}", source_path.display());
+        let target_location = format!("file:{}", target_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"stale target")
+        );
+        file_io
+            .copy_file(&source_location, &target_location)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"source value")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_source_and_target_after_rename() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        let target_path = source_directory.path().join("snapshot-2");
+        std::fs::write(&source_path, b"source value").unwrap();
+        std::fs::write(&target_path, b"target value").unwrap();
+        let source_location = format!("file:{}", source_path.display());
+        let target_location = format!("file:{}", target_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io
+                .new_input(&source_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"source value")
+        );
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"target value")
+        );
+        file_io
+            .rename(&source_location, &target_location)
+            .await
+            .unwrap();
+        std::fs::write(&source_path, b"new source!!").unwrap();
+
+        assert_eq!(
+            file_io
+                .new_input(&target_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"source value")
+        );
+        assert_eq!(
+            file_io
+                .new_input(&source_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new source!!")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_directories_after_rename() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let old_directory = source_directory.path().join("old");
+        let new_directory = source_directory.path().join("new");
+        std::fs::create_dir(&old_directory).unwrap();
+        std::fs::create_dir(&new_directory).unwrap();
+        let old_snapshot = old_directory.join("snapshot-1");
+        let new_snapshot = new_directory.join("snapshot-1");
+        std::fs::write(&old_snapshot, b"old directory").unwrap();
+        std::fs::write(&new_snapshot, b"new directory").unwrap();
+        let old_directory_location = format!("file:{}", old_directory.display());
+        let new_directory_location = format!("file:{}", new_directory.display());
+        let old_snapshot_location = format!("file:{}", old_snapshot.display());
+        let new_snapshot_location = format!("file:{}", new_snapshot.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io
+                .new_input(&old_snapshot_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"old directory")
+        );
+        assert_eq!(
+            file_io
+                .new_input(&new_snapshot_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new directory")
+        );
+        std::fs::remove_dir_all(&new_directory).unwrap();
+        file_io
+            .rename(&old_directory_location, &new_directory_location)
+            .await
+            .unwrap();
+        std::fs::create_dir(&old_directory).unwrap();
+        std::fs::write(&old_snapshot, b"replacement!!").unwrap();
+
+        assert_eq!(
+            file_io
+                .new_input(&new_snapshot_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"old directory")
+        );
+        assert_eq!(
+            file_io
+                .new_input(&old_snapshot_location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"replacement!!")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_local_cache_invalidates_after_streaming_write_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let location = format!("file:{}", source_path.display());
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"old metadata")
+        );
+        let mut writer = file_io
+            .new_output(&location)
+            .unwrap()
+            .async_writer()
+            .await
+            .unwrap();
+        writer.write_all(b"new metadata").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(
+            file_io.new_input(&location).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"new metadata")
+        );
     }
 }

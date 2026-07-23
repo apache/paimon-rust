@@ -22,6 +22,7 @@ use crate::api::rest_error::RestError;
 use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::Options;
 use crate::error::Error;
+use crate::io::cache::LocalCache;
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
@@ -38,6 +39,7 @@ pub struct RESTEnv {
     api: Arc<RESTApi>,
     options: Options,
     data_token_enabled: bool,
+    local_cache: Option<Arc<LocalCache>>,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -58,13 +60,30 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
     ) -> Self {
+        Self::new_with_local_cache(identifier, uuid, api, options, data_token_enabled, None)
+    }
+
+    pub(crate) fn new_with_local_cache(
+        identifier: Identifier,
+        uuid: String,
+        api: Arc<RESTApi>,
+        options: Options,
+        data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Self {
         Self {
             identifier,
             uuid,
             api,
             options,
             data_token_enabled,
+            local_cache,
         }
+    }
+
+    #[cfg(test)]
+    fn has_local_cache(&self) -> bool {
+        self.local_cache.is_some()
     }
 
     /// Get the REST API client.
@@ -84,6 +103,7 @@ impl RESTEnv {
             self.api.clone(),
             self.options.clone(),
             self.data_token_enabled,
+            self.local_cache.clone(),
         )
         .await
     }
@@ -94,6 +114,7 @@ impl RESTEnv {
         api: Arc<RESTApi>,
         options: Options,
         data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
         let response = api
             .get_table(identifier)
@@ -142,16 +163,31 @@ impl RESTEnv {
         })?;
 
         let file_io = if data_token_enabled && !is_external {
-            RESTTokenFileIO::new(identifier.clone(), table_path.clone(), options.clone())
-                .build_file_io()
-                .await?
+            RESTTokenFileIO::new_with_local_cache(
+                identifier.clone(),
+                table_path.clone(),
+                options.clone(),
+                local_cache.clone(),
+            )
+            .build_file_io()
+            .await?
         } else {
             let mut builder = FileIO::from_path(&table_path)?;
             builder = builder.with_props(options.to_map());
+            if let Some(local_cache) = &local_cache {
+                builder = builder.with_local_cache(local_cache.clone());
+            }
             builder.build()?
         };
 
-        let rest_env = RESTEnv::new(identifier.clone(), uuid, api, options, data_token_enabled);
+        let rest_env = RESTEnv::new_with_local_cache(
+            identifier.clone(),
+            uuid,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+        );
 
         Ok(Table::new(
             file_io,
@@ -185,5 +221,41 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
             full_name: identifier.full_name(),
         },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::CatalogOptions;
+    use crate::io::cache::create_local_cache;
+
+    #[tokio::test]
+    async fn test_rest_env_clones_catalog_local_cache() {
+        let cache_directory = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_directory.path().to_string_lossy(),
+        );
+        let local_cache = create_local_cache(&options).unwrap();
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+
+        let rest_env = RESTEnv::new_with_local_cache(
+            Identifier::new("database", "table"),
+            "uuid".to_string(),
+            api,
+            options,
+            false,
+            local_cache,
+        );
+
+        assert!(rest_env.has_local_cache());
+        assert!(rest_env.clone().has_local_cache());
     }
 }
