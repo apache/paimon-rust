@@ -33,7 +33,7 @@ use crate::catalog::{
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::{create_local_cache, LocalCache};
+use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
 use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
@@ -73,8 +73,6 @@ impl RESTCatalog {
             .ok_or_else(|| RestError::BadRequest {
                 message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
             })?;
-        let local_cache = create_local_cache(&options)?;
-
         let api = Arc::new(RESTApi::new(options.clone(), config_required).await?);
 
         let data_token_enabled = api
@@ -84,6 +82,7 @@ impl RESTCatalog {
             .unwrap_or(false);
 
         let api_options = api.options().clone();
+        let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
 
         Ok(Self {
             api,

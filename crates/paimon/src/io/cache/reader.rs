@@ -33,6 +33,7 @@ pub(crate) struct CachedFileReader {
 }
 
 impl CachedFileReader {
+    #[cfg(test)]
     pub(crate) fn new(
         delegate: Arc<dyn FileRead>,
         path: impl Into<String>,
@@ -41,9 +42,19 @@ impl CachedFileReader {
     ) -> Self {
         let path = path.into();
         let read_token = cache.read_token(&path);
+        Self::new_with_token(delegate, path, file_size, cache, read_token)
+    }
+
+    pub(in crate::io) fn new_with_token(
+        delegate: Arc<dyn FileRead>,
+        path: impl Into<String>,
+        file_size: u64,
+        cache: Arc<LocalCache>,
+        read_token: CacheReadToken,
+    ) -> Self {
         Self {
             delegate,
-            path,
+            path: path.into(),
             file_size,
             cache,
             read_token,
@@ -322,6 +333,40 @@ mod tests {
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn test_cached_range_single_flight_is_shared_across_cache_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let delegate = Arc::new(SlowCountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let config = || LocalCacheConfig {
+            dir: directory.path().to_path_buf(),
+            namespace: "test".to_string(),
+            max_size: None,
+            block_size: 4,
+            whitelist: std::collections::HashSet::from([FileType::Meta]),
+        };
+        let first_reader = CachedFileReader::new(
+            delegate.clone(),
+            "s3://bucket/table/snapshot/snapshot-1",
+            8,
+            Arc::new(LocalCache::new(config()).unwrap()),
+        );
+        let second_reader = CachedFileReader::new(
+            delegate.clone(),
+            "s3://bucket/table/snapshot/snapshot-1",
+            8,
+            Arc::new(LocalCache::new(config()).unwrap()),
+        );
+
+        let (first, second) = tokio::join!(first_reader.read(0..4), second_reader.read(0..4));
+
+        assert_eq!(first.unwrap(), Bytes::from_static(b"abcd"));
+        assert_eq!(second.unwrap(), Bytes::from_static(b"abcd"));
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
     #[derive(Debug)]
     struct BlockingReader {
         data: Bytes,
@@ -384,6 +429,149 @@ mod tests {
             current_reader.read(0..4).await.unwrap(),
             Bytes::from_static(b"new!")
         );
+        assert_eq!(current_delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_miss_cannot_republish_across_shared_cache_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = "s3://bucket/table/snapshot/snapshot-1";
+        let cache_a = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                dir: directory.path().to_path_buf(),
+                namespace: "test".to_string(),
+                max_size: None,
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let cache_b = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                dir: directory.path().to_path_buf(),
+                namespace: "test".to_string(),
+                max_size: None,
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let old_reader = CachedFileReader::new(
+            Arc::new(BlockingReader {
+                data: Bytes::from_static(b"old!"),
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            path,
+            4,
+            cache_a,
+        );
+        let old_load = tokio::spawn(async move { old_reader.read(0..4).await });
+
+        started.notified().await;
+        cache_b.invalidate_path(path).await;
+        release.notify_one();
+        assert_eq!(
+            old_load.await.unwrap().unwrap(),
+            Bytes::from_static(b"old!")
+        );
+
+        let current_delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"new!"),
+            reads: AtomicUsize::new(0),
+        });
+        let current_reader =
+            CachedFileReader::new(current_delegate.clone(), path, 4, cache_b.clone());
+        assert_eq!(
+            current_reader.read(0..4).await.unwrap(),
+            Bytes::from_static(b"new!")
+        );
+        assert_eq!(current_delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prefix_invalidation_cannot_hit_old_block_while_waiting_on_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = "s3://bucket/table/snapshot";
+        let first_path = "s3://bucket/table/snapshot/snapshot-1";
+        let observed_path = "s3://bucket/table/snapshot/snapshot-2";
+        let blocked_path = "s3://bucket/table/snapshot/snapshot-3";
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                dir: directory.path().to_path_buf(),
+                namespace: "test".to_string(),
+                max_size: None,
+                block_size: 4,
+                whitelist: std::collections::HashSet::from([FileType::Meta]),
+            })
+            .unwrap(),
+        );
+        let old_reader = CachedFileReader::new(
+            Arc::new(CountingReader {
+                data: Bytes::from_static(b"old!"),
+                reads: AtomicUsize::new(0),
+            }),
+            first_path,
+            4,
+            cache.clone(),
+        );
+        assert_eq!(
+            old_reader.read(0..4).await.unwrap(),
+            Bytes::from_static(b"old!")
+        );
+        let warm_size_token = cache.read_token(first_path);
+        cache.put_file_size(first_path, 4, &warm_size_token).await;
+        drop(warm_size_token);
+        drop(old_reader);
+
+        let observed_token = cache.read_token(observed_path);
+        let blocked_token = cache.read_token(blocked_path);
+        let blocked_guard = blocked_token.publish_guard().await;
+        let invalidating_cache = cache.clone();
+        let invalidation =
+            tokio::spawn(async move { invalidating_cache.invalidate_prefix(prefix).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while observed_token.is_current() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let current_delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"new!"),
+            reads: AtomicUsize::new(0),
+        });
+        let current_reader =
+            CachedFileReader::new(current_delegate.clone(), first_path, 4, cache.clone());
+        let mut current_load = tokio::spawn(async move { current_reader.read(0..4).await });
+        let size_cache = cache.clone();
+        let mut current_size = tokio::spawn(async move {
+            let token = size_cache.read_token(first_path);
+            size_cache.file_size(first_path, &token).await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut current_load)
+                .await
+                .is_err(),
+            "cache read completed before prefix invalidation removed the old block"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut current_size)
+                .await
+                .is_err(),
+            "file-size lookup completed before prefix invalidation removed the old entry"
+        );
+        drop(blocked_guard);
+        invalidation.await.unwrap();
+        assert_eq!(
+            current_load.await.unwrap().unwrap(),
+            Bytes::from_static(b"new!")
+        );
+        assert_eq!(current_size.await.unwrap(), None);
         assert_eq!(current_delegate.reads.load(Ordering::SeqCst), 1);
     }
 

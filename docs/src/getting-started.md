@@ -173,8 +173,12 @@ catalogs can safely use the same base directory without reading one another's
 entries. Runtime cache read, write, validation, and eviction failures are
 fail-open: the original storage remains the source of truth. Paimon mutable
 markers and temporary files always bypass the cache; other eligible files rely
-on Paimon's immutable-file convention. Use a separate `local-cache.dir` for
-each worker or process because processes do not share exact LRU or size
+on Paimon's immutable-file convention. Cache managers using the same canonical
+directory in one process share LRU and size accounting; if their configured
+limits differ, the smallest `local-cache.max-size` is used. Restart recovery
+runs on a blocking worker, reads only block headers and file metadata, and
+validates payload CRC lazily on the first hit. Use a separate `local-cache.dir`
+for each worker or process because processes do not share exact LRU or size
 accounting.
 
 ### Manage Databases

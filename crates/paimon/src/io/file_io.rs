@@ -583,17 +583,26 @@ impl InputFile {
         let Some(cache) = &self.cache else {
             return Ok(self.op.read(&self.relative_path).await?.to_bytes());
         };
-        let size = if let Some(size) = cache.file_size(&self.cache_path) {
+        let read_token = cache.read_token(&self.cache_path);
+        let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
             size
         } else {
             let size = self.op.stat(&self.relative_path).await?.content_length();
-            cache.put_file_size(&self.cache_path, size);
+            cache
+                .put_file_size(&self.cache_path, size, &read_token)
+                .await;
             size
         };
         let delegate = Arc::new(self.op.reader(&self.relative_path).await?);
-        CachedFileReader::new(delegate, &self.cache_path, size, cache.clone())
-            .read_full()
-            .await
+        CachedFileReader::new_with_token(
+            delegate,
+            &self.cache_path,
+            size,
+            cache.clone(),
+            read_token,
+        )
+        .read_full()
+        .await
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
@@ -601,18 +610,22 @@ impl InputFile {
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct(reader));
         };
-        let size = if let Some(size) = cache.file_size(&self.cache_path) {
+        let read_token = cache.read_token(&self.cache_path);
+        let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
             size
         } else {
             let size = self.op.stat(&self.relative_path).await?.content_length();
-            cache.put_file_size(&self.cache_path, size);
+            cache
+                .put_file_size(&self.cache_path, size, &read_token)
+                .await;
             size
         };
-        Ok(InputFileReader::Cached(CachedFileReader::new(
+        Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
             Arc::new(reader),
             &self.cache_path,
             size,
             cache.clone(),
+            read_token,
         )))
     }
 }

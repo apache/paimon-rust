@@ -21,13 +21,12 @@ mod reader;
 
 use self::file_type::FileType;
 use crate::common::{CatalogOptions, Options};
-use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
-use disk::{BlockKey, DiskCache};
+use disk::{BlockKey, CacheReadToken, DiskCache};
 pub(super) use reader::CachedFileReader;
 
 const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v2";
@@ -35,26 +34,11 @@ const DEFAULT_FILE_SIZE_CAPACITY: usize = 65_536;
 
 #[derive(Debug)]
 pub(crate) struct LocalCache {
-    disk: DiskCache,
+    disk: Arc<DiskCache>,
     namespace: String,
     block_size: u64,
     whitelist: HashSet<FileType>,
-    file_sizes: Mutex<IndexMap<String, u64>>,
     file_size_capacity: usize,
-    in_flight: tokio::sync::Mutex<HashMap<BlockKey, Weak<tokio::sync::Mutex<()>>>>,
-    path_states: Mutex<HashMap<String, Weak<PathCacheState>>>,
-}
-
-#[derive(Debug)]
-struct PathCacheState {
-    generation: std::sync::atomic::AtomicU64,
-    publish_gate: tokio::sync::RwLock<()>,
-}
-
-#[derive(Clone)]
-pub(super) struct CacheReadToken {
-    generation: u64,
-    state: Arc<PathCacheState>,
 }
 
 impl LocalCache {
@@ -66,14 +50,11 @@ impl LocalCache {
             .unwrap_or(DEFAULT_FILE_SIZE_CAPACITY)
             .clamp(1, DEFAULT_FILE_SIZE_CAPACITY);
         Ok(Self {
-            disk: DiskCache::new(config.dir.join(CACHE_DIRECTORY_NAME), config.max_size)?,
+            disk: DiskCache::shared(config.dir.join(CACHE_DIRECTORY_NAME), config.max_size)?,
             namespace: config.namespace,
             block_size: config.block_size,
             whitelist: config.whitelist,
-            file_sizes: Mutex::new(IndexMap::new()),
             file_size_capacity,
-            in_flight: tokio::sync::Mutex::new(HashMap::new()),
-            path_states: Mutex::new(HashMap::new()),
         })
     }
 
@@ -90,21 +71,13 @@ impl LocalCache {
     }
 
     async fn get_block(&self, key: &BlockKey, token: &CacheReadToken) -> Option<bytes::Bytes> {
-        if token
-            .state
-            .generation
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != token.generation
-        {
+        let _prefix_guard = self.disk.prefix_read_guard().await;
+        let _publish_guard = token.publish_guard().await;
+        if !token.is_current() {
             return None;
         }
         let payload = self.disk.get_block(key).await;
-        if token
-            .state
-            .generation
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == token.generation
-        {
+        if token.is_current() {
             payload
         } else {
             None
@@ -112,13 +85,9 @@ impl LocalCache {
     }
 
     async fn put_block(&self, key: &BlockKey, payload: bytes::Bytes, token: &CacheReadToken) {
-        let _publish_guard = token.state.publish_gate.read().await;
-        if token
-            .state
-            .generation
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != token.generation
-        {
+        let _prefix_guard = self.disk.prefix_read_guard().await;
+        let _publish_guard = token.publish_guard().await;
+        if !token.is_current() {
             return;
         }
         self.disk.put_block(key, payload).await;
@@ -129,128 +98,54 @@ impl LocalCache {
     }
 
     pub(super) fn read_token(&self, path: &str) -> CacheReadToken {
-        let state = self.path_state(path);
-        CacheReadToken {
-            generation: state.generation.load(std::sync::atomic::Ordering::SeqCst),
-            state,
-        }
-    }
-
-    fn path_state(&self, path: &str) -> Arc<PathCacheState> {
-        let mut states = self
-            .path_states
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(state) = states.get(path).and_then(Weak::upgrade) {
-            return state;
-        }
-        if states.len() >= 1024 {
-            states.retain(|_, state| state.strong_count() > 0);
-        }
-        let state = Arc::new(PathCacheState {
-            generation: std::sync::atomic::AtomicU64::new(0),
-            publish_gate: tokio::sync::RwLock::new(()),
-        });
-        states.insert(path.to_string(), Arc::downgrade(&state));
-        state
+        self.disk.read_token(&self.namespace, path)
     }
 
     async fn block_load_lock(&self, key: &BlockKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut in_flight = self.in_flight.lock().await;
-        if let Some(lock) = in_flight.get(key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        if in_flight.len() >= 1024 {
-            in_flight.retain(|_, lock| lock.strong_count() > 0);
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        in_flight.insert(key.clone(), Arc::downgrade(&lock));
-        lock
+        self.disk.block_load_lock(key).await
     }
 
     async fn release_block_load_lock(&self, key: &BlockKey, lock: &Arc<tokio::sync::Mutex<()>>) {
-        let mut in_flight = self.in_flight.lock().await;
-        if Arc::strong_count(lock) == 1
-            && in_flight
-                .get(key)
-                .and_then(Weak::upgrade)
-                .is_some_and(|current| Arc::ptr_eq(&current, lock))
-        {
-            in_flight.remove(key);
-        }
+        self.disk.release_block_load_lock(key, lock).await;
     }
 
-    pub(super) fn file_size(&self, path: &str) -> Option<u64> {
-        let mut file_sizes = self
-            .file_sizes
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let size = file_sizes.shift_remove(path)?;
-        file_sizes.insert(path.to_string(), size);
-        Some(size)
+    pub(super) async fn file_size(&self, path: &str, token: &CacheReadToken) -> Option<u64> {
+        let _prefix_guard = self.disk.prefix_read_guard().await;
+        let _publish_guard = token.publish_guard().await;
+        token
+            .is_current()
+            .then(|| self.disk.file_size(&self.namespace, path))
+            .flatten()
     }
 
-    pub(super) fn put_file_size(&self, path: &str, size: u64) {
-        let mut file_sizes = self
-            .file_sizes
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        file_sizes.shift_remove(path);
-        file_sizes.insert(path.to_string(), size);
-        while file_sizes.len() > self.file_size_capacity {
-            file_sizes.shift_remove_index(0);
+    pub(super) async fn put_file_size(&self, path: &str, size: u64, token: &CacheReadToken) {
+        let _prefix_guard = self.disk.prefix_read_guard().await;
+        let _publish_guard = token.publish_guard().await;
+        if !token.is_current() {
+            return;
         }
+        self.disk
+            .put_file_size(&self.namespace, path, size, self.file_size_capacity);
     }
 
     pub(super) async fn invalidate_path(&self, path: &str) {
-        let state = self.path_state(path);
-        let _publish_guard = state.publish_gate.write().await;
-        state
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.file_sizes
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .shift_remove(path);
         self.disk.invalidate_path(&self.namespace, path).await;
     }
 
     pub(super) async fn invalidate_prefix(&self, prefix: &str) {
-        let prefix = prefix.trim_end_matches('/');
-        let states = {
-            let states = self
-                .path_states
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            states
-                .iter()
-                .filter(|(path, _)| path_matches_prefix(path, prefix))
-                .filter_map(|(_, state)| Weak::upgrade(state))
-                .collect::<Vec<_>>()
-        };
-        for state in states {
-            let _publish_guard = state.publish_gate.write().await;
-            state
-                .generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        self.file_sizes
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|path, _| !path_matches_prefix(path, prefix));
         self.disk.invalidate_prefix(&self.namespace, prefix).await;
     }
 }
 
-fn path_matches_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+pub(crate) fn create_local_cache(options: &Options) -> crate::Result<Option<Arc<LocalCache>>> {
+    create_local_cache_with_namespace(options, options)
 }
 
-pub(crate) fn create_local_cache(options: &Options) -> crate::Result<Option<Arc<LocalCache>>> {
-    LocalCacheConfig::from_options(options)?
+pub(crate) fn create_local_cache_with_namespace(
+    cache_options: &Options,
+    namespace_options: &Options,
+) -> crate::Result<Option<Arc<LocalCache>>> {
+    LocalCacheConfig::from_options_with_namespace(cache_options, namespace_options)?
         .map(LocalCache::new)
         .transpose()
         .map(|cache| cache.map(Arc::new))
@@ -266,7 +161,15 @@ pub(crate) struct LocalCacheConfig {
 }
 
 impl LocalCacheConfig {
+    #[cfg(test)]
     pub(crate) fn from_options(options: &Options) -> crate::Result<Option<Self>> {
+        Self::from_options_with_namespace(options, options)
+    }
+
+    fn from_options_with_namespace(
+        options: &Options,
+        namespace_options: &Options,
+    ) -> crate::Result<Option<Self>> {
         let enabled = match options
             .get(CatalogOptions::LOCAL_CACHE_ENABLED)
             .map(|value| value.trim())
@@ -323,7 +226,7 @@ impl LocalCacheConfig {
 
         Ok(Some(Self {
             dir,
-            namespace: catalog_namespace(options),
+            namespace: catalog_namespace(namespace_options),
             max_size,
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
@@ -438,6 +341,35 @@ mod tests {
     }
 
     #[test]
+    fn test_local_cache_namespace_uses_effective_catalog_options() {
+        let mut local_options = Options::new();
+        local_options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        local_options.set(CatalogOptions::LOCAL_CACHE_DIR, "/tmp/paimon-cache");
+        local_options.set(CatalogOptions::WAREHOUSE, "warehouse");
+        let mut effective_options = local_options.clone();
+        effective_options.set("s3.endpoint", "https://server-provided-endpoint");
+
+        let local_namespace = LocalCacheConfig::from_options(&local_options)
+            .unwrap()
+            .unwrap()
+            .namespace;
+        let effective_config =
+            LocalCacheConfig::from_options_with_namespace(&local_options, &effective_options)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            effective_config.dir,
+            std::path::Path::new("/tmp/paimon-cache")
+        );
+        assert_ne!(effective_config.namespace, local_namespace);
+        assert_eq!(
+            effective_config.namespace,
+            catalog_namespace(&effective_options)
+        );
+    }
+
+    #[test]
     fn test_local_cache_config_rejects_zero_block_size() {
         let mut options = Options::new();
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
@@ -471,12 +403,57 @@ mod tests {
         })
         .unwrap();
         let path = "s3://bucket/table/snapshot/snapshot-1";
+        let token = cache.read_token(path);
 
-        assert_eq!(cache.file_size(path), None);
-        cache.put_file_size(path, 42);
-        assert_eq!(cache.file_size(path), Some(42));
+        assert_eq!(cache.file_size(path, &token).await, None);
+        cache.put_file_size(path, 42, &token).await;
+        assert_eq!(cache.file_size(path, &token).await, Some(42));
         cache.invalidate_path(path).await;
-        assert_eq!(cache.file_size(path), None);
+        assert_eq!(cache.file_size(path, &token).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_local_cache_file_size_is_invalidated_across_shared_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = || LocalCacheConfig {
+            dir: directory.path().to_path_buf(),
+            namespace: "test".to_string(),
+            max_size: None,
+            block_size: 4,
+            whitelist: HashSet::from([FileType::Meta]),
+        };
+        let first = LocalCache::new(config()).unwrap();
+        let second = LocalCache::new(config()).unwrap();
+        let path = "s3://bucket/table/snapshot/snapshot-1";
+        let token = first.read_token(path);
+
+        first.put_file_size(path, 42, &token).await;
+        assert_eq!(second.file_size(path, &token).await, Some(42));
+        second.invalidate_path(path).await;
+        let current_token = first.read_token(path);
+        assert_eq!(first.file_size(path, &current_token).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_stale_file_size_cannot_republish_after_invalidation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = LocalCache::new(LocalCacheConfig {
+            dir: directory.path().to_path_buf(),
+            namespace: "test".to_string(),
+            max_size: None,
+            block_size: 4,
+            whitelist: HashSet::from([FileType::Meta]),
+        })
+        .unwrap();
+        let path = "s3://bucket/table/snapshot/snapshot-1";
+        let stale_token = cache.read_token(path);
+
+        assert_eq!(cache.file_size(path, &stale_token).await, None);
+        cache.invalidate_path(path).await;
+        cache.put_file_size(path, 42, &stale_token).await;
+
+        let current_token = cache.read_token(path);
+        assert_eq!(cache.file_size(path, &current_token).await, None);
     }
 
     #[test]
@@ -526,8 +503,8 @@ mod tests {
         assert_eq!(std::fs::read(nested).unwrap(), b"nested foreign");
     }
 
-    #[test]
-    fn test_local_cache_bounds_file_size_entries() {
+    #[tokio::test]
+    async fn test_local_cache_bounds_file_size_entries() {
         let directory = tempfile::tempdir().unwrap();
         let cache = LocalCache::new(LocalCacheConfig {
             dir: directory.path().to_path_buf(),
@@ -537,13 +514,16 @@ mod tests {
             whitelist: HashSet::from([FileType::Meta]),
         })
         .unwrap();
+        let first_token = cache.read_token("snapshot-1");
+        let second_token = cache.read_token("snapshot-2");
+        let third_token = cache.read_token("snapshot-3");
 
-        cache.put_file_size("snapshot-1", 1);
-        cache.put_file_size("snapshot-2", 2);
-        cache.put_file_size("snapshot-3", 3);
+        cache.put_file_size("snapshot-1", 1, &first_token).await;
+        cache.put_file_size("snapshot-2", 2, &second_token).await;
+        cache.put_file_size("snapshot-3", 3, &third_token).await;
 
-        assert_eq!(cache.file_size("snapshot-1"), None);
-        assert_eq!(cache.file_size("snapshot-2"), Some(2));
-        assert_eq!(cache.file_size("snapshot-3"), Some(3));
+        assert_eq!(cache.file_size("snapshot-1", &first_token).await, None);
+        assert_eq!(cache.file_size("snapshot-2", &second_token).await, Some(2));
+        assert_eq!(cache.file_size("snapshot-3", &third_token).await, Some(3));
     }
 }
