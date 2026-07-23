@@ -88,6 +88,7 @@ impl FileWriter {
 /// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 pub struct TableWrite {
     table: Table,
+    write_schema: Arc<arrow_schema::Schema>,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
@@ -131,6 +132,7 @@ impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
         let is_overwrite = false;
         let schema = table.schema();
+        let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         let blob_view_fields = core_options.blob_view_fields();
@@ -344,6 +346,7 @@ impl TableWrite {
 
         Ok(Self {
             table: table.clone(),
+            write_schema,
             partition_writers: HashMap::new(),
             partition_computer,
             partition_keys,
@@ -434,6 +437,8 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.validate_write_batch_schema(batch)?;
+
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -448,6 +453,102 @@ impl TableWrite {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
         }
+        Ok(())
+    }
+
+    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
+        let expected_schema = &self.write_schema;
+        let actual_schema = batch.schema();
+        let table_field_count = expected_schema.fields().len();
+        let actual_field_count = actual_schema.fields().len();
+        let allows_value_kind = self.changelog_producer == ChangelogProducer::Input;
+        let includes_value_kind = allows_value_kind && actual_field_count == table_field_count + 1;
+
+        if actual_field_count != table_field_count && !includes_value_kind {
+            let maximum_expected_count = table_field_count + usize::from(allows_value_kind);
+            let (mismatch_index, expected_field, actual_field) =
+                if actual_field_count < table_field_count {
+                    let field = expected_schema.field(actual_field_count);
+                    (
+                        actual_field_count,
+                        format!("'{}': {:?}", field.name(), field.data_type()),
+                        "<missing>".to_string(),
+                    )
+                } else {
+                    let field = actual_schema.field(maximum_expected_count);
+                    (
+                        maximum_expected_count,
+                        "<no field>".to_string(),
+                        format!("'{}': {:?}", field.name(), field.data_type()),
+                    )
+                };
+            let expected_count = if allows_value_kind {
+                format!("{table_field_count} or {}", table_field_count + 1)
+            } else {
+                table_field_count.to_string()
+            };
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "write batch schema field count mismatch: expected {expected_count}, actual {actual_field_count}; first mismatch at index {mismatch_index}: expected {expected_field}, actual {actual_field}"
+                ),
+                source: None,
+            });
+        }
+
+        for (index, expected_field) in expected_schema.fields().iter().enumerate() {
+            let actual_field = actual_schema.field(index);
+            if actual_field.name() != expected_field.name() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema field name mismatch at index {index}: expected '{}', actual '{}'",
+                        expected_field.name(),
+                        actual_field.name()
+                    ),
+                    source: None,
+                });
+            }
+        }
+        if includes_value_kind {
+            let actual_field = actual_schema.field(table_field_count);
+            if actual_field.name() != VALUE_KIND_FIELD_NAME {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema field name mismatch at index {table_field_count}: expected '{VALUE_KIND_FIELD_NAME}', actual '{}'",
+                        actual_field.name()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        for (index, expected_field) in expected_schema.fields().iter().enumerate() {
+            let actual_field = actual_schema.field(index);
+            if actual_field.data_type() != expected_field.data_type() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}",
+                        expected_field.name(),
+                        expected_field.data_type(),
+                        actual_field.data_type()
+                    ),
+                    source: None,
+                });
+            }
+        }
+        if includes_value_kind {
+            let actual_field = actual_schema.field(table_field_count);
+            if actual_field.data_type() != &arrow_schema::DataType::Int8 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema data type mismatch for field '{VALUE_KIND_FIELD_NAME}' at index {table_field_count}: expected {:?}, actual {:?}",
+                        arrow_schema::DataType::Int8,
+                        actual_field.data_type()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -758,7 +859,6 @@ impl TableWrite {
             || !self.blob_view_fields.is_empty()
         {
             let fields = self.table.schema().fields();
-            let input_schema = build_target_arrow_schema(fields)?;
             Ok(FileWriter::AppendDedicated(Box::new(
                 AppendDedicatedFormatFileWriter::new(
                     self.table.file_io().clone(),
@@ -774,7 +874,7 @@ impl TableWrite {
                     self.file_format.clone(),
                     self.vector_target_file_size,
                     self.vector_file_format.as_deref(),
-                    &input_schema,
+                    &self.write_schema,
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
@@ -1189,6 +1289,300 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn make_id_only_batch(ids: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(ids))],
+        )
+        .unwrap()
+    }
+
+    fn assert_data_invalid_contains(error: crate::Error, expected_context: &[&str]) {
+        let message = match error {
+            crate::Error::DataInvalid { message, .. } => message,
+            error => panic!("expected DataInvalid, got {error:?}"),
+        };
+        for context in expected_context {
+            assert!(
+                message.contains(context),
+                "expected error message to contain {context:?}, got {message:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_arrow_batch_rejects_missing_blob_field() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_blob_schema_validation"),
+            "memory:/test_blob_schema_validation".to_string(),
+            test_blob_table_schema(),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let error = table_write
+            .write_arrow_batch(&make_id_only_batch(vec![1]))
+            .await
+            .unwrap_err();
+
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 2",
+                "actual 1",
+                "payload",
+                "<missing>",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_arrow_batch_rejects_missing_vector_field() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_vector_schema_validation"),
+            "memory:/test_vector_schema_validation".to_string(),
+            test_vector_table_schema("parquet"),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let error = table_write
+            .write_arrow_batch(&make_id_only_batch(vec![1]))
+            .await
+            .unwrap_err();
+
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 2",
+                "actual 1",
+                "embedding",
+                "<missing>",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_arrow_batch_rejects_mismatched_table_fields() {
+        let table = test_table(&test_file_io(), "memory:/test_schema_field_validation");
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let swapped = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("id", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let error = table_write.write_arrow_batch(&swapped).await.unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &["field name", "index 0", "expected 'id'", "actual 'value'"],
+        );
+
+        let wrong_name = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("wrong", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let error = table_write
+            .write_arrow_batch(&wrong_name)
+            .await
+            .unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field name",
+                "index 1",
+                "expected 'value'",
+                "actual 'wrong'",
+            ],
+        );
+
+        let wrong_type = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int64, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let error = table_write
+            .write_arrow_batch(&wrong_type)
+            .await
+            .unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &["data type", "field 'id'", "expected Int32", "actual Int64"],
+        );
+
+        let unexpected_column = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("extra", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+        )
+        .unwrap();
+        let error = table_write
+            .write_arrow_batch(&unexpected_column)
+            .await
+            .unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 2",
+                "actual 3",
+                "<no field>",
+                "extra",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_arrow_batch_rejects_invalid_empty_batch_schema() {
+        let table = test_table(&test_file_io(), "memory:/test_empty_schema_validation");
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )])));
+
+        let error = table_write.write_arrow_batch(&batch).await.unwrap_err();
+
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 2",
+                "actual 1",
+                "value",
+                "<missing>",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normal_write_rejects_appended_value_kind() {
+        let table = test_table(&test_file_io(), "memory:/test_unexpected_value_kind");
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let error = table_write
+            .write_arrow_batch(&make_batch_with_value_kind(vec![1], vec![10], vec![0]))
+            .await
+            .unwrap_err();
+
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 2",
+                "actual 3",
+                "<no field>",
+                VALUE_KIND_FIELD_NAME,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rowkind_field_accepts_table_schema_and_rejects_caller_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_rowkind_schema_validation";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_rowkind_schema_validation"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let caller_value_kind = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["+I"])),
+                Arc::new(Int8Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let error = table_write
+            .write_arrow_batch(&caller_value_kind)
+            .await
+            .unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 3",
+                "actual 4",
+                VALUE_KIND_FIELD_NAME,
+            ],
+        );
+
+        let valid = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["+I"])),
+            ],
+        )
+        .unwrap();
+        table_write.write_arrow_batch(&valid).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files[0].row_count, 1);
     }
 
     #[tokio::test]
@@ -2678,6 +3072,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_input_changelog_rejects_misplaced_or_wrong_type_value_kind() {
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "test_input_changelog_schema_validation"),
+            "memory:/test_input_changelog_schema_validation".to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let misplaced = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let error = table_write.write_arrow_batch(&misplaced).await.unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field name",
+                "index 1",
+                "expected 'value'",
+                VALUE_KIND_FIELD_NAME,
+            ],
+        );
+
+        let wrong_type = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let error = table_write
+            .write_arrow_batch(&wrong_type)
+            .await
+            .unwrap_err();
+        assert_data_invalid_contains(
+            error,
+            &[
+                "data type",
+                VALUE_KIND_FIELD_NAME,
+                "expected Int8",
+                "actual Int32",
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn test_input_changelog_writes_raw_rows_separately_from_data_rows() {
         let file_io = test_file_io();
         let table_path = "memory:/test_input_changelog_duplicate_pk";
@@ -3471,6 +3928,35 @@ mod tests {
             tw2.bucket_assigner,
             BucketAssignerEnum::Dynamic(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_cross_partition_write_rejects_caller_value_kind() {
+        let file_io = test_file_io();
+        let table =
+            test_cross_partition_table(&file_io, "memory:/test_cross_partition_schema_validation");
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let error = table_write
+            .write_arrow_batch(&make_partitioned_batch_with_value_kind(
+                vec!["a"],
+                vec![1],
+                vec![10],
+                vec![0],
+            ))
+            .await
+            .unwrap_err();
+
+        assert_data_invalid_contains(
+            error,
+            &[
+                "field count",
+                "expected 3",
+                "actual 4",
+                "<no field>",
+                VALUE_KIND_FIELD_NAME,
+            ],
+        );
     }
 
     #[test]
