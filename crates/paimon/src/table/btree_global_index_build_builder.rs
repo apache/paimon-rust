@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::bitmap_global_index_reader::{BitmapGlobalIndexWriter, BitmapWriteResult};
+use super::bitmap_global_index_reader::{
+    make_bitmap_key_comparator, serialize_bitmap_datum, BitmapGlobalIndexWriter, BitmapWriteResult,
+};
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
 };
+use crate::btree::key_serde::KeyComparator;
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
 use crate::spec::{
     bucket_dir_name, extract_datum_from_arrow, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    DataType, FileKind, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
+    DataType, Datum, FileKind, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::source::is_data_evolution_normal_file;
@@ -41,6 +44,18 @@ const BTREE_BLOCK_SIZE: usize = 4 * 1024;
 const BITMAP_DICTIONARY_BLOCK_SIZE: usize = 16 * 1024;
 
 type BTreeKeyRow = (Option<Vec<u8>>, i64);
+type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
+
+fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
+    match index_type {
+        BTREE_GLOBAL_INDEX_TYPE => (make_key_comparator(data_type), serialize_datum),
+        BITMAP_GLOBAL_INDEX_TYPE => (
+            make_bitmap_key_comparator(data_type),
+            serialize_bitmap_datum,
+        ),
+        _ => unreachable!("normalized sorted global index type"),
+    }
+}
 
 pub struct BTreeGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
@@ -189,8 +204,9 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             }
         })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-        let mut rows = extract_index_rows(self.table, shard, index_column, index_field).await?;
-        let cmp = make_key_comparator(index_field.data_type());
+        let (cmp, serialize_key) = make_index_key_codec(index_type, index_field.data_type());
+        let mut rows =
+            extract_index_rows(self.table, shard, index_column, index_field, serialize_key).await?;
         sort_index_rows(&mut rows, &cmp);
 
         self.table
@@ -234,7 +250,6 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 (write_result.row_count, write_result.meta)
             }
             BITMAP_GLOBAL_INDEX_TYPE => {
-                let cmp = make_key_comparator(index_field.data_type());
                 let mut writer = BitmapGlobalIndexWriter::new(
                     writer,
                     BITMAP_DICTIONARY_BLOCK_SIZE,
@@ -597,6 +612,7 @@ async fn extract_index_rows(
     shard: &BTreeGlobalIndexShard,
     index_column: &str,
     index_field: &DataField,
+    serialize_key: SerializeKeyFn,
 ) -> Result<Vec<BTreeKeyRow>> {
     let splits = build_read_splits_for_shard(shard)?;
 
@@ -613,6 +629,7 @@ async fn extract_index_rows(
             shard.row_range_start,
             shard.row_range_end,
         )?),
+        serialize_key,
     )
 }
 
@@ -655,6 +672,7 @@ fn extract_index_rows_from_batches(
     data_type: &DataType,
     row_range_start: i64,
     expected_row_count: i64,
+    serialize_key: SerializeKeyFn,
 ) -> Result<Vec<BTreeKeyRow>> {
     let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
     let mut rows = Vec::with_capacity(row_count);
@@ -705,7 +723,7 @@ fn extract_index_rows_from_batches(
             expected_row_id += 1;
 
             let key = extract_datum_from_arrow(batch, row, value_index, data_type)?
-                .map(|datum| serialize_datum(&datum, data_type));
+                .map(|datum| serialize_key(&datum, data_type));
             rows.push((key, row_id - row_range_start));
         }
     }
@@ -768,12 +786,13 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryType, GlobalIndexSearchMode, IndexManifest, IntType, ManifestEntry, PredicateBuilder,
-        Schema, TableSchema, VarBinaryType, VarCharType,
+        BinaryType, DoubleType, FloatType, GlobalIndexSearchMode, IndexManifest, IntType,
+        ManifestEntry, Predicate, PredicateBuilder, Schema, TableSchema, VarBinaryType,
+        VarCharType,
     };
     use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
     use crate::table::{merge_row_ranges, SnapshotManager, TableCommit, TableWrite};
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};
     use std::sync::Arc;
@@ -1056,9 +1075,15 @@ mod tests {
             vec![Some(10), None, Some(30)],
             vec![Some(5), Some(6), Some(7)],
         );
-        let rows =
-            extract_index_rows_from_batches(&[batch], "id", &DataType::Int(IntType::new()), 5, 3)
-                .unwrap();
+        let rows = extract_index_rows_from_batches(
+            &[batch],
+            "id",
+            &DataType::Int(IntType::new()),
+            5,
+            3,
+            serialize_datum,
+        )
+        .unwrap();
 
         assert_eq!(
             rows,
@@ -1071,11 +1096,56 @@ mod tests {
     }
 
     #[test]
+    fn test_index_key_codec_scopes_java_nan_semantics_to_bitmap() {
+        fn assert_codec(
+            data_type: DataType,
+            negative_nan: Datum,
+            raw_nan_key: Vec<u8>,
+            canonical_nan_key: Vec<u8>,
+            zero: Datum,
+        ) {
+            let (btree_cmp, btree_serialize) =
+                make_index_key_codec(BTREE_GLOBAL_INDEX_TYPE, &data_type);
+            let btree_nan_key = btree_serialize(&negative_nan, &data_type);
+            let zero_key = btree_serialize(&zero, &data_type);
+            assert_eq!(btree_nan_key, raw_nan_key);
+            assert!(btree_cmp(&btree_nan_key, &zero_key).is_lt());
+
+            let (bitmap_cmp, bitmap_serialize) =
+                make_index_key_codec(BITMAP_GLOBAL_INDEX_TYPE, &data_type);
+            let bitmap_nan_key = bitmap_serialize(&negative_nan, &data_type);
+            assert_eq!(bitmap_nan_key, canonical_nan_key);
+            assert!(bitmap_cmp(&bitmap_nan_key, &zero_key).is_gt());
+        }
+
+        assert_codec(
+            DataType::Float(FloatType::new()),
+            Datum::Float(f32::from_bits(0xffc0_0001)),
+            0xffc0_0001u32.to_le_bytes().to_vec(),
+            0x7fc0_0000u32.to_le_bytes().to_vec(),
+            Datum::Float(0.0),
+        );
+        assert_codec(
+            DataType::Double(DoubleType::new()),
+            Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+            0xfff8_0000_0000_0001u64.to_le_bytes().to_vec(),
+            0x7ff8_0000_0000_0000u64.to_le_bytes().to_vec(),
+            Datum::Double(0.0),
+        );
+    }
+
+    #[test]
     fn test_extract_index_rows_rejects_row_id_gap() {
         let batch = index_batch(vec![Some(10), Some(30)], vec![Some(5), Some(7)]);
-        let err =
-            extract_index_rows_from_batches(&[batch], "id", &DataType::Int(IntType::new()), 5, 2)
-                .expect_err("row-id gap should fail");
+        let err = extract_index_rows_from_batches(
+            &[batch],
+            "id",
+            &DataType::Int(IntType::new()),
+            5,
+            2,
+            serialize_datum,
+        )
+        .expect_err("row-id gap should fail");
 
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("expected _ROW_ID"))
@@ -1126,6 +1196,7 @@ mod tests {
             &DataType::VarChar(VarCharType::string_type()),
             10,
             2,
+            serialize_datum,
         )
         .unwrap();
 
@@ -1158,6 +1229,34 @@ mod tests {
             .mkdirs(&format!("{}/manifest/", table.location()))
             .await
             .unwrap();
+    }
+
+    async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
+        let mut builder = table.new_read_builder();
+        builder.with_filter(predicate);
+        let plan = builder.new_scan().plan().await.unwrap();
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 
     #[tokio::test]
@@ -1370,6 +1469,203 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_floating_candidates_preserve_residual_results() {
+        let table_path = "memory:/test_bitmap_floating_residual_candidates";
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("f", DataType::Float(FloatType::new()))
+            .column("d", DataType::Double(DoubleType::new()))
+            .options(table_options("100"))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "test_bitmap_floating_residual_candidates"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_dirs(&table).await;
+
+        let float_negative_nan = f32::from_bits(0xffc0_0001);
+        let double_negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("f", ArrowDataType::Float32, true),
+            ArrowField::new("d", ArrowDataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..9)) as ArrayRef,
+                Arc::new(Float32Array::from(vec![
+                    Some(float_negative_nan),
+                    Some(f32::from_bits(0xffff_1234)),
+                    Some(f32::NAN),
+                    Some(f32::from_bits(0x7fc0_0010)),
+                    Some(-1.0),
+                    Some(-0.0),
+                    Some(0.0),
+                    Some(1.0),
+                    None,
+                ])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![
+                    Some(double_negative_nan),
+                    Some(f64::from_bits(0xffff_1234_5678_9abc)),
+                    Some(f64::NAN),
+                    Some(f64::from_bits(0x7ff8_0000_0000_0010)),
+                    Some(-1.0),
+                    Some(-0.0),
+                    Some(0.0),
+                    Some(1.0),
+                    None,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        for column in ["f", "d"] {
+            let shard_count = table
+                .new_btree_global_index_build_builder()
+                .with_index_column(column)
+                .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(shard_count, 1);
+        }
+
+        let mut disabled_options = table.schema().options().clone();
+        disabled_options.insert("global-index.enabled".to_string(), "false".to_string());
+        let table_without_index = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().to_string(),
+            table.schema().copy_with_replaced_options(disabled_options),
+            None,
+        );
+
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let cases = [
+            (
+                "Float < 0",
+                predicates.less_than("f", Datum::Float(0.0)).unwrap(),
+                vec![0, 1, 4, 5],
+            ),
+            (
+                "Double < 0",
+                predicates.less_than("d", Datum::Double(0.0)).unwrap(),
+                vec![0, 1, 4, 5],
+            ),
+            (
+                "Float = canonical NaN",
+                predicates.equal("f", Datum::Float(f32::NAN)).unwrap(),
+                vec![2],
+            ),
+            (
+                "Double = canonical NaN",
+                predicates.equal("d", Datum::Double(f64::NAN)).unwrap(),
+                vec![2],
+            ),
+            (
+                "Float = negative NaN",
+                predicates
+                    .equal("f", Datum::Float(float_negative_nan))
+                    .unwrap(),
+                vec![0],
+            ),
+            (
+                "Double = negative NaN",
+                predicates
+                    .equal("d", Datum::Double(double_negative_nan))
+                    .unwrap(),
+                vec![0],
+            ),
+            (
+                "Float IN NaNs",
+                predicates
+                    .is_in(
+                        "f",
+                        vec![Datum::Float(float_negative_nan), Datum::Float(f32::NAN)],
+                    )
+                    .unwrap(),
+                vec![0, 2],
+            ),
+            (
+                "Double IN NaNs",
+                predicates
+                    .is_in(
+                        "d",
+                        vec![Datum::Double(double_negative_nan), Datum::Double(f64::NAN)],
+                    )
+                    .unwrap(),
+                vec![0, 2],
+            ),
+            (
+                "Float != canonical NaN",
+                predicates.not_equal("f", Datum::Float(f32::NAN)).unwrap(),
+                vec![0, 1, 3, 4, 5, 6, 7],
+            ),
+            (
+                "Double != canonical NaN",
+                predicates.not_equal("d", Datum::Double(f64::NAN)).unwrap(),
+                vec![0, 1, 3, 4, 5, 6, 7],
+            ),
+            (
+                "Float NOT IN",
+                predicates
+                    .is_not_in("f", vec![Datum::Float(f32::NAN), Datum::Float(0.0)])
+                    .unwrap(),
+                vec![0, 1, 3, 4, 5, 7],
+            ),
+            (
+                "Double NOT IN",
+                predicates
+                    .is_not_in("d", vec![Datum::Double(f64::NAN), Datum::Double(0.0)])
+                    .unwrap(),
+                vec![0, 1, 3, 4, 5, 7],
+            ),
+            (
+                "Float combined range",
+                Predicate::and(vec![
+                    predicates
+                        .greater_or_equal("f", Datum::Float(float_negative_nan))
+                        .unwrap(),
+                    predicates.less_or_equal("f", Datum::Float(0.0)).unwrap(),
+                ]),
+                vec![0, 4, 5, 6],
+            ),
+            (
+                "Double combined range",
+                Predicate::and(vec![
+                    predicates
+                        .greater_or_equal("d", Datum::Double(double_negative_nan))
+                        .unwrap(),
+                    predicates.less_or_equal("d", Datum::Double(0.0)).unwrap(),
+                ]),
+                vec![0, 4, 5, 6],
+            ),
+        ];
+
+        for (name, predicate, expected) in cases {
+            let without_index = scan_ids(&table_without_index, predicate.clone()).await;
+            assert_eq!(without_index, expected, "{name}: residual baseline");
+            let with_index = scan_ids(&table, predicate).await;
+            assert_eq!(
+                with_index, without_index,
+                "{name}: global index changed rows"
+            );
+        }
     }
 
     /// Bitmap is built through the same sorted builder; a second build with no

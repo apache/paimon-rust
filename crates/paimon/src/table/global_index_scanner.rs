@@ -20,7 +20,10 @@
 //!
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
-use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
+use super::bitmap_global_index_reader::{
+    is_bitmap_floating_residual_sensitive_op, make_bitmap_key_comparator, serialize_bitmap_datum,
+    BitmapGlobalIndexReader,
+};
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
 };
@@ -111,6 +114,40 @@ struct GlobalIndexEntry {
 enum GlobalIndexFileKind {
     BTree,
     Bitmap,
+}
+
+fn is_floating_point(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Float(_) | DataType::Double(_))
+}
+
+fn bitmap_meta_may_match(
+    meta: &BTreeIndexMeta,
+    op: PredicateOperator,
+    data_type: &DataType,
+    serialized_literals: &[Vec<u8>],
+    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+) -> bool {
+    if is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(op) {
+        !meta.only_nulls()
+    } else {
+        meta.may_match(op, serialized_literals, cmp)
+    }
+}
+
+fn bitmap_meta_may_match_between(
+    meta: &BTreeIndexMeta,
+    data_type: &DataType,
+    from_key: &[u8],
+    to_key: &[u8],
+    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+) -> bool {
+    if is_floating_point(data_type)
+        && is_bitmap_floating_residual_sensitive_op(PredicateOperator::Between)
+    {
+        !meta.only_nulls()
+    } else {
+        meta.may_match_between(from_key, to_key, cmp)
+    }
 }
 
 impl GlobalIndexFileKind {
@@ -444,23 +481,48 @@ impl GlobalIndexScanner {
         let pruning_info: Vec<_> = effective_predicates
             .iter()
             .map(|(op, literals, data_type)| {
-                let cmp = make_key_comparator(data_type);
-                let serialized: Vec<Vec<u8>> = literals
+                let btree_cmp = make_key_comparator(data_type);
+                let btree_serialized = literals
                     .iter()
                     .map(|l| serialize_datum(l, data_type))
-                    .collect();
-                (*op, cmp, serialized)
+                    .collect::<Vec<_>>();
+                let bitmap_cmp = make_bitmap_key_comparator(data_type);
+                let bitmap_serialized = literals
+                    .iter()
+                    .map(|l| serialize_bitmap_datum(l, data_type))
+                    .collect::<Vec<_>>();
+                (
+                    *op,
+                    *data_type,
+                    btree_cmp,
+                    btree_serialized,
+                    bitmap_cmp,
+                    bitmap_serialized,
+                )
             })
             .collect();
 
         let predicate_matches: Vec<Vec<bool>> = pruning_info
             .iter()
-            .map(|(op, cmp, serialized)| {
-                entries
-                    .iter()
-                    .map(|entry| entry.meta.may_match(*op, serialized, cmp))
-                    .collect()
-            })
+            .map(
+                |(op, data_type, btree_cmp, btree_serialized, bitmap_cmp, bitmap_serialized)| {
+                    entries
+                        .iter()
+                        .map(|entry| match entry.index_type {
+                            GlobalIndexFileKind::BTree => {
+                                entry.meta.may_match(*op, btree_serialized, btree_cmp)
+                            }
+                            GlobalIndexFileKind::Bitmap => bitmap_meta_may_match(
+                                &entry.meta,
+                                *op,
+                                data_type,
+                                bitmap_serialized,
+                                bitmap_cmp.as_ref(),
+                            ),
+                        })
+                        .collect()
+                },
+            )
             .collect();
         let predicate_fallback_plans: Vec<Option<FallbackScanPlan>> = effective_predicates
             .iter()
@@ -473,12 +535,28 @@ impl GlobalIndexScanner {
 
         let between_matches_by_entry: Vec<bool> = match between.as_ref() {
             Some(b) => {
-                let cmp = make_key_comparator(b.data_type);
-                let from_key = serialize_datum(b.from, b.data_type);
-                let to_key = serialize_datum(b.to, b.data_type);
+                let btree_cmp = make_key_comparator(b.data_type);
+                let btree_from = serialize_datum(b.from, b.data_type);
+                let btree_to = serialize_datum(b.to, b.data_type);
+                let bitmap_cmp = make_bitmap_key_comparator(b.data_type);
+                let bitmap_from = serialize_bitmap_datum(b.from, b.data_type);
+                let bitmap_to = serialize_bitmap_datum(b.to, b.data_type);
                 entries
                     .iter()
-                    .map(|entry| entry.meta.may_match_between(&from_key, &to_key, &cmp))
+                    .map(|entry| match entry.index_type {
+                        GlobalIndexFileKind::BTree => {
+                            entry
+                                .meta
+                                .may_match_between(&btree_from, &btree_to, &btree_cmp)
+                        }
+                        GlobalIndexFileKind::Bitmap => bitmap_meta_may_match_between(
+                            &entry.meta,
+                            b.data_type,
+                            &bitmap_from,
+                            &bitmap_to,
+                            bitmap_cmp.as_ref(),
+                        ),
+                    })
                     .collect()
             }
             None => Vec::new(),
@@ -608,8 +686,12 @@ impl GlobalIndexScanner {
 
         if plan.between_matches && plan.between_evaluated {
             let between = between.expect("evaluated between query is present");
-            let from_key = serialize_datum(between.from, between.data_type);
-            let to_key = serialize_datum(between.to, between.data_type);
+            let serialize_key = match entry.index_type {
+                GlobalIndexFileKind::BTree => serialize_datum,
+                GlobalIndexFileKind::Bitmap => serialize_bitmap_datum,
+            };
+            let from_key = serialize_key(between.from, between.data_type);
+            let to_key = serialize_key(between.to, between.data_type);
             let bitmap = reader
                 .as_ref()
                 .expect("reader is opened when between matches")
@@ -1332,6 +1414,9 @@ pub(crate) async fn evaluate_global_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::test_util::VecFileWrite;
+    use crate::btree::{BTreeIndexWriter, BlockCompressionType};
+    use crate::table::bitmap_global_index_reader::BitmapGlobalIndexWriter;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
@@ -1417,6 +1502,129 @@ mod tests {
             &DataType::VarChar(crate::spec::VarCharType::new(100).unwrap()),
         );
         assert_eq!(key, b"hello".to_vec());
+    }
+
+    fn assert_bitmap_floating_meta_policy(
+        data_type: DataType,
+        min: Datum,
+        max: Datum,
+        outside: Datum,
+        nan: Datum,
+    ) {
+        let cmp = make_bitmap_key_comparator(&data_type);
+        let min_key = serialize_bitmap_datum(&min, &data_type);
+        let max_key = serialize_bitmap_datum(&max, &data_type);
+        let outside_key = serialize_bitmap_datum(&outside, &data_type);
+        let nan_key = serialize_bitmap_datum(&nan, &data_type);
+        let meta = BTreeIndexMeta::new(Some(min_key.clone()), Some(max_key), false);
+
+        assert!(!bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::Eq,
+            &data_type,
+            std::slice::from_ref(&outside_key),
+            cmp.as_ref(),
+        ));
+        assert!(!bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::In,
+            &data_type,
+            std::slice::from_ref(&outside_key),
+            cmp.as_ref(),
+        ));
+        assert!(!bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::IsNull,
+            &data_type,
+            &[],
+            cmp.as_ref(),
+        ));
+        assert!(bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::IsNotNull,
+            &data_type,
+            &[],
+            cmp.as_ref(),
+        ));
+
+        let nan_meta = BTreeIndexMeta::new(Some(min_key), Some(nan_key.clone()), false);
+        assert!(bitmap_meta_may_match(
+            &nan_meta,
+            PredicateOperator::Eq,
+            &data_type,
+            std::slice::from_ref(&nan_key),
+            cmp.as_ref(),
+        ));
+        assert!(bitmap_meta_may_match(
+            &nan_meta,
+            PredicateOperator::In,
+            &data_type,
+            std::slice::from_ref(&nan_key),
+            cmp.as_ref(),
+        ));
+
+        assert!(bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::Gt,
+            &data_type,
+            std::slice::from_ref(&outside_key),
+            cmp.as_ref(),
+        ));
+        assert!(bitmap_meta_may_match_between(
+            &meta,
+            &data_type,
+            &outside_key,
+            &outside_key,
+            cmp.as_ref(),
+        ));
+
+        let only_nulls = BTreeIndexMeta::new(None, None, true);
+        assert!(bitmap_meta_may_match(
+            &only_nulls,
+            PredicateOperator::IsNull,
+            &data_type,
+            &[],
+            cmp.as_ref(),
+        ));
+        assert!(!bitmap_meta_may_match(
+            &only_nulls,
+            PredicateOperator::IsNotNull,
+            &data_type,
+            &[],
+            cmp.as_ref(),
+        ));
+        assert!(!bitmap_meta_may_match(
+            &only_nulls,
+            PredicateOperator::NotEq,
+            &data_type,
+            std::slice::from_ref(&outside_key),
+            cmp.as_ref(),
+        ));
+        assert!(!bitmap_meta_may_match_between(
+            &only_nulls,
+            &data_type,
+            &outside_key,
+            &outside_key,
+            cmp.as_ref(),
+        ));
+    }
+
+    #[test]
+    fn test_bitmap_floating_meta_prunes_equality_and_fails_open_for_ranges() {
+        assert_bitmap_floating_meta_policy(
+            DataType::Float(crate::spec::FloatType::new()),
+            Datum::Float(-1.0),
+            Datum::Float(1.0),
+            Datum::Float(2.0),
+            Datum::Float(f32::NAN),
+        );
+        assert_bitmap_floating_meta_policy(
+            DataType::Double(crate::spec::DoubleType::new()),
+            Datum::Double(-1.0),
+            Datum::Double(1.0),
+            Datum::Double(2.0),
+            Datum::Double(f64::NAN),
+        );
     }
 
     #[test]
@@ -1517,24 +1725,27 @@ mod tests {
         (file_io, table_path, testdata_name.to_string(), tmp)
     }
 
-    type JavaBitmapTestdataTable = (FileIO, String, String, BTreeIndexMeta, tempfile::TempDir);
+    type BitmapTestdataTable = (FileIO, String, String, BTreeIndexMeta, tempfile::TempDir);
 
-    fn setup_java_bitmap_testdata_table() -> JavaBitmapTestdataTable {
-        const FILE_NAME: &str = "bitmap_varchar_java.index";
-        let src = format!("{}/testdata/bitmap/{FILE_NAME}", env!("CARGO_MANIFEST_DIR"));
+    fn setup_bitmap_testdata_table(file_name: &str) -> BitmapTestdataTable {
+        let src = format!("{}/testdata/bitmap/{file_name}", env!("CARGO_MANIFEST_DIR"));
         let meta_src = format!(
-            "{}/testdata/bitmap/{FILE_NAME}.meta",
+            "{}/testdata/bitmap/{file_name}.meta",
             env!("CARGO_MANIFEST_DIR")
         );
         let tmp = tempfile::tempdir().unwrap();
         let index_dir = tmp.path().join("index");
         std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::copy(&src, index_dir.join(FILE_NAME)).unwrap();
+        std::fs::copy(&src, index_dir.join(file_name)).unwrap();
         let meta = BTreeIndexMeta::deserialize(&std::fs::read(meta_src).unwrap()).unwrap();
 
         let table_path = format!("file://{}", tmp.path().display());
         let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
-        (file_io, table_path, FILE_NAME.to_string(), meta, tmp)
+        (file_io, table_path, file_name.to_string(), meta, tmp)
+    }
+
+    fn setup_java_bitmap_testdata_table() -> BitmapTestdataTable {
+        setup_bitmap_testdata_table("bitmap_varchar_java.index")
     }
 
     fn make_global_index_entry(
@@ -2052,6 +2263,317 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(null_result.unwrap(), vec![RowRange::new(104, 104)]);
+    }
+
+    async fn assert_bitmap_int_fixture(file_name: &str) {
+        let data_type = DataType::Int(crate::spec::IntType::new());
+        let (file_io, table_path, file_name, meta, _tmp) = setup_bitmap_testdata_table(file_name);
+        let entries = vec![make_global_index_entry_with_type(
+            BITMAP_GLOBAL_INDEX_TYPE,
+            &file_name,
+            1,
+            100,
+            105,
+            &meta,
+        )];
+        let fields = int_schema_fields();
+        assert_eq!(meta.first_key, Some(le_int_key(-1)));
+        assert_eq!(meta.last_key, Some(le_int_key(256)));
+        assert!(meta.has_nulls);
+
+        let cases = [
+            (
+                PredicateOperator::Eq,
+                vec![Datum::Int(0)],
+                vec![RowRange::new(101, 102)],
+            ),
+            (
+                PredicateOperator::Eq,
+                vec![Datum::Int(256)],
+                vec![RowRange::new(104, 104)],
+            ),
+            (
+                PredicateOperator::In,
+                vec![Datum::Int(-1), Datum::Int(1), Datum::Int(256)],
+                vec![RowRange::new(100, 100), RowRange::new(103, 104)],
+            ),
+            (
+                PredicateOperator::NotEq,
+                vec![Datum::Int(0)],
+                vec![RowRange::new(100, 100), RowRange::new(103, 104)],
+            ),
+            (
+                PredicateOperator::NotIn,
+                vec![Datum::Int(-1), Datum::Int(1), Datum::Int(256)],
+                vec![RowRange::new(101, 102)],
+            ),
+            (
+                PredicateOperator::IsNull,
+                vec![],
+                vec![RowRange::new(105, 105)],
+            ),
+        ];
+
+        for (op, literals, expected) in cases {
+            let predicates = vec![Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: data_type.clone(),
+                op,
+                literals,
+            }];
+            let result =
+                evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(result, expected, "{file_name}: {op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_java_logical_order_bitmap_int_fixture() {
+        assert_bitmap_int_fixture("bitmap_int_logical_java.index").await;
+    }
+
+    async fn assert_bitmap_nan_equality_uses_direct_lookup(
+        data_type: DataType,
+        nan_literals: [Datum; 3],
+        zero: Datum,
+    ) {
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            1,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+        for (row_id, literal) in nan_literals.iter().enumerate() {
+            let key = serialize_bitmap_datum(literal, &data_type);
+            writer.write(Some(&key), row_id as i64).unwrap();
+        }
+        let zero_key = serialize_bitmap_datum(&zero, &data_type);
+        writer.write(Some(&zero_key), 3).unwrap();
+        let write_result = writer.finish().await.unwrap();
+        let bytes = captured.to_vec();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let file_name = "bitmap-current.index";
+        std::fs::write(index_dir.join(file_name), &bytes).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+
+        let mut entry = make_global_index_entry_with_type(
+            BITMAP_GLOBAL_INDEX_TYPE,
+            file_name,
+            1,
+            100,
+            103,
+            &write_result.meta,
+        );
+        entry.index_file.file_size = bytes.len() as i64;
+        let entries = vec![entry];
+        let fields = vec![DataField::new(1, "id".to_string(), data_type.clone())];
+        let cases = [
+            (PredicateOperator::Eq, vec![nan_literals[0].clone()]),
+            (
+                PredicateOperator::In,
+                vec![nan_literals[1].clone(), nan_literals[2].clone()],
+            ),
+        ];
+
+        for (op, literals) in cases {
+            let predicates = vec![Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: data_type.clone(),
+                op,
+                literals,
+            }];
+            let result = evaluate_global_index_fast_with_fallback_size(
+                &file_io,
+                &table_path,
+                &entries,
+                &predicates,
+                &fields,
+                i64::MAX,
+                0,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, vec![RowRange::new(100, 102)], "{data_type:?}: {op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_nan_equality_uses_direct_lookup_with_fallback_scan_disabled() {
+        assert_bitmap_nan_equality_uses_direct_lookup(
+            DataType::Float(crate::spec::FloatType::new()),
+            [
+                Datum::Float(f32::from_bits(0xffc0_0001)),
+                Datum::Float(f32::from_bits(0x7fc0_0010)),
+                Datum::Float(f32::NAN),
+            ],
+            Datum::Float(0.0),
+        )
+        .await;
+        assert_bitmap_nan_equality_uses_direct_lookup(
+            DataType::Double(crate::spec::DoubleType::new()),
+            [
+                Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+                Datum::Double(f64::from_bits(0x7ff8_0000_0000_0010)),
+                Datum::Double(f64::NAN),
+            ],
+            Datum::Double(0.0),
+        )
+        .await;
+    }
+
+    fn legacy_floating_comparator(data_type: &DataType) -> BoxedCmp {
+        match data_type {
+            DataType::Float(_) => Box::new(|left, right| {
+                let left = f32::from_le_bytes(left.try_into().unwrap());
+                let right = f32::from_le_bytes(right.try_into().unwrap());
+                left.total_cmp(&right)
+            }),
+            DataType::Double(_) => Box::new(|left, right| {
+                let left = f64::from_le_bytes(left.try_into().unwrap());
+                let right = f64::from_le_bytes(right.try_into().unwrap());
+                left.total_cmp(&right)
+            }),
+            _ => unreachable!("legacy floating comparator requires Float or Double"),
+        }
+    }
+
+    async fn assert_legacy_floating_btree(
+        file_name: &str,
+        data_type: DataType,
+        nan_keys: Vec<Vec<u8>>,
+        nan_literals: Vec<Datum>,
+        zero_key: Vec<u8>,
+        zero_literal: Datum,
+    ) {
+        let mut rows = nan_keys
+            .into_iter()
+            .enumerate()
+            .map(|(row_id, key)| (key, row_id as i64))
+            .collect::<Vec<_>>();
+        rows.push((zero_key, 3));
+        let cmp = legacy_floating_comparator(&data_type);
+        rows.sort_by(|left, right| cmp(&left.0, &right.0));
+        let expected_first_key = rows.first().unwrap().0.clone();
+        let expected_last_key = rows.last().unwrap().0.clone();
+
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer =
+            BTreeIndexWriter::with_comparator(Box::new(output), 1, BlockCompressionType::None, cmp);
+        for (key, row_id) in rows {
+            writer.write(Some(&key), row_id).await.unwrap();
+        }
+        let write_result = writer.finish().await.unwrap();
+        assert_eq!(write_result.meta.first_key, Some(expected_first_key));
+        assert_eq!(write_result.meta.last_key, Some(expected_last_key));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join(file_name), captured.to_vec()).unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        let entries = vec![make_global_index_entry(
+            file_name,
+            1,
+            100,
+            103,
+            &write_result.meta,
+        )];
+        let fields = vec![DataField::new(1, "id".to_string(), data_type.clone())];
+        let cases = [
+            (
+                PredicateOperator::Eq,
+                vec![zero_literal.clone()],
+                vec![RowRange::new(103, 103)],
+            ),
+            (
+                PredicateOperator::Eq,
+                vec![nan_literals[0].clone()],
+                vec![RowRange::new(100, 100)],
+            ),
+            (
+                PredicateOperator::In,
+                vec![
+                    nan_literals[0].clone(),
+                    nan_literals[1].clone(),
+                    zero_literal,
+                ],
+                vec![RowRange::new(100, 101), RowRange::new(103, 103)],
+            ),
+        ];
+
+        for (op, literals, expected) in cases {
+            let predicates = vec![Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: data_type.clone(),
+                op,
+                literals,
+            }];
+            let result =
+                evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(result, expected, "{file_name}: {op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_legacy_float_btree() {
+        let nan_bits = [0xffc0_0001u32, 0xffc0_0010, 0xffff_1234];
+        assert_legacy_floating_btree(
+            "btree_float_legacy_rust.index",
+            DataType::Float(crate::spec::FloatType::new()),
+            nan_bits
+                .iter()
+                .map(|bits| bits.to_le_bytes().to_vec())
+                .collect(),
+            nan_bits
+                .iter()
+                .map(|bits| Datum::Float(f32::from_bits(*bits)))
+                .collect(),
+            0.0f32.to_le_bytes().to_vec(),
+            Datum::Float(0.0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_legacy_double_btree() {
+        let nan_bits = [
+            0xfff8_0000_0000_0001u64,
+            0xfff8_0000_0000_0010,
+            0xffff_1234_5678_9abc,
+        ];
+        assert_legacy_floating_btree(
+            "btree_double_legacy_rust.index",
+            DataType::Double(crate::spec::DoubleType::new()),
+            nan_bits
+                .iter()
+                .map(|bits| bits.to_le_bytes().to_vec())
+                .collect(),
+            nan_bits
+                .iter()
+                .map(|bits| Datum::Double(f64::from_bits(*bits)))
+                .collect(),
+            0.0f64.to_le_bytes().to_vec(),
+            Datum::Double(0.0),
+        )
+        .await;
     }
 
     #[tokio::test]

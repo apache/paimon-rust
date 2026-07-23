@@ -19,6 +19,7 @@
 //!
 //! Reference: `org.apache.paimon.globalindex.bitmap.BitmapGlobalIndexFormat`.
 
+use crate::btree::key_serde::KeyComparator;
 use crate::btree::var_len::{decode_var_int, decode_var_long, encode_var_int, encode_var_long};
 use crate::btree::BTreeIndexMeta;
 use crate::btree::{make_key_comparator, serialize_datum, BlockCompressionType};
@@ -35,6 +36,80 @@ const MAGIC: i32 = 0x4247_4958;
 const VERSION: i32 = 1;
 const FOOTER_LENGTH: usize = 48;
 const BLOCK_TRAILER_LENGTH: usize = 5;
+const JAVA_CANONICAL_FLOAT_NAN_BITS: u32 = 0x7fc0_0000;
+const JAVA_CANONICAL_DOUBLE_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
+// Bitmap follows current Java's floating-point key contract. Shared BTree key
+// serde intentionally keeps the already-persisted Rust contract.
+pub(crate) fn make_bitmap_key_comparator(data_type: &DataType) -> KeyComparator {
+    match data_type {
+        DataType::Float(_) => Box::new(|left, right| {
+            let left = f32::from_le_bytes(left[..4].try_into().unwrap());
+            let right = f32::from_le_bytes(right[..4].try_into().unwrap());
+            compare_float_like_java(left, right)
+        }),
+        DataType::Double(_) => Box::new(|left, right| {
+            let left = f64::from_le_bytes(left[..8].try_into().unwrap());
+            let right = f64::from_le_bytes(right[..8].try_into().unwrap());
+            compare_double_like_java(left, right)
+        }),
+        _ => make_key_comparator(data_type),
+    }
+}
+
+pub(crate) fn serialize_bitmap_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
+    match (datum, data_type) {
+        (Datum::Float(value), DataType::Float(_)) => {
+            let bits = if value.is_nan() {
+                JAVA_CANONICAL_FLOAT_NAN_BITS
+            } else {
+                value.to_bits()
+            };
+            bits.to_le_bytes().to_vec()
+        }
+        (Datum::Double(value), DataType::Double(_)) => {
+            let bits = if value.is_nan() {
+                JAVA_CANONICAL_DOUBLE_NAN_BITS
+            } else {
+                value.to_bits()
+            };
+            bits.to_le_bytes().to_vec()
+        }
+        _ => serialize_datum(datum, data_type),
+    }
+}
+
+pub(crate) fn is_bitmap_floating_residual_sensitive_op(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::NotEq
+            | PredicateOperator::NotIn
+            | PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
+    )
+}
+
+fn compare_float_like_java(left: f32, right: f32) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.total_cmp(&right),
+    }
+}
+
+fn compare_double_like_java(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.total_cmp(&right),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct BlockInfo {
@@ -124,12 +199,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
     }
 
     pub(crate) async fn finish(mut self) -> io::Result<BitmapWriteResult> {
+        let mut bitmaps = std::mem::take(&mut self.bitmaps)
+            .into_iter()
+            .collect::<Vec<_>>();
+        bitmaps.sort_by(|(left, _), (right, _)| (self.key_comparator)(left, right));
+
         let mut bytes = Vec::new();
         write_bitmap_index_bytes(
             &mut bytes,
             &self.null_rows,
             &self.non_null_rows,
-            &self.bitmaps,
+            &bitmaps,
             self.dictionary_block_size,
             self.compression_type,
         )?;
@@ -190,58 +270,61 @@ impl BitmapGlobalIndexReader {
         literals: &[Datum],
         data_type: &DataType,
     ) -> io::Result<RoaringTreemap> {
+        if is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(op) {
+            return self.is_not_null().await;
+        }
         match op {
             PredicateOperator::Eq => {
-                let key = serialize_datum(&literals[0], data_type);
-                self.equal(&key).await
+                let key = serialize_bitmap_datum(&literals[0], data_type);
+                self.equal(&key, data_type).await
             }
             PredicateOperator::NotEq => {
                 let mut result = self.is_not_null().await?;
-                let key = serialize_datum(&literals[0], data_type);
-                result -= self.equal(&key).await?;
+                let key = serialize_bitmap_datum(&literals[0], data_type);
+                result -= self.equal(&key, data_type).await?;
                 Ok(result)
             }
             PredicateOperator::In => {
                 let keys = literals
                     .iter()
-                    .map(|literal| serialize_datum(literal, data_type))
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
                     .collect::<Vec<_>>();
-                self.in_keys(&keys).await
+                self.in_keys(&keys, data_type).await
             }
             PredicateOperator::NotIn => {
                 let mut result = self.is_not_null().await?;
                 let keys = literals
                     .iter()
-                    .map(|literal| serialize_datum(literal, data_type))
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
                     .collect::<Vec<_>>();
-                result -= self.in_keys(&keys).await?;
+                result -= self.in_keys(&keys, data_type).await?;
                 Ok(result)
             }
             PredicateOperator::IsNull => self.is_null().await,
             PredicateOperator::IsNotNull => self.is_not_null().await,
             PredicateOperator::Lt => {
-                let key = serialize_datum(&literals[0], data_type);
+                let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| cmp(candidate, &key).is_lt())
                     .await
             }
             PredicateOperator::LtEq => {
-                let key = serialize_datum(&literals[0], data_type);
+                let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| !cmp(candidate, &key).is_gt())
                     .await
             }
             PredicateOperator::Gt => {
-                let key = serialize_datum(&literals[0], data_type);
+                let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| cmp(candidate, &key).is_gt())
                     .await
             }
             PredicateOperator::GtEq => {
-                let key = serialize_datum(&literals[0], data_type);
+                let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| !cmp(candidate, &key).is_lt())
                     .await
             }
             PredicateOperator::Between => {
-                let from = serialize_datum(&literals[0], data_type);
-                let to = serialize_datum(&literals[1], data_type);
+                let from = serialize_bitmap_datum(&literals[0], data_type);
+                let to = serialize_bitmap_datum(&literals[1], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| {
                     !cmp(candidate, &from).is_lt() && !cmp(candidate, &to).is_gt()
                 })
@@ -249,8 +332,8 @@ impl BitmapGlobalIndexReader {
             }
             PredicateOperator::NotBetween => {
                 let mut result = self.is_not_null().await?;
-                let from = serialize_datum(&literals[0], data_type);
-                let to = serialize_datum(&literals[1], data_type);
+                let from = serialize_bitmap_datum(&literals[0], data_type);
+                let to = serialize_bitmap_datum(&literals[1], data_type);
                 let inside = self
                     .scan_dictionary(data_type, |candidate, cmp| {
                         !cmp(candidate, &from).is_lt() && !cmp(candidate, &to).is_gt()
@@ -266,7 +349,7 @@ impl BitmapGlobalIndexReader {
                         "Bitmap global index starts_with only supports string columns",
                     ));
                 }
-                let prefix = serialize_datum(&literals[0], data_type);
+                let prefix = serialize_bitmap_datum(&literals[0], data_type);
                 if prefix.is_empty() {
                     return self.is_not_null().await;
                 }
@@ -280,7 +363,7 @@ impl BitmapGlobalIndexReader {
                         "Bitmap global index ends_with only supports string columns",
                     ));
                 }
-                let suffix = serialize_datum(&literals[0], data_type);
+                let suffix = serialize_bitmap_datum(&literals[0], data_type);
                 if suffix.is_empty() {
                     return self.is_not_null().await;
                 }
@@ -294,7 +377,7 @@ impl BitmapGlobalIndexReader {
                         "Bitmap global index contains only supports string columns",
                     ));
                 }
-                let needle = serialize_datum(&literals[0], data_type);
+                let needle = serialize_bitmap_datum(&literals[0], data_type);
                 if needle.is_empty() {
                     return self.is_not_null().await;
                 }
@@ -325,6 +408,9 @@ impl BitmapGlobalIndexReader {
         from_inclusive: bool,
         to_inclusive: bool,
     ) -> io::Result<RoaringTreemap> {
+        if is_floating_point(data_type) {
+            return self.is_not_null().await;
+        }
         self.scan_dictionary(data_type, |candidate, cmp| {
             let from_cmp = cmp(candidate, from);
             let to_cmp = cmp(candidate, to);
@@ -342,23 +428,33 @@ impl BitmapGlobalIndexReader {
         self.read_bitmap(self.footer.non_null_rows_block).await
     }
 
-    async fn equal(&self, key: &[u8]) -> io::Result<RoaringTreemap> {
-        match self.find_bitmap_block(key).await? {
+    async fn equal(&self, key: &[u8], data_type: &DataType) -> io::Result<RoaringTreemap> {
+        let logical_cmp = make_bitmap_key_comparator(data_type);
+        self.equal_with_comparator(key, logical_cmp.as_ref()).await
+    }
+
+    async fn equal_with_comparator(
+        &self,
+        key: &[u8],
+        logical_cmp: &(dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync),
+    ) -> io::Result<RoaringTreemap> {
+        match self.find_bitmap_block(key, logical_cmp).await? {
             Some(block) => self.read_bitmap(block).await,
             None => Ok(RoaringTreemap::new()),
         }
     }
 
-    async fn in_keys(&self, keys: &[Vec<u8>]) -> io::Result<RoaringTreemap> {
+    async fn in_keys(&self, keys: &[Vec<u8>], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let mut sorted_keys = keys.to_vec();
         sorted_keys.sort();
         sorted_keys.dedup();
 
+        let logical_cmp = make_bitmap_key_comparator(data_type);
         let mut result = RoaringTreemap::new();
         for key in sorted_keys {
-            if let Some(block) = self.find_bitmap_block(&key).await? {
-                result |= self.read_bitmap(block).await?;
-            }
+            result |= self
+                .equal_with_comparator(&key, logical_cmp.as_ref())
+                .await?;
         }
         Ok(result)
     }
@@ -368,7 +464,7 @@ impl BitmapGlobalIndexReader {
         data_type: &DataType,
         predicate: impl Fn(&[u8], &dyn Fn(&[u8], &[u8]) -> Ordering) -> bool,
     ) -> io::Result<RoaringTreemap> {
-        let cmp = make_key_comparator(data_type);
+        let cmp = make_bitmap_key_comparator(data_type);
         self.scan_serialized_dictionary(|candidate| predicate(candidate, cmp.as_ref()))
             .await
     }
@@ -388,13 +484,16 @@ impl BitmapGlobalIndexReader {
         Ok(result)
     }
 
-    async fn find_bitmap_block(&self, key: &[u8]) -> io::Result<Option<BlockInfo>> {
-        let Some(block_meta) = self.find_dictionary_block_meta(key) else {
+    async fn find_bitmap_block(
+        &self,
+        key: &[u8],
+        logical_cmp: &(dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync),
+    ) -> io::Result<Option<BlockInfo>> {
+        let Some(block_meta) = self.find_dictionary_block_meta(key, logical_cmp) else {
             return Ok(None);
         };
-
         for entry in self.read_dictionary_block(block_meta.block).await? {
-            match compare_unsigned(&entry.key, key) {
+            match logical_cmp(&entry.key, key) {
                 Ordering::Equal => return Ok(Some(entry.bitmap_block)),
                 Ordering::Greater => return Ok(None),
                 Ordering::Less => {}
@@ -403,7 +502,11 @@ impl BitmapGlobalIndexReader {
         Ok(None)
     }
 
-    fn find_dictionary_block_meta(&self, key: &[u8]) -> Option<&DictionaryBlockMeta> {
+    fn find_dictionary_block_meta(
+        &self,
+        key: &[u8],
+        compare: impl Fn(&[u8], &[u8]) -> Ordering,
+    ) -> Option<&DictionaryBlockMeta> {
         if self.dictionary_blocks.is_empty() {
             return None;
         }
@@ -411,7 +514,7 @@ impl BitmapGlobalIndexReader {
         let mut high = self.dictionary_blocks.len();
         while low < high {
             let mid = (low + high) / 2;
-            if compare_unsigned(&self.dictionary_blocks[mid].first_key, key) != Ordering::Greater {
+            if compare(&self.dictionary_blocks[mid].first_key, key) != Ordering::Greater {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -519,7 +622,6 @@ fn read_index_block(bytes: &[u8]) -> io::Result<Vec<DictionaryBlockMeta>> {
             block: block_info(offset, length)?,
         });
     }
-    blocks.sort_by(|left, right| compare_unsigned(&left.first_key, &right.first_key));
     Ok(blocks)
 }
 
@@ -627,18 +729,12 @@ fn read_i32_be(bytes: &[u8], offset: usize) -> io::Result<i32> {
     Ok(i32::from_be_bytes(value.try_into().unwrap()))
 }
 
-fn compare_unsigned(left: &[u8], right: &[u8]) -> Ordering {
-    for (left, right) in left.iter().zip(right.iter()) {
-        match left.cmp(right) {
-            Ordering::Equal => {}
-            non_eq => return non_eq,
-        }
-    }
-    left.len().cmp(&right.len())
-}
-
 fn is_character_string(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Char(_) | DataType::VarChar(_))
+}
+
+fn is_floating_point(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Float(_) | DataType::Double(_))
 }
 
 fn string_literal(literals: &[Datum], op: PredicateOperator) -> io::Result<&str> {
@@ -666,7 +762,7 @@ fn write_bitmap_index_bytes(
     out: &mut Vec<u8>,
     null_rows: &RoaringTreemap,
     non_null_rows: &RoaringTreemap,
-    bitmaps: &BTreeMap<Vec<u8>, RoaringTreemap>,
+    bitmaps: &[(Vec<u8>, RoaringTreemap)],
     dictionary_block_size: usize,
     compression_type: BlockCompressionType,
 ) -> io::Result<()> {
@@ -706,7 +802,7 @@ fn write_bitmap_block(out: &mut Vec<u8>, bitmap: &RoaringTreemap) -> io::Result<
 
 fn write_dictionary_and_bitmap_blocks(
     out: &mut Vec<u8>,
-    bitmaps: &BTreeMap<Vec<u8>, RoaringTreemap>,
+    bitmaps: &[(Vec<u8>, RoaringTreemap)],
     dictionary_block_size: usize,
     compression_type: BlockCompressionType,
 ) -> io::Result<(Vec<DictionaryBlockMeta>, usize)> {
@@ -889,4 +985,405 @@ fn u64_to_i64(value: u64) -> io::Result<i64> {
             format!("Bitmap global index offset is too large: {value}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::btree::test_util::{BytesFileRead, VecFileWrite};
+    use crate::spec::{DoubleType, FloatType, IntType};
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    struct TrackingFileRead {
+        bytes: Bytes,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    async fn write_bitmap_bytes(
+        data_type: &DataType,
+        values: &[(Datum, i64)],
+        dictionary_block_size: usize,
+    ) -> Vec<u8> {
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            dictionary_block_size,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(data_type),
+        );
+        for (value, row_id) in values {
+            let key = serialize_bitmap_datum(value, data_type);
+            writer.write(Some(&key), *row_id).unwrap();
+        }
+        writer.finish().await.unwrap();
+        captured.to_vec()
+    }
+
+    async fn write_and_read_entries(
+        data_type: &DataType,
+        values: &[(Datum, i64)],
+    ) -> (BitmapGlobalIndexReader, Vec<DictionaryEntry>) {
+        let bytes = write_bitmap_bytes(data_type, values, 1 << 20).await;
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        let mut entries = Vec::new();
+        for block in &reader.dictionary_blocks {
+            entries.extend(reader.read_dictionary_block(block.block).await.unwrap());
+        }
+        (reader, entries)
+    }
+
+    #[test]
+    fn test_bitmap_floating_residual_sensitive_operator_set() {
+        for op in [
+            PredicateOperator::NotEq,
+            PredicateOperator::NotIn,
+            PredicateOperator::Lt,
+            PredicateOperator::LtEq,
+            PredicateOperator::Gt,
+            PredicateOperator::GtEq,
+            PredicateOperator::Between,
+            PredicateOperator::NotBetween,
+        ] {
+            assert!(is_bitmap_floating_residual_sensitive_op(op), "{op}");
+        }
+        for op in [
+            PredicateOperator::Eq,
+            PredicateOperator::In,
+            PredicateOperator::IsNull,
+            PredicateOperator::IsNotNull,
+            PredicateOperator::StartsWith,
+            PredicateOperator::EndsWith,
+            PredicateOperator::Contains,
+            PredicateOperator::Like,
+        ] {
+            assert!(!is_bitmap_floating_residual_sensitive_op(op), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writer_orders_numeric_keys_logically() {
+        let data_type = DataType::Int(IntType::new());
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            1 << 20,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+
+        writer.write(None, 5).unwrap();
+        for (value, row_id) in [(-1i32, 0), (0, 1), (0, 2), (1, 3), (256, 4)] {
+            writer.write(Some(&value.to_le_bytes()), row_id).unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let bytes = captured.to_vec();
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.dictionary_blocks.len(), 1);
+        let keys = reader
+            .read_dictionary_block(reader.dictionary_blocks[0].block)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| i32::from_le_bytes(entry.key.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![-1, 0, 1, 256]);
+    }
+
+    #[tokio::test]
+    async fn test_writer_orders_and_canonicalizes_float_keys_like_java() {
+        let data_type = DataType::Float(FloatType::new());
+        let values = [
+            (Datum::Float(f32::from_bits(0xffc0_0001)), 0),
+            (Datum::Float(-1.0), 1),
+            (Datum::Float(-0.0), 2),
+            (Datum::Float(0.0), 3),
+            (Datum::Float(1.0), 4),
+            (Datum::Float(f32::from_bits(0x7fc0_0010)), 5),
+            (Datum::Float(f32::from_bits(0x7fff_1234)), 6),
+        ];
+        let (reader, entries) = write_and_read_entries(&data_type, &values).await;
+
+        let key_bits = entries
+            .iter()
+            .map(|entry| u32::from_le_bytes(entry.key.as_slice().try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            key_bits,
+            vec![
+                (-1.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0x7fc0_0000,
+            ]
+        );
+        let nan_rows = reader
+            .read_bitmap(entries.last().unwrap().bitmap_block)
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(nan_rows, vec![0, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_writer_orders_and_canonicalizes_double_keys_like_java() {
+        let data_type = DataType::Double(DoubleType::new());
+        let values = [
+            (Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)), 0),
+            (Datum::Double(-1.0), 1),
+            (Datum::Double(-0.0), 2),
+            (Datum::Double(0.0), 3),
+            (Datum::Double(1.0), 4),
+            (Datum::Double(f64::from_bits(0x7ff8_0000_0000_0010)), 5),
+            (Datum::Double(f64::from_bits(0x7fff_1234_5678_9abc)), 6),
+        ];
+        let (reader, entries) = write_and_read_entries(&data_type, &values).await;
+
+        let key_bits = entries
+            .iter()
+            .map(|entry| u64::from_le_bytes(entry.key.as_slice().try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            key_bits,
+            vec![
+                (-1.0f64).to_bits(),
+                (-0.0f64).to_bits(),
+                0.0f64.to_bits(),
+                1.0f64.to_bits(),
+                0x7ff8_0000_0000_0000,
+            ]
+        );
+        let nan_rows = reader
+            .read_bitmap(entries.last().unwrap().bitmap_block)
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(nan_rows, vec![0, 5, 6]);
+    }
+
+    async fn assert_eq_and_in_read_only_logical_candidate_block(
+        data_type: DataType,
+        negative_nan: Datum,
+        positive_nan: Datum,
+        canonical_nan: Datum,
+        negative_one: Datum,
+        zero: Datum,
+        one: Datum,
+    ) {
+        let values = [
+            (negative_nan.clone(), 0),
+            (positive_nan.clone(), 1),
+            (canonical_nan.clone(), 2),
+            (negative_one.clone(), 3),
+            (zero, 4),
+            (one, 5),
+        ];
+        let bytes = write_bitmap_bytes(&data_type, &values, 1).await;
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(TrackingFileRead {
+                bytes: Bytes::from(bytes.clone()),
+                ranges: Arc::clone(&ranges),
+            }),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert!(reader.dictionary_blocks.len() > 1);
+
+        let cases = [
+            (PredicateOperator::Eq, vec![negative_nan], vec![0, 1, 2]),
+            (
+                PredicateOperator::In,
+                vec![positive_nan, canonical_nan],
+                vec![0, 1, 2],
+            ),
+            (PredicateOperator::Eq, vec![negative_one], vec![3]),
+        ];
+        for (op, literals, expected) in cases {
+            let key = serialize_bitmap_datum(&literals[0], &data_type);
+            let cmp = make_bitmap_key_comparator(&data_type);
+            let expected_block = reader
+                .find_dictionary_block_meta(&key, cmp.as_ref())
+                .unwrap()
+                .block;
+            ranges.lock().unwrap().clear();
+
+            let actual = reader
+                .query(op, &literals, &data_type)
+                .await
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{data_type:?}: {op}");
+
+            let actual_ranges = ranges.lock().unwrap().clone();
+            assert_eq!(actual_ranges.len(), 2, "{data_type:?}: {op}");
+            assert_eq!(
+                actual_ranges[0],
+                expected_block.offset
+                    ..expected_block.offset + (expected_block.length + BLOCK_TRAILER_LENGTH) as u64,
+                "{data_type:?}: {op}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eq_and_in_read_only_logical_candidate_block() {
+        assert_eq_and_in_read_only_logical_candidate_block(
+            DataType::Float(FloatType::new()),
+            Datum::Float(f32::from_bits(0xffc0_0001)),
+            Datum::Float(f32::from_bits(0x7fc0_0010)),
+            Datum::Float(f32::NAN),
+            Datum::Float(-1.0),
+            Datum::Float(0.0),
+            Datum::Float(1.0),
+        )
+        .await;
+        assert_eq_and_in_read_only_logical_candidate_block(
+            DataType::Double(DoubleType::new()),
+            Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+            Datum::Double(f64::from_bits(0x7ff8_0000_0000_0010)),
+            Datum::Double(f64::NAN),
+            Datum::Double(-1.0),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+        )
+        .await;
+    }
+
+    async fn assert_floating_residual_sensitive_ops_return_all_non_null_candidates(
+        data_type: DataType,
+        negative_nan: Datum,
+        zero: Datum,
+        one: Datum,
+    ) {
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            1,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+        for (row_id, value) in [&negative_nan, &zero, &one].into_iter().enumerate() {
+            let key = serialize_bitmap_datum(value, &data_type);
+            writer.write(Some(&key), row_id as i64).unwrap();
+        }
+        writer.write(None, 3).unwrap();
+        writer.finish().await.unwrap();
+
+        let bytes = captured.to_vec();
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        let expected = vec![0, 1, 2];
+        let cases = [
+            (PredicateOperator::NotEq, vec![negative_nan.clone()]),
+            (
+                PredicateOperator::NotIn,
+                vec![negative_nan.clone(), zero.clone()],
+            ),
+            (PredicateOperator::Lt, vec![zero.clone()]),
+            (PredicateOperator::LtEq, vec![zero.clone()]),
+            (PredicateOperator::Gt, vec![negative_nan.clone()]),
+            (PredicateOperator::GtEq, vec![negative_nan.clone()]),
+            (
+                PredicateOperator::Between,
+                vec![negative_nan.clone(), zero.clone()],
+            ),
+            (
+                PredicateOperator::NotBetween,
+                vec![negative_nan.clone(), zero.clone()],
+            ),
+        ];
+        for (op, literals) in cases {
+            let actual = reader
+                .query(op, &literals, &data_type)
+                .await
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{data_type:?}: {op}");
+        }
+
+        let direct_cases = [
+            (PredicateOperator::Eq, vec![negative_nan.clone()], vec![0]),
+            (
+                PredicateOperator::In,
+                vec![negative_nan.clone(), zero.clone()],
+                vec![0, 1],
+            ),
+            (PredicateOperator::Eq, vec![zero.clone()], vec![1]),
+            (
+                PredicateOperator::In,
+                vec![zero.clone(), one.clone()],
+                vec![1, 2],
+            ),
+        ];
+        for (op, literals, expected) in direct_cases {
+            let actual = reader
+                .query(op, &literals, &data_type)
+                .await
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{data_type:?}: direct {op}");
+        }
+
+        let from = serialize_bitmap_datum(&negative_nan, &data_type);
+        let to = serialize_bitmap_datum(&zero, &data_type);
+        let actual = reader
+            .range_query(&from, &to, &data_type, true, true)
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{data_type:?}: combined range");
+    }
+
+    #[tokio::test]
+    async fn test_floating_residual_sensitive_ops_return_all_non_null_candidates() {
+        assert_floating_residual_sensitive_ops_return_all_non_null_candidates(
+            DataType::Float(FloatType::new()),
+            Datum::Float(f32::from_bits(0xffc0_0001)),
+            Datum::Float(0.0),
+            Datum::Float(1.0),
+        )
+        .await;
+        assert_floating_residual_sensitive_ops_return_all_non_null_candidates(
+            DataType::Double(DoubleType::new()),
+            Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+        )
+        .await;
+    }
 }
