@@ -119,6 +119,14 @@ impl BinaryRow {
 
     /// Serialize this BinaryRow to bytes (arity prefix + data), the inverse of `from_serialized_bytes`.
     pub fn to_serialized_bytes(&self) -> Vec<u8> {
+        // Java's BinaryRow.EMPTY_ROW points to its 8-byte fixed part, so the
+        // schemaless wire representation is 4 bytes of arity plus that body.
+        // BinaryRow::new(0) is an in-memory stub without backing data; normalize
+        // it here instead of emitting a truncated row that the strict decoder
+        // correctly rejects.
+        if self.arity == 0 && self.data.is_empty() {
+            return EMPTY_SERIALIZED_ROW.clone();
+        }
         let mut buf = Vec::with_capacity(4 + self.data.len());
         buf.extend_from_slice(&self.arity.to_be_bytes());
         buf.extend_from_slice(&self.data);
@@ -1554,6 +1562,17 @@ mod tests {
         assert_eq!(row.arity(), 0);
         assert!(row.is_empty());
         assert_eq!(row.data(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_empty_binary_row_serializes_to_java_wire_format() {
+        let serialized = BinaryRow::new(0).to_serialized_bytes();
+        assert_eq!(serialized, *EMPTY_SERIALIZED_ROW);
+        assert_eq!(serialized.len(), 12);
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&serialized).unwrap(),
+            BinaryRow::from_bytes(0, vec![0; 8])
+        );
     }
 
     #[test]
