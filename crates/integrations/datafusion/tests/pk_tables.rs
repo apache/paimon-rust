@@ -186,6 +186,8 @@ async fn test_pk_partial_update_ignore_delete_alias_e2e() {
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .unwrap();
+    // The batch below supplies explicit row kinds through `_VALUE_KIND`, which
+    // is part of the input changelog write contract rather than a normal write.
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_partial_update_ignore_delete (
@@ -194,6 +196,7 @@ async fn test_pk_partial_update_ignore_delete_alias_e2e() {
             ) WITH (
                 'bucket' = '1',
                 'merge-engine' = 'partial-update',
+                'changelog-producer' = 'input',
                 'partial-update.ignore-delete' = 'true'
             )",
         )
