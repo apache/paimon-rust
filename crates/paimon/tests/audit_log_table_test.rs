@@ -197,7 +197,7 @@ async fn audit_log_delta_scan_preserves_pk_row_kinds() {
     let (file_io, table) = memory_table(
         table_path,
         pk_schema(&[
-            ("changelog-producer", "none"),
+            ("changelog-producer", "input"),
             ("merge-engine", "deduplicate"),
             ("bucket", "1"),
         ]),

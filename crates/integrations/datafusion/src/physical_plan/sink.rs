@@ -32,25 +32,35 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::DisplayAs;
 use futures::StreamExt;
+use paimon::spec::{CoreOptions, ROW_ID_FIELD_NAME};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
-fn to_paimon_batch(batch: RecordBatch) -> DFResult<RecordBatch> {
-    if !batch
-        .schema()
-        .fields()
-        .iter()
-        .any(|field| field.data_type() == &ArrowDataType::Utf8View)
+fn to_paimon_batch(batch: RecordBatch, strip_internal_row_id: bool) -> DFResult<RecordBatch> {
+    let input_schema = batch.schema();
+    let row_id_index = strip_internal_row_id.then(|| {
+        input_schema
+            .fields()
+            .iter()
+            .rposition(|field| field.name() == ROW_ID_FIELD_NAME)
+    });
+    let row_id_index = row_id_index.flatten();
+    if row_id_index.is_none()
+        && !input_schema
+            .fields()
+            .iter()
+            .any(|field| field.data_type() == &ArrowDataType::Utf8View)
     {
         return Ok(batch);
     }
 
-    let fields = batch
-        .schema()
+    let fields = input_schema
         .fields()
         .iter()
-        .map(|field| {
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != row_id_index)
+        .map(|(_, field)| {
             if field.data_type() == &ArrowDataType::Utf8View {
                 Arc::new(field.as_ref().clone().with_data_type(ArrowDataType::Utf8))
             } else {
@@ -60,11 +70,14 @@ fn to_paimon_batch(batch: RecordBatch) -> DFResult<RecordBatch> {
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new_with_metadata(
         fields,
-        batch.schema().metadata().clone(),
+        input_schema.metadata().clone(),
     ));
     let columns = batch
         .columns()
         .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != row_id_index)
+        .map(|(_, column)| column)
         .zip(schema.fields())
         .map(|(column, field)| {
             if column.data_type() == field.data_type() {
@@ -88,14 +101,18 @@ fn to_paimon_batch(batch: RecordBatch) -> DFResult<RecordBatch> {
 pub struct PaimonDataSink {
     table: Table,
     schema: ArrowSchemaRef,
+    strip_internal_row_id: bool,
     overwrite: bool,
 }
 
 impl PaimonDataSink {
     pub fn new(table: Table, schema: ArrowSchemaRef, overwrite: bool) -> Self {
+        let strip_internal_row_id =
+            CoreOptions::new(table.schema().options()).data_evolution_enabled();
         Self {
             table,
             schema,
+            strip_internal_row_id,
             overwrite,
         }
     }
@@ -131,7 +148,7 @@ impl DataSink for PaimonDataSink {
         let mut row_count = 0u64;
 
         while let Some(batch) = data.next().await {
-            let batch = to_paimon_batch(batch?)?;
+            let batch = to_paimon_batch(batch?, self.strip_internal_row_id)?;
             row_count += batch.num_rows() as u64;
             tw.write_arrow_batch(&batch)
                 .await
@@ -151,5 +168,41 @@ impl DataSink for PaimonDataSink {
         }
 
         Ok(row_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int32Array, Int64Array, StringViewArray};
+    use datafusion::arrow::datatypes::Field;
+
+    #[test]
+    fn test_to_paimon_batch_strips_internal_row_id_and_casts_string_views() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8View, true),
+            Field::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringViewArray::from(vec![Some("a"), None])),
+                Arc::new(Int64Array::from(vec![10, 11])),
+            ],
+        )
+        .unwrap();
+
+        let converted = to_paimon_batch(batch, true).unwrap();
+
+        assert_eq!(converted.num_rows(), 2);
+        assert_eq!(converted.num_columns(), 2);
+        assert_eq!(converted.schema().field(0).name(), "id");
+        assert_eq!(converted.schema().field(1).name(), "name");
+        assert_eq!(
+            converted.schema().field(1).data_type(),
+            &ArrowDataType::Utf8
+        );
     }
 }
