@@ -461,7 +461,12 @@ impl TableWrite {
         let actual_schema = batch.schema();
         let table_field_count = expected_schema.fields().len();
         let actual_field_count = actual_schema.fields().len();
-        let allows_value_kind = self.changelog_producer == ChangelogProducer::Input;
+        // Cross-partition routing generates its own `_VALUE_KIND` column so that
+        // migrated rows can be written as deletes in their previous partition.
+        // Accepting a caller-provided column here would make the generated delete
+        // batch contain `_VALUE_KIND` twice.
+        let allows_value_kind = self.changelog_producer == ChangelogProducer::Input
+            && !matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_));
         let includes_value_kind = allows_value_kind && actual_field_count == table_field_count + 1;
 
         if actual_field_count != table_field_count && !includes_value_kind {
@@ -3931,10 +3936,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cross_partition_write_rejects_caller_value_kind() {
+    async fn test_input_changelog_cross_partition_write_rejects_caller_value_kind() {
         let file_io = test_file_io();
-        let table =
-            test_cross_partition_table(&file_io, "memory:/test_cross_partition_schema_validation");
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .partition_keys(["pt"])
+            .option("changelog-producer", "input")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_cross_partition_schema_validation"),
+            "memory:/test_cross_partition_schema_validation".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
         let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
 
         let error = table_write
