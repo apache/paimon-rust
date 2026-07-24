@@ -681,6 +681,18 @@ fn global_index_detail_data_ranges(entries: &[ManifestEntry]) -> Vec<RowRange> {
     )
 }
 
+fn should_use_global_index_row_range_optimization(
+    row_range_optimization_disabled: bool,
+    data_evolution_enabled: bool,
+    global_index_enabled: bool,
+    has_data_predicates: bool,
+) -> bool {
+    !row_range_optimization_disabled
+        && data_evolution_enabled
+        && global_index_enabled
+        && has_data_predicates
+}
+
 fn should_skip_level_zero_for_scan(
     scan_all_files: bool,
     has_primary_keys: bool,
@@ -1323,10 +1335,12 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if data_evolution_enabled
-            && core_options.global_index_enabled()
-            && !self.data_predicates.is_empty()
-        {
+        if should_use_global_index_row_range_optimization(
+            self.row_range_optimization_disabled,
+            data_evolution_enabled,
+            core_options.global_index_enabled(),
+            !self.data_predicates.is_empty(),
+        ) {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.global_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -1571,9 +1585,6 @@ impl<'a> PaimonTableScan<'a> {
         after: &Snapshot,
     ) -> crate::Result<(Plan, Plan)> {
         self.ensure_query_auth_allowed()?;
-        let before_entries = self.plan_manifest_entries(before).await?;
-        let after_entries = self.plan_manifest_entries(after).await?;
-        Self::validate_diff_bucket_layout(&before_entries, &after_entries)?;
         // A limit hint cannot be pushed into either side of a Diff: truncating
         // the states independently can both hide changes and invent them.
         let mut full_state_scan = self.clone();
@@ -1581,11 +1592,14 @@ impl<'a> PaimonTableScan<'a> {
         // Row ranges identify physical positions in individual files, whereas
         // Diff compares complete logical states across both snapshots.
         full_state_scan = full_state_scan.without_row_range_optimization();
+        let before_entries = full_state_scan.plan_manifest_entries(before).await?;
+        let after_entries = full_state_scan.plan_manifest_entries(after).await?;
+        Self::validate_diff_bucket_layout(&before_entries, &after_entries)?;
         let before_plan = full_state_scan
-            .plan_snapshot_from_entries(before.clone(), before_entries, None, None)
+            .plan_snapshot_from_entries(before.clone(), before_entries, None, None, None, None)
             .await?;
         let after_plan = full_state_scan
-            .plan_snapshot_from_entries(after.clone(), after_entries, None, None)
+            .plan_snapshot_from_entries(after.clone(), after_entries, None, None, None, None)
             .await?;
         Ok((before_plan, after_plan))
     }
