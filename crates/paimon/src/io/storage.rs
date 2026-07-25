@@ -68,6 +68,8 @@ use super::FileIOBuilder;
 /// The storage carries all supported storage services in paimon
 #[derive(Debug)]
 pub enum Storage {
+    /// A caller-provided opendal operator (see `FileIOBuilder::with_operator`).
+    Custom { op: Operator },
     #[cfg(feature = "storage-memory")]
     Memory { op: Operator },
     #[cfg(feature = "storage-fs")]
@@ -111,7 +113,10 @@ pub enum Storage {
 
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
-        let (scheme_str, props) = file_io_builder.into_parts();
+        let (scheme_str, props, operator) = file_io_builder.into_parts();
+        if let Some(op) = operator {
+            return Ok(Self::Custom { op });
+        }
         let scheme = scheme_str.to_ascii_lowercase();
         match scheme.as_str() {
             #[cfg(feature = "storage-memory")]
@@ -186,6 +191,7 @@ impl Storage {
 
     pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, Cow<'a, str>)> {
         match self {
+            Storage::Custom { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
             #[cfg(feature = "storage-memory")]
             Storage::Memory { op } => {
                 Ok((op.clone(), Cow::Borrowed(Self::memory_relative_path(path)?)))
@@ -289,7 +295,6 @@ impl Storage {
     /// does `PathBuf::from("/").join("C:/dir")`, and because the argument
     /// carries a drive prefix `Path::join` replaces the base, yielding the real
     /// `C:\dir` on Windows.
-    #[cfg(feature = "storage-fs")]
     fn fs_relative_path(path: &str) -> crate::Result<Cow<'_, str>> {
         // A `file://` / `file:/` URL is already in scheme-relative form.
         if let Some(stripped) = path.strip_prefix("file:/") {

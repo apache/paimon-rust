@@ -372,6 +372,7 @@ pub struct FileIOBuilder {
     scheme_str: Option<String>,
     props: HashMap<String, String>,
     cache: Option<Arc<LocalCache>>,
+    operator: Option<Operator>,
 }
 
 impl FileIOBuilder {
@@ -380,11 +381,22 @@ impl FileIOBuilder {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
             cache: None,
+            operator: None,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
-        (self.scheme_str.unwrap_or_default(), self.props)
+    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>, Option<Operator>) {
+        (self.scheme_str.unwrap_or_default(), self.props, self.operator)
+    }
+
+    /// Uses a caller-provided opendal operator instead of building one from the scheme:
+    /// embedders bring their own storage backend (for example a customized local-filesystem
+    /// service) without registering a scheme. Paths are handed to the operator in
+    /// scheme-relative form, exactly as the built-in local-filesystem backend receives them,
+    /// so the operator's root decides what they resolve against.
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = Some(operator);
+        self
     }
 
     pub fn with_prop(mut self, key: impl ToString, value: impl ToString) -> Self {
