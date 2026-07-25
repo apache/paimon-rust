@@ -20,7 +20,7 @@
 //! Reference: [pypaimon TableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
-use crate::arrow::build_target_arrow_schema;
+use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
@@ -434,6 +434,8 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.validate_write_batch_schema(batch)?;
+
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -448,6 +450,104 @@ impl TableWrite {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Validate that an incoming batch matches the public write contract before
+    /// it reaches the empty-batch fast path or any dedicated writer.
+    ///
+    /// Callers must supply exactly the table's fields, in the same order, with
+    /// matching names and Arrow data types. When `changelog-producer=input`
+    /// (and the row kind is not derived from a `rowkind.field` or a
+    /// cross-partition writer), a single trailing `_VALUE_KIND: Int8` column may
+    /// additionally be appended. Any other shape — reordered, renamed,
+    /// wrong-typed, missing, or otherwise unexpected columns — is rejected with
+    /// [`Error::DataInvalid`](crate::Error::DataInvalid). This keeps malformed
+    /// schemas from reaching downstream writers (e.g. the dedicated
+    /// BLOB/VECTOR writer) that index columns positionally and would otherwise
+    /// panic.
+    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
+        use arrow_schema::DataType as ArrowDataType;
+
+        let table_fields = self.table.schema().fields();
+        let batch_fields = batch.schema().fields().clone();
+
+        let is_cross_partition =
+            matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_));
+        // `_VALUE_KIND` is only supplied by callers in plain input-changelog
+        // mode; for rowkind.field and cross-partition writers it is generated
+        // internally, so an incoming `_VALUE_KIND` column is illegal there.
+        let allow_value_kind = self.changelog_producer == ChangelogProducer::Input
+            && self.row_kind_generator.is_none()
+            && !is_cross_partition;
+
+        let expected_len = table_fields.len();
+        let max_len = expected_len + usize::from(allow_value_kind);
+
+        if batch_fields.len() < expected_len || batch_fields.len() > max_len {
+            let expected_desc = if allow_value_kind {
+                format!("{expected_len} table field(s) with an optional trailing '{VALUE_KIND_FIELD_NAME}'")
+            } else {
+                format!("{expected_len} table field(s)")
+            };
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "write batch schema mismatch: expected {expected_desc}, but got {} column(s): [{}]",
+                    batch_fields.len(),
+                    batch_fields
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                source: None,
+            });
+        }
+
+        for (idx, table_field) in table_fields.iter().enumerate() {
+            let batch_field = &batch_fields[idx];
+            if batch_field.name() != table_field.name() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema mismatch at column {idx}: expected field name '{}', but got '{}'",
+                        table_field.name(),
+                        batch_field.name()
+                    ),
+                    source: None,
+                });
+            }
+            let expected_type = paimon_type_to_arrow(table_field.data_type())?;
+            if batch_field.data_type() != &expected_type {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema mismatch at column {idx} ('{}'): expected Arrow type {expected_type:?}, but got {:?}",
+                        table_field.name(),
+                        batch_field.data_type()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
+        if batch_fields.len() == expected_len + 1 {
+            // Only reachable when `allow_value_kind` is true (otherwise the count
+            // check above already rejected the extra column). Verify the trailing
+            // column is exactly `_VALUE_KIND: Int8`.
+            let vk_field = &batch_fields[expected_len];
+            if vk_field.name() != VALUE_KIND_FIELD_NAME
+                || vk_field.data_type() != &ArrowDataType::Int8
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema mismatch at column {expected_len}: expected trailing '{VALUE_KIND_FIELD_NAME}' of Arrow type Int8, but got '{}' of type {:?}",
+                        vk_field.name(),
+                        vk_field.data_type()
+                    ),
+                    source: None,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -3778,5 +3878,456 @@ mod tests {
             3,
             "append tables keep file-level bin pack"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_arrow_batch schema validation tests
+    // -----------------------------------------------------------------------
+
+    fn rowkind_field_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn assert_data_invalid(err: crate::Error) {
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "expected DataInvalid, got {err:?}"
+        );
+    }
+
+    /// A BLOB table uses a dedicated-format writer that indexes columns
+    /// positionally; a batch missing the blob column must be rejected up front
+    /// with DataInvalid instead of panicking downstream.
+    #[tokio::test]
+    async fn test_write_rejects_blob_batch_missing_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_blob_missing";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_blob_table"),
+            table_path.to_string(),
+            test_blob_table_schema(),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    /// A VECTOR table also uses the dedicated-format writer; a batch missing the
+    /// vector column must be rejected with DataInvalid, not panic.
+    #[tokio::test]
+    async fn test_write_rejects_vector_batch_missing_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_vector_missing";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_vector_table"),
+            table_path.to_string(),
+            test_vector_table_schema("parquet"),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_reordered_columns() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_reordered";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        // Table order is [id, value]; swap the two columns.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("id", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_wrong_field_name() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_wrong_name";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("wrong", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_wrong_arrow_type() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_wrong_type";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        // `value` should be Int32 but is provided as Int64.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_unexpected_extra_column() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_extra_col";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("extra", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    /// Plain (non input-changelog) tables must not accept a caller-supplied
+    /// `_VALUE_KIND` column.
+    #[tokio::test]
+    async fn test_write_rejects_value_kind_on_plain_table() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_plain_value_kind";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_pk_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = make_batch_with_value_kind(vec![1], vec![10], vec![0]);
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    /// input-changelog: a `_VALUE_KIND` that is not the trailing column (here in
+    /// the middle) must be rejected.
+    #[tokio::test]
+    async fn test_input_changelog_rejects_misplaced_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_misplaced_vk";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        // [id, _VALUE_KIND, value] — table order is [id, value].
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    /// input-changelog: a trailing `_VALUE_KIND` with the wrong Arrow type must
+    /// be rejected.
+    #[tokio::test]
+    async fn test_input_changelog_rejects_wrong_value_kind_type() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_wrong_vk_type";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    /// Schema validation runs before the empty-batch fast path, so an empty
+    /// batch with a bad schema is still rejected.
+    #[tokio::test]
+    async fn test_write_rejects_empty_batch_with_bad_schema() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_empty_bad";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let empty = RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "wrong",
+            ArrowDataType::Int32,
+            false,
+        )])));
+
+        assert_data_invalid(table_write.write_arrow_batch(&empty).await.unwrap_err());
+    }
+
+    /// rowkind.field tables generate `_VALUE_KIND` internally; a caller-supplied
+    /// `_VALUE_KIND` column must be rejected.
+    #[tokio::test]
+    async fn test_rowkind_field_rejects_caller_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_rowkind_vk";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_rowkind_field"),
+            table_path.to_string(),
+            rowkind_field_schema(),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        // Table fields are [id, value, op]; appending _VALUE_KIND is illegal.
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["+I"])),
+                Arc::new(Int8Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    // ---- Legal inputs must continue to pass validation ----
+
+    #[tokio::test]
+    async fn test_write_accepts_plain_table_fields() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_plain_ok";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_input_changelog_accepts_with_and_without_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_input_ok";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            pk_changelog_schema(&[("changelog-producer", "input")]),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        // Without _VALUE_KIND.
+        table_write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        // With a trailing _VALUE_KIND.
+        table_write
+            .write_arrow_batch(&make_batch_with_value_kind(vec![2], vec![20], vec![0]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cross_partition_accepts_table_fields() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_cross_ok";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_cross_partition_table(&file_io, table_path);
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_partitioned_batch_3col(
+                vec!["a", "b"],
+                vec![1, 2],
+                vec![10, 20],
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The dedicated VECTOR writer requires the canonical FixedSizeList form
+    /// (inner field "element", nullable). A batch whose inner field diverges
+    /// (here named "item" with non-null elements) is rejected up front with
+    /// DataInvalid instead of failing deeper in the writer.
+    #[tokio::test]
+    async fn test_write_rejects_vector_with_noncanonical_inner_field() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_vector_noncanonical";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_vector_table"),
+            table_path.to_string(),
+            test_vector_table_schema("parquet"),
+            None,
+        );
+
+        // Inner field named "item" (Arrow default) and non-nullable elements,
+        // differing from the canonical ("element", nullable) form the dedicated
+        // vector writer requires.
+        let inner = Arc::new(ArrowField::new("item", ArrowDataType::Float32, false));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(inner.clone());
+        for vector in [[1.0f32, 0.0], [0.0, 1.0]] {
+            for value in vector {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        let embedding = builder.finish();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::FixedSizeList(inner, 2), true),
+            ])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(embedding)],
+        )
+        .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        assert_data_invalid(table_write.write_arrow_batch(&batch).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_rowkind_field_accepts_table_fields() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_rowkind_ok";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_rowkind_field"),
+            table_path.to_string(),
+            rowkind_field_schema(),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["+I"])),
+            ],
+        )
+        .unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
     }
 }
