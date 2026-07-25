@@ -461,11 +461,11 @@ impl TableWrite {
         let actual_schema = batch.schema();
         let table_field_count = expected_schema.fields().len();
         let actual_field_count = actual_schema.fields().len();
-        // Cross-partition routing generates its own `_VALUE_KIND` column so that
-        // migrated rows can be written as deletes in their previous partition.
-        // Accepting a caller-provided column here would make the generated delete
-        // batch contain `_VALUE_KIND` twice.
-        let allows_value_kind = self.changelog_producer == ChangelogProducer::Input
+        // Primary-key data writers consume `_VALUE_KIND` independently of whether
+        // separate changelog files are enabled. Row-kind generation and
+        // cross-partition routing add the column themselves, so callers must not.
+        let allows_value_kind = !self.primary_key_indices.is_empty()
+            && self.row_kind_generator.is_none()
             && !matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_));
         let includes_value_kind = allows_value_kind && actual_field_count == table_field_count + 1;
 
@@ -3044,6 +3044,48 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[tokio::test]
+    async fn test_default_changelog_producer_accepts_value_kind() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_default_changelog_value_kind";
+        setup_dirs(&file_io, table_path).await;
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_default_changelog_value_kind"),
+            table_path.to_string(),
+            pk_changelog_schema(&[]),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        table_write
+            .write_arrow_batch(&make_batch_with_value_kind(
+                vec![1, 1, 2],
+                vec![10, 20, 30],
+                vec![1, 2, 3],
+            ))
+            .await
+            .unwrap();
+
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        assert!(messages[0].new_changelog_files.is_empty());
+
+        let data_file = &messages[0].new_files[0];
+        let data_file_path = format!(
+            "{table_path}/{}/{}",
+            bucket_dir_name(messages[0].bucket),
+            data_file.file_name
+        );
+        let data_batches =
+            read_physical_key_value_batches(&file_io, &data_file_path, data_file.file_size).await;
+        assert_eq!(collect_i8(&data_batches, 1), vec![2, 3]);
+        assert_eq!(collect_i32(&data_batches, 2), vec![1, 2]);
+        assert_eq!(collect_i32(&data_batches, 3), vec![20, 30]);
     }
 
     #[test]
