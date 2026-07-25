@@ -148,6 +148,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
@@ -167,6 +168,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
@@ -174,6 +176,10 @@ impl<'a> TableRead<'a> {
                 message: "Format tables do not support audit log batch read".to_string(),
             }),
         }
+    }
+
+    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
+        CoreOptions::new(self.table().schema().options()).ensure_read_authorized()
     }
 }
 
@@ -630,6 +636,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
+                max_merge_file_streams: Some(256),
             },
         );
         reader.read(splits)
@@ -765,6 +772,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: false,
+                max_merge_file_streams: None,
             },
         );
         reader.read(splits)
@@ -1489,6 +1497,34 @@ mod tests {
                 Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
             ),
             "directly-constructed read of a query-auth.enabled table must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_direct_incremental_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let plan = IncrementalPlan::new(IncrementalScanMode::Delta, Vec::new());
+        assert!(
+            matches!(
+                read.to_incremental_arrow(&plan),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "directly-constructed incremental read of a query-auth.enabled table must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_direct_audit_log_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let plan = IncrementalPlan::new(IncrementalScanMode::Delta, Vec::new());
+        assert!(
+            matches!(
+                read.to_audit_log_arrow(&plan),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "directly-constructed audit-log read of a query-auth.enabled table must fail closed"
         );
     }
 

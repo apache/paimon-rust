@@ -75,7 +75,7 @@ let batches = reader
 
 The first output column is `rowkind`. `Diff` emits `+I`, `-U`, `+U`, and `-D`
 records by comparing the before and after images. If table option
-`read.sequence-number.enabled=true` is set, `_SEQUENCE_NUMBER` follows
+`table-read.sequence-number.enabled=true` is set, `_SEQUENCE_NUMBER` follows
 `rowkind`.
 
 ## Diff Restrictions

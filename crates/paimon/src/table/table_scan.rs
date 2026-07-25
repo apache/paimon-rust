@@ -1585,6 +1585,20 @@ impl<'a> PaimonTableScan<'a> {
         after: &Snapshot,
     ) -> crate::Result<(Plan, Plan)> {
         self.ensure_query_auth_allowed()?;
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if core_options.deletion_vectors_enabled() {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "Batch incremental Diff does not support tables with deletion-vectors.enabled=true"
+                        .to_string(),
+            });
+        }
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff does not support _ROW_ID row-range filters"
+                    .to_string(),
+            });
+        }
         // A limit hint cannot be pushed into either side of a Diff: truncating
         // the states independently can both hide changes and invent them.
         let mut full_state_scan = self.clone();
@@ -3250,6 +3264,39 @@ mod tests {
         )
     }
 
+    fn diff_test_table(table_path: &str, deletion_vectors_enabled: bool) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "deduplicate");
+        if deletion_vectors_enabled {
+            schema = schema.option("deletion-vectors.enabled", "true");
+        }
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "diff_gate"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
+    }
+
+    fn diff_snapshot(snapshot_id: i64) -> Snapshot {
+        Snapshot::builder()
+            .version(1)
+            .id(snapshot_id)
+            .schema_id(0)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("test-user".to_string())
+            .commit_identifier(snapshot_id)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(snapshot_id as u64)
+            .build()
+    }
+
     fn two_int_stats_row(id: Option<i32>, value: Option<i32>) -> Vec<u8> {
         let mut builder = BinaryRowBuilder::new(2);
         match id {
@@ -4300,6 +4347,43 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_deletion_vectors_enabled() {
+        let table = diff_test_table("memory:/diff_dv_gate", true);
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
+        let before = diff_snapshot(1);
+        let after = diff_snapshot(2);
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
+            "Diff must fail closed on deletion-vector tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_row_id_filters() {
+        let table = diff_test_table("memory:/diff_row_id_gate", false);
+        let mut builder = table.new_read_builder();
+        let filter = Predicate::Leaf {
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            index: 0,
+            data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+            op: PredicateOperator::GtEq,
+            literals: vec![Datum::Long(10)],
+        };
+        builder.with_filter(filter);
+        let scan = builder.new_scan();
+        let before = diff_snapshot(1);
+        let after = diff_snapshot(2);
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("_ROW_ID")),
+            "Diff must reject _ROW_ID row-range filters instead of dropping them"
         );
     }
 

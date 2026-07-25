@@ -75,6 +75,8 @@ pub(crate) struct KeyValueReadConfig {
     pub read_batch_size: usize,
     /// Merge files from all supplied splits into one globally key-sorted stream.
     pub merge_splits: bool,
+    /// Optional cap on file streams opened by a single sort-merge group.
+    pub max_merge_file_streams: Option<usize>,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -146,6 +148,20 @@ fn widen_partial_update_sequence_group_fields(
         user_fields.push(field);
     }
     Ok(user_fields)
+}
+
+fn ensure_merge_fan_in_limit(stream_count: usize, limit: Option<usize>) -> crate::Result<()> {
+    if let Some(limit) = limit {
+        if stream_count <= limit {
+            return Ok(());
+        }
+        return Err(Error::Unsupported {
+            message: format!(
+                "KeyValueFileReader refuses to merge {stream_count} file streams in one sort-merge group; maximum is {limit}. Compact the table before reading this highly fragmented group"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl KeyValueFileReader {
@@ -391,6 +407,7 @@ impl KeyValueFileReader {
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
+        let max_merge_file_streams = self.config.max_merge_file_streams;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -413,6 +430,14 @@ impl KeyValueFileReader {
                         })?;
                     }
                 }
+                let file_count = split_group
+                    .iter()
+                    .map(|split| split.data_files().len())
+                    .sum::<usize>();
+                if file_count == 0 {
+                    continue;
+                }
+                ensure_merge_fan_in_limit(file_count, max_merge_file_streams)?;
                 // Create one stream per data file.
                 let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
@@ -547,8 +572,10 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
+        stats::BinaryTableStats, BinaryRow, DataFileMeta, DataType, Datum, IntType,
+        PredicateBuilder, Schema, TableSchema, VarCharType,
     };
+    use crate::table::source::DataSplitBuilder;
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
     use arrow_array::{Array, Int32Array, StringArray};
@@ -697,6 +724,31 @@ mod tests {
             .collect()
     }
 
+    fn dummy_data_file(name: String) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name,
+            file_size: 128,
+            row_count: 1,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
     #[test]
     fn retain_primary_key_conjuncts_semantics() {
         let fields = vec![
@@ -777,6 +829,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_merge_rejects_too_many_file_streams_on_read_path() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_merge_fan_in_limit";
+        let table = pk_table(&file_io, table_path, &[]);
+        let core_options = table.schema().core_options();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(
+                (0..257)
+                    .map(|i| dummy_data_file(format!("file-{i}.parquet")))
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+        let reader = KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: true,
+                max_merge_file_streams: Some(256),
+            },
+        );
+
+        let err = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { message } if message.contains("file streams")),
+            "KV merge must fail before opening an unbounded number of file streams"
+        );
+    }
+
+    #[tokio::test]
     async fn kv_input_decode_honors_read_batch_size_without_changing_merge_batching() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_read_batch_size";
@@ -823,6 +925,7 @@ mod tests {
                     .collect(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: false,
+                max_merge_file_streams: None,
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());
