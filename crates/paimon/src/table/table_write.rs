@@ -24,7 +24,7 @@ use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET, ROW_ID_FIELD_NAME,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -457,15 +457,14 @@ impl TableWrite {
     /// it reaches the empty-batch fast path or any dedicated writer.
     ///
     /// Callers must supply exactly the table's fields, in the same order, with
-    /// matching names and Arrow data types. When `changelog-producer=input`
-    /// (and the row kind is not derived from a `rowkind.field` or a
-    /// cross-partition writer), a single trailing `_VALUE_KIND: Int8` column may
-    /// additionally be appended. Any other shape — reordered, renamed,
+    /// matching names and Arrow data types. Data-evolution writes may append
+    /// `_ROW_ID: Int64`; when `changelog-producer=input` (and the row kind is not
+    /// derived from a `rowkind.field` or a cross-partition writer), they may also
+    /// append `_VALUE_KIND: Int8`. Any other shape — reordered, renamed,
     /// wrong-typed, missing, or otherwise unexpected columns — is rejected with
     /// [`Error::DataInvalid`](crate::Error::DataInvalid). This keeps malformed
-    /// schemas from reaching downstream writers (e.g. the dedicated
-    /// BLOB/VECTOR writer) that index columns positionally and would otherwise
-    /// panic.
+    /// schemas from reaching downstream writers (e.g. the dedicated BLOB/VECTOR
+    /// writer) that index columns positionally and would otherwise panic.
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
         use arrow_schema::DataType as ArrowDataType;
 
@@ -480,19 +479,14 @@ impl TableWrite {
         let allow_value_kind = self.changelog_producer == ChangelogProducer::Input
             && self.row_kind_generator.is_none()
             && !is_cross_partition;
+        let allow_row_id = CoreOptions::new(self.table.schema().options()).data_evolution_enabled();
 
         let expected_len = table_fields.len();
-        let max_len = expected_len + usize::from(allow_value_kind);
 
-        if batch_fields.len() < expected_len || batch_fields.len() > max_len {
-            let expected_desc = if allow_value_kind {
-                format!("{expected_len} table field(s) with an optional trailing '{VALUE_KIND_FIELD_NAME}'")
-            } else {
-                format!("{expected_len} table field(s)")
-            };
+        if batch_fields.len() < expected_len {
             return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "write batch schema mismatch: expected {expected_desc}, but got {} column(s): [{}]",
+                    "write batch schema mismatch: expected at least {expected_len} table field(s), but got {} column(s): [{}]",
                     batch_fields.len(),
                     batch_fields
                         .iter()
@@ -529,23 +523,50 @@ impl TableWrite {
             }
         }
 
-        if batch_fields.len() == expected_len + 1 {
-            // Only reachable when `allow_value_kind` is true (otherwise the count
-            // check above already rejected the extra column). Verify the trailing
-            // column is exactly `_VALUE_KIND: Int8`.
-            let vk_field = &batch_fields[expected_len];
-            if vk_field.name() != VALUE_KIND_FIELD_NAME
-                || vk_field.data_type() != &ArrowDataType::Int8
-            {
+        let mut suffix_idx = expected_len;
+        if batch_fields
+            .get(suffix_idx)
+            .is_some_and(|field| field.name() == ROW_ID_FIELD_NAME)
+        {
+            let row_id_field = &batch_fields[suffix_idx];
+            if !allow_row_id || row_id_field.data_type() != &ArrowDataType::Int64 {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
-                        "write batch schema mismatch at column {expected_len}: expected trailing '{VALUE_KIND_FIELD_NAME}' of Arrow type Int8, but got '{}' of type {:?}",
-                        vk_field.name(),
-                        vk_field.data_type()
+                        "write batch schema mismatch at column {suffix_idx}: trailing '{ROW_ID_FIELD_NAME}' is only allowed for data-evolution writes with Arrow type Int64, but got {:?}",
+                        row_id_field.data_type()
                     ),
                     source: None,
                 });
             }
+            suffix_idx += 1;
+        }
+
+        if batch_fields
+            .get(suffix_idx)
+            .is_some_and(|field| field.name() == VALUE_KIND_FIELD_NAME)
+        {
+            let value_kind_field = &batch_fields[suffix_idx];
+            if !allow_value_kind || value_kind_field.data_type() != &ArrowDataType::Int8 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "write batch schema mismatch at column {suffix_idx}: trailing '{VALUE_KIND_FIELD_NAME}' is only allowed for input changelog writes with Arrow type Int8, but got {:?}",
+                        value_kind_field.data_type()
+                    ),
+                    source: None,
+                });
+            }
+            suffix_idx += 1;
+        }
+
+        if let Some(field) = batch_fields.get(suffix_idx) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "write batch schema mismatch at column {suffix_idx}: unexpected field '{}' of type {:?}",
+                    field.name(),
+                    field.data_type()
+                ),
+                source: None,
+            });
         }
 
         Ok(())
@@ -985,8 +1006,8 @@ mod tests {
         DataType, Datum, DecimalType, FileKind, FloatType, IndexManifest, IntType,
         LocalZonedTimestampType, Manifest, ManifestList, PredicateBuilder, Schema, TableSchema,
         TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
-        SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
-        VALUE_KIND_FIELD_NAME,
+        ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+        VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
@@ -4210,6 +4231,43 @@ mod tests {
             .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_accepts_trailing_row_id() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_validate_row_id_ok";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_data_evolution"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write.write_arrow_batch(&batch).await.unwrap();
     }
 
     #[tokio::test]
