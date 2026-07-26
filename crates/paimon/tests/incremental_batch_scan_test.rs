@@ -17,7 +17,7 @@
 
 mod common;
 
-use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch};
 use futures::TryStreamExt;
 use paimon::table::IncrementalScanMode;
 
@@ -687,8 +687,8 @@ async fn diff_empty_projection_preserves_changed_row_count() {
 }
 
 #[tokio::test]
-async fn diff_ignores_row_ranges_when_planning_full_states() {
-    use paimon::table::{AuditLogTable, RowRange};
+async fn diff_rejects_row_ranges_instead_of_dropping_them() {
+    use paimon::table::RowRange;
 
     let table_path = "memory:/incremental_batch/diff_row_ranges";
     let (file_io, table) = memory_table(
@@ -713,40 +713,17 @@ async fn diff_ignores_row_ranges_when_planning_full_states() {
 
     let mut builder = table.new_read_builder();
     builder.with_row_ranges(vec![RowRange::new(1, 2)]);
-    let plan = builder
+    let err = builder
         .new_incremental_scan(IncrementalScanMode::Diff, 2, 3)
         .plan()
         .await
-        .unwrap();
-    assert!(plan.splits().iter().all(|split| match split {
-        paimon::table::IncrementalSplit::DiffPair { before, after } => before
-            .iter()
-            .chain(after)
-            .all(|split| split.row_ranges().is_none()),
-        paimon::table::IncrementalSplit::Data(_) => false,
-    }));
-    let batches: Vec<RecordBatch> = AuditLogTable::new(table.clone())
-        .to_arrow(&plan)
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let rowkinds: Vec<&str> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .iter()
-                .flatten()
-        })
-        .collect();
-    assert_eq!(
-        rowkinds,
-        vec!["-U", "+U"],
-        "Diff must compare complete states rather than physical row ranges"
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            paimon::Error::Unsupported { ref message } if message.contains("_ROW_ID")
+        ),
+        "Diff must reject _ROW_ID row-range filters instead of dropping them: {err:?}"
     );
 }
 
