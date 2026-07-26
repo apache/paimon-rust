@@ -177,3 +177,74 @@ def test_commit_different_builder_same_table_raises():
         messages = write.prepare_commit()
         with pytest.raises(ValueError):
             table.new_write_builder().new_commit().commit(messages)
+
+
+def test_abort_cleans_up_written_data():
+    # Write data, prepare commit, abort — the written files should be deleted
+    # and reading back should return zero rows.
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        wb = table.new_write_builder()
+        write = wb.new_write()
+        write.write_arrow(_batch([1, 2, 3], ["a", "b", "c"]))
+        messages = write.prepare_commit()
+        assert len(messages) >= 1
+        wb.new_commit().abort(messages)
+        # After abort, no snapshot was committed — the table should be empty.
+        batches = ctx.sql("SELECT COUNT(*) AS cnt FROM paimon.wdb.t")
+        assert batches[0].column(0).to_pylist() == [0]
+
+
+def test_abort_empty_messages_noop():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        wb = table.new_write_builder()
+        messages = wb.new_write().prepare_commit()  # no write
+        assert messages == []
+        wb.new_commit().abort(messages)  # no-op success
+        batches = ctx.sql("SELECT COUNT(*) AS cnt FROM paimon.wdb.t")
+        assert batches[0].column(0).to_pylist() == [0]
+
+
+def test_abort_non_message_raises_typeerror():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        with pytest.raises(TypeError):
+            table.new_write_builder().new_commit().abort([object()])
+        with pytest.raises(TypeError):
+            table.new_write_builder().new_commit().abort(42)
+
+
+def test_abort_cross_table_messages_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.wdb")
+        ctx.sql("CREATE TABLE paimon.wdb.t1 (id INT, name STRING)")
+        ctx.sql("CREATE TABLE paimon.wdb.t2 (id INT, name STRING)")
+        catalog = PaimonCatalog({"warehouse": warehouse})
+        t1 = catalog.get_table("wdb.t1")
+        t2 = catalog.get_table("wdb.t2")
+        batch = pa.record_batch(
+            [pa.array([1], pa.int32()), pa.array(["a"], pa.string())],
+            names=["id", "name"],
+        )
+        w1 = t1.new_write_builder().new_write()
+        w1.write_arrow(batch)
+        messages = w1.prepare_commit()
+        with pytest.raises(ValueError):
+            t2.new_write_builder().new_commit().abort(messages)
+
+
+def test_abort_different_builder_same_table_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        write = table.new_write_builder().new_write()
+        write.write_arrow(_batch([1], ["a"]))
+        messages = write.prepare_commit()
+        with pytest.raises(ValueError):
+            table.new_write_builder().new_commit().abort(messages)

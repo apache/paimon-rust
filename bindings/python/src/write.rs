@@ -175,38 +175,76 @@ pub struct PyTableCommit {
     commit_user: String,
 }
 
+/// Collect and validate commit messages from a Python iterable, returning the
+/// inner Rust `CommitMessage` values. Shared by `commit` and `abort`.
+fn collect_and_validate_messages<'py>(
+    messages: &Bound<'py, PyAny>,
+    table_location: &str,
+    commit_user: &str,
+    method: &str,
+) -> PyResult<Vec<CommitMessage>> {
+    let mut inner_messages = Vec::new();
+    let iter = messages.try_iter().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "{method}() expects a sequence of CommitMessage objects"
+        ))
+    })?;
+    for item in iter {
+        let item = item?;
+        let msg: PyRef<'py, PyCommitMessage> = item.extract().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "{method}() expects a sequence of CommitMessage objects"
+            ))
+        })?;
+        if msg.table_location != table_location {
+            return Err(PyValueError::new_err(format!(
+                "commit message was prepared for a different table \
+                 (message table '{}', committer table '{}')",
+                msg.table_location, table_location
+            )));
+        }
+        if msg.commit_user != commit_user {
+            return Err(PyValueError::new_err(
+                "commit message was prepared by a different WriteBuilder \
+                 (writer and committer must come from the same \
+                 table.new_write_builder() so they share one commit_user)"
+                    .to_string(),
+            ));
+        }
+        inner_messages.push(msg.inner.clone());
+    }
+    Ok(inner_messages)
+}
+
 #[pymethods]
 impl PyTableCommit {
     /// Commit the given commit messages. Empty input is a no-op success.
     fn commit(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut inner_messages = Vec::new();
-        let iter = messages.try_iter().map_err(|_| {
-            PyTypeError::new_err("commit() expects a sequence of CommitMessage objects")
-        })?;
-        for item in iter {
-            let item = item?;
-            let msg: PyRef<PyCommitMessage> = item.extract().map_err(|_| {
-                PyTypeError::new_err("commit() expects a sequence of CommitMessage objects")
-            })?;
-            if msg.table_location != self.table_location {
-                return Err(PyValueError::new_err(format!(
-                    "commit message was prepared for a different table \
-                     (message table '{}', committer table '{}')",
-                    msg.table_location, self.table_location
-                )));
-            }
-            if msg.commit_user != self.commit_user {
-                return Err(PyValueError::new_err(
-                    "commit message was prepared by a different WriteBuilder \
-                     (writer and committer must come from the same \
-                     table.new_write_builder() so they share one commit_user)"
-                        .to_string(),
-                ));
-            }
-            inner_messages.push(msg.inner.clone());
-        }
+        let inner_messages = collect_and_validate_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+            "commit",
+        )?;
         let rt = runtime();
         py.detach(|| rt.block_on(async { self.inner.commit(inner_messages).await }))
+            .map_err(to_py_err)
+    }
+
+    /// Abort a prepared commit by deleting newly written data, changelog and
+    /// index files. Deletion is best-effort: missing files or storage errors
+    /// are silently ignored so abort cleanup never masks the original write
+    /// failure. After abort the data must not be committed — the files no
+    /// longer exist.
+    fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
+        let inner_messages = collect_and_validate_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+            "abort",
+        )?;
+        let rt = runtime();
+        py.detach(|| rt.block_on(async { self.inner.abort(&inner_messages).await }))
             .map_err(to_py_err)
     }
 }
