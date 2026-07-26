@@ -336,9 +336,10 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
-        // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -400,9 +401,11 @@ impl<'a> VectorSearchBuilder<'a> {
     /// [`with_projection`](Self::with_projection)) plus `__paimon_search_score`;
     /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
-        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        // Fail closed: materializes rows outside `TableScan`/`TableRead`, so it
+        // cannot apply the row filter / masking — only a fully unrestricted
+        // grant may run it (same gate as the scored entry points).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1563,15 +1566,20 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 });
             }
         }
-        // Check the pinned execution view as defense in depth before any fast
-        // path returns data-derived row ids/scores outside TableScan/TableRead.
+        // Strict, like the scored path: batch vector search reads index files
+        // raw and returns top-k membership/ordering/scores over masked or
+        // filter-hidden rows — a ranking oracle it cannot enforce the row filter
+        // on, so only a fully unrestricted grant may run it. The pinned
+        // execution view is what gets checked, before any fast path (an empty
+        // snapshot would otherwise return empty results and bypass it); this
+        // also covers the DataFusion lateral path.
         let execution_table = self
             .prepared_filter
             .as_ref()
             .map(PreparedVectorSearchFilter::table)
             .unwrap_or(self.table);
+        execution_table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(execution_table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1759,9 +1767,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     /// scored global row-ids, not materialized rows, so callers use
     /// [`execute`](Self::execute) instead.
     pub async fn execute_read(&self) -> crate::Result<Vec<ArrowRecordBatchStream>> {
-        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        // Fail closed: materializes rows outside `TableScan`/`TableRead`, so it
+        // cannot apply the row filter / masking — only a fully unrestricted
+        // grant may run it (same gate as the scored entry points).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()

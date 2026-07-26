@@ -39,7 +39,15 @@ pub(super) async fn extract_index_rows(
     index_type: &str,
     serialize_key: SerializeKeyFn,
 ) -> Result<Vec<SortedIndexKeyRow>> {
-    let splits = build_read_splits_for_shard(shard)?;
+    // Building the global index reads the indexed column across the shard. Under
+    // a restricted query-auth grant that read would drop/mask rows, so the index
+    // would be built over a filtered view. Require an unrestricted grant and read
+    // raw (stamp the returned grant on each split).
+    let build_grant = table.authorize_unrestricted_read().await?;
+    let splits: Vec<crate::table::DataSplit> = build_read_splits_for_shard(shard)?
+        .into_iter()
+        .map(|split| split.with_query_auth_grant(build_grant.clone()))
+        .collect();
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;

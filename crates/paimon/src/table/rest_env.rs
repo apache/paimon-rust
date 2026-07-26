@@ -304,6 +304,15 @@ impl RESTEnv {
         builder.build()
     }
 
+    /// Fetch the per-user row filter and column masking for this table.
+    /// Mirrors Java `CatalogEnvironment.tableQueryAuth()`.
+    pub(crate) async fn table_query_auth(
+        &self,
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.api.auth_table_query(&self.identifier, select).await
+    }
+
     /// Create a `RESTSnapshotCommit` from this environment.
     pub fn snapshot_commit(&self) -> Arc<dyn SnapshotCommit> {
         Arc::new(RESTSnapshotCommit::new(

@@ -116,8 +116,10 @@ impl<'a> FullTextSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let text_column =
             self.text_column
                 .as_deref()
@@ -202,9 +204,11 @@ impl<'a> FullTextSearchBuilder<'a> {
     /// returning nothing, since the append/data-evolution materialized read is not
     /// supported here.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
-        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        // Fail closed: materializes rows outside `TableScan`/`TableRead`, so it
+        // cannot apply the row filter / masking — only a fully unrestricted
+        // grant may run it (same gate as the scored entry points).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let text_column =
             self.text_column
                 .as_deref()

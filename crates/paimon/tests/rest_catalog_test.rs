@@ -27,7 +27,7 @@ use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, RecordBatch, Strin
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use axum::http::StatusCode;
 use futures::TryStreamExt;
-use paimon::api::ConfigResponse;
+use paimon::api::{AuthTableQueryResponse, ConfigResponse};
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
@@ -661,6 +661,564 @@ async fn test_catalog_get_table() {
     let identifier = Identifier::new("default", "my_table");
     let table = ctx.catalog.get_table(&identifier).await;
     assert!(table.is_ok(), "failed to get table: {table:?}");
+}
+
+/// The grant is scoped to the columns the plan requested (like Java passing
+/// `readType.getFieldNames()`): a wider read against a scoped grant fails
+/// closed until it re-plans.
+#[tokio::test]
+async fn test_query_auth_grant_scoped_to_planned_columns() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server.add_table_with_schema(
+        "default",
+        "qa_scope",
+        schema,
+        "file:///tmp/test_warehouse/default.db/qa_scope",
+    );
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "qa_scope"))
+        .await
+        .unwrap();
+
+    // Plan a projection of {id}: the grant is scoped to that column and stamped
+    // on this plan's splits (not a shared slot on the table).
+    let mut projected = table.new_read_builder();
+    projected.with_projection(&["id"]).unwrap();
+    projected.new_scan().plan().await.unwrap();
+
+    // The {id} plan's scoped grant lives on its own splits, so it cannot leak
+    // to a separate full-table read (per-query, no shared mutable slot). Reading
+    // real splits that carry no grant fails closed — covered by the read_builder
+    // unit tests, which can build such a split directly.
+
+    // A separate full-table read re-authorizes for all columns when it plans.
+    table.new_read_builder().new_scan().plan().await.unwrap();
+}
+
+/// Java #8447 baseline: a query-auth row filter disables count-based limit
+/// pushdown, so a limited read still reaches authorized rows in later files.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_row_filter_reads_past_limit_pushdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+
+    // Write two commits (-> two files) through a plain FileSystemCatalog table.
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let write_schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let identifier = Identifier::new("default", "qa_limit");
+    fs_catalog
+        .create_table(&identifier, write_schema, false)
+        .await
+        .unwrap();
+    let writer = fs_catalog.get_table(&identifier).await.unwrap();
+    let int_batch = |ids: Vec<i64>| {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    };
+    write_batch(&writer, int_batch(vec![1, 2, 3, 4]), "u1").await;
+    write_batch(&writer, int_batch(vec![5, 6, 7, 8]), "u2").await;
+
+    // Read the same files through the REST catalog with query-auth enabled and
+    // a row filter of id >= 6 (all matches live in the SECOND file).
+    let ctx = setup_catalog(vec!["default"]).await;
+    let read_schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server.add_table_with_schema(
+        "default",
+        "qa_limit",
+        read_schema,
+        &format!("{warehouse}/default.db/qa_limit"),
+    );
+    ctx.server.set_auth_response(
+        "default",
+        "qa_limit",
+        AuthTableQueryResponse {
+            filter: Some(vec![
+                r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"BIGINT"}},"function":"GREATER_OR_EQUAL","literals":[6]}"#
+                    .to_string(),
+            ]),
+            column_masking: None,
+        },
+    );
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+
+    let mut builder = table.new_read_builder();
+    builder.with_limit(2);
+    let plan = builder.new_scan().plan().await.unwrap();
+    // The filter runs as a residual pass, so the plan must not cap splits by
+    // the unfiltered limit and must report its row counts as inexact.
+    assert!(!plan.row_counts_exact());
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![6, 7, 8],
+        "authorized rows beyond file 1 must appear"
+    );
+}
+
+/// Java #8570 baseline: a cross-column mask (`alias := UPPER(name)`) and a row
+/// filter on an unprojected column (`score`) must still enforce when the caller
+/// projects neither `name` nor `score` — the read is widened with the grant's
+/// columns and every batch of every split is projected back to the caller's
+/// columns (no auth-added column may leak from later splits).
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_cross_column_mask_with_narrow_projection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let columns = || {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("alias", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("score", DataType::BigInt(BigIntType::new()))
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+    };
+    let identifier = Identifier::new("default", "qa_cross_mask");
+    fs_catalog
+        .create_table(&identifier, columns().build().unwrap(), false)
+        .await
+        .unwrap();
+    let writer = fs_catalog.get_table(&identifier).await.unwrap();
+    let batch = |ids: Vec<i32>, names: Vec<&str>, aliases: Vec<&str>, scores: Vec<i64>| {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("alias", ArrowDataType::Utf8, true),
+            ArrowField::new("score", ArrowDataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(aliases)),
+                Arc::new(Int64Array::from(scores)),
+            ],
+        )
+        .unwrap()
+    };
+    // Two commits -> two files, so enforcement is exercised across splits.
+    write_batch(
+        &writer,
+        batch(vec![1, 2], vec!["ann", "bob"], vec!["x", "y"], vec![5, 15]),
+        "u1",
+    )
+    .await;
+    write_batch(
+        &writer,
+        batch(vec![3, 4], vec!["cid", "dan"], vec!["z", "w"], vec![20, 8]),
+        "u2",
+    )
+    .await;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.add_table_with_schema(
+        "default",
+        "qa_cross_mask",
+        columns()
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+        &format!("{warehouse}/default.db/qa_cross_mask"),
+    );
+    ctx.server.set_auth_response(
+        "default",
+        "qa_cross_mask",
+        AuthTableQueryResponse {
+            // Row filter on `score` (index 3), which the caller does not project.
+            filter: Some(vec![
+                r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":3,"name":"score","type":"BIGINT"}},"function":"GREATER_OR_EQUAL","literals":[10]}"#
+                    .to_string(),
+            ]),
+            // Cross-column mask: `alias` is overwritten from `name` (index 1),
+            // which the caller does not project either.
+            column_masking: Some(HashMap::from([(
+                "alias".to_string(),
+                r#"{"name":"UPPER","inputs":[{"index":1,"name":"name","type":"STRING"}]}"#
+                    .to_string(),
+            )])),
+        },
+    );
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&["id", "alias"]).unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let mut rows = Vec::new();
+    for b in &batches {
+        assert_eq!(
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "alias"],
+            "auth-added columns (name, score) must not leak from any split"
+        );
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let aliases = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for r in 0..b.num_rows() {
+            rows.push((ids.value(r), aliases.value(r).to_string()));
+        }
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(2, "BOB".to_string()), (3, "CID".to_string())],
+        "filter must drop score<10 rows in both files and alias must be UPPER(name)"
+    );
+}
+
+/// Visible end-to-end demo of query-auth enforcement over a mock REST catalog:
+/// the same files are read once with no grant (raw) and once through a
+/// `query-auth.enabled` table whose per-user grant applies a row filter
+/// (`salary >= 90000`) plus column masking (`name -> UPPER(name)`). Run with:
+///   cargo test -p paimon --test rest_catalog_test query_auth_enforcement_demo -- --nocapture
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_enforcement_demo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+
+    // --- Write demo_employees (id, name, salary) via a plain FileSystemCatalog ---
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let columns = || {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("salary", DataType::BigInt(BigIntType::new()))
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+    };
+    let identifier = Identifier::new("default", "demo_employees");
+    fs_catalog
+        .create_table(&identifier, columns().build().unwrap(), false)
+        .await
+        .unwrap();
+    let writer = fs_catalog.get_table(&identifier).await.unwrap();
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, true),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+        ArrowField::new("salary", ArrowDataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec![
+                "alice", "bob", "charlie", "diana", "eve",
+            ])),
+            Arc::new(Int64Array::from(vec![120000, 85000, 95000, 70000, 99000])),
+        ],
+    )
+    .unwrap();
+    write_batch(&writer, batch, "u1").await;
+
+    let dump = |label: &str, batches: &[RecordBatch]| {
+        println!("\n  {label}");
+        println!("    {:<4} {:<10} {:>8}", "id", "name", "salary");
+        for b in batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let sal = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+            for r in 0..b.num_rows() {
+                println!(
+                    "    {:<4} {:<10} {:>8}",
+                    ids.value(r),
+                    names.value(r),
+                    sal.value(r)
+                );
+            }
+        }
+    };
+
+    // --- Raw read (no query-auth) ---
+    let raw: Vec<RecordBatch> = {
+        let b = writer.new_read_builder();
+        b.new_read()
+            .unwrap()
+            .to_arrow(b.new_scan().plan().await.unwrap().splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    };
+    dump("RAW (no grant): all rows, real names", &raw);
+
+    // --- Enforced read through the REST catalog with a per-user grant ---
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.add_table_with_schema(
+        "default",
+        "demo_employees",
+        columns()
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+        &format!("{warehouse}/default.db/demo_employees"),
+    );
+    ctx.server.set_auth_response(
+        "default",
+        "demo_employees",
+        AuthTableQueryResponse {
+            // Row filter: salary >= 90000 (field index 2).
+            filter: Some(vec![
+                r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":2,"name":"salary","type":"BIGINT"}},"function":"GREATER_OR_EQUAL","literals":[90000]}"#
+                    .to_string(),
+            ]),
+            // Column masking: name -> UPPER(name) (field index 1).
+            column_masking: Some(HashMap::from([(
+                "name".to_string(),
+                r#"{"name":"UPPER","inputs":[{"index":1,"name":"name","type":"STRING"}]}"#
+                    .to_string(),
+            )])),
+        },
+    );
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let b = table.new_read_builder();
+    // Plan first: scan planning fetches + verifies the per-user grant (mirroring
+    // Java `CatalogEnvironment.tableQueryAuth()`) and authorizes the shared read
+    // state; only then may the sync read gate (`new_read`/`to_arrow`) proceed.
+    let plan = b.new_scan().plan().await.unwrap();
+    let enforced: Vec<RecordBatch> = b
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    dump("ENFORCED (grant: salary>=90000, name->UPPER)", &enforced);
+
+    let mut rows: Vec<(i32, String, i64)> = enforced
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let sal = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|r| (ids.value(r), names.value(r).to_string(), sal.value(r)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "ALICE".to_string(), 120000),
+            (3, "CHARLIE".to_string(), 95000),
+            (5, "EVE".to_string(), 99000),
+        ],
+        "row filter must drop salary<90000 and masking must uppercase name"
+    );
+}
+
+/// Query-auth: scan planning transparently fetches the per-user grant
+/// (mirroring Java's `CatalogEnvironment.tableQueryAuth()`); an unrestricted
+/// user reads everything, a filtered/masked user gets an enforced read, and
+/// paths that cannot enforce stay fail-closed.
+#[tokio::test]
+async fn test_catalog_get_table_query_auth() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("query-auth.enabled", "true")
+        .build()
+        .expect("Failed to build schema");
+    ctx.server.add_table_with_schema(
+        "default",
+        "qa",
+        schema,
+        "file:///tmp/test_warehouse/default.db/qa",
+    );
+    let identifier = Identifier::new("default", "qa");
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+
+    // Reading no splits yields no rows, so it is allowed even before planning;
+    // real splits carrying no grant fail closed (read_builder unit tests).
+    let ungranted = table.new_read_builder().new_read().unwrap();
+    assert!(ungranted.to_arrow(&[]).is_ok());
+
+    // The mock /auth endpoint reports unrestricted by default: planning a scan
+    // authorizes the table and stamps the grant on its splits.
+    let builder = table.new_read_builder();
+    builder
+        .new_scan()
+        .plan()
+        .await
+        .expect("unrestricted user should be able to plan a query-auth scan");
+
+    // A parseable row filter (Java Predicate JSON) grants a filtered read:
+    // planning and building the read succeed; the filter is enforced inside
+    // `to_arrow`.
+    ctx.server.set_auth_response(
+        "default",
+        "qa",
+        AuthTableQueryResponse {
+            filter: Some(vec![
+                r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"BIGINT"}},"function":"GREATER_THAN","literals":[5]}"#
+                    .to_string(),
+            ]),
+            column_masking: None,
+        },
+    );
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let builder = table.new_read_builder();
+    builder
+        .new_scan()
+        .plan()
+        .await
+        .expect("a parseable row filter should allow planning a (filtered) read");
+    // ... but paths that bypass the row filter stay strictly fail-closed.
+    let err = table
+        .new_vector_search_builder()
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("query-auth.enabled"),
+        "search must stay fail-closed for a filtered user, got: {err}"
+    );
+
+    // An unparseable filter fails the plan and keeps the table fail-closed.
+    ctx.server.set_auth_response(
+        "default",
+        "qa",
+        AuthTableQueryResponse {
+            filter: Some(vec!["{\"kind\":\"CUSTOM\"}".to_string()]),
+            column_masking: None,
+        },
+    );
+    let fresh = ctx.catalog.get_table(&identifier).await.unwrap();
+    assert!(fresh.new_read_builder().new_scan().plan().await.is_err());
+
+    // Parseable column masking grants a (masked) read; a caller predicate on
+    // the masked column is rejected (it would leak the raw value).
+    ctx.server.set_auth_response(
+        "default",
+        "qa",
+        AuthTableQueryResponse {
+            filter: None,
+            column_masking: Some(HashMap::from([(
+                "id".to_string(),
+                "{\"name\":\"NULL\"}".to_string(),
+            )])),
+        },
+    );
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let builder = table.new_read_builder();
+    builder.new_scan().plan().await.expect("masked read plans");
+    // A caller predicate on a masked column fails closed at plan time (pruning
+    // on its raw value would leak it); the same guard runs again in `to_arrow`.
+    let mut filtered = table.new_read_builder();
+    filtered.with_filter(
+        PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Long(1))
+            .unwrap(),
+    );
+    let Err(err) = filtered.new_scan().plan().await else {
+        panic!("a caller predicate on a masked column must fail closed");
+    };
+    assert!(
+        err.to_string().contains("masked column"),
+        "a caller predicate on a masked column must fail closed, got: {err}"
+    );
+
+    // Every plan re-authorizes (like Java): revoking down to an unparseable
+    // grant fails the plan, and a read without a stamped grant stays closed.
+    ctx.server.set_auth_response(
+        "default",
+        "qa",
+        AuthTableQueryResponse {
+            filter: Some(vec!["{\"kind\":\"CUSTOM\"}".to_string()]),
+            column_masking: None,
+        },
+    );
+    assert!(table.new_read_builder().new_scan().plan().await.is_err());
 }
 
 #[tokio::test]

@@ -106,7 +106,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             source: Some(Box::new(e)),
         })?;
         let mut raw_file = tokio::fs::File::from_std(raw_file);
-        let split = data_split_for_shard(shard)?;
+        // Index building reads raw values, so it requires an unrestricted grant:
+        // a restricted one would index a filtered or masked view. Stamp it so the
+        // read below is authorized. Mirrors the sorted global index builder.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let split = data_split_for_shard(shard)?.with_query_auth_grant(build_grant);
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
         let read = read_builder.new_read()?;

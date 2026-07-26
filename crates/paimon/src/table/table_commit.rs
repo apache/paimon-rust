@@ -207,6 +207,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -254,6 +255,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -339,6 +341,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -595,6 +598,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -643,6 +647,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -676,6 +681,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -703,6 +709,10 @@ impl TableCommit {
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        // No query-auth gate: abort only deletes files the caller just wrote and
+        // publishes nothing. A restricted user's commit is rejected *after*
+        // `prepare_commit` wrote them, so requiring a grant here would strand
+        // those files instead of cleaning them up.
         self.table.ensure_not_branch_reference_for_write()?;
 
         let table_path = self.table.location().trim_end_matches('/');

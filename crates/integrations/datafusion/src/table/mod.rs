@@ -459,7 +459,11 @@ impl TableProvider for PaimonTableProvider {
             .map_err(to_datafusion_error)?;
 
         let target = state.config_options().execution.target_partitions;
+        // Inexact plan row counts (a query-auth row filter drops rows inside
+        // `TableRead`) would let DataFusion's aggregate-statistics rule answer
+        // COUNT(*) with the unfiltered count without ever invoking the read.
         let filter_exact = !filter_analysis.requires_residual
+            && plan.row_counts_exact()
             && filter_analysis
                 .pushed_predicate
                 .as_ref()

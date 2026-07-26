@@ -73,6 +73,10 @@ impl<'a> FormatTableRead<'a> {
         self.table
     }
 
+    pub(crate) fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
     pub(crate) fn with_filter(mut self, filter: Predicate) -> Self {
         self.data_predicates = split_scan_predicates(self.table, filter).1;
         self
@@ -102,8 +106,9 @@ impl<'a> FormatTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // Query-auth (fail-closed + row filter + masking) is enforced by the
+        // outer `TableRead::to_arrow` off the grant stamped on the splits.
         let core_options = self.table.schema().core_options();
-        core_options.ensure_read_authorized()?;
         // Mapping the conjunct onto the data fields drops it, so the read would
         // silently ignore the filter. Guard on the read path, not the builder:
         // `TableRead` is public and can be constructed and filtered directly.

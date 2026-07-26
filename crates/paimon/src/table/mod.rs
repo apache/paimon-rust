@@ -83,6 +83,7 @@ mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
 mod postpone_fixed_bucket_write_builder;
 mod prepared_files;
+pub(crate) mod query_auth;
 mod read_builder;
 pub mod referenced_files;
 pub(crate) mod rest_env;
@@ -169,7 +170,9 @@ use crate::spec::{
     CoreOptions, DataField, Snapshot, TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
     SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
 };
-use std::collections::HashMap;
+use query_auth::QueryAuthGrant;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -254,6 +257,130 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
         })
+    }
+
+    /// Authorize this user against the REST server when `query-auth.enabled` is
+    /// set: fetch and parse the per-user row filter / column masking and return
+    /// it as the grant the read pipeline enforces. `select` are the queried
+    /// columns (table-schema indices; `None` = all) — like Java's
+    /// `readType.getFieldNames()`, so a column-restricted user can still read
+    /// an authorized subset; the grant is scoped to exactly those columns and a
+    /// wider read fails closed until it re-plans. Returns `None` when the table
+    /// is not `query-auth.enabled`. Called from scan planning and search
+    /// execution at the same per-plan frequency as Java's
+    /// `CatalogEnvironment.tableQueryAuth()`, so a revoked grant takes effect on
+    /// the next plan. The grant is threaded to the read on the split it plans
+    /// (never a shared mutable slot), so it is per-query and cannot leak into a
+    /// concurrent query or a write-path rewrite.
+    pub(crate) async fn verify_query_auth_for_read(
+        &self,
+        select: Option<&HashSet<usize>>,
+    ) -> Result<Option<Arc<QueryAuthGrant>>> {
+        if !CoreOptions::new(self.schema.options()).query_auth_enabled() {
+            return Ok(None);
+        }
+        let Some(rest_env) = &self.rest_env else {
+            return Err(crate::Error::Unsupported {
+                message: "reading a table with 'query-auth.enabled' = true requires a REST \
+                          catalog to authorize the query"
+                    .to_string(),
+            });
+        };
+        let fields = self.schema.fields();
+        let select_names = select.map(|indices| {
+            fields
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| indices.contains(i))
+                .map(|(_, f)| f.name().to_string())
+                .collect::<Vec<_>>()
+        });
+        let auth = rest_env.table_query_auth(select_names).await?;
+        let filters = query_auth::parse_auth_filters(&auth.filter.unwrap_or_default(), fields)?;
+        let masks =
+            query_auth::parse_column_masking(&auth.column_masking.unwrap_or_default(), fields)?;
+        let grant =
+            QueryAuthGrant::new(filters, masks, select.cloned()).with_schema_id(self.schema.id());
+
+        // The server expresses its rules against the table's CURRENT schema, but
+        // a time-travelled or branch copy reads a DIFFERENT one. Binding those
+        // rules by name onto it is unsound — a column dropped and re-added under
+        // the same name has a different field id, so a filter or mask would bind
+        // to an unrelated historical column. Fail closed rather than mis-bind.
+        if !grant.is_unrestricted() && (self.time_traveled || self.branch_reference) {
+            return Err(crate::Error::Unsupported {
+                message: "a query-auth row filter / column masking grant cannot be applied to a \
+                          time-travelled or branch read: the grant is bound to the table's \
+                          current schema"
+                    .to_string(),
+            });
+        }
+
+        Ok(Some(Arc::new(grant)))
+    }
+
+    /// Authorize a read that cannot enforce a row filter / masking on its output
+    /// (search, system tables, or a write-path rewrite that must read raw).
+    /// Returns the grant to stamp on the splits it reads (`None` = not a
+    /// query-auth table). Fails closed when the grant is restricted — such a
+    /// path must never run under a partial grant, since it would either leak
+    /// (search/metadata) or silently drop/mask rows into a committed rewrite.
+    pub(crate) async fn authorize_unrestricted_read(&self) -> Result<Option<Arc<QueryAuthGrant>>> {
+        match self.verify_query_auth_for_read(None).await? {
+            Some(grant) if grant.is_unrestricted() => Ok(Some(grant)),
+            Some(_) => {
+                // A restricted grant only arrives on a query-auth.enabled table,
+                // where the strict schema check always fails closed.
+                CoreOptions::new(self.schema.options()).ensure_read_authorized()?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Authorize an internal read that rewrites data (copy-on-write DML, index
+    /// builds) and stamp the grant on `splits`.
+    ///
+    /// Such a read must see raw rows — rewriting from a filtered or masked view
+    /// would destroy hidden rows and persist masked values — so it requires a
+    /// fully unrestricted grant and fails closed otherwise. The grant the caller
+    /// would get from scan planning must NOT be used here: under a row filter it
+    /// shifts row offsets, and rewrites replay those offsets.
+    pub async fn authorize_rewrite_splits(&self, splits: Vec<DataSplit>) -> Result<Vec<DataSplit>> {
+        // This is the only public API that stamps a grant, so it must not be
+        // usable to launder splits: refuse ones that already carry a restricted
+        // grant rather than overwriting it.
+        if splits
+            .iter()
+            .any(DataSplit::has_restricted_query_auth_grant)
+        {
+            return Err(crate::Error::Unsupported {
+                message: "cannot re-authorize a split already planned under a query-auth row \
+                          filter / column masking grant"
+                    .to_string(),
+            });
+        }
+        let grant = self.authorize_unrestricted_read().await?;
+        Ok(splits
+            .into_iter()
+            .map(|split| split.with_query_auth_grant(grant.clone()))
+            .collect())
+    }
+
+    /// Authorize a commit. Writes must require a fully unrestricted grant: the
+    /// data being committed may have come from an enforced read (e.g. `INSERT
+    /// OVERWRITE t SELECT * FROM t`), which would destroy rows the grant hid and
+    /// persist masked values as the stored data. Committing cannot tell where
+    /// its rows came from, so it fails closed for any restricted grant.
+    pub(crate) async fn authorize_unrestricted_write(&self) -> Result<()> {
+        self.authorize_unrestricted_read().await.map(|_| ())
+    }
+
+    /// Fail closed when a read reaches `TableRead::to_arrow` without a grant
+    /// stamped on its splits (an unauthorized path) and the table is
+    /// `query-auth.enabled`; a no-op otherwise.
+    pub(crate) fn ensure_read_without_grant(&self) -> Result<()> {
+        CoreOptions::new(self.schema.options()).ensure_read_authorized()
     }
 
     /// Get the table's identifier.
@@ -578,11 +705,22 @@ impl Table {
             })?;
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
+        // `query-auth.enabled` is delivered by the REST catalog on the table
+        // response, so the branch's on-disk schema need not carry it. Inherit it
+        // from this table: a branch references the same data files, and dropping
+        // the flag here would make `t$branch_x` read them raw, unauthorized.
+        let branch_schema = if CoreOptions::new(self.schema.options()).query_auth_enabled() {
+            schema
+                .copy_with_replaced_options(options)
+                .copy_with_query_auth_enabled()
+        } else {
+            schema.copy_with_replaced_options(options)
+        };
         Ok(Self {
             file_io: self.file_io.clone(),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
-            schema: schema.copy_with_replaced_options(options),
+            schema: branch_schema,
             schema_manager,
             branch,
             branch_reference: true,
@@ -698,6 +836,51 @@ mod tests {
         assert_eq!(
             copied.schema().options().get("scan.snapshot-id"),
             Some(&"3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_unrestricted_read_fails_closed() {
+        // Every write/build path (cow_writer, data_evolution_writer, btree index
+        // build, cross-partition bucket assign) authorizes through this gate
+        // before its internal read. A query-auth table it cannot authorize as
+        // unrestricted must fail closed rather than read raw and rewrite
+        // filtered/masked data into a committed result.
+        let table = super::query_auth_table();
+        let err = table.authorize_unrestricted_read().await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "write-path authorization must fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_branch_copy_inherits_query_auth_flag() {
+        use crate::spec::CoreOptions;
+
+        // `query-auth.enabled` arrives on the REST table response, so a branch's
+        // on-disk schema need not carry it. If the branch copy dropped it,
+        // `t$branch_x` would read the same data files raw and unauthorized.
+        let table = super::query_auth_table();
+        assert!(CoreOptions::new(table.schema().options()).query_auth_enabled());
+
+        // `copy_with_branch` replaces the options wholesale with the branch
+        // schema's; the flag must survive that replacement.
+        let branch_schema =
+            table
+                .schema()
+                .copy_with_replaced_options(std::collections::HashMap::from([(
+                    "branch".to_string(),
+                    "b1".to_string(),
+                )]));
+        assert!(
+            !CoreOptions::new(branch_schema.options()).query_auth_enabled(),
+            "precondition: a replaced-options copy loses the flag on its own"
+        );
+        assert!(
+            CoreOptions::new(branch_schema.copy_with_query_auth_enabled().options())
+                .query_auth_enabled(),
+            "the branch copy must re-assert query-auth.enabled"
         );
     }
 }

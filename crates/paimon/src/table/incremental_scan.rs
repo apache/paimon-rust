@@ -158,6 +158,24 @@ impl IncrementalPlan {
             })
             .collect()
     }
+
+    /// Every data split this plan reads, including both sides of a
+    /// [`IncrementalSplit::DiffPair`]. Authorization must use this rather than
+    /// [`Self::data_splits`], which drops the diff pairs — a Diff plan would
+    /// otherwise present no splits and skip the query-auth grant check.
+    pub(crate) fn all_data_splits(&self) -> Vec<&DataSplit> {
+        let mut out = Vec::new();
+        for split in &self.splits {
+            match split {
+                IncrementalSplit::Data(data) => out.push(data),
+                IncrementalSplit::DiffPair { before, after } => {
+                    out.extend(before.iter());
+                    out.extend(after.iter());
+                }
+            }
+        }
+        out
+    }
 }
 
 pub(crate) fn validate_diff_pair(before: &[DataSplit], after: &[DataSplit]) -> crate::Result<()> {

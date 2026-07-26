@@ -26,6 +26,7 @@ use crate::arrow::ParquetReadBudget;
 use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    filter_columns: HashSet<usize>,
 }
 
 impl<'a> FormatReadBuilder<'a> {
@@ -56,6 +58,7 @@ impl<'a> FormatReadBuilder<'a> {
             row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
+            filter_columns: HashSet::new(),
         }
     }
 
@@ -88,6 +91,10 @@ impl<'a> FormatReadBuilder<'a> {
     }
 
     pub(crate) fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        // Capture the full predicate's columns before it is split, so masked and
+        // out-of-scope partition keys can't prune on their raw value.
+        self.filter_columns.clear();
+        filter.collect_leaf_field_indices(&mut self.filter_columns);
         let (partition_predicate, data_predicates) = split_scan_predicates(self.table, filter);
         self.partition_filter = partition_predicate.map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
@@ -124,6 +131,24 @@ impl<'a> FormatReadBuilder<'a> {
             self.limit,
             self.row_ranges.clone(),
         )
+        .with_query_auth_scope(self.filter_columns.clone(), self.projected_schema_indices())
+    }
+
+    /// Table-schema indices of the projected columns (`None` = all).
+    fn projected_schema_indices(&self) -> Option<Vec<usize>> {
+        // Resolve names too (see `PaimonReadBuilder::projected_schema_indices`).
+        self.resolve_read_type().ok().flatten().map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|s| s.id() == f.id())
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
@@ -134,8 +159,9 @@ impl<'a> FormatReadBuilder<'a> {
                 message: "Row ranges are not supported for format tables".to_string(),
             });
         }
-        let core_options = self.table.schema().core_options();
-        core_options.ensure_read_authorized()?;
+        // Query-auth is enforced in `TableRead::to_arrow` off the grant stamped
+        // on the splits by planning; no gate needed here (see the Paimon
+        // `PaimonReadBuilder::new_read`).
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema().fields().to_vec(),
             Some(fields) => fields,

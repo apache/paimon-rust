@@ -64,8 +64,11 @@ impl Table {
     ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
-        // Manifests carry partition values and per-column stats.
-        CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
+        // Per-partition record counts and partition-key values are derived from
+        // the raw manifests, so a row filter would not apply: they disclose the
+        // size and key space of data the grant hides. Require an unrestricted
+        // grant (this also covers `list_partitions`, which delegates here).
+        self.authorize_unrestricted_read().await?;
         let sm = SnapshotManager::new(self.file_io().clone(), self.location().to_string());
         let snapshot = match sm.get_latest_snapshot().await? {
             Some(s) => s,

@@ -243,6 +243,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
                 .collect()
         };
         let filter_exact = !filter_analysis.requires_residual
+            && plan.row_counts_exact()
             && filter_analysis
                 .pushed_predicate
                 .as_ref()

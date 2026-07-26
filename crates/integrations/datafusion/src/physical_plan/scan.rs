@@ -952,6 +952,18 @@ impl PaimonTableScan {
             return Statistics::unknown_column(&self.schema());
         }
 
+        // Manifest stats describe the data BEFORE query-auth enforcement: the
+        // bounds of a masked column are the raw values the mask hides, and null
+        // counts cover rows the row filter drops. Publishing them (e.g. via
+        // EXPLAIN, or to the optimizer) would leak exactly what enforcement hides.
+        if partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::has_restricted_query_auth_grant)
+        {
+            return Statistics::unknown_column(&self.schema());
+        }
+
         let Ok(merge_engine) = self.table.schema().core_options().merge_engine() else {
             return Statistics::unknown_column(&self.schema());
         };
@@ -1172,6 +1184,18 @@ impl ExecutionPlan for PaimonTableScan {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
         };
+
+        // Under a restricted grant the manifest row count is the count BEFORE
+        // the row filter runs, so publishing it (EXPLAIN, the optimizer) would
+        // disclose how much data the filter hides — the same reason the column
+        // statistics are suppressed. Report the whole thing as unknown.
+        if partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::has_restricted_query_auth_grant)
+        {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        }
 
         let mut total_rows: usize = 0;
         let mut all_row_counts_known = true;

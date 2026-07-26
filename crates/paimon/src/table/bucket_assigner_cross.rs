@@ -88,6 +88,13 @@ impl GlobalPartitionIndex {
             .collect();
         let projected_pk_indices: Vec<usize> = (0..pk_fields.len()).collect();
 
+        // Building the cross-partition PK index reads every primary key. Under a
+        // restricted query-auth grant the planned splits would filter rows, so
+        // the index would miss hidden keys and produce duplicate PKs / lost
+        // updates on upsert. Require a fully unrestricted grant (the plan then
+        // stamps that unrestricted grant on its splits, so the reads run raw).
+        table.authorize_unrestricted_read().await?;
+
         let mut rb = table.new_read_builder();
         rb.with_projection(&pk_field_names)?;
         let scan = rb.new_scan().with_scan_all_files();

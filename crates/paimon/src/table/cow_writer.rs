@@ -213,6 +213,14 @@ impl CopyOnWriteMergeWriter {
             return Ok(Vec::new());
         }
 
+        // A copy-on-write rewrite reads each affected file and rewrites it in
+        // place. Under a restricted query-auth grant that read would filter and
+        // mask rows, silently deleting hidden rows and persisting masked values
+        // on commit — so require a fully unrestricted grant and read raw. The
+        // returned grant (unrestricted, or `None` for a non-query-auth table) is
+        // stamped on each split so `to_arrow` reads raw instead of failing closed.
+        let write_grant = self.table.authorize_unrestricted_read().await?;
+
         let schema = self.table.schema();
         let core_options = CoreOptions::new(schema.options());
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
@@ -235,6 +243,7 @@ impl CopyOnWriteMergeWriter {
         let update_batches = &self.update_batches;
         let file_index = &self.file_index;
         let table = &self.table;
+        let write_grant = &write_grant;
         let partition_keys = &partition_keys;
         let partition_computer = &partition_computer;
         let write_fields = &write_fields;
@@ -256,7 +265,8 @@ impl CopyOnWriteMergeWriter {
                     .with_bucket_path(file_info.bucket_path.clone())
                     .with_total_buckets(file_info.total_buckets)
                     .with_data_files(vec![file_info.file_meta.clone()])
-                    .build()?;
+                    .build()?
+                    .with_query_auth_grant(write_grant.clone());
 
                 let read = table.new_read_builder().new_read()?;
                 let original_batches: Vec<RecordBatch> =
