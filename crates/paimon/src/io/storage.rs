@@ -68,8 +68,9 @@ use super::FileIOBuilder;
 /// The storage carries all supported storage services in paimon
 #[derive(Debug)]
 pub enum Storage {
-    /// A caller-provided opendal operator (see `FileIOBuilder::with_operator`).
-    Custom { op: Operator },
+    /// A caller-provided opendal operator, explicitly scoped to filesystem semantics
+    /// (see `FileIOBuilder::with_fs_operator`).
+    CustomFs { op: Operator },
     #[cfg(feature = "storage-memory")]
     Memory { op: Operator },
     #[cfg(feature = "storage-fs")]
@@ -115,7 +116,7 @@ impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
         let (scheme_str, props, operator) = file_io_builder.into_parts();
         if let Some(op) = operator {
-            return Ok(Self::Custom { op });
+            return Ok(Self::CustomFs { op });
         }
         let scheme = scheme_str.to_ascii_lowercase();
         match scheme.as_str() {
@@ -191,7 +192,22 @@ impl Storage {
 
     pub(crate) fn create<'a>(&self, path: &'a str) -> crate::Result<(Operator, Cow<'a, str>)> {
         match self {
-            Storage::Custom { op } => Ok((op.clone(), Self::fs_relative_path(path)?)),
+            Storage::CustomFs { op } => {
+                // The custom operator is a *filesystem* operator: paths resolve with the
+                // local-filesystem rules below. A scheme'd path would be silently mangled by
+                // those rules (`s3://bucket/a` → `3://bucket/a`), so reject it instead —
+                // object-store operators need the bucket/scheme resolution the built-in
+                // backends perform, which this hook deliberately does not reimplement.
+                if !path.starts_with("file:/") && path.contains("://") {
+                    return Err(error::Error::ConfigInvalid {
+                        message: format!(
+                            "the custom operator is a filesystem operator and cannot resolve \
+                             the scheme'd path: {path}"
+                        ),
+                    });
+                }
+                Ok((op.clone(), Self::fs_relative_path(path)?))
+            }
             #[cfg(feature = "storage-memory")]
             Storage::Memory { op } => {
                 Ok((op.clone(), Cow::Borrowed(Self::memory_relative_path(path)?)))
@@ -560,5 +576,42 @@ mod fs_relative_path_tests {
         // make_path concatenates with `/`, so a Windows warehouse yields a
         // mixed-separator path that must still normalize cleanly.
         assert_eq!(rel(r"C:\Users\wh/db.db/t"), "C:/Users/wh/db.db/t");
+    }
+}
+
+#[cfg(all(test, feature = "storage-memory"))]
+mod tests {
+    use super::*;
+
+    fn memory_operator() -> Operator {
+        Operator::from_config(opendal::services::MemoryConfig::default()).unwrap()
+    }
+
+    /// The filesystem operator resolves absolute paths and `file:` URLs with the
+    /// local-filesystem rules, against the operator's own root.
+    #[test]
+    fn custom_fs_operator_resolves_filesystem_paths() {
+        let storage = Storage::CustomFs {
+            op: memory_operator(),
+        };
+        let (_, relative) = storage.create("/warehouse/db/table").unwrap();
+        assert_eq!(relative, "warehouse/db/table");
+        let (_, relative) = storage.create("file:/warehouse/db/table").unwrap();
+        assert_eq!(relative, "warehouse/db/table");
+    }
+
+    /// A scheme'd path would be silently mangled by the filesystem rules
+    /// (`s3://bucket/a` → `3://bucket/a`), so it is rejected instead.
+    #[test]
+    fn custom_fs_operator_rejects_schemed_paths() {
+        let storage = Storage::CustomFs {
+            op: memory_operator(),
+        };
+        for path in ["s3://bucket/a", "oss://bucket/a", "hdfs://nn/a"] {
+            assert!(
+                storage.create(path).is_err(),
+                "expected {path} to be rejected by the filesystem operator"
+            );
+        }
     }
 }
