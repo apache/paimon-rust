@@ -1606,9 +1606,11 @@ impl<'a> PaimonTableScan<'a> {
         // Row ranges identify physical positions in individual files, whereas
         // Diff compares complete logical states across both snapshots.
         full_state_scan = full_state_scan.without_row_range_optimization();
+        full_state_scan
+            .validate_diff_bucket_layout(before, after)
+            .await?;
         let before_entries = full_state_scan.plan_manifest_entries(before).await?;
         let after_entries = full_state_scan.plan_manifest_entries(after).await?;
-        Self::validate_diff_bucket_layout(&before_entries, &after_entries)?;
         let before_plan = full_state_scan
             .plan_snapshot_from_entries(before.clone(), before_entries, None, None, None, None)
             .await?;
@@ -1618,36 +1620,25 @@ impl<'a> PaimonTableScan<'a> {
         Ok((before_plan, after_plan))
     }
 
-    fn validate_diff_bucket_layout(
-        before_entries: &[ManifestEntry],
-        after_entries: &[ManifestEntry],
+    async fn validate_diff_bucket_layout(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
     ) -> crate::Result<()> {
-        use std::collections::{BTreeMap, BTreeSet};
-
-        fn totals(entries: &[ManifestEntry]) -> BTreeMap<Vec<u8>, BTreeSet<i32>> {
-            let mut result: BTreeMap<Vec<u8>, BTreeSet<i32>> = BTreeMap::new();
-            for entry in entries {
-                result
-                    .entry(entry.partition().to_vec())
-                    .or_default()
-                    .insert(entry.total_buckets());
-            }
-            result
+        if before.schema_id() == after.schema_id() {
+            return Ok(());
         }
 
-        let before = totals(before_entries);
-        let after = totals(after_entries);
-        for (partition, before_totals) in &before {
-            let Some(after_totals) = after.get(partition) else {
-                continue;
-            };
-            if before_totals != after_totals {
-                return Err(crate::Error::Unsupported {
-                    message:
-                        "Batch incremental Diff does not support bucket rescale between snapshots"
-                            .to_string(),
-                });
-            }
+        let schema_manager = self.table.schema_manager();
+        let (before_schema, after_schema) = futures::try_join!(
+            schema_manager.schema(before.schema_id()),
+            schema_manager.schema(after.schema_id())
+        )?;
+        if before_schema.core_options().bucket() != after_schema.core_options().bucket() {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff does not support bucket rescale between snapshots"
+                    .to_string(),
+            });
         }
         Ok(())
     }
@@ -3270,6 +3261,7 @@ mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
+            .option("bucket", "1")
             .option("merge-engine", "deduplicate");
         if deletion_vectors_enabled {
             schema = schema.option("deletion-vectors.enabled", "true");
@@ -3284,10 +3276,14 @@ mod tests {
     }
 
     fn diff_snapshot(snapshot_id: i64) -> Snapshot {
+        diff_snapshot_with_schema(snapshot_id, 0)
+    }
+
+    fn diff_snapshot_with_schema(snapshot_id: i64, schema_id: i64) -> Snapshot {
         Snapshot::builder()
             .version(1)
             .id(snapshot_id)
-            .schema_id(0)
+            .schema_id(schema_id)
             .base_manifest_list(String::new())
             .delta_manifest_list(String::new())
             .commit_user("test-user".to_string())
@@ -4361,6 +4357,30 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
             "Diff must fail closed on deletion-vector tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_bucket_rescale_from_snapshot_schemas() {
+        let table = diff_test_table("memory:/diff_bucket_rescale_gate", false);
+        let before_schema = table.schema().clone();
+        let after_schema = before_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "bucket".to_string(),
+                "2".to_string(),
+            )])
+            .unwrap();
+        write_schema_file(&table, &before_schema).await;
+        write_schema_file(&table, &after_schema).await;
+
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
+        let before = diff_snapshot_with_schema(1, before_schema.id());
+        let after = diff_snapshot_with_schema(2, after_schema.id());
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("bucket rescale")),
+            "Diff must reject bucket rescale even when both snapshots are empty"
         );
     }
 

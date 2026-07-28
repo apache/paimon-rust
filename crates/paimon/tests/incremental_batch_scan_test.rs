@@ -974,7 +974,7 @@ fn incremental_plan_rejects_partial_or_inconsistent_diff_states() {
 
 #[tokio::test]
 async fn diff_rejects_bucket_rescale_between_snapshots() {
-    use std::collections::HashMap;
+    use paimon::spec::SchemaChange;
 
     let table_path = "memory:/incremental_batch/diff_bucket_rescale";
     let (file_io, table) = memory_table(
@@ -989,7 +989,20 @@ async fn diff_rejects_bucket_rescale_between_snapshots() {
     persist_table_schema(&file_io, table_path, table.schema()).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
 
-    let table = table.copy_with_options(HashMap::from([("bucket".to_string(), "2".to_string())]));
+    let schema = table
+        .schema()
+        .apply_changes(vec![SchemaChange::set_option(
+            "bucket".to_string(),
+            "2".to_string(),
+        )])
+        .unwrap();
+    let table = paimon::table::Table::new(
+        file_io.clone(),
+        table.identifier().clone(),
+        table_path.to_string(),
+        schema,
+        None,
+    );
     persist_table_schema(&file_io, table_path, table.schema()).await;
     write_batch(&table, &make_batch(vec![2], vec![20])).await;
 
