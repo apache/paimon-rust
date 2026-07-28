@@ -28,6 +28,8 @@
 //! - `ALTER TABLE db.t ADD COLUMN col TYPE`
 //! - `ALTER TABLE db.t DROP COLUMN col`
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
+//! - `ALTER TABLE db.t ALTER COLUMN col TYPE new_type`
+//! - `ALTER TABLE db.t ALTER COLUMN col SET|DROP NOT NULL`
 //! - `ALTER TABLE db.t RENAME TO new_name`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
@@ -55,11 +57,11 @@ use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, ColumnOption, CreateFunction,
-    CreateFunctionBody, CreateTable, CreateTableOptions, CreateView, Delete, Expr as SqlExpr,
-    FromTable, FunctionBehavior, FunctionReturnType, Insert, Merge, ObjectName, ObjectType,
-    RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption, Statement,
-    TableFactor, TableObject, Truncate, Update, Value as SqlValue,
+    AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
+    ColumnOption, CreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions, CreateView,
+    Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Insert, Merge,
+    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -1030,6 +1032,20 @@ impl SQLContext {
         Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         let identifier = self.resolve_table_name(name)?;
 
+        if operations.len() > 1
+            && operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    AlterTableOperation::RenameTable { .. }
+                        | AlterTableOperation::DropPartitions { .. }
+                )
+            })
+        {
+            return Err(DataFusionError::Plan(
+                "ALTER TABLE RENAME TO and DROP PARTITION must be used alone".to_string(),
+            ));
+        }
+
         let mut changes = Vec::new();
         let mut rename_to: Option<Identifier> = None;
 
@@ -1051,6 +1067,9 @@ impl SQLContext {
                         old_column_name.value.clone(),
                         new_column_name.value.clone(),
                     ));
+                }
+                AlterTableOperation::AlterColumn { column_name, op } => {
+                    changes.push(alter_column_to_schema_change(&column_name.value, op)?);
                 }
                 AlterTableOperation::RenameTable { table_name } => {
                     let new_name = match table_name {
@@ -2380,6 +2399,41 @@ fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
     })
 }
 
+fn alter_column_to_schema_change(
+    column_name: &str,
+    operation: &AlterColumnOperation,
+) -> DFResult<SchemaChange> {
+    match operation {
+        AlterColumnOperation::SetNotNull => Ok(SchemaChange::update_column_nullability(
+            column_name.to_string(),
+            false,
+        )),
+        AlterColumnOperation::DropNotNull => Ok(SchemaChange::update_column_nullability(
+            column_name.to_string(),
+            true,
+        )),
+        AlterColumnOperation::SetDataType {
+            data_type, using, ..
+        } => {
+            if using.is_some() {
+                return Err(DataFusionError::Plan(
+                    "ALTER COLUMN TYPE USING is not supported".to_string(),
+                ));
+            }
+            let new_data_type = sql_data_type_to_paimon_type(data_type, true)?;
+            Ok(SchemaChange::UpdateColumnType {
+                field_names: vec![column_name.to_string()],
+                new_data_type,
+                // A type-only SQL change must not change the column's nullability.
+                keep_nullability: true,
+            })
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "Unsupported ALTER COLUMN operation: {other}"
+        ))),
+    }
+}
+
 fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
     sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))
 }
@@ -3273,6 +3327,7 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::StringViewArray;
+    use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use paimon::catalog::Database;
     use paimon::spec::{
         DataField as PaimonDataField, DataType as PaimonDataType, IntType, Schema as PaimonSchema,
@@ -6177,6 +6232,116 @@ mod tests {
             ));
         } else {
             panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_update_column_type_preserves_nullability() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        for sql in [
+            "ALTER TABLE mydb.t1 ALTER COLUMN value TYPE BIGINT",
+            "ALTER TABLE mydb.t1 ALTER COLUMN value SET DATA TYPE BIGINT",
+        ] {
+            sql_context.sql(sql).await.unwrap();
+
+            let calls = catalog.take_calls();
+            assert_eq!(calls.len(), 1);
+            if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+                assert_eq!(changes.len(), 1);
+                assert!(matches!(
+                    &changes[0],
+                    SchemaChange::UpdateColumnType {
+                        field_names,
+                        new_data_type: PaimonDataType::BigInt(_),
+                        keep_nullability: true,
+                    } if field_names.first().map(String::as_str) == Some("value")
+                ));
+            } else {
+                panic!("expected AlterTable call");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_update_column_nullability() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        for (sql, expected_nullability) in [
+            ("ALTER TABLE mydb.t1 ALTER COLUMN value SET NOT NULL", false),
+            ("ALTER TABLE mydb.t1 ALTER COLUMN value DROP NOT NULL", true),
+        ] {
+            sql_context.sql(sql).await.unwrap();
+
+            let calls = catalog.take_calls();
+            assert_eq!(calls.len(), 1);
+            if let CatalogCall::AlterTable { changes, .. } = &calls[0] {
+                assert_eq!(changes.len(), 1);
+                assert!(matches!(
+                    &changes[0],
+                    SchemaChange::UpdateColumnNullability {
+                        field_names,
+                        new_nullability,
+                    } if field_names.first().map(String::as_str) == Some("value")
+                        && *new_nullability == expected_nullability
+                ));
+            } else {
+                panic!("expected AlterTable call");
+            }
+        }
+    }
+
+    #[test]
+    fn test_alter_table_update_column_type_rejects_using() {
+        let statements = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "ALTER TABLE mydb.t1 ALTER COLUMN value \
+             TYPE BIGINT USING CAST(value AS BIGINT)",
+        )
+        .unwrap();
+        let Statement::AlterTable(alter_table) = &statements[0] else {
+            panic!("expected ALTER TABLE statement");
+        };
+        let AlterTableOperation::AlterColumn { column_name, op } = &alter_table.operations[0]
+        else {
+            panic!("expected ALTER COLUMN operation");
+        };
+
+        let err = alter_column_to_schema_change(&column_name.value, op).unwrap_err();
+
+        assert!(err.to_string().contains("USING is not supported"));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_update_column_default_is_unsupported() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        let err = sql_context
+            .sql("ALTER TABLE mydb.t1 ALTER COLUMN value SET DEFAULT 1")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Unsupported ALTER COLUMN operation"));
+        assert!(catalog.take_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rejects_mixed_special_operations_before_catalog_calls() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        for sql in [
+            "ALTER TABLE mydb.t1 RENAME TO t2, ADD COLUMN age INT",
+            "ALTER TABLE mydb.t1 DROP PARTITION (pt = 'a'), ADD COLUMN age INT",
+        ] {
+            let err = sql_context.sql(sql).await.unwrap_err();
+            assert!(err.to_string().contains("must be used alone"));
+            assert!(catalog.take_calls().is_empty());
         }
     }
 

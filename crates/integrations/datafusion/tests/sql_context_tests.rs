@@ -1164,6 +1164,53 @@ async fn test_alter_table_add_column() {
 }
 
 #[tokio::test]
+async fn test_alter_table_update_column_type_and_nullability() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    let identifier = Identifier::new("mydb", "alter_column_test");
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+    let schema = paimon::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("alter-column-null-to-not-null.disabled", "false")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("ALTER TABLE mydb.alter_column_test ALTER COLUMN value SET NOT NULL")
+        .await
+        .expect("ALTER COLUMN SET NOT NULL should succeed");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert!(!table.schema().fields()[1].data_type().is_nullable());
+
+    sql_context
+        .sql("ALTER TABLE mydb.alter_column_test ALTER COLUMN value TYPE BIGINT")
+        .await
+        .expect("ALTER COLUMN TYPE should succeed");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert!(matches!(
+        table.schema().fields()[1].data_type(),
+        DataType::BigInt(_)
+    ));
+    assert!(!table.schema().fields()[1].data_type().is_nullable());
+
+    sql_context
+        .sql("ALTER TABLE mydb.alter_column_test ALTER COLUMN value DROP NOT NULL")
+        .await
+        .expect("ALTER COLUMN DROP NOT NULL should succeed");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert!(table.schema().fields()[1].data_type().is_nullable());
+}
+
+#[tokio::test]
 async fn test_alter_table_rename() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

@@ -255,6 +255,7 @@ impl TableSchema {
                             message: format!("Cannot rename partition column: [{name}]"),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(&self.options, name, "rename")?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -302,6 +303,7 @@ impl TableSchema {
                             ),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(&self.options, name, "drop")?;
                     // Dropping a column referenced by `bucket-key` / `sequence.field`
                     // would silently break bucket assignment / sequence ordering on
                     // existing data (e.g. `bucket_key_indices` becomes empty and writes
@@ -355,6 +357,11 @@ impl TableSchema {
                             message: "Cannot update primary key".to_string(),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(
+                        &self.options,
+                        name,
+                        "update type of",
+                    )?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -557,6 +564,35 @@ fn assert_nullability_change(
                  You can set table configuration option 'alter-column-null-to-not-null.disabled' = 'false' \
                  to allow converting null columns to not null"
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Reject destructive changes to columns referenced by a primary-key index.
+///
+/// The index metadata and existing index files are tied to the original column
+/// name and type. Mirrors Java
+/// `SchemaManager.assertNotUpdatingPrimaryKeyIndexColumn`.
+fn assert_not_updating_primary_key_index_column(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    operation: &str,
+) -> crate::Result<()> {
+    let core_options = CoreOptions::new(options);
+    let is_vector_index_column = core_options.primary_key_vector_index_enabled()
+        && core_options
+            .primary_key_vector_index_columns()?
+            .iter()
+            .any(|column| column == field_name);
+    let is_full_text_index_column = core_options
+        .primary_key_full_text_index_columns()
+        .iter()
+        .any(|column| column == field_name);
+
+    if is_vector_index_column || is_full_text_index_column {
+        return Err(crate::Error::Unsupported {
+            message: format!("Cannot {operation} primary-key index column: [{field_name}]"),
         });
     }
     Ok(())
@@ -2921,6 +2957,102 @@ mod tests {
             new_schema.options().get("fields.tag.list-agg-delimiter"),
             None
         );
+    }
+
+    fn assert_primary_key_index_column_changes_rejected(
+        table_schema: &TableSchema,
+        column_name: &str,
+        new_data_type: DataType,
+    ) {
+        let changes = [
+            (
+                crate::spec::SchemaChange::rename_column(
+                    column_name.to_string(),
+                    format!("renamed_{column_name}"),
+                ),
+                format!("Cannot rename primary-key index column: [{column_name}]"),
+            ),
+            (
+                crate::spec::SchemaChange::drop_column(column_name.to_string()),
+                format!("Cannot drop primary-key index column: [{column_name}]"),
+            ),
+            (
+                crate::spec::SchemaChange::update_column_type(
+                    column_name.to_string(),
+                    new_data_type,
+                ),
+                format!("Cannot update type of primary-key index column: [{column_name}]"),
+            ),
+        ];
+
+        for (change, expected_message) in changes {
+            let err = table_schema.apply_changes(vec![change]).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message == &expected_message),
+                "expected primary-key index guard, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_destructive_primary_key_full_text_index_column_changes() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("content", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("deletion-vectors.enabled", "true")
+                .option("pk-full-text.index.columns", "content")
+                .build()
+                .unwrap(),
+        );
+
+        assert_primary_key_index_column_changes_rejected(
+            &table_schema,
+            "content",
+            DataType::Int(IntType::new()),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::remove_option("pk-full-text.index.columns".to_string()),
+                crate::spec::SchemaChange::rename_column(
+                    "content".to_string(),
+                    "renamed_content".to_string(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { ref message }
+                if message == "Cannot rename primary-key index column: [content]"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_destructive_primary_key_vector_index_column_changes() {
+        let vector_type = DataType::Vector(
+            VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_type.clone())
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("deletion-vectors.enabled", "true")
+                .option("pk-vector.index.columns", "embedding")
+                .option("fields.embedding.pk-vector.index.type", "ivf_flat")
+                .option("fields.embedding.pk-vector.distance.metric", "l2")
+                .build()
+                .unwrap(),
+        );
+
+        assert_primary_key_index_column_changes_rejected(&table_schema, "embedding", vector_type);
     }
 
     #[test]
