@@ -47,6 +47,8 @@ pub struct DataFileMeta {
     #[serde(rename = "_FILE_SIZE")]
     pub file_size: i64,
     // row_count tells the total number of rows (including add & delete) in this file.
+    // A negative value means the producer does not know the row count; see
+    // [`DataFileMeta::ROW_COUNT_UNKNOWN`]. Never treat it as a real count.
     #[serde(rename = "_ROW_COUNT")]
     pub row_count: i64,
     #[serde(rename = "_MIN_KEY", with = "serde_bytes")]
@@ -188,6 +190,21 @@ fn read_compact_millis_as_utc(
 }
 
 impl DataFileMeta {
+    /// Placeholder for `row_count` when the producer cannot know how many rows
+    /// a file holds.
+    ///
+    /// Metadata that comes from a manifest always carries a real count. Sources
+    /// that plan over bare directory listings (for example `type=format-table`,
+    /// which has no manifest) have nothing to fill in and must use this value:
+    /// a plain `0` is indistinguishable from a file that really is empty, and
+    /// every consumer that trusts it silently returns a wrong answer.
+    pub const ROW_COUNT_UNKNOWN: i64 = -1;
+
+    /// Whether `row_count` is a real count rather than [`Self::ROW_COUNT_UNKNOWN`].
+    pub fn row_count_known(&self) -> bool {
+        self.row_count >= 0
+    }
+
     /// Decode this file's manifest value statistics for a field in the current schema.
     ///
     /// Returns `None` when statistics are missing, malformed, or belong to a different

@@ -561,9 +561,25 @@ impl DataSplit {
         file.data_file_path(&self.bucket_path)
     }
 
-    /// Total row count of all data files in this split.
+    /// Sum of the physical row counts this split knows about.
+    ///
+    /// Files whose count is [`DataFileMeta::ROW_COUNT_UNKNOWN`] contribute
+    /// nothing, so the result is a lower bound, not a total. Ask
+    /// [`Self::row_counts_known`] before presenting it as one.
     pub fn row_count(&self) -> i64 {
-        self.data_files.iter().map(|f| f.row_count).sum()
+        self.data_files
+            .iter()
+            .filter(|f| f.row_count_known())
+            .map(|f| f.row_count)
+            .sum()
+    }
+
+    /// Whether every data file in this split carries a real row count.
+    ///
+    /// False for splits planned without a manifest (`type=format-table`), where
+    /// the only honest answer about row counts is "unknown".
+    pub fn row_counts_known(&self) -> bool {
+        self.data_files.iter().all(DataFileMeta::row_count_known)
     }
 
     /// Returns the merged row count if it can be computed.
@@ -577,10 +593,15 @@ impl DataSplit {
     /// 2. If all files have `first_row_id` (data evolution mode): merge
     ///    overlapping row ID ranges and take max row count per group.
     ///
-    /// Returns `None` otherwise.
+    /// Returns `None` otherwise, and always `None` when any file's row count is
+    /// [`DataFileMeta::ROW_COUNT_UNKNOWN`] — no arithmetic over a placeholder
+    /// produces a number a caller may trust.
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if !self.row_counts_known() {
+            return None;
+        }
         if let Some(count) = self.raw_merged_row_count() {
             return Some(count);
         }
@@ -1330,6 +1351,57 @@ mod tests {
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    /// A placeholder row count must surface as "unknown", not as a number.
+    /// Reporting `Some(0)` here lets an engine answer `COUNT(*)` with 0 for a
+    /// split that holds data.
+    #[test]
+    fn test_merged_row_count_unknown_when_a_file_has_no_row_count() {
+        let s = split(
+            vec![
+                file("a", DataFileMeta::ROW_COUNT_UNKNOWN, None),
+                file("b", DataFileMeta::ROW_COUNT_UNKNOWN, None),
+            ],
+            true,
+        );
+        assert!(!s.row_counts_known());
+        assert_eq!(s.merged_row_count(), None);
+        assert_eq!(s.row_count(), 0, "unknown files contribute nothing");
+    }
+
+    /// One unknown file poisons the whole split: the rest are still a lower
+    /// bound, never a total.
+    #[test]
+    fn test_merged_row_count_unknown_when_mixed_with_known_files() {
+        let s = split(
+            vec![
+                file("a", 10, None),
+                file("b", DataFileMeta::ROW_COUNT_UNKNOWN, None),
+            ],
+            true,
+        );
+        assert_eq!(s.merged_row_count(), None);
+        assert_eq!(s.row_count(), 10);
+    }
+
+    /// Unknown row counts must not be rescued by the data-evolution branch.
+    #[test]
+    fn test_merged_row_count_unknown_beats_data_evolution_branch() {
+        let s = split(
+            vec![file("a", DataFileMeta::ROW_COUNT_UNKNOWN, Some(0))],
+            false,
+        );
+        assert_eq!(s.merged_row_count(), None);
+    }
+
+    /// A file that really holds zero rows stays an exact 0 — "unknown" is a
+    /// distinct value, not a synonym for empty.
+    #[test]
+    fn test_merged_row_count_zero_rows_stays_exact() {
+        let s = split(vec![file("a", 0, None)], true);
+        assert!(s.row_counts_known());
+        assert_eq!(s.merged_row_count(), Some(0));
     }
 
     #[test]

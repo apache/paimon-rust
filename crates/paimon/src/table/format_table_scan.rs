@@ -619,7 +619,7 @@ fn data_file_meta(file_name: String, file_size: i64, schema_id: i64) -> DataFile
     DataFileMeta {
         file_name,
         file_size,
-        row_count: 0,
+        row_count: DataFileMeta::ROW_COUNT_UNKNOWN,
         min_key: Vec::new(),
         max_key: Vec::new(),
         key_stats: BinaryTableStats::empty(),
