@@ -137,8 +137,15 @@ impl BinaryTableStats {
 }
 
 impl Display for BinaryTableStats {
-    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    /// `min_values`/`max_values` are serialized `BinaryRow`s that cannot be decoded without
+    /// the column types, so they print as raw bytes (same convention as `DataFileMeta`'s
+    /// `minKey`/`keyStats` fields).
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BinaryTableStats{{minValues={:?}, maxValues={:?}, nullCounts={:?}}}",
+            self.min_values, self.max_values, self.null_counts
+        )
     }
 }
 
@@ -235,5 +242,30 @@ mod tests {
         let bytes = stats.to_simple_stats_row_data();
         let back = BinaryTableStats::from_simple_stats_row_data(&bytes).unwrap();
         assert_eq!(back.to_simple_stats_row_data(), bytes);
+    }
+
+    #[test]
+    fn display_formats_labeled_fields() {
+        let stats = BinaryTableStats::new(
+            vec![0, 0, 0, 2, 1],
+            vec![0, 0, 0, 2, 9],
+            vec![Some(0), None, Some(3)],
+        );
+        assert_eq!(
+            format!("{stats}"),
+            "BinaryTableStats{minValues=[0, 0, 0, 2, 1], maxValues=[0, 0, 0, 2, 9], \
+             nullCounts=[Some(0), None, Some(3)]}"
+        );
+    }
+
+    #[test]
+    fn display_empty_stats_does_not_panic() {
+        let stats = BinaryTableStats::empty();
+        let rendered = format!("{stats}");
+        assert!(
+            rendered.starts_with("BinaryTableStats{minValues=[")
+                && rendered.ends_with("nullCounts=[]}"),
+            "unexpected empty-stats rendering: {rendered}"
+        );
     }
 }
