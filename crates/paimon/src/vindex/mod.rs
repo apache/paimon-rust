@@ -25,8 +25,6 @@ use std::collections::HashMap;
 
 pub const IVF_FLAT_IDENTIFIER: &str = "ivf-flat";
 pub const IVF_PQ_IDENTIFIER: &str = "ivf-pq";
-pub const IVF_HNSW_FLAT_IDENTIFIER: &str = "ivf-hnsw-flat";
-pub const IVF_HNSW_SQ_IDENTIFIER: &str = "ivf-hnsw-sq";
 
 const DEFAULT_DIMENSION: &str = "128";
 const DEFAULT_METRIC: &str = "inner_product";
@@ -35,18 +33,13 @@ const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
 
 pub fn is_vindex_index_type(index_type: &str) -> bool {
-    matches!(
-        index_type,
-        IVF_FLAT_IDENTIFIER | IVF_PQ_IDENTIFIER | IVF_HNSW_FLAT_IDENTIFIER | IVF_HNSW_SQ_IDENTIFIER
-    )
+    matches!(index_type, IVF_FLAT_IDENTIFIER | IVF_PQ_IDENTIFIER)
 }
 
 pub(crate) fn native_index_type(index_type: &str) -> Option<&'static str> {
     match index_type {
         IVF_FLAT_IDENTIFIER => Some("ivf_flat"),
         IVF_PQ_IDENTIFIER => Some("ivf_pq"),
-        IVF_HNSW_FLAT_IDENTIFIER => Some("ivf_hnsw_flat"),
-        IVF_HNSW_SQ_IDENTIFIER => Some("ivf_hnsw_sq"),
         _ => None,
     }
 }
@@ -129,19 +122,6 @@ impl VindexVectorIndexOptions {
                     DEFAULT_PQ_USE_OPQ,
                 ),
             );
-        }
-
-        for key in ["hnsw.m", "hnsw.ef-construction", "hnsw.max-level"] {
-            if let Some(value) = optional_value(
-                table_options,
-                user_options,
-                field.name(),
-                index_type,
-                key,
-                key,
-            ) {
-                native_options.insert(key.to_string(), value);
-            }
         }
 
         let config = VectorIndexConfig::from_options(&native_options).map_err(|e| {
@@ -232,9 +212,6 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
     match key {
         "dimension" | "nlist" | "metric" => true,
         "pq.m" | "use-opq" => index_type == IVF_PQ_IDENTIFIER,
-        "hnsw.m" | "hnsw.ef-construction" | "hnsw.max-level" => {
-            index_type == IVF_HNSW_FLAT_IDENTIFIER || index_type == IVF_HNSW_SQ_IDENTIFIER
-        }
         _ => false,
     }
 }
@@ -243,9 +220,6 @@ fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
     match suffix {
         "dimension" | "nlist" | "distance.metric" => true,
         "pq.m" | "pq.use-opq" => index_type == IVF_PQ_IDENTIFIER,
-        "hnsw.m" | "hnsw.ef-construction" | "hnsw.max-level" => {
-            index_type == IVF_HNSW_FLAT_IDENTIFIER || index_type == IVF_HNSW_SQ_IDENTIFIER
-        }
         _ => false,
     }
 }
@@ -334,8 +308,8 @@ mod tests {
     fn test_vindex_index_type_identifier_helper() {
         assert!(is_vindex_index_type(IVF_FLAT_IDENTIFIER));
         assert!(is_vindex_index_type(IVF_PQ_IDENTIFIER));
-        assert!(is_vindex_index_type(IVF_HNSW_FLAT_IDENTIFIER));
-        assert!(is_vindex_index_type(IVF_HNSW_SQ_IDENTIFIER));
+        assert!(!is_vindex_index_type("ivf-hnsw-flat"));
+        assert!(!is_vindex_index_type("ivf-hnsw-sq"));
         assert!(!is_vindex_index_type(""));
         assert!(!is_vindex_index_type("btree"));
         assert!(!is_vindex_index_type("lumina"));
@@ -546,14 +520,8 @@ mod tests {
     fn test_native_index_type_helper() {
         assert_eq!(native_index_type(IVF_FLAT_IDENTIFIER), Some("ivf_flat"));
         assert_eq!(native_index_type(IVF_PQ_IDENTIFIER), Some("ivf_pq"));
-        assert_eq!(
-            native_index_type(IVF_HNSW_FLAT_IDENTIFIER),
-            Some("ivf_hnsw_flat")
-        );
-        assert_eq!(
-            native_index_type(IVF_HNSW_SQ_IDENTIFIER),
-            Some("ivf_hnsw_sq")
-        );
+        assert_eq!(native_index_type("ivf-hnsw-flat"), None);
+        assert_eq!(native_index_type("ivf-hnsw-sq"), None);
         assert_eq!(native_index_type("btree"), None);
     }
 

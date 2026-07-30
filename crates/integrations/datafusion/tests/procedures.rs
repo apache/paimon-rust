@@ -153,15 +153,23 @@ async fn test_create_global_index_requires_index_column() {
 }
 
 #[tokio::test]
-async fn test_create_global_index_rejects_unsupported_index_type() {
+async fn test_create_global_index_rejects_unsupported_index_types() {
     let (_tmp, sql_context) = setup_btree_global_index_table("global_index_bad_type").await;
 
-    assert_sql_error(
-        &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.global_index_bad_type', index_column => 'id', index_type => 'full-text')",
-        "only supports index_type => 'btree', 'bitmap'",
-    )
-    .await;
+    for index_type in ["full-text", "ivf-hnsw-flat", "ivf-hnsw-sq"] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_global_index(\
+                    table => 'test_db.global_index_bad_type', \
+                    index_column => 'id', \
+                    index_type => '{index_type}'\
+                )"
+            ),
+            "only supports index_type => 'btree', 'bitmap', or vindex types ('ivf-flat', 'ivf-pq')",
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

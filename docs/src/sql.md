@@ -963,8 +963,8 @@ CREATE TABLE paimon.my_db.items (
 );
 ```
 
-For vector indexes backed by vindex, set `index_type` to one of `ivf-flat`,
-`ivf-pq`, `ivf-hnsw-flat`, or `ivf-hnsw-sq`:
+For vector indexes backed by vindex, set `index_type` to `ivf-flat` or
+`ivf-pq`:
 
 ```sql
 CALL sys.create_global_index(
@@ -1003,12 +1003,9 @@ Supported vindex options:
 | `<index-type>.nlist` | `256` | all vindex types | Number of IVF lists. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
-| `<index-type>.hnsw.m` | native default | HNSW vindex types | HNSW graph connectivity. |
-| `<index-type>.hnsw.ef-construction` | native default | HNSW vindex types | HNSW construction beam width. |
-| `<index-type>.hnsw.max-level` | native default | HNSW vindex types | Maximum HNSW graph level. |
 
 Native vindex aliases are also accepted in the `options` string: `dimension`,
-`metric`, `nlist`, `pq.m`, `use-opq`, and `hnsw.*`.
+`metric`, `nlist`, `pq.m`, and `use-opq`.
 
 Inspect committed index files with the `$table_indexes` system table:
 

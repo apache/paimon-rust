@@ -571,7 +571,7 @@ async fn proc_create_global_index(
     } else {
         return Err(DataFusionError::NotImplemented(format!(
             "create_global_index only supports index_type => 'btree', 'bitmap', or vindex types \
-             ('ivf-flat', 'ivf-pq', 'ivf-hnsw-flat', 'ivf-hnsw-sq'), got '{index_type}'"
+             ('ivf-flat', 'ivf-pq'), got '{index_type}'"
         )));
     }
     ok_result(ctx)
