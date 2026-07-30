@@ -96,6 +96,7 @@ use crate::{BlobReaderRegistry, DynamicOptions};
 pub struct SQLContext {
     ctx: SessionContext,
     catalogs: HashMap<String, Arc<dyn Catalog>>,
+    incremental_query_catalogs: crate::incremental_query::IncrementalQueryCatalogs,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
     blob_reader_registry: BlobReaderRegistry,
@@ -122,11 +123,18 @@ impl SQLContext {
             ))
             .build();
         let ctx = SessionContext::new_with_state(state);
+        let incremental_query_catalogs =
+            crate::incremental_query::IncrementalQueryCatalogs::default();
+        crate::incremental_query::register_incremental_query_catalogs(
+            &ctx,
+            incremental_query_catalogs.clone(),
+        );
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         Self {
             ctx,
             catalogs: HashMap::new(),
+            incremental_query_catalogs,
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
         }
@@ -203,6 +211,11 @@ impl SQLContext {
                 Some(session_state),
             )),
         );
+        self.incremental_query_catalogs.register(
+            catalog_name.clone(),
+            catalog.clone(),
+            default_db.unwrap_or("default"),
+        );
         register_table_functions(
             &self.ctx,
             &catalog,
@@ -241,6 +254,8 @@ impl SQLContext {
                 "SET datafusion.catalog.default_catalog = '{catalog_name}'"
             ))
             .await?;
+        self.incremental_query_catalogs
+            .set_current(catalog_name.clone());
         Ok(())
     }
 
@@ -256,6 +271,8 @@ impl SQLContext {
                 "SET datafusion.catalog.default_schema = '{database_name}'"
             ))
             .await?;
+        self.incremental_query_catalogs
+            .set_current_database(database_name.to_string());
         Ok(())
     }
 
@@ -3483,11 +3500,6 @@ fn register_table_functions(
     dynamic_options: DynamicOptions,
 ) {
     crate::blob_view::register_blob_view(ctx, Arc::clone(catalog), default_database);
-    crate::incremental_query::register_incremental_query(
-        ctx,
-        Arc::clone(catalog),
-        default_database,
-    );
     crate::vector_search::register_vector_search_with_dynamic_options(
         ctx,
         Arc::clone(catalog),

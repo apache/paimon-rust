@@ -146,6 +146,90 @@ async fn incremental_query_without_audit_log_returns_delta_rows() {
 }
 
 #[tokio::test]
+async fn incremental_query_resolves_the_qualified_catalog() {
+    let (_first_tmp, first_catalog) = common::create_test_env();
+    let (_second_tmp, second_catalog) = common::create_test_env();
+    let mut ctx = paimon_datafusion::SQLContext::new();
+    ctx.register_catalog("first", first_catalog).await.unwrap();
+    ctx.register_catalog("second", second_catalog)
+        .await
+        .unwrap();
+
+    common::exec(
+        &ctx,
+        "CREATE TABLE first.default.inc_t (id INT) WITH ('bucket' = '1', 'bucket-key' = 'id')",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE second.default.inc_t (id INT) WITH ('bucket' = '1', 'bucket-key' = 'id')",
+    )
+    .await;
+    common::exec(&ctx, "CREATE SCHEMA second.analytics").await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE second.analytics.inc_t (id INT) WITH ('bucket' = '1', 'bucket-key' = 'id')",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO first.default.inc_t VALUES (1)").await;
+    common::exec(&ctx, "INSERT INTO second.default.inc_t VALUES (2)").await;
+    common::exec(&ctx, "INSERT INTO second.analytics.inc_t VALUES (3)").await;
+
+    let first = ctx
+        .sql("SELECT id FROM paimon_incremental_query('first.default.inc_t', 0, 1)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let second = ctx
+        .sql("SELECT id FROM paimon_incremental_query('second.default.inc_t', 0, 1)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(collect_id_value_only(&first), vec![1]);
+    assert_eq!(collect_id_value_only(&second), vec![2]);
+
+    ctx.set_current_catalog("second").await.unwrap();
+    let current = ctx
+        .sql("SELECT id FROM paimon_incremental_query('inc_t', 0, 1)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_id_value_only(&current), vec![2]);
+
+    ctx.set_current_database("analytics").await.unwrap();
+    let current_database = ctx
+        .sql("SELECT id FROM paimon_incremental_query('inc_t', 0, 1)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_id_value_only(&current_database), vec![3]);
+}
+
+fn collect_id_value_only(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+                .expect("id column")
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn incremental_query_with_audit_log_suffix_exposes_rowkind() {
     let (_tmp, ctx) = common::setup_sql_context().await;
     setup_table_with_three_snapshots(&ctx).await;

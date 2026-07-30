@@ -24,8 +24,19 @@ use paimon::table::IncrementalScanMode;
 /// Parsed target of `paimon_incremental_query`: base table plus optional `$audit_log`.
 #[derive(Debug, Clone)]
 pub(crate) struct IncrementalTableRef {
-    pub identifier: Identifier,
+    pub catalog: Option<String>,
+    pub database: Option<String>,
+    pub object: String,
     pub audit_log: bool,
+}
+
+impl IncrementalTableRef {
+    pub fn identifier(&self, default_database: &str) -> Identifier {
+        Identifier::new(
+            self.database.as_deref().unwrap_or(default_database),
+            &self.object,
+        )
+    }
 }
 
 /// Parse table name for incremental query TVF.
@@ -35,13 +46,12 @@ pub(crate) struct IncrementalTableRef {
 pub(crate) fn parse_incremental_table_ref(
     function_name: &str,
     name: &str,
-    default_database: &str,
 ) -> DFResult<IncrementalTableRef> {
     let parts: Vec<&str> = name.split('.').collect();
-    let (database, object_name) = match parts.len() {
-        1 => (default_database, parts[0]),
-        2 => (parts[0], parts[1]),
-        3 => (parts[1], parts[2]),
+    let (catalog, database, object_name) = match parts.len() {
+        1 => (None, None, parts[0]),
+        2 => (None, Some(parts[0]), parts[1]),
+        3 => (Some(parts[0]), Some(parts[1]), parts[2]),
         _ => {
             return Err(DataFusionError::Plan(format!(
                 "{function_name}: invalid table name '{name}', expected 'table', 'database.table', or 'catalog.database.table'"
@@ -63,7 +73,9 @@ pub(crate) fn parse_incremental_table_ref(
     };
 
     Ok(IncrementalTableRef {
-        identifier: Identifier::new(database.to_string(), base.to_string()),
+        catalog: catalog.map(str::to_string),
+        database: database.map(str::to_string),
+        object: base.to_string(),
         audit_log,
     })
 }
@@ -189,10 +201,9 @@ mod incremental_query_args_tests {
 
     #[test]
     fn parse_incremental_table_ref_plain_name() {
-        let parsed =
-            parse_incremental_table_ref("paimon_incremental_query", "orders", "default").unwrap();
-        assert_eq!(parsed.identifier.database(), "default");
-        assert_eq!(parsed.identifier.object(), "orders");
+        let parsed = parse_incremental_table_ref("paimon_incremental_query", "orders").unwrap();
+        assert_eq!(parsed.identifier("default").database(), "default");
+        assert_eq!(parsed.identifier("default").object(), "orders");
         assert!(!parsed.audit_log);
     }
 
@@ -201,11 +212,11 @@ mod incremental_query_args_tests {
         let parsed = parse_incremental_table_ref(
             "paimon_incremental_query",
             "paimon.test_db.orders$audit_log",
-            "default",
         )
         .unwrap();
-        assert_eq!(parsed.identifier.database(), "test_db");
-        assert_eq!(parsed.identifier.object(), "orders");
+        assert_eq!(parsed.catalog.as_deref(), Some("paimon"));
+        assert_eq!(parsed.identifier("default").database(), "test_db");
+        assert_eq!(parsed.identifier("default").object(), "orders");
         assert!(parsed.audit_log);
     }
 
@@ -225,10 +236,9 @@ mod incremental_query_args_tests {
 
     #[test]
     fn parse_incremental_table_ref_rejects_unknown_system_suffix() {
-        let err =
-            parse_incremental_table_ref("paimon_incremental_query", "orders$snapshots", "default")
-                .unwrap_err()
-                .to_string();
+        let err = parse_incremental_table_ref("paimon_incremental_query", "orders$snapshots")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("snapshots"), "unexpected error: {err}");
     }
 

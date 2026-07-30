@@ -28,8 +28,9 @@
 //! execution plan. Snapshot planning lives in paimon-core
 //! (`IncrementalScan` / `AuditLogTable`).
 
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -55,6 +56,70 @@ use crate::table_function_args::{
 
 const FUNCTION_NAME: &str = "paimon_incremental_query";
 
+#[derive(Clone)]
+struct CatalogBinding {
+    catalog: Arc<dyn Catalog>,
+    default_database: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct IncrementalQueryCatalogs {
+    catalogs: Arc<RwLock<HashMap<String, CatalogBinding>>>,
+    current_catalog: Arc<RwLock<Option<String>>>,
+    current_database: Arc<RwLock<Option<String>>>,
+}
+
+impl IncrementalQueryCatalogs {
+    pub(crate) fn register(&self, name: String, catalog: Arc<dyn Catalog>, default_database: &str) {
+        self.catalogs.write().unwrap().insert(
+            name,
+            CatalogBinding {
+                catalog,
+                default_database: default_database.to_string(),
+            },
+        );
+    }
+
+    pub(crate) fn set_current(&self, name: String) {
+        *self.current_catalog.write().unwrap() = Some(name);
+    }
+
+    pub(crate) fn set_current_database(&self, name: String) {
+        *self.current_database.write().unwrap() = Some(name);
+    }
+
+    fn resolve(&self, name: Option<&str>) -> DFResult<CatalogBinding> {
+        let name = match name {
+            Some(name) => name.to_string(),
+            None => self
+                .current_catalog
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(
+                        "paimon_incremental_query: no current catalog is configured".to_string(),
+                    )
+                })?,
+        };
+        let mut binding = self
+            .catalogs
+            .read()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "paimon_incremental_query: unknown catalog '{name}'"
+                ))
+            })?;
+        if let Some(current_database) = self.current_database.read().unwrap().as_ref() {
+            binding.default_database.clone_from(current_database);
+        }
+        Ok(binding)
+    }
+}
+
 /// Register the `paimon_incremental_query` table-valued function on a [`SessionContext`].
 pub fn register_incremental_query(
     ctx: &SessionContext,
@@ -67,28 +132,56 @@ pub fn register_incremental_query(
     );
 }
 
+pub(crate) fn register_incremental_query_catalogs(
+    ctx: &SessionContext,
+    catalogs: IncrementalQueryCatalogs,
+) {
+    ctx.register_udtf(
+        FUNCTION_NAME,
+        Arc::new(IncrementalQueryFunction::with_catalogs(catalogs)),
+    );
+}
+
 /// Table function that performs batch incremental reads between snapshot IDs.
 ///
 /// Arguments:
 /// `(table_name STRING, start_snapshot_exclusive BIGINT, end_snapshot_inclusive BIGINT [, scan_mode STRING])`
 pub struct IncrementalQueryFunction {
-    catalog: Arc<dyn Catalog>,
-    default_database: String,
+    source: CatalogSource,
+}
+
+#[derive(Clone)]
+enum CatalogSource {
+    Fixed(CatalogBinding),
+    Registered(IncrementalQueryCatalogs),
 }
 
 impl Debug for IncrementalQueryFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncrementalQueryFunction")
-            .field("default_database", &self.default_database)
-            .finish()
+        f.debug_struct("IncrementalQueryFunction").finish()
     }
 }
 
 impl IncrementalQueryFunction {
     pub fn new(catalog: Arc<dyn Catalog>, default_database: &str) -> Self {
         Self {
-            catalog,
-            default_database: default_database.to_string(),
+            source: CatalogSource::Fixed(CatalogBinding {
+                catalog,
+                default_database: default_database.to_string(),
+            }),
+        }
+    }
+
+    fn with_catalogs(catalogs: IncrementalQueryCatalogs) -> Self {
+        Self {
+            source: CatalogSource::Registered(catalogs),
+        }
+    }
+
+    fn resolve_catalog(&self, name: Option<&str>) -> DFResult<CatalogBinding> {
+        match &self.source {
+            CatalogSource::Fixed(binding) => Ok(binding.clone()),
+            CatalogSource::Registered(catalogs) => catalogs.resolve(name),
         }
     }
 }
@@ -113,11 +206,11 @@ impl TableFunctionImpl for IncrementalQueryFunction {
             IncrementalScanMode::Auto
         };
 
-        let table_ref =
-            parse_incremental_table_ref(FUNCTION_NAME, &table_name, &self.default_database)?;
+        let table_ref = parse_incremental_table_ref(FUNCTION_NAME, &table_name)?;
+        let binding = self.resolve_catalog(table_ref.catalog.as_deref())?;
 
-        let catalog = Arc::clone(&self.catalog);
-        let identifier = table_ref.identifier.clone();
+        let catalog = Arc::clone(&binding.catalog);
+        let identifier = table_ref.identifier(&binding.default_database);
         let table = block_on_with_runtime(
             async move { catalog.get_table(&identifier).await },
             "paimon_incremental_query: catalog access thread panicked",
