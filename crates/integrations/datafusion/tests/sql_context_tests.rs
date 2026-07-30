@@ -1318,6 +1318,46 @@ async fn test_alter_table_update_column_type_and_nullability() {
 }
 
 #[tokio::test]
+async fn test_alter_column_preserves_quoted_identifier() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.mydb")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.mydb.quoted_column (
+                id INT,
+                \"MixedCase\" INT
+            )",
+        )
+        .await
+        .expect("CREATE TABLE should preserve the quoted column name");
+
+    sql_context
+        .sql(
+            "ALTER TABLE paimon.mydb.quoted_column
+             ALTER COLUMN \"MixedCase\" TYPE BIGINT",
+        )
+        .await
+        .expect("ALTER COLUMN should resolve the quoted column name");
+
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "quoted_column"))
+        .await
+        .unwrap();
+    let field = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "MixedCase")
+        .expect("quoted column should retain its exact name");
+    assert!(matches!(field.data_type(), DataType::BigInt(_)));
+}
+
+#[tokio::test]
 async fn test_alter_table_rename() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

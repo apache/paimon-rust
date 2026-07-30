@@ -35,7 +35,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr as SqlExpr, Ident, Merge, MergeAction, MergeClauseKind,
-    MergeInsertKind, TableFactor,
+    MergeInsertExpr, MergeInsertKind, TableFactor,
 };
 use futures::TryStreamExt;
 
@@ -43,7 +43,7 @@ use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions, 
 use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table, WriteBuilder};
 
 use crate::error::to_datafusion_error;
-use crate::sql_context::SQLContext;
+use crate::sql_context::{normalize_schema_identifier, SQLContext};
 
 /// Maximum number of retries when DML conflicts with concurrent compaction.
 const DML_MAX_RETRIES: u32 = 5;
@@ -128,14 +128,15 @@ pub(crate) async fn execute_merge_into(
     ctx: &SQLContext,
     merge: &Merge,
     table: Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
 
     if core_options.data_evolution_enabled() {
-        execute_data_evolution_merge(ctx, merge, table).await
+        execute_data_evolution_merge(ctx, merge, table, enable_ident_normalization).await
     } else if schema.trimmed_primary_keys().is_empty() {
-        execute_cow_merge(ctx, merge, table).await
+        execute_cow_merge(ctx, merge, table, enable_ident_normalization).await
     } else {
         Err(DataFusionError::Plan(
             "MERGE INTO on primary-key tables without data-evolution is not supported".to_string(),
@@ -168,9 +169,10 @@ async fn execute_data_evolution_merge(
     ctx: &SQLContext,
     merge: &Merge,
     table: Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     retry_on_conflict("MERGE INTO", is_row_id_conflict, || {
-        execute_merge_into_once(ctx, merge, &table)
+        execute_merge_into_once(ctx, merge, &table, enable_ident_normalization)
     })
     .await
 }
@@ -198,7 +200,10 @@ enum CowMatchedAction {
 }
 
 /// Parse MERGE clauses for the CoW path (supports DELETE unlike the data-evolution parser).
-fn extract_cow_merge_clauses(merge: &Merge) -> DFResult<CowMergeClauses> {
+fn extract_cow_merge_clauses(
+    merge: &Merge,
+    enable_ident_normalization: bool,
+) -> DFResult<CowMergeClauses> {
     let mut matched: Vec<CowMatchedClause> = Vec::new();
     let mut inserts: Vec<MergeInsertClause> = Vec::new();
 
@@ -216,7 +221,12 @@ fn extract_cow_merge_clauses(merge: &Merge) -> DFResult<CowMergeClauses> {
                                     .0
                                     .last()
                                     .and_then(|p| p.as_ident())
-                                    .map(|id| id.value.clone())
+                                    .map(|ident| {
+                                        normalize_schema_identifier(
+                                            ident,
+                                            enable_ident_normalization,
+                                        )
+                                    })
                                     .ok_or_else(|| {
                                         DataFusionError::Plan(format!(
                                             "Invalid column name in SET: {name}"
@@ -253,25 +263,11 @@ fn extract_cow_merge_clauses(merge: &Merge) -> DFResult<CowMergeClauses> {
             MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => {
                 match &clause.action {
                     MergeAction::Insert(insert_expr) => {
-                        let columns: Vec<String> =
-                            insert_expr.columns.iter().map(|c| c.to_string()).collect();
-                        let value_exprs = match &insert_expr.kind {
-                            MergeInsertKind::Values(values) => {
-                                if values.rows.is_empty() {
-                                    return Err(DataFusionError::Plan(
-                                        "INSERT VALUES must have at least one row".to_string(),
-                                    ));
-                                }
-                                values.rows[0].iter().map(|e| e.to_string()).collect()
-                            }
-                            MergeInsertKind::Row => Vec::new(),
-                        };
-                        let predicate = clause.predicate.as_ref().map(|p| p.to_string());
-                        inserts.push(MergeInsertClause {
-                            columns,
-                            value_exprs,
-                            predicate,
-                        });
+                        inserts.push(extract_merge_insert_clause(
+                            insert_expr,
+                            clause.predicate.as_ref(),
+                            enable_ident_normalization,
+                        )?);
                     }
                     _ => {
                         return Err(DataFusionError::Plan(
@@ -299,9 +295,14 @@ fn extract_cow_merge_clauses(merge: &Merge) -> DFResult<CowMergeClauses> {
 }
 
 /// Execute MERGE INTO on an append-only table with retry on delete conflict.
-async fn execute_cow_merge(ctx: &SQLContext, merge: &Merge, table: Table) -> DFResult<DataFrame> {
+async fn execute_cow_merge(
+    ctx: &SQLContext,
+    merge: &Merge,
+    table: Table,
+    enable_ident_normalization: bool,
+) -> DFResult<DataFrame> {
     retry_on_conflict("CoW MERGE INTO", is_delete_conflict, || {
-        execute_cow_merge_once(ctx, merge, &table)
+        execute_cow_merge_once(ctx, merge, &table, enable_ident_normalization)
     })
     .await
 }
@@ -311,8 +312,15 @@ async fn execute_cow_merge_once(
     ctx: &SQLContext,
     merge: &Merge,
     table: &Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
-    let mut clauses = extract_cow_merge_clauses(merge)?;
+    let mut clauses = extract_cow_merge_clauses(merge, enable_ident_normalization)?;
+    validate_merge_insert_columns(&clauses.inserts, table.schema().fields())?;
+    for matched in &clauses.matched {
+        if let CowMatchedAction::Update(update) = &matched.action {
+            validate_update_columns(&update.columns, table.schema().fields())?;
+        }
+    }
 
     // Collect the union of all update columns across matched clauses (preserving order)
     let mut update_columns: Vec<String> = Vec::new();
@@ -625,9 +633,14 @@ async fn execute_merge_into_once(
     ctx: &SQLContext,
     merge: &Merge,
     table: &Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     // 1. Parse all MERGE clauses
-    let parsed = extract_merge_clauses(merge)?;
+    let parsed = extract_merge_clauses(merge, enable_ident_normalization)?;
+    validate_merge_insert_columns(&parsed.inserts, table.schema().fields())?;
+    if let Some(update) = &parsed.update {
+        validate_update_columns(&update.columns, table.schema().fields())?;
+    }
 
     // Validate preconditions early and create writer (before executing any SQL)
     let wb = table.new_write_builder();
@@ -988,19 +1001,18 @@ fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[DataField]) -> 
         "*".to_string()
     } else {
         // Build column_name -> expression mapping from the INSERT clause
-        let col_expr_map: HashMap<String, &str> = ins
+        let col_expr_map: HashMap<&str, &str> = ins
             .columns
             .iter()
             .zip(ins.value_exprs.iter())
-            .map(|(col, expr)| (col.to_lowercase(), expr.as_str()))
+            .map(|(col, expr)| (col.as_str(), expr.as_str()))
             .collect();
 
         // Emit SELECT in table schema order
         table_fields
             .iter()
             .map(|field| {
-                let key = field.name().to_lowercase();
-                match col_expr_map.get(&key) {
+                match col_expr_map.get(field.name()) {
                     Some(expr) => format!("{expr} AS {}", quote_identifier(field.name())),
                     // Column not in INSERT list — fill with NULL
                     None => format!("NULL AS {}", quote_identifier(field.name())),
@@ -1021,6 +1033,87 @@ struct MergeInsertClause {
     predicate: Option<String>,
 }
 
+fn extract_merge_insert_clause(
+    insert_expr: &MergeInsertExpr,
+    predicate: Option<&SqlExpr>,
+    enable_ident_normalization: bool,
+) -> DFResult<MergeInsertClause> {
+    let columns = insert_expr
+        .columns
+        .iter()
+        .map(|name| match name.0.as_slice() {
+            [part] => part
+                .as_ident()
+                .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("Invalid column name in MERGE INSERT: {name}"))
+                }),
+            _ => Err(DataFusionError::Plan(format!(
+                "Expected a simple column name in MERGE INSERT, got: {name}"
+            ))),
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    let value_exprs = match &insert_expr.kind {
+        MergeInsertKind::Values(values) => {
+            let row = values.rows.first().ok_or_else(|| {
+                DataFusionError::Plan("INSERT VALUES must have at least one row".to_string())
+            })?;
+            row.iter().map(ToString::to_string).collect()
+        }
+        // INSERT ROW — BigQuery syntax, treat as INSERT *.
+        MergeInsertKind::Row => Vec::new(),
+    };
+
+    Ok(MergeInsertClause {
+        columns,
+        value_exprs,
+        predicate: predicate.map(ToString::to_string),
+    })
+}
+
+fn validate_merge_insert_columns(
+    inserts: &[MergeInsertClause],
+    table_fields: &[DataField],
+) -> DFResult<()> {
+    for insert in inserts {
+        validate_target_columns(&insert.columns, table_fields, "MERGE INSERT")?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_update_columns(
+    columns: &[String],
+    table_fields: &[DataField],
+) -> DFResult<()> {
+    validate_target_columns(columns, table_fields, "UPDATE")
+}
+
+fn validate_target_columns(
+    columns: &[String],
+    table_fields: &[DataField],
+    operation: &str,
+) -> DFResult<()> {
+    let target_columns: HashSet<&str> = table_fields.iter().map(|field| field.name()).collect();
+    let mut seen = HashSet::new();
+
+    for column in columns {
+        if !seen.insert(column.as_str()) {
+            return Err(DataFusionError::Plan(format!(
+                "Duplicate column '{column}' in {operation}"
+            )));
+        }
+        if !target_columns.contains(column.as_str()) {
+            return Err(DataFusionError::Plan(format!(
+                "Unknown column '{column}' in {operation}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parsed WHEN MATCHED THEN UPDATE clause.
 struct MergeUpdateClause {
     columns: Vec<String>,
@@ -1035,7 +1128,10 @@ struct ParsedMergeClauses {
 }
 
 /// Extract UPDATE and INSERT clauses from the MERGE AST.
-fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
+fn extract_merge_clauses(
+    merge: &Merge,
+    enable_ident_normalization: bool,
+) -> DFResult<ParsedMergeClauses> {
     let mut update: Option<MergeUpdateClause> = None;
     let mut delete = false;
     let mut inserts: Vec<MergeInsertClause> = Vec::new();
@@ -1063,7 +1159,12 @@ fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
                                     .0
                                     .last()
                                     .and_then(|p| p.as_ident())
-                                    .map(|id| id.value.clone())
+                                    .map(|ident| {
+                                        normalize_schema_identifier(
+                                            ident,
+                                            enable_ident_normalization,
+                                        )
+                                    })
                                     .ok_or_else(|| {
                                         DataFusionError::Plan(format!(
                                             "Invalid column name in SET: {name}"
@@ -1094,31 +1195,11 @@ fn extract_merge_clauses(merge: &Merge) -> DFResult<ParsedMergeClauses> {
             MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => {
                 match &clause.action {
                     MergeAction::Insert(insert_expr) => {
-                        let columns: Vec<String> =
-                            insert_expr.columns.iter().map(|c| c.to_string()).collect();
-
-                        let value_exprs = match &insert_expr.kind {
-                            MergeInsertKind::Values(values) => {
-                                if values.rows.is_empty() {
-                                    return Err(DataFusionError::Plan(
-                                        "INSERT VALUES must have at least one row".to_string(),
-                                    ));
-                                }
-                                values.rows[0].iter().map(|e| e.to_string()).collect()
-                            }
-                            MergeInsertKind::Row => {
-                                // INSERT ROW — BigQuery syntax, treat as INSERT *
-                                Vec::new()
-                            }
-                        };
-
-                        let predicate = clause.predicate.as_ref().map(|p| p.to_string());
-
-                        inserts.push(MergeInsertClause {
-                            columns,
-                            value_exprs,
-                            predicate,
-                        });
+                        inserts.push(extract_merge_insert_clause(
+                            insert_expr,
+                            clause.predicate.as_ref(),
+                            enable_ident_normalization,
+                        )?);
                     }
                     _ => {
                         return Err(DataFusionError::Plan(
@@ -1651,6 +1732,49 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_update_assignments_normalize_identifiers() {
+        for (target, enabled, expected) in [
+            ("VALUE", true, "value"),
+            ("\"VALUE\"", true, "VALUE"),
+            ("VALUE", false, "VALUE"),
+        ] {
+            let merge = parse_merge(&format!(
+                "MERGE INTO target t USING source s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET {target} = s.value"
+            ));
+
+            let parsed = extract_merge_clauses(&merge, enabled).unwrap();
+            assert_eq!(parsed.update.unwrap().columns, [expected]);
+
+            let cow = extract_cow_merge_clauses(&merge, enabled).unwrap();
+            let CowMatchedAction::Update(update) = &cow.matched[0].action else {
+                panic!("expected update action");
+            };
+            assert_eq!(update.columns, [expected]);
+        }
+    }
+
+    #[test]
+    fn test_merge_insert_columns_normalize_identifiers() {
+        for (target, enabled, expected) in [
+            ("MIXEDCASE", true, "mixedcase"),
+            ("\"MixedCase\"", true, "MixedCase"),
+            ("MixedCase", false, "MixedCase"),
+        ] {
+            let merge = parse_merge(&format!(
+                "MERGE INTO target t USING source s ON t.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT ({target}) VALUES (s.value)"
+            ));
+
+            let parsed = extract_merge_clauses(&merge, enabled).unwrap();
+            assert_eq!(parsed.inserts[0].columns, [expected]);
+
+            let cow = extract_cow_merge_clauses(&merge, enabled).unwrap();
+            assert_eq!(cow.inserts[0].columns, [expected]);
+        }
+    }
+
+    #[test]
     fn test_normalize_merge_insert_batch_uses_position() {
         let table_fields = vec![
             DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
@@ -1758,9 +1882,9 @@ mod tests {
         // Execute MERGE INTO
         let merge = parse_merge(
             "MERGE INTO paimon.test_db.t_merge t USING paimon.test_db.source s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET name = s.name",
+             WHEN MATCHED THEN UPDATE SET NAME = s.name",
         );
-        execute_merge_into(&sql_context, &merge, table)
+        execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
 
@@ -1828,7 +1952,7 @@ mod tests {
             "MERGE INTO paimon.test_db.t_merge2 t USING paimon.test_db.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
-        let result = execute_merge_into(&sql_context, &merge, table)
+        let result = execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
         let batches = result.collect().await.unwrap();
@@ -1874,7 +1998,7 @@ mod tests {
             "MERGE INTO t USING s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET id = s.id",
         );
-        let result = execute_merge_into(&sql_context, &merge, table).await;
+        let result = execute_merge_into(&sql_context, &merge, table, true).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1958,9 +2082,9 @@ mod tests {
 
         let merge = parse_merge(
             "MERGE INTO paimon.test_db.t_cow_upd t USING paimon.test_db.source s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET name = s.name",
+             WHEN MATCHED THEN UPDATE SET NAME = s.name",
         );
-        execute_merge_into(&sql_context, &merge, table)
+        execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
 
@@ -2003,7 +2127,7 @@ mod tests {
             "MERGE INTO paimon.test_db.t_cow_del t USING paimon.test_db.source s ON t.id = s.id \
              WHEN MATCHED THEN DELETE",
         );
-        execute_merge_into(&sql_context, &merge, table)
+        execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
 
@@ -2042,7 +2166,7 @@ mod tests {
             "MERGE INTO paimon.test_db.t_cow_ins t USING paimon.test_db.source s ON t.id = s.id \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         );
-        execute_merge_into(&sql_context, &merge, table)
+        execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
 
@@ -2088,7 +2212,7 @@ mod tests {
              WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
         );
-        execute_merge_into(&sql_context, &merge, table)
+        execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
 
@@ -2128,7 +2252,7 @@ mod tests {
             "MERGE INTO paimon.test_db.t_cow_nomatch t USING paimon.test_db.source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET name = s.name",
         );
-        let result = execute_merge_into(&sql_context, &merge, table)
+        let result = execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap();
         let batches = result.collect().await.unwrap();

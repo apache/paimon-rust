@@ -62,7 +62,7 @@ use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions, CreateView,
-    Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Insert, Merge,
+    Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
     ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
     SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
 };
@@ -368,8 +368,9 @@ impl SQLContext {
     /// directly; everything else is delegated to DataFusion.
     pub async fn sql(&self, sql: &str) -> DFResult<DataFrame> {
         let is_create_table = looks_like_create_table(sql);
+        let enable_ident_normalization = self.ctx.enable_ident_normalization();
         let (rewritten_sql, partition_keys) = if is_create_table {
-            extract_partition_by(sql)?
+            extract_partition_by(sql, enable_ident_normalization)?
         } else {
             (sql.to_string(), vec![])
         };
@@ -435,8 +436,13 @@ impl SQLContext {
                 } else {
                     let (catalog, _catalog_name, _) =
                         self.resolve_catalog_and_table(&create_table.name)?;
-                    self.handle_create_table(&catalog, create_table, partition_keys)
-                        .await
+                    self.handle_create_table(
+                        &catalog,
+                        create_table,
+                        partition_keys,
+                        enable_ident_normalization,
+                    )
+                    .await
                 }
             }
             Statement::ShowCreate {
@@ -451,17 +457,24 @@ impl SQLContext {
                     &alter_table.name,
                     &alter_table.operations,
                     alter_table.if_exists,
+                    enable_ident_normalization,
                 )
                 .await
             }
-            Statement::Merge(merge) => self.handle_merge_into(merge).await,
-            Statement::Update(update) => self.handle_update(update).await,
+            Statement::Merge(merge) => {
+                self.handle_merge_into(merge, enable_ident_normalization)
+                    .await
+            }
+            Statement::Update(update) => {
+                self.handle_update(update, enable_ident_normalization).await
+            }
             Statement::Delete(delete) => self.handle_delete(delete).await,
             Statement::Insert(insert)
                 if insert.overwrite
                     && insert.partitioned.as_ref().is_some_and(|p| !p.is_empty()) =>
             {
-                self.handle_insert_overwrite_partition(insert).await
+                self.handle_insert_overwrite_partition(insert, enable_ident_normalization)
+                    .await
             }
             Statement::Set(Set::SingleAssignment {
                 variable, values, ..
@@ -497,7 +510,10 @@ impl SQLContext {
                 }
                 self.ctx.sql(sql).await
             }
-            Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
+            Statement::Truncate(truncate) => {
+                self.handle_truncate_table(truncate, enable_ident_normalization)
+                    .await
+            }
             Statement::CreateView(create_view) => {
                 if create_view.temporary {
                     // Temporary views are always handled by us (Paimon catalog temp storage)
@@ -845,6 +861,7 @@ impl SQLContext {
         catalog: &Arc<dyn Catalog>,
         ct: &CreateTable,
         partition_keys: Vec<String>,
+        enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
         if ct.external {
             return Err(DataFusionError::Plan(
@@ -866,12 +883,17 @@ impl SQLContext {
 
         let mut builder = paimon::spec::Schema::builder();
         let table_options = extract_options(&ct.table_options)?;
+        let column_names: Vec<String> = ct
+            .columns
+            .iter()
+            .map(|column| normalize_schema_identifier(&column.name, enable_ident_normalization))
+            .collect();
 
         // Columns
-        for col in &ct.columns {
+        for (col, column_name) in ct.columns.iter().zip(&column_names) {
             let paimon_type = column_def_to_paimon_type(col)?;
             let comment = column_def_comment(col);
-            builder = builder.column_with_description(col.name.value.clone(), paimon_type, comment);
+            builder = builder.column_with_description(column_name.clone(), paimon_type, comment);
         }
 
         // Primary key from constraints: PRIMARY KEY (col, ...)
@@ -880,7 +902,7 @@ impl SQLContext {
                 let pk_cols: Vec<String> = pk
                     .columns
                     .iter()
-                    .map(|c| primary_key_column_name(&c.column.expr))
+                    .map(|c| primary_key_column_name(&c.column.expr, enable_ident_normalization))
                     .collect();
                 builder = builder.primary_key(pk_cols);
             }
@@ -888,9 +910,8 @@ impl SQLContext {
 
         // Partition keys (extracted and validated before parsing)
         if !partition_keys.is_empty() {
-            let col_names: Vec<&str> = ct.columns.iter().map(|c| c.name.value.as_str()).collect();
             for pk in &partition_keys {
-                if !col_names.contains(&pk.as_str()) {
+                if !column_names.contains(pk) {
                     return Err(DataFusionError::Plan(format!(
                         "PARTITIONED BY column '{pk}' is not defined in the table"
                     )));
@@ -1164,6 +1185,7 @@ impl SQLContext {
         name: &ObjectName,
         operations: &[AlterTableOperation],
         if_exists: bool,
+        enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
         Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         let identifier = self.resolve_table_name(name)?;
@@ -1188,11 +1210,17 @@ impl SQLContext {
         for op in operations {
             match op {
                 AlterTableOperation::AddColumn { column_def, .. } => {
-                    changes.push(column_def_to_add_column(column_def)?);
+                    changes.push(column_def_to_add_column(
+                        column_def,
+                        enable_ident_normalization,
+                    )?);
                 }
                 AlterTableOperation::DropColumn { column_names, .. } => {
                     for col in column_names {
-                        changes.push(SchemaChange::drop_column(col.value.clone()));
+                        changes.push(SchemaChange::drop_column(normalize_schema_identifier(
+                            col,
+                            enable_ident_normalization,
+                        )));
                     }
                 }
                 AlterTableOperation::RenameColumn {
@@ -1200,12 +1228,16 @@ impl SQLContext {
                     new_column_name,
                 } => {
                     changes.push(SchemaChange::rename_column(
-                        old_column_name.value.clone(),
-                        new_column_name.value.clone(),
+                        normalize_schema_identifier(old_column_name, enable_ident_normalization),
+                        normalize_schema_identifier(new_column_name, enable_ident_normalization),
                     ));
                 }
                 AlterTableOperation::AlterColumn { column_name, op } => {
-                    changes.push(alter_column_to_schema_change(&column_name.value, op)?);
+                    changes.push(alter_column_to_schema_change(
+                        column_name,
+                        op,
+                        enable_ident_normalization,
+                    )?);
                 }
                 AlterTableOperation::RenameTable { table_name } => {
                     let new_name = match table_name {
@@ -1238,6 +1270,7 @@ impl SQLContext {
                             &identifier,
                             partitions,
                             if_exists || *partition_if_exists,
+                            enable_ident_normalization,
                         )
                         .await;
                 }
@@ -1298,7 +1331,11 @@ impl SQLContext {
         Ok(())
     }
 
-    async fn handle_merge_into(&self, merge: &Merge) -> DFResult<DataFrame> {
+    async fn handle_merge_into(
+        &self,
+        merge: &Merge,
+        enable_ident_normalization: bool,
+    ) -> DFResult<DataFrame> {
         self.ensure_no_time_travel_for_write("MERGE INTO")?;
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
@@ -1316,10 +1353,14 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        crate::merge_into::execute_merge_into(self, merge, table).await
+        crate::merge_into::execute_merge_into(self, merge, table, enable_ident_normalization).await
     }
 
-    async fn handle_update(&self, update: &Update) -> DFResult<DataFrame> {
+    async fn handle_update(
+        &self,
+        update: &Update,
+        enable_ident_normalization: bool,
+    ) -> DFResult<DataFrame> {
         self.ensure_no_time_travel_for_write("UPDATE")?;
         let table_name = match &update.table.relation {
             TableFactor::Table { name, .. } => name.clone(),
@@ -1337,7 +1378,7 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        crate::update::execute_update(self, update, table).await
+        crate::update::execute_update(self, update, table, enable_ident_normalization).await
     }
 
     async fn handle_delete(&self, delete: &Delete) -> DFResult<DataFrame> {
@@ -1369,7 +1410,11 @@ impl SQLContext {
         crate::delete::execute_delete(self, delete, table, &table_ref).await
     }
 
-    async fn handle_insert_overwrite_partition(&self, insert: &Insert) -> DFResult<DataFrame> {
+    async fn handle_insert_overwrite_partition(
+        &self,
+        insert: &Insert,
+        enable_ident_normalization: bool,
+    ) -> DFResult<DataFrame> {
         self.ensure_no_time_travel_for_write("INSERT OVERWRITE")?;
         let table_name = match &insert.table {
             TableObject::TableName(name) => name.clone(),
@@ -1390,8 +1435,12 @@ impl SQLContext {
             DataFusionError::Plan("INSERT OVERWRITE PARTITION requires a PARTITION clause".into())
         })?;
         let partition_fields = table.schema().partition_fields();
-        let static_partitions =
-            parse_static_partitions(partition_exprs, &partition_fields, table.schema().fields())?;
+        let static_partitions = parse_static_partitions(
+            partition_exprs,
+            &partition_fields,
+            table.schema().fields(),
+            enable_ident_normalization,
+        )?;
 
         let source = insert.source.as_ref().ok_or_else(|| {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
@@ -1412,7 +1461,7 @@ impl SQLContext {
                 insert
                     .columns
                     .iter()
-                    .map(object_name_to_single_identifier)
+                    .map(|name| object_name_to_single_identifier(name, enable_ident_normalization))
                     .collect::<DFResult<_>>()?,
             )
         } else if !insert.after_columns.is_empty() {
@@ -1420,7 +1469,7 @@ impl SQLContext {
                 insert
                     .after_columns
                     .iter()
-                    .map(|ident| ident.value.clone())
+                    .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
                     .collect(),
             )
         } else {
@@ -1514,7 +1563,11 @@ impl SQLContext {
         crate::merge_into::ok_result(&self.ctx, row_count)
     }
 
-    async fn handle_truncate_table(&self, truncate: &Truncate) -> DFResult<DataFrame> {
+    async fn handle_truncate_table(
+        &self,
+        truncate: &Truncate,
+        enable_ident_normalization: bool,
+    ) -> DFResult<DataFrame> {
         self.ensure_no_time_travel_for_write("TRUNCATE TABLE")?;
         if truncate.table_names.len() > 1 {
             return Err(DataFusionError::Plan(
@@ -1547,6 +1600,7 @@ impl SQLContext {
                 partitions,
                 table.schema().fields(),
                 table.schema().partition_keys(),
+                enable_ident_normalization,
             )?;
             commit
                 .truncate_partitions(partition_values)
@@ -1803,6 +1857,7 @@ impl SQLContext {
         identifier: &Identifier,
         partitions: &[SqlExpr],
         if_exists: bool,
+        enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
         if partitions.is_empty() {
             return Err(DataFusionError::Plan(
@@ -1821,6 +1876,7 @@ impl SQLContext {
             partitions,
             table.schema().fields(),
             table.schema().partition_keys(),
+            enable_ident_normalization,
         )?;
 
         let wb = table.new_write_builder();
@@ -2406,7 +2462,7 @@ fn find_partitioned_by(sql: &str) -> Option<(usize, usize)> {
 }
 
 /// Parse a single partition column token, handling quoted identifiers.
-fn parse_partition_column(token: &str) -> DFResult<String> {
+fn parse_partition_column(token: &str, enable_ident_normalization: bool) -> DFResult<String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err(DataFusionError::Plan(
@@ -2434,7 +2490,10 @@ fn parse_partition_column(token: &str) -> DFResult<String> {
         }
         if let Some(end) = end {
             if trimmed[end..].trim().is_empty() {
-                return Ok(value);
+                return Ok(normalize_schema_identifier(
+                    &Ident::with_quote(first as char, value),
+                    enable_ident_normalization,
+                ));
             }
         }
         return Err(DataFusionError::Plan(format!(
@@ -2444,7 +2503,10 @@ fn parse_partition_column(token: &str) -> DFResult<String> {
 
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     match parts.len() {
-        1 => Ok(parts[0].to_string()),
+        1 => Ok(normalize_schema_identifier(
+            &Ident::new(parts[0]),
+            enable_ident_normalization,
+        )),
         _ => Err(DataFusionError::Plan(format!(
             "PARTITIONED BY column '{}' should not specify a type. \
              Use column references only, e.g. PARTITIONED BY ({})",
@@ -2491,7 +2553,10 @@ fn split_partition_columns(inner: &str) -> DFResult<Vec<&str>> {
 /// Since sqlparser's GenericDialect requires types in column definitions,
 /// we extract and validate the clause ourselves, then strip it from the SQL
 /// so sqlparser can parse the rest.
-fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
+fn extract_partition_by(
+    sql: &str,
+    enable_ident_normalization: bool,
+) -> DFResult<(String, Vec<String>)> {
     let Some((kw_start, by_end)) = find_partitioned_by(sql) else {
         return Ok((sql.to_string(), vec![]));
     };
@@ -2545,7 +2610,7 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
 
     let mut partition_keys = Vec::new();
     for token in split_partition_columns(inner)? {
-        partition_keys.push(parse_partition_column(token)?);
+        partition_keys.push(parse_partition_column(token, enable_ident_normalization)?);
     }
 
     let clause_end = paren_end + 1;
@@ -2555,13 +2620,26 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
     Ok((rewritten, partition_keys))
 }
 
+pub(crate) fn normalize_schema_identifier(
+    identifier: &Ident,
+    enable_ident_normalization: bool,
+) -> String {
+    IdentNormalizer::new(enable_ident_normalization).normalize(identifier.clone())
+}
+
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].
-fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
+fn column_def_to_add_column(
+    col: &ColumnDef,
+    enable_ident_normalization: bool,
+) -> DFResult<SchemaChange> {
     let paimon_type = column_def_to_paimon_type(col)?;
     let comment = column_def_comment(col);
 
     Ok(SchemaChange::AddColumn {
-        field_names: vec![col.name.value.clone()],
+        field_names: vec![normalize_schema_identifier(
+            &col.name,
+            enable_ident_normalization,
+        )],
         data_type: paimon_type,
         comment,
         column_move: None,
@@ -2569,18 +2647,19 @@ fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
 }
 
 fn alter_column_to_schema_change(
-    column_name: &str,
+    column_name: &Ident,
     operation: &AlterColumnOperation,
+    enable_ident_normalization: bool,
 ) -> DFResult<SchemaChange> {
+    let column_name = normalize_schema_identifier(column_name, enable_ident_normalization);
+
     match operation {
-        AlterColumnOperation::SetNotNull => Ok(SchemaChange::update_column_nullability(
-            column_name.to_string(),
-            false,
-        )),
-        AlterColumnOperation::DropNotNull => Ok(SchemaChange::update_column_nullability(
-            column_name.to_string(),
-            true,
-        )),
+        AlterColumnOperation::SetNotNull => {
+            Ok(SchemaChange::update_column_nullability(column_name, false))
+        }
+        AlterColumnOperation::DropNotNull => {
+            Ok(SchemaChange::update_column_nullability(column_name, true))
+        }
         AlterColumnOperation::SetDataType {
             data_type, using, ..
         } => {
@@ -2591,7 +2670,7 @@ fn alter_column_to_schema_change(
             }
             let new_data_type = sql_data_type_to_paimon_type(data_type, true)?;
             Ok(SchemaChange::UpdateColumnType {
-                field_names: vec![column_name.to_string()],
+                field_names: vec![column_name],
                 new_data_type,
                 // A type-only SQL change must not change the column's nullability.
                 keep_nullability: true,
@@ -2614,9 +2693,11 @@ fn column_def_comment(col: &ColumnDef) -> Option<String> {
     })
 }
 
-fn primary_key_column_name(expr: &SqlExpr) -> String {
+fn primary_key_column_name(expr: &SqlExpr, enable_ident_normalization: bool) -> String {
     match expr {
-        SqlExpr::Identifier(ident) => ident.value.clone(),
+        SqlExpr::Identifier(ident) => {
+            normalize_schema_identifier(ident, enable_ident_normalization)
+        }
         _ => expr.to_string(),
     }
 }
@@ -2829,11 +2910,14 @@ fn object_name_to_string(name: &ObjectName) -> String {
         .join(".")
 }
 
-fn object_name_to_single_identifier(name: &ObjectName) -> DFResult<String> {
+fn object_name_to_single_identifier(
+    name: &ObjectName,
+    enable_ident_normalization: bool,
+) -> DFResult<String> {
     match name.0.as_slice() {
         [part] => part
             .as_ident()
-            .map(|id| id.value.clone())
+            .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
             .ok_or_else(|| DataFusionError::Plan(format!("Invalid column name: {name}"))),
         _ => Err(DataFusionError::Plan(format!(
             "Expected a simple column name, got: {name}"
@@ -2883,11 +2967,13 @@ fn parse_partition_values(
     exprs: &[SqlExpr],
     all_fields: &[PaimonDataField],
     partition_keys: &[String],
+    enable_ident_normalization: bool,
 ) -> DFResult<Vec<HashMap<String, Option<Datum>>>> {
     let field_map: HashMap<&str, &PaimonDataField> =
         all_fields.iter().map(|f| (f.name(), f)).collect();
 
     let mut partition = HashMap::new();
+    let mut seen_columns = HashSet::new();
     for expr in exprs {
         let (col_name, val_expr) = match expr {
             SqlExpr::BinaryOp {
@@ -2896,7 +2982,9 @@ fn parse_partition_values(
                 right,
             } => {
                 let col = match left.as_ref() {
-                    SqlExpr::Identifier(ident) => ident.value.clone(),
+                    SqlExpr::Identifier(ident) => {
+                        normalize_schema_identifier(ident, enable_ident_normalization)
+                    }
                     other => {
                         return Err(DataFusionError::Plan(format!(
                             "Expected column name in partition spec, got: {other}"
@@ -2912,6 +3000,11 @@ fn parse_partition_values(
             }
         };
 
+        if !seen_columns.insert(col_name.clone()) {
+            return Err(DataFusionError::Plan(format!(
+                "Duplicate partition column '{col_name}'"
+            )));
+        }
         if !partition_keys.iter().any(|k| k == &col_name) {
             return Err(DataFusionError::Plan(format!(
                 "Column '{col_name}' is not a partition column"
@@ -2947,8 +3040,10 @@ fn parse_static_partitions(
     exprs: &[SqlExpr],
     partition_fields: &[PaimonDataField],
     all_fields: &[PaimonDataField],
+    enable_ident_normalization: bool,
 ) -> DFResult<HashMap<String, Option<Datum>>> {
     let mut result = HashMap::new();
+    let mut seen_columns = HashSet::new();
     let field_map: HashMap<&str, &PaimonDataField> =
         all_fields.iter().map(|f| (f.name(), f)).collect();
     let partition_names: Vec<&str> = partition_fields.iter().map(|f| f.name()).collect();
@@ -2961,25 +3056,20 @@ fn parse_static_partitions(
                 right,
             } => {
                 let col = match left.as_ref() {
-                    SqlExpr::Identifier(ident) => ident.value.clone(),
+                    SqlExpr::Identifier(ident) => {
+                        normalize_schema_identifier(ident, enable_ident_normalization)
+                    }
                     other => {
                         return Err(DataFusionError::Plan(format!(
                             "Expected column name in PARTITION clause, got: {other}"
                         )))
                     }
                 };
-                (col, right.as_ref())
+                (col, Some(right.as_ref()))
             }
-            // Dynamic partition: bare column name without value — skip it,
-            // the column will be read from the source query.
             SqlExpr::Identifier(ident) => {
-                let col_name = &ident.value;
-                if !partition_names.contains(&col_name.as_str()) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Column '{col_name}' is not a partition column"
-                    )));
-                }
-                continue;
+                let col = normalize_schema_identifier(ident, enable_ident_normalization);
+                (col, None)
             }
             other => {
                 return Err(DataFusionError::Plan(format!(
@@ -2988,12 +3078,21 @@ fn parse_static_partitions(
             }
         };
 
+        if !seen_columns.insert(col_name.clone()) {
+            return Err(DataFusionError::Plan(format!(
+                "Duplicate partition column '{col_name}'"
+            )));
+        }
         if !partition_names.contains(&col_name.as_str()) {
             return Err(DataFusionError::Plan(format!(
                 "Column '{col_name}' is not a partition column"
             )));
         }
 
+        // Dynamic partition columns are read from the source query.
+        let Some(val_expr) = val_expr else {
+            continue;
+        };
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
@@ -6138,6 +6237,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_table_normalizes_schema_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql(
+                "CREATE TABLE mydb.t1 (
+                    ID INT NOT NULL,
+                    PART STRING,
+                    PRIMARY KEY (ID)
+                ) PARTITIONED BY (PART)",
+            )
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::CreateTable { schema, .. }] = calls.as_slice() else {
+            panic!("expected one CreateTable call, got {calls:?}");
+        };
+        let field_names: Vec<&str> = schema.fields().iter().map(|field| field.name()).collect();
+        assert_eq!(field_names, ["id", "part"]);
+        assert_eq!(schema.primary_keys(), ["id"]);
+        assert_eq!(schema.partition_keys(), ["part"]);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_preserves_quoted_schema_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("CREATE TABLE mydb.t1 (\"ID\" INT NOT NULL, PRIMARY KEY (\"ID\"))")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::CreateTable { schema, .. }] = calls.as_slice() else {
+            panic!("expected one CreateTable call, got {calls:?}");
+        };
+        assert_eq!(schema.fields()[0].name(), "ID");
+        assert_eq!(schema.primary_keys(), ["ID"]);
+    }
+
+    #[tokio::test]
     async fn test_create_table_if_not_exists() {
         let catalog = Arc::new(MockCatalog::new());
         let sql_context = make_sql_context(catalog.clone()).await;
@@ -6284,7 +6427,7 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         sql_context
-            .sql("ALTER TABLE mydb.t1 ADD COLUMN age INT")
+            .sql("ALTER TABLE mydb.t1 ADD COLUMN AGE INT")
             .await
             .unwrap();
 
@@ -6370,7 +6513,7 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         sql_context
-            .sql("ALTER TABLE mydb.t1 DROP COLUMN age")
+            .sql("ALTER TABLE mydb.t1 DROP COLUMN AGE")
             .await
             .unwrap();
 
@@ -6392,7 +6535,7 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         sql_context
-            .sql("ALTER TABLE mydb.t1 RENAME COLUMN old_name TO new_name")
+            .sql("ALTER TABLE mydb.t1 RENAME COLUMN OLD_NAME TO NEW_NAME")
             .await
             .unwrap();
 
@@ -6416,8 +6559,8 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         for sql in [
-            "ALTER TABLE mydb.t1 ALTER COLUMN value TYPE BIGINT",
-            "ALTER TABLE mydb.t1 ALTER COLUMN value SET DATA TYPE BIGINT",
+            "ALTER TABLE mydb.t1 ALTER COLUMN VALUE TYPE BIGINT",
+            "ALTER TABLE mydb.t1 ALTER COLUMN VALUE SET DATA TYPE BIGINT",
         ] {
             sql_context.sql(sql).await.unwrap();
 
@@ -6445,8 +6588,8 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         for (sql, expected_nullability) in [
-            ("ALTER TABLE mydb.t1 ALTER COLUMN value SET NOT NULL", false),
-            ("ALTER TABLE mydb.t1 ALTER COLUMN value DROP NOT NULL", true),
+            ("ALTER TABLE mydb.t1 ALTER COLUMN VALUE SET NOT NULL", false),
+            ("ALTER TABLE mydb.t1 ALTER COLUMN VALUE DROP NOT NULL", true),
         ] {
             sql_context.sql(sql).await.unwrap();
 
@@ -6484,9 +6627,62 @@ mod tests {
             panic!("expected ALTER COLUMN operation");
         };
 
-        let err = alter_column_to_schema_change(&column_name.value, op).unwrap_err();
+        let err = alter_column_to_schema_change(column_name, op, true).unwrap_err();
 
         assert!(err.to_string().contains("USING is not supported"));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_preserves_quoted_schema_identifier() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("ALTER TABLE mydb.t1 ALTER COLUMN \"MixedCase\" TYPE BIGINT")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::AlterTable { changes, .. }] = calls.as_slice() else {
+            panic!("expected one AlterTable call, got {calls:?}");
+        };
+        assert!(matches!(
+            &changes[0],
+            SchemaChange::UpdateColumnType { field_names, .. }
+                if field_names == &["MixedCase"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_schema_identifier_normalization_can_be_disabled() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("SET datafusion.sql_parser.enable_ident_normalization = false")
+            .await
+            .unwrap();
+        sql_context
+            .sql("CREATE TABLE mydb.t1 (VALUE INT)")
+            .await
+            .unwrap();
+        sql_context
+            .sql("ALTER TABLE mydb.t1 ALTER COLUMN VALUE TYPE BIGINT")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::CreateTable { schema, .. }, CatalogCall::AlterTable { changes, .. }] =
+            calls.as_slice()
+        else {
+            panic!("expected CreateTable and AlterTable calls, got {calls:?}");
+        };
+        assert_eq!(schema.fields()[0].name(), "VALUE");
+        assert!(matches!(
+            &changes[0],
+            SchemaChange::UpdateColumnType { field_names, .. }
+                if field_names == &["VALUE"]
+        ));
     }
 
     #[tokio::test]
@@ -6687,7 +6883,7 @@ mod tests {
 
     #[test]
     fn test_extract_partition_by_no_clause() {
-        let (rewritten, keys) = extract_partition_by("CREATE TABLE t (id INT)").unwrap();
+        let (rewritten, keys) = extract_partition_by("CREATE TABLE t (id INT)", true).unwrap();
         assert_eq!(rewritten, "CREATE TABLE t (id INT)");
         assert!(keys.is_empty());
     }
@@ -6696,6 +6892,7 @@ mod tests {
     fn test_extract_partition_by_single_column() {
         let (rewritten, keys) = extract_partition_by(
             "CREATE TABLE t (id INT, dt STRING) PARTITIONED BY (dt) WITH ('k'='v')",
+            true,
         )
         .unwrap();
         assert_eq!(keys, vec!["dt"]);
@@ -6705,35 +6902,65 @@ mod tests {
 
     #[test]
     fn test_extract_partition_by_multiple_columns() {
-        let (_, keys) =
-            extract_partition_by("CREATE TABLE t (a INT, b INT, c INT) PARTITIONED BY (a, b)")
-                .unwrap();
+        let (_, keys) = extract_partition_by(
+            "CREATE TABLE t (a INT, b INT, c INT) PARTITIONED BY (a, b)",
+            true,
+        )
+        .unwrap();
         assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_extract_partition_by_normalizes_identifiers() {
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (PART INT) PARTITIONED BY (PART)", true).unwrap();
+        assert_eq!(keys, ["part"]);
+
+        let (_, keys) = extract_partition_by(
+            "CREATE TABLE t (\"PART\" INT) PARTITIONED BY (\"PART\")",
+            true,
+        )
+        .unwrap();
+        assert_eq!(keys, ["PART"]);
+
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (`PART` INT) PARTITIONED BY (`PART`)", true)
+                .unwrap();
+        assert_eq!(keys, ["PART"]);
+
+        let (_, keys) =
+            extract_partition_by("CREATE TABLE t (PART INT) PARTITIONED BY (PART)", false).unwrap();
+        assert_eq!(keys, ["PART"]);
     }
 
     #[test]
     fn test_extract_partition_by_mixed_case() {
         let (_, keys) =
-            extract_partition_by("CREATE TABLE t (dt INT) Partitioned by (dt)").unwrap();
+            extract_partition_by("CREATE TABLE t (dt INT) Partitioned by (dt)", true).unwrap();
         assert_eq!(keys, vec!["dt"]);
     }
 
     #[test]
     fn test_extract_partition_by_rejects_typed_column() {
-        let err = extract_partition_by("CREATE TABLE t (dt STRING) PARTITIONED BY (dt STRING)")
-            .unwrap_err();
+        let err = extract_partition_by(
+            "CREATE TABLE t (dt STRING) PARTITIONED BY (dt STRING)",
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("should not specify a type"));
     }
 
     #[test]
     fn test_extract_partition_by_empty_parens() {
-        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY ()").unwrap_err();
+        let err =
+            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY ()", true).unwrap_err();
         assert!(err.to_string().contains("at least one column"));
     }
 
     #[test]
     fn test_extract_partition_by_unmatched_paren() {
-        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY (dt").unwrap_err();
+        let err =
+            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY (dt", true).unwrap_err();
         assert!(err.to_string().contains("Unmatched"));
     }
 
@@ -6741,7 +6968,7 @@ mod tests {
     fn test_extract_partition_by_skips_string_literal() {
         let sql =
             "CREATE TABLE t (id INT) WITH ('note' = 'PARTITIONED BY (x)') PARTITIONED BY (id)";
-        let (rewritten, keys) = extract_partition_by(sql).unwrap();
+        let (rewritten, keys) = extract_partition_by(sql, true).unwrap();
         assert_eq!(keys, vec!["id"]);
         assert!(rewritten.contains("WITH"));
         assert!(rewritten.contains("'PARTITIONED BY (x)'"));
@@ -6750,15 +6977,17 @@ mod tests {
     #[test]
     fn test_extract_partition_by_skips_line_comment() {
         let sql = "CREATE TABLE t (id INT) -- PARTITIONED BY (x)\nPARTITIONED BY (id)";
-        let (_, keys) = extract_partition_by(sql).unwrap();
+        let (_, keys) = extract_partition_by(sql, true).unwrap();
         assert_eq!(keys, vec!["id"]);
     }
 
     #[test]
     fn test_extract_partition_by_double_quoted_identifier() {
-        let (_, keys) =
-            extract_partition_by("CREATE TABLE t (\"order\" INT) PARTITIONED BY (\"order\")")
-                .unwrap();
+        let (_, keys) = extract_partition_by(
+            "CREATE TABLE t (\"order\" INT) PARTITIONED BY (\"order\")",
+            true,
+        )
+        .unwrap();
         assert_eq!(keys, vec!["order"]);
     }
 
@@ -6767,6 +6996,7 @@ mod tests {
         let (_, keys) = extract_partition_by(
             "CREATE TABLE t (\"a\"\"b,c\" INT, `d``e,f` INT) \
              PARTITIONED BY (\"a\"\"b,c\", `d``e,f`)",
+            true,
         )
         .unwrap();
         assert_eq!(keys, vec!["a\"b,c", "d`e,f"]);
@@ -6774,20 +7004,25 @@ mod tests {
 
     #[test]
     fn test_extract_partition_by_backtick_quoted_identifier() {
-        let (_, keys) =
-            extract_partition_by("CREATE TABLE t (`order` INT) PARTITIONED BY (`order`)").unwrap();
+        let (_, keys) = extract_partition_by(
+            "CREATE TABLE t (`order` INT) PARTITIONED BY (`order`)",
+            true,
+        )
+        .unwrap();
         assert_eq!(keys, vec!["order"]);
     }
 
     #[test]
     fn test_extract_partition_by_no_paren_after_by() {
-        let err = extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY dt").unwrap_err();
+        let err =
+            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY dt", true).unwrap_err();
         assert!(err.to_string().contains("Expected '('"));
     }
 
     #[test]
     fn test_extract_partition_by_only_partitioned_no_by() {
-        let (rewritten, keys) = extract_partition_by("CREATE TABLE partitioned (id INT)").unwrap();
+        let (rewritten, keys) =
+            extract_partition_by("CREATE TABLE partitioned (id INT)", true).unwrap();
         assert_eq!(rewritten, "CREATE TABLE partitioned (id INT)");
         assert!(keys.is_empty());
     }
@@ -6795,7 +7030,7 @@ mod tests {
     #[test]
     fn test_extract_partition_by_skips_block_comment() {
         let sql = "CREATE TABLE t (id INT) /* PARTITIONED BY (x) */ PARTITIONED BY (id)";
-        let (rewritten, keys) = extract_partition_by(sql).unwrap();
+        let (rewritten, keys) = extract_partition_by(sql, true).unwrap();
         assert_eq!(keys, vec!["id"]);
         assert!(rewritten.contains("/* PARTITIONED BY (x) */"));
     }
@@ -6966,6 +7201,66 @@ mod tests {
         (temp_dir, sql_context)
     }
 
+    async fn collect_partition_rows(
+        sql_context: &SQLContext,
+        table: &str,
+        partition_column: &str,
+        value_column: &str,
+    ) -> Vec<(String, i32)> {
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT {partition_column}, {value_column} FROM {table} \
+                 ORDER BY {partition_column}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in batches {
+            let partitions = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((partitions.value(row).to_string(), values.value(row)));
+            }
+        }
+        rows
+    }
+
+    async fn setup_duplicate_partition_table() -> (tempfile::TempDir, SQLContext) {
+        let (tmp, sql_context) = setup_fs_sql_context().await;
+        sql_context
+            .sql(
+                "CREATE TABLE paimon.test_db.duplicate_partition_keys (
+                    dt VARCHAR,
+                    value INT
+                ) PARTITIONED BY (dt)",
+            )
+            .await
+            .unwrap();
+        sql_context
+            .sql(
+                "INSERT INTO paimon.test_db.duplicate_partition_keys
+                 VALUES ('a', 1), ('b', 2)",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        (tmp, sql_context)
+    }
+
     #[tokio::test]
     async fn test_dynamic_read_batch_size_overrides_table_option() {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
@@ -7061,7 +7356,7 @@ mod tests {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
 
         sql_context
-            .sql("CREATE TABLE paimon.test_db.t2 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
+            .sql("CREATE TABLE paimon.test_db.t2 (PT VARCHAR, ID INT) PARTITIONED BY (PT)")
             .await
             .unwrap();
         sql_context
@@ -7073,7 +7368,7 @@ mod tests {
             .unwrap();
 
         sql_context
-            .sql("TRUNCATE TABLE paimon.test_db.t2 PARTITION (pt = 'a')")
+            .sql("TRUNCATE TABLE paimon.test_db.t2 PARTITION (PT = 'a')")
             .await
             .unwrap();
 
@@ -7109,7 +7404,7 @@ mod tests {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
 
         sql_context
-            .sql("CREATE TABLE paimon.test_db.t3 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
+            .sql("CREATE TABLE paimon.test_db.t3 (PT VARCHAR, ID INT) PARTITIONED BY (PT)")
             .await
             .unwrap();
         sql_context
@@ -7121,7 +7416,7 @@ mod tests {
             .unwrap();
 
         sql_context
-            .sql("ALTER TABLE paimon.test_db.t3 DROP PARTITION (pt = 'b')")
+            .sql("ALTER TABLE paimon.test_db.t3 DROP PARTITION (PT = 'b')")
             .await
             .unwrap();
 
@@ -7150,6 +7445,160 @@ mod tests {
             }
         }
         assert_eq!(rows, vec![("a".to_string(), 1), ("a".to_string(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_partition_removal_rejects_normalized_duplicate_keys() {
+        for sql in [
+            "TRUNCATE TABLE paimon.test_db.duplicate_partition_keys
+             PARTITION (DT = 'a', dt = 'b')",
+            "ALTER TABLE paimon.test_db.duplicate_partition_keys
+             DROP PARTITION (DT = 'a', dt = 'b')",
+        ] {
+            let (_tmp, sql_context) = setup_duplicate_partition_table().await;
+
+            let err = sql_context.sql(sql).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Duplicate partition column 'dt'"),
+                "Expected duplicate partition column error, got: {err}"
+            );
+            assert_eq!(
+                collect_partition_rows(
+                    &sql_context,
+                    "paimon.test_db.duplicate_partition_keys",
+                    "dt",
+                    "value",
+                )
+                .await,
+                [("a".to_string(), 1), ("b".to_string(), 2)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_overwrite_rejects_duplicate_partition_keys() {
+        for sql in [
+            "INSERT OVERWRITE paimon.test_db.duplicate_partition_keys
+             PARTITION (DT = 'a', dt = 'b') VALUES (9)",
+            "INSERT OVERWRITE paimon.test_db.duplicate_partition_keys
+             PARTITION (DT = 'a', dt) VALUES (9)",
+        ] {
+            let (_tmp, sql_context) = setup_duplicate_partition_table().await;
+
+            let err = sql_context.sql(sql).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Duplicate partition column 'dt'"),
+                "Expected duplicate partition column error, got: {err}"
+            );
+            assert_eq!(
+                collect_partition_rows(
+                    &sql_context,
+                    "paimon.test_db.duplicate_partition_keys",
+                    "dt",
+                    "value",
+                )
+                .await,
+                [("a".to_string(), 1), ("b".to_string(), 2)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_writes_preserve_quoted_identifiers() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        let table = "paimon.test_db.quoted_partition_writes";
+
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE {table} (
+                    \"PART\" VARCHAR,
+                    \"VALUE\" INT
+                ) PARTITIONED BY (\"PART\")"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!("INSERT INTO {table} VALUES ('x', 1), ('y', 10)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        sql_context
+            .sql(&format!(
+                "INSERT OVERWRITE {table} (\"VALUE\") \
+                 PARTITION (\"PART\" = 'x') VALUES (2)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "UPDATE {table} SET \"VALUE\" = 3 WHERE \"PART\" = 'x'"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "TRUNCATE TABLE {table} PARTITION (\"PART\" = 'y')"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_partition_rows(&sql_context, table, "\"PART\"", "\"VALUE\"").await,
+            [("x".to_string(), 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_writes_respect_disabled_normalization() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        let table = "paimon.test_db.preserved_partition_writes";
+
+        sql_context
+            .sql("SET datafusion.sql_parser.enable_ident_normalization = false")
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE {table} (
+                    PART VARCHAR,
+                    VALUE INT
+                ) PARTITIONED BY (PART)"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!("INSERT INTO {table} VALUES ('x', 1)"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        sql_context
+            .sql(&format!(
+                "INSERT OVERWRITE {table} (VALUE) \
+                 PARTITION (PART = 'x') VALUES (2)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!("UPDATE {table} SET VALUE = 3 WHERE PART = 'x'"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_partition_rows(&sql_context, table, "PART", "VALUE").await,
+            [("x".to_string(), 3)]
+        );
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, Int64Array};
+use arrow_array::{Array, Int32Array, Int64Array};
 use common::string_value;
 use paimon::catalog::Identifier;
 use paimon::table::SnapshotManager;
@@ -34,6 +34,17 @@ use paimon_datafusion::SQLContext;
 use tempfile::TempDir;
 
 // ======================= Helpers =======================
+
+const MERGE_TABLE_CONFIGS: [(&str, &str); 2] = [
+    ("merge_ident_cow", ""),
+    (
+        "merge_ident_data_evolution",
+        "WITH (
+            'data-evolution.enabled' = 'true',
+            'row-tracking.enabled' = 'true'
+        )",
+    ),
+];
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -138,7 +149,189 @@ async fn register_source(sql_context: &SQLContext, sql: &str) {
     sql_context.sql(sql).await.unwrap().collect().await.unwrap();
 }
 
+async fn assert_merge_insert_identifier(
+    table_column: &str,
+    insert_column: &str,
+    query_column: &str,
+    enable_ident_normalization: bool,
+) {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    if !enable_ident_normalization {
+        sql_context
+            .sql("SET datafusion.sql_parser.enable_ident_normalization = false")
+            .await
+            .unwrap();
+    }
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.merge_ident_source \
+         AS SELECT * FROM (VALUES (1, 42)) AS t(id, source_value)",
+    )
+    .await;
+
+    for (table_name, options) in MERGE_TABLE_CONFIGS {
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.{table_name} (
+                    id INT NOT NULL,
+                    {table_column} INT
+                ) {options}"
+            ))
+            .await
+            .unwrap();
+
+        sql_context
+            .sql(&format!(
+                "MERGE INTO paimon.test_db.{table_name} t
+                 USING paimon.test_db.merge_ident_source s ON t.id = s.id
+                 WHEN NOT MATCHED THEN
+                 INSERT (id, {insert_column}) VALUES (s.id, s.source_value)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT {query_column} FROM paimon.test_db.{table_name}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(!values.is_null(0), "{table_name} wrote NULL");
+        assert_eq!(values.value(0), 42, "{table_name} wrote the wrong value");
+    }
+}
+
 // ======================= Functional Tests =======================
+
+#[tokio::test]
+async fn test_merge_insert_preserves_quoted_identifier() {
+    assert_merge_insert_identifier("\"MixedCase\"", "\"MixedCase\"", "\"MixedCase\"", true).await;
+}
+
+#[tokio::test]
+async fn test_merge_insert_normalizes_unquoted_identifier_by_default() {
+    assert_merge_insert_identifier("MIXEDCASE", "MIXEDCASE", "mixedcase", true).await;
+}
+
+#[tokio::test]
+async fn test_merge_insert_respects_disabled_identifier_normalization() {
+    assert_merge_insert_identifier("MixedCase", "MixedCase", "\"MixedCase\"", false).await;
+}
+
+#[tokio::test]
+async fn test_merge_insert_rejects_unknown_and_duplicate_columns() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.merge_ident_source \
+         AS SELECT * FROM (VALUES (1, 42)) AS t(id, source_value)",
+    )
+    .await;
+
+    for (table_name, options) in MERGE_TABLE_CONFIGS {
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.{table_name} (
+                    id INT NOT NULL,
+                    value INT
+                ) {options}"
+            ))
+            .await
+            .unwrap();
+
+        for (columns, expected_error) in [
+            ("id, missing", "Unknown column 'missing' in MERGE INSERT"),
+            ("id, ID", "Duplicate column 'id' in MERGE INSERT"),
+        ] {
+            let sql = format!(
+                "MERGE INTO paimon.test_db.{table_name} t
+                 USING paimon.test_db.merge_ident_source s ON t.id = s.id
+                 WHEN NOT MATCHED THEN
+                 INSERT ({columns}) VALUES (s.id, s.source_value)"
+            );
+            assert_merge_error(&sql_context, &sql, expected_error).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_merge_update_rejects_unknown_and_duplicate_target_columns() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.merge_update_source \
+         AS SELECT * FROM (VALUES (1)) AS t(id)",
+    )
+    .await;
+
+    for (table_name, options) in MERGE_TABLE_CONFIGS {
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.{table_name} (
+                    id INT,
+                    value INT
+                ) {options}"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.{table_name} (id, value) VALUES (1, 10)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        for (assignments, expected_error) in [
+            ("\"VALUE\" = 3", "Unknown column 'VALUE' in UPDATE"),
+            ("value = 3, VALUE = 4", "Duplicate column 'value' in UPDATE"),
+        ] {
+            let sql = format!(
+                "MERGE INTO paimon.test_db.{table_name} t
+                 USING paimon.test_db.merge_update_source s ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET {assignments}"
+            );
+            assert_merge_error(&sql_context, &sql, expected_error).await;
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_row_id_values_after_insert() {

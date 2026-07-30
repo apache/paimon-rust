@@ -37,15 +37,16 @@ use crate::error::to_datafusion_error;
 use crate::merge_into::{
     build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
     is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
-    register_cow_target_table, retry_on_conflict, TempTableTracker,
+    register_cow_target_table, retry_on_conflict, validate_update_columns, TempTableTracker,
 };
-use crate::sql_context::SQLContext;
+use crate::sql_context::{normalize_schema_identifier, SQLContext};
 
 /// Execute an UPDATE statement on a Paimon table.
 pub(crate) async fn execute_update(
     ctx: &SQLContext,
     update: &Update,
     table: Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     if let TableFactor::Table { alias: Some(a), .. } = &update.table.relation {
         return Err(DataFusionError::Plan(format!(
@@ -58,9 +59,9 @@ pub(crate) async fn execute_update(
     let core_options = CoreOptions::new(schema.options());
 
     if core_options.data_evolution_enabled() {
-        execute_data_evolution_update(ctx, update, table).await
+        execute_data_evolution_update(ctx, update, table, enable_ident_normalization).await
     } else if schema.trimmed_primary_keys().is_empty() {
-        execute_cow_update(ctx, update, &table).await
+        execute_cow_update(ctx, update, &table, enable_ident_normalization).await
     } else {
         Err(DataFusionError::Plan(
             "UPDATE on primary-key tables without data-evolution is not supported".to_string(),
@@ -77,9 +78,10 @@ async fn execute_data_evolution_update(
     ctx: &SQLContext,
     update: &Update,
     table: Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     retry_on_conflict("UPDATE", is_row_id_conflict, || {
-        execute_update_once(ctx, update, &table)
+        execute_update_once(ctx, update, &table, enable_ident_normalization)
     })
     .await
 }
@@ -89,29 +91,11 @@ async fn execute_update_once(
     ctx: &SQLContext,
     update: &Update,
     table: &Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     // 1. Extract SET assignments
-    let mut columns = Vec::new();
-    let mut exprs = Vec::new();
-    for assignment in &update.assignments {
-        let col_name = match &assignment.target {
-            AssignmentTarget::ColumnName(name) => name
-                .0
-                .last()
-                .and_then(|p| p.as_ident())
-                .map(|id| id.value.clone())
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!("Invalid column name in SET: {name}"))
-                })?,
-            AssignmentTarget::Tuple(_) => {
-                return Err(DataFusionError::Plan(
-                    "Tuple assignment in UPDATE SET is not supported".to_string(),
-                ));
-            }
-        };
-        columns.push(col_name);
-        exprs.push(assignment.value.to_string());
-    }
+    let (columns, exprs) = extract_set_assignments(update, enable_ident_normalization)?;
+    validate_update_columns(&columns, table.schema().fields())?;
 
     // 2. Create TableUpdate through the table write builder (validates preconditions)
     let wb = table.new_write_builder();
@@ -176,9 +160,10 @@ async fn execute_cow_update(
     ctx: &SQLContext,
     update: &Update,
     table: &Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     retry_on_conflict("CoW UPDATE", is_delete_conflict, || {
-        execute_cow_update_once(ctx, update, table)
+        execute_cow_update_once(ctx, update, table, enable_ident_normalization)
     })
     .await
 }
@@ -188,8 +173,10 @@ async fn execute_cow_update_once(
     ctx: &SQLContext,
     update: &Update,
     table: &Table,
+    enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
-    let (columns, exprs) = extract_set_assignments(update)?;
+    let (columns, exprs) = extract_set_assignments(update, enable_ident_normalization)?;
+    validate_update_columns(&columns, table.schema().fields())?;
 
     let table_ref = update.table.to_string();
     let where_str = update.selection.as_ref().map(|e| e.to_string());
@@ -305,7 +292,10 @@ async fn execute_cow_update_inner(
 }
 
 /// Extract column names and expressions from UPDATE SET assignments.
-fn extract_set_assignments(update: &Update) -> DFResult<(Vec<String>, Vec<String>)> {
+fn extract_set_assignments(
+    update: &Update,
+    enable_ident_normalization: bool,
+) -> DFResult<(Vec<String>, Vec<String>)> {
     let mut columns = Vec::new();
     let mut exprs = Vec::new();
     for assignment in &update.assignments {
@@ -314,7 +304,7 @@ fn extract_set_assignments(update: &Update) -> DFResult<(Vec<String>, Vec<String
                 .0
                 .last()
                 .and_then(|p| p.as_ident())
-                .map(|id| id.value.clone())
+                .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
                 .ok_or_else(|| {
                     DataFusionError::Plan(format!("Invalid column name in SET: {name}"))
                 })?,
@@ -401,6 +391,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_extract_set_assignments_normalizes_identifiers() {
+        for (sql, enabled, expected) in [
+            ("UPDATE t SET VALUE = 1", true, "value"),
+            ("UPDATE t SET \"VALUE\" = 1", true, "VALUE"),
+            ("UPDATE t SET VALUE = 1", false, "VALUE"),
+        ] {
+            let update = parse_update(sql);
+            let (columns, _) = extract_set_assignments(&update, enabled).unwrap();
+            assert_eq!(columns, [expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_unknown_and_duplicate_target_columns() {
+        let (_tmp, sql_context, _catalog) = setup_sql_context().await;
+
+        for (table_name, options) in [
+            ("t_update_columns_cow", ""),
+            (
+                "t_update_columns_data_evolution",
+                "WITH (
+                    'data-evolution.enabled' = 'true',
+                    'row-tracking.enabled' = 'true'
+                )",
+            ),
+        ] {
+            sql_context
+                .sql(&format!(
+                    "CREATE TABLE paimon.test_db.{table_name} (
+                        id INT,
+                        value INT
+                    ) {options}"
+                ))
+                .await
+                .unwrap();
+            sql_context
+                .sql(&format!(
+                    "INSERT INTO paimon.test_db.{table_name} (id, value) VALUES (1, 10)"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+
+            for (assignments, expected_error) in [
+                ("\"VALUE\" = 3", "Unknown column 'VALUE' in UPDATE"),
+                ("value = 3, VALUE = 4", "Duplicate column 'value' in UPDATE"),
+            ] {
+                let err = sql_context
+                    .sql(&format!(
+                        "UPDATE paimon.test_db.{table_name} SET {assignments}"
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains(expected_error),
+                    "Error '{err}' does not contain '{expected_error}'"
+                );
+            }
+        }
+    }
+
     fn collect_rows(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<(i32, String, i32)> {
         let mut rows = Vec::new();
         for batch in batches {
@@ -432,7 +486,9 @@ mod tests {
 
         let update =
             parse_update("UPDATE paimon.test_db.t_with_where SET name = 'ALICE' WHERE id = 1");
-        execute_update(&sql_context, &update, table).await.unwrap();
+        execute_update(&sql_context, &update, table, true)
+            .await
+            .unwrap();
 
         let batches = sql_context
             .sql("SELECT id, name, value FROM paimon.test_db.t_with_where ORDER BY id")
@@ -457,8 +513,10 @@ mod tests {
     async fn test_update_without_where() {
         let (_tmp, sql_context, table) = setup_data_evolution_table("t_without_where").await;
 
-        let update = parse_update("UPDATE paimon.test_db.t_without_where SET value = 99");
-        execute_update(&sql_context, &update, table).await.unwrap();
+        let update = parse_update("UPDATE paimon.test_db.t_without_where SET VALUE = 99");
+        execute_update(&sql_context, &update, table, true)
+            .await
+            .unwrap();
 
         let batches = sql_context
             .sql("SELECT id, name, value FROM paimon.test_db.t_without_where ORDER BY id")
@@ -486,7 +544,9 @@ mod tests {
         let update = parse_update(
             "UPDATE paimon.test_db.t_multi_col SET name = 'updated', value = 0 WHERE id = 2",
         );
-        execute_update(&sql_context, &update, table).await.unwrap();
+        execute_update(&sql_context, &update, table, true)
+            .await
+            .unwrap();
 
         let batches = sql_context
             .sql("SELECT id, name, value FROM paimon.test_db.t_multi_col ORDER BY id")
@@ -513,7 +573,9 @@ mod tests {
 
         let update =
             parse_update("UPDATE paimon.test_db.t_no_match SET name = 'nobody' WHERE id = 99");
-        let result = execute_update(&sql_context, &update, table).await.unwrap();
+        let result = execute_update(&sql_context, &update, table, true)
+            .await
+            .unwrap();
         let batches = result.collect().await.unwrap();
         let count = batches[0]
             .column(0)
@@ -538,7 +600,9 @@ mod tests {
             .unwrap();
 
         let update = parse_update("UPDATE paimon.test_db.t_row_id SET name = 'ALICE' WHERE id = 1");
-        execute_update(&sql_context, &update, table).await.unwrap();
+        execute_update(&sql_context, &update, table, true)
+            .await
+            .unwrap();
 
         // Get row IDs after update
         let after = sql_context
@@ -583,7 +647,7 @@ mod tests {
 
         let sql_context = SQLContext::new();
         let update = parse_update("UPDATE t SET id = 1");
-        let result = execute_update(&sql_context, &update, table).await;
+        let result = execute_update(&sql_context, &update, table, true).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -653,10 +717,20 @@ mod tests {
     async fn test_cow_update_without_where() {
         let (_tmp, sql_context) = setup_append_only_table("t_cow_no_where").await;
 
-        sql_context
-            .sql("UPDATE paimon.test_db.t_cow_no_where SET value = 99")
+        let result = sql_context
+            .sql("UPDATE paimon.test_db.t_cow_no_where SET VALUE = 99")
+            .await
+            .unwrap()
+            .collect()
             .await
             .unwrap();
+        let count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 3);
 
         let rows = query_rows(&sql_context, "paimon.test_db.t_cow_no_where").await;
         assert_eq!(

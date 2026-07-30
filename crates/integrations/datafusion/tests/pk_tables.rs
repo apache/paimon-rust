@@ -961,9 +961,9 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_ow_part (
-                dt STRING, id INT NOT NULL, name STRING,
-                PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt)
+                DT STRING, ID INT NOT NULL, NAME STRING,
+                PRIMARY KEY (DT, ID)
+            ) PARTITIONED BY (DT)
             WITH ('bucket' = '1')",
         )
         .await
@@ -986,7 +986,7 @@ async fn test_pk_insert_overwrite_with_partition_clause() {
     // The SELECT only provides non-partition columns (id, name).
     sql_context
         .sql(
-            "INSERT OVERWRITE paimon.test_db.t_ow_part PARTITION (dt = '2024-01-01') \
+            "INSERT OVERWRITE paimon.test_db.t_ow_part PARTITION (DT = '2024-01-01') \
              VALUES (10, 'new_alice'), (20, 'new_bob')",
         )
         .await
@@ -1236,9 +1236,9 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_dyn (
-                dt STRING, id INT NOT NULL, name STRING,
-                PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt)
+                DT STRING, ID INT NOT NULL, NAME STRING,
+                PRIMARY KEY (DT, ID)
+            ) PARTITIONED BY (DT)
             WITH ('bucket' = '1')",
         )
         .await
@@ -1259,7 +1259,7 @@ async fn test_pk_insert_overwrite_dynamic_partition_preserves_other_partitions()
     // Should only overwrite partitions present in the source data.
     sql_context
         .sql(
-            "INSERT OVERWRITE paimon.test_db.t_dyn PARTITION (dt) \
+            "INSERT OVERWRITE paimon.test_db.t_dyn PARTITION (DT) \
              VALUES ('2024-01-01', 10, 'new_alice')",
         )
         .await
@@ -1354,9 +1354,9 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t_reorder (
-                dt STRING, id INT NOT NULL, name STRING,
-                PRIMARY KEY (dt, id)
-            ) PARTITIONED BY (dt)
+                DT STRING, ID INT NOT NULL, NAME STRING,
+                PRIMARY KEY (DT, ID)
+            ) PARTITIONED BY (DT)
             WITH ('bucket' = '1')",
         )
         .await
@@ -1365,7 +1365,7 @@ async fn test_pk_insert_overwrite_with_after_columns_reorder() {
     // Insert with columns in reversed order: (name, id) instead of schema order (id, name)
     sql_context
         .sql(
-            "INSERT OVERWRITE paimon.test_db.t_reorder (name, id) PARTITION (dt = '2024-01-01') \
+            "INSERT OVERWRITE paimon.test_db.t_reorder (NAME, ID) PARTITION (dt = '2024-01-01') \
              VALUES ('alice', 1), ('bob', 2)",
         )
         .await

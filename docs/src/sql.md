@@ -578,6 +578,27 @@ CREATE TABLE IF NOT EXISTS paimon.my_db.users (
 );
 ```
 
+Top-level column identifiers in persistent Paimon DDL follow
+`datafusion.sql_parser.enable_ident_normalization`. With the default value
+`true`, unquoted identifiers are stored in lowercase, while quoted identifiers
+preserve their spelling. This applies consistently to column definitions,
+primary keys, partition keys, and `ALTER TABLE` column operations.
+
+```sql
+CREATE TABLE paimon.my_db.unquoted_example (ID INT);   -- stores `id`
+CREATE TABLE paimon.my_db.quoted_example ("ID" INT);   -- stores `ID`
+```
+
+Set the option to `false` to preserve unquoted spelling:
+
+```sql
+SET datafusion.sql_parser.enable_ident_normalization = false;
+CREATE TABLE paimon.my_db.preserved_example (ID INT);  -- stores `ID`
+```
+
+Changing the option does not rename existing schema fields. Quote an existing
+mixed-case or uppercase field when normalization is enabled.
+
 Unsupported syntax (will return an error):
 - `CREATE EXTERNAL TABLE`
 - `LOCATION`
