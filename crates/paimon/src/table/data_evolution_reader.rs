@@ -242,7 +242,6 @@ impl DataEvolutionReader {
                             self.table_schema_id,
                             &self.table_fields,
                             &file_meta,
-                            push_down_raw_predicates,
                         )
                         .await?;
 
@@ -772,18 +771,14 @@ impl DataEvolutionReader {
 
 /// Resolve the schema that a raw-convertible file physically stores.
 ///
-/// Without predicate pushdown, preserving the full schema-level field list is
-/// sufficient because `DataFileReader` fills physically absent columns with
-/// NULLs after decoding. Once predicates reach the format reader, however, it
-/// must know that a partial-column file does not contain fields omitted from
-/// `write_cols`; predicate remapping can then apply the correct all-NULL
-/// semantics instead of trying to decode a nonexistent column.
+/// Partial-column files omit fields listed outside `write_cols`; returning only
+/// their physical fields lets `DataFileReader` apply field-id mapping and
+/// all-NULL semantics consistently, with or without predicate pushdown.
 async fn raw_file_data_fields(
     schema_manager: &SchemaManager,
     table_schema_id: i64,
     table_fields: &[DataField],
     file: &DataFileMeta,
-    predicate_pushdown_enabled: bool,
 ) -> crate::Result<Option<Vec<DataField>>> {
     let schema_fields = if file.schema_id == table_schema_id {
         None
@@ -796,10 +791,6 @@ async fn raw_file_data_fields(
                 .to_vec(),
         )
     };
-
-    if !predicate_pushdown_enabled {
-        return Ok(schema_fields);
-    }
 
     let Some(write_cols) = file.write_cols.as_ref() else {
         return Ok(schema_fields);
