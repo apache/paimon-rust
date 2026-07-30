@@ -212,7 +212,7 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
-            let file_reader = DataFileReader::new(
+            let raw_file_reader = DataFileReader::new(
                 self.file_io.clone(),
                 self.schema_manager.clone(),
                 self.table_schema_id,
@@ -269,7 +269,7 @@ impl DataEvolutionReader {
                         let mut row_id_cursor = file_base_row_id;
                         let mut row_id_offset: usize = 0;
 
-                        let mut stream = file_reader.read_single_file_stream(
+                        let mut stream = raw_file_reader.read_single_file_stream(
                             &split,
                             file_meta,
                             data_fields,
