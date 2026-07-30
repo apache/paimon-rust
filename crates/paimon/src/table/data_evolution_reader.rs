@@ -237,7 +237,7 @@ impl DataEvolutionReader {
                             &file_meta,
                         )
                         .await?;
-                        let data_fields = raw_file_data_fields(
+                        let data_fields = raw_file_physical_fields(
                             &self.schema_manager,
                             self.table_schema_id,
                             &self.table_fields,
@@ -774,7 +774,7 @@ impl DataEvolutionReader {
 /// Partial-column files omit fields listed outside `write_cols`; returning only
 /// their physical fields lets `DataFileReader` apply field-id mapping and
 /// all-NULL semantics consistently, with or without predicate pushdown.
-async fn raw_file_data_fields(
+async fn raw_file_physical_fields(
     schema_manager: &SchemaManager,
     table_schema_id: i64,
     table_fields: &[DataField],
