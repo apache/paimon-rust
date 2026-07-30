@@ -616,6 +616,17 @@ impl DataSplit {
             .is_some_and(|g| g.has_server_restrictions())
     }
 
+    /// Whether this split carries any grant that is not fully unrestricted —
+    /// row filter, column mask, **or** column scope. Transport and
+    /// re-authorization use this instead of
+    /// [`Self::has_restricted_query_auth_grant`]: a scope-only grant distorts no
+    /// statistics, but no wire format carries it either.
+    pub fn carries_query_auth_restriction(&self) -> bool {
+        self.query_auth_grant
+            .as_ref()
+            .is_some_and(|g| !g.is_unrestricted())
+    }
+
     /// Stamp the query-auth grant this split must be read under. Called by scan
     /// planning and write-path authorizers on every emitted split.
     pub(crate) fn with_query_auth_grant(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
@@ -763,11 +774,11 @@ impl DataSplit {
     /// would read the data raw. `what` names the attempted operation.
     fn ensure_no_restricted_grant(&self, what: &str) -> crate::Result<()> {
         match &self.query_auth_grant {
-            Some(grant) if grant.has_server_restrictions() => Err(crate::Error::Unsupported {
+            Some(grant) if !grant.is_unrestricted() => Err(crate::Error::Unsupported {
                 message: format!(
-                    "cannot {what} a split planned under a query-auth row filter / column \
-                     masking grant: the grant cannot cross the wire, so the reader would see \
-                     unfiltered data"
+                    "cannot {what} a split planned under a query-auth grant: no wire format \
+                     carries the grant, so the receiver would read the data without its row \
+                     filter, column masking, or column scope"
                 ),
             }),
             _ => Ok(()),
@@ -1575,7 +1586,12 @@ mod tests {
         let filter = PredicateBuilder::new(&fields)
             .greater_than("id", crate::spec::Datum::Int(1))
             .unwrap();
-        let restricted = Arc::new(QueryAuthGrant::new(vec![filter], Vec::new(), None, 0));
+        let restricted = Arc::new(QueryAuthGrant::new(
+            vec![filter],
+            Vec::new(),
+            None,
+            crate::table::query_auth::GrantBinding::default(),
+        ));
         let plain = split(vec![file("a", 1, None)], true);
         let guarded = plain.clone().with_query_auth_grant(Some(restricted));
 

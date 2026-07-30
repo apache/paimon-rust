@@ -512,10 +512,30 @@ impl<'a> PaimonReadBuilder<'a> {
             &self.filter.data_predicates,
             self.table.schema().fields(),
         ))
-        .with_query_auth_scope(self.filter_columns.clone(), self.projected_schema_indices())
+        .with_query_auth_scope(
+            self.filter_columns.clone(),
+            self.projected_schema_indices(),
+            self.projected_system_field_names(),
+        )
     }
 
     /// Table-schema indices of the projected columns (`None` = all).
+    /// Projected system fields (`_ROW_ID`, …). `projected_schema_indices` drops
+    /// them for lack of an index, but Java's `select` includes them.
+    fn projected_system_field_names(&self) -> Vec<String> {
+        self.resolve_read_type()
+            .ok()
+            .flatten()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter(|f| crate::table::query_auth::is_reserved_system_field(f))
+                    .map(|f| f.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn projected_schema_indices(&self) -> Option<Vec<usize>> {
         // Resolve names too: a `with_projection` selection lives in
         // `projection_names`, and scoping the grant to all columns would deny a
@@ -1067,7 +1087,7 @@ mod tests {
             vec![auth_filter],
             Vec::new(),
             None,
-            table.schema().id(),
+            crate::table::query_auth::GrantBinding::of(&table),
         ));
 
         let split = DataSplitBuilder::new()
@@ -1144,7 +1164,7 @@ mod tests {
             vec![auth_filter],
             masks,
             None,
-            table.schema().id(),
+            crate::table::query_auth::GrantBinding::of(&table),
         ));
 
         let split = DataSplitBuilder::new()
@@ -1195,7 +1215,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::new()),
-            table.schema().id(),
+            crate::table::query_auth::GrantBinding::of(&table),
         ));
         let split = DataSplitBuilder::new()
             .with_snapshot(1)

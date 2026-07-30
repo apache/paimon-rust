@@ -937,14 +937,19 @@ impl<'a> TableScan<'a> {
         self,
         filter_columns: HashSet<usize>,
         projected: Option<Vec<usize>>,
+        system_select: Vec<String>,
     ) -> Self {
         match self.0 {
-            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(
-                scan.with_query_auth_scope(filter_columns, projected),
-            )),
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(
-                scan.with_query_auth_scope(filter_columns, projected),
-            )),
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(scan.with_query_auth_scope(
+                filter_columns,
+                projected,
+                system_select,
+            ))),
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan.with_query_auth_scope(
+                filter_columns,
+                projected,
+                system_select,
+            ))),
         }
     }
 
@@ -1042,6 +1047,8 @@ struct PaimonTableScan<'a> {
     /// against the live grant at plan time (see `ensure_query_auth_allowed`).
     query_auth_filter_columns: HashSet<usize>,
     query_auth_projected: Option<Vec<usize>>,
+    /// Sent in `select`, but has no index to scope.
+    query_auth_system_select: Vec<String>,
 }
 
 impl<'a> PaimonTableScan<'a> {
@@ -1065,6 +1072,7 @@ impl<'a> PaimonTableScan<'a> {
             projected_read_field_ids: None,
             query_auth_filter_columns: HashSet::new(),
             query_auth_projected: None,
+            query_auth_system_select: Vec::new(),
         }
     }
 
@@ -1105,9 +1113,11 @@ impl<'a> PaimonTableScan<'a> {
         mut self,
         filter_columns: HashSet<usize>,
         projected: Option<Vec<usize>>,
+        system_select: Vec<String>,
     ) -> Self {
         self.query_auth_filter_columns = filter_columns;
         self.query_auth_projected = projected;
+        self.query_auth_system_select = system_select;
         self
     }
 
@@ -1211,7 +1221,7 @@ impl<'a> PaimonTableScan<'a> {
         });
         let grant = self
             .table
-            .verify_query_auth_for_read(select.as_ref())
+            .verify_query_auth_for_read(select.as_ref(), &self.query_auth_system_select)
             .await?;
         if let Some(grant) = &grant {
             crate::table::query_auth::scope_check(

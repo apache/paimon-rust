@@ -32,9 +32,8 @@ use crate::Result;
 /// Scan a table's manifest entries and aggregate them into [`Partition`] rows,
 /// matching the shape catalogs would otherwise return from a metastore.
 pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Partition>> {
-    // Same disclosure as `Table::partition_stats`: per-partition record counts
-    // and key values come from the raw manifests, so a row filter would not
-    // apply to them. Require an unrestricted grant.
+    // Like `Table::partition_stats`: record counts and key values come from raw
+    // manifests, which a row filter would not touch.
     table.authorize_unrestricted_read().await?;
     let file_io = table.file_io();
     let snapshot_sm = table.snapshot_manager();

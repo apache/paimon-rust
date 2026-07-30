@@ -189,13 +189,12 @@ impl<'a> TableRead<'a> {
         let Some(grant) = self.resolve_split_grant(data_splits)? else {
             return self.to_arrow_dispatch(data_splits);
         };
-        // Checked for every grant, not just restricted ones: an unrestricted
-        // grant fetched for one table must not authorize a raw read of another's
-        // splits. `authorize_rewrite_splits` is public and stamps grants, so a
-        // caller holding two tables could otherwise launder splits through it.
-        if !grant.matches_schema(self.table().schema().id()) {
+        // Checked for every grant: `authorize_rewrite_splits` is public, so an
+        // unrestricted grant from one table must not authorize a raw read of
+        // another's splits.
+        if !grant.matches_table(self.table()) {
             return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table schema cannot be \
+                message: "a query-auth grant issued for a different table or schema cannot be \
                           enforced here; re-plan the scan"
                     .to_string(),
             });
@@ -298,7 +297,6 @@ impl<'a> TableRead<'a> {
             return Ok(());
         };
 
-        // Filters and masks cannot be applied on this path at all.
         if grant.has_server_restrictions() {
             return Err(crate::Error::Unsupported {
                 message: "reading a query-auth row filter / column masking grant on an \
@@ -307,14 +305,12 @@ impl<'a> TableRead<'a> {
             });
         }
 
-        // No filter or mask, but the grant may still be scoped to a subset of
-        // columns, and nothing downstream re-checks that on this path (the batch
-        // path does it inside `to_arrow_auth_enforced`). Without this a read
-        // wider than the scope returns columns the server never authorized.
+        // A scoped grant still needs checking, and nothing downstream on this
+        // path does it (the batch path does, in `to_arrow_auth_enforced`).
         let table = self.table();
-        if !grant.matches_schema(table.schema().id()) {
+        if !grant.matches_table(table) {
             return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table schema cannot be \
+                message: "a query-auth grant issued for a different table or schema cannot be \
                           enforced here; re-plan the scan"
                     .to_string(),
             });
@@ -363,9 +359,9 @@ impl<'a> TableRead<'a> {
         // The grant's filter and mask indices are POSITIONAL in the schema they
         // were parsed against, so enforcing them on another schema would bind
         // them to different columns. Refuse a grant issued for a different one.
-        if !grant.matches_schema(table.schema().id()) {
+        if !grant.matches_table(table) {
             return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table schema cannot be \
+                message: "a query-auth grant issued for a different table or schema cannot be \
                           enforced here; re-plan the scan"
                     .to_string(),
             });
@@ -1974,18 +1970,28 @@ mod tests {
     }
 
     #[test]
-    fn test_grant_from_another_schema_cannot_authorize_a_raw_read() {
+    fn test_grant_from_another_table_cannot_authorize_a_raw_read() {
         // `authorize_rewrite_splits` is public and stamps grants, so a caller
-        // holding two tables could stamp one table's UNRESTRICTED grant onto
-        // splits of a restricted one. An unrestricted grant used to skip
-        // straight to the raw dispatch, so the binding must be checked first.
+        // holding two tables can stamp one table's UNRESTRICTED grant onto
+        // splits of another. Both tables sit at schema id 0 (a per-table
+        // counter, so freshly created tables collide), which is exactly why the
+        // grant binds the table identity and not just that counter.
         let table = query_auth_table();
+        let other = {
+            let mut t = query_auth_table();
+            t.location = "/tmp/test-query-auth-table-other".to_string();
+            t
+        };
+        assert_eq!(table.schema.id(), other.schema.id());
+
         let foreign = Arc::new(query_auth::QueryAuthGrant::new(
             Vec::new(),
             Vec::new(),
             None,
-            table.schema.id() + 1,
+            query_auth::GrantBinding::of(&other),
         ));
+        // Unrestricted grants used to skip straight to the raw dispatch, so the
+        // binding has to be checked before that branch.
         assert!(foreign.is_unrestricted());
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(foreign));
         let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
@@ -1993,9 +1999,9 @@ mod tests {
             matches!(
                 read.to_arrow(&[granted]),
                 Err(crate::Error::Unsupported { ref message })
-                    if message.contains("different table schema")
+                    if message.contains("different table or schema")
             ),
-            "a grant bound to another schema must not authorize a raw read"
+            "a grant bound to another table must not authorize a raw read"
         );
     }
 
@@ -2005,9 +2011,8 @@ mod tests {
         use std::collections::HashSet;
         let table = query_auth_table();
         let real = table.schema.fields()[0].clone();
-        // Authorized id 0 under another column's NAME: scoping resolves by id
-        // (would pass) while the physical read resolves by name. The batch path
-        // guards this too; both must go through `canonical_projection`.
+        // Authorized id under another column's name: scoped by id, read by
+        // name. Both paths must go through `canonical_projection`.
         let forged = crate::spec::DataField::new(
             real.id(),
             "not_the_real_name".to_string(),
@@ -2017,7 +2022,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
-            table.schema.id(),
+            query_auth::GrantBinding::of(&table),
         ));
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
         let plan = IncrementalPlan::new(
@@ -2040,10 +2045,9 @@ mod tests {
         use super::super::incremental_scan::{IncrementalPlan, IncrementalScanMode};
         use std::collections::HashSet;
 
-        // A column-scoped grant carries no filter and no mask, so the "cannot
-        // apply filters here" check passes it through. Nothing else on the
-        // incremental path checks scope, so without an explicit check a read
-        // wider than the scope would return unauthorized columns raw.
+        // A column-scoped grant has no filter or mask, so the filter check
+        // passes it through; without an explicit scope check a wider read
+        // would return unauthorized columns raw.
         let table = query_auth_table();
         let fields = table.schema.fields().to_vec();
         let read = TableRead::new(&table, fields.clone(), Vec::new());
@@ -2052,7 +2056,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Some(authorized),
-                table.schema.id(),
+                query_auth::GrantBinding::of(&table),
             ));
             let granted =
                 split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
@@ -2095,7 +2099,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
-            table.schema.id(),
+            query_auth::GrantBinding::of(&table),
         ));
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
 
@@ -2137,7 +2141,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
-            table.schema.id(),
+            query_auth::GrantBinding::of(&table),
         ));
         let granted =
             split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant.clone()));

@@ -131,10 +131,30 @@ impl<'a> FormatReadBuilder<'a> {
             self.limit,
             self.row_ranges.clone(),
         )
-        .with_query_auth_scope(self.filter_columns.clone(), self.projected_schema_indices())
+        .with_query_auth_scope(
+            self.filter_columns.clone(),
+            self.projected_schema_indices(),
+            self.projected_system_field_names(),
+        )
     }
 
     /// Table-schema indices of the projected columns (`None` = all).
+    /// Projected system fields (`_ROW_ID`, …). `projected_schema_indices` drops
+    /// them for lack of an index, but Java's `select` includes them.
+    fn projected_system_field_names(&self) -> Vec<String> {
+        self.resolve_read_type()
+            .ok()
+            .flatten()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter(|f| crate::table::query_auth::is_reserved_system_field(f))
+                    .map(|f| f.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn projected_schema_indices(&self) -> Option<Vec<usize>> {
         // Resolve names too (see `PaimonReadBuilder::projected_schema_indices`).
         self.resolve_read_type().ok().flatten().map(|fields| {

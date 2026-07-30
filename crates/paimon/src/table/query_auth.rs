@@ -42,31 +42,49 @@ pub(crate) struct QueryAuthGrant {
     filters: Vec<Predicate>,
     masks: Vec<ColumnMask>,
     authorized: Option<HashSet<usize>>,
-    /// Schema this grant's positional filter/mask indices were parsed against.
-    /// Enforcing it on a different schema would bind them to other columns.
+    /// Where this grant's positional indices are meaningful. The schema id
+    /// alone would not do: it is a per-table counter, so two fresh tables
+    /// both sit at 0.
+    binding: GrantBinding,
+}
+
+/// Identity a grant is bound to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantBinding {
+    location: String,
+    branch: String,
     schema_id: i64,
 }
 
+impl GrantBinding {
+    pub(crate) fn of(table: &super::Table) -> Self {
+        Self {
+            location: table.location().to_string(),
+            branch: table.branch().to_string(),
+            schema_id: table.schema().id(),
+        }
+    }
+}
+
 impl QueryAuthGrant {
-    /// `schema_id` binds the grant to the schema its column indices were
-    /// resolved against; it is required so the binding cannot be forgotten.
+    /// `binding` is required so it cannot be forgotten.
     pub(crate) fn new(
         filters: Vec<Predicate>,
         masks: Vec<ColumnMask>,
         authorized: Option<HashSet<usize>>,
-        schema_id: i64,
+        binding: GrantBinding,
     ) -> Self {
         Self {
             filters,
             masks,
             authorized,
-            schema_id,
+            binding,
         }
     }
 
-    /// Whether this grant may be enforced against `schema_id`.
-    pub(crate) fn matches_schema(&self, schema_id: i64) -> bool {
-        self.schema_id == schema_id
+    /// Whether this grant may be enforced on `table`.
+    pub(crate) fn matches_table(&self, table: &super::Table) -> bool {
+        self.binding == GrantBinding::of(table)
     }
 
     /// Fully unrestricted: every column approved, no filter, no masking.
@@ -175,15 +193,39 @@ pub(crate) fn unauthorized_column_error(fields: &[DataField], column: usize) -> 
     ))
 }
 
+/// Reserved system fields a read type may project. The reader produces them, so
+/// they are not table columns and carry no grant scope. Both id and name must
+/// match, so a forged field cannot borrow a system id. Mirrors Java
+/// `SpecialFields.SYSTEM_FIELD_NAMES`.
+const RESERVED_SYSTEM_FIELDS: [(i32, &str); 4] = [
+    (crate::spec::ROW_ID_FIELD_ID, crate::spec::ROW_ID_FIELD_NAME),
+    (
+        crate::spec::SEQUENCE_NUMBER_FIELD_ID,
+        crate::spec::SEQUENCE_NUMBER_FIELD_NAME,
+    ),
+    (
+        crate::spec::VALUE_KIND_FIELD_ID,
+        crate::spec::VALUE_KIND_FIELD_NAME,
+    ),
+    (
+        crate::spec::ROW_KIND_FIELD_ID,
+        crate::spec::ROW_KIND_FIELD_NAME,
+    ),
+];
+
+pub(crate) fn is_reserved_system_field(field: &DataField) -> bool {
+    RESERVED_SYSTEM_FIELDS
+        .iter()
+        .any(|(id, name)| *id == field.id() && *name == field.name())
+}
+
 /// Table-schema indices a read type touches, rejecting any field that is not a
 /// canonical `(id, name)` pair of `fields`.
 ///
-/// Authorization and mask selection resolve columns by id, but the physical read
-/// resolves them by name, so a read type pairing an authorized id with another
-/// column's name would be scoped by id while reading the other column.
-/// `TableRead::new` / `with_read_type` are public, so this is reachable — fail
-/// closed. A field matching neither an id nor a name is a system column (row id,
-/// etc.), which carries no grant scope and maps to no index.
+/// Scoping and masking resolve by id while the physical read resolves by name,
+/// so a read type pairing an authorized id with another column's name would be
+/// scoped by id and read by name. `TableRead::new` / `with_read_type` are
+/// public, so this is reachable — fail closed.
 pub(crate) fn canonical_projection(
     fields: &[DataField],
     read_type: &[DataField],
@@ -193,9 +235,12 @@ pub(crate) fn canonical_projection(
         let by_id = fields.iter().position(|s| s.id() == field.id());
         let by_name = fields.iter().position(|s| s.name() == field.name());
         match (by_id, by_name) {
-            // Both lookups land on the same schema field.
             (Some(i), Some(n)) if i == n => indices.push(i),
-            (None, None) => {}
+            // Absent from the schema. Anything but a reserved system field is
+            // a column dropped by schema evolution, which the reader still
+            // resolves by field id in older files and returns raw. Java rejects
+            // it in `TableQueryAuthResult.checkFieldExists`.
+            (None, None) if is_reserved_system_field(field) => {}
             _ => {
                 return Err(unsupported(format!(
                     "query-auth read type field #{} `{}` is not a column of this table",
@@ -1106,15 +1151,57 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_projection_system_and_dropped_fields() {
+        use crate::spec::{DataType, IntType};
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+
+        // Produced by the reader, so it maps to no index and is allowed.
+        let row_id = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            DataType::Int(IntType::new()),
+        );
+        assert_eq!(
+            canonical_projection(&fields, std::slice::from_ref(&row_id)).unwrap(),
+            Vec::<usize>::new()
+        );
+
+        // Matches neither an id nor a name, but is still readable by field id
+        // from older files — must not pass as a system field.
+        let dropped = DataField::new(7, "dropped".to_string(), DataType::Int(IntType::new()));
+        assert!(
+            canonical_projection(&fields, &[dropped]).is_err(),
+            "a dropped column must not be waved through as a system field"
+        );
+
+        // A system id under another name is not a system field.
+        let forged = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            "not_row_id".to_string(),
+            DataType::Int(IntType::new()),
+        );
+        assert!(canonical_projection(&fields, &[forged]).is_err());
+    }
+
+    #[test]
     fn test_grant_authorized_column_scope() {
         // A grant scoped to a subset is not globally unrestricted and rejects
         // columns outside the approved set.
-        let grant = QueryAuthGrant::new(Vec::new(), Vec::new(), Some(HashSet::from([0])), 0);
+        let grant = QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            Some(HashSet::from([0])),
+            GrantBinding::default(),
+        );
         assert!(!grant.is_unrestricted());
         assert!(grant.authorizes_columns([0]));
         assert!(!grant.authorizes_columns([1]));
         // `None` (all columns) with no filter/mask is fully unrestricted.
-        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, 0);
+        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, GrantBinding::default());
         assert!(all.is_unrestricted());
         assert!(all.authorizes_columns([0, 1, 99]));
     }

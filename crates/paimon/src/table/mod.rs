@@ -275,6 +275,7 @@ impl Table {
     pub(crate) async fn verify_query_auth_for_read(
         &self,
         select: Option<&HashSet<usize>>,
+        system_select: &[String],
     ) -> Result<Option<Arc<QueryAuthGrant>>> {
         if !CoreOptions::new(self.schema.options()).query_auth_enabled() {
             return Ok(None);
@@ -287,19 +288,28 @@ impl Table {
             });
         };
         let fields = self.schema.fields();
+        // Java's `select` is `readType.getFieldNames()`, so projected system
+        // fields go too. They have no index to scope, but the server may still
+        // refuse them.
         let select_names = select.map(|indices| {
             fields
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| indices.contains(i))
                 .map(|(_, f)| f.name().to_string())
+                .chain(system_select.iter().cloned())
                 .collect::<Vec<_>>()
         });
         let auth = rest_env.table_query_auth(select_names).await?;
         let filters = query_auth::parse_auth_filters(&auth.filter.unwrap_or_default(), fields)?;
         let masks =
             query_auth::parse_column_masking(&auth.column_masking.unwrap_or_default(), fields)?;
-        let grant = QueryAuthGrant::new(filters, masks, select.cloned(), self.schema.id());
+        let grant = QueryAuthGrant::new(
+            filters,
+            masks,
+            select.cloned(),
+            query_auth::GrantBinding::of(self),
+        );
 
         // The server expresses its rules against the table's CURRENT schema, but
         // a time-travelled or branch copy reads a DIFFERENT one. Binding those
@@ -325,7 +335,7 @@ impl Table {
     /// path must never run under a partial grant, since it would either leak
     /// (search/metadata) or silently drop/mask rows into a committed rewrite.
     pub(crate) async fn authorize_unrestricted_read(&self) -> Result<Option<Arc<QueryAuthGrant>>> {
-        match self.verify_query_auth_for_read(None).await? {
+        match self.verify_query_auth_for_read(None, &[]).await? {
             Some(grant) if grant.is_unrestricted() => Ok(Some(grant)),
             Some(_) => Err(crate::Error::Unsupported {
                 message: "this read on a 'query-auth.enabled' table must see raw rows, so it \
@@ -349,10 +359,7 @@ impl Table {
         // This is the only public API that stamps a grant, so it must not be
         // usable to launder splits: refuse ones that already carry a restricted
         // grant rather than overwriting it.
-        if splits
-            .iter()
-            .any(DataSplit::has_restricted_query_auth_grant)
-        {
+        if splits.iter().any(DataSplit::carries_query_auth_restriction) {
             return Err(crate::Error::Unsupported {
                 message: "cannot re-authorize a split already planned under a query-auth row \
                           filter / column masking grant"
@@ -859,10 +866,9 @@ mod tests {
         use crate::io::FileIOBuilder;
         use crate::spec::{CoreOptions, DataType, IntType, Schema, TableSchema};
 
-        // `query-auth.enabled` arrives on the REST table response, so the
-        // branch's on-disk schema does not carry it. If `copy_with_branch`
-        // dropped it, `t$branch_x` would read the same data files raw and
-        // unauthorized, so drive the real method rather than its inputs.
+        // The flag arrives on the REST table response, not the branch's
+        // on-disk schema; if `copy_with_branch` dropped it, `t$branch_x` would
+        // read the same files unauthorized. Drive the real method.
         let tmp = tempfile::tempdir().unwrap();
         let location = tmp.path().display().to_string();
         let file_io = FileIOBuilder::new("file").build().unwrap();
