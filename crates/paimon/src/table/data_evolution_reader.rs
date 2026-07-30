@@ -6216,6 +6216,71 @@ mod tests {
         )
     }
 
+    /// A positional `.row` file must be decoded with its physical `write_cols`,
+    /// not the full table schema. With BLOB first in the table schema, decoding
+    /// an id-only file as `[payload, id]` reads the id bytes as a BLOB offset and
+    /// either corrupts alignment or runs past the row payload.
+    #[tokio::test]
+    async fn test_raw_row_file_uses_write_cols_when_blob_precedes_projection() {
+        use crate::arrow::format::create_format_writer;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/raw-row-write-cols";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("payload", DataType::Blob(BlobType::new()))
+                .column("id", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let id_field = table_schema.fields()[1].clone();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "raw_row_write_cols_t"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let row_schema = build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
+        let batch = RecordBatch::try_new(
+            row_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let output = file_io
+            .new_output(&format!("{bucket_path}/data.row"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, row_schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+
+        let mut file_meta = data_file("data.row", 0, 2, 1, Some(vec!["id"]));
+        file_meta.file_size = file_size;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file_meta])
+            .build()
+            .unwrap();
+
+        let batches = TableRead::new(&table, vec![id_field], Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2]);
+    }
+
     /// Raw-convertible branch: a leaf predicate is applied exactly through the
     /// public ReadBuilder -> TableRead -> to_arrow path.
     #[tokio::test]
