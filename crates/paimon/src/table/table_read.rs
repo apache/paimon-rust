@@ -186,11 +186,24 @@ impl<'a> TableRead<'a> {
     /// raw; and a `query-auth.enabled` table whose splits carry no grant means
     /// an unauthorized read path — fail closed.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        match self.resolve_split_grant(data_splits)? {
-            Some(grant) if !grant.is_unrestricted() => {
-                self.to_arrow_auth_enforced(data_splits, grant)
-            }
-            _ => self.to_arrow_dispatch(data_splits),
+        let Some(grant) = self.resolve_split_grant(data_splits)? else {
+            return self.to_arrow_dispatch(data_splits);
+        };
+        // Checked for every grant, not just restricted ones: an unrestricted
+        // grant fetched for one table must not authorize a raw read of another's
+        // splits. `authorize_rewrite_splits` is public and stamps grants, so a
+        // caller holding two tables could otherwise launder splits through it.
+        if !grant.matches_schema(self.table().schema().id()) {
+            return Err(crate::Error::Unsupported {
+                message: "a query-auth grant issued for a different table schema cannot be \
+                          enforced here; re-plan the scan"
+                    .to_string(),
+            });
+        }
+        if grant.is_unrestricted() {
+            self.to_arrow_dispatch(data_splits)
+        } else {
+            self.to_arrow_auth_enforced(data_splits, grant)
         }
     }
 
@@ -281,14 +294,38 @@ impl<'a> TableRead<'a> {
     fn ensure_incremental_plan_authorized(&self, plan: &IncrementalPlan) -> crate::Result<()> {
         // `all_data_splits` (not `data_splits`) so a Diff plan's pairs are seen:
         // `data_splits` drops them, which would present no splits at all.
-        match self.resolve_split_grant(plan.all_data_splits())? {
-            Some(grant) if grant.has_server_restrictions() => Err(crate::Error::Unsupported {
+        let Some(grant) = self.resolve_split_grant(plan.all_data_splits())? else {
+            return Ok(());
+        };
+
+        // Filters and masks cannot be applied on this path at all.
+        if grant.has_server_restrictions() {
+            return Err(crate::Error::Unsupported {
                 message: "reading a query-auth row filter / column masking grant on an \
                           incremental or audit-log scan is not supported"
                     .to_string(),
-            }),
-            _ => Ok(()),
+            });
         }
+
+        // No filter or mask, but the grant may still be scoped to a subset of
+        // columns, and nothing downstream re-checks that on this path (the batch
+        // path does it inside `to_arrow_auth_enforced`). Without this a read
+        // wider than the scope returns columns the server never authorized.
+        let table = self.table();
+        if !grant.matches_schema(table.schema().id()) {
+            return Err(crate::Error::Unsupported {
+                message: "a query-auth grant issued for a different table schema cannot be \
+                          enforced here; re-plan the scan"
+                    .to_string(),
+            });
+        }
+        let schema_fields = table.schema().fields();
+        let projected = query_auth::canonical_projection(schema_fields, self.read_type())?;
+        let mut filter_columns = std::collections::HashSet::new();
+        self.data_predicates()
+            .iter()
+            .for_each(|p| p.collect_leaf_field_indices(&mut filter_columns));
+        query_auth::scope_check(&grant, schema_fields, &filter_columns, Some(projected))
     }
 
     /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
@@ -347,47 +384,16 @@ impl<'a> TableRead<'a> {
             return Err(query_auth::masked_filter_error(&schema_fields, *index));
         }
 
-        // Every projected field must be a canonical (id, name) pair from the
-        // table schema. Authorization and mask selection resolve columns by id,
-        // but the physical read resolves them by name, so a hand-built read type
-        // pairing an authorized id with another column's name would read that
-        // other column and skip its mask. `with_read_type` / `TableRead::new`
-        // are public, so this is reachable — fail closed.
-        for field in self.read_type() {
-            let by_id = schema_fields.iter().find(|s| s.id() == field.id());
-            let by_name = schema_fields.iter().find(|s| s.name() == field.name());
-            match (by_id, by_name) {
-                // Canonical: the same schema field on both lookups.
-                (Some(s), Some(n)) if s.name() == field.name() && n.id() == field.id() => {}
-                // Neither an id nor a name of this schema: a system column (row
-                // id, etc.), which carries no grant scope — leave it to the reader.
-                (None, None) => {}
-                // Any mix — a known id under another column's name, or an
-                // unknown id borrowing a real column's name — would be scoped and
-                // masked by id while the physical read resolves it by name.
-                _ => {
-                    return Err(crate::Error::Unsupported {
-                        message: format!(
-                            "query-auth read type field #{} `{}` is not a column of this table",
-                            field.id(),
-                            field.name()
-                        ),
-                    });
-                }
-            }
-        }
-
         // The grant is scoped to the columns authorized for this read; a wider
         // projection or a predicate on an un-approved column must re-authorize.
         // (The builder/scan paths also check this before pruning; this covers a
         // directly-constructed `TableRead`.)
-        let projected_indices = self
-            .read_type()
-            .iter()
-            .filter_map(|f| schema_fields.iter().position(|s| s.id() == f.id()));
-        if let Some(index) =
-            grant.first_unauthorized(projected_indices.chain(caller_referenced.iter().copied()))
-        {
+        let projected = query_auth::canonical_projection(&schema_fields, self.read_type())?;
+        if let Some(index) = grant.first_unauthorized(
+            projected
+                .into_iter()
+                .chain(caller_referenced.iter().copied()),
+        ) {
             return Err(query_auth::unauthorized_column_error(&schema_fields, index));
         }
 
@@ -1968,6 +1974,110 @@ mod tests {
     }
 
     #[test]
+    fn test_grant_from_another_schema_cannot_authorize_a_raw_read() {
+        // `authorize_rewrite_splits` is public and stamps grants, so a caller
+        // holding two tables could stamp one table's UNRESTRICTED grant onto
+        // splits of a restricted one. An unrestricted grant used to skip
+        // straight to the raw dispatch, so the binding must be checked first.
+        let table = query_auth_table();
+        let foreign = Arc::new(query_auth::QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            table.schema.id() + 1,
+        ));
+        assert!(foreign.is_unrestricted());
+        let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(foreign));
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        assert!(
+            matches!(
+                read.to_arrow(&[granted]),
+                Err(crate::Error::Unsupported { ref message })
+                    if message.contains("different table schema")
+            ),
+            "a grant bound to another schema must not authorize a raw read"
+        );
+    }
+
+    #[test]
+    fn test_incremental_read_rejects_noncanonical_read_type() {
+        use super::super::incremental_scan::{IncrementalPlan, IncrementalScanMode};
+        use std::collections::HashSet;
+        let table = query_auth_table();
+        let real = table.schema.fields()[0].clone();
+        // Authorized id 0 under another column's NAME: scoping resolves by id
+        // (would pass) while the physical read resolves by name. The batch path
+        // guards this too; both must go through `canonical_projection`.
+        let forged = crate::spec::DataField::new(
+            real.id(),
+            "not_the_real_name".to_string(),
+            real.data_type().clone(),
+        );
+        let grant = Arc::new(query_auth::QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            Some(HashSet::from([0])),
+            table.schema.id(),
+        ));
+        let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
+        let plan = IncrementalPlan::new(
+            IncrementalScanMode::Delta,
+            vec![IncrementalSplit::Data(granted)],
+        );
+        let read = TableRead::new(&table, vec![forged], Vec::new());
+        assert!(
+            matches!(
+                read.to_incremental_arrow(&plan),
+                Err(crate::Error::Unsupported { ref message })
+                    if message.contains("is not a column of this table")
+            ),
+            "a read type pairing an authorized id with another column's name must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_incremental_read_enforces_column_scope() {
+        use super::super::incremental_scan::{IncrementalPlan, IncrementalScanMode};
+        use std::collections::HashSet;
+
+        // A column-scoped grant carries no filter and no mask, so the "cannot
+        // apply filters here" check passes it through. Nothing else on the
+        // incremental path checks scope, so without an explicit check a read
+        // wider than the scope would return unauthorized columns raw.
+        let table = query_auth_table();
+        let fields = table.schema.fields().to_vec();
+        let read = TableRead::new(&table, fields.clone(), Vec::new());
+        let plan_for = |authorized: HashSet<usize>| {
+            let grant = Arc::new(query_auth::QueryAuthGrant::new(
+                Vec::new(),
+                Vec::new(),
+                Some(authorized),
+                table.schema.id(),
+            ));
+            let granted =
+                split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
+            IncrementalPlan::new(
+                IncrementalScanMode::Delta,
+                vec![IncrementalSplit::Data(granted)],
+            )
+        };
+
+        let out_of_scope = plan_for(HashSet::new());
+        assert!(
+            matches!(
+                read.to_incremental_arrow(&out_of_scope),
+                Err(crate::Error::Unsupported { ref message })
+                    if message.contains("outside the authorized set")
+            ),
+            "incremental read wider than the grant's column scope must fail closed"
+        );
+
+        // Reading exactly the authorized columns is allowed.
+        let in_scope = plan_for((0..fields.len()).collect());
+        assert!(read.ensure_incremental_plan_authorized(&in_scope).is_ok());
+    }
+
+    #[test]
     fn test_noncanonical_read_type_fails_closed() {
         use std::collections::HashSet;
 
@@ -1985,6 +2095,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            table.schema.id(),
         ));
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
 
@@ -2026,6 +2137,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            table.schema.id(),
         ));
         let granted =
             split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant.clone()));

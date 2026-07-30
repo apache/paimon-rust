@@ -666,37 +666,88 @@ async fn test_catalog_get_table() {
 /// The grant is scoped to the columns the plan requested (like Java passing
 /// `readType.getFieldNames()`): a wider read against a scoped grant fails
 /// closed until it re-plans.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_query_auth_grant_scoped_to_planned_columns() {
-    let ctx = setup_catalog(vec!["default"]).await;
-    let schema = Schema::builder()
-        .column("id", DataType::BigInt(BigIntType::new()))
-        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
-        .option("query-auth.enabled", "true")
-        .build()
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+
+    // Real data, so the scoped plan actually produces splits to assert on.
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
         .unwrap();
+    let columns = || {
+        Schema::builder()
+            .column("id", DataType::BigInt(BigIntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+    };
+    let identifier = Identifier::new("default", "qa_scope");
+    fs_catalog
+        .create_table(&identifier, columns().build().unwrap(), false)
+        .await
+        .unwrap();
+    let writer = fs_catalog.get_table(&identifier).await.unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, true),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2])),
+            Arc::new(arrow_array::StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .unwrap();
+    write_batch(&writer, batch, "u1").await;
+
+    let ctx = setup_catalog(vec!["default"]).await;
     ctx.server.add_table_with_schema(
         "default",
         "qa_scope",
-        schema,
-        "file:///tmp/test_warehouse/default.db/qa_scope",
+        columns()
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+        &format!("{warehouse}/default.db/qa_scope"),
     );
-    let table = ctx
-        .catalog
-        .get_table(&Identifier::new("default", "qa_scope"))
-        .await
-        .unwrap();
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
 
     // Plan a projection of {id}: the grant is scoped to that column and stamped
     // on this plan's splits (not a shared slot on the table).
     let mut projected = table.new_read_builder();
     projected.with_projection(&["id"]).unwrap();
-    projected.new_scan().plan().await.unwrap();
+    let scoped_plan = projected.new_scan().plan().await.unwrap();
+    assert!(
+        !scoped_plan.splits().is_empty(),
+        "the scoped plan must produce splits for this assertion to mean anything"
+    );
+    assert!(
+        projected
+            .new_read()
+            .unwrap()
+            .to_arrow(scoped_plan.splits())
+            .is_ok(),
+        "the planned projection must read under its own grant"
+    );
 
-    // The {id} plan's scoped grant lives on its own splits, so it cannot leak
-    // to a separate full-table read (per-query, no shared mutable slot). Reading
-    // real splits that carry no grant fails closed — covered by the read_builder
-    // unit tests, which can build such a split directly.
+    // The grant rides on the splits it was planned with, so handing those
+    // splits to a wider read must fail closed rather than widen the scope.
+    let wide = table.new_read_builder().new_read().unwrap();
+    match wide.to_arrow(scoped_plan.splits()) {
+        Err(paimon::Error::Unsupported { message }) => assert!(
+            message.contains("outside the authorized set"),
+            "unexpected rejection: {message}"
+        ),
+        Ok(_) => panic!("a wider read must not run under the {{id}} plan's scoped grant"),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
 
     // A separate full-table read re-authorizes for all columns when it plans.
     table.new_read_builder().new_scan().plan().await.unwrap();

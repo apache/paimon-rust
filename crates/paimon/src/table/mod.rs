@@ -299,8 +299,7 @@ impl Table {
         let filters = query_auth::parse_auth_filters(&auth.filter.unwrap_or_default(), fields)?;
         let masks =
             query_auth::parse_column_masking(&auth.column_masking.unwrap_or_default(), fields)?;
-        let grant =
-            QueryAuthGrant::new(filters, masks, select.cloned()).with_schema_id(self.schema.id());
+        let grant = QueryAuthGrant::new(filters, masks, select.cloned(), self.schema.id());
 
         // The server expresses its rules against the table's CURRENT schema, but
         // a time-travelled or branch copy reads a DIFFERENT one. Binding those
@@ -328,12 +327,12 @@ impl Table {
     pub(crate) async fn authorize_unrestricted_read(&self) -> Result<Option<Arc<QueryAuthGrant>>> {
         match self.verify_query_auth_for_read(None).await? {
             Some(grant) if grant.is_unrestricted() => Ok(Some(grant)),
-            Some(_) => {
-                // A restricted grant only arrives on a query-auth.enabled table,
-                // where the strict schema check always fails closed.
-                CoreOptions::new(self.schema.options()).ensure_read_authorized()?;
-                Ok(None)
-            }
+            Some(_) => Err(crate::Error::Unsupported {
+                message: "this read on a 'query-auth.enabled' table must see raw rows, so it \
+                          cannot apply the server's row filter / column masking and refuses to \
+                          run under a restricted grant"
+                    .to_string(),
+            }),
             None => Ok(None),
         }
     }
@@ -854,33 +853,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_branch_copy_inherits_query_auth_flag() {
-        use crate::spec::CoreOptions;
+    #[tokio::test]
+    async fn test_branch_copy_inherits_query_auth_flag() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{CoreOptions, DataType, IntType, Schema, TableSchema};
 
-        // `query-auth.enabled` arrives on the REST table response, so a branch's
-        // on-disk schema need not carry it. If the branch copy dropped it,
-        // `t$branch_x` would read the same data files raw and unauthorized.
-        let table = super::query_auth_table();
-        assert!(CoreOptions::new(table.schema().options()).query_auth_enabled());
+        // `query-auth.enabled` arrives on the REST table response, so the
+        // branch's on-disk schema does not carry it. If `copy_with_branch`
+        // dropped it, `t$branch_x` would read the same data files raw and
+        // unauthorized, so drive the real method rather than its inputs.
+        let tmp = tempfile::tempdir().unwrap();
+        let location = tmp.path().display().to_string();
+        let file_io = FileIOBuilder::new("file").build().unwrap();
 
-        // `copy_with_branch` replaces the options wholesale with the branch
-        // schema's; the flag must survive that replacement.
-        let branch_schema =
-            table
-                .schema()
-                .copy_with_replaced_options(std::collections::HashMap::from([(
-                    "branch".to_string(),
-                    "b1".to_string(),
-                )]));
-        assert!(
-            !CoreOptions::new(branch_schema.options()).query_auth_enabled(),
-            "precondition: a replaced-options copy loses the flag on its own"
+        // The on-disk schema deliberately has NO query-auth option.
+        let on_disk = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
         );
+        let sm = super::SchemaManager::new(file_io.clone(), location.clone());
+        file_io
+            .new_output(&sm.schema_path(0))
+            .unwrap()
+            .write(serde_json::to_vec(&on_disk).unwrap().into())
+            .await
+            .unwrap();
+
+        let build = |schema: TableSchema| {
+            super::Table::new(
+                file_io.clone(),
+                Identifier::new("default", "auth_t"),
+                location.clone(),
+                schema,
+                None,
+            )
+        };
+
+        let plain = build(on_disk.clone());
         assert!(
-            CoreOptions::new(branch_schema.copy_with_query_auth_enabled().options())
-                .query_auth_enabled(),
-            "the branch copy must re-assert query-auth.enabled"
+            !CoreOptions::new(
+                plain
+                    .copy_with_branch(super::DEFAULT_MAIN_BRANCH)
+                    .await
+                    .unwrap()
+                    .schema()
+                    .options()
+            )
+            .query_auth_enabled(),
+            "a branch of a non-query-auth table must not gain the flag"
+        );
+
+        let guarded = build(on_disk.copy_with_query_auth_enabled());
+        assert!(
+            CoreOptions::new(
+                guarded
+                    .copy_with_branch(super::DEFAULT_MAIN_BRANCH)
+                    .await
+                    .unwrap()
+                    .schema()
+                    .options()
+            )
+            .query_auth_enabled(),
+            "the branch copy must inherit query-auth.enabled from the REST table"
         );
     }
 }

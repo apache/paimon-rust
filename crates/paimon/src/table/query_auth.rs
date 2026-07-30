@@ -44,33 +44,29 @@ pub(crate) struct QueryAuthGrant {
     authorized: Option<HashSet<usize>>,
     /// Schema this grant's positional filter/mask indices were parsed against.
     /// Enforcing it on a different schema would bind them to other columns.
-    schema_id: Option<i64>,
+    schema_id: i64,
 }
 
 impl QueryAuthGrant {
+    /// `schema_id` binds the grant to the schema its column indices were
+    /// resolved against; it is required so the binding cannot be forgotten.
     pub(crate) fn new(
         filters: Vec<Predicate>,
         masks: Vec<ColumnMask>,
         authorized: Option<HashSet<usize>>,
+        schema_id: i64,
     ) -> Self {
         Self {
             filters,
             masks,
             authorized,
-            schema_id: None,
+            schema_id,
         }
     }
 
-    /// Bind this grant to the schema its indices were resolved against.
-    pub(crate) fn with_schema_id(mut self, schema_id: i64) -> Self {
-        self.schema_id = Some(schema_id);
-        self
-    }
-
-    /// Whether this grant may be enforced against `schema_id`. A grant with no
-    /// binding (test-constructed) matches anything.
+    /// Whether this grant may be enforced against `schema_id`.
     pub(crate) fn matches_schema(&self, schema_id: i64) -> bool {
-        self.schema_id.is_none_or(|bound| bound == schema_id)
+        self.schema_id == schema_id
     }
 
     /// Fully unrestricted: every column approved, no filter, no masking.
@@ -177,6 +173,39 @@ pub(crate) fn unauthorized_column_error(fields: &[DataField], column: usize) -> 
         "query-auth read touches column `{}` outside the authorized set",
         field_name(fields, column)
     ))
+}
+
+/// Table-schema indices a read type touches, rejecting any field that is not a
+/// canonical `(id, name)` pair of `fields`.
+///
+/// Authorization and mask selection resolve columns by id, but the physical read
+/// resolves them by name, so a read type pairing an authorized id with another
+/// column's name would be scoped by id while reading the other column.
+/// `TableRead::new` / `with_read_type` are public, so this is reachable — fail
+/// closed. A field matching neither an id nor a name is a system column (row id,
+/// etc.), which carries no grant scope and maps to no index.
+pub(crate) fn canonical_projection(
+    fields: &[DataField],
+    read_type: &[DataField],
+) -> crate::Result<Vec<usize>> {
+    let mut indices = Vec::with_capacity(read_type.len());
+    for field in read_type {
+        let by_id = fields.iter().position(|s| s.id() == field.id());
+        let by_name = fields.iter().position(|s| s.name() == field.name());
+        match (by_id, by_name) {
+            // Both lookups land on the same schema field.
+            (Some(i), Some(n)) if i == n => indices.push(i),
+            (None, None) => {}
+            _ => {
+                return Err(unsupported(format!(
+                    "query-auth read type field #{} `{}` is not a column of this table",
+                    field.id(),
+                    field.name()
+                )))
+            }
+        }
+    }
+    Ok(indices)
 }
 
 /// Live query-auth scope check shared by the read/scan gates: fail closed when
@@ -1080,12 +1109,12 @@ mod tests {
     fn test_grant_authorized_column_scope() {
         // A grant scoped to a subset is not globally unrestricted and rejects
         // columns outside the approved set.
-        let grant = QueryAuthGrant::new(Vec::new(), Vec::new(), Some(HashSet::from([0])));
+        let grant = QueryAuthGrant::new(Vec::new(), Vec::new(), Some(HashSet::from([0])), 0);
         assert!(!grant.is_unrestricted());
         assert!(grant.authorizes_columns([0]));
         assert!(!grant.authorizes_columns([1]));
         // `None` (all columns) with no filter/mask is fully unrestricted.
-        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None);
+        let all = QueryAuthGrant::new(Vec::new(), Vec::new(), None, 0);
         assert!(all.is_unrestricted());
         assert!(all.authorizes_columns([0, 1, 99]));
     }

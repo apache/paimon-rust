@@ -1067,6 +1067,7 @@ mod tests {
             vec![auth_filter],
             Vec::new(),
             None,
+            table.schema().id(),
         ));
 
         let split = DataSplitBuilder::new()
@@ -1139,7 +1140,12 @@ mod tests {
             table.schema().fields(),
         )
         .unwrap();
-        let grant = std::sync::Arc::new(QueryAuthGrant::new(vec![auth_filter], masks, None));
+        let grant = std::sync::Arc::new(QueryAuthGrant::new(
+            vec![auth_filter],
+            masks,
+            None,
+            table.schema().id(),
+        ));
 
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -1189,6 +1195,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::new()),
+            table.schema().id(),
         ));
         let split = DataSplitBuilder::new()
             .with_snapshot(1)

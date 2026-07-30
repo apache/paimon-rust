@@ -1575,7 +1575,7 @@ mod tests {
         let filter = PredicateBuilder::new(&fields)
             .greater_than("id", crate::spec::Datum::Int(1))
             .unwrap();
-        let restricted = Arc::new(QueryAuthGrant::new(vec![filter], Vec::new(), None));
+        let restricted = Arc::new(QueryAuthGrant::new(vec![filter], Vec::new(), None, 0));
         let plain = split(vec![file("a", 1, None)], true);
         let guarded = plain.clone().with_query_auth_grant(Some(restricted));
 
