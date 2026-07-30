@@ -198,7 +198,7 @@ ordered-multimap@0.7.3											X
 paimon@0.4.0		X													
 paimon-integration-tests@0.4.0		X													
 paimon-mosaic-core@0.2.0		X													
-paimon-vindex-core@0.2.0		X													
+paimon-vindex-core@0.3.0		X													
 parquet@58.3.0		X													
 paste@1.0.15		X									X				
 percent-encoding@2.3.2		X									X				

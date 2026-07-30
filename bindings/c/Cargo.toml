@@ -43,4 +43,4 @@ serde_json = "1.0.120"
 # Test-only: the vector-search integration tests build a real primary-key vindex
 # IVF-flat ANN segment fixture in-process. Versions match crates/paimon.
 bytes = "1.7.1"
-paimon-vindex-core = "0.2.0"
+paimon-vindex-core = "0.3.0"

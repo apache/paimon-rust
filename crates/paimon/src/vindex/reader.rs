@@ -25,9 +25,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 const DEFAULT_NPROBE: usize = 16;
-const DEFAULT_EF_SEARCH: usize = 0;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
-const EF_SEARCH_PARAMETER: &str = "hnsw.ef_search";
 
 pub struct VindexVectorGlobalIndexReader {
     io_meta: GlobalIndexIOMeta,
@@ -152,22 +150,15 @@ fn search_vindex(
         return Ok(None);
     }
 
-    let params = VectorSearchParams::with_ef_search(
-        effective_k,
-        int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
-        int_parameter(options, EF_SEARCH_PARAMETER, DEFAULT_EF_SEARCH)?,
-    );
+    let nprobe = int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?;
+    let params = VectorSearchParams::new(effective_k, nprobe);
 
     let (labels, distances) = if let Some(include_ids) = &vector_search.include_row_ids {
         if include_ids.is_empty() {
             return Ok(None);
         }
         let ek = std::cmp::min(effective_k, include_ids.len() as usize);
-        let params = VectorSearchParams::with_ef_search(
-            params.top_k.min(ek),
-            params.nprobe,
-            params.ef_search,
-        );
+        let params = VectorSearchParams::new(params.top_k.min(ek), nprobe);
         let mut filter_bytes = Vec::new();
         include_ids
             .serialize_into(&mut filter_bytes)
@@ -323,12 +314,7 @@ mod tests {
             int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).unwrap(),
             32
         );
-        assert_eq!(
-            int_parameter(&options, EF_SEARCH_PARAMETER, DEFAULT_EF_SEARCH).unwrap(),
-            DEFAULT_EF_SEARCH
-        );
-
-        options.insert(EF_SEARCH_PARAMETER.to_string(), "abc".to_string());
-        assert!(int_parameter(&options, EF_SEARCH_PARAMETER, DEFAULT_EF_SEARCH).is_err());
+        options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
+        assert!(int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).is_err());
     }
 }
