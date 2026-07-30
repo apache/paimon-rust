@@ -33,6 +33,10 @@ const DISTINCT_SUFFIX: &str = ".distinct";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
 const NESTED_KEY_SUFFIX: &str = ".nested-key";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
+const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
+const MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX: &str = ".map.shared-shredding.max-columns";
+const MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX: &str =
+    ".map.shared-shredding.column-placement-policy";
 
 /// Minimal aggregation mode recognized by the current Rust implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,14 +282,34 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
     None
 }
 
-/// Field-scoped aggregation option suffixes whose key names a single column,
-/// so the column rename/drop path can keep them in sync with the schema.
-const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 2] =
-    [AGG_FUNCTION_SUFFIX, LIST_AGG_DELIMITER_SUFFIX];
+/// Field-scoped option suffixes whose key names a single column
+/// (`fields.<col>.<suffix>`) while the value carries no column names, so the
+/// column rename/drop path can keep them in sync with the schema by rewriting
+/// the key only.  Mirrors case 2 of Java
+/// `SchemaManager.applyRenameColumnsToOptions` (Java's case-2 list; the
+/// aggregation/partial-update engines do not accept every entry at create
+/// time, but the keys can still arrive in Java-written metadata).
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 7] = [
+    AGG_FUNCTION_SUFFIX,
+    IGNORE_RETRACT_SUFFIX,
+    DISTINCT_SUFFIX,
+    LIST_AGG_DELIMITER_SUFFIX,
+    MAP_STORAGE_LAYOUT_SUFFIX,
+    MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX,
+    MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX,
+];
 
-/// Rename a column inside field-scoped aggregation option KEYS, mirroring
-/// Java `SchemaManager.applyRenameColumnsToOptions` (case 2): the value is
-/// unchanged, only `fields.<old>.<suffix>` -> `fields.<new>.<suffix>`.
+/// Field-scoped option suffixes where BOTH the key's comma-separated field
+/// list and the value may name columns (`fields.<col,col,...>.<suffix>`).
+/// Mirrors case 3 of Java `SchemaManager.applyRenameColumnsToOptions`.
+const FIELD_SCOPED_FIELD_LIST_SUFFIXES: [&str; 2] = [SEQUENCE_GROUP_SUFFIX, NESTED_KEY_SUFFIX];
+
+/// Rename a column inside field-scoped option keys (and, for field-list
+/// options, values), mirroring Java `SchemaManager.applyRenameColumnsToOptions`:
+///
+/// - case 2: `fields.<old>.<suffix>` -> `fields.<new>.<suffix>`, value kept
+/// - case 3 (`sequence-group`, `nested-key`): every comma-separated entry
+///   equal to `old` is renamed in BOTH the key's field list and the value
 pub(crate) fn rename_field_scoped_options(
     options: &mut HashMap<String, String>,
     old: &str,
@@ -297,6 +321,41 @@ pub(crate) fn rename_field_scoped_options(
             options.insert(format!("{FIELDS_PREFIX}{new}{suffix}"), value);
         }
     }
+
+    // Collect first: mutating the map while iterating it is not allowed, and
+    // options that don't reference `old` must stay untouched.
+    let mut rewritten = Vec::new();
+    for (key, value) in options.iter() {
+        let Some(suffix) = FIELD_SCOPED_FIELD_LIST_SUFFIXES
+            .iter()
+            .find(|suffix| key.starts_with(FIELDS_PREFIX) && key.ends_with(**suffix))
+        else {
+            continue;
+        };
+        let key_fields = &key[FIELDS_PREFIX.len()..key.len() - suffix.len()];
+        let new_key_fields = rename_in_field_list(key_fields, old, new);
+        let new_value = rename_in_field_list(value, old, new);
+        if new_key_fields != key_fields || new_value != *value {
+            rewritten.push((
+                key.clone(),
+                format!("{FIELDS_PREFIX}{new_key_fields}{suffix}"),
+                new_value,
+            ));
+        }
+    }
+    for (old_key, new_key, new_value) in rewritten {
+        options.remove(&old_key);
+        options.insert(new_key, new_value);
+    }
+}
+
+/// Rename exact matches of `old` inside a comma-separated field list,
+/// preserving order and any entries that don't match.
+fn rename_in_field_list(list: &str, old: &str, new: &str) -> String {
+    list.split(',')
+        .map(|field| if field == old { new } else { field })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Remove a dropped column's field-scoped aggregation option keys so no
@@ -723,5 +782,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_rename_field_scoped_options_case2_rewrites_key_only() {
+        let mut options: HashMap<String, String> = [
+            ("fields.a.aggregate-function", "sum"),
+            ("fields.a.ignore-retract", "true"),
+            ("fields.a.distinct", "true"),
+            ("fields.a.list-agg-delimiter", ";"),
+            ("fields.a.map.storage-layout", "shared-shredding"),
+            ("fields.a.map.shared-shredding.max-columns", "64"),
+            (
+                "fields.a.map.shared-shredding.column-placement-policy",
+                "even",
+            ),
+            // Same leading characters but a different column: must not move.
+            ("fields.ab.aggregate-function", "max"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+        rename_field_scoped_options(&mut options, "a", "b");
+
+        for (suffix, value) in [
+            ("aggregate-function", "sum"),
+            ("ignore-retract", "true"),
+            ("distinct", "true"),
+            ("list-agg-delimiter", ";"),
+            ("map.storage-layout", "shared-shredding"),
+            ("map.shared-shredding.max-columns", "64"),
+            ("map.shared-shredding.column-placement-policy", "even"),
+        ] {
+            assert_eq!(
+                options
+                    .get(&format!("fields.b.{suffix}"))
+                    .map(String::as_str),
+                Some(value),
+                "expected fields.b.{suffix} to carry the original value"
+            );
+            assert!(
+                !options.contains_key(&format!("fields.a.{suffix}")),
+                "old key fields.a.{suffix} should be gone"
+            );
+        }
+        assert_eq!(
+            options
+                .get("fields.ab.aggregate-function")
+                .map(String::as_str),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn test_rename_field_scoped_options_case3_rewrites_key_and_value() {
+        let mut options: HashMap<String, String> = [
+            // Rename hits both the key's field list and the value.
+            ("fields.g1,g2.sequence-group", "g2,price"),
+            // No reference to the renamed column: must stay untouched.
+            ("fields.other.sequence-group", "price"),
+            // nested-key: the column can appear in the key and in the value.
+            ("fields.g2.nested-key", "g2"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+        rename_field_scoped_options(&mut options, "g2", "g3");
+
+        assert_eq!(
+            options
+                .get("fields.g1,g3.sequence-group")
+                .map(String::as_str),
+            Some("g3,price")
+        );
+        assert_eq!(
+            options
+                .get("fields.other.sequence-group")
+                .map(String::as_str),
+            Some("price")
+        );
+        assert_eq!(
+            options.get("fields.g3.nested-key").map(String::as_str),
+            Some("g3")
+        );
+        assert!(!options.contains_key("fields.g1,g2.sequence-group"));
+        assert!(!options.contains_key("fields.g2.nested-key"));
     }
 }

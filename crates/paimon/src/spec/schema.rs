@@ -372,9 +372,10 @@ impl TableSchema {
                         name,
                         &new_name,
                     );
-                    // Field-scoped aggregation options encode the column in the
-                    // key (`fields.<col>.aggregate-function` / `.list-agg-delimiter`),
-                    // so they must be rewritten too, mirroring Java
+                    // Field-scoped options encode column names in the key
+                    // (`fields.<col>.aggregate-function`, `fields.<cols>.sequence-group`,
+                    // ...) and, for field-list options, in the value too, so they
+                    // must be rewritten as well, mirroring Java
                     // `SchemaManager.applyRenameColumnsToOptions`.
                     rename_field_scoped_options(&mut new_schema.options, name, &new_name);
                 }
@@ -3293,6 +3294,191 @@ mod tests {
         );
         assert_eq!(
             new_schema.options().get("fields.tag.list-agg-delimiter"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rename_column_rewrites_sequence_group_options() {
+        // `sequence-group` is rejected by Rust's create-time merge-engine
+        // validation, so the fixture carries the option on a table without
+        // `merge-engine` — the shape in which Java-written metadata arrives.
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("version", DataType::Int(IntType::new()))
+                .column("source_order", DataType::Int(IntType::new()))
+                .column("price", DataType::Int(IntType::new()))
+                .column("quantity", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option(
+                    "fields.version,source_order.sequence-group",
+                    "price,quantity",
+                )
+                .build()
+                .unwrap(),
+        );
+
+        // Rename a sequence field (key side) and a protected field (value side).
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::rename_column(
+                    "source_order".to_string(),
+                    "order_seq".to_string(),
+                ),
+                crate::spec::SchemaChange::rename_column("price".to_string(), "amount".to_string()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.version,order_seq.sequence-group")
+                .map(String::as_str),
+            Some("amount,quantity")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.version,source_order.sequence-group"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rename_column_rewrites_nested_key_options() {
+        // Same rationale as the sequence-group test: `nested-key` cannot be
+        // created through Rust, but Java-written tables carry it.
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("profile", DataType::Int(IntType::new()))
+                .column("region", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("fields.profile.nested-key", "region")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::rename_column("profile".to_string(), "info".to_string()),
+                crate::spec::SchemaChange::rename_column("region".to_string(), "area".to_string()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.info.nested-key")
+                .map(String::as_str),
+            Some("area")
+        );
+        assert_eq!(new_schema.options().get("fields.profile.nested-key"), None);
+    }
+
+    #[test]
+    fn test_rename_column_rewrites_remaining_case2_suffixes() {
+        // `ignore-retract` / `distinct` are rejected by Rust's create-time
+        // merge-engine validation; the fixture carries them (and the
+        // map-shredding options, which Rust does honor) as plain metadata,
+        // like a Java-written schema.
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("price", DataType::Int(IntType::new()))
+                .column(
+                    "props",
+                    DataType::Map(MapType::new(
+                        DataType::VarChar(VarCharType::string_type()),
+                        DataType::Int(IntType::new()),
+                    )),
+                )
+                .primary_key(["id"])
+                .option("fields.price.ignore-retract", "true")
+                .option("fields.price.distinct", "true")
+                .option("fields.props.map.storage-layout", "shared-shredding")
+                .option("fields.props.map.shared-shredding.max-columns", "64")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::rename_column("price".to_string(), "amount".to_string()),
+                crate::spec::SchemaChange::rename_column(
+                    "props".to_string(),
+                    "properties".to_string(),
+                ),
+            ])
+            .unwrap();
+
+        for (key, value) in [
+            ("fields.amount.ignore-retract", "true"),
+            ("fields.amount.distinct", "true"),
+            ("fields.properties.map.storage-layout", "shared-shredding"),
+            ("fields.properties.map.shared-shredding.max-columns", "64"),
+        ] {
+            assert_eq!(
+                new_schema.options().get(key).map(String::as_str),
+                Some(value),
+                "expected {key} to follow the rename"
+            );
+        }
+        for old_key in [
+            "fields.price.ignore-retract",
+            "fields.price.distinct",
+            "fields.props.map.storage-layout",
+            "fields.props.map.shared-shredding.max-columns",
+        ] {
+            assert_eq!(new_schema.options().get(old_key), None);
+        }
+    }
+
+    #[test]
+    fn test_rename_column_field_scoped_options_match_whole_names_only() {
+        // `price2` merely starts with `price`: its keys must not move when
+        // `price` is renamed, while a value-side exact reference to `price`
+        // still gets rewritten (Java `applyNotNestedColumnRename` semantics).
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("price", DataType::Int(IntType::new()))
+                .column("price2", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("fields.price2.sequence-group", "price")
+                .option("fields.price2.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "price".to_string(),
+                "amount".to_string(),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.price2.sequence-group")
+                .map(String::as_str),
+            Some("amount")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.price2.aggregate-function")
+                .map(String::as_str),
+            Some("sum")
+        );
+        assert_eq!(
+            new_schema.options().get("fields.amount.sequence-group"),
             None
         );
     }
