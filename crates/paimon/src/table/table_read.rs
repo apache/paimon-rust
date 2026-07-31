@@ -156,6 +156,15 @@ impl<'a> TableRead<'a> {
 
     /// Override the Parquet resource budget shared by this read.
     #[doc(hidden)]
+    /// The budget the caller attached, if any. `None` means "use the table's
+    /// configured default", which each read resolves for itself.
+    fn explicit_parquet_read_budget(&self) -> Option<Arc<ParquetReadBudget>> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.parquet_read_budget.clone(),
+            TableReadKind::Format(read) => read.explicit_parquet_read_budget(),
+        }
+    }
+
     pub fn with_parquet_read_budget(self, budget: Arc<ParquetReadBudget>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
@@ -178,27 +187,20 @@ impl<'a> TableRead<'a> {
 
     /// Returns an [`ArrowRecordBatchStream`].
     ///
-    /// Query-auth is enforced here off the grant stamped on the splits by scan
-    /// planning (or a write-path authorizer), never a shared slot on `Table`, so
-    /// the grant is exactly the one this query planned and cannot leak from a
-    /// concurrent query or a write rewrite. A restricted grant is applied on the
-    /// output stream; an unrestricted grant (or a non-query-auth table) reads
-    /// raw; and a `query-auth.enabled` table whose splits carry no grant means
-    /// an unauthorized read path — fail closed.
+    /// Query-auth is enforced off the grant stamped on the splits, never a shared
+    /// slot, so a concurrent query or a rewrite cannot leak into it. No grant on
+    /// a `query-auth.enabled` table means an unauthorized path: fail closed.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let Some(grant) = self.resolve_split_grant(data_splits)? else {
             return self.to_arrow_dispatch(data_splits);
         };
-        // Checked for every grant: `authorize_rewrite_splits` is public, so an
-        // unrestricted grant from one table must not authorize a raw read of
-        // another's splits.
-        if !grant.matches_table(self.table()) {
-            return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table or schema cannot be \
-                          enforced here; re-plan the scan"
-                    .to_string(),
-            });
-        }
+        query_auth::authorize_read(
+            &grant,
+            self.table(),
+            self.read_type(),
+            self.data_predicates(),
+            &[],
+        )?;
         if grant.is_unrestricted() {
             self.to_arrow_dispatch(data_splits)
         } else {
@@ -206,14 +208,11 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// The single query-auth grant every split in `data_splits` was planned
-    /// under, or `None` when the table is not `query-auth.enabled`.
+    /// The single grant every split was planned under, or `None` for a
+    /// non-query-auth table.
     ///
-    /// Splits from different plans must not be mixed: taking any one grant and
-    /// applying it to the whole slice would let a split carrying a permissive
-    /// grant relax the read of splits planned under a stricter one, so a
-    /// disagreement fails closed. A `query-auth.enabled` table whose splits
-    /// carry no grant means an unauthorized read path — also fail closed.
+    /// A disagreement fails closed: one split's permissive grant must not relax
+    /// the read of splits planned under a stricter one.
     fn resolve_split_grant<'s>(
         &self,
         data_splits: impl IntoIterator<Item = &'s DataSplit>,
@@ -276,7 +275,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_incremental_plan_authorized(plan)?;
+        self.ensure_incremental_plan_authorized(plan, &[])?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
@@ -287,10 +286,13 @@ impl<'a> TableRead<'a> {
     }
 
     /// Incremental and audit-log reads consume their splits inside
-    /// `PaimonTableRead`, which cannot apply the row filter / masking pass, so a
-    /// restricted grant must fail closed here rather than return raw rows. An
-    /// unrestricted grant (or a non-query-auth table) proceeds.
-    fn ensure_incremental_plan_authorized(&self, plan: &IncrementalPlan) -> crate::Result<()> {
+    /// `PaimonTableRead`, which cannot apply the filter / masking pass, so a
+    /// restricted grant fails closed here rather than return raw rows.
+    fn ensure_incremental_plan_authorized(
+        &self,
+        plan: &IncrementalPlan,
+        implicit_system_fields: &[&str],
+    ) -> crate::Result<()> {
         // `all_data_splits` (not `data_splits`) so a Diff plan's pairs are seen:
         // `data_splits` drops them, which would present no splits at all.
         let Some(grant) = self.resolve_split_grant(plan.all_data_splits())? else {
@@ -307,21 +309,14 @@ impl<'a> TableRead<'a> {
 
         // A scoped grant still needs checking, and nothing downstream on this
         // path does it (the batch path does, in `to_arrow_auth_enforced`).
-        let table = self.table();
-        if !grant.matches_table(table) {
-            return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table or schema cannot be \
-                          enforced here; re-plan the scan"
-                    .to_string(),
-            });
-        }
-        let schema_fields = table.schema().fields();
-        let projected = query_auth::canonical_projection(schema_fields, self.read_type())?;
-        let mut filter_columns = std::collections::HashSet::new();
-        self.data_predicates()
-            .iter()
-            .for_each(|p| p.collect_leaf_field_indices(&mut filter_columns));
-        query_auth::scope_check(&grant, schema_fields, &filter_columns, Some(projected))
+        query_auth::authorize_read(
+            &grant,
+            self.table(),
+            self.read_type(),
+            self.data_predicates(),
+            implicit_system_fields,
+        )
+        .map(|_| ())
     }
 
     /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
@@ -334,7 +329,14 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_incremental_plan_authorized(plan)?;
+        // The audit schema prepends these on top of the read type, so neither
+        // reached the auth request via the projection. Check only what this read
+        // actually emits: `_SEQUENCE_NUMBER` is conditional.
+        let mut implicit = vec![ROW_KIND_FIELD_NAME];
+        if audit_sequence_number_enabled(self.table()) {
+            implicit.push(SEQUENCE_NUMBER_FIELD_NAME);
+        }
+        self.ensure_incremental_plan_authorized(plan, &implicit)?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
@@ -344,10 +346,9 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Read with the query-auth grant applied exactly: read the union of the
-    /// projection, the filter columns, and the mask inputs; per batch, drop
-    /// non-matching rows (on raw values, like Java), overwrite masked columns,
-    /// then project back to the requested columns.
+    /// Read the union of the projection, filter columns and mask inputs; per
+    /// batch drop non-matching rows (on raw values, like Java), overwrite masked
+    /// columns, then project back to the requested columns.
     fn to_arrow_auth_enforced(
         &self,
         data_splits: &[DataSplit],
@@ -359,53 +360,23 @@ impl<'a> TableRead<'a> {
         // The grant's filter and mask indices are POSITIONAL in the schema they
         // were parsed against, so enforcing them on another schema would bind
         // them to different columns. Refuse a grant issued for a different one.
-        if !grant.matches_table(table) {
-            return Err(crate::Error::Unsupported {
-                message: "a query-auth grant issued for a different table or schema cannot be \
-                          enforced here; re-plan the scan"
-                    .to_string(),
-            });
-        }
+        let projected = query_auth::authorize_read(
+            &grant,
+            table,
+            self.read_type(),
+            self.data_predicates(),
+            &[],
+        )?;
         let schema_fields = table.schema().fields().to_vec();
 
-        // A caller predicate on a masked column would leak raw values through
-        // row selection (an oracle); refuse such reads.
-        let masked: std::collections::HashSet<usize> =
-            grant.masks().iter().map(|m| m.column).collect();
-        let mut caller_referenced = std::collections::HashSet::new();
-        self.data_predicates()
-            .iter()
-            .for_each(|p| p.collect_leaf_field_indices(&mut caller_referenced));
-        if let Some(index) = caller_referenced.intersection(&masked).next() {
-            return Err(query_auth::masked_filter_error(&schema_fields, *index));
-        }
-
-        // The grant is scoped to the columns authorized for this read; a wider
-        // projection or a predicate on an un-approved column must re-authorize.
-        // (The builder/scan paths also check this before pruning; this covers a
-        // directly-constructed `TableRead`.)
-        let projected = query_auth::canonical_projection(&schema_fields, self.read_type())?;
-        if let Some(index) = grant.first_unauthorized(
-            projected
-                .into_iter()
-                .chain(caller_referenced.iter().copied()),
-        ) {
-            return Err(query_auth::unauthorized_column_error(&schema_fields, index));
-        }
-
-        // Only masks whose target is caller-projected matter (others are
-        // projected away); keeping just those avoids masking a target that was
-        // added to the physical read solely because a filter references it.
-        let caller_ids: std::collections::HashSet<i32> =
-            self.read_type().iter().map(|f| f.id()).collect();
+        // Only masks whose target the caller projected matter; the rest would
+        // mask a column added to the physical read just for a filter. Comparing
+        // by index is sound only because `authorize_read` above rejected any
+        // non-canonical read type — moving it later would silently drop masks.
         let masks: Vec<query_auth::ColumnMask> = grant
             .masks()
             .iter()
-            .filter(|m| {
-                schema_fields
-                    .get(m.column)
-                    .is_some_and(|t| caller_ids.contains(&t.id()))
-            })
+            .filter(|m| projected.contains(&m.column))
             .cloned()
             .collect();
 
@@ -436,7 +407,13 @@ impl<'a> TableRead<'a> {
         // The inner read must NOT apply the caller's limit: it would cap rows
         // before the auth filter. Read everything, then truncate the output.
         let caller_limit = self.read_limit();
-        let inner = TableRead::new(table, physical.clone(), self.data_predicates().to_vec());
+        // Carry the caller's Parquet budget: DataFusion hands one query-wide
+        // budget to every scan partition, so a fresh read here would give each
+        // authorized partition its own and multiply row-group concurrency.
+        let mut inner = TableRead::new(table, physical.clone(), self.data_predicates().to_vec());
+        if let Some(budget) = self.explicit_parquet_read_budget() {
+            inner = inner.with_parquet_read_budget(budget);
+        }
         let stream = inner.to_arrow_dispatch(data_splits)?.map(move |batch| {
             let batch = batch?;
             let filtered =
@@ -1192,7 +1169,7 @@ fn audit_schema_for_read_type(
     build_target_arrow_schema(&fields)
 }
 
-fn audit_sequence_number_enabled(table: &Table) -> bool {
+pub(crate) fn audit_sequence_number_enabled(table: &Table) -> bool {
     table
         .schema()
         .options()
@@ -1971,11 +1948,9 @@ mod tests {
 
     #[test]
     fn test_grant_from_another_table_cannot_authorize_a_raw_read() {
-        // `authorize_rewrite_splits` is public and stamps grants, so a caller
-        // holding two tables can stamp one table's UNRESTRICTED grant onto
-        // splits of another. Both tables sit at schema id 0 (a per-table
-        // counter, so freshly created tables collide), which is exactly why the
-        // grant binds the table identity and not just that counter.
+        // `authorize_rewrite_splits` is public, so a caller holding two tables
+        // can stamp one's unrestricted grant onto the other's splits. Both sit
+        // at schema id 0 — a per-table counter — hence the identity binding.
         let table = query_auth_table();
         let other = {
             let mut t = query_auth_table();
@@ -1987,6 +1962,7 @@ mod tests {
         let foreign = Arc::new(query_auth::QueryAuthGrant::new(
             Vec::new(),
             Vec::new(),
+            None,
             None,
             query_auth::GrantBinding::of(&other),
         ));
@@ -2022,6 +1998,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            None,
             query_auth::GrantBinding::of(&table),
         ));
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
@@ -2056,6 +2033,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Some(authorized),
+                None,
                 query_auth::GrantBinding::of(&table),
             ));
             let granted =
@@ -2078,7 +2056,9 @@ mod tests {
 
         // Reading exactly the authorized columns is allowed.
         let in_scope = plan_for((0..fields.len()).collect());
-        assert!(read.ensure_incremental_plan_authorized(&in_scope).is_ok());
+        assert!(read
+            .ensure_incremental_plan_authorized(&in_scope, &[])
+            .is_ok());
     }
 
     #[test]
@@ -2099,6 +2079,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            None,
             query_auth::GrantBinding::of(&table),
         ));
         let granted = split(vec![file("a", 5, Some(0))], true).with_query_auth_grant(Some(grant));
@@ -2141,6 +2122,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(HashSet::from([0])),
+            None,
             query_auth::GrantBinding::of(&table),
         ));
         let granted =

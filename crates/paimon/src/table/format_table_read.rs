@@ -90,6 +90,10 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
+    pub(super) fn explicit_parquet_read_budget(&self) -> Option<Arc<ParquetReadBudget>> {
+        self.parquet_read_budget.clone()
+    }
+
     pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
         self

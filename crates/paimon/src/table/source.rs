@@ -501,19 +501,16 @@ pub struct DataSplit {
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
     raw_convertible: bool,
-    /// The per-user query-auth grant this split must be read under, stamped by
-    /// scan planning (or a write-path authorizer). Runtime-only — never
-    /// serialized — mirroring Java `QueryAuthSplit(split, authResult)`. Carried
-    /// on the split so `TableRead::to_arrow` enforces the exact grant the plan
-    /// fetched, instead of a shared mutable slot on `Table`.
+    /// The grant this split must be read under, stamped by scan planning.
+    /// Runtime-only, mirroring Java `QueryAuthSplit(split, authResult)`: on the
+    /// split so `to_arrow` enforces exactly the grant its plan fetched.
     #[serde(skip)]
     query_auth_grant: Option<Arc<QueryAuthGrant>>,
 }
 
-/// Hand-written so that serializing a split planned under a restricted
-/// query-auth grant FAILS instead of silently dropping the grant: no serde
-/// format carries it, so the receiver would read the split's files raw. The
-/// emitted shape is identical to the derived one (the grant is never a field).
+/// Hand-written so serializing a split planned under a grant FAILS instead of
+/// silently dropping it — no serde format carries it. The emitted shape is
+/// identical to the derived one.
 impl Serialize for DataSplit {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -607,18 +604,16 @@ impl DataSplit {
     }
 
     /// Whether this split is planned under a grant that filters rows or masks
-    /// columns. Engines must not publish this split's raw manifest statistics
-    /// (min/max/null counts describe the data before enforcement), and must not
-    /// send it across a wire format that cannot carry the grant.
+    /// columns. Engines must not publish its raw manifest statistics, which
+    /// describe the data before enforcement.
     pub fn has_restricted_query_auth_grant(&self) -> bool {
         self.query_auth_grant
             .as_ref()
             .is_some_and(|g| g.has_server_restrictions())
     }
 
-    /// Whether this split carries any grant that is not fully unrestricted —
-    /// row filter, column mask, **or** column scope. Transport and
-    /// re-authorization use this instead of
+    /// Whether this split carries any grant that is not fully unrestricted.
+    /// Transport and re-authorization use this rather than
     /// [`Self::has_restricted_query_auth_grant`]: a scope-only grant distorts no
     /// statistics, but no wire format carries it either.
     pub fn carries_query_auth_restriction(&self) -> bool {
@@ -694,6 +689,17 @@ impl DataSplit {
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        // A row filter drops rows after the scan, so the manifest count is not
+        // the logical output count. Java's `QueryAuthSplit.mergedRowCount()`
+        // returns empty for the same reason; `Plan::row_counts_exact` only
+        // covers callers that go through the plan.
+        if self
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|g| g.has_row_filter())
+        {
+            return None;
+        }
         if !self.row_counts_known() {
             return None;
         }
@@ -768,17 +774,19 @@ impl DataSplit {
     /// Serialize the DataSplit fields to Java `DataSplit#serialize` (version 9) binary.
     /// Byte-compatible with `compatibility/datasplit-v9`. Row ranges are not part of the
     /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
-    /// Fail closed when this split carries a restricted query-auth grant and is
-    /// about to leave the process: no split wire format (native bytes, the Java
-    /// `SplitSerializer` frame, or serde) carries the grant, so the receiver
-    /// would read the data raw. `what` names the attempted operation.
+    /// Fail closed when a split carrying a grant is about to leave the process:
+    /// no wire format (native bytes, the Java `SplitSerializer` frame, serde)
+    /// carries it. `what` names the attempted operation.
     fn ensure_no_restricted_grant(&self, what: &str) -> crate::Result<()> {
         match &self.query_auth_grant {
-            Some(grant) if !grant.is_unrestricted() => Err(crate::Error::Unsupported {
+            // Any stamped grant, unrestricted included: the receiver would get
+            // a grant-less split and fail closed anyway, so refuse at the
+            // boundary where the cause is still visible.
+            Some(_) => Err(crate::Error::Unsupported {
                 message: format!(
                     "cannot {what} a split planned under a query-auth grant: no wire format \
-                     carries the grant, so the receiver would read the data without its row \
-                     filter, column masking, or column scope"
+                     carries the grant, so the receiver could not enforce the row filter, \
+                     column masking, or column scope it was planned under"
                 ),
             }),
             _ => Ok(()),
@@ -1409,6 +1417,10 @@ pub struct Plan {
     /// False when a residual pass (e.g. a query-auth row filter) drops rows
     /// after the scan, so split row counts overcount the read output.
     row_counts_exact: bool,
+    /// Whether this plan was made under a server-restricted grant. Recorded on
+    /// the plan, not inferred from its splits: a fully pruned plan has none to
+    /// carry the grant but its scan metadata is just as pre-enforcement.
+    query_auth_restricted: bool,
 }
 
 impl Plan {
@@ -1416,6 +1428,7 @@ impl Plan {
         Self {
             splits,
             row_counts_exact: true,
+            query_auth_restricted: false,
         }
     }
     pub(crate) fn with_inexact_row_counts(mut self) -> Self {
@@ -1423,12 +1436,11 @@ impl Plan {
         self
     }
 
-    /// Stamp the per-user query-auth grant onto every split so
-    /// [`crate::table::TableRead::to_arrow`] enforces exactly the grant this
-    /// plan fetched (see [`DataSplit::with_query_auth_grant`]). A no-op when
-    /// `grant` is `None` (non-query-auth table): splits keep their empty grant
-    /// and read raw.
+    /// Stamp the grant onto every split so [`crate::table::TableRead::to_arrow`]
+    /// enforces exactly the one this plan fetched. A no-op for `None` (not a
+    /// query-auth table).
     pub(crate) fn stamp_query_auth_grant(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
+        self.query_auth_restricted = grant.as_ref().is_some_and(|g| g.has_server_restrictions());
         if grant.is_some() {
             self.splits = self
                 .splits
@@ -1445,6 +1457,14 @@ impl Plan {
     /// Whether split row counts exactly reflect the rows a read will produce.
     pub fn row_counts_exact(&self) -> bool {
         self.row_counts_exact
+    }
+
+    /// Whether this plan was made under a row filter or column masking.
+    ///
+    /// On the plan, not a split: a fully pruned plan has no split to carry it,
+    /// yet its scan metadata is just as pre-enforcement.
+    pub fn planned_under_restricted_grant(&self) -> bool {
+        self.query_auth_restricted
     }
 
     /// Sum of data-file bytes referenced by this plan.
@@ -1574,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restricted_grant_split_cannot_be_serialized() {
+    fn test_query_auth_grant_split_cannot_be_serialized() {
         use crate::spec::{DataType, IntType, PredicateBuilder};
         use crate::table::query_auth::QueryAuthGrant;
 
@@ -1590,6 +1610,7 @@ mod tests {
             vec![filter],
             Vec::new(),
             None,
+            None,
             crate::table::query_auth::GrantBinding::default(),
         ));
         let plain = split(vec![file("a", 1, None)], true);
@@ -1604,13 +1625,16 @@ mod tests {
             "serde (pickle, JSON)"
         );
 
-        // Unstamped and unrestricted splits still serialize.
+        // Only an unstamped split serializes. An unrestricted grant is refused
+        // too: the receiver would get a grant-less split and fail closed when
+        // reading it, so rejecting here reports the real cause at the boundary.
         assert!(plain.serialize().is_ok());
         assert!(serde_json::to_vec(&plain).is_ok());
         let unrestricted = plain
             .clone()
             .with_query_auth_grant(Some(Arc::new(QueryAuthGrant::default())));
-        assert!(serde_json::to_vec(&unrestricted).is_ok());
+        assert!(unrestricted.serialize().is_err());
+        assert!(serde_json::to_vec(&unrestricted).is_err());
     }
 
     #[test]

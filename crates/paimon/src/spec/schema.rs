@@ -266,11 +266,9 @@ impl TableSchema {
         Ok(())
     }
 
-    /// Force `query-auth.enabled = true` on this schema.
-    ///
-    /// Used when a copy must inherit the flag from a table whose schema carries
-    /// it (the REST catalog delivers it on the table response, so an on-disk
-    /// schema — e.g. a branch's — need not have it).
+    /// Force `query-auth.enabled = true`. The REST catalog delivers the flag on
+    /// the table response, so a copy built from an on-disk schema (a branch's)
+    /// must re-assert it.
     pub(crate) fn copy_with_query_auth_enabled(&self) -> Self {
         let mut new_schema = self.clone();
         new_schema

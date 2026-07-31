@@ -71,6 +71,12 @@ impl RESTEnv {
         }
     }
 
+    /// The REST catalog's table UUID: stable across renames and unique across
+    /// catalogs, unlike an identifier or the per-table schema counter.
+    pub(crate) fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
     #[cfg(test)]
     fn has_local_cache(&self) -> bool {
         self.local_cache.is_some()
@@ -79,6 +85,51 @@ impl RESTEnv {
     /// Get the REST API client.
     pub fn api(&self) -> &Arc<RESTApi> {
         &self.api
+    }
+
+    /// Confirm the server still resolves this environment's identifier to the
+    /// UUID this handle was loaded with.
+    ///
+    /// The authorization exchange returns only the filter and the masks, so
+    /// nothing in it proves *which* table the server authorized. After a drop
+    /// and a same-name re-create, a permissive replacement would otherwise issue
+    /// a grant that a stale handle applies to the old table's files.
+    pub(crate) async fn ensure_uuid_is_current(&self) -> Result<()> {
+        let response = self.api.get_table(&self.identifier).await?;
+        match response.id.as_deref() {
+            Some(server_uuid) if server_uuid == self.uuid => Ok(()),
+            Some(server_uuid) => Err(Error::DataInvalid {
+                message: format!(
+                    "table '{}' now resolves to uuid {server_uuid}, not the {} this handle was \
+                     loaded with; re-load the table before reading it",
+                    self.identifier.full_name(),
+                    self.uuid
+                ),
+                source: None,
+            }),
+            // A server that does not report an id cannot be checked against.
+            None => Ok(()),
+        }
+    }
+
+    /// A copy of this environment addressing `branch` of the same table, as
+    /// Java spells it: `db.table$branch_<name>`. The main branch is the table
+    /// itself and needs no suffix.
+    pub(crate) fn for_branch(&self, branch: &str) -> Result<Self> {
+        if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            return Ok(self.clone());
+        }
+        let object = format!(
+            "{}{}{}{}",
+            self.identifier.object(),
+            crate::catalog::SYSTEM_TABLE_SPLITTER,
+            crate::catalog::SYSTEM_BRANCH_PREFIX,
+            branch
+        );
+        Ok(Self {
+            identifier: Identifier::new(self.identifier.database(), &object),
+            ..self.clone()
+        })
     }
 
     /// Get the table identifier.
@@ -372,5 +423,33 @@ mod tests {
 
         assert!(rest_env.has_local_cache());
         assert!(rest_env.clone().has_local_cache());
+    }
+
+    #[tokio::test]
+    async fn test_for_branch_addresses_the_branch_table() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let rest_env = RESTEnv::new(
+            Identifier::new("db", "t"),
+            "uuid".to_string(),
+            api,
+            options,
+            false,
+            None,
+        );
+
+        let branch = rest_env.for_branch("b1").unwrap();
+        assert_eq!(branch.identifier().object(), "t$branch_b1");
+        assert_eq!(branch.identifier().database(), "db");
+
+        // The main branch IS the table; no suffix.
+        let main = rest_env
+            .for_branch(crate::catalog::DEFAULT_MAIN_BRANCH)
+            .unwrap();
+        assert_eq!(main.identifier().object(), "t");
     }
 }

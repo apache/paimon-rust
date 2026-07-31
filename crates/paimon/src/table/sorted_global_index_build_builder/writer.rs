@@ -47,6 +47,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         index_field: &DataField,
         index_column: &str,
         write_options: &GlobalIndexWriteOptions,
+        grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -77,6 +78,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                 index_field,
                 index_type,
                 serialize_key,
+                grant,
             )
             .await?
         };

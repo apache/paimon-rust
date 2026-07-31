@@ -214,11 +214,9 @@ impl CopyOnWriteMergeWriter {
         }
 
         // A copy-on-write rewrite reads each affected file and rewrites it in
-        // place. Under a restricted query-auth grant that read would filter and
-        // mask rows, silently deleting hidden rows and persisting masked values
-        // on commit — so require a fully unrestricted grant and read raw. The
-        // returned grant (unrestricted, or `None` for a non-query-auth table) is
-        // stamped on each split so `to_arrow` reads raw instead of failing closed.
+        // place, so under a restricted grant it would silently delete hidden
+        // rows and persist masked values. Require an unrestricted grant and
+        // stamp it on each split, so `to_arrow` reads raw.
         let write_grant = self.table.authorize_unrestricted_read().await?;
 
         let schema = self.table.schema();

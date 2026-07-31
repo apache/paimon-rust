@@ -167,10 +167,8 @@ impl DataEvolutionWriter {
             return Ok(Vec::new());
         }
 
-        // This rewrite reads each affected file's original columns and rewrites
-        // it; under a restricted query-auth grant that read would filter/mask
-        // rows into the committed result. Require an unrestricted grant and read
-        // raw (stamp the returned grant on each split).
+        // This rewrite reads each affected file's original columns, so a
+        // restricted grant would filter/mask rows into the committed result.
         let write_grant = self.table.authorize_unrestricted_read().await?;
 
         // 1. Scan file metadata and build row_id -> file group index.
@@ -492,10 +490,8 @@ impl DataEvolutionDeleteWriter {
             return Ok(Vec::new());
         }
 
-        // The row ids to delete come from a read the caller performed; under a
-        // restricted grant that read hid rows, so the committed deletion vectors
-        // would encode a delete set derived from a filtered view. Require an
-        // unrestricted grant, like `DataEvolutionWriter::prepare_commit`.
+        // The row ids come from a read the caller performed; under a restricted
+        // grant the deletion vectors would encode a filtered view.
         self.table.authorize_unrestricted_read().await?;
 
         let scan = self

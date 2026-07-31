@@ -70,9 +70,12 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         // Building the index scans the table's rows.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-
         self.table.ensure_not_branch_reference_for_write()?;
+        // Authorize before reading any manifest or index metadata, and once for
+        // the whole build: doing it per shard both skipped the early-return
+        // paths and issued one REST round-trip per shard.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let grant = build_grant.as_ref();
 
         if !is_lumina_index_type(&self.index_type) {
             return Err(Error::DataInvalid {
@@ -169,7 +172,8 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let build_result = async {
-                let vectors = extract_vectors(self.table, &shard, index_column, dimension).await?;
+                let vectors =
+                    extract_vectors(self.table, &shard, index_column, dimension, grant).await?;
                 self.build_index_file(
                     &shard,
                     &vectors,

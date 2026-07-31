@@ -142,17 +142,13 @@ impl<'a> FormatReadBuilder<'a> {
     /// Projected system fields (`_ROW_ID`, …). `projected_schema_indices` drops
     /// them for lack of an index, but Java's `select` includes them.
     fn projected_system_field_names(&self) -> Vec<String> {
-        self.resolve_read_type()
-            .ok()
-            .flatten()
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter(|f| crate::table::query_auth::is_reserved_system_field(f))
-                    .map(|f| f.name().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        // Format tables have no row-id extraction (`with_row_ranges` is inert),
+        // so the read type is the only source.
+        crate::table::query_auth::projected_system_field_names(
+            self.resolve_read_type().ok().flatten().as_deref(),
+            &std::collections::HashSet::new(),
+            false,
+        )
     }
 
     fn projected_schema_indices(&self) -> Option<Vec<usize>> {

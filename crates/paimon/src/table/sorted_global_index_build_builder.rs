@@ -100,9 +100,12 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         // Building the index scans the table's rows.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-
         self.table.ensure_not_branch_reference_for_write()?;
+        // Authorize before reading any manifest or index metadata, and once for
+        // the whole build: doing it per shard both skipped the early-return
+        // paths and issued one REST round-trip per shard.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let grant = build_grant.as_ref();
 
         let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -204,7 +207,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = match self
-                .build_index_file(&shard, index_field, index_column, &write_options)
+                .build_index_file(&shard, index_field, index_column, &write_options, grant)
                 .await
             {
                 Ok(index_file) => index_file,

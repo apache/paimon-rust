@@ -159,10 +159,10 @@ impl IncrementalPlan {
             .collect()
     }
 
-    /// Every data split this plan reads, including both sides of a
-    /// [`IncrementalSplit::DiffPair`]. Authorization must use this rather than
-    /// [`Self::data_splits`], which drops the diff pairs — a Diff plan would
-    /// otherwise present no splits and skip the query-auth grant check.
+    /// Every data split this plan reads, both sides of a
+    /// [`IncrementalSplit::DiffPair`] included. Authorization must use this:
+    /// [`Self::data_splits`] drops the pairs, so a Diff plan would present no
+    /// splits and skip the grant check.
     pub(crate) fn all_data_splits(&self) -> Vec<&DataSplit> {
         let mut out = Vec::new();
         for split in &self.splits {
@@ -240,6 +240,19 @@ impl<'a> IncrementalScan<'a> {
     ) -> Self {
         let scan = TableScan::new(table, None, Vec::new(), None, None, None);
         Self::new(table, scan, mode, start_exclusive, end_inclusive)
+    }
+
+    /// Declare the system fields an audit-log read emits on top of the read
+    /// type, so planning asks the server about them.
+    pub(crate) fn with_audit_system_fields(mut self) -> Self {
+        let mut names = vec![crate::spec::ROW_KIND_FIELD_NAME.to_string()];
+        if crate::table::table_read::audit_sequence_number_enabled(self.table) {
+            names.push(crate::spec::SEQUENCE_NUMBER_FIELD_NAME.to_string());
+        }
+        self.scan = self
+            .scan
+            .with_query_auth_scope(std::collections::HashSet::new(), None, names);
+        self
     }
 
     pub(crate) fn new(

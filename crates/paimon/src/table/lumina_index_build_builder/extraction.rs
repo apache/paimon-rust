@@ -30,11 +30,10 @@ pub(super) async fn extract_vectors(
     shard: &LuminaIndexShard,
     index_column: &str,
     dimension: i32,
+    grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
 ) -> Result<Vec<f32>> {
-    // Index building reads raw values, so it requires an unrestricted grant (a
-    // restricted one would index a filtered/masked view); stamp it so the read
-    // is authorized. Mirrors the B-tree index builder.
-    let build_grant = table.authorize_unrestricted_read().await?;
+    // Index building reads raw values, so `grant` must be the unrestricted one
+    // the caller obtained; stamp it so the read is authorized.
     let split = DataSplitBuilder::new()
         .with_snapshot(shard.snapshot_id)
         .with_partition(shard.partition.clone())
@@ -47,7 +46,7 @@ pub(super) async fn extract_vectors(
             shard.row_range_end,
         )])
         .build()?
-        .with_query_auth_grant(build_grant);
+        .with_query_auth_grant(grant.cloned());
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;

@@ -124,9 +124,23 @@ impl<'a> FormatTableScan<'a> {
         });
         let grant = self
             .table
-            .verify_query_auth_for_read(select.as_ref(), &self.query_auth_system_select)
+            .verify_query_auth_for_read(select.as_ref(), Some(&self.query_auth_system_select))
             .await?;
         if let Some(grant) = &grant {
+            // The grant authorizes the catalog table, but `plan_inner` reads
+            // from `CoreOptions::path`. An override could point the scan at
+            // another directory and have those splits stamped with this grant.
+            let core = CoreOptions::new(self.table.schema().options());
+            if core.path().is_some_and(|p| {
+                p.trim_end_matches('/') != self.table.location().trim_end_matches('/')
+            }) {
+                return Err(crate::Error::Unsupported {
+                    message: "a 'path' override cannot be used on a \
+                              'query-auth.enabled' table: the grant authorizes the \
+                              catalog table's location, not the overridden one"
+                        .to_string(),
+                });
+            }
             crate::table::query_auth::scope_check(
                 grant,
                 self.table.schema().fields(),

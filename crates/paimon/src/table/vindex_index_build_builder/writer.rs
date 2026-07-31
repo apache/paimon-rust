@@ -47,6 +47,7 @@ pub(super) struct BuiltIndexFile {
 }
 
 impl<'a> VindexIndexBuildBuilder<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_index_file(
         &self,
         shard: &VindexIndexShard,
@@ -55,6 +56,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
+        grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
     ) -> Result<BuiltIndexFile> {
         let timing_enabled = vector_index_build_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
@@ -106,11 +108,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             source: Some(Box::new(e)),
         })?;
         let mut raw_file = tokio::fs::File::from_std(raw_file);
-        // Index building reads raw values, so it requires an unrestricted grant:
-        // a restricted one would index a filtered or masked view. Stamp it so the
-        // read below is authorized. Mirrors the sorted global index builder.
-        let build_grant = self.table.authorize_unrestricted_read().await?;
-        let split = data_split_for_shard(shard)?.with_query_auth_grant(build_grant);
+        // Index building reads raw values, so `grant` must be the unrestricted one
+        // `execute` obtained: a restricted one would index a filtered or masked
+        // view. Stamp it so the read below is authorized.
+        let split = data_split_for_shard(shard)?.with_query_auth_grant(grant.cloned());
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
         let read = read_builder.new_read()?;

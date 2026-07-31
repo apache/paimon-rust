@@ -60,8 +60,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
-        // Building the index scans the table's rows.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // Building the index scans the table's rows. Authorize before reading any
+        // manifest or index metadata, and once for the whole build: doing it per
+        // shard both skipped the early-return paths and issued one REST
+        // round-trip per shard.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let grant = build_grant.as_ref();
 
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -176,6 +180,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     index_field.id(),
                     &vindex_options,
                     index_meta.clone(),
+                    grant,
                 )
                 .await
             {

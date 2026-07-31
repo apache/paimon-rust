@@ -709,10 +709,9 @@ impl TableCommit {
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        // No query-auth gate: abort only deletes files the caller just wrote and
-        // publishes nothing. A restricted user's commit is rejected *after*
-        // `prepare_commit` wrote them, so requiring a grant here would strand
-        // those files instead of cleaning them up.
+        // No query-auth gate: abort only deletes files the caller just wrote.
+        // A restricted commit is rejected after `prepare_commit` wrote them, so
+        // gating here would strand them instead of cleaning up.
         self.table.ensure_not_branch_reference_for_write()?;
 
         let table_path = self.table.location().trim_end_matches('/');

@@ -672,6 +672,23 @@ impl Predicate {
             Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
         }
     }
+    /// Column names referenced by every leaf. Unlike
+    /// [`Self::collect_leaf_field_indices`] this surfaces system columns too,
+    /// whose positional index is not a table-schema index.
+    pub fn collect_leaf_column_names(&self, out: &mut std::collections::HashSet<String>) {
+        match self {
+            Predicate::Leaf { column, .. } => {
+                out.insert(column.clone());
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children
+                    .iter()
+                    .for_each(|c| c.collect_leaf_column_names(out));
+            }
+            Predicate::Not(inner) => inner.collect_leaf_column_names(out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
 
     /// Serialize this predicate in the REST catalog wire format, the inverse of
     /// [`Self::from_rest_json`].
@@ -2489,6 +2506,31 @@ mod tests {
     }
 
     // ======================== Decimal equivalence ========================
+
+    #[test]
+    fn test_user_leaf_indices_skip_system_columns() {
+        use std::collections::HashSet;
+        // A `_ROW_ID` leaf carries a placeholder index (0). Treating it as a
+        // table-schema index would drag an unrelated column into the auth
+        // request and the scope checks.
+        let row_id = Predicate::Leaf {
+            index: 0,
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            data_type: DataType::BigInt(BigIntType::new()),
+            op: PredicateOperator::GtEq,
+            literals: vec![Datum::Long(5)],
+        };
+        let mut all = HashSet::new();
+        row_id.collect_leaf_field_indices(&mut all);
+        assert_eq!(all, HashSet::from([0]), "placeholder index is present");
+
+        let mut names = HashSet::new();
+        row_id.collect_leaf_column_names(&mut names);
+        assert_eq!(
+            names,
+            HashSet::from([crate::spec::ROW_ID_FIELD_NAME.to_string()])
+        );
+    }
 
     #[test]
     fn test_decimal_eq_same_scale() {

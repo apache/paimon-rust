@@ -370,6 +370,10 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
+        // Read before `into_splits` consumes the plan. From the plan, not its
+        // splits: a fully pruned plan carries no split to stamp, but its scan
+        // metadata is just as pre-enforcement.
+        let restricted = self.plan.planned_under_restricted_grant();
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
@@ -381,18 +385,21 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        Ok(Arc::new(PaimonTableScan::try_new(
-            projected_schema,
-            self.table.clone(),
-            read_type,
-            self.pushed_predicate,
-            planned_partitions,
-            self.limit,
-            self.filter_exact,
-            self.scan_trace,
-            None,
-            self.case_sensitive,
-        )?))
+        Ok(Arc::new(
+            PaimonTableScan::try_new(
+                projected_schema,
+                self.table.clone(),
+                read_type,
+                self.pushed_predicate,
+                planned_partitions,
+                self.limit,
+                self.filter_exact,
+                self.scan_trace,
+                None,
+                self.case_sensitive,
+            )?
+            .with_query_auth_restricted(restricted),
+        ))
     }
 }
 

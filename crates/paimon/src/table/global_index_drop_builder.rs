@@ -54,6 +54,10 @@ impl<'a> GlobalIndexDropBuilder<'a> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
         self.table.ensure_not_branch_reference_for_write()?;
+        // Before any metadata read: the commit-time gate is too late, since a
+        // restricted caller would otherwise learn whether a matching index
+        // exists from the difference between `Ok(0)` and a rejection.
+        self.table.authorize_unrestricted_write().await?;
 
         let index_type =
             normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {

@@ -1551,7 +1551,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         let total_start = timing_enabled.then(Instant::now);
         // The builder target is authoritative for current auth/type policy.
         // A prepared filter only pins a snapshot and may carry older options.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.authorize_unrestricted_read().await?;
         if let Some(prepared) = &self.prepared_filter {
             if !same_vector_search_table(self.table, prepared.table()) {
                 return Err(crate::Error::DataInvalid {
@@ -1566,7 +1566,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 });
             }
         }
-        // Strict, like the scored path: batch vector search reads index files
+        // Strict: batch vector search reads index files raw and ranks over
         // raw and returns top-k membership/ordering/scores over masked or
         // filter-hidden rows — a ranking oracle it cannot enforce the row filter
         // on, so only a fully unrestricted grant may run it. The pinned
@@ -1578,8 +1578,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             .as_ref()
             .map(PreparedVectorSearchFilter::table)
             .unwrap_or(self.table);
-        execution_table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(execution_table.schema().options());
+        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -5410,11 +5410,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_execute_fails_closed_when_query_auth_enabled() {
-        // The batch scored entry returns data-derived row ids/scores outside
-        // `TableScan`/`TableRead`, so it must fail closed under
-        // `query-auth.enabled` exactly like the single-query builder. Its config
-        // is otherwise valid, so without the guard the empty-snapshot fast path
-        // would return empty results and silently bypass authorization.
+        // The batch builder reads index files raw, never through
+        // `plan`/`to_arrow`, so it gates query-auth itself. The config is valid,
+        // so without the guard the empty-snapshot path would bypass it.
         let table = crate::table::query_auth_table();
         let err = table
             .new_batch_vector_search_builder()

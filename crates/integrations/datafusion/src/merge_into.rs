@@ -1314,10 +1314,9 @@ pub(crate) async fn register_cow_target_table(
         return Ok((false, table_name));
     }
 
-    // This read rewrites the target files, so it must see raw rows: authorize an
-    // unrestricted grant once and stamp it on every split. Stamping the scan
-    // plan's grant instead would shift the positional row offsets the writer
-    // replays under a row filter, rewriting the wrong rows.
+    // This read rewrites the target files, so it must see raw rows. The scan
+    // plan's grant would shift the positional row offsets the writer replays,
+    // rewriting the wrong rows.
     let mut splits = Vec::with_capacity(file_index.len());
     for file_info in file_index.iter() {
         splits.push(
