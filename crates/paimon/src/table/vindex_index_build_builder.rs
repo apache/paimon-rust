@@ -63,6 +63,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         self.table.ensure_not_branch_reference_for_write()?;
+        // Authorize before reading any manifest or index metadata, and once for
+        // the whole build: doing it per shard both skipped the early-return
+        // paths and issued one REST round-trip per shard.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let grant = build_grant.as_ref();
 
         if !is_vindex_index_type(&self.index_type) {
             return Err(Error::DataInvalid {
@@ -158,7 +163,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let shard_count = shards.len();
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
-            let vectors = extract_vectors(self.table, &shard, index_column, dimension).await?;
+            let vectors =
+                extract_vectors(self.table, &shard, index_column, dimension, grant).await?;
             let index_file = self
                 .build_index_file(
                     &shard,
@@ -551,7 +557,10 @@ async fn extract_vectors(
     shard: &VindexIndexShard,
     index_column: &str,
     dimension: i32,
+    grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
 ) -> Result<Vec<f32>> {
+    // Index building reads raw values, so `grant` must be the unrestricted one
+    // the caller obtained; stamp it so the read is authorized.
     let split = DataSplitBuilder::new()
         .with_snapshot(shard.snapshot_id)
         .with_partition(shard.partition.clone())
@@ -563,7 +572,8 @@ async fn extract_vectors(
             shard.row_range_start,
             shard.row_range_end,
         )])
-        .build()?;
+        .build()?
+        .with_query_auth_grant(grant.cloned());
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;

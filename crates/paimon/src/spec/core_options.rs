@@ -416,8 +416,9 @@ impl<'a> CoreOptions<'a> {
 
     /// Whether `query-auth.enabled` is set.
     ///
-    /// When set, the server enforces a per-user row filter / column masking that this client
-    /// can't yet apply, so read paths fail closed (see `ensure_read_authorized`).
+    /// When set, every read must first be authorized against the REST server,
+    /// which returns a per-user row filter / column masking to apply. Paths that
+    /// cannot do so fail closed (see `ensure_read_authorized`).
     pub fn query_auth_enabled(&self) -> bool {
         self.options
             .get(QUERY_AUTH_ENABLED_OPTION)
@@ -431,9 +432,9 @@ impl<'a> CoreOptions<'a> {
     pub fn ensure_read_authorized(&self) -> crate::Result<()> {
         if self.query_auth_enabled() {
             return Err(crate::Error::Unsupported {
-                message: "reading a table with 'query-auth.enabled' = true is not supported: \
-                          the Rust client cannot yet enforce its row-level auth filter / column \
-                          masking, so it refuses to read to avoid returning unfiltered data"
+                message: "reading a table with 'query-auth.enabled' = true is not supported on \
+                          this path: it cannot obtain or apply the server's per-user row filter / \
+                          column masking, so it refuses to read to avoid returning raw data"
                     .to_string(),
             });
         }

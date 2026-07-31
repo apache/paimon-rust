@@ -631,6 +631,45 @@ impl Predicate {
             Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
         }
     }
+
+    /// Like [`Self::collect_leaf_field_indices`], but skipping leaves that name
+    /// a reserved system column. Their index is a placeholder (`_ROW_ID` uses
+    /// 0), so treating it as a table-schema index would point at an unrelated
+    /// column; callers track those leaves by name instead.
+    pub fn collect_user_leaf_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
+        match self {
+            Predicate::Leaf { index, column, .. } => {
+                if !crate::table::query_auth::is_reserved_system_field_name(column) {
+                    out.insert(*index);
+                }
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children
+                    .iter()
+                    .for_each(|c| c.collect_user_leaf_field_indices(out));
+            }
+            Predicate::Not(inner) => inner.collect_user_leaf_field_indices(out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
+
+    /// Column names referenced by every leaf. Unlike
+    /// [`Self::collect_leaf_field_indices`] this surfaces system columns too,
+    /// whose positional index is not a table-schema index.
+    pub fn collect_leaf_column_names(&self, out: &mut std::collections::HashSet<String>) {
+        match self {
+            Predicate::Leaf { column, .. } => {
+                out.insert(column.clone());
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children
+                    .iter()
+                    .for_each(|c| c.collect_leaf_column_names(out));
+            }
+            Predicate::Not(inner) => inner.collect_leaf_column_names(out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
 }
 
 fn rest_json_err(detail: impl fmt::Display) -> Error {
@@ -2190,6 +2229,28 @@ mod tests {
     }
 
     // ======================== Decimal equivalence ========================
+
+    #[test]
+    fn test_user_leaf_indices_skip_system_columns() {
+        use std::collections::HashSet;
+        // A `_ROW_ID` leaf carries a placeholder index (0). Treating it as a
+        // table-schema index would drag an unrelated column into the auth
+        // request and the scope checks.
+        let row_id = Predicate::Leaf {
+            index: 0,
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            data_type: DataType::BigInt(BigIntType::new()),
+            op: PredicateOperator::GtEq,
+            literals: vec![Datum::Long(5)],
+        };
+        let mut all = HashSet::new();
+        row_id.collect_leaf_field_indices(&mut all);
+        assert_eq!(all, HashSet::from([0]), "placeholder index is present");
+
+        let mut user = HashSet::new();
+        row_id.collect_user_leaf_field_indices(&mut user);
+        assert!(user.is_empty(), "system leaf must not contribute an index");
+    }
 
     #[test]
     fn test_decimal_eq_same_scale() {

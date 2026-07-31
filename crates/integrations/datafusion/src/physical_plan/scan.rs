@@ -768,6 +768,10 @@ pub struct PaimonTableScan {
     /// Column-name case sensitivity carried from planning to execution so the
     /// read path resolves names the same way the scan was planned.
     case_sensitive: bool,
+    /// Set from [`paimon::table::Plan::planned_under_restricted_grant`]. Kept
+    /// on the plan rather than inferred from the splits, so a fully pruned scan
+    /// still suppresses its metadata.
+    query_auth_restricted: bool,
     /// Physical filters retained from DataFusion's runtime filter-pushdown pass.
     /// They are evaluated exactly by this scan.
     runtime_filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -778,6 +782,22 @@ pub struct PaimonTableScan {
 }
 
 impl PaimonTableScan {
+    /// Record that this scan was planned under a row filter or column masking.
+    pub(crate) fn with_query_auth_restricted(mut self, restricted: bool) -> Self {
+        self.query_auth_restricted = restricted;
+        self
+    }
+
+    /// Whether this scan runs under a row filter or column masking.
+    fn is_query_auth_restricted(&self) -> bool {
+        self.query_auth_restricted
+            || self
+                .planned_partitions
+                .iter()
+                .flat_map(|splits| splits.iter())
+                .any(paimon::DataSplit::has_restricted_query_auth_grant)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: ArrowSchemaRef,
@@ -808,6 +828,7 @@ impl PaimonTableScan {
             scan_trace,
             pushed_variants,
             case_sensitive,
+            query_auth_restricted: false,
             runtime_filters: Vec::new(),
             decoder_filters: Vec::new(),
         }
@@ -848,6 +869,16 @@ impl PaimonTableScan {
 
     fn manifest_column_statistics(&self, partitions: &[Arc<[DataSplit]>]) -> Vec<ColumnStatistics> {
         if self.read_type.len() != self.schema().fields().len() {
+            return Statistics::unknown_column(&self.schema());
+        }
+
+        // Manifest stats precede enforcement: a masked column's bounds are the
+        // raw values it hides, and null counts cover filtered-out rows.
+        if partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::has_restricted_query_auth_grant)
+        {
             return Statistics::unknown_column(&self.schema());
         }
 
@@ -1066,6 +1097,16 @@ impl ExecutionPlan for PaimonTableScan {
             None => &self.planned_partitions,
         };
 
+        // The manifest row count precedes the filter, so it would disclose how
+        // much data is hidden. Report the whole thing as unknown.
+        if partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::has_restricted_query_auth_grant)
+        {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        }
+
         let mut total_rows: usize = 0;
         let mut all_row_counts_known = true;
         for splits in partitions {
@@ -1108,6 +1149,19 @@ impl DisplayAs for PaimonTableScan {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
+
+        // These counts and the trace precede the filter/masking that run in
+        // `TableRead`, so EXPLAIN would disclose what enforcement hides — the
+        // same reason the statistics are suppressed.
+        if self.is_query_auth_restricted() {
+            write!(f, ", query-auth=restricted")?;
+            let columns = self
+                .read_type
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect::<Vec<_>>();
+            return write!(f, ", projection=[{}]", columns.join(", "));
+        }
 
         let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
         let total_files: usize = self

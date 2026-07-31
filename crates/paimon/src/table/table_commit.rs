@@ -156,6 +156,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -199,6 +200,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -270,6 +272,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
@@ -519,6 +522,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -566,6 +570,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -597,6 +602,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
+        self.table.authorize_unrestricted_write().await?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -621,6 +627,9 @@ impl TableCommit {
     /// files or storage errors are ignored so abort cleanup never masks the
     /// original write failure.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
+        // No query-auth gate: abort only deletes files the caller just wrote.
+        // A restricted commit is rejected after `prepare_commit` wrote them, so
+        // gating here would strand them instead of cleaning up.
         self.table.ensure_not_branch_reference_for_write()?;
 
         for message in commit_messages {

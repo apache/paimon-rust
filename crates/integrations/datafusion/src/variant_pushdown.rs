@@ -243,23 +243,30 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
                 .collect()
         };
         let filter_exact = !filter_analysis.requires_residual
+            && plan.row_counts_exact()
             && filter_analysis
                 .pushed_predicate
                 .as_ref()
                 .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
 
-        Ok(Some(Arc::new(PaimonTableScan::new(
-            Arc::clone(&node.arrow_schema),
-            node.table.clone(),
-            node.read_type.clone(),
-            filter_analysis.pushed_predicate,
-            planned_partitions,
-            pushed_limit,
-            filter_exact,
-            Some(scan_trace),
-            Some(node.pushed_variants.clone()),
-            case_sensitive,
-        ))))
+        // From the plan, not its splits: a fully pruned plan carries no split to
+        // stamp, but its scan metadata is just as pre-enforcement.
+        let restricted = plan.planned_under_restricted_grant();
+        Ok(Some(Arc::new(
+            PaimonTableScan::new(
+                Arc::clone(&node.arrow_schema),
+                node.table.clone(),
+                node.read_type.clone(),
+                filter_analysis.pushed_predicate,
+                planned_partitions,
+                pushed_limit,
+                filter_exact,
+                Some(scan_trace),
+                Some(node.pushed_variants.clone()),
+                case_sensitive,
+            )
+            .with_query_auth_restricted(restricted),
+        )))
     }
 }
 

@@ -50,6 +50,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+# for the shared REST catalog mock (crates/paimon/tests/mock_server.rs)
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
 bytes = "1.7.1"
 flate2 = "1"
 paimon-ftindex-core = "0.1.0"

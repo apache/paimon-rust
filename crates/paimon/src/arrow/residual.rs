@@ -368,7 +368,7 @@ pub(crate) fn evaluate_exact_leaf_predicate(
 /// operator, including finer-scale literals that cannot be represented at the
 /// column scale (e.g. `d > 1.05` on a DECIMAL(_,1) column is exactly `d >= 1.1`).
 /// NULL rows stay NULL in the mask (collapsed to `false` by the caller).
-fn evaluate_decimal_leaf(
+pub(crate) fn evaluate_decimal_leaf(
     array: &ArrayRef,
     op: PredicateOperator,
     literals: &[Datum],
@@ -696,7 +696,7 @@ fn set_membership_hash_mask(
     }
 }
 
-fn evaluate_column_predicate(
+pub(crate) fn evaluate_column_predicate(
     column: &ArrayRef,
     scalar: &Scalar<ArrayRef>,
     op: PredicateOperator,
@@ -855,7 +855,7 @@ fn combine_filter_masks(left: &BooleanArray, right: &BooleanArray, use_or: bool)
     BooleanArray::new(values, None)
 }
 
-fn boolean_mask_from_predicate(
+pub(crate) fn boolean_mask_from_predicate(
     len: usize,
     mut predicate: impl FnMut(usize) -> bool,
 ) -> BooleanArray {

@@ -255,6 +255,17 @@ impl TableSchema {
         Ok(())
     }
 
+    /// Force `query-auth.enabled = true`. The REST catalog delivers the flag on
+    /// the table response, so a copy built from an on-disk schema (a branch's)
+    /// must re-assert it.
+    pub(crate) fn copy_with_query_auth_enabled(&self) -> Self {
+        let mut new_schema = self.clone();
+        new_schema
+            .options
+            .insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
+        new_schema
+    }
+
     /// Apply a list of schema changes and return a new schema with incremented ID.
     ///
     /// Column-level changes operate on **top-level** columns only: a

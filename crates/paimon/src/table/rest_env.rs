@@ -71,6 +71,12 @@ impl RESTEnv {
         }
     }
 
+    /// The REST catalog's table UUID: stable across renames and unique across
+    /// catalogs, unlike an identifier or the per-table schema counter.
+    pub(crate) fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
     #[cfg(test)]
     fn has_local_cache(&self) -> bool {
         self.local_cache.is_some()
@@ -186,6 +192,15 @@ impl RESTEnv {
             table_schema,
             Some(rest_env),
         ))
+    }
+
+    /// Fetch the per-user row filter and column masking for this table.
+    /// Mirrors Java `CatalogEnvironment.tableQueryAuth()`.
+    pub(crate) async fn table_query_auth(
+        &self,
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.api.auth_table_query(&self.identifier, select).await
     }
 
     /// Create a `RESTSnapshotCommit` from this environment.

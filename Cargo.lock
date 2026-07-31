@@ -4607,6 +4607,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "constant_time_eq",

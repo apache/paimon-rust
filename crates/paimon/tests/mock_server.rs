@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use paimon::api::{
-    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
-    CreateFunctionRequest, CreateViewRequest, ErrorResponse, GetDatabaseResponse,
+    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, AuthTableQueryResponse,
+    ConfigResponse, CreateFunctionRequest, CreateViewRequest, ErrorResponse, GetDatabaseResponse,
     GetFunctionResponse, GetTableResponse, GetViewResponse, ListDatabasesResponse,
     ListFunctionsResponse, ListTablesResponse, ListViewsResponse, RenameTableRequest,
     ResourcePaths,
@@ -53,6 +53,8 @@ struct MockState {
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
+    /// Per-table auth response for `POST .../tables/{table}/auth`; absent = unrestricted.
+    auth_responses: HashMap<String, AuthTableQueryResponse>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -705,6 +707,20 @@ impl RESTServer {
         (StatusCode::NOT_FOUND, Json(err)).into_response()
     }
 
+    /// Handle POST /databases/:db/tables/:table/auth - per-user query-auth check.
+    pub async fn auth_table_query(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let response = s
+            .auth_responses
+            .get(&format!("{db}.{table}"))
+            .cloned()
+            .unwrap_or_default();
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
     /// Handle DELETE /databases/:db/tables/:table - drop a table.
     pub async fn drop_table(
         Path((db, table)): Path<(String, String)>,
@@ -967,6 +983,13 @@ impl RESTServer {
         );
     }
 
+    /// Set the auth response returned for `POST .../tables/{table}/auth`.
+    pub fn set_auth_response(&self, database: &str, table: &str, response: AuthTableQueryResponse) {
+        let mut s = self.inner.lock().unwrap();
+        s.auth_responses
+            .insert(format!("{database}.{table}"), response);
+    }
+
     /// Add a no-permission table to the server state.
     pub fn add_no_permission_table(&self, database: &str, table: &str) {
         let mut s = self.inner.lock().unwrap();
@@ -1104,6 +1127,10 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/functions/:function"),
             get(RESTServer::get_function),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/auth"),
+            post(RESTServer::auth_table_query),
         )
         .route(
             &format!("{prefix}/tables/rename"),

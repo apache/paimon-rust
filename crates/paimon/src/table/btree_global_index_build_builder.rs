@@ -84,6 +84,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         self.table.ensure_not_branch_reference_for_write()?;
+        // Authorize before reading any manifest or index metadata, and once for
+        // the whole build: doing it per shard both skipped the early-return
+        // paths and issued one REST round-trip per shard.
+        let build_grant = self.table.authorize_unrestricted_read().await?;
+        let grant = build_grant.as_ref();
 
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -167,7 +172,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = self
-                .build_index_file(&shard, index_field, index_column)
+                .build_index_file(&shard, index_field, index_column, grant)
                 .await?;
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
@@ -194,6 +199,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         shard: &BTreeGlobalIndexShard,
         index_field: &DataField,
         index_column: &str,
+        grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -205,8 +211,15 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let (cmp, serialize_key) = make_index_key_codec(index_type, index_field.data_type());
-        let mut rows =
-            extract_index_rows(self.table, shard, index_column, index_field, serialize_key).await?;
+        let mut rows = extract_index_rows(
+            self.table,
+            shard,
+            index_column,
+            index_field,
+            serialize_key,
+            grant,
+        )
+        .await?;
         sort_index_rows(&mut rows, &cmp);
 
         self.table
@@ -613,8 +626,12 @@ async fn extract_index_rows(
     index_column: &str,
     index_field: &DataField,
     serialize_key: SerializeKeyFn,
+    grant: Option<&std::sync::Arc<crate::table::query_auth::QueryAuthGrant>>,
 ) -> Result<Vec<BTreeKeyRow>> {
-    let splits = build_read_splits_for_shard(shard)?;
+    let splits: Vec<crate::table::DataSplit> = build_read_splits_for_shard(shard)?
+        .into_iter()
+        .map(|s| s.with_query_auth_grant(grant.cloned()))
+        .collect();
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;

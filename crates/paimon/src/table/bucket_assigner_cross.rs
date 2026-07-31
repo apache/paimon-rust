@@ -85,6 +85,11 @@ impl GlobalPartitionIndex {
             .collect();
         let projected_pk_indices: Vec<usize> = (0..pk_fields.len()).collect();
 
+        // The cross-partition PK index reads every primary key; under a
+        // restricted grant it would miss hidden keys and produce duplicate PKs
+        // or lost updates on upsert.
+        table.authorize_unrestricted_read().await?;
+
         let mut rb = table.new_read_builder();
         rb.with_projection(&pk_field_names)?;
         let scan = rb.new_scan().with_scan_all_files();

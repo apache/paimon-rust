@@ -64,6 +64,9 @@ impl Table {
     ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
+        // Record counts and key values come from raw manifests, which a row
+        // filter would not touch. Also covers `list_partitions`.
+        self.authorize_unrestricted_read().await?;
         let sm = SnapshotManager::new(self.file_io().clone(), self.location().to_string());
         let snapshot = match sm.get_latest_snapshot().await? {
             Some(s) => s,

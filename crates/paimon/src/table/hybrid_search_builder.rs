@@ -286,8 +286,10 @@ impl<'a> HybridSearchBuilder<'a> {
     }
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
@@ -350,8 +352,11 @@ impl<'a> HybridSearchBuilder<'a> {
     /// (append/data-evolution) hybrid is unsupported here — those use
     /// `execute`/`execute_scored`. Mirrors Java `HybridSearchBuilderImpl` PK path.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+        // Materializes rows outside `TableScan`/`TableRead`, so it cannot apply
+        // the row filter / masking — only a fully unrestricted grant may run it
+        // (same gate as the vector and full-text builders).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;

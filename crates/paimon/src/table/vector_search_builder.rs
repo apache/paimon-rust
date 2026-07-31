@@ -200,8 +200,10 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
+        // Strict: search results bypass the query-auth row filter, so only a
+        // fully unrestricted grant may search.
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -275,9 +277,11 @@ impl<'a> VectorSearchBuilder<'a> {
     /// [`with_projection`](Self::with_projection)) plus `__paimon_search_score`;
     /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
-        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        // Fail closed: materializes rows outside `TableScan`/`TableRead`, so it
+        // cannot apply the row filter / masking — only a fully unrestricted
+        // grant may run it (same gate as the scored entry points).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1053,12 +1057,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
-        // Fail closed: like `execute_read` and the single-query builder, this
-        // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
-        // so it must refuse a `query-auth.enabled` table before any fast path
-        // (an empty snapshot would otherwise return empty results and bypass it).
+        // Batch vector search reads index files raw and ranks over masked or
+        // hidden rows — an oracle it cannot enforce the filter on. Checked
+        // before any fast path, or an empty snapshot would bypass it.
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1172,9 +1175,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     /// scored global row-ids, not materialized rows, so callers use
     /// [`execute`](Self::execute) instead.
     pub async fn execute_read(&self) -> crate::Result<Vec<ArrowRecordBatchStream>> {
-        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        // Fail closed: materializes rows outside `TableScan`/`TableRead`, so it
+        // cannot apply the row filter / masking — only a fully unrestricted
+        // grant may run it (same gate as the scored entry points).
+        self.table.authorize_unrestricted_read().await?;
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -3532,11 +3537,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_execute_fails_closed_when_query_auth_enabled() {
-        // The batch scored entry returns data-derived row ids/scores outside
-        // `TableScan`/`TableRead`, so it must fail closed under
-        // `query-auth.enabled` exactly like the single-query builder. Its config
-        // is otherwise valid, so without the guard the empty-snapshot fast path
-        // would return empty results and silently bypass authorization.
+        // The batch builder reads index files raw, never through
+        // `plan`/`to_arrow`, so it gates query-auth itself. The config is valid,
+        // so without the guard the empty-snapshot path would bypass it.
         let table = crate::table::query_auth_table();
         let err = table
             .new_batch_vector_search_builder()

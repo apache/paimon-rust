@@ -1233,12 +1233,13 @@ pub(crate) async fn register_cow_target_table(
         return Ok((false, table_name));
     }
 
-    // Read all files in parallel
-    let read_futures: Vec<_> = file_index
-        .iter()
-        .enumerate()
-        .map(|(file_idx, file_info)| async move {
-            let single_split = DataSplitBuilder::new()
+    // This read rewrites the target files, so it must see raw rows. The scan
+    // plan's grant would shift the positional row offsets the writer replays,
+    // rewriting the wrong rows.
+    let mut splits = Vec::with_capacity(file_index.len());
+    for file_info in file_index.iter() {
+        splits.push(
+            DataSplitBuilder::new()
                 .with_snapshot(file_info.snapshot_id)
                 .with_partition(
                     paimon::spec::BinaryRow::from_serialized_bytes(&file_info.partition)
@@ -1249,8 +1250,19 @@ pub(crate) async fn register_cow_target_table(
                 .with_total_buckets(file_info.total_buckets)
                 .with_data_files(vec![file_info.file_meta.clone()])
                 .build()
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error)?,
+        );
+    }
+    let splits = table
+        .authorize_rewrite_splits(splits)
+        .await
+        .map_err(to_datafusion_error)?;
 
+    // Read all files in parallel
+    let read_futures: Vec<_> = splits
+        .into_iter()
+        .enumerate()
+        .map(|(file_idx, single_split)| async move {
             let read = table
                 .new_read_builder()
                 .new_read()

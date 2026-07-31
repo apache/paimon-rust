@@ -164,6 +164,10 @@ impl DataEvolutionWriter {
             return Ok(Vec::new());
         }
 
+        // This rewrite reads each affected file's original columns, so a
+        // restricted grant would filter/mask rows into the committed result.
+        let write_grant = self.table.authorize_unrestricted_read().await?;
+
         // 1. Scan file metadata and build row_id -> file group index.
         //    In data-evolution tables, multiple files can share the same first_row_id
         //    (base file + partial-column files). We must group them so the reader
@@ -248,7 +252,8 @@ impl DataEvolutionWriter {
                 .with_total_buckets(file_range.total_buckets)
                 .with_data_files(file_range.files.clone())
                 .with_raw_convertible(file_range.files.len() == 1)
-                .build()?;
+                .build()?
+                .with_query_auth_grant(write_grant.clone());
 
             let stream = read.to_arrow(&[split])?;
             let original_batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -459,6 +464,10 @@ impl DataEvolutionDeleteWriter {
         if self.row_ids.is_empty() {
             return Ok(Vec::new());
         }
+
+        // The row ids come from a read the caller performed; under a restricted
+        // grant the deletion vectors would encode a filtered view.
+        self.table.authorize_unrestricted_read().await?;
 
         let scan = self
             .table

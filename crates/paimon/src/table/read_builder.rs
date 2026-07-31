@@ -210,6 +210,8 @@ impl<'a> ReadBuilder<'a> {
     }
 
     /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Slicing by physical row id selects rows by `_ROW_ID` without any
+    /// predicate, so it must reach the auth request like a filter on it would.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -291,6 +293,13 @@ struct PaimonReadBuilder<'a> {
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    /// Table-schema indices referenced by the full caller filter (before it is
+    /// split into partition/data conjuncts). The query-auth gates check these
+    /// against the grant fetched at plan time.
+    filter_columns: HashSet<usize>,
+    /// System columns (`_ROW_ID`, …) the caller filter referenced. They have no
+    /// table index, and row-id extraction strips the leaf before planning.
+    filter_system_names: HashSet<String>,
 }
 
 impl<'a> PaimonReadBuilder<'a> {
@@ -303,6 +312,8 @@ impl<'a> PaimonReadBuilder<'a> {
             limit: None,
             row_ranges: None,
             case_sensitive: true,
+            filter_columns: HashSet::new(),
+            filter_system_names: HashSet::new(),
         }
     }
 
@@ -362,6 +373,20 @@ impl<'a> PaimonReadBuilder<'a> {
     /// primary-key merge reads push key conjuncts below the merge and enforce
     /// the full predicate with an exact post-merge residual filter.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        // Capture the FULL predicate's columns before it is split into
+        // partition/data conjuncts, so the guards see a masked partition key
+        // that would otherwise be pruned on its raw value.
+        self.filter_columns.clear();
+        filter.collect_user_leaf_field_indices(&mut self.filter_columns);
+        // System columns too, and BEFORE `try_extract_row_id_ranges` strips the
+        // `_ROW_ID` leaf: it selects rows by that column without ever appearing
+        // in the read type, so the server must still get to refuse it.
+        let mut names = std::collections::HashSet::new();
+        filter.collect_leaf_column_names(&mut names);
+        self.filter_system_names = names
+            .into_iter()
+            .filter(|n| crate::table::query_auth::is_reserved_system_field_name(n.as_str()))
+            .collect();
         self.filter = normalize_filter(self.table, filter);
         self.try_extract_row_id_ranges();
         self
@@ -380,6 +405,8 @@ impl<'a> PaimonReadBuilder<'a> {
     }
 
     /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Slicing by physical row id selects rows by `_ROW_ID` without any
+    /// predicate, so it must reach the auth request like a filter on it would.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         self.row_ranges = if ranges.is_empty() {
             None
@@ -434,6 +461,9 @@ impl<'a> PaimonReadBuilder<'a> {
         let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
+        // The grant's field ids are folded into the projection in
+        // `TableScan::plan`, where it has been fetched; reading an empty grant
+        // here was a fail-open row-filter bypass.
         let read_type = self.resolve_read_type().unwrap_or(None);
         TableScan::new(
             self.table,
@@ -448,14 +478,47 @@ impl<'a> PaimonReadBuilder<'a> {
             &self.filter.data_predicates,
             self.table.schema().fields(),
         ))
+        .with_query_auth_scope(
+            self.filter_columns.clone(),
+            self.projected_schema_indices(),
+            self.projected_system_field_names(),
+        )
+    }
+
+    /// Table-schema indices of the projected columns (`None` = all).
+    /// Projected system fields (`_ROW_ID`, …). `projected_schema_indices` drops
+    /// them for lack of an index, but Java's `select` includes them.
+    fn projected_system_field_names(&self) -> Vec<String> {
+        crate::table::query_auth::projected_system_field_names(
+            self.resolve_read_type().ok().flatten().as_deref(),
+            &self.filter_system_names,
+            self.row_ranges.is_some(),
+        )
+    }
+
+    fn projected_schema_indices(&self) -> Option<Vec<usize>> {
+        // Resolve names too: a `with_projection` selection lives in
+        // `projection_names`, and scoping to all columns would deny a user
+        // authorized for exactly the subset. Unresolvable falls back to full
+        // scope; `new_read` reports the error.
+        self.resolve_read_type().ok().flatten().map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| {
+                    self.table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|s| s.id() == f.id())
+                })
+                .collect()
+        })
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        // Fail closed at read construction so bindings that short-circuit before
-        // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
-        let core_options = self.table.schema.core_options();
-        core_options.ensure_read_authorized()?;
+        // Enforced in `TableRead::to_arrow` off the grant planning stamped on
+        // the splits, so read construction needs no gate.
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,
@@ -813,28 +876,272 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_read_fails_closed_when_query_auth_enabled() {
+    /// A real split carrying no query-auth grant (an unauthorized read path).
+    fn ungranted_split() -> crate::table::DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4, 1)])
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_closed_when_query_auth_enabled() {
         let table = query_auth_table();
-        // `new_read` fails closed, so bindings that short-circuit before `to_arrow` can't bypass.
-        let err = table.new_read_builder().new_read().unwrap_err();
+        // Enforcement is at `to_arrow` off the split grant: a read whose splits
+        // carry no grant (never authorized by planning) must fail closed, so
+        // bindings that short-circuit can't bypass.
+        let read = table.new_read_builder().new_read().unwrap();
+        let Err(err) = read.to_arrow(&[ungranted_split()]) else {
+            panic!("a query-auth read without a stamped grant must fail closed");
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "building a read for a query-auth.enabled table must fail closed"
         );
     }
 
-    #[test]
-    fn test_dynamic_option_cannot_disable_query_auth() {
+    #[tokio::test]
+    async fn test_dynamic_option_cannot_disable_query_auth() {
         // Copying the table with the option off must not weaken a stored `true`.
         let table = query_auth_table().copy_with_options(HashMap::from([(
             "query-auth.enabled".to_string(),
             "false".to_string(),
         )]));
-        let err = table.new_read_builder().new_read().unwrap_err();
+        let read = table.new_read_builder().new_read().unwrap();
+        let Err(err) = read.to_arrow(&[ungranted_split()]) else {
+            panic!("a dynamic override must not disable query-auth");
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_auth_filtered_grant_filters_rows_exactly() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 20, 30])],
+            None,
+        );
+        let file_size = fs::metadata(&parquet_path).unwrap().len() as i64;
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("query-auth.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        // Grant: the user may only see rows with value >= 10. The filter column
+        // is NOT in the projection, so the read must fetch it and project it away.
+        // The grant is threaded on the split (as scan planning would stamp it).
+        let auth_filter = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+        let grant = std::sync::Arc::new(crate::table::query_auth::QueryAuthGrant::new(
+            vec![auth_filter],
+            Vec::new(),
+            None,
+            None,
+            crate::table::query_auth::GrantBinding::of(&table),
+        ));
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
+            .build()
+            .unwrap()
+            .with_query_auth_grant(Some(grant));
+
+        let read = TableRead::new(&table, vec![table.schema().fields()[0].clone()], Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+        // The filter column must not leak into the output schema.
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_auth_masked_grant_masks_and_guards_predicates() {
+        use crate::table::query_auth::{parse_column_masking, QueryAuthGrant};
+        use arrow_array::Array;
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![1, 2, 20, 30])],
+            None,
+        );
+        let file_size = fs::metadata(&parquet_path).unwrap().len() as i64;
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("query-auth.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        // Grant: filter on raw `value` >= 10, then mask `value` with NULL.
+        let auth_filter = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+        let masks = parse_column_masking(
+            &std::collections::HashMap::from([(
+                "value".to_string(),
+                r#"{"name":"NULL"}"#.to_string(),
+            )]),
+            table.schema().fields(),
+        )
+        .unwrap();
+        let grant = std::sync::Arc::new(QueryAuthGrant::new(
+            vec![auth_filter],
+            masks,
+            None,
+            None,
+            crate::table::query_auth::GrantBinding::of(&table),
+        ));
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
+            .build()
+            .unwrap()
+            .with_query_auth_grant(Some(grant));
+
+        // Filter runs on raw values, then the surviving rows are masked.
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+        assert_eq!(batches[0].column(1).null_count(), 2, "value masked to NULL");
+
+        // A caller predicate on the masked column must fail closed (oracle guard).
+        let caller_filter = PredicateBuilder::new(table.schema().fields())
+            .equal("value", crate::spec::Datum::Int(20))
+            .unwrap();
+        let read = TableRead::new(
+            &table,
+            table.schema().fields().to_vec(),
+            vec![caller_filter],
+        );
+        let Err(err) = read.to_arrow(&[split]) else {
+            panic!("filtering on a masked column must fail closed");
+        };
+        assert!(err.to_string().contains("masked column"), "got: {err}");
+    }
+
+    #[test]
+    fn test_row_id_filter_reaches_the_auth_select() {
+        // `try_extract_row_id_ranges` strips the `_ROW_ID` leaf from the
+        // predicates during `with_filter`, so collecting system names from the
+        // surviving predicates afterwards would never see it.
+        let table = crate::table::query_auth_table();
+        let mut rb = table.new_read_builder();
+        let filter = crate::spec::Predicate::Leaf {
+            index: 0,
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            data_type: crate::spec::DataType::BigInt(crate::spec::BigIntType::new()),
+            op: crate::spec::PredicateOperator::GtEq,
+            literals: vec![crate::spec::Datum::Long(5)],
+        };
+        rb.with_filter(filter);
+        let names = paimon_builder(&rb).projected_system_field_names();
+        assert!(
+            names.iter().any(|n| n == crate::spec::ROW_ID_FIELD_NAME),
+            "a _ROW_ID filter must reach the auth select, got {names:?}"
+        );
+
+        // An explicit row-range slice selects by `_ROW_ID` with no predicate.
+        let mut rb2 = table.new_read_builder();
+        rb2.with_row_ranges(vec![crate::table::RowRange::new(0, 10)]);
+        let names2 = paimon_builder(&rb2).projected_system_field_names();
+        assert!(names2.iter().any(|n| n == crate::spec::ROW_ID_FIELD_NAME));
+    }
+
+    #[tokio::test]
+    async fn test_query_auth_scope_rejects_unauthorized_column() {
+        use crate::table::query_auth::QueryAuthGrant;
+        // A grant scoped to no columns must fail closed when the read projects
+        // `id` — the scope check runs in `to_arrow` before any data is read
+        // (and also at plan time; see the rest_catalog integration test).
+        let table = query_auth_table();
+        let grant = std::sync::Arc::new(QueryAuthGrant::new(
+            Vec::new(),
+            Vec::new(),
+            Some(HashSet::new()),
+            None,
+            crate::table::query_auth::GrantBinding::of(&table),
+        ));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("/tmp/does-not-matter".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4, 1)])
+            .build()
+            .unwrap()
+            .with_query_auth_grant(Some(grant));
+        let read = TableRead::new(&table, vec![table.schema().fields()[0].clone()], Vec::new());
+        let Err(err) = read.to_arrow(&[split]) else {
+            panic!("reading an unauthorized column must fail closed");
+        };
+        assert!(
+            err.to_string().contains("outside the authorized set"),
+            "got: {err}"
         );
     }
 

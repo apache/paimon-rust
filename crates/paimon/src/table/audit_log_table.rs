@@ -77,7 +77,11 @@ impl AuditLogTable {
         start_exclusive: i64,
         end_inclusive: i64,
     ) -> IncrementalScan<'_> {
+        // The audit read prepends `rowkind` (and `_SEQUENCE_NUMBER` when
+        // enabled) to its output; declare them at planning time so the server
+        // sees them in `select` and the grant's system scope covers them.
         IncrementalScan::for_table(&self.wrapped, mode, start_exclusive, end_inclusive)
+            .with_audit_system_fields()
     }
 
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
