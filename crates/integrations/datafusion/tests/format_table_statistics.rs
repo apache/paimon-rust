@@ -197,3 +197,17 @@ async fn test_format_table_with_empty_file_counts_zero() {
         0
     );
 }
+
+/// A positive `LIMIT` must not be answered from a file count. A format table has no
+/// row counts, so keeping only the first `limit` files is a guess, and an empty data
+/// file — ordinary output from an engine that writes one file per task — makes the
+/// guess wrong.
+#[tokio::test]
+async fn test_format_table_limit_is_not_answered_from_a_file_count() {
+    let (_tmp, context, table_dir) = setup_format_table().await;
+    write_parquet(&table_dir.join("part-0.parquet"), &[]);
+    write_parquet(&table_dir.join("part-1.parquet"), &[1, 2, 3]);
+
+    let scanned = scanned_rows(&context, "SELECT id FROM paimon.test_db.events LIMIT 1").await;
+    assert_eq!(scanned, 1, "LIMIT 1 over 3 rows must return a row");
+}

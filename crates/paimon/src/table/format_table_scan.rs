@@ -272,13 +272,17 @@ impl<'a> FormatTableScan<'a> {
         }
     }
 
+    /// A limit of zero needs no split at all. A positive one keeps every split: a format
+    /// table has no row counts, so the number of files says nothing about the number of
+    /// rows, and dropping files would answer the query from a guess.
+    ///
+    /// Mirrors Java `FormatTableScan.FormatTableScanPlan.splits`.
     pub(crate) fn apply_limit_pushdown(
         &self,
         splits: Vec<crate::DataSplit>,
     ) -> Vec<crate::DataSplit> {
         match self.limit {
             Some(0) => Vec::new(),
-            Some(limit) if splits.len() > limit => splits.into_iter().take(limit).collect(),
             _ => splits,
         }
     }
