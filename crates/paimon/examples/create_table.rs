@@ -8,12 +8,12 @@ use paimon::catalog::Identifier;
 use paimon::spec::{DataType, IntType, Schema, VarCharType};
 use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
 
-// This example create a paimon table and inserts test data
+// This example creates a paimon table and inserts test data
 // set the catalog path and run example using:
 // cargo run --package paimon --example create_table
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Create local catalog
+    // Open local catalog
     let catalog = create_catelog().await?;
 
     // Create new database
@@ -81,10 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 pub async fn create_catelog() -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
     let mut options = Options::new();
-    options.set(
-        CatalogOptions::WAREHOUSE,
-        "/home/ganesh/paimon/exp/paimon-rust/crates/paimon/testdata",
-    );
+    options.set(CatalogOptions::WAREHOUSE, "/path-to/testdata");
     let catalog = CatalogFactory::create(options).await?;
     Ok(catalog)
 }
