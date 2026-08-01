@@ -128,7 +128,7 @@ jobs:
           rustup update stable
           rustup default stable
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -207,7 +207,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.source_sha }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
