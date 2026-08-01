@@ -4541,7 +4541,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libloading 0.9.0",
  "log",
- "lz4_flex 0.11.6",
+ "lz4_flex 0.13.1",
  "md-5 0.10.6",
  "opendal-core",
  "opendal-http-transport-reqwest",
