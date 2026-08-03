@@ -4493,15 +4493,26 @@ mod tests {
                 "embedding",
                 DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
             );
-        for (k, v) in options {
-            builder = builder.option(*k, *v);
+        if options
+            .iter()
+            .any(|(key, _)| *key == "pk-vector.index.columns")
+        {
+            builder = builder.primary_key(["id"]).option("bucket", "1");
         }
         let schema = builder.build().unwrap();
+        // Runtime validation must remain defensive for schemas committed by old
+        // or external writers, including malformed configurations which the
+        // current Schema builder rejects at commit time.
+        let runtime_options = options
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let table_schema = TableSchema::new(0, &schema).copy_with_options(runtime_options);
         Table::new(
             FileIOBuilder::new("memory").build().unwrap(),
             Identifier::new("default", "pk_vector_test"),
             "memory:/pk_vector_test".to_string(),
-            TableSchema::new(0, &schema),
+            table_schema,
             None,
         )
     }
@@ -4649,6 +4660,7 @@ mod tests {
             )
             .primary_key(["id"])
             .option("bucket", "1")
+            .option("deletion-vectors.enabled", "true")
             .option("pk-vector.index.columns", "embedding")
             .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
             .option("fields.embedding.pk-vector.distance.metric", "l2")
@@ -5135,29 +5147,39 @@ mod tests {
     async fn execute_read_partition_only_filter_without_deletion_vectors_passes_guard() {
         use crate::spec::VarCharType;
 
-        // Partitioned PK-vector table, deletion vectors OFF (default).
-        let mut builder = Schema::builder()
+        // Partitioned PK-vector table from old metadata, deletion vectors OFF.
+        let schema = Schema::builder()
             .column("dt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .column(
                 "embedding",
                 DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
             )
-            .partition_keys(["dt"]);
-        for (k, v) in [
-            ("pk-vector.index.columns", "embedding"),
-            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
-            ("fields.embedding.pk-vector.distance.metric", "l2"),
-            ("fields.embedding.dimension", "4"),
-        ] {
-            builder = builder.option(k, v);
-        }
-        let schema = builder.build().unwrap();
+            .partition_keys(["dt"])
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let table_schema = TableSchema::new(0, &schema).copy_with_options(HashMap::from([
+            (
+                "pk-vector.index.columns".to_string(),
+                "embedding".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                IVF_FLAT_IDENTIFIER.to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.distance.metric".to_string(),
+                "l2".to_string(),
+            ),
+            ("fields.embedding.dimension".to_string(), "4".to_string()),
+        ]));
         let table = Table::new(
             FileIOBuilder::new("memory").build().unwrap(),
             Identifier::new("default", "pk_vector_partitioned"),
             "memory:/pk_vector_partitioned".to_string(),
-            TableSchema::new(0, &schema),
+            table_schema,
             None,
         );
 
@@ -5773,6 +5795,9 @@ mod tests {
                 DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
             )
             .column(reserved, DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("deletion-vectors.enabled", "true")
             .option("pk-vector.index.columns", "embedding")
             .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
             .option("fields.embedding.pk-vector.distance.metric", "l2")

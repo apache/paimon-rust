@@ -1221,8 +1221,8 @@ impl<'a> CoreOptions<'a> {
         self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
     }
 
-    /// The configured PK-vector index columns, split on ',' and trimmed. Errors when
-    /// the key is present but resolves to no non-blank column.
+    /// The configured PK-vector index columns, split on ',' and trimmed. Blank tokens
+    /// are preserved so schema validation can reject malformed column lists.
     pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
         let raw = self
             .options
@@ -1230,17 +1230,7 @@ impl<'a> CoreOptions<'a> {
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "pk-vector.index.columns is not set".to_string(),
             })?;
-        let columns: Vec<String> = raw
-            .split(',')
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
-            .collect();
-        if columns.is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "pk-vector.index.columns is set but names no column".to_string(),
-            });
-        }
-        Ok(columns)
+        Ok(raw.split(',').map(|c| c.trim().to_string()).collect())
     }
 
     /// The single PK-vector index column. The first release supports exactly one.
@@ -2344,11 +2334,21 @@ mod tests {
     }
 
     #[test]
-    fn test_pk_vector_empty_columns_errors() {
-        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "  ,  ".to_string())]);
-        let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_vector_index_enabled()); // key present
-        assert!(co.primary_key_vector_index_columns().is_err());
+    fn test_pk_vector_index_columns_preserve_blank_tokens() {
+        for (value, expected) in [
+            ("embedding,", vec!["embedding", ""]),
+            (",embedding", vec!["", "embedding"]),
+            ("embedding,,", vec!["embedding", "", ""]),
+            (" ", vec![""]),
+        ] {
+            let opts = HashMap::from([("pk-vector.index.columns".to_string(), value.to_string())]);
+            assert_eq!(
+                CoreOptions::new(&opts)
+                    .primary_key_vector_index_columns()
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@
 use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
-    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
+    POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -268,6 +268,20 @@ impl TableSchema {
             .get(crate::spec::DISABLE_EXPLICIT_TYPE_CASTING_OPTION)
             .map(|v| v != "true")
             .unwrap_or(true);
+        // Capture stable IDs before applying changes so removing the option or
+        // renaming its column cannot bypass historical bucket-key protection.
+        let old_bucket_key_field_ids: HashSet<i32> = self
+            .core_options()
+            .bucket_key()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| {
+                self.fields
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .map(DataField::id)
+            })
+            .collect();
 
         let mut new_schema = self.clone();
         new_schema.id += 1;
@@ -338,6 +352,11 @@ impl TableSchema {
                             full_name: full_name.to_string(),
                             column: name.to_string(),
                         })?;
+                    if fields[idx].data_type().is_blob_file_field() {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot rename BLOB column: [{name}]"),
+                        });
+                    }
                     if new_name != name && field_index(&fields, &new_name).is_some() {
                         return Err(crate::Error::ColumnAlreadyExist {
                             full_name: full_name.to_string(),
@@ -382,6 +401,11 @@ impl TableSchema {
                         });
                     }
                     assert_not_updating_primary_key_index_column(&self.options, name, "drop")?;
+                    assert_not_updating_bucket_key_column(
+                        &old_bucket_key_field_ids,
+                        &fields[idx],
+                        "drop",
+                    )?;
                     // Dropping a column referenced by `bucket-key` / `sequence.field`
                     // would silently break bucket assignment / sequence ordering on
                     // existing data (e.g. `bucket_key_indices` becomes empty and writes
@@ -446,10 +470,15 @@ impl TableSchema {
                             column: name.to_string(),
                         })?;
                     let old = &fields[idx];
+                    assert_not_updating_bucket_key_column(
+                        &old_bucket_key_field_ids,
+                        old,
+                        "update type of",
+                    )?;
                     // Mirrors Java `assertNotChangingBlobColumnType`: BLOB
                     // columns use a dedicated storage layout that other types
                     // cannot be converted to or from.
-                    if old.data_type().is_blob_type() || new_data_type.is_blob_type() {
+                    if old.data_type().is_blob_file_field() || new_data_type.is_blob_file_field() {
                         return Err(crate::Error::Unsupported {
                             message: format!(
                                 "Cannot change column type involving BLOB: [{name}] {:?} -> {new_data_type:?}",
@@ -547,41 +576,12 @@ impl TableSchema {
             });
         }
 
-        // Re-run create-time validations on the final schema, mirroring Java
-        // `SchemaValidation.validateTableSchema` after applying changes.
-        validate_no_reserved_field_names(&new_schema.fields)?;
-        Schema::validate_key_field_types(
-            &new_schema.fields,
-            &new_schema.primary_keys,
-            &new_schema.options,
-        )?;
-        Schema::validate_blob_fields(
-            &new_schema.fields,
-            &new_schema.partition_keys,
-            &new_schema.options,
-        )?;
-        Schema::validate_vector_store_fields(
-            &new_schema.fields,
-            &new_schema.partition_keys,
-            &new_schema.options,
-        )?;
-        PartialUpdateConfig::new(&new_schema.options)
-            .validate_create_mode(!new_schema.primary_keys.is_empty())?;
-        AggregationConfig::new(&new_schema.options)
-            .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
-        Schema::validate_first_row_changelog_producer(&new_schema.options)?;
-        Schema::validate_rowkind_field(
-            &new_schema.options,
-            &new_schema.primary_keys,
-            &new_schema.fields,
-        )?;
-        Schema::validate_bucket_keys(
-            &new_schema.options,
+        Schema::validate_final_schema(
             &new_schema.fields,
             &new_schema.partition_keys,
             &new_schema.primary_keys,
+            &new_schema.options,
         )?;
-        Schema::validate_read_batch_size(&new_schema.options)?;
         Ok(new_schema)
     }
 
@@ -707,6 +707,19 @@ fn assert_not_updating_primary_key_index_column(
     if is_vector_index_column || is_full_text_index_column {
         return Err(crate::Error::Unsupported {
             message: format!("Cannot {operation} primary-key index column: [{field_name}]"),
+        });
+    }
+    Ok(())
+}
+
+fn assert_not_updating_bucket_key_column(
+    old_bucket_key_field_ids: &HashSet<i32>,
+    field: &DataField,
+    operation: &str,
+) -> crate::Result<()> {
+    if old_bucket_key_field_ids.contains(&field.id()) {
+        return Err(crate::Error::Unsupported {
+            message: format!("Cannot {operation} bucket-key column: [{}]", field.name()),
         });
     }
     Ok(())
@@ -1101,16 +1114,7 @@ impl Schema {
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
         Self::normalize_blob_comment_directives(&mut fields, &mut options)?;
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys, &options)?;
-        validate_no_reserved_field_names(&fields)?;
-        Self::validate_key_field_types(&fields, &primary_keys, &options)?;
-        Self::validate_blob_fields(&fields, &partition_keys, &options)?;
-        Self::validate_vector_store_fields(&fields, &partition_keys, &options)?;
-        PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
-        AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
-        Self::validate_first_row_changelog_producer(&options)?;
-        Self::validate_rowkind_field(&options, &primary_keys, &fields)?;
-        Self::validate_bucket_keys(&options, &fields, &partition_keys, &primary_keys)?;
-        Self::validate_read_batch_size(&options)?;
+        Self::validate_final_schema(&fields, &partition_keys, &primary_keys, &options)?;
 
         Ok(Self {
             fields,
@@ -1119,6 +1123,28 @@ impl Schema {
             options,
             comment,
         })
+    }
+
+    fn validate_final_schema(
+        fields: &[DataField],
+        partition_keys: &[String],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        validate_no_reserved_field_names(fields)?;
+        Self::validate_key_field_types(fields, primary_keys, options)?;
+        Self::validate_blob_fields(fields, partition_keys, options)?;
+        Self::validate_vector_store_fields(fields, partition_keys, options)?;
+        PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
+        AggregationConfig::new(options).validate_create_mode(primary_keys, fields)?;
+        Self::validate_first_row_changelog_producer(options)?;
+        Self::validate_rowkind_field(options, primary_keys, fields)?;
+        Self::validate_deletion_vectors(options)?;
+        Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
+        Self::validate_read_batch_size(options)?;
+        Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
+        Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        Ok(())
     }
 
     /// Normalize primary keys: optionally take from table options (`primary-key`), remove from options.
@@ -1471,6 +1497,35 @@ impl Schema {
         })
     }
 
+    fn validate_deletion_vectors(options: &HashMap<String, String>) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        if !core.deletion_vectors_enabled() {
+            return Ok(());
+        }
+
+        let changelog_producer = core
+            .try_changelog_producer()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if !matches!(
+            changelog_producer,
+            ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
+        ) {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Deletion vectors mode is only supported for NONE/INPUT/LOOKUP changelog producer now.".to_string(),
+            });
+        }
+
+        let merge_engine = core
+            .merge_engine()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if merge_engine == MergeEngine::FirstRow {
+            return Err(crate::Error::ConfigInvalid {
+                message: "First row merge engine does not need deletion vectors because there is no deletion of old data in this merge engine.".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_rowkind_field(
         options: &HashMap<String, String>,
         primary_keys: &[String],
@@ -1590,6 +1645,146 @@ impl Schema {
             .read_batch_size()
             .map(|_| ())
             .map_err(Self::options_error_to_config_invalid)
+    }
+
+    fn validate_primary_key_vector_index(
+        fields: &[DataField],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        if !core.primary_key_vector_index_enabled() {
+            return Ok(());
+        }
+
+        let column = core.primary_key_vector_index_column()?;
+        if column.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "pk-vector.index.columns must name a non-empty column".to_string(),
+            });
+        }
+        core.primary_key_vector_index_type(&column)?;
+        Self::validate_primary_key_index_prerequisites("vector", primary_keys, &core)?;
+
+        let field = fields
+            .iter()
+            .find(|field| field.name() == column)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-vector.index.columns entry '{column}' must reference an existing column."
+                ),
+            })?;
+        let supported_type = match field.data_type() {
+            DataType::Vector(vector) => matches!(vector.element_type(), DataType::Float(_)),
+            DataType::Array(array) => matches!(array.element_type(), DataType::Float(_)),
+            _ => false,
+        };
+        if !supported_type {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-vector.index.columns entry '{column}' must reference an ARRAY<FLOAT> or VECTOR<FLOAT> column."
+                ),
+            });
+        }
+
+        core.primary_key_vector_distance_metric(&column)
+            .map(|_| ())
+            .map_err(Self::options_error_to_config_invalid)
+    }
+
+    fn validate_primary_key_full_text_index(
+        fields: &[DataField],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        if !core.primary_key_full_text_index_enabled() {
+            return Ok(());
+        }
+
+        let columns = core.primary_key_full_text_index_columns();
+        if columns.len() != 1 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-full-text.index.columns must name exactly one column, got {}",
+                    columns.len()
+                ),
+            });
+        }
+        let column = &columns[0];
+        if column.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "pk-full-text.index.columns must name a non-empty column".to_string(),
+            });
+        }
+
+        Self::validate_primary_key_index_prerequisites("full-text", primary_keys, &core)?;
+        if core.primary_key_vector_index_enabled()
+            && core.primary_key_vector_index_column()? == *column
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Primary-key vector and full-text indexes cannot reference the same column: '{column}'."
+                ),
+            });
+        }
+
+        let field = fields
+            .iter()
+            .find(|field| field.name() == column)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-full-text.index.columns entry '{column}' must reference an existing column."
+                ),
+            })?;
+        if !matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_)) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-full-text.index.columns entry '{column}' must reference a CHAR or VARCHAR column."
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_primary_key_index_prerequisites(
+        index_name: &str,
+        primary_keys: &[String],
+        core: &CoreOptions<'_>,
+    ) -> crate::Result<()> {
+        if primary_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Primary-key {index_name} index requires a primary-key table."),
+            });
+        }
+
+        let merge_engine = core
+            .merge_engine()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if merge_engine != MergeEngine::FirstRow && !core.deletion_vectors_enabled() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Primary-key {index_name} index requires deletion-vectors.enabled = true."
+                ),
+            });
+        }
+        if core.deletion_vectors_enabled() && core.deletion_vectors_merge_on_read() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Primary-key {index_name} index requires deletion-vectors.merge-on-read = false."
+                ),
+            });
+        }
+
+        let bucket = core.bucket();
+        if bucket <= 0 && bucket != POSTPONE_BUCKET {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Primary-key {index_name} index requires fixed or postpone bucket mode (bucket > 0 or bucket = -2), but bucket is {bucket}."
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Returns top-level Blob field names for create-time Blob contract checks.
@@ -1811,9 +2006,100 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, FloatType, IntType, VarCharType, VectorType};
+    use crate::spec::{BlobType, CharType, FloatType, IntType, VarCharType, VectorType};
 
     use super::*;
+
+    fn build_index_test_schema(
+        columns: Vec<(&str, DataType)>,
+        primary_keys: &[&str],
+        options: &[(&str, &str)],
+    ) -> crate::Result<Schema> {
+        let mut builder = Schema::builder();
+        for (name, data_type) in columns {
+            builder = builder.column(name, data_type);
+        }
+        if !primary_keys.is_empty() {
+            builder = builder.primary_key(primary_keys.iter().copied());
+        }
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build()
+    }
+
+    fn assert_config_invalid<T: std::fmt::Debug>(result: crate::Result<T>, expected_message: &str) {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::ConfigInvalid { message }
+                if message.contains(expected_message)),
+            "expected ConfigInvalid containing '{expected_message}', got {error:?}"
+        );
+    }
+
+    fn build_vector_index_test_schema(
+        data_type: DataType,
+        primary_keys: &[&str],
+        configure: impl FnOnce(&mut HashMap<String, String>),
+    ) -> crate::Result<Schema> {
+        let mut options = HashMap::from([
+            ("bucket".to_string(), "1".to_string()),
+            ("deletion-vectors.enabled".to_string(), "true".to_string()),
+            (
+                "pk-vector.index.columns".to_string(),
+                "embedding".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                "ivf-flat".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.distance.metric".to_string(),
+                "l2".to_string(),
+            ),
+        ]);
+        configure(&mut options);
+        let option_refs: Vec<(&str, &str)> = options
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        build_index_test_schema(
+            vec![
+                ("id", DataType::Int(IntType::new())),
+                ("embedding", data_type),
+            ],
+            primary_keys,
+            &option_refs,
+        )
+    }
+
+    fn build_full_text_index_test_schema(
+        data_type: DataType,
+        primary_keys: &[&str],
+        configure: impl FnOnce(&mut HashMap<String, String>),
+    ) -> crate::Result<Schema> {
+        let mut options = HashMap::from([
+            ("bucket".to_string(), "1".to_string()),
+            ("deletion-vectors.enabled".to_string(), "true".to_string()),
+            (
+                "pk-full-text.index.columns".to_string(),
+                "content".to_string(),
+            ),
+        ]);
+        configure(&mut options);
+        let option_refs: Vec<(&str, &str)> = options
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        build_index_test_schema(
+            vec![
+                ("id", DataType::Int(IntType::new())),
+                ("content", data_type),
+            ],
+            primary_keys,
+            &option_refs,
+        )
+    }
 
     #[test]
     fn test_create_data_field() {
@@ -2597,6 +2883,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_deletion_vector_schema_validation_accepts_supported_changelog_producers() {
+        for producer in ["none", "input", "lookup"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("deletion-vectors.enabled", "true")
+                .option("changelog-producer", producer)
+                .build()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_deletion_vector_schema_validation_rejects_incompatible_changelog_producers() {
+        for (producer, expected_message) in [
+            ("full-compaction", "NONE/INPUT/LOOKUP"),
+            ("unknown", "Unsupported changelog-producer"),
+        ] {
+            assert_config_invalid(
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .primary_key(["id"])
+                    .option("deletion-vectors.enabled", "true")
+                    .option("changelog-producer", producer)
+                    .build(),
+                expected_message,
+            );
+        }
+    }
+
+    #[test]
+    fn test_deletion_vector_apply_changes_rejects_incompatible_changelog_producers() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("deletion-vectors.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+
+        for (producer, expected_message) in [
+            ("full-compaction", "NONE/INPUT/LOOKUP"),
+            ("unknown", "Unsupported changelog-producer"),
+        ] {
+            assert_config_invalid(
+                table_schema.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                    "changelog-producer".to_string(),
+                    producer.to_string(),
+                )]),
+                expected_message,
+            );
+        }
+    }
+
     fn cast_test_schema(options: &[(&str, &str)]) -> TableSchema {
         let mut builder = Schema::builder()
             .column("a", DataType::Int(IntType::new()))
@@ -2690,6 +3036,10 @@ mod tests {
             &Schema::builder()
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
+                .column(
+                    "payloads",
+                    DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+                )
                 .option("data-evolution.enabled", "true")
                 .build()
                 .unwrap(),
@@ -2701,6 +3051,16 @@ mod tests {
                 DataType::VarChar(crate::spec::VarCharType::new(10).unwrap()),
             ),
             ("id", DataType::Blob(BlobType::new())),
+            (
+                "payloads",
+                DataType::Array(ArrayType::new(DataType::VarBinary(
+                    crate::spec::VarBinaryType::new(10).unwrap(),
+                ))),
+            ),
+            (
+                "id",
+                DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+            ),
         ] {
             let err = table_schema
                 .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
@@ -2712,6 +3072,37 @@ mod tests {
                 matches!(err, crate::Error::Unsupported { ref message }
                     if message.contains("involving BLOB") && message.contains(column)),
                 "expected BLOB type-change rejection for {column}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_changes_rejects_blob_column_rename() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .column(
+                    "payloads",
+                    DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+                )
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+
+        for column in ["payload", "payloads"] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                    column.to_string(),
+                    format!("renamed_{column}"),
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message == &format!("Cannot rename BLOB column: [{column}]")),
+                "expected BLOB rename rejection for {column}, got {err:?}"
             );
         }
     }
@@ -3500,6 +3891,386 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_create_schema_validates_primary_key_vector_index() {
+        for vector_type in [
+            vector_4f(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        ] {
+            build_vector_index_test_schema(vector_type, &["id"], |_| {}).unwrap();
+        }
+
+        build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+            options.insert("bucket".to_string(), "-2".to_string());
+            options.insert("merge-engine".to_string(), "first-row".to_string());
+            options.remove("deletion-vectors.enabled");
+        })
+        .unwrap();
+
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert("merge-engine".to_string(), "first-row".to_string());
+            }),
+            "does not need deletion vectors",
+        );
+
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &[], |_| {}),
+            "primary-key table",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert("pk-vector.index.columns".to_string(), " ".to_string());
+            }),
+            "non-empty column",
+        );
+        for columns in ["embedding,", ",embedding", "embedding,,", "embedding,other"] {
+            assert_config_invalid(
+                build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                    options.insert("pk-vector.index.columns".to_string(), columns.to_string());
+                }),
+                "exactly one",
+            );
+        }
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert("pk-vector.index.columns".to_string(), "missing".to_string());
+                options.insert(
+                    "fields.missing.pk-vector.index.type".to_string(),
+                    "ivf-flat".to_string(),
+                );
+            }),
+            "existing column",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+                &["id"],
+                |_| {},
+            ),
+            "ARRAY<FLOAT> or VECTOR<FLOAT>",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.remove("fields.embedding.pk-vector.index.type");
+            }),
+            "index.type is required",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert(
+                    "fields.embedding.pk-vector.distance.metric".to_string(),
+                    "manhattan".to_string(),
+                );
+            }),
+            "unsupported vector distance metric",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert("bucket".to_string(), "-1".to_string());
+            }),
+            "fixed or postpone bucket",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.remove("deletion-vectors.enabled");
+            }),
+            "deletion-vectors.enabled",
+        );
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.insert(
+                    "deletion-vectors.merge-on-read".to_string(),
+                    "true".to_string(),
+                );
+            }),
+            "merge-on-read = false",
+        );
+    }
+
+    #[test]
+    fn test_apply_changes_validates_primary_key_vector_index() {
+        let table_schema = TableSchema::new(
+            0,
+            &build_index_test_schema(
+                vec![
+                    ("id", DataType::Int(IntType::new())),
+                    ("embedding", vector_4f()),
+                ],
+                &["id"],
+                &[("bucket", "1")],
+            )
+            .unwrap(),
+        );
+
+        table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "deletion-vectors.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "pk-vector.index.columns".to_string(),
+                    "embedding".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "fields.embedding.pk-vector.index.type".to_string(),
+                    "ivf-flat".to_string(),
+                ),
+            ])
+            .unwrap();
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "pk-vector.index.columns".to_string(),
+                    "embedding".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "fields.embedding.pk-vector.index.type".to_string(),
+                    "ivf-flat".to_string(),
+                ),
+            ]),
+            "deletion-vectors.enabled",
+        );
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "merge-engine".to_string(),
+                    "first-row".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "deletion-vectors.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "pk-vector.index.columns".to_string(),
+                    "embedding".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "fields.embedding.pk-vector.index.type".to_string(),
+                    "ivf-flat".to_string(),
+                ),
+            ]),
+            "does not need deletion vectors",
+        );
+
+        for (columns, expected_message) in [
+            (" ", "non-empty column"),
+            ("embedding,", "exactly one"),
+            (",embedding", "exactly one"),
+            ("embedding,,", "exactly one"),
+        ] {
+            assert_config_invalid(
+                table_schema.apply_changes(vec![
+                    crate::spec::SchemaChange::set_option(
+                        "deletion-vectors.enabled".to_string(),
+                        "true".to_string(),
+                    ),
+                    crate::spec::SchemaChange::set_option(
+                        "pk-vector.index.columns".to_string(),
+                        columns.to_string(),
+                    ),
+                    crate::spec::SchemaChange::set_option(
+                        "fields.embedding.pk-vector.index.type".to_string(),
+                        "ivf-flat".to_string(),
+                    ),
+                ]),
+                expected_message,
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_schema_validates_primary_key_full_text_index() {
+        for text_type in [
+            DataType::Char(CharType::new(32).unwrap()),
+            DataType::VarChar(VarCharType::string_type()),
+        ] {
+            build_full_text_index_test_schema(text_type, &["id"], |_| {}).unwrap();
+        }
+
+        build_full_text_index_test_schema(
+            DataType::VarChar(VarCharType::string_type()),
+            &["id"],
+            |options| {
+                options.insert("bucket".to_string(), "-2".to_string());
+                options.insert("merge-engine".to_string(), "first-row".to_string());
+                options.remove("deletion-vectors.enabled");
+            },
+        )
+        .unwrap();
+
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert("merge-engine".to_string(), "first-row".to_string());
+                },
+            ),
+            "does not need deletion vectors",
+        );
+
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &[],
+                |_| {},
+            ),
+            "primary-key table",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert("pk-full-text.index.columns".to_string(), " ".to_string());
+                },
+            ),
+            "non-empty column",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert(
+                        "pk-full-text.index.columns".to_string(),
+                        "content,other".to_string(),
+                    );
+                },
+            ),
+            "exactly one",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert(
+                        "pk-full-text.index.columns".to_string(),
+                        "missing".to_string(),
+                    );
+                },
+            ),
+            "existing column",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(DataType::Int(IntType::new()), &["id"], |_| {}),
+            "CHAR or VARCHAR",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert("bucket".to_string(), "-1".to_string());
+                },
+            ),
+            "fixed or postpone bucket",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.remove("deletion-vectors.enabled");
+                },
+            ),
+            "deletion-vectors.enabled",
+        );
+        assert_config_invalid(
+            build_full_text_index_test_schema(
+                DataType::VarChar(VarCharType::string_type()),
+                &["id"],
+                |options| {
+                    options.insert(
+                        "deletion-vectors.merge-on-read".to_string(),
+                        "true".to_string(),
+                    );
+                },
+            ),
+            "merge-on-read = false",
+        );
+        assert_config_invalid(
+            build_index_test_schema(
+                vec![
+                    ("id", DataType::Int(IntType::new())),
+                    (
+                        "embedding",
+                        DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+                    ),
+                ],
+                &["id"],
+                &[
+                    ("bucket", "1"),
+                    ("deletion-vectors.enabled", "true"),
+                    ("pk-vector.index.columns", "embedding"),
+                    ("fields.embedding.pk-vector.index.type", "ivf-flat"),
+                    ("pk-full-text.index.columns", "embedding"),
+                ],
+            ),
+            "cannot reference the same column",
+        );
+    }
+
+    #[test]
+    fn test_apply_changes_validates_primary_key_full_text_index() {
+        let table_schema = TableSchema::new(
+            0,
+            &build_index_test_schema(
+                vec![
+                    ("id", DataType::Int(IntType::new())),
+                    ("content", DataType::VarChar(VarCharType::string_type())),
+                ],
+                &["id"],
+                &[("bucket", "1")],
+            )
+            .unwrap(),
+        );
+
+        table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "deletion-vectors.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "pk-full-text.index.columns".to_string(),
+                    "content".to_string(),
+                ),
+            ])
+            .unwrap();
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "pk-full-text.index.columns".to_string(),
+                "content".to_string(),
+            )]),
+            "deletion-vectors.enabled",
+        );
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "merge-engine".to_string(),
+                    "first-row".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "deletion-vectors.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "pk-full-text.index.columns".to_string(),
+                    "content".to_string(),
+                ),
+            ]),
+            "does not need deletion vectors",
+        );
+    }
+
     fn assert_primary_key_index_column_changes_rejected(
         table_schema: &TableSchema,
         column_name: &str,
@@ -3587,13 +4358,28 @@ mod tests {
                 .option("bucket", "1")
                 .option("deletion-vectors.enabled", "true")
                 .option("pk-vector.index.columns", "embedding")
-                .option("fields.embedding.pk-vector.index.type", "ivf_flat")
+                .option("fields.embedding.pk-vector.index.type", "ivf-flat")
                 .option("fields.embedding.pk-vector.distance.metric", "l2")
                 .build()
                 .unwrap(),
         );
 
         assert_primary_key_index_column_changes_rejected(&table_schema, "embedding", vector_type);
+
+        let err = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::remove_option("pk-vector.index.columns".to_string()),
+                crate::spec::SchemaChange::rename_column(
+                    "embedding".to_string(),
+                    "renamed_embedding".to_string(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { ref message }
+                if message == "Cannot rename primary-key index column: [embedding]"
+        ));
     }
 
     #[test]
@@ -3847,6 +4633,60 @@ mod tests {
                 if message.contains("bucket-key") && message.contains("name")),
             "drop of a bucket-key column should be rejected, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_bucket_key_history_rejects_destructive_column_changes() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("bucket_col", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("bucket", "4")
+                .option("bucket-key", "bucket_col")
+                .build()
+                .unwrap(),
+        );
+
+        for changes in [
+            vec![crate::spec::SchemaChange::update_column_type(
+                "bucket_col".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )],
+            vec![
+                crate::spec::SchemaChange::remove_option(BUCKET_KEY_OPTION.to_string()),
+                crate::spec::SchemaChange::drop_column("bucket_col".to_string()),
+            ],
+            vec![
+                crate::spec::SchemaChange::rename_column(
+                    "bucket_col".to_string(),
+                    "renamed_bucket_col".to_string(),
+                ),
+                crate::spec::SchemaChange::update_column_type(
+                    "renamed_bucket_col".to_string(),
+                    DataType::BigInt(crate::spec::BigIntType::new()),
+                ),
+            ],
+        ] {
+            let err = table_schema.apply_changes(changes).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("bucket-key column") && message.contains("bucket_col")),
+                "expected historical bucket-key protection, got {err:?}"
+            );
+        }
+
+        let updated = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::BigInt(crate::spec::BigIntType::new()),
+            )])
+            .unwrap();
+        assert!(matches!(
+            updated.fields()[2].data_type(),
+            DataType::BigInt(_)
+        ));
     }
 
     #[test]

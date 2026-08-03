@@ -1341,6 +1341,7 @@ mod tests {
             .column("body", DataType::VarChar(VarCharType::string_type()))
             .primary_key(["id"])
             .option("bucket", "1")
+            .option("deletion-vectors.enabled", "true")
             .option("pk-full-text.index.columns", "body");
         for (k, v) in extra {
             builder = builder.option(*k, *v);
