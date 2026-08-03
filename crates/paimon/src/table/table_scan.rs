@@ -167,7 +167,7 @@ async fn read_all_manifest_entries(
 
     if let Some(index) = row_range_index {
         let before = manifest_files.len();
-        retain_manifest_row_range_components(&mut manifest_files, index);
+        retain_manifest_row_ranges(&mut manifest_files, index);
         if let Some(trace) = trace.as_deref_mut() {
             trace.manifest_files_pruned_by_row_ranges = before - manifest_files.len();
         }
@@ -271,7 +271,7 @@ async fn read_all_manifest_entries(
     let manifest_entries_after_merge = all_entries.len();
     if let Some(index) = row_range_index {
         let before = all_entries.len();
-        all_entries = retain_live_manifest_entry_row_range_groups(all_entries, index);
+        all_entries = retain_manifest_entry_row_ranges(all_entries, index);
         counters.pruned_by_row_ranges = before - all_entries.len();
     }
     if let Some(trace) = trace {
@@ -288,7 +288,6 @@ async fn read_all_manifest_entries(
     Ok(all_entries)
 }
 
-#[cfg(test)]
 fn manifest_file_overlaps_row_range_index(
     manifest: &crate::spec::ManifestFileMeta,
     row_range_index: &RowRangeIndex,
@@ -303,64 +302,13 @@ fn manifest_row_id_range(manifest: &crate::spec::ManifestFileMeta) -> Option<(i6
     }
 }
 
-fn retain_manifest_row_range_components(
+fn retain_manifest_row_ranges(
     manifests: &mut Vec<crate::spec::ManifestFileMeta>,
     row_range_index: &RowRangeIndex,
 ) {
-    let ranges = manifests
-        .iter()
-        .map(manifest_row_id_range)
-        .collect::<Option<Vec<_>>>();
-    let Some(ranges) = ranges else {
-        // An unknown manifest range may contain the anchor that connects otherwise
-        // disjoint dedicated-file ranges. Fail open for the whole list.
-        return;
-    };
-
-    let mut order = (0..manifests.len()).collect::<Vec<_>>();
-    order.sort_unstable_by_key(|&idx| ranges[idx]);
-    let mut keep = vec![false; manifests.len()];
-    let mut component = Vec::new();
-    let mut component_from = 0i64;
-    let mut component_to = 0i64;
-
-    for idx in order {
-        let (from, to) = ranges[idx];
-        if component.is_empty() {
-            component_from = from;
-            component_to = to;
-            component.push(idx);
-        } else if from <= component_to {
-            component_to = component_to.max(to);
-            component.push(idx);
-        } else {
-            if row_range_index.intersects(component_from, component_to) {
-                for component_idx in component.drain(..) {
-                    keep[component_idx] = true;
-                }
-            } else {
-                component.clear();
-            }
-            component_from = from;
-            component_to = to;
-            component.push(idx);
-        }
-    }
-    if !component.is_empty() && row_range_index.intersects(component_from, component_to) {
-        for component_idx in component {
-            keep[component_idx] = true;
-        }
-    }
-
-    let mut idx = 0usize;
-    manifests.retain(|_| {
-        let retain = keep[idx];
-        idx += 1;
-        retain
-    });
+    manifests.retain(|manifest| manifest_file_overlaps_row_range_index(manifest, row_range_index));
 }
 
-#[cfg(test)]
 fn data_file_overlaps_row_range_index(
     file: &DataFileMeta,
     row_range_index: &RowRangeIndex,
@@ -369,152 +317,14 @@ fn data_file_overlaps_row_range_index(
         .is_none_or(|(from, to)| row_range_index.intersects(from, to))
 }
 
-fn retain_live_manifest_entry_row_range_groups(
+fn retain_manifest_entry_row_ranges(
     entries: Vec<ManifestEntry>,
     row_range_index: &RowRangeIndex,
 ) -> Vec<ManifestEntry> {
-    debug_assert!(entries.iter().all(|entry| *entry.kind() == FileKind::Add));
-    let mut buckets: HashMap<(&[u8], i32), Vec<usize>> = HashMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        buckets
-            .entry((entry.partition(), entry.bucket()))
-            .or_default()
-            .push(idx);
-    }
-
-    let mut keep = vec![false; entries.len()];
-    for indices in buckets.values_mut() {
-        if indices
-            .iter()
-            .any(|&idx| entries[idx].file().row_id_range().is_none())
-        {
-            // Unknown file ranges may bridge otherwise disjoint row groups.
-            // Keep the whole bucket rather than risking a partial group.
-            for &idx in indices.iter() {
-                keep[idx] = true;
-            }
-            continue;
-        }
-
-        indices.sort_unstable_by_key(|&idx| {
-            entries[idx]
-                .file()
-                .row_id_range()
-                .expect("validated row-id range")
-        });
-        let mut component = Vec::new();
-        let mut component_from = 0i64;
-        let mut component_to = 0i64;
-
-        for &idx in indices.iter() {
-            let (from, to) = entries[idx]
-                .file()
-                .row_id_range()
-                .expect("validated row-id range");
-            if component.is_empty() {
-                component_from = from;
-                component_to = to;
-                component.push(idx);
-            } else if from <= component_to {
-                component_to = component_to.max(to);
-                component.push(idx);
-            } else {
-                retain_selected_row_range_component(
-                    &entries,
-                    &mut keep,
-                    &component,
-                    component_from,
-                    component_to,
-                    row_range_index,
-                );
-                component.clear();
-                component_from = from;
-                component_to = to;
-                component.push(idx);
-            }
-        }
-        retain_selected_row_range_component(
-            &entries,
-            &mut keep,
-            &component,
-            component_from,
-            component_to,
-            row_range_index,
-        );
-    }
-    drop(buckets);
-
     entries
         .into_iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| keep[idx].then_some(entry))
+        .filter(|entry| data_file_overlaps_row_range_index(entry.file(), row_range_index))
         .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum DataEvolutionProviderKey<'a> {
-    Normal,
-    // Blob bunches span schema versions and resolve to one write column.
-    Blob(Option<&'a [String]>),
-    Vector(i64, String, Option<Vec<&'a str>>),
-}
-
-fn data_evolution_provider_key(file: &DataFileMeta) -> DataEvolutionProviderKey<'_> {
-    if crate::table::dedicated_format_file_writer::is_blob_file_name(&file.file_name) {
-        DataEvolutionProviderKey::Blob(file.write_cols.as_deref())
-    } else if is_vector_store_file_name(&file.file_name) {
-        let write_cols = file.write_cols.as_ref().map(|cols| {
-            let mut cols = cols.iter().map(String::as_str).collect::<Vec<_>>();
-            cols.sort_unstable();
-            cols
-        });
-        DataEvolutionProviderKey::Vector(
-            file.schema_id,
-            file.file_name
-                .rsplit('.')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-            write_cols,
-        )
-    } else {
-        DataEvolutionProviderKey::Normal
-    }
-}
-
-fn retain_selected_row_range_component(
-    entries: &[ManifestEntry],
-    keep: &mut [bool],
-    component: &[usize],
-    component_from: i64,
-    component_to: i64,
-    row_range_index: &RowRangeIndex,
-) {
-    if component.is_empty() || !row_range_index.intersects(component_from, component_to) {
-        return;
-    }
-
-    // Keep files that can contribute to the selected rows.
-    let mut selected_providers = HashSet::new();
-    for &idx in component {
-        let file = entries[idx].file();
-        let (from, to) = file.row_id_range().expect("validated row-id range");
-        if row_range_index.intersects(from, to) {
-            keep[idx] = true;
-            selected_providers.insert(data_evolution_provider_key(file));
-        }
-    }
-
-    // Keep one missing-provider witness for gap validation.
-    for &idx in component {
-        if keep[idx] {
-            continue;
-        }
-        let provider = data_evolution_provider_key(entries[idx].file());
-        if selected_providers.insert(provider) {
-            keep[idx] = true;
-        }
-    }
 }
 
 fn data_evolution_row_range_groups(
@@ -1712,7 +1522,7 @@ impl<'a> PaimonTableScan<'a> {
             }
         }
         if let Some(index) = row_range_index {
-            retain_manifest_row_range_components(&mut manifest_metas, index);
+            retain_manifest_row_ranges(&mut manifest_metas, index);
         }
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
@@ -1787,7 +1597,7 @@ impl<'a> PaimonTableScan<'a> {
         }
         let entries = merge_manifest_entries(entries);
         let entries = if let Some(index) = row_range_index {
-            retain_live_manifest_entry_row_range_groups(entries, index)
+            retain_manifest_entry_row_ranges(entries, index)
         } else {
             entries
         };
@@ -2197,9 +2007,8 @@ impl<'a> PaimonTableScan<'a> {
 mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
-        manifest_file_overlaps_row_range_index, merge_manifest_entries,
-        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_live_manifest_entry_row_range_groups, retain_manifest_row_range_components,
+        manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
+        retain_index_manifest_entry, retain_manifest_entry_row_ranges, retain_manifest_row_ranges,
         should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
         PaimonTableScan, RowRangeIndex, TableScan,
     };
@@ -2303,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_row_range_pruning_retains_overlapping_component() {
+    fn test_manifest_row_range_pruning_uses_each_envelope() {
         let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
         let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
         let manifest = |name: &str, min, max| {
@@ -2317,19 +2126,19 @@ mod tests {
             manifest("other-group", 10, 15),
         ];
 
-        retain_manifest_row_range_components(&mut manifests, &index);
+        retain_manifest_row_ranges(&mut manifests, &index);
 
         assert_eq!(
             manifests
                 .iter()
                 .map(ManifestFileMeta::file_name)
                 .collect::<Vec<_>>(),
-            vec!["anchor", "left-dedicated", "right-dedicated"]
+            vec!["anchor"]
         );
     }
 
     #[test]
-    fn test_manifest_row_range_component_pruning_fails_open_on_unknown_range() {
+    fn test_manifest_row_range_pruning_fails_open_per_unknown_range() {
         let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
         let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
         let mut manifests = vec![
@@ -2342,13 +2151,19 @@ mod tests {
                 .with_row_id_stats(Some(10), Some(15)),
         ];
 
-        retain_manifest_row_range_components(&mut manifests, &index);
+        retain_manifest_row_ranges(&mut manifests, &index);
 
-        assert_eq!(manifests.len(), 4);
+        assert_eq!(
+            manifests
+                .iter()
+                .map(ManifestFileMeta::file_name)
+                .collect::<Vec<_>>(),
+            vec!["unknown", "inverted", "one-sided"]
+        );
     }
 
     #[test]
-    fn test_manifest_entry_row_range_pruning_drops_disjoint_files_from_wide_component() {
+    fn test_manifest_entry_row_range_pruning_uses_each_file_range() {
         let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
         let entry = |name: &str, first_row_id, row_count| {
             ManifestEntry::new(
@@ -2367,7 +2182,7 @@ mod tests {
             entry("other-group", 10, 2),
         ];
 
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_manifest_entry_row_ranges(entries, &index);
 
         assert_eq!(
             retained
@@ -2379,150 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_entry_row_range_pruning_prunes_rolled_blob_sidecars_behind_wide_anchor() {
-        let index = RowRangeIndex::create(vec![RowRange::new(120, 129)]);
-        let entry = |name: &str, first_row_id, row_count, schema_id, write_cols: &[&str]| {
-            let mut file = make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols);
-            file.schema_id = schema_id;
-            ManifestEntry::new(FileKind::Add, Vec::new(), 0, 1, file, 3)
-        };
-        let entries = vec![
-            entry("base.parquet", 0, 1_000, 3, &["record_index"]),
-            entry("image-0.blob", 0, 100, 1, &["image"]),
-            entry("image-1.blob", 100, 100, 3, &["image"]),
-            entry("image-2.blob", 200, 100, 2, &["image"]),
-            entry("image-3.blob", 300, 100, 3, &["image"]),
-        ];
-
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
-
-        assert_eq!(
-            retained
-                .iter()
-                .map(|entry| entry.file().file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["base.parquet", "image-1.blob"]
-        );
-    }
-
-    #[test]
-    fn test_vector_provider_key_distinguishes_schema_ids() {
-        let index = RowRangeIndex::create(vec![RowRange::new(120, 129)]);
-        let entry = |name: &str, first_row_id, row_count, schema_id, write_cols: &[&str]| {
-            let mut file = make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols);
-            file.schema_id = schema_id;
-            ManifestEntry::new(FileKind::Add, Vec::new(), 0, 1, file, 3)
-        };
-        let entries = vec![
-            entry("base.parquet", 0, 1_000, 3, &["id"]),
-            entry("old.vector.parquet", 0, 100, 1, &["embedding"]),
-            entry("new.vector.parquet", 100, 100, 3, &["embedding"]),
-        ];
-
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
-
-        assert_eq!(
-            retained
-                .iter()
-                .map(|entry| entry.file().file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["base.parquet", "old.vector.parquet", "new.vector.parquet"]
-        );
-    }
-
-    #[test]
-    fn test_vector_provider_key_normalizes_write_col_order() {
-        let index = RowRangeIndex::create(vec![RowRange::new(120, 129)]);
-        let entry = |name: &str, first_row_id, row_count, write_cols: &[&str]| {
-            ManifestEntry::new(
-                FileKind::Add,
-                Vec::new(),
-                0,
-                1,
-                make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols),
-                3,
-            )
-        };
-        let entries = vec![
-            entry("base.parquet", 0, 1_000, &["id"]),
-            entry("old.vector.parquet", 0, 100, &["velocity", "embedding"]),
-            entry("new.vector.parquet", 100, 100, &["embedding", "velocity"]),
-        ];
-
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
-
-        assert_eq!(
-            retained
-                .iter()
-                .map(|entry| entry.file().file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["base.parquet", "new.vector.parquet"]
-        );
-    }
-
-    #[test]
-    fn test_manifest_entry_row_range_pruning_keeps_provider_witness_for_selected_gap() {
-        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
-        let entry = |name: &str, first_row_id, row_count, write_cols: &[&str]| {
-            ManifestEntry::new(
-                FileKind::Add,
-                Vec::new(),
-                0,
-                1,
-                make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols),
-                3,
-            )
-        };
-        let entries = vec![
-            entry("base.parquet", 0, 6, &["id"]),
-            entry("payload-left.blob", 0, 2, &["payload"]),
-            entry("payload-right.blob", 4, 2, &["payload"]),
-        ];
-
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
-
-        assert_eq!(
-            retained
-                .iter()
-                .map(|entry| entry.file().file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["base.parquet", "payload-left.blob"]
-        );
-    }
-
-    #[test]
-    fn test_manifest_entry_row_range_pruning_does_not_resurrect_deleted_provider_witness() {
-        let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
-        let entry = |kind, name: &str, first_row_id, row_count, write_cols: &[&str]| {
-            ManifestEntry::new(
-                kind,
-                Vec::new(),
-                0,
-                1,
-                make_evo_file_with_cols(name, row_count, 0, first_row_id, write_cols),
-                3,
-            )
-        };
-        let entries = vec![
-            entry(FileKind::Add, "base.parquet", 0, 6, &["id"]),
-            entry(FileKind::Add, "deleted-payload.blob", 0, 2, &["payload"]),
-            entry(FileKind::Delete, "deleted-payload.blob", 0, 2, &["payload"]),
-        ];
-
-        let live_entries = merge_manifest_entries(entries);
-        let retained = retain_live_manifest_entry_row_range_groups(live_entries, &index);
-
-        assert_eq!(
-            retained
-                .iter()
-                .map(|entry| entry.file().file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["base.parquet"]
-        );
-    }
-
-    #[test]
-    fn test_manifest_entry_row_range_pruning_fails_open_per_bucket() {
+    fn test_manifest_entry_row_range_pruning_fails_open_per_file() {
         let index = RowRangeIndex::create(vec![RowRange::new(2, 2)]);
         let entry = |name: &str, bucket, first_row_id, row_count| {
             ManifestEntry::new(
@@ -2542,22 +2214,14 @@ mod tests {
             entry("bucket-1-outside", 1, Some(10), 2),
         ];
 
-        let retained = retain_live_manifest_entry_row_range_groups(entries, &index);
+        let retained = retain_manifest_entry_row_ranges(entries, &index);
 
         let mut names = retained
             .into_iter()
             .map(|entry| entry.file().file_name.clone())
             .collect::<Vec<_>>();
         names.sort();
-        assert_eq!(
-            names,
-            vec![
-                "bucket-0-outside",
-                "overflow",
-                "unknown-anchor",
-                "zero-count",
-            ]
-        );
+        assert_eq!(names, vec!["overflow", "unknown-anchor", "zero-count"]);
     }
 
     #[test]

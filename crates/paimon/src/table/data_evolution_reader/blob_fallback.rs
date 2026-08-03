@@ -106,11 +106,13 @@ impl LazyBlobFile {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn read(
     split: &DataSplit,
     bunch: BlobBunch,
     read_fields: Vec<DataField>,
     row_ranges: Option<Vec<RowRange>>,
+    batch_size: Option<usize>,
     file_io: FileIO,
     blob_as_descriptor: bool,
     anchor_deletion_vector: Option<DeletionVectorContext>,
@@ -124,6 +126,7 @@ pub(super) fn read(
 
     let target_schema = build_target_arrow_schema(&read_fields)?;
     let array_field = matches!(read_fields[0].data_type(), DataType::Array(_));
+    let batch_size = batch_size.unwrap_or(BATCH_SIZE).max(1);
     let split = split.clone();
 
     Ok(try_stream! {
@@ -161,8 +164,8 @@ pub(super) fn read(
             }
         }
 
-        let mut row_cursor = RowIdBatchCursor::new(selected_ranges);
-        while let Some(row_ids) = row_cursor.next_batch(BATCH_SIZE) {
+        let mut row_cursor = RowIdBatchCursor::new(selected_ranges, batch_size);
+        while let Some(row_ids) = row_cursor.next_batch() {
             yield resolve_batch(
                 &mut sequence_groups,
                 &row_ids,
@@ -270,21 +273,23 @@ struct RowIdBatchCursor {
     ranges: Vec<RowRange>,
     range_index: usize,
     next_row_id: Option<i64>,
+    batch_size: usize,
 }
 
 impl RowIdBatchCursor {
-    fn new(ranges: Vec<RowRange>) -> Self {
+    fn new(ranges: Vec<RowRange>, batch_size: usize) -> Self {
         let next_row_id = ranges.first().map(RowRange::from);
         Self {
             ranges,
             range_index: 0,
             next_row_id,
+            batch_size,
         }
     }
 
-    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<i64>> {
-        let mut row_ids = Vec::with_capacity(batch_size);
-        while row_ids.len() < batch_size {
+    fn next_batch(&mut self) -> Option<Vec<i64>> {
+        let mut row_ids = Vec::with_capacity(self.batch_size);
+        while row_ids.len() < self.batch_size {
             let Some(row_id) = self.next_row_id else {
                 break;
             };
@@ -311,6 +316,16 @@ mod tests {
     use bytes::Bytes;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_row_id_batch_cursor_honors_batch_size() {
+        let mut cursor = RowIdBatchCursor::new(vec![RowRange::new(0, 4)], 2);
+
+        assert_eq!(cursor.next_batch(), Some(vec![0, 1]));
+        assert_eq!(cursor.next_batch(), Some(vec![2, 3]));
+        assert_eq!(cursor.next_batch(), Some(vec![4]));
+        assert_eq!(cursor.next_batch(), None);
+    }
 
     #[allow(dead_code)]
     mod blob_test_utils {

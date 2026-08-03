@@ -114,6 +114,14 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
     if ranges.len() <= 1 {
         return ranges;
     }
+    if ranges.windows(2).all(|pair| {
+        pair[0]
+            .to
+            .checked_add(1)
+            .is_some_and(|next| next < pair[1].from)
+    }) {
+        return ranges;
+    }
     ranges.sort_by_key(|r| r.from);
     let mut merged: Vec<RowRange> = Vec::with_capacity(ranges.len());
     let mut iter = ranges.into_iter();

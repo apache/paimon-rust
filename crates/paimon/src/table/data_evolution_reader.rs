@@ -1147,13 +1147,27 @@ fn open_source_stream(
             let uncovered_ranges =
                 crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges());
             if !uncovered_ranges.is_empty() {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "Blob bunch logical row ranges {:?} do not cover effective selected row ranges {selected_ranges:?}; uncovered ranges are {uncovered_ranges:?}",
-                        bunch.logical_ranges()
-                    ),
-                    source: None,
-                });
+                if read_fields
+                    .iter()
+                    .any(|field| !field.data_type().is_nullable())
+                {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Cannot NULL-fill uncovered ranges {uncovered_ranges:?} for non-nullable BLOB field"
+                        ),
+                        source: None,
+                    });
+                }
+                return blob_fallback::read(
+                    split,
+                    bunch.clone(),
+                    read_fields.clone(),
+                    row_ranges,
+                    batch_size,
+                    file_io,
+                    blob_as_descriptor,
+                    anchor_deletion_vector.cloned(),
+                );
             }
         }
 
@@ -1164,6 +1178,7 @@ fn open_source_stream(
                 bunch.clone(),
                 read_fields.clone(),
                 row_ranges,
+                batch_size,
                 file_io,
                 blob_as_descriptor,
                 anchor_deletion_vector.cloned(),
@@ -1233,45 +1248,33 @@ fn open_source_stream(
                     let covered_ranges = bunch
                         .files
                         .iter()
-                        .map(|file| {
-                            let first_row_id =
-                                file.first_row_id.ok_or_else(|| Error::DataInvalid {
-                                    message: format!(
-                                        "Vector file '{}' is missing first_row_id",
-                                        file.file_name
-                                    ),
-                                    source: None,
-                                })?;
-                            if file.row_count <= 0 {
-                                return Err(Error::DataInvalid {
-                                    message: format!(
-                                        "Vector file '{}' row count must be positive, got {}",
-                                        file.file_name, file.row_count
-                                    ),
-                                    source: None,
-                                });
-                            }
-                            let last_row_id = first_row_id
-                                .checked_add(file.row_count - 1)
-                                .ok_or_else(|| Error::DataInvalid {
-                                    message: format!(
-                                        "Vector file '{}' row range overflows i64",
-                                        file.file_name
-                                    ),
-                                    source: None,
-                                })?;
-                            Ok(RowRange::new(first_row_id, last_row_id))
-                        })
+                        .map(vector_file_row_range)
                         .collect::<crate::Result<Vec<_>>>()?;
                     let uncovered_ranges =
                         crate::table::source::exclude_row_ranges(ranges, &covered_ranges);
                     if !uncovered_ranges.is_empty() {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "Vector bunch does not cover effective selected row ranges {uncovered_ranges:?}"
-                            ),
-                            source: None,
-                        });
+                        if source
+                            .read_fields()
+                            .iter()
+                            .any(|field| !field.data_type().is_nullable())
+                        {
+                            return Err(Error::DataInvalid {
+                                message: format!(
+                                    "Cannot NULL-fill uncovered ranges {uncovered_ranges:?} for non-nullable vector field"
+                                ),
+                                source: None,
+                            });
+                        }
+                        return read_vector_bunch_with_null_gaps_stream(
+                            file_reader,
+                            split,
+                            bunch.files_overlapping(ranges),
+                            data_fields.clone(),
+                            ranges.to_vec(),
+                            anchor_deletion_vector.cloned(),
+                            source.read_fields(),
+                            batch_size,
+                        );
                     }
                     bunch.files_overlapping(ranges)
                 }
@@ -1287,6 +1290,102 @@ fn open_source_stream(
             )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_vector_bunch_with_null_gaps_stream(
+    file_reader: DataFileReader,
+    split: &DataSplit,
+    files: Vec<DataFileMeta>,
+    data_fields: Option<Vec<DataField>>,
+    selected_ranges: Vec<RowRange>,
+    anchor_deletion_vector: Option<DeletionVectorContext>,
+    read_fields: &[DataField],
+    batch_size: Option<usize>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    let files = files
+        .into_iter()
+        .map(|file| vector_file_row_range(&file).map(|range| (file, range)))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let mut reads: Vec<(Option<usize>, Vec<RowRange>)> = Vec::new();
+    let mut file_idx = 0usize;
+    for selected in selected_ranges {
+        let mut cursor = selected.from();
+        loop {
+            while files
+                .get(file_idx)
+                .is_some_and(|(_, range)| range.to() < cursor)
+            {
+                file_idx += 1;
+            }
+            let (provider, range_to) = match files
+                .get(file_idx)
+                .filter(|(_, range)| range.from() <= cursor)
+            {
+                Some((_, range)) => (Some(file_idx), selected.to().min(range.to())),
+                None => (
+                    None,
+                    files
+                        .get(file_idx)
+                        .map(|(_, range)| selected.to().min(range.from() - 1))
+                        .unwrap_or_else(|| selected.to()),
+                ),
+            };
+            let range = RowRange::new(cursor, range_to);
+            match reads.last_mut() {
+                Some((last_provider, ranges)) if *last_provider == provider => ranges.push(range),
+                _ => reads.push((provider, vec![range])),
+            }
+            if range_to == selected.to() {
+                break;
+            }
+            cursor = range_to + 1;
+        }
+    }
+
+    let target_schema = build_target_arrow_schema(read_fields)?;
+    let null_batch_size = batch_size.unwrap_or(1024).max(1);
+    let split = split.clone();
+
+    Ok(try_stream! {
+        for (provider, ranges) in reads {
+            if let Some(file_idx) = provider {
+                let file = &files[file_idx].0;
+                let deletion_vector =
+                    shifted_deletion_vector_for_file(file, anchor_deletion_vector.as_ref())?;
+                let mut stream = file_reader.read_single_file_stream(
+                    &split,
+                    file.clone(),
+                    data_fields.clone(),
+                    deletion_vector,
+                    Some(ranges),
+                )?;
+                while let Some(batch) = stream.next().await {
+                    yield batch?;
+                }
+            } else {
+                let mut gap_rows = ranges.iter().map(RowRange::count).sum::<i64>();
+                while gap_rows > 0 {
+                    let rows = usize::try_from(gap_rows)
+                        .unwrap_or(usize::MAX)
+                        .min(null_batch_size);
+                    let columns = target_schema
+                        .fields()
+                        .iter()
+                        .map(|field| arrow_array::new_null_array(field.data_type(), rows))
+                        .collect::<Vec<_>>();
+                    yield RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+                        Error::UnexpectedError {
+                            message: format!("Failed to build NULL-filled vector batch: {e}"),
+                            source: Some(Box::new(e)),
+                        }
+                    })?;
+                    gap_rows -= i64::try_from(rows).unwrap_or(i64::MAX);
+                }
+            }
+        }
+    }
+    .boxed())
 }
 
 fn read_bunch_files_stream(
@@ -1419,16 +1518,18 @@ fn selected_absolute_row_ranges_for_file(
     };
 
     if let Some(ranges) = row_ranges {
-        let selected = ranges
-            .iter()
-            .filter_map(|range| {
-                range
-                    .intersect_inclusive(first_row_id, first_row_id + row_count - 1)
-                    .map(|range| {
-                        RowRange::new(range.from() - first_row_id, range.to() - first_row_id)
-                    })
-            })
-            .collect::<Vec<_>>();
+        let selected = crate::table::merge_row_ranges(
+            ranges
+                .iter()
+                .filter_map(|range| {
+                    range
+                        .intersect_inclusive(first_row_id, first_row_id + row_count - 1)
+                        .map(|range| {
+                            RowRange::new(range.from() - first_row_id, range.to() - first_row_id)
+                        })
+                })
+                .collect(),
+        );
         local_ranges = intersect_local_ranges(&local_ranges, &selected);
     }
 
@@ -1808,6 +1909,14 @@ fn build_source_plan_with_row_id_pushdown(
         if let Some(source_idx) = source_idx {
             let field_offset = sources[source_idx].add_read_field(field.clone());
             column_plan.push(Some((source_idx, field_offset)));
+        } else if !field.data_type().is_nullable() {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Cannot read non-nullable field '{}' without a provider",
+                    field.name()
+                ),
+                source: None,
+            });
         } else {
             column_plan.push(None);
         }
@@ -2153,6 +2262,29 @@ fn blob_file_row_range(file: &DataFileMeta) -> crate::Result<RowRange> {
     Ok(RowRange::new(first_row_id, last_row_id))
 }
 
+fn vector_file_row_range(file: &DataFileMeta) -> crate::Result<RowRange> {
+    let first_row_id = file.first_row_id.ok_or_else(|| Error::DataInvalid {
+        message: format!("Vector file '{}' is missing first_row_id", file.file_name),
+        source: None,
+    })?;
+    if file.row_count <= 0 {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Vector file '{}' row count must be positive, got {}",
+                file.file_name, file.row_count
+            ),
+            source: None,
+        });
+    }
+    let last_row_id = first_row_id
+        .checked_add(file.row_count - 1)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("Vector file '{}' row range overflows i64", file.file_name),
+            source: None,
+        })?;
+    Ok(RowRange::new(first_row_id, last_row_id))
+}
+
 /// Aggregates rolled `.vector.<format>` segments belonging to one logical vector
 /// source, mirroring upstream `VectorFileBunch` non-pushdown semantics. Unlike
 /// `BlobBunch`, the expected row count is taken directly from the prepared group's
@@ -2406,6 +2538,25 @@ mod tests {
 
     use blob_test_utils::{write_blob_file, write_blob_file_with_values, BlobFixtureValue};
     use test_utils::{local_file_path, write_int_parquet_file};
+
+    #[test]
+    fn test_selected_absolute_row_ranges_normalizes_before_intersection() {
+        let selected = selected_absolute_row_ranges_for_file(
+            0,
+            6,
+            Some(&[
+                RowRange::new(4, 4),
+                RowRange::new(2, 3),
+                RowRange::new(0, 2),
+                RowRange::new(4, 4),
+            ]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected, vec![RowRange::new(0, 4)]);
+    }
 
     #[tokio::test]
     async fn test_descriptor_columns_resolve_concurrently_and_preserve_order() {
@@ -3201,6 +3352,33 @@ mod tests {
             build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new()).unwrap();
 
         assert_eq!(source_plan.column_plan, vec![Some((0, 0)), Some((2, 0))]);
+    }
+
+    #[test]
+    fn test_row_id_pushdown_rejects_missing_non_nullable_provider() {
+        let files = vec![data_file("data.parquet", 0, 4, 1, None)];
+        let prepared_group = PreparedMergeGroup::new(&files).unwrap();
+        let file_infos = vec![resolved_info(vec![1])];
+        let read_type = vec![
+            DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "payload".to_string(),
+                DataType::Blob(BlobType::with_nullable(false)),
+            ),
+        ];
+
+        let err = build_source_plan_with_row_id_pushdown(
+            &prepared_group,
+            &file_infos,
+            &read_type,
+            &HashSet::new(),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::DataInvalid { message, .. }
+                if message.contains("non-nullable field 'payload'")));
     }
 
     #[test]
@@ -4065,7 +4243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_selected_blob_fallback_rejects_uncovered_non_deleted_range() {
+    async fn test_selected_blob_fallback_fills_uncovered_nullable_range() {
         use BlobFixtureValue::{Placeholder, Value};
 
         let tempdir = tempdir().unwrap();
@@ -4138,8 +4316,8 @@ mod tests {
             .build()
             .unwrap();
 
-        // Row 0 is outside the selection and row 1 is deleted, so only the
-        // uncovered, selected, non-deleted row 3 must make the read fail.
+        // Row 0 is outside the selection and row 1 is deleted. Row 2 is covered
+        // by the BLOB provider, while the uncovered row 3 must be NULL-filled.
         for blob_as_descriptor in [false, true] {
             let mode_table = table.copy_with_options(HashMap::from([(
                 "blob-as-descriptor".to_string(),
@@ -4150,18 +4328,20 @@ mod tests {
                 mode_table.schema().fields().to_vec(),
                 Vec::new(),
             );
-            let mut stream = read.to_arrow(std::slice::from_ref(&split)).unwrap();
-            let first = stream.try_next().await;
-            assert!(
-                matches!(
-                    &first,
-                    Err(Error::DataInvalid { message, .. })
-                        if message.contains(
-                            "uncovered ranges are [RowRange { from: 3, to: 3 }]"
-                        )
-                ),
-                "blob_as_descriptor={blob_as_descriptor}: expected uncovered selected BLOB range error, got {first:?}"
-            );
+            let batches = read
+                .to_arrow(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
+            let payloads = collect_binary_values(&batches, "payload");
+            assert_eq!(payloads.len(), 2);
+            assert!(payloads[0].is_some());
+            assert_eq!(payloads[1], None);
+            if !blob_as_descriptor {
+                assert_eq!(payloads[0], Some(b"covered".to_vec()));
+            }
         }
     }
 
@@ -5429,12 +5609,14 @@ mod tests {
             .with_row_ranges(vec![RowRange::new(2, 2), RowRange::new(4, 4)])
             .build()
             .unwrap();
-        let mut stream = read.to_arrow(&[uncovered_split]).unwrap();
-        let error = stream.try_next().await.unwrap_err();
-        assert!(matches!(error, Error::DataInvalid { message, .. }
-        if message.contains(
-            "does not cover effective selected row ranges [RowRange { from: 2, to: 2 }]"
-        )));
+        let batches = read
+            .to_arrow(&[uncovered_split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![3, 5]);
+        assert_fixed_size_list(&batches, "embedding", 2, &[None, Some(vec![5.0, 5.0])]);
 
         let full_split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -5592,7 +5774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_and_read_prunes_unselected_rolled_dedicated_sources() {
+    async fn test_scan_and_read_prunes_rolled_dedicated_ranges() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -5754,7 +5936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_and_read_rejects_selected_gap_after_dedicated_pruning() {
+    async fn test_scan_and_read_null_fills_selected_dedicated_gap() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -5828,14 +6010,97 @@ mod tests {
             let plan = builder.new_scan().plan().await.unwrap();
 
             let mut stream = builder.new_read().unwrap().to_arrow(plan.splits()).unwrap();
-            let error = stream.try_next().await.unwrap_err();
+            let batch = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(
+                collect_int_values(std::slice::from_ref(&batch), "id"),
+                vec![3]
+            );
+            let column = batch.column_by_name(field).unwrap();
             assert!(
-                matches!(error, Error::DataInvalid { ref message, .. }
-                if message.contains(provider_kind)
-                    && message.contains("cover effective selected row ranges")),
-                "expected missing {provider_kind} coverage error, got {error:?}"
+                column.is_null(0),
+                "missing {provider_kind} range should be null-filled"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_btree_hit_null_fills_missing_nullable_blob() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        fs::create_dir_all(tempdir.path().join("snapshot")).unwrap();
+        fs::create_dir_all(tempdir.path().join("manifest")).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
+        let mut normal_file = data_file_meta_with_path(
+            "data.parquet",
+            0,
+            3,
+            1,
+            normal_path.metadata().unwrap().len() as i64,
+            Some(vec!["id"]),
+        );
+        normal_file.first_row_id = None;
+        normal_file.file_source = Some(0);
+
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "btree_missing_blob_t"),
+            table_path,
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .option("global-index.enabled", "true")
+                    .option("sorted-index.records-per-range", "10")
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+        TableCommit::new(table.clone(), "btree-missing-blob-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![normal_file],
+            )])
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("id")
+            .execute()
+            .await
+            .unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id", "payload"]).unwrap();
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(2))
+                .unwrap(),
+        );
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert_eq!(
+            plan.splits()[0].row_ranges(),
+            Some(&[RowRange::new(1, 1)][..])
+        );
+
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![2]);
+        assert_eq!(collect_binary_values(&batches, "payload"), vec![None]);
     }
 
     /// (6) Row-range mismatch: normal file row_count=3 but `.vector.parquet` row_count=2
