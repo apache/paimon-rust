@@ -1550,7 +1550,8 @@ RESET 'paimon.scan.watermark';
 
 This reads the earliest snapshot whose watermark is greater than or equal to the
 given value (snapshots without a watermark are skipped). It is mutually
-exclusive with the other time-travel selectors.
+exclusive with the other time-travel selectors. If no matching snapshot exists,
+scan planning fails.
 
 ## Dynamic Options (SET / RESET)
 

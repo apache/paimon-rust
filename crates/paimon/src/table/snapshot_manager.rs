@@ -370,10 +370,10 @@ impl SnapshotManager {
     /// deleted snapshots; watermarks are non-decreasing in snapshot order.
     ///
     /// Reference: [SnapshotManager.laterOrEqualWatermark](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
-    /// The Java binary search records the raw mid snapshot as the candidate
-    /// (which may itself carry no watermark); this returns the earliest snapshot
-    /// that actually matches, a subset of the Java behavior that is equivalent
-    /// for the batch full-scan (`ScanMode.ALL`) use.
+    /// The Java binary search can retain the raw mid snapshot after walking
+    /// backwards over missing watermark metadata. This implementation only
+    /// returns a snapshot whose own effective watermark satisfies the predicate,
+    /// preserving the method's contract when watermark metadata is sparse.
     pub async fn later_or_equal_watermark(
         &self,
         watermark: i64,
