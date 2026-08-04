@@ -478,27 +478,25 @@ mod tests {
     async fn cancelling_waiter_does_not_stop_submitted_task() {
         let (started_sender, started_receiver) = oneshot::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_for_task = Arc::clone(&completed);
+        let (completed_sender, completed_receiver) = oneshot::channel();
         let join = tokio::spawn(async move {
             execute_global_index("test global-index task failed", move || {
                 let _ = started_sender.send(());
                 release_receiver.recv().unwrap();
-                completed_for_task.store(true, Ordering::SeqCst);
+                let _ = completed_sender.send(());
                 Ok(())
             })
             .await
         });
         started_receiver.await.unwrap();
 
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            release_sender.send(()).unwrap();
-        });
         join.abort();
         assert!(join.await.unwrap_err().is_cancelled());
-        releaser.join().unwrap();
-        assert!(completed.load(Ordering::SeqCst));
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), completed_receiver)
+            .await
+            .expect("submitted task did not finish after waiter cancellation")
+            .expect("submitted task stopped before reporting completion");
     }
 
     #[test]
