@@ -101,6 +101,19 @@ fn total_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> usize
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+fn set_snapshot_watermark(temp_dir: &TempDir, snapshot_id: i64, watermark: i64) {
+    let path = temp_dir
+        .path()
+        .join("default.db")
+        .join("t")
+        .join("snapshot")
+        .join(format!("snapshot-{snapshot_id}"));
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    snapshot["watermark"] = serde_json::json!(watermark);
+    std::fs::write(path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn test_version_as_of_uses_snapshot_schema() {
     let (_tmp, sql_context) = setup_evolved_table().await;
@@ -136,6 +149,58 @@ async fn test_version_as_of_uses_snapshot_schema() {
         .unwrap();
     assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
     assert_eq!(total_rows(&batches), 5);
+}
+
+#[tokio::test]
+async fn test_version_as_of_java_watermark_prefix() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let warehouse = format!("file://{}", temp_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE TABLE paimon.default.t (id INT)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for id in 1..=3 {
+        sql_context
+            .sql(&format!("INSERT INTO paimon.default.t VALUES ({id})"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+    set_snapshot_watermark(&temp_dir, 1, 1);
+    set_snapshot_watermark(&temp_dir, 3, 10);
+
+    for (watermark, expected_rows) in [(1, 1), (9, 3), (10, 3)] {
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT * FROM paimon.default.t VERSION AS OF 'watermark-{watermark}'"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(total_rows(&batches), expected_rows);
+    }
+
+    let df = sql_context
+        .sql("SELECT * FROM paimon.default.t VERSION AS OF 'watermark-11'")
+        .await
+        .unwrap();
+    let err = df.collect().await.expect_err("watermark 11 must not match");
+    assert!(
+        err.to_string().contains("watermark[11]"),
+        "error should name the unmatched watermark: {err}"
+    );
 }
 
 #[tokio::test]

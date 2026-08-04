@@ -149,7 +149,7 @@ fn object_name_to_table_reference(
 /// Resolve `VERSION AS OF <expr>` into `scan.version` option.
 ///
 /// The raw value (integer or string) is passed through as-is.
-/// Resolution (tag vs snapshot id) happens at scan time in `TableScan`.
+/// Resolution (tag vs watermark vs snapshot id) happens at scan time in `TableScan`.
 fn resolve_version_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> {
     let version = match expr {
         ast::Expr::Value(v) => match &v.value {
@@ -163,7 +163,7 @@ fn resolve_version_as_of(expr: &ast::Expr) -> DFResult<HashMap<String, String>> 
         },
         _ => {
             return Err(datafusion::error::DataFusionError::Plan(format!(
-                "Unsupported VERSION AS OF expression: {expr}. Expected an integer snapshot id or a tag name."
+                "Unsupported VERSION AS OF expression: {expr}. Expected an integer snapshot id, a tag name, or a quoted 'watermark-<value>'."
             )))
         }
     };

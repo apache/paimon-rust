@@ -1539,8 +1539,16 @@ This finds the latest snapshot whose commit time is less than or equal to the gi
 
 ### By Watermark
 
-There is no SQL `AS OF` syntax for watermarks; use the dynamic option
-`scan.watermark` (milliseconds) instead:
+Use `VERSION AS OF 'watermark-<value>'` syntax:
+
+```sql
+SELECT * FROM paimon.default.my_table
+VERSION AS OF 'watermark-1704067200000';
+```
+
+This resolves the tag first if a tag with that exact name exists. Otherwise,
+the suffix is parsed as a watermark in milliseconds. The session-scoped dynamic
+option `scan.watermark` is also available:
 
 ```sql
 SET 'paimon.scan.watermark' = '1704067200000';

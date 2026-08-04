@@ -295,8 +295,8 @@ pub(crate) enum TimeTravelSelector<'a> {
     /// watermark is greater than or equal to the value (millis).
     Watermark(i64),
     /// `scan.version` (SQL `VERSION AS OF`): ambiguous by design. Resolved at
-    /// scan time as tag name (if a tag exists) → snapshot id (if parseable) →
-    /// error. `option_name` is kept for error attribution.
+    /// scan time as tag name (if a tag exists) → `watermark-<value>` → snapshot
+    /// id (if parseable) → error. `option_name` is kept for error attribution.
     Version {
         value: &'a str,
         option_name: &'static str,

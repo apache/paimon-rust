@@ -22,6 +22,8 @@ use crate::table::{SnapshotManager, Table, TagManager};
 use crate::Error;
 use std::collections::HashMap;
 
+const WATERMARK_PREFIX: &str = "watermark-";
+
 /// Resolve the snapshot selected by the time-travel options, if any.
 ///
 /// Returns `Ok(None)` when no time-travel selector is configured. Returns an
@@ -46,24 +48,26 @@ pub(crate) async fn travel_to_snapshot(
             }
         }
         Some(TimeTravelSelector::Watermark(w)) => {
-            match snapshot_manager.later_or_equal_watermark(w).await? {
-                Some(s) => Ok(Some(s)),
-                // Mirrors Java StaticFromWatermarkStartingScanner's error.
-                None => Err(Error::DataInvalid {
-                    message: format!(
-                        "There is currently no snapshot later than or equal to watermark[{w}]"
-                    ),
-                    source: None,
-                }),
-            }
+            resolve_watermark(snapshot_manager, w).await.map(Some)
         }
         Some(TimeTravelSelector::Version {
             value: v,
             option_name,
         }) => {
-            // `scan.version` is ambiguous by design: tag first, then snapshot id.
+            // Match Java TimeTravelUtil.adaptScanVersion: tag first, then the
+            // `watermark-<value>` prefix, then snapshot id.
             if tag_manager.tag_exists(v).await? {
                 resolve_tag(tag_manager, v).await.map(Some)
+            } else if let Some(raw_watermark) = v.strip_prefix(WATERMARK_PREFIX) {
+                let watermark = raw_watermark
+                    .parse::<i64>()
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!("{option_name} '{v}' has an invalid watermark value."),
+                        source: Some(Box::new(e)),
+                    })?;
+                resolve_watermark(snapshot_manager, watermark)
+                    .await
+                    .map(Some)
             } else if let Ok(id) = v.parse::<i64>() {
                 snapshot_manager.get_snapshot(id).await.map(Some)
             } else {
@@ -101,6 +105,22 @@ pub(crate) async fn travel_to_snapshot(
             }
         }
         None => Ok(None),
+    }
+}
+
+async fn resolve_watermark(
+    snapshot_manager: &SnapshotManager,
+    watermark: i64,
+) -> crate::Result<Snapshot> {
+    match snapshot_manager.later_or_equal_watermark(watermark).await? {
+        Some(snapshot) => Ok(snapshot),
+        // Mirrors Java StaticFromWatermarkStartingScanner's error.
+        None => Err(Error::DataInvalid {
+            message: format!(
+                "There is currently no snapshot later than or equal to watermark[{watermark}]"
+            ),
+            source: None,
+        }),
     }
 }
 
@@ -566,6 +586,39 @@ mod tests {
             .unwrap();
         assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(3));
         assert!(traveled.has_resolved_travel_snapshot());
+    }
+
+    #[tokio::test]
+    async fn test_scan_version_resolves_java_watermark_prefix_after_tag() {
+        let (file_io, table_path) = setup_watermark_table().await;
+        let table = make_table(&file_io, &table_path, schema_v0());
+
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.version", "watermark-150")]))
+            .await
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(3));
+
+        // Java resolves an existing tag before interpreting the watermark prefix.
+        let sm = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let snapshot1 = sm.get_snapshot(1).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path.clone());
+        tm.create("watermark-150", &snapshot1).await.unwrap();
+        let tagged = table
+            .copy_with_time_travel(options(&[("scan.version", "watermark-150")]))
+            .await
+            .unwrap();
+        assert_eq!(tagged.travel_snapshot().map(|s| s.id()), Some(1));
+
+        let err =
+            super::travel_to_snapshot(&sm, &tm, &options(&[("scan.version", "watermark-invalid")]))
+                .await
+                .expect_err("invalid watermark version must fail");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("invalid watermark value")),
+            "expected watermark parse error, got {err:?}"
+        );
     }
 
     #[tokio::test]
