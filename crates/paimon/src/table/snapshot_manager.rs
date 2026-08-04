@@ -561,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn test_later_or_equal_watermark_picks_earliest_match() {
         let (_, sm) = setup("memory:/test_watermark_earliest").await;
-        for (id, w) in [(1, 100), (2, 200), (3, 300)] {
+        for (id, w) in [(1, 100), (2, 200), (3, 200), (4, 300)] {
             sm.commit_snapshot(&test_snapshot_with_watermark(id, Some(w)))
                 .await
                 .unwrap();
@@ -570,8 +570,10 @@ mod tests {
         assert_eq!(pick_watermark(&sm, 50).await, Some(1));
         assert_eq!(pick_watermark(&sm, 100).await, Some(1));
         assert_eq!(pick_watermark(&sm, 150).await, Some(2));
+        // Equal watermarks still select the earliest matching snapshot.
         assert_eq!(pick_watermark(&sm, 200).await, Some(2));
-        assert_eq!(pick_watermark(&sm, 300).await, Some(3));
+        assert_eq!(pick_watermark(&sm, 201).await, Some(4));
+        assert_eq!(pick_watermark(&sm, 300).await, Some(4));
         // Later than every watermark: no match.
         assert_eq!(pick_watermark(&sm, 301).await, None);
     }
