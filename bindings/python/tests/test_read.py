@@ -567,6 +567,16 @@ def test_time_travel_unresolved_snapshot_raises():
             table.new_read_builder({"scan.snapshot-id": "999"})
 
 
+def test_time_travel_unresolved_watermark_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        # The Rust commit path never writes watermarks, so no snapshot matches;
+        # the binding must raise instead of silently reading latest.
+        with pytest.raises(ValueError, match="did not resolve"):
+            table.new_read_builder({"scan.watermark": "1"})
+
+
 def test_unsupported_scan_option_raises_not_implemented():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
@@ -657,6 +667,16 @@ def test_time_travel_conflicting_selectors_raises():
         # both offending keys are named
         assert "scan.snapshot-id" in str(exc.value)
         assert "scan.tag-name" in str(exc.value)
+
+
+def test_time_travel_watermark_conflicting_selector_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(ValueError, match="Only one time-travel selector") as exc:
+            table.new_read_builder({"scan.watermark": "1", "scan.snapshot-id": "1"})
+        assert "scan.watermark" in str(exc.value)
+        assert "scan.snapshot-id" in str(exc.value)
 
 
 def test_split_serialize_produces_split_v1_binary():

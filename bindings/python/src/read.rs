@@ -31,8 +31,9 @@ use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 4] = [
+const TIME_TRAVEL_SELECTORS: [&str; 5] = [
     "scan.timestamp-millis",
+    "scan.watermark",
     "scan.version",
     "scan.snapshot-id",
     "scan.tag-name",
