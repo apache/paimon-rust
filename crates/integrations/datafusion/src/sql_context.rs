@@ -96,6 +96,7 @@ use crate::{BlobReaderRegistry, DynamicOptions};
 pub struct SQLContext {
     ctx: SessionContext,
     catalogs: HashMap<String, Arc<dyn Catalog>>,
+    incremental_query_catalogs: crate::incremental_query::IncrementalQueryCatalogs,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
     blob_reader_registry: BlobReaderRegistry,
@@ -122,11 +123,18 @@ impl SQLContext {
             ))
             .build();
         let ctx = SessionContext::new_with_state(state);
+        let incremental_query_catalogs =
+            crate::incremental_query::IncrementalQueryCatalogs::default();
+        crate::incremental_query::register_incremental_query_catalogs(
+            &ctx,
+            incremental_query_catalogs.clone(),
+        );
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         Self {
             ctx,
             catalogs: HashMap::new(),
+            incremental_query_catalogs,
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
         }
@@ -160,11 +168,11 @@ impl SQLContext {
     ///
     /// `default_db = Some("")` is rejected — pass `None` to opt out instead.
     ///
-    /// **Note on built-in TVFs (`vector_search`, `full_text_search`):** when
-    /// `default_db = None`, bare table names inside these functions still resolve
-    /// against the literal namespace `"default"` (the fallback in
-    /// [`register_table_functions`]). Callers using `None` must qualify table names
-    /// (`'db.table'` or `'catalog.db.table'`) in those calls.
+    /// **Note on built-in TVFs (`paimon_incremental_query`, `vector_search`,
+    /// `full_text_search`):** when `default_db = None`, bare table names inside
+    /// these functions still resolve against the literal namespace `"default"`
+    /// (the fallback in [`register_table_functions`]). Callers using `None` must
+    /// qualify table names (`'db.table'` or `'catalog.db.table'`) in those calls.
     pub async fn register_catalog_with_default_db(
         &mut self,
         catalog_name: impl Into<String>,
@@ -202,6 +210,11 @@ impl SQLContext {
                 self.blob_reader_registry.clone(),
                 Some(session_state),
             )),
+        );
+        self.incremental_query_catalogs.register(
+            catalog_name.clone(),
+            catalog.clone(),
+            default_db.unwrap_or("default"),
         );
         register_table_functions(
             &self.ctx,
@@ -241,6 +254,8 @@ impl SQLContext {
                 "SET datafusion.catalog.default_catalog = '{catalog_name}'"
             ))
             .await?;
+        self.incremental_query_catalogs
+            .set_current(catalog_name.clone());
         Ok(())
     }
 
@@ -256,6 +271,8 @@ impl SQLContext {
                 "SET datafusion.catalog.default_schema = '{database_name}'"
             ))
             .await?;
+        self.incremental_query_catalogs
+            .set_current_database(database_name.to_string());
         Ok(())
     }
 
@@ -5782,9 +5799,10 @@ mod tests {
     async fn register_catalog_with_none_table_function_resolves_bare_name_to_literal_default() {
         // Documents the fallback in register_table_functions: `default_db.unwrap_or("default")`.
         // When the caller opts out of default-db init, bare table names inside built-in TVFs
-        // (vector_search / full_text_search) still resolve against the literal namespace
-        // `"default"` — so a caller using `None` MUST use fully-qualified names with these
-        // functions or they'll hit a `default.<name>` lookup that may not exist / be readable.
+        // (paimon_incremental_query / vector_search / full_text_search) still resolve
+        // against the literal namespace `"default"` — so a caller using `None` MUST use
+        // fully-qualified names with these functions or they'll hit a `default.<name>`
+        // lookup that may not exist / be readable.
         let catalog = Arc::new(ProbeTrackingCatalog::new());
         let mut ctx = SQLContext::new();
         ctx.register_catalog_with_default_db("paimon", catalog, None)

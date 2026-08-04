@@ -73,9 +73,9 @@ the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
 functions pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
-functions (`vector_search`, `hybrid_search`, and `full_text_search` when the
-`fulltext` feature is enabled) against it. It also manages session-scoped
-dynamic options internally for `SET`/`RESET` support.
+functions (`paimon_incremental_query`, `vector_search`, `hybrid_search`, and
+`full_text_search` when the `fulltext` feature is enabled) against it. It also
+manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ### REST Catalog Views and SQL Functions
 
@@ -1191,6 +1191,72 @@ CROSS JOIN LATERAL vector_search(
     10
 ) AS r;
 ```
+
+## Incremental Query
+
+Paimon supports batch incremental reads between snapshot IDs via the
+`paimon_incremental_query` table-valued function. This aligns with Spark's
+`paimon_incremental_query` TVF: results are returned as `RecordBatch` streams
+within a single SQL query (not a long-running CDC stream).
+
+### Registration
+
+When you use a `SQLContext`, `paimon_incremental_query` is registered
+automatically for every catalog you register — no extra setup is needed.
+
+With a raw DataFusion `SessionContext`, register it explicitly:
+
+```rust
+use paimon_datafusion::register_incremental_query;
+
+register_incremental_query(&ctx, catalog.clone(), "default");
+```
+
+### Usage
+
+```sql
+SELECT * FROM paimon_incremental_query('table_name', start_snapshot_id, end_snapshot_id);
+SELECT * FROM paimon_incremental_query('table_name$audit_log', start_snapshot_id, end_snapshot_id);
+SELECT * FROM paimon_incremental_query('table_name$audit_log', start_snapshot_id, end_snapshot_id, 'diff');
+```
+
+| Argument | Type | Description |
+|---|---|---|
+| `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form. Append `$audit_log` to read the audit-log view with a `rowkind` column (`+I`, `-U`, `+U`, `-D`). |
+| `start_snapshot_id` | BIGINT | Exclusive lower bound snapshot ID |
+| `end_snapshot_id` | BIGINT | Inclusive upper bound snapshot ID |
+| `scan_mode` | STRING | Optional. One of `auto` (default), `delta`, `changelog`, or `diff`. |
+
+Examples:
+
+```sql
+-- Delta / auto rows between snapshots 0 and 2 (exclusive start, inclusive end)
+SELECT * FROM paimon_incremental_query('paimon.my_db.orders', 0, 2);
+
+-- Audit log with row kinds
+SELECT rowkind, * FROM paimon_incremental_query('paimon.my_db.orders$audit_log', 0, 2);
+
+-- Diff mode on a primary-key table (before/after images)
+SELECT rowkind, * FROM paimon_incremental_query('paimon.my_db.orders$audit_log', 0, 2, 'diff');
+```
+
+The snapshot interval is **(start, end]** — rows committed after
+`start_snapshot_id` through `end_snapshot_id` inclusive. Omitting `scan_mode`
+uses `auto`, which picks an appropriate mode based on table options (for
+example `changelog-producer = input` tables often behave like changelog reads).
+
+Modes:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | Resolve to `delta` when `changelog-producer=none`, otherwise `changelog`. |
+| `delta` | Read data files from APPEND snapshots in the range. |
+| `changelog` | Read existing changelog manifest files in the range (skips OVERWRITE and snapshots without changelog manifests). Does not generate changelogs. |
+| `diff` | Compare before/after snapshot states for primary-key tables (`merge-engine=deduplicate`). |
+
+Illegal `scan_mode` values and out-of-range snapshot bounds fail with clear
+errors. Projection and residual filters are supported via the normal DataFusion
+plan (column projection is applied by the incremental scan; filters are residual).
 
 ## Vector Search
 
