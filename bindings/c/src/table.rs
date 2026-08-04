@@ -2301,8 +2301,8 @@ mod tests {
     fn unsupported_scan_option_is_rejected() {
         unsafe {
             let table = boxed_test_table();
-            let k = CString::new("scan.watermark").unwrap();
-            let v = CString::new("0").unwrap();
+            let k = CString::new("incremental-between").unwrap();
+            let v = CString::new("1,2").unwrap();
             let opts = [opt(&k, &v)];
             // Core's validate_scan_options rejects this before resolution; the
             // binding surfaces core's Unsupported code.

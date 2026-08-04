@@ -105,7 +105,7 @@ pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
 const INCREMENTAL_BETWEEN_OPTION: &str = "incremental-between";
 const INCREMENTAL_BETWEEN_TIMESTAMP_OPTION: &str = "incremental-between-timestamp";
 const INCREMENTAL_BETWEEN_SCAN_MODE_OPTION: &str = "incremental-between-scan-mode";
-const SCAN_WATERMARK_OPTION: &str = "scan.watermark";
+pub const SCAN_WATERMARK_OPTION: &str = "scan.watermark";
 const SCAN_MODE_OPTION: &str = "scan.mode";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
@@ -291,6 +291,9 @@ pub struct CoreOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimeTravelSelector<'a> {
     TimestampMillis(i64),
+    /// `scan.watermark`: batch time travel to the earliest snapshot whose
+    /// watermark is greater than or equal to the value (millis).
+    Watermark(i64),
     /// `scan.version` (SQL `VERSION AS OF`): ambiguous by design. Resolved at
     /// scan time as tag name (if a tag exists) → snapshot id (if parseable) →
     /// error. `option_name` is kept for error attribution.
@@ -408,7 +411,6 @@ impl<'a> CoreOptions<'a> {
             INCREMENTAL_BETWEEN_OPTION,
             INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
             INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
-            SCAN_WATERMARK_OPTION,
         ] {
             if self.options.contains_key(key) {
                 return Err(crate::Error::Unsupported {
@@ -424,6 +426,7 @@ impl<'a> CoreOptions<'a> {
                     SCAN_SNAPSHOT_ID_OPTION,
                     SCAN_TAG_NAME_OPTION,
                     SCAN_VERSION_OPTION,
+                    SCAN_WATERMARK_OPTION,
                 ]
             } else if mode.eq_ignore_ascii_case("from-timestamp") {
                 &[SCAN_TIMESTAMP_MILLIS_OPTION]
@@ -792,9 +795,12 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(4);
+        let mut selectors = Vec::with_capacity(5);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        if self.options.contains_key(SCAN_WATERMARK_OPTION) {
+            selectors.push(SCAN_WATERMARK_OPTION);
         }
         if self.options.contains_key(SCAN_VERSION_OPTION) {
             selectors.push(SCAN_VERSION_OPTION);
@@ -826,6 +832,8 @@ impl<'a> CoreOptions<'a> {
 
         if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else if let Some(watermark) = self.parse_i64_option(SCAN_WATERMARK_OPTION)? {
+            Ok(Some(TimeTravelSelector::Watermark(watermark)))
         } else if let Some(value) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
             Ok(Some(TimeTravelSelector::Version {
                 value,
@@ -2065,6 +2073,41 @@ mod tests {
     }
 
     #[test]
+    fn test_watermark_maps_to_watermark_selector() {
+        let options = HashMap::from([(SCAN_WATERMARK_OPTION.to_string(), "1234".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .try_time_travel_selector()
+                .unwrap(),
+            Some(TimeTravelSelector::Watermark(1234))
+        );
+
+        // Strict numeric parsing, like scan.timestamp-millis.
+        let options = HashMap::from([(SCAN_WATERMARK_OPTION.to_string(), "abc".to_string())]);
+        assert!(CoreOptions::new(&options)
+            .try_time_travel_selector()
+            .is_err());
+    }
+
+    #[test]
+    fn test_watermark_conflicts_with_other_selectors() {
+        let options = HashMap::from([
+            (SCAN_WATERMARK_OPTION.to_string(), "1".to_string()),
+            (SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "2".to_string()),
+        ]);
+        let err = CoreOptions::new(&options)
+            .try_time_travel_selector()
+            .unwrap_err();
+        match err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains(SCAN_WATERMARK_OPTION));
+                assert!(message.contains(SCAN_TIMESTAMP_MILLIS_OPTION));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_snapshot_id_conflicts_with_version_lists_original_keys() {
         let options = HashMap::from([
             (SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string()),
@@ -2156,7 +2199,6 @@ mod tests {
             "incremental-between",
             "incremental-between-timestamp",
             "incremental-between-scan-mode",
-            "scan.watermark",
         ] {
             let options = HashMap::from([(key.to_string(), "x".to_string())]);
             let err = CoreOptions::new(&options)
@@ -2194,6 +2236,7 @@ mod tests {
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
             SCAN_VERSION_OPTION,
+            SCAN_WATERMARK_OPTION,
         ] {
             let options = HashMap::from([
                 ("scan.mode".to_string(), "from-snapshot".to_string()),

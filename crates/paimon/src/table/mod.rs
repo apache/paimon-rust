@@ -373,6 +373,7 @@ impl Table {
         let selector_changed = extra.keys().any(|k| {
             k == crate::spec::SCAN_VERSION_OPTION
                 || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+                || k == crate::spec::SCAN_WATERMARK_OPTION
                 || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
                 || k == crate::spec::SCAN_TAG_NAME_OPTION
         });
@@ -400,10 +401,10 @@ impl Table {
     ///
     /// Mirrors Java `AbstractFileStoreTable.copy(dynamicOptions)` →
     /// `tryTimeTravel`: if the merged options contain a time-travel selector
-    /// (`scan.version` / `scan.timestamp-millis` / `scan.snapshot-id` /
-    /// `scan.tag-name`) that resolves to a snapshot, the table's fields and
-    /// keys come from that snapshot's schema while the options stay the merged
-    /// ones (Java `TableSchema.copy(newOptions)`).
+    /// (`scan.version` / `scan.timestamp-millis` / `scan.watermark` /
+    /// `scan.snapshot-id` / `scan.tag-name`) that resolves to a snapshot, the
+    /// table's fields and keys come from that snapshot's schema while the
+    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.

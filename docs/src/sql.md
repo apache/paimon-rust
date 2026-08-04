@@ -1537,6 +1537,21 @@ SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00';
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
 
+### By Watermark
+
+There is no SQL `AS OF` syntax for watermarks; use the dynamic option
+`scan.watermark` (milliseconds) instead:
+
+```sql
+SET 'paimon.scan.watermark' = '1704067200000';
+SELECT * FROM paimon.default.my_table;
+RESET 'paimon.scan.watermark';
+```
+
+This reads the earliest snapshot whose watermark is greater than or equal to the
+given value (snapshots without a watermark are skipped). It is mutually
+exclusive with the other time-travel selectors.
+
 ## Dynamic Options (SET / RESET)
 
 Use `SET` to configure session-scoped Paimon dynamic options that apply to subsequent table loads:
