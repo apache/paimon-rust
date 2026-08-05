@@ -721,6 +721,9 @@ ALTER TABLE paimon.my_db.users RENAME COLUMN name TO username;
 -- Rename a table
 ALTER TABLE paimon.my_db.users RENAME TO members;
 
+-- Change a regular scalar column type
+ALTER TABLE paimon.my_db.users ALTER COLUMN age TYPE BIGINT;
+
 -- Set table properties
 ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'true');
 ```
@@ -730,6 +733,71 @@ ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'tru
 ```sql
 ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 ```
+
+#### ALTER COLUMN TYPE
+
+Type evolution is limited to top-level scalar columns with no key, partition,
+bucket, sequence, row-kind routing, persisted global-index, or search-payload
+dependency. Nested and constructed types are rejected before schema metadata is
+written. Existing configured primary-key vector/full-text index columns and
+persisted global-index primary or extra payload fields are also rejected; this
+operation does not invalidate or rebuild indexes.
+
+Rust-written global-index entries persist their build schema ID. Readers ignore
+an entry when any indexed field has a different logical type in the current
+schema, so an index commit racing with `ALTER COLUMN TYPE` cannot be used for
+pruning under incompatible key semantics. Legacy entries without a build schema
+ID remain eligible only when complete schema history proves that none of their
+indexed fields has changed type.
+
+This is a compatibility tightening from earlier Rust releases, which admitted
+some Arrow-castable pairs without guaranteeing matching Paimon reader
+semantics. Such pairs are now rejected before schema metadata is written. The
+Rust matrix is also currently narrower than Java Paimon's complete executor
+set; expanding it requires adding and testing the corresponding Rust semantic
+executor first.
+
+The executable conversion matrix is intentionally narrower than general SQL
+`CAST`:
+
+| Source | Target | Execution semantics |
+|---|---|---|
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT`, `FLOAT`, `DOUBLE` | Any listed primitive numeric type allowed by the table's implicit/explicit-cast option | Paimon primitive conversion, including Java-compatible narrowing, overflow, `NaN`, and infinity behavior |
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | `DECIMAL(p, s)` | Scale to the target decimal; values exceeding target precision become null |
+| `DECIMAL(p, s)` | `DECIMAL(p2, s2)` | Half-up rescaling; values exceeding target precision become null |
+| `CHAR(n)`, `VARCHAR(n)` | `CHAR(m)`, `VARCHAR(m)` | Unicode character truncation; `CHAR` is space-padded to its target length |
+| `BINARY(n)`, `VARBINARY(n)` | `BINARY(m)`, `VARBINARY(m)` | Byte truncation; `BINARY` is zero-padded to its target length |
+| `DATE` | `TIMESTAMP(p)`, where `p` is 0–3 | Epoch-day conversion to the millisecond physical representation |
+| `TIMESTAMP(p)` | `DATE` | Paimon epoch-millisecond division, truncated toward zero |
+
+Changing timestamp precision, converting to or from local-zoned timestamps,
+floating-point-to-decimal conversions, decimal-to-primitive conversions, and
+cross-family conversions such as numeric-to-string are not admitted by schema
+evolution even if an ordinary SQL `CAST` could express them. Nullability changes
+continue to follow the existing table options.
+
+For repeated type changes, the final target must have an executable direct cast
+from every historical type of the same stable field ID. A non-executable chain
+is rejected before the new schema metadata is written.
+
+Readers resolve old columns by stable Paimon field ID and present them using the
+current logical type. Writers normalize target `CHAR`/`VARCHAR` and
+`BINARY`/`VARBINARY` constraints only for field IDs that have a supported type
+change in schema history; this does not retroactively change write behavior for
+unrelated existing columns.
+
+Predicate pushdown fails open across type evolution. A predicate that cannot be
+safely converted to an old file's schema is not passed to that file reader or
+its statistics pruning path, so the full candidate set is retained and the
+DataFusion residual filter produces the final result. DataFusion resolves type
+evolution by stable field ID and retains the additional residual only when a
+pushed predicate references an evolved field. Unrelated additions, renames,
+comments, or option changes do not cause a table-wide pushdown downgrade.
+
+Type narrowing and other downgrades are not guaranteed to be lossless. Values
+may be truncated, rounded, rejected on overflow, or otherwise follow the target
+executor's conversion semantics. This feature does not provide downgrade
+recovery or restore the original value representation.
 
 ## DML
 

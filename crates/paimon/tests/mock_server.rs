@@ -941,6 +941,18 @@ impl RESTServer {
         schema: paimon::spec::Schema,
         path: &str,
     ) {
+        self.add_table_with_schema_id(database, table, schema, path, 0);
+    }
+
+    /// Add a table with an explicit schema ID to the server state.
+    pub fn add_table_with_schema_id(
+        &self,
+        database: &str,
+        table: &str,
+        schema: paimon::spec::Schema,
+        path: &str,
+        schema_id: i64,
+    ) {
         let mut s = self.inner.lock().unwrap();
         s.databases.entry(database.to_string()).or_insert_with(|| {
             GetDatabaseResponse::new(
@@ -960,7 +972,7 @@ impl RESTServer {
                 Some(table.to_string()),
                 Some(path.to_string()),
                 Some(true),
-                Some(0),
+                Some(schema_id),
                 Some(schema),
                 AuditRESTResponse::new(None, None, None, None, None),
             ),

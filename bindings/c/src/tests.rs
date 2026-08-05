@@ -2085,6 +2085,7 @@ fn build_pk_vector_table(path: &str, vectors: &[[f32; PK_DIM]]) -> Table {
                     &[(&data_file_name, row_count)],
                 )),
                 index_meta: None,
+                build_schema_id: None,
             }),
         };
 

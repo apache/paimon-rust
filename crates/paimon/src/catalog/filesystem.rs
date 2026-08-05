@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use crate::catalog::schema_evolution::{apply_schema_changes, validate_type_evolution_precommit};
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
@@ -458,26 +459,10 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
-        let new_schema = current
-            .apply_changes(changes)
-            .map_err(|e| fill_table_name(e, identifier))?;
+        let new_schema = apply_schema_changes(&current, &changes, identifier)?;
+        validate_type_evolution_precommit(&self.file_io, &table_path, &current, &new_schema)
+            .await?;
         self.save_table_schema(&table_path, &new_schema).await
-    }
-}
-
-/// `TableSchema::apply_changes` returns column errors without a table name;
-/// fill in the identifier's full name so the message identifies the table.
-fn fill_table_name(err: Error, identifier: &Identifier) -> Error {
-    match err {
-        Error::ColumnNotExist { column, .. } => Error::ColumnNotExist {
-            full_name: identifier.full_name(),
-            column,
-        },
-        Error::ColumnAlreadyExist { column, .. } => Error::ColumnAlreadyExist {
-            full_name: identifier.full_name(),
-            column,
-        },
-        other => other,
     }
 }
 

@@ -218,6 +218,7 @@ mod tests {
                 extra_field_ids: None,
                 source_meta: None,
                 index_meta: None,
+                build_schema_id: None,
             }),
         }
     }

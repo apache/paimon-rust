@@ -26,6 +26,7 @@ mod filesystem;
 mod function;
 mod partition_listing;
 mod rest;
+mod schema_evolution;
 mod view;
 
 use std::collections::HashMap;

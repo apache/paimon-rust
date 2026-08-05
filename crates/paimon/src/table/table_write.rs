@@ -21,6 +21,9 @@
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::schema_evolution::{
+    normalize_array_for_schema_evolution_storage, requires_schema_evolution_storage_normalization,
+};
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
@@ -126,6 +129,9 @@ pub struct TableWrite {
     has_dedicated_vector_fields: bool,
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
+    /// Field IDs with a supported type change to a bounded character or binary
+    /// target. Only these fields receive target storage normalization.
+    evolved_storage_field_ids: Option<Arc<HashSet<i32>>>,
 }
 
 impl TableWrite {
@@ -343,6 +349,12 @@ impl TableWrite {
                 .fields()
                 .iter()
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
+        let evolved_storage_field_ids = (schema.id() == 0
+            || !schema
+                .fields()
+                .iter()
+                .any(|field| requires_schema_evolution_storage_normalization(field.data_type())))
+        .then(|| Arc::new(HashSet::new()));
 
         Ok(Self {
             table: table.clone(),
@@ -377,6 +389,7 @@ impl TableWrite {
             has_dedicated_vector_fields,
             row_kind_generator,
             row_kind_filter,
+            evolved_storage_field_ids,
         })
     }
 
@@ -443,7 +456,8 @@ impl TableWrite {
             return Ok(());
         }
 
-        let batch = self.enrich_rowkind_batch(batch)?;
+        let batch = self.normalize_evolved_storage_fields(batch).await?;
+        let batch = self.enrich_rowkind_batch(&batch)?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -454,6 +468,44 @@ impl TableWrite {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn normalize_evolved_storage_fields(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        if self.evolved_storage_field_ids.is_none() {
+            self.evolved_storage_field_ids = Some(
+                self.table
+                    .schema_manager()
+                    .storage_normalization_field_ids(self.table.schema())
+                    .await?,
+            );
+        }
+        let evolved_field_ids = self.evolved_storage_field_ids.as_ref().unwrap();
+        if evolved_field_ids.is_empty() {
+            return Ok(batch.clone());
+        }
+
+        let fields = self.table.schema().fields();
+        let mut columns = batch.columns().to_vec();
+        for (index, field) in fields.iter().enumerate() {
+            if evolved_field_ids.contains(&field.id()) {
+                columns[index] = normalize_array_for_schema_evolution_storage(
+                    &columns[index],
+                    field.data_type(),
+                )?;
+            }
+        }
+
+        RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
+            crate::Error::UnexpectedError {
+                message: format!(
+                    "Failed to build storage-normalized schema evolution batch: {error}"
+                ),
+                source: Some(Box::new(error)),
+            }
+        })
     }
 
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
@@ -1032,6 +1084,31 @@ mod tests {
             test_schema(),
             None,
         )
+    }
+
+    #[test]
+    fn test_writer_skips_history_lookup_without_bounded_storage_targets() {
+        let schema = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "no_storage_normalization"),
+            "memory:/no_storage_normalization".to_string(),
+            schema,
+            None,
+        );
+
+        let writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        assert!(writer
+            .evolved_storage_field_ids
+            .as_ref()
+            .is_some_and(|field_ids| field_ids.is_empty()));
     }
 
     fn test_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {

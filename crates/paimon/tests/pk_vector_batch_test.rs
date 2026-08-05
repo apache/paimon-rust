@@ -297,6 +297,7 @@ async fn build_table(vectors: &[[f32; DIM]]) -> (tempfile::TempDir, Table) {
                 &[(&data_file_name, row_count)],
             )),
             index_meta: None,
+            build_schema_id: None,
         }),
     };
 

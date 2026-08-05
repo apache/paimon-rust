@@ -360,6 +360,7 @@ mod tests {
             extra_field_ids: None,
             index_meta: None,
             source_meta: Some(source_meta),
+            build_schema_id: None,
         }
     }
 

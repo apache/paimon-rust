@@ -2646,16 +2646,19 @@ impl TableCommit {
         messages
             .iter()
             .flat_map(|msg| {
-                let adds = msg
-                    .new_index_files
-                    .iter()
-                    .map(move |index_file| IndexManifestEntry {
+                let adds = msg.new_index_files.iter().map(move |index_file| {
+                    let mut index_file = index_file.clone();
+                    if let Some(global_meta) = index_file.global_index_meta.as_mut() {
+                        global_meta.build_schema_id = Some(self.table.schema().id());
+                    }
+                    IndexManifestEntry {
                         kind: FileKind::Add,
                         partition: msg.partition.clone(),
                         bucket: msg.bucket,
-                        index_file: index_file.clone(),
+                        index_file,
                         version: 1,
-                    });
+                    }
+                });
                 let deletes =
                     msg.deleted_index_files
                         .iter()
@@ -3014,6 +3017,7 @@ mod tests {
                 extra_field_ids: None,
                 source_meta: None,
                 index_meta: None,
+                build_schema_id: None,
             }),
         }
     }
@@ -3572,6 +3576,15 @@ mod tests {
                 .unwrap();
         assert_eq!(index_entries.len(), 1);
         assert_eq!(index_entries[0].index_file.file_name, "lumina-0.index");
+        assert_eq!(
+            index_entries[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .build_schema_id,
+            Some(0)
+        );
     }
 
     #[tokio::test]

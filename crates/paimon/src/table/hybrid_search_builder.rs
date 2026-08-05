@@ -1397,6 +1397,7 @@ mod pk_hybrid_tests {
                     &[(&data_file_name, row_count)],
                 )),
                 index_meta: None,
+                build_schema_id: None,
             }),
         };
 
@@ -1427,6 +1428,7 @@ mod pk_hybrid_tests {
                 extra_field_ids: None,
                 source_meta: Some(source_meta_bytes(1, &[(&data_file_name, row_count)])),
                 index_meta: None,
+                build_schema_id: None,
             }),
         };
 

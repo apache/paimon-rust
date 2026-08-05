@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::PagedList;
+use crate::catalog::schema_evolution::{apply_schema_changes, validate_type_evolution_precommit};
 use crate::catalog::{
     list_partitions_from_file_system, Catalog, Database, Identifier, DB_LOCATION_PROP,
 };
@@ -278,6 +279,25 @@ impl Catalog for RESTCatalog {
         changes: Vec<SchemaChange>,
         ignore_if_not_exists: bool,
     ) -> Result<()> {
+        if changes
+            .iter()
+            .any(|change| matches!(change, SchemaChange::UpdateColumnType { .. }))
+        {
+            let table = match self.get_table(identifier).await {
+                Ok(table) => table,
+                Err(Error::TableNotExist { .. }) if ignore_if_not_exists => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let new_schema = apply_schema_changes(table.schema(), &changes, identifier)?;
+            validate_type_evolution_precommit(
+                table.file_io(),
+                table.location(),
+                table.schema(),
+                &new_schema,
+            )
+            .await?;
+        }
+
         let result = self
             .api
             .alter_table(identifier, changes)

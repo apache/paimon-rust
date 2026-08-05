@@ -693,6 +693,7 @@ mod read_tests {
                 extra_field_ids: None,
                 index_meta: None,
                 source_meta: Some(frame(1, files)),
+                build_schema_id: None,
             }),
         }
     }

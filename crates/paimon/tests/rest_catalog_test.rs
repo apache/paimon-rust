@@ -31,8 +31,8 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
-    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PredicateBuilder,
-    Schema, SchemaChange, VarCharType,
+    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, DecimalType, FloatType,
+    IntType, PredicateBuilder, Schema, SchemaChange, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -975,6 +975,112 @@ async fn test_catalog_alter_table() {
         .alter_table(&missing, vec![], true)
         .await
         .unwrap();
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_catalog_alter_type_runs_rust_preflight_before_post() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
+    fs_catalog
+        .create_database("default", false, HashMap::new())
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "rest_type_evolution");
+    let initial_schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Float(FloatType::new()))
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_table(&identifier, initial_schema, false)
+        .await
+        .unwrap();
+    let ctx = setup_catalog(vec!["default"]).await;
+    let rest_schema = |table: &Table| -> Schema {
+        serde_json::from_value(
+            serde_json::to_value(table.schema()).expect("serialize table schema"),
+        )
+        .expect("deserialize REST schema")
+    };
+
+    let initial_table = fs_catalog.get_table(&identifier).await.unwrap();
+    ctx.server.add_table_with_schema_id(
+        identifier.database(),
+        identifier.object(),
+        rest_schema(&initial_table),
+        initial_table.location(),
+        initial_table.schema().id(),
+    );
+    let error = ctx
+        .catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+            )],
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, paimon::Error::Unsupported { ref message }
+            if message.contains("cannot be converted")),
+        "unexpected error: {error:?}"
+    );
+
+    fs_catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            false,
+        )
+        .await
+        .unwrap();
+    let stored_table = fs_catalog.get_table(&identifier).await.unwrap();
+    ctx.server.add_table_with_schema_id(
+        identifier.database(),
+        identifier.object(),
+        rest_schema(&stored_table),
+        stored_table.location(),
+        stored_table.schema().id(),
+    );
+
+    let error = ctx
+        .catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+            )],
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, paimon::Error::Unsupported { ref message }
+            if message.contains("historical schema 0")
+                && message.contains("unimplemented schema evolution cast")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        stored_table
+            .schema_manager()
+            .list_all()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 // ==================== Multiple Databases Tests ====================

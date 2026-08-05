@@ -19,15 +19,29 @@
 //!
 //! Reference: [org.apache.paimon.schema.SchemaManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
 
+use crate::arrow::schema_evolution::{
+    requires_schema_evolution_storage_normalization, same_type_ignoring_nullability,
+    schema_evolution_cast_implemented,
+};
 use crate::io::FileIO;
-use crate::spec::TableSchema;
+use crate::spec::{GlobalIndexMeta, TableSchema};
 use futures::future::try_join_all;
 use opendal::raw::get_basename;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
 const SCHEMA_DIR: &str = "schema";
 const SCHEMA_PREFIX: &str = "schema-";
+
+#[derive(Debug)]
+struct SchemaEvolutionInfo {
+    history_complete: bool,
+    type_evolved_field_ids: Arc<HashSet<i32>>,
+    storage_normalization_field_ids: Arc<HashSet<i32>>,
+}
+
+type SchemaEvolutionCell = Arc<OnceCell<Arc<SchemaEvolutionInfo>>>;
 
 /// Manager for versioned table schema files.
 ///
@@ -46,6 +60,9 @@ pub struct SchemaManager {
     table_path: String,
     /// Shared cache of loaded schemas by ID.
     cache: Arc<Mutex<HashMap<i64, Arc<TableSchema>>>>,
+    /// Shared history analysis by current schema ID. A `OnceCell` prevents
+    /// concurrent writers/readers from repeating the same remote schema LIST.
+    evolution_cache: Arc<Mutex<HashMap<i64, SchemaEvolutionCell>>>,
 }
 
 impl SchemaManager {
@@ -54,6 +71,7 @@ impl SchemaManager {
             file_io,
             table_path,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            evolution_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -154,13 +172,177 @@ impl SchemaManager {
 
         Ok(schema)
     }
+
+    /// Return type-evolved field IDs for `current_schema`, or `None` when its
+    /// preceding schema history is incomplete. Results are cached by current
+    /// schema ID and shared across `SchemaManager` clones.
+    pub async fn type_evolved_field_ids(
+        &self,
+        current_schema: &TableSchema,
+    ) -> crate::Result<Option<Arc<HashSet<i32>>>> {
+        let info = self.schema_evolution_info(current_schema).await?;
+        Ok(info
+            .history_complete
+            .then(|| Arc::clone(&info.type_evolved_field_ids)))
+    }
+
+    /// Return whether a global index was encoded with field types compatible
+    /// with `current_schema`.
+    ///
+    /// New index entries carry their build schema ID. Legacy entries remain
+    /// usable only when complete history proves that none of their dependent
+    /// fields has changed type.
+    pub(crate) async fn global_index_schema_compatible(
+        &self,
+        current_schema: &TableSchema,
+        global_index: &GlobalIndexMeta,
+    ) -> crate::Result<bool> {
+        let field_ids = std::iter::once(global_index.index_field_id)
+            .chain(global_index.extra_field_ids.iter().flatten().copied())
+            .collect::<Vec<_>>();
+
+        if field_ids.iter().any(|field_id| {
+            current_schema
+                .fields()
+                .iter()
+                .all(|field| field.id() != *field_id)
+        }) {
+            return Ok(false);
+        }
+
+        let Some(build_schema_id) = global_index.build_schema_id else {
+            let Some(evolved_field_ids) = self.type_evolved_field_ids(current_schema).await? else {
+                return Ok(false);
+            };
+            return Ok(field_ids
+                .iter()
+                .all(|field_id| !evolved_field_ids.contains(field_id)));
+        };
+
+        if build_schema_id == current_schema.id() {
+            return Ok(true);
+        }
+        let build_schema = self.schema(build_schema_id).await?;
+        Ok(field_ids.iter().all(|field_id| {
+            let build_field = build_schema
+                .fields()
+                .iter()
+                .find(|field| field.id() == *field_id);
+            let current_field = current_schema
+                .fields()
+                .iter()
+                .find(|field| field.id() == *field_id);
+            matches!(
+                (build_field, current_field),
+                (Some(build), Some(current))
+                    if same_type_ignoring_nullability(
+                        build.data_type(),
+                        current.data_type()
+                    )
+            )
+        }))
+    }
+
+    /// Return fields that need target storage normalization after a supported
+    /// type evolution. Unlike predicate planning, writer behavior does not
+    /// require a complete history and preserves the previous best-effort scan.
+    pub(crate) async fn storage_normalization_field_ids(
+        &self,
+        current_schema: &TableSchema,
+    ) -> crate::Result<Arc<HashSet<i32>>> {
+        let info = self.schema_evolution_info(current_schema).await?;
+        Ok(Arc::clone(&info.storage_normalization_field_ids))
+    }
+
+    async fn schema_evolution_info(
+        &self,
+        current_schema: &TableSchema,
+    ) -> crate::Result<Arc<SchemaEvolutionInfo>> {
+        let cell = {
+            let mut cache = self.evolution_cache.lock().unwrap();
+            Arc::clone(
+                cache
+                    .entry(current_schema.id())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        let info = cell
+            .get_or_try_init(|| self.load_schema_evolution_info(current_schema))
+            .await?;
+        Ok(Arc::clone(info))
+    }
+
+    async fn load_schema_evolution_info(
+        &self,
+        current_schema: &TableSchema,
+    ) -> crate::Result<Arc<SchemaEvolutionInfo>> {
+        if current_schema.id() == 0 {
+            return Ok(Arc::new(SchemaEvolutionInfo {
+                history_complete: true,
+                type_evolved_field_ids: Arc::new(HashSet::new()),
+                storage_normalization_field_ids: Arc::new(HashSet::new()),
+            }));
+        }
+
+        let schemas = self.list_all().await?;
+        let historical = schemas
+            .iter()
+            .filter(|schema| schema.id() < current_schema.id())
+            .collect::<Vec<_>>();
+        let history_complete = usize::try_from(current_schema.id())
+            .ok()
+            .is_some_and(|count| {
+                historical.len() == count
+                    && historical
+                        .iter()
+                        .enumerate()
+                        .all(|(id, schema)| schema.id() == id as i64)
+            });
+
+        let mut type_evolved_field_ids = HashSet::new();
+        let mut storage_normalization_field_ids = HashSet::new();
+        for current_field in current_schema.fields() {
+            for historical_schema in &historical {
+                let Some(historical_field) = historical_schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.id() == current_field.id())
+                else {
+                    continue;
+                };
+                if same_type_ignoring_nullability(
+                    historical_field.data_type(),
+                    current_field.data_type(),
+                ) {
+                    continue;
+                }
+                type_evolved_field_ids.insert(current_field.id());
+                if requires_schema_evolution_storage_normalization(current_field.data_type())
+                    && schema_evolution_cast_implemented(
+                        historical_field.data_type(),
+                        current_field.data_type(),
+                    )
+                {
+                    storage_normalization_field_ids.insert(current_field.id());
+                }
+            }
+        }
+
+        Ok(Arc::new(SchemaEvolutionInfo {
+            history_complete,
+            type_evolved_field_ids: Arc::new(type_evolved_field_ids),
+            storage_normalization_field_ids: Arc::new(storage_normalization_field_ids),
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
-    use crate::spec::Schema;
+    use crate::spec::{
+        BigIntType, CharType, DataType, GlobalIndexMeta, IntType, Schema, SchemaChange,
+    };
     use bytes::Bytes;
 
     fn memory_file_io() -> FileIO {
@@ -170,8 +352,12 @@ mod tests {
     async fn write_schema_file(file_io: &FileIO, dir: &str, id: i64) {
         let schema = Schema::builder().build().unwrap();
         let table_schema = TableSchema::new(id, &schema);
+        write_table_schema_file(file_io, dir, &table_schema).await;
+    }
+
+    async fn write_table_schema_file(file_io: &FileIO, dir: &str, table_schema: &TableSchema) {
         let json = serde_json::to_vec(&table_schema).unwrap();
-        let path = format!("{dir}/{SCHEMA_PREFIX}{id}");
+        let path = format!("{dir}/{SCHEMA_PREFIX}{}", table_schema.id());
         let out = file_io.new_output(&path).unwrap();
         out.write(Bytes::from(json)).await.unwrap();
     }
@@ -264,5 +450,146 @@ mod tests {
         let sm = SchemaManager::new(file_io, table_path.to_string());
         let latest = sm.latest().await.unwrap().expect("latest");
         assert_eq!(latest.id(), 5);
+    }
+
+    #[tokio::test]
+    async fn schema_evolution_info_is_cached_by_current_schema_id() {
+        let file_io = memory_file_io();
+        let table_path = "memory:/schema_evolution_info";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+
+        let initial = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::Char(CharType::new(10).unwrap()))
+                .build()
+                .unwrap(),
+        );
+        let renamed = initial
+            .apply_changes(vec![SchemaChange::rename_column(
+                "name".to_string(),
+                "renamed_name".to_string(),
+            )])
+            .unwrap();
+        let evolved = renamed
+            .apply_changes(vec![
+                SchemaChange::update_column_type(
+                    "id".to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+                SchemaChange::update_column_type(
+                    "renamed_name".to_string(),
+                    DataType::Char(CharType::new(5).unwrap()),
+                ),
+            ])
+            .unwrap();
+        for schema in [&initial, &renamed, &evolved] {
+            write_table_schema_file(&file_io, &dir, schema).await;
+        }
+
+        let manager = SchemaManager::new(file_io, table_path.to_string());
+        let rename_info = manager.schema_evolution_info(&renamed).await.unwrap();
+        assert!(rename_info.history_complete);
+        assert!(rename_info.type_evolved_field_ids.is_empty());
+        assert!(rename_info.storage_normalization_field_ids.is_empty());
+
+        let manager_clone = manager.clone();
+        let (first, second) = tokio::join!(
+            manager.schema_evolution_info(&evolved),
+            manager_clone.schema_evolution_info(&evolved)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.history_complete);
+        assert_eq!(
+            first.type_evolved_field_ids.as_ref(),
+            &HashSet::from([evolved.fields()[0].id(), evolved.fields()[1].id()])
+        );
+        assert_eq!(
+            first.storage_normalization_field_ids.as_ref(),
+            &HashSet::from([evolved.fields()[1].id()])
+        );
+
+        let public_ids = manager
+            .type_evolved_field_ids(&evolved)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&public_ids, &first.type_evolved_field_ids));
+    }
+
+    #[tokio::test]
+    async fn global_index_compatibility_uses_build_schema_field_types() {
+        let file_io = memory_file_io();
+        let table_path = "memory:/global_index_schema_compatibility";
+        let dir = format!("{table_path}/{SCHEMA_DIR}");
+        file_io.mkdirs(&dir).await.unwrap();
+
+        let initial = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::Char(CharType::new(10).unwrap()))
+                .build()
+                .unwrap(),
+        );
+        let current = initial
+            .apply_changes(vec![
+                SchemaChange::update_column_type(
+                    "id".to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+                SchemaChange::add_column("unrelated".to_string(), DataType::Int(IntType::new())),
+            ])
+            .unwrap();
+        for schema in [&initial, &current] {
+            write_table_schema_file(&file_io, &dir, schema).await;
+        }
+
+        let manager = SchemaManager::new(file_io, table_path.to_string());
+        let id_field_id = initial.fields()[0].id();
+        let name_field_id = initial.fields()[1].id();
+        let meta = |index_field_id, extra_field_ids, build_schema_id| GlobalIndexMeta {
+            row_range_start: 0,
+            row_range_end: 9,
+            index_field_id,
+            extra_field_ids,
+            index_meta: None,
+            source_meta: None,
+            build_schema_id,
+        };
+
+        assert!(!manager
+            .global_index_schema_compatible(&current, &meta(id_field_id, None, Some(initial.id())),)
+            .await
+            .unwrap());
+        assert!(manager
+            .global_index_schema_compatible(
+                &current,
+                &meta(name_field_id, None, Some(initial.id())),
+            )
+            .await
+            .unwrap());
+        assert!(!manager
+            .global_index_schema_compatible(
+                &current,
+                &meta(name_field_id, Some(vec![id_field_id]), Some(initial.id())),
+            )
+            .await
+            .unwrap());
+
+        // Legacy entries have no build schema ID. Complete history still lets
+        // unchanged fields use them, while evolved dependencies are rejected.
+        assert!(!manager
+            .global_index_schema_compatible(&current, &meta(id_field_id, None, None))
+            .await
+            .unwrap());
+        assert!(manager
+            .global_index_schema_compatible(&current, &meta(name_field_id, None, None))
+            .await
+            .unwrap());
     }
 }

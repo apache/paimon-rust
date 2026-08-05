@@ -1208,13 +1208,17 @@ impl<'a> PaimonTableScan<'a> {
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
-        let entries = IndexManifest::read(self.table.file_io(), &path)
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
-            })
-            .collect();
+        let entries = super::global_index_build_common::retain_schema_compatible_entries(
+            self.table,
+            IndexManifest::read(self.table.file_io(), &path).await?,
+            |entry| normalize_sorted_global_index_type(&entry.index_file.index_type).is_some(),
+        )
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
+        })
+        .collect();
         Ok(Some(entries))
     }
 
@@ -1841,11 +1845,16 @@ impl<'a> PaimonTableScan<'a> {
                     let groups = row_id_groups
                         .into_iter()
                         .filter(|group| {
-                            data_evolution_group_matches_predicates(
-                                group,
-                                &self.data_predicates,
-                                self.table.schema().fields(),
-                            )
+                            // Group stats are encoded with each file's schema.
+                            // Until type-evolved stats can be converted safely,
+                            // retain every cross-schema group and let the row
+                            // reader plus residual filter decide.
+                            group.iter().any(|file| file.schema_id != table_schema_id)
+                                || data_evolution_group_matches_predicates(
+                                    group,
+                                    &self.data_predicates,
+                                    self.table.schema().fields(),
+                                )
                         })
                         .collect::<Vec<_>>();
                     if let Some(trace) = trace.as_deref_mut() {

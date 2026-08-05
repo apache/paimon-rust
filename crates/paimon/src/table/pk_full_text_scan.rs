@@ -312,7 +312,20 @@ impl<'a> PrimaryKeyFullTextScan<'a> {
         let mut entries: Vec<(BinaryRow, i32, IndexFileMeta)> = Vec::new();
         if let Some(name) = snapshot.index_manifest() {
             let path = snapshot_manager.manifest_path(name);
-            for entry in IndexManifest::read(self.table.file_io(), &path).await? {
+            let index_entries = super::global_index_build_common::retain_schema_compatible_entries(
+                self.table,
+                IndexManifest::read(self.table.file_io(), &path).await?,
+                |entry| {
+                    entry.index_file.index_type == PK_FULL_TEXT_INDEX_TYPE
+                        && entry
+                            .index_file
+                            .global_index_meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.index_field_id == self.text_field_id)
+                },
+            )
+            .await?;
+            for entry in index_entries {
                 // The on-disk index manifest is combined to live ADD entries only.
                 if entry.kind != FileKind::Add {
                     return Err(data_invalid(format!(
@@ -501,6 +514,7 @@ mod tests {
             extra_field_ids: None,
             index_meta: None,
             source_meta,
+            build_schema_id: None,
         }
     }
 

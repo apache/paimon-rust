@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
 use paimon::catalog::{list_partitions_from_file_system, Identifier};
@@ -1315,6 +1316,260 @@ async fn test_alter_table_update_column_type_and_nullability() {
         .expect("ALTER COLUMN DROP NOT NULL should succeed");
     let table = catalog.get_table(&identifier).await.unwrap();
     assert!(table.schema().fields()[1].data_type().is_nullable());
+}
+
+#[tokio::test]
+async fn test_alter_type_reads_old_and_new_writes_with_natural_predicate() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.mydb")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.mydb.type_evolution (id INT, name CHAR(10))")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "INSERT INTO paimon.mydb.type_evolution VALUES \
+             (1, 'abcdefghij'), (2, 'uvwxyzabcd')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("ALTER TABLE paimon.mydb.type_evolution ALTER COLUMN name TYPE CHAR(5)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.mydb.type_evolution VALUES (3, 'klmnopqrst')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, name FROM paimon.mydb.type_evolution ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                (
+                    array_value_to_string(batch.column(0).as_ref(), row).unwrap(),
+                    array_value_to_string(batch.column(1).as_ref(), row).unwrap(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            ("1".to_string(), "abcde".to_string()),
+            ("2".to_string(), "uvwxy".to_string()),
+            ("3".to_string(), "klmno".to_string()),
+        ]
+    );
+
+    let batches = sql_context
+        .sql("SELECT id, name FROM paimon.mydb.type_evolution WHERE name = 'abcde'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                (
+                    array_value_to_string(batch.column(0).as_ref(), row).unwrap(),
+                    array_value_to_string(batch.column(1).as_ref(), row).unwrap(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, vec![("1".to_string(), "abcde".to_string())]);
+}
+
+#[tokio::test]
+async fn test_alter_type_rejects_unexecutable_historical_cast_before_commit() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    let identifier = Identifier::new("mydb", "chained_type_evolution");
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.mydb")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.mydb.chained_type_evolution (id INT, value FLOAT)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.mydb.chained_type_evolution VALUES (1, 1.5)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("ALTER TABLE paimon.mydb.chained_type_evolution ALTER COLUMN value TYPE INT")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let error = sql_context
+        .sql(
+            "ALTER TABLE paimon.mydb.chained_type_evolution \
+             ALTER COLUMN value TYPE DECIMAL(10, 2)",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("historical schema 0 requires an unimplemented schema evolution cast"),
+        "{error:?}"
+    );
+
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(table.schema().id(), 1);
+    assert!(matches!(
+        table.schema().fields()[1].data_type(),
+        DataType::Int(_)
+    ));
+    assert_eq!(table.schema_manager().list_all().await.unwrap().len(), 2);
+
+    let batches = sql_context
+        .sql("SELECT id, value FROM paimon.mydb.chained_type_evolution")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        array_value_to_string(batches[0].column(0).as_ref(), 0).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        array_value_to_string(batches[0].column(1).as_ref(), 0).unwrap(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn test_unrelated_schema_change_does_not_normalize_existing_char_column() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.mydb")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.mydb.unchanged_char (id INT, name CHAR(5))")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("ALTER TABLE paimon.mydb.unchanged_char ADD COLUMN note INT")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.mydb.unchanged_char VALUES (1, 'abcdefghij', 7)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT name FROM paimon.mydb.unchanged_char")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        array_value_to_string(batches[0].column(0).as_ref(), 0).unwrap(),
+        "abcdefghij"
+    );
+}
+
+#[tokio::test]
+async fn test_unsupported_alter_type_fails_before_schema_commit() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    let identifier = Identifier::new("mydb", "unsupported_type_evolution");
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+    let schema = paimon::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("flag", DataType::Boolean(paimon::spec::BooleanType::new()))
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+
+    let error = sql_context
+        .sql("ALTER TABLE paimon.mydb.unsupported_type_evolution ALTER COLUMN flag TYPE DATE")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be converted"),
+        "{error:?}"
+    );
+
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(table.schema().id(), 0);
+    assert!(matches!(
+        table.schema().fields()[1].data_type(),
+        DataType::Boolean(_)
+    ));
 }
 
 #[tokio::test]

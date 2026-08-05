@@ -436,6 +436,7 @@ async fn build_table_with_first_row_id(
                 &[(&data_file_name, row_count)],
             )),
             index_meta: None,
+            build_schema_id: None,
         }),
     };
 
@@ -1283,6 +1284,7 @@ async fn pk_vector_refine_factor_matches_exact_ground_truth() {
                 &[(&data_file_name, row_count)],
             )),
             index_meta: None,
+            build_schema_id: None,
         }),
     };
     let mut message = CommitMessage::new(partition, bucket, vec![indexed_meta]);

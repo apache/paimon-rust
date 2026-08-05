@@ -18,7 +18,7 @@
 //! Data-level stats predicate filtering for manifest entries and data evolution groups.
 
 use super::Table;
-use crate::arrow::schema_evolution::create_index_mapping;
+use crate::arrow::filtering::remap_predicates_to_file;
 use crate::predicate_stats::{
     data_leaf_may_match, data_leaf_must_match, missing_field_may_match, missing_field_must_match,
     predicates_may_match_with_schema, StatsAccessor,
@@ -145,22 +145,10 @@ impl StatsAccessor for FileStatsRows {
 #[derive(Debug)]
 pub(super) struct ResolvedStatsSchema {
     file_fields: Vec<DataField>,
-    field_mapping: Vec<Option<usize>>,
 }
 
 fn identity_field_mapping(num_fields: usize) -> Vec<Option<usize>> {
     (0..num_fields).map(Some).collect()
-}
-
-fn normalize_field_mapping(mapping: Option<Vec<i32>>, num_fields: usize) -> Vec<Option<usize>> {
-    mapping
-        .map(|field_mapping| {
-            field_mapping
-                .into_iter()
-                .map(|index| usize::try_from(index).ok())
-                .collect()
-        })
-        .unwrap_or_else(|| identity_field_mapping(num_fields))
 }
 
 /// Check whether a data file *may* contain rows matching all `predicates`.
@@ -214,18 +202,11 @@ async fn resolve_stats_schema(
     let resolved = if file_schema_id == table_schema.id() {
         Some(Arc::new(ResolvedStatsSchema {
             file_fields: current_fields.to_vec(),
-            field_mapping: identity_field_mapping(current_fields.len()),
         }))
     } else {
         let file_schema = table.schema_manager().schema(file_schema_id).await.ok()?;
         let file_fields = file_schema.fields().to_vec();
-        Some(Arc::new(ResolvedStatsSchema {
-            field_mapping: normalize_field_mapping(
-                create_index_mapping(current_fields, &file_fields),
-                current_fields.len(),
-            ),
-            file_fields,
-        }))
+        Some(Arc::new(ResolvedStatsSchema { file_fields }))
     };
 
     schema_cache.insert(file_schema_id, resolved.clone());
@@ -255,11 +236,17 @@ pub(super) async fn data_file_matches_predicates_for_table(
         return true;
     };
 
+    let file_predicates =
+        remap_predicates_to_file(predicates, table.schema().fields(), &resolved.file_fields);
+    if file_predicates.predicates.is_empty() {
+        return true;
+    }
     let stats = FileStatsRows::from_data_file(file, &resolved.file_fields);
+    let field_mapping = identity_field_mapping(resolved.file_fields.len());
     predicates_may_match_with_schema(
-        predicates,
+        &file_predicates.predicates,
         &stats,
-        &resolved.field_mapping,
+        &field_mapping,
         &resolved.file_fields,
     )
 }

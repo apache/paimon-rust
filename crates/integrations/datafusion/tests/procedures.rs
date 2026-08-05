@@ -217,6 +217,38 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
 }
 
 #[tokio::test]
+async fn test_alter_type_rejects_persisted_global_index_dependency_before_commit() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_alter_type_guard").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_alter_type_guard (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_alter_type_guard', index_column => 'id', index_type => 'btree')",
+    )
+    .await;
+
+    assert_sql_error(
+        &sql_context,
+        "ALTER TABLE paimon.test_db.btree_alter_type_guard ALTER COLUMN id TYPE BIGINT",
+        "persisted global index 'btree' depends on field id",
+    )
+    .await;
+
+    let schema_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_alter_type_guard$schemas`",
+    )
+    .await;
+    assert_eq!(
+        schema_count, 1,
+        "failed ALTER must not write schema metadata"
+    );
+}
+
+#[tokio::test]
 async fn test_create_global_index_btree_string_fallback_scan_reads() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_string_fallback").await;
     exec(

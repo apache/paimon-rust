@@ -49,6 +49,13 @@ pub struct GlobalIndexMeta {
 
     #[serde(default, rename = "_SOURCE_META", with = "serde_bytes")]
     pub source_meta: Option<Vec<u8>>,
+
+    /// Schema used to encode the indexed fields.
+    ///
+    /// Rust readers use this to reject an index whose key semantics no longer
+    /// match the current field types after schema evolution.
+    #[serde(default, rename = "_BUILD_SCHEMA_ID")]
+    pub build_schema_id: Option<i64>,
 }
 
 /// Metadata of index file.

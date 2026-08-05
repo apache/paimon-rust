@@ -1575,6 +1575,7 @@ mod fulltext_tests {
                 extra_field_ids: None,
                 index_meta: None,
                 source_meta: None,
+                build_schema_id: None,
             }),
         }];
         TableCommit::new(table, "test-user".to_string())

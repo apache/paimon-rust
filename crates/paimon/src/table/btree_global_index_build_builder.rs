@@ -303,6 +303,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 extra_field_ids: None,
                 source_meta: None,
                 index_meta: Some(index_meta.serialize()),
+                build_schema_id: None,
             }),
         })
     }
@@ -2518,6 +2519,7 @@ mod tests {
                 extra_field_ids: None,
                 source_meta: None,
                 index_meta: None,
+                build_schema_id: None,
             }),
         };
         let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);

@@ -458,6 +458,7 @@ mod tests {
             extra_field_ids: None,
             index_meta: None,
             source_meta: None,
+            build_schema_id: None,
         };
         assert!(PrimaryKeyIndexSourceMeta::from_global_index_meta(&meta).is_err());
     }
@@ -471,6 +472,7 @@ mod tests {
             extra_field_ids: None,
             index_meta: None,
             source_meta: Some(frame(1, &[("f0", 3)])),
+            build_schema_id: None,
         };
         let parsed = PrimaryKeyIndexSourceMeta::from_global_index_meta(&meta).unwrap();
         assert_eq!(parsed.data_level(), 1);

@@ -133,6 +133,46 @@ async fn variant_get_projection_pushes_extractions_into_scan() {
 }
 
 #[tokio::test]
+async fn variant_get_projection_reads_files_from_an_older_schema() {
+    let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
+    common::exec(
+        &sql_context,
+        "ALTER TABLE paimon.test_db.t ADD COLUMN unrelated INT",
+    )
+    .await;
+
+    let sql = r#"
+        SELECT id, variant_get(payload, '$.age', 'int') AS age
+        FROM paimon.test_db.t
+        ORDER BY id
+    "#;
+    let df = sql_context.sql(sql).await.unwrap();
+    let plan = df.create_physical_plan().await.unwrap();
+    let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_text.contains("PushedVariants=[payload=[$.age]]"),
+        "plan should push the variant extraction for old-schema files, got:\n{plan_text}"
+    );
+
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    let ids = batches[0]
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let ages = batches[0]
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2]);
+    assert_eq!(ages.values(), &[27, 32]);
+}
+
+#[tokio::test]
 async fn variant_get_filter_pushes_extraction_into_scan() {
     let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
     let sql = r#"

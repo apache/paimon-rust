@@ -168,7 +168,12 @@ impl<'a> FullTextSearchBuilder<'a> {
         let index_entries = match snapshot.index_manifest() {
             Some(index_manifest_name) => {
                 let manifest_path = snapshot_manager.manifest_path(index_manifest_name);
-                IndexManifest::read(self.table.file_io(), &manifest_path).await?
+                super::global_index_build_common::retain_schema_compatible_entries(
+                    self.table,
+                    IndexManifest::read(self.table.file_io(), &manifest_path).await?,
+                    |entry| entry.index_file.index_type == FULL_TEXT_INDEX_TYPE,
+                )
+                .await?
             }
             None => Vec::new(),
         };
@@ -1018,6 +1023,7 @@ mod tests {
                     extra_field_ids: None,
                     index_meta: None,
                     source_meta: None,
+                    build_schema_id: None,
                 }),
             },
             version: 1,
@@ -1099,6 +1105,7 @@ mod tests {
                     extra_field_ids: None,
                     index_meta: None,
                     source_meta: None,
+                    build_schema_id: None,
                 }),
             },
             version: 1,
@@ -1276,6 +1283,7 @@ mod tests {
                     extra_field_ids: None,
                     index_meta: None,
                     source_meta: None,
+                    build_schema_id: None,
                 }),
             },
             version: 1,

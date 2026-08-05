@@ -699,16 +699,18 @@ mod tests {
     use crate::deletion_vector::DeletionVector;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        BinaryRow, DataField, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema,
-        VarCharType,
+        BinaryRow, CharType, DataField, DataFileMeta, DataType, Datum, IntType, Predicate,
+        PredicateBuilder, Schema, TableSchema, VarCharType,
     };
     use crate::table::{query_auth_table, DataSplitBuilder, DeletionFile, Table};
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
     use bytes::Bytes;
     use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
     use roaring::RoaringBitmap;
     use std::collections::{HashMap, HashSet};
-    use std::fs;
+    use std::fs::{self, File};
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -733,6 +735,123 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    fn char_evolution_schema(id: i64, length: usize) -> TableSchema {
+        TableSchema::new(
+            id,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::Char(CharType::new(length).unwrap()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn write_id_name_parquet_file(
+        path: &Path,
+        fields: &[DataField],
+        ids: Vec<i32>,
+        names: Vec<&str>,
+    ) {
+        let schema = crate::arrow::build_target_arrow_schema(fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    async fn write_schema_file(table: &Table, schema: &TableSchema) {
+        let path = table.schema_manager().schema_path(schema.id());
+        let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap();
+        table.file_io().mkdirs(dir).await.unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(schema).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    async fn read_type_evolved_char_rows(
+        include_current_file: bool,
+        predicate: impl FnOnce(&[DataField]) -> Predicate,
+    ) -> Vec<i32> {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let old_schema = char_evolution_schema(0, 10);
+        let current_schema = char_evolution_schema(1, 5);
+        let old_path = bucket_dir.join("old.parquet");
+        write_id_name_parquet_file(
+            &old_path,
+            old_schema.fields(),
+            vec![1, 2],
+            vec!["abcde-oldx", "other-oldx"],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "type_evolved_filter"),
+            table_path,
+            current_schema.clone(),
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let old_size = fs::metadata(&old_path).unwrap().len() as i64;
+        let mut files = vec![test_data_file::<DataFileMeta>("old.parquet", 2, old_size)];
+        if include_current_file {
+            let current_path = bucket_dir.join("current.parquet");
+            write_id_name_parquet_file(
+                &current_path,
+                current_schema.fields(),
+                vec![3, 4],
+                vec!["abcde", "other"],
+            );
+            let current_size = fs::metadata(&current_path).unwrap().len() as i64;
+            let mut current_file =
+                test_data_file::<DataFileMeta>("current.parquet", 2, current_size);
+            current_file.schema_id = current_schema.id();
+            files.push(current_file);
+        }
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .build()
+            .unwrap();
+        let predicate = predicate(table.schema().fields());
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+        collect_int_column(&batches, "id")
     }
 
     async fn write_test_deletion_file(
@@ -1264,6 +1383,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(collect_int_column(&batches, "id"), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_new_read_applies_type_evolved_filter_to_old_file() {
+        let rows = read_type_evolved_char_rows(false, |fields| {
+            PredicateBuilder::new(fields)
+                .equal("name", Datum::String("abcde".to_string()))
+                .unwrap()
+        })
+        .await;
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_new_read_applies_type_evolved_filter_to_old_and_current_files() {
+        let rows = read_type_evolved_char_rows(true, |fields| {
+            PredicateBuilder::new(fields)
+                .equal("name", Datum::String("abcde".to_string()))
+                .unwrap()
+        })
+        .await;
+        assert_eq!(rows, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_new_read_not_over_type_evolved_and_keeps_old_rows() {
+        let rows = read_type_evolved_char_rows(false, |fields| {
+            let builder = PredicateBuilder::new(fields);
+            Predicate::negate(Predicate::and(vec![
+                builder.equal("id", Datum::Int(1)).unwrap(),
+                builder
+                    .equal("name", Datum::String("other".to_string()))
+                    .unwrap(),
+            ]))
+        })
+        .await;
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_new_read_not_is_null_on_added_columns_filters_old_rows() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("new1", DataType::Int(IntType::new()))
+                .column("new2", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let old_path = bucket_dir.join("old.parquet");
+        write_int_parquet_file(&old_path, vec![("id", vec![1, 2])], None);
+
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "added_column_filter"),
+            table_path,
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let file_size = fs::metadata(&old_path).unwrap().len() as i64;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file::<DataFileMeta>(
+                "old.parquet",
+                2,
+                file_size,
+            )])
+            .build()
+            .unwrap();
+        let builder = PredicateBuilder::new(table.schema().fields());
+        let predicate = Predicate::negate(Predicate::and(vec![
+            builder.is_null("new1").unwrap(),
+            builder.is_null("new2").unwrap(),
+        ]));
+        let mut read_builder = table.new_read_builder();
+        read_builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
+        let batches = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(collect_int_column(&batches, "id").is_empty());
     }
 
     #[tokio::test]

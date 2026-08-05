@@ -17,6 +17,7 @@
 
 //! Paimon table provider for DataFusion.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
@@ -164,6 +165,42 @@ impl PaimonTableProvider {
     pub fn table(&self) -> &Table {
         &self.table
     }
+
+    async fn predicate_involves_type_evolution(&self, predicate: &Predicate) -> bool {
+        if self.table.schema().id() == 0 {
+            return false;
+        }
+        let evolved_field_ids = await_with_runtime(
+            self.table
+                .schema_manager()
+                .type_evolved_field_ids(self.table.schema()),
+        )
+        .await
+        .ok()
+        .flatten();
+        predicate_references_field_ids(
+            predicate,
+            self.table.schema().fields(),
+            evolved_field_ids.as_deref(),
+        )
+    }
+}
+
+fn predicate_references_field_ids(
+    predicate: &Predicate,
+    fields: &[DataField],
+    field_ids: Option<&HashSet<i32>>,
+) -> bool {
+    let Some(field_ids) = field_ids else {
+        return true;
+    };
+    let mut indices = HashSet::new();
+    predicate.collect_leaf_field_indices(&mut indices);
+    indices.into_iter().any(|index| {
+        fields
+            .get(index)
+            .is_some_and(|field| field_ids.contains(&field.id()))
+    })
 }
 
 /// Build a `CREATE TABLE` DDL string for a Paimon table.
@@ -423,6 +460,10 @@ impl TableProvider for PaimonTableProvider {
         // Plan splits eagerly so we know partition count upfront.
         let filter_analysis =
             analyze_filters(filters, self.table.schema().fields(), case_sensitive);
+        let requires_schema_evolution_residual = match &filter_analysis.pushed_predicate {
+            Some(predicate) => self.predicate_involves_type_evolution(predicate).await,
+            None => false,
+        };
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_case_sensitive(case_sensitive);
         if let Some(indices) = projection {
@@ -436,7 +477,8 @@ impl TableProvider for PaimonTableProvider {
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
-        let pushed_limit = limit.filter(|_| !filter_analysis.requires_residual);
+        let pushed_limit = limit
+            .filter(|_| !filter_analysis.requires_residual && !requires_schema_evolution_residual);
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
@@ -451,6 +493,7 @@ impl TableProvider for PaimonTableProvider {
 
         let target = state.config_options().execution.target_partitions;
         let filter_exact = !filter_analysis.requires_residual
+            && !requires_schema_evolution_residual
             && filter_analysis
                 .pushed_predicate
                 .as_ref()
@@ -547,6 +590,75 @@ mod tests {
     fn test_bucket_round_robin_single_bucket() {
         let result = bucket_round_robin(vec![1, 2, 3], 1);
         assert_eq!(result, vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn test_non_type_schema_version_preserves_exact_partition_pushdown() {
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{IntType, Schema as PaimonSchema, TableSchema};
+
+        let schema = PaimonSchema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "evolved_filter"),
+            "memory:/evolved_filter".to_string(),
+            TableSchema::new(1, &schema),
+            None,
+        );
+        let provider = PaimonTableProvider::try_new(table).unwrap();
+        let filter = col("pt").eq(lit(1));
+
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter]).unwrap(),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+    }
+
+    #[test]
+    fn test_type_evolution_predicate_detection_uses_stable_ids() {
+        use paimon::spec::{
+            Datum, IntType, PredicateBuilder, Schema as PaimonSchema, SchemaChange,
+        };
+
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let initial = paimon::spec::TableSchema::new(0, &schema);
+        let renamed = initial
+            .apply_changes(vec![SchemaChange::rename_column(
+                "value".to_string(),
+                "renamed_value".to_string(),
+            )])
+            .unwrap();
+
+        let evolved = renamed
+            .apply_changes(vec![SchemaChange::update_column_type(
+                "id".to_string(),
+                DataType::BigInt(BigIntType::new()),
+            )])
+            .unwrap();
+        let evolved_ids = HashSet::from([evolved.fields()[0].id()]);
+
+        let builder = PredicateBuilder::new(evolved.fields());
+        let evolved_filter = builder.equal("id", Datum::Long(1)).unwrap();
+        let unchanged_filter = builder.equal("renamed_value", Datum::Int(1)).unwrap();
+        assert!(predicate_references_field_ids(
+            &evolved_filter,
+            evolved.fields(),
+            Some(&evolved_ids)
+        ));
+        assert!(!predicate_references_field_ids(
+            &unchanged_filter,
+            evolved.fields(),
+            Some(&evolved_ids)
+        ));
     }
 
     fn get_test_warehouse() -> String {

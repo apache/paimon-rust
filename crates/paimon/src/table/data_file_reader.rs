@@ -17,7 +17,9 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::create_format_reader_with_budget;
-use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
+use crate::arrow::schema_evolution::{
+    cast_array_for_schema_evolution, create_index_mapping, NULL_FIELD_INDEX,
+};
 use crate::arrow::ParquetReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
@@ -29,7 +31,6 @@ use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
 use crate::{DataSplit, Error};
 use arrow_array::{Array, Int64Array, RecordBatch};
-use arrow_cast::cast;
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -271,7 +272,7 @@ impl DataFileReader {
         // they pass, so this guard does not affect them.
         Self::reject_row_id_with_predicates(&self.read_type, &self.predicates)?;
 
-        let read_type = self.read_type.clone();
+        let output_read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
         // The first version of the engine hook is deliberately limited to a
@@ -292,9 +293,36 @@ impl DataFileReader {
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
 
-        let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let is_row_file = is_row_file(&file_meta);
+
+        // File-level predicates are only a pruning/filtering optimization. When
+        // a predicate references a type-evolved field, its current-schema
+        // literal cannot be passed to the old physical type. Keep the safe
+        // remapped subset for the format reader, then enforce the original
+        // predicate after converting the batch to current logical types.
+        let remapped = crate::arrow::filtering::remap_predicates_to_file(
+            &predicates,
+            &table_fields,
+            &file_fields,
+        );
+        let current_schema_residual = remapped.requires_current_schema_residual.then(|| {
+            crate::arrow::format::FilePredicates {
+                predicates: predicates.clone(),
+                row_filter_factory: None,
+                file_fields: table_fields.clone(),
+            }
+        });
+        let read_type = crate::arrow::residual::widen_scan_fields(
+            &output_read_type,
+            current_schema_residual.as_ref(),
+        );
+        let target_schema = build_target_arrow_schema(&read_type)?;
+        let output_schema = if current_schema_residual.is_some() {
+            Some(build_target_arrow_schema(&output_read_type)?)
+        } else {
+            None
+        };
 
         // Compute index mapping and determine which columns to read from the file.
         let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
@@ -319,16 +347,11 @@ impl DataFileReader {
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = {
-            let remapped = crate::arrow::filtering::remap_predicates_to_file(
-                &predicates,
-                &table_fields,
-                &file_fields,
-            );
-            if remapped.is_empty() && row_filter_factory.is_none() {
+            if remapped.predicates.is_empty() && row_filter_factory.is_none() {
                 None
             } else {
                 Some(crate::arrow::format::FilePredicates {
-                    predicates: remapped,
+                    predicates: remapped.predicates,
                     row_filter_factory,
                     file_fields: file_fields.clone(),
                 })
@@ -397,42 +420,45 @@ impl DataFileReader {
                             None
                         } else {
                             let data_field = &data_fields.as_ref().unwrap()[data_idx as usize];
-                            batch_schema
-                                .index_of(data_field.name())
-                                .ok()
-                                .map(|col_idx| batch.column(col_idx))
+                            match batch_schema.index_of(data_field.name()) {
+                                Ok(col_idx) => Some((
+                                    batch.column(col_idx),
+                                    decoded_data_type(data_field, &format_read_fields)?,
+                                )),
+                                Err(_) => None,
+                            }
                         }
                     } else if let Some(ref df) = data_fields {
-                        batch_schema
-                            .index_of(df[i].name())
-                            .ok()
-                            .map(|col_idx| batch.column(col_idx))
+                        let data_field = &df[i];
+                        match batch_schema.index_of(data_field.name()) {
+                            Ok(col_idx) => Some((
+                                batch.column(col_idx),
+                                decoded_data_type(data_field, &format_read_fields)?,
+                            )),
+                            Err(_) => None,
+                        }
                     } else {
                         batch_schema
                             .index_of(target_field.name())
                             .ok()
-                            .map(|col_idx| batch.column(col_idx))
+                            .map(|col_idx| (batch.column(col_idx), read_type[i].data_type()))
                     };
 
                     match source_col {
-                        Some(col) => {
-                            if col.data_type() == target_field.data_type() {
-                                columns.push(col.clone());
-                            } else {
-                                let casted = cast(col, target_field.data_type()).map_err(|e| {
-                                    Error::UnexpectedError {
-                                        message: format!(
-                                            "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                                            target_field.name(),
-                                            col.data_type(),
-                                            target_field.data_type()
-                                        ),
-                                        source: Some(Box::new(e)),
-                                    }
-                                })?;
-                                columns.push(casted);
-                            }
-                        }
+                        Some((col, source_type)) => columns.push(
+                            cast_array_for_schema_evolution(
+                                col,
+                                source_type,
+                                read_type[i].data_type(),
+                            )
+                            .map_err(|error| Error::UnexpectedError {
+                                message: format!(
+                                    "Failed to evolve column '{}': {error}",
+                                    target_field.name()
+                                ),
+                                source: Some(Box::new(error)),
+                            })?,
+                        ),
                         None => {
                             let null_array = arrow_array::new_null_array(target_field.data_type(), num_rows);
                             columns.push(null_array);
@@ -455,6 +481,18 @@ impl DataFileReader {
                         source: Some(Box::new(e)),
                     }
                 })?;
+                let result = match &current_schema_residual {
+                    Some(residual) => crate::arrow::residual::filter_record_batch_by_predicates(
+                        result,
+                        residual,
+                        &read_type,
+                    )?,
+                    None => result,
+                };
+                let result = match &output_schema {
+                    Some(schema) => project_batch_prefix(result, schema)?,
+                    None => result,
+                };
                 yield result;
             }
         }
@@ -535,11 +573,11 @@ impl DataFileReader {
                 &table_fields,
                 &file_fields,
             );
-            if remapped.is_empty() {
+            if remapped.predicates.is_empty() {
                 None
             } else {
                 Some(crate::arrow::format::FilePredicates {
-                    predicates: remapped,
+                    predicates: remapped.predicates,
                     row_filter_factory: None,
                     file_fields: file_fields.clone(),
                 })
@@ -582,14 +620,76 @@ impl DataFileReader {
                 let result = project_file_batch(
                     &batch,
                     &target_schema,
+                    &read_type,
                     index_mapping.as_deref(),
                     data_fields.as_deref(),
+                    &format_read_fields,
                 )?;
                 yield result;
             }
         }
         .boxed())
     }
+}
+
+/// Project a batch whose leading columns follow the caller's read type back to
+/// that output schema. Predicate-only columns appended for a current-schema
+/// residual are removed after filtering.
+fn project_batch_prefix(
+    batch: RecordBatch,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    let output_width = output_schema.fields().len();
+    if batch.num_columns() == output_width {
+        return Ok(batch);
+    }
+    if batch.num_columns() < output_width {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Cannot project {} batch columns to {output_width} output columns",
+                batch.num_columns()
+            ),
+            source: None,
+        });
+    }
+
+    let columns = batch.columns()[..output_width].to_vec();
+    let result = if columns.is_empty() {
+        RecordBatch::try_new_with_options(
+            output_schema.clone(),
+            columns,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )
+    } else {
+        RecordBatch::try_new(output_schema.clone(), columns)
+    };
+    result.map_err(|error| Error::UnexpectedError {
+        message: format!("Failed to project RecordBatch to requested read type: {error}"),
+        source: Some(Box::new(error)),
+    })
+}
+
+/// Return the semantic type materialized by the format reader for `data_field`.
+///
+/// The decoded type can differ from the file schema type when nested projection
+/// rewrites a physical column, for example a VARIANT extraction materialized as
+/// a synthetic ROW. Field IDs remain stable across that rewrite.
+fn decoded_data_type<'a>(
+    data_field: &DataField,
+    decoded_fields: &'a [DataField],
+) -> crate::Result<&'a DataType> {
+    decoded_fields
+        .iter()
+        .find(|field| field.id() == data_field.id())
+        .map(DataField::data_type)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Decoded fields do not contain file field '{}' with id {}",
+                data_field.name(),
+                data_field.id()
+            ),
+            source: None,
+        })
 }
 
 /// Project one decoded file `batch` onto `target_schema`, resolving each target
@@ -601,8 +701,10 @@ impl DataFileReader {
 fn project_file_batch(
     batch: &RecordBatch,
     target_schema: &Arc<arrow_schema::Schema>,
+    read_type: &[DataField],
     index_mapping: Option<&[i32]>,
     data_fields: Option<&[DataField]>,
+    decoded_fields: &[DataField],
 ) -> crate::Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let batch_schema = batch.schema();
@@ -614,42 +716,41 @@ fn project_file_batch(
                 None
             } else {
                 let data_field = &data_fields.unwrap()[data_idx as usize];
-                batch_schema
-                    .index_of(data_field.name())
-                    .ok()
-                    .map(|col_idx| batch.column(col_idx))
+                match batch_schema.index_of(data_field.name()) {
+                    Ok(col_idx) => Some((
+                        batch.column(col_idx),
+                        decoded_data_type(data_field, decoded_fields)?,
+                    )),
+                    Err(_) => None,
+                }
             }
         } else if let Some(df) = data_fields {
-            batch_schema
-                .index_of(df[i].name())
-                .ok()
-                .map(|col_idx| batch.column(col_idx))
+            let data_field = &df[i];
+            match batch_schema.index_of(data_field.name()) {
+                Ok(col_idx) => Some((
+                    batch.column(col_idx),
+                    decoded_data_type(data_field, decoded_fields)?,
+                )),
+                Err(_) => None,
+            }
         } else {
             batch_schema
                 .index_of(target_field.name())
                 .ok()
-                .map(|col_idx| batch.column(col_idx))
+                .map(|col_idx| (batch.column(col_idx), read_type[i].data_type()))
         };
 
         match source_col {
-            Some(col) => {
-                if col.data_type() == target_field.data_type() {
-                    columns.push(col.clone());
-                } else {
-                    let casted = cast(col, target_field.data_type()).map_err(|e| {
-                        Error::UnexpectedError {
-                            message: format!(
-                                "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                                target_field.name(),
-                                col.data_type(),
-                                target_field.data_type()
-                            ),
-                            source: Some(Box::new(e)),
-                        }
-                    })?;
-                    columns.push(casted);
-                }
-            }
+            Some((col, source_type)) => columns.push(
+                cast_array_for_schema_evolution(col, source_type, read_type[i].data_type())
+                    .map_err(|error| Error::UnexpectedError {
+                        message: format!(
+                            "Failed to evolve column '{}': {error}",
+                            target_field.name()
+                        ),
+                        source: Some(Box::new(error)),
+                    })?,
+            ),
             None => {
                 columns.push(arrow_array::new_null_array(
                     target_field.data_type(),
@@ -990,6 +1091,7 @@ mod row_tests {
     use crate::spec::{
         is_variant_extraction_row_type, variant_extraction_row, BigIntType, BinaryRow,
         DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, RowType, VarCharType,
+        VariantType,
     };
     use crate::table::source::DataSplitBuilder;
     use crate::variant::variant_shredding_type;
@@ -1061,6 +1163,35 @@ mod row_tests {
 
         assert_eq!(read_fields.len(), 1);
         assert_eq!(read_fields[0].data_type(), &DataType::Int(IntType::new()));
+    }
+
+    #[test]
+    fn project_file_batch_uses_decoded_variant_extraction_type() {
+        let extraction_type = DataType::Row(variant_extraction_row(
+            true,
+            vec![(
+                DataType::Int(IntType::new()),
+                "$.age".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        ));
+        let read_type = vec![field(1, "v", extraction_type)];
+        let target_schema = build_target_arrow_schema(&read_type).unwrap();
+        let batch = RecordBatch::new_empty(target_schema.clone());
+        let data_fields = vec![field(1, "v", DataType::Variant(VariantType::new()))];
+
+        let projected = project_file_batch(
+            &batch,
+            &target_schema,
+            &read_type,
+            Some(&[0]),
+            Some(&data_fields),
+            &read_type,
+        )
+        .unwrap();
+
+        assert_eq!(projected.schema(), target_schema);
     }
 
     #[tokio::test]

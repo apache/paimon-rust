@@ -212,6 +212,23 @@ fn decode_nullable_global_index(
         None
     };
 
+    // Rust extension used to guard index key semantics across ALTER TYPE.
+    // It is trailing and optional so Java and older Rust manifests remain
+    // readable in both directions.
+    let has_build_schema_id = extract_record_schema(schema)
+        .map(|s| s.fields.iter().any(|f| f.name == "_BUILD_SCHEMA_ID"))
+        .unwrap_or(false);
+    let build_schema_id = if has_build_schema_id {
+        let u_idx = cursor.read_union_index()?;
+        if u_idx == 0 {
+            None
+        } else {
+            Some(cursor.read_long()?)
+        }
+    } else {
+        None
+    };
+
     Ok(Some(GlobalIndexMeta {
         row_range_start,
         row_range_end,
@@ -219,5 +236,6 @@ fn decode_nullable_global_index(
         extra_field_ids,
         index_meta,
         source_meta,
+        build_schema_id,
     }))
 }

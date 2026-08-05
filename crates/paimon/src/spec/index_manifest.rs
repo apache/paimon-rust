@@ -71,7 +71,8 @@ pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
                     {"name": "_INDEX_FIELD_ID", "type": "int"},
                     {"name": "_EXTRA_FIELD_IDS", "type": ["null", {"type": "array", "items": "int"}], "default": null},
                     {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null},
-                    {"name": "_SOURCE_META", "type": ["null", "bytes"], "default": null}
+                    {"name": "_SOURCE_META", "type": ["null", "bytes"], "default": null},
+                    {"name": "_BUILD_SCHEMA_ID", "type": ["null", "long"], "default": null}
                 ]
             }]
         }
@@ -277,7 +278,10 @@ mod tests {
         assert_eq!(sample, decoded);
     }
 
-    fn global_index_entry(source_meta: Option<Vec<u8>>) -> IndexManifestEntry {
+    fn global_index_entry(
+        source_meta: Option<Vec<u8>>,
+        build_schema_id: Option<i64>,
+    ) -> IndexManifestEntry {
         IndexManifestEntry {
             version: 1,
             kind: FileKind::Add,
@@ -296,6 +300,7 @@ mod tests {
                     extra_field_ids: Some(vec![4, 5]),
                     index_meta: Some(vec![9, 8, 7]),
                     source_meta,
+                    build_schema_id,
                 }),
             },
         }
@@ -304,7 +309,7 @@ mod tests {
     #[test]
     fn source_meta_round_trips_through_index_manifest() {
         // New-format writer schema carries _SOURCE_META; a Some(..) value must round-trip.
-        let entry = global_index_entry(Some(vec![1, 2, 3]));
+        let entry = global_index_entry(Some(vec![1, 2, 3]), Some(7));
         let bytes = crate::spec::to_avro_bytes_with_compression(
             INDEX_MANIFEST_ENTRY_SCHEMA,
             std::slice::from_ref(&entry),
@@ -322,9 +327,18 @@ mod tests {
                 .source_meta,
             Some(vec![1, 2, 3])
         );
+        assert_eq!(
+            decoded[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .build_schema_id,
+            Some(7)
+        );
 
         // A None source_meta must also round-trip as None.
-        let entry_none = global_index_entry(None);
+        let entry_none = global_index_entry(None, None);
         let bytes_none = crate::spec::to_avro_bytes_with_compression(
             INDEX_MANIFEST_ENTRY_SCHEMA,
             std::slice::from_ref(&entry_none),
@@ -340,6 +354,33 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .source_meta,
+            None
+        );
+    }
+
+    #[test]
+    fn java_six_field_global_index_decodes_without_build_schema_id() {
+        let java_schema = INDEX_MANIFEST_ENTRY_SCHEMA.replace(
+            ",\n                    {\"name\": \"_BUILD_SCHEMA_ID\", \"type\": [\"null\", \"long\"], \"default\": null}",
+            "",
+        );
+        let entry = global_index_entry(Some(vec![1, 2, 3]), None);
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            &java_schema,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, vec![entry]);
+        assert_eq!(
+            decoded[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .build_schema_id,
             None
         );
     }
@@ -422,14 +463,14 @@ mod tests {
 }"#;
 
         // Written by a pre-#8549 writer (5-field record, source_meta absent).
-        let entry = global_index_entry(None);
+        let entry = global_index_entry(None, None);
         let bytes = crate::spec::to_avro_bytes_with_compression(
             LEGACY_SCHEMA,
             std::slice::from_ref(&entry),
             crate::spec::DEFAULT_AVRO_COMPRESSION,
         )
         .unwrap();
-        // Decoding with the current 6-field reader must not misalign the stream.
+        // Decoding with the current 7-field reader must not misalign the stream.
         let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
         assert_eq!(decoded[0], entry);
         assert_eq!(
@@ -439,6 +480,15 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .source_meta,
+            None
+        );
+        assert_eq!(
+            decoded[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .build_schema_id,
             None
         );
     }

@@ -269,10 +269,10 @@ impl TableSchema {
             .get(crate::spec::DISABLE_EXPLICIT_TYPE_CASTING_OPTION)
             .map(|v| v != "true")
             .unwrap_or(true);
-        // Capture stable IDs before applying changes so removing the option or
-        // renaming its column cannot bypass historical bucket-key protection.
-        let old_bucket_key_field_ids: HashSet<i32> = self
-            .core_options()
+        // Capture stable IDs before applying changes so renaming a role column
+        // cannot bypass dependency protection later in the same change batch.
+        let original_core_options = self.core_options();
+        let old_bucket_key_field_ids: HashSet<i32> = original_core_options
             .bucket_key()
             .into_iter()
             .flatten()
@@ -283,6 +283,22 @@ impl TableSchema {
                     .map(DataField::id)
             })
             .collect();
+        let old_sequence_field_ids: HashSet<i32> = original_core_options
+            .sequence_fields()
+            .into_iter()
+            .filter_map(|name| {
+                self.fields
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .map(DataField::id)
+            })
+            .collect();
+        let old_rowkind_field_id = original_core_options.rowkind_field().and_then(|name| {
+            self.fields
+                .iter()
+                .find(|field| field.name() == name)
+                .map(DataField::id)
+        });
 
         let mut new_schema = self.clone();
         new_schema.id += 1;
@@ -471,6 +487,18 @@ impl TableSchema {
                             column: name.to_string(),
                         })?;
                     let old = &fields[idx];
+                    if old_sequence_field_ids.contains(&old.id()) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Cannot update type of sequence field: [{name}]"),
+                        });
+                    }
+                    if old_rowkind_field_id == Some(old.id()) {
+                        return Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Cannot update type of rowkind routing field: [{name}]"
+                            ),
+                        });
+                    }
                     assert_not_updating_bucket_key_column(
                         &old_bucket_key_field_ids,
                         old,
@@ -498,15 +526,15 @@ impl TableSchema {
                         )?;
                         new_data_type
                     };
-                    // Existing data files keep the old schema; the read path
-                    // casts old columns to the new type, so the change must be
-                    // both a supported Paimon cast and executable by arrow.
-                    let arrow_castable = arrow_cast::can_cast_types(
-                        &crate::arrow::paimon_type_to_arrow(old.data_type())?,
-                        &crate::arrow::paimon_type_to_arrow(&target)?,
-                    );
+                    // Existing files keep the old schema. Admission therefore
+                    // requires both a legal Paimon cast and a concrete schema
+                    // evolution executor. Arrow castability alone does not
+                    // define Paimon conversion semantics.
                     if !crate::spec::supports_cast(old.data_type(), &target, allow_explicit_cast)
-                        || !arrow_castable
+                        || !crate::arrow::schema_evolution::schema_evolution_cast_implemented(
+                            old.data_type(),
+                            &target,
+                        )
                     {
                         return Err(crate::Error::Unsupported {
                             message: format!(
@@ -3059,6 +3087,8 @@ mod tests {
         for new_type in [
             DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
             DataType::Boolean(crate::spec::BooleanType::new()),
+            DataType::Timestamp(crate::spec::TimestampType::new(6).unwrap()),
+            DataType::VarChar(crate::spec::VarCharType::new(20).unwrap()),
         ] {
             let err = table_schema
                 .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
@@ -3072,6 +3102,25 @@ mod tests {
                 "expected cast rejection, got {err:?}"
             );
         }
+
+        let floating_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("f", DataType::Double(crate::spec::DoubleType::new()))
+                .build()
+                .unwrap(),
+        );
+        let err = floating_schema
+            .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                "f".to_string(),
+                DataType::Decimal(crate::spec::DecimalType::new(12, 2).unwrap()),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("cannot be converted") && message.contains('f')),
+            "expected unimplemented semantic cast rejection, got {err:?}"
+        );
     }
 
     #[test]
@@ -4977,6 +5026,80 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message }
                 if message.contains("sequence.field") && message.contains("ts")),
             "drop of a sequence.field column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_type_rejects_sequence_and_rowkind_role_columns() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("seq", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("sequence.field", "seq")
+                .option("rowkind.field", "op")
+                .build()
+                .unwrap(),
+        );
+
+        for (column, target, expected_message) in [
+            (
+                "seq",
+                DataType::BigInt(crate::spec::BigIntType::new()),
+                "sequence field",
+            ),
+            (
+                "op",
+                DataType::Char(crate::spec::CharType::new(10).unwrap()),
+                "rowkind routing field",
+            ),
+        ] {
+            let err = table_schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_column_type(
+                    column.to_string(),
+                    target,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains(expected_message) && message.contains(column)),
+                "expected role-column rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_type_rejects_sequence_role_after_rename_in_same_batch() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("seq", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("sequence.field", "seq")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::rename_column(
+                    "seq".to_string(),
+                    "renamed_seq".to_string(),
+                ),
+                crate::spec::SchemaChange::update_column_type(
+                    "renamed_seq".to_string(),
+                    DataType::BigInt(crate::spec::BigIntType::new()),
+                ),
+            ])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("sequence field") && message.contains("renamed_seq")),
+            "expected stable role-column rejection, got {err:?}"
         );
     }
 

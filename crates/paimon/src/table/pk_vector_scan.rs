@@ -271,7 +271,20 @@ impl<'a> PkVectorScan<'a> {
         let mut entries = Vec::new();
         if let Some(name) = snapshot.index_manifest() {
             let path = snapshot_manager.manifest_path(name);
-            for entry in IndexManifest::read(self.table.file_io(), &path).await? {
+            let index_entries = super::global_index_build_common::retain_schema_compatible_entries(
+                self.table,
+                IndexManifest::read(self.table.file_io(), &path).await?,
+                |entry| {
+                    entry.index_file.index_type == self.index_type
+                        && entry
+                            .index_file
+                            .global_index_meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.index_field_id == self.vector_field_id)
+                },
+            )
+            .await?;
+            for entry in index_entries {
                 // The on-disk index manifest is combined to live ADD entries only.
                 // A non-ADD entry means a malformed manifest; fail loud rather than
                 // silently drop it (mirrors Java `checkArgument(kind == ADD)`).
@@ -469,6 +482,7 @@ mod tests {
             extra_field_ids: None,
             index_meta: Some(vec![1, 2, 3]),
             source_meta: Some(source_meta_bytes(data_level, source_files)),
+            build_schema_id: None,
         }
     }
 
