@@ -152,6 +152,7 @@ impl Catalog for MetadataListingCatalog {
 struct PartitionCatalog {
     inner: Arc<FileSystemCatalog>,
     fail_list_partitions: AtomicBool,
+    unknown_statistics: AtomicBool,
     partition_identifiers: Mutex<Vec<Identifier>>,
 }
 
@@ -160,12 +161,19 @@ impl PartitionCatalog {
         Self {
             inner,
             fail_list_partitions: AtomicBool::new(false),
+            unknown_statistics: AtomicBool::new(false),
             partition_identifiers: Mutex::new(Vec::new()),
         }
     }
 
     fn set_fail_list_partitions(&self, fail: bool) {
         self.fail_list_partitions.store(fail, Ordering::SeqCst);
+    }
+
+    /// Report every statistic as never measured, the way a catalog does for a partition that was
+    /// registered but never had statistics reported to it.
+    fn set_unknown_statistics(&self, unknown: bool) {
+        self.unknown_statistics.store(unknown, Ordering::SeqCst);
     }
 
     fn take_partition_identifiers(&self) -> Vec<Identifier> {
@@ -266,7 +274,17 @@ impl Catalog for PartitionCatalog {
             .push(identifier.clone());
 
         let Some(branch) = identifier.branch_name()? else {
-            return self.inner.list_partitions(identifier).await;
+            let mut partitions = self.inner.list_partitions(identifier).await?;
+            if self.unknown_statistics.load(Ordering::SeqCst) {
+                for partition in &mut partitions {
+                    partition.record_count = paimon::spec::Partition::UNKNOWN;
+                    partition.file_size_in_bytes = paimon::spec::Partition::UNKNOWN;
+                    partition.file_count = paimon::spec::Partition::UNKNOWN;
+                    partition.last_file_creation_time = paimon::spec::Partition::UNKNOWN;
+                    partition.total_buckets = paimon::spec::Partition::UNKNOWN_TOTAL_BUCKETS;
+                }
+            }
+            return Ok(partitions);
         };
         if self.fail_list_partitions.load(Ordering::SeqCst) {
             return Err(paimon::Error::Unsupported {
@@ -578,6 +596,78 @@ async fn test_select_branch_table_reads_branch_snapshot() {
         "INSERT OVERWRITE on Paimon branch 'main' is not supported",
     )
     .await;
+}
+
+/// A statistic the catalog never had reported to it has to read as NULL.
+///
+/// The alternative is what this used to do: declare the columns non-nullable and let
+/// `Partition::UNKNOWN` through, so `$partitions` claimed the partition holds -1 rows and -1 files.
+/// Reporting it as `0` instead would be worse still — that is a real measurement meaning empty.
+#[tokio::test]
+async fn test_partitions_system_table_shows_unreported_statistics_as_null() {
+    let (_tmp, file_catalog) = create_test_env();
+    let catalog = Arc::new(PartitionCatalog::new(file_catalog.clone()));
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.default.unknown_stats_orders \
+             (id INT, name STRING) PARTITIONED BY (id)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.unknown_stats_orders VALUES (1, 'a')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let sql = "SELECT record_count, file_size_in_bytes, file_count, total_buckets \
+               FROM paimon.default.unknown_stats_orders$partitions";
+
+    // Measured statistics still arrive as values, so a NULL below means unknown and not that the
+    // column stopped being populated at all.
+    let measured = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let measured = &measured[0];
+    assert_eq!(measured.num_rows(), 1);
+    for column in 0..4 {
+        assert!(
+            !measured.column(column).is_null(0),
+            "column {column} should carry a measurement before the switch"
+        );
+    }
+
+    catalog.set_unknown_statistics(true);
+
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    for column in 0..4 {
+        assert!(
+            batch.column(column).is_null(0),
+            "column {column} was never measured and must read as NULL"
+        );
+    }
+
+    // The partition itself is still registered; only its statistics are unknown.
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.unknown_stats_orders$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
 }
 
 #[tokio::test]

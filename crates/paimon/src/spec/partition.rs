@@ -46,6 +46,27 @@ pub struct Partition {
     pub options: Option<HashMap<String, String>>,
 }
 
+impl Partition {
+    /// A statistic the catalog never had reported to it.
+    ///
+    /// On this plane — what `list_partitions` observed — any negative value means the field was
+    /// never measured, and `-1` is the canonical spelling. `0` is an exact zero and must stay
+    /// distinguishable from it: a partition nobody reported on is not an empty partition. The
+    /// counterpart for file-level counts is [`crate::spec::DataFileMeta::ROW_COUNT_UNKNOWN`].
+    ///
+    /// This says nothing about the delta plane used by snapshot commits, where a negative value is
+    /// a decrement to apply rather than a missing measurement.
+    pub const UNKNOWN: i64 = -1;
+
+    /// A partition with no buckets, or none the catalog knows of. Format tables have no buckets.
+    pub const UNKNOWN_TOTAL_BUCKETS: i32 = -1;
+
+    /// Whether a statistic read off a partition is a measurement rather than [`Self::UNKNOWN`].
+    pub fn is_known(value: i64) -> bool {
+        value >= 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +128,18 @@ mod tests {
         }"#;
         let decoded: Partition = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.spec.get("dt"), Some(&"2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_unknown_is_negative_and_zero_is_a_measurement() {
+        assert_eq!(Partition::UNKNOWN, -1);
+        assert_eq!(Partition::UNKNOWN_TOTAL_BUCKETS, -1);
+
+        assert!(!Partition::is_known(Partition::UNKNOWN));
+        assert!(!Partition::is_known(-42));
+
+        // A partition nobody reported on is not an empty partition.
+        assert!(Partition::is_known(0));
+        assert!(Partition::is_known(1));
     }
 }
