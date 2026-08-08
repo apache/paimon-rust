@@ -1804,8 +1804,8 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 4]);
     }
 
-    /// Row-group predicate pruning, deletion vectors and projection must compose correctly:
-    /// the predicate keeps one row group, the DV deletes one of its rows, projection keeps `id`.
+    /// Exact predicate filtering, deletion vectors and projection must compose correctly:
+    /// the predicate selects `id = 10`, the DV deletes that row, and no rows remain.
     #[tokio::test]
     async fn test_mosaic_predicate_dv_projection_combination() {
         let fields = pk_fields();
@@ -1869,7 +1869,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(batches.iter().map(|b| b.num_columns()).max(), Some(1));
-        assert_eq!(collect_ids(&batches), vec![11]);
+        assert!(collect_ids(&batches).is_empty());
     }
 }
 
