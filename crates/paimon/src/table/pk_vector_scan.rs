@@ -752,17 +752,11 @@ mod tests {
             )
         }
 
-        /// Build a real single-file primary-key table via the public write path, in a
-        /// fresh temp dir. Persists the schema and writes one data batch, then commits
-        /// the written data file with real `value_stats` for the `id`/`score` columns.
+        /// Build a real single-file primary-key table via the public write path.
         ///
-        /// The stats injection mirrors the meta-modification the baseline fixture uses
-        /// for `level`/`file_source`: the Rust key-value (primary-key) writer records
-        /// column stats in `key_stats` and leaves `value_stats` empty, but scan-time
-        /// file pruning reads `value_stats`. Java primary-key writers populate value
-        /// stats, so committing them here makes the file prunable exactly as it would be
-        /// in a table written by the Java engine. Returns the temp dir (kept alive by
-        /// the caller) and the opened table.
+        /// The Rust key-value writer records primary-key stats in `key_stats`. For the
+        /// deletion-vector test, also populate `value_stats` so its non-key predicate
+        /// has the same metadata a Java primary-key writer produces.
         async fn build_pruning_test_table(
             with_deletion_vectors: bool,
         ) -> (tempfile::TempDir, Table) {
@@ -793,19 +787,24 @@ mod tests {
             let base_meta = written.new_files[0].clone();
             let bucket = written.bucket;
             let partition = written.partition.clone();
+            assert_eq!(base_meta.key_stats.null_counts(), &vec![Some(0)]);
+            assert!(base_meta.value_stats.null_counts().is_empty());
+            assert_eq!(base_meta.value_stats_cols, Some(vec![]));
 
-            // Real value stats over the `id` (col 0) and `score` (col 1) columns, so a
-            // predicate outside the written [0, PRUNE_ROWS) range can prune the file.
-            let int = DataType::Int(IntType::new());
-            let value_stats: BinaryTableStats =
-                compute_column_stats(&batch, &[0, 1], &[int.clone(), int]).unwrap();
-            let indexed_meta = DataFileMeta {
-                value_stats,
-                value_stats_cols: Some(vec!["id".to_string(), "score".to_string()]),
-                ..base_meta
+            let file_meta = if with_deletion_vectors {
+                let int = DataType::Int(IntType::new());
+                let value_stats: BinaryTableStats =
+                    compute_column_stats(&batch, &[0, 1], &[int.clone(), int]).unwrap();
+                DataFileMeta {
+                    value_stats,
+                    value_stats_cols: Some(vec!["id".to_string(), "score".to_string()]),
+                    ..base_meta
+                }
+            } else {
+                base_meta
             };
 
-            let message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+            let message = CommitMessage::new(partition, bucket, vec![file_meta]);
             TableCommit::new(table.clone(), "pkvector-prune".to_string())
                 .commit(vec![message])
                 .await
@@ -831,7 +830,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn plan_prunes_file_when_pk_predicate_excludes_it() {
+        async fn plan_prunes_rust_pk_file_using_key_stats() {
             // Real PK table, one data file with id in [0, PRUNE_ROWS). A predicate
             // `id = OUT_OF_RANGE` cannot match the file's id stats, so the scan drops
             // the file and plan() returns no splits. Control (no filter) returns one.

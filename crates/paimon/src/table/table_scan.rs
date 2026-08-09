@@ -27,8 +27,8 @@ use super::global_index_types::normalize_sorted_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
-    data_evolution_group_matches_predicates, data_file_matches_predicates,
-    data_file_matches_predicates_for_table, group_by_overlapping_row_id, FileStatsRows,
+    data_evolution_group_matches_predicates, data_file_matches_predicates_for_table,
+    data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
     ResolvedStatsSchema,
 };
 use super::Table;
@@ -123,8 +123,10 @@ async fn read_all_manifest_entries(
     partition_filter: Option<&PartitionFilter>,
     partition_fields: &[DataField],
     data_predicates: &[Predicate],
+    key_predicates: &[Predicate],
     current_schema_id: i64,
     schema_fields: &[DataField],
+    key_fields: &[String],
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
     bucket_function_type: BucketFunctionType,
@@ -239,12 +241,14 @@ async fn read_all_manifest_entries(
                         counters.pruned_by_level += 1;
                         continue;
                     }
-                    if !data_predicates.is_empty()
-                        && !data_file_matches_predicates(
+                    if (!data_predicates.is_empty() || !key_predicates.is_empty())
+                        && !data_file_matches_predicates_with_key_stats(
                             entry.file(),
                             data_predicates,
+                            key_predicates,
                             current_schema_id,
                             schema_fields,
+                            key_fields,
                         )
                     {
                         counters.pruned_by_data_stats += 1;
@@ -1144,6 +1148,8 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             self.stats_pruning_predicates()
         };
+        let key_fields = self.table.schema().trimmed_primary_keys();
+        let pushdown_key_predicates = self.key_stats_predicates(&pushdown_data_predicates);
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
             Vec::new()
@@ -1179,8 +1185,10 @@ impl<'a> PaimonTableScan<'a> {
             self.partition_filter.as_ref(),
             &partition_fields,
             &pushdown_data_predicates,
+            &pushdown_key_predicates,
             self.table.schema().id(),
             self.table.schema().fields(),
+            &key_fields,
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
             bucket_function_type,
@@ -1348,6 +1356,16 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             self.data_predicates.clone()
         }
+    }
+
+    /// Project file-safe predicates onto trimmed primary-key columns while
+    /// preserving table-schema field indices.
+    fn key_stats_predicates(&self, predicates: &[Predicate]) -> Vec<Predicate> {
+        let key_fields = self.table.schema().trimmed_primary_keys();
+        if key_fields.is_empty() {
+            return Vec::new();
+        }
+        retain_primary_key_conjuncts(predicates, self.table.schema().fields(), &key_fields)
     }
 
     /// Plan data splits from a snapshot's delta manifest list (APPEND deltas).
@@ -1724,6 +1742,7 @@ impl<'a> PaimonTableScan<'a> {
         // For non-data-evolution tables, cross-schema files were kept (fail-open)
         // by the pushdown. Apply the full schema-aware filter for those files.
         let stats_pruning_predicates = self.stats_pruning_predicates();
+        let key_stats_predicates = self.key_stats_predicates(&stats_pruning_predicates);
         let entries = if stats_pruning_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
@@ -1747,6 +1766,7 @@ impl<'a> PaimonTableScan<'a> {
                             self.table,
                             entry.file(),
                             &stats_pruning_predicates,
+                            &key_stats_predicates,
                             &mut schema_cache,
                         )
                         .await
@@ -2042,16 +2062,17 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind,
-        IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta, Predicate,
-        PredicateBuilder, PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema,
-        VarCharType,
+        ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
+        FileKind, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta,
+        Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema, SchemaChange,
+        Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, RowRange};
     use crate::table::stats_filter::{
         data_evolution_group_matches_predicates, data_file_matches_predicates,
+        data_file_matches_predicates_for_table, data_file_matches_predicates_with_key_stats,
         group_by_overlapping_row_id,
     };
     use crate::table::{CommitMessage, Table, TableCommit};
@@ -3195,6 +3216,149 @@ mod tests {
             &[predicate],
             TEST_SCHEMA_ID,
             &test_schema_fields(),
+        ));
+    }
+
+    #[test]
+    fn test_data_file_matches_composite_key_stats_in_primary_key_order() {
+        let fields = vec![
+            DataField::new(0, "key_a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "payload".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "key_b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+        );
+        file.value_stats_cols = Some(Vec::new());
+        // key_stats order is [key_b, key_a], independent of table field order.
+        file.key_stats = BinaryTableStats::new(
+            two_int_stats_row(Some(100), Some(10)),
+            two_int_stats_row(Some(200), Some(20)),
+            vec![Some(0), Some(0)],
+        );
+        let key_fields = vec!["key_b".to_string(), "key_a".to_string()];
+        let pb = PredicateBuilder::new(&fields);
+
+        let key_a_out_of_range = pb.equal("key_a", Datum::Int(150)).unwrap();
+        assert!(!data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&key_a_out_of_range),
+            std::slice::from_ref(&key_a_out_of_range),
+            TEST_SCHEMA_ID,
+            &fields,
+            &key_fields,
+        ));
+
+        let key_b_in_range = pb.equal("key_b", Datum::Int(150)).unwrap();
+        assert!(data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&key_b_in_range),
+            std::slice::from_ref(&key_b_in_range),
+            TEST_SCHEMA_ID,
+            &fields,
+            &key_fields,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_data_file_matches_key_stats_across_renamed_reordered_schema() {
+        let old_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("payload", DataType::Int(IntType::new()))
+                .column("old_b", DataType::Int(IntType::new()))
+                .column("old_a", DataType::Int(IntType::new()))
+                .primary_key(["old_b", "old_a"])
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![
+                SchemaChange::rename_column("old_b".to_string(), "new_b".to_string()),
+                SchemaChange::rename_column("old_a".to_string(), "new_a".to_string()),
+                SchemaChange::update_column_position(ColumnMove::move_first("new_a".to_string())),
+            ])
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("test_db", "cross_schema_key_stats"),
+            "memory:/cross_schema_key_stats".to_string(),
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta_with_schema(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+            old_schema.id(),
+        );
+        file.value_stats_cols = Some(Vec::new());
+        // Old key_stats order is [old_b, old_a]. Current fields are reordered to
+        // [new_a, payload, new_b], while field IDs remain [2, 0, 1].
+        file.key_stats = BinaryTableStats::new(
+            two_int_stats_row(Some(100), Some(10)),
+            two_int_stats_row(Some(200), Some(20)),
+            vec![Some(0), Some(0)],
+        );
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let new_a_out_of_range = pb.equal("new_a", Datum::Int(150)).unwrap();
+        let new_b_in_range = pb.equal("new_b", Datum::Int(150)).unwrap();
+        let mut schema_cache = HashMap::new();
+
+        assert!(
+            !data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                std::slice::from_ref(&new_a_out_of_range),
+                std::slice::from_ref(&new_a_out_of_range),
+                &mut schema_cache,
+            )
+            .await
+        );
+        assert!(
+            data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                std::slice::from_ref(&new_b_in_range),
+                std::slice::from_ref(&new_b_in_range),
+                &mut schema_cache,
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn test_data_file_matches_corrupt_key_stats_fails_open() {
+        let fields = int_field();
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+        );
+        file.value_stats_cols = Some(Vec::new());
+        file.key_stats = BinaryTableStats::new(vec![0], vec![0], vec![Some(0)]);
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(30))
+            .unwrap();
+
+        assert!(data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&predicate),
+            std::slice::from_ref(&predicate),
+            TEST_SCHEMA_ID,
+            &fields,
+            &["id".to_string()],
         ));
     }
 
