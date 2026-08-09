@@ -39,6 +39,8 @@ use std::sync::MutexGuard;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
+#[cfg(feature = "storage-jindo")]
+use super::JindoStorageConfig;
 use opendal::Operator;
 #[cfg(feature = "storage-cos")]
 use opendal_service_cos::CosConfig;
@@ -78,6 +80,11 @@ pub enum Storage {
     #[cfg(feature = "storage-oss")]
     Oss {
         config: Box<OssConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
+    #[cfg(feature = "storage-jindo")]
+    Jindo {
+        config: Box<JindoStorageConfig>,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-s3")]
@@ -130,6 +137,23 @@ impl Storage {
             }),
             #[cfg(feature = "storage-oss")]
             "oss" => {
+                #[cfg(feature = "storage-jindo")]
+                if super::use_jindo(&props)? {
+                    let config = super::jindo_config_parse(props)?;
+                    return Ok(Self::Jindo {
+                        config: Box::new(config),
+                        operators: Mutex::new(HashMap::new()),
+                    });
+                }
+                #[cfg(not(feature = "storage-jindo"))]
+                if props
+                    .get("fs.oss.impl")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("jindo"))
+                {
+                    return Err(error::Error::IoUnsupported {
+                        message: "Jindo requires the storage-jindo feature".to_string(),
+                    });
+                }
                 let config = super::oss_config_parse(props)?;
                 Ok(Self::Oss {
                     config: Box::new(config),
@@ -219,6 +243,15 @@ impl Storage {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
+                Ok((op, Cow::Borrowed(relative_path)))
+            }
+            #[cfg(feature = "storage-jindo")]
+            Storage::Jindo { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "Jindo OSS", &["oss"])?;
+                let op = Self::cached_operator(operators, "Jindo OSS", &bucket, || {
+                    super::jindo_config_build(config, &bucket)
+                })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-s3")]
@@ -333,6 +366,7 @@ impl Storage {
     #[cfg(any(
         feature = "storage-cos",
         feature = "storage-gcs",
+        feature = "storage-jindo",
         feature = "storage-obs",
         feature = "storage-oss",
         feature = "storage-s3"
@@ -372,6 +406,7 @@ impl Storage {
         feature = "storage-azdls",
         feature = "storage-cos",
         feature = "storage-gcs",
+        feature = "storage-jindo",
         feature = "storage-oss",
         feature = "storage-obs",
         feature = "storage-s3"
@@ -472,6 +507,14 @@ mod scheme_tests {
             .unwrap();
             assert!(matches!(storage, Storage::Oss { .. }), "{scheme}");
         }
+    }
+
+    #[cfg(feature = "storage-jindo")]
+    #[test]
+    fn jindo_oss_implementation_is_selected() {
+        let storage =
+            Storage::build(FileIOBuilder::new("oss").with_prop("fs.oss.impl", "jindo")).unwrap();
+        assert!(matches!(storage, Storage::Jindo { .. }));
     }
 
     #[cfg(feature = "storage-s3")]

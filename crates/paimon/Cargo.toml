@@ -41,6 +41,7 @@ storage-all = [
     "storage-obs",
     "storage-gcs",
     "storage-hdfs",
+    "storage-jindo",
 ]
 fulltext = ["dep:paimon-ftindex-core", "dep:tempfile"]
 vortex = ["dep:vortex"]
@@ -54,6 +55,7 @@ storage-azdls = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-azdl
 storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
 storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
 storage-hdfs = ["dep:opendal-service-hdfs-native"]
+storage-jindo = ["storage-oss"]
 
 [dependencies]
 url = "2.5.2"

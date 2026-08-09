@@ -44,6 +44,7 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
+| `storage-jindo`  | Alibaba Cloud OSS through JindoSDK |
 | `storage-cos`    | Tencent Cloud COS |
 | `storage-azdls`  | Azure Data Lake Storage Gen2 |
 | `storage-obs`    | Huawei Cloud OBS |
@@ -125,6 +126,13 @@ options.set(CatalogOptions::URI, "http://localhost:8080");
 options.set(CatalogOptions::WAREHOUSE, "my_warehouse");
 let catalog = CatalogFactory::create(options).await?;
 ```
+
+With `storage-jindo`, set `fs.oss.impl` to `jindo` to use an installed JindoSDK
+for OSS scan planning. Set `fs.jindo.library.path` unless the library is
+available through `JINDOSDK_HOME` or `JINDOSDK_LIBRARY_PATH`. The Python binding
+also discovers it from an installed `pyjindosdk` package. This initial
+integration supports object stat, reads, and listings, but not writes, deletes,
+or copies.
 
 Supported metastore types:
 

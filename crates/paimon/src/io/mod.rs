@@ -62,6 +62,11 @@ pub(crate) mod storage_oss;
 #[cfg(feature = "storage-oss")]
 use storage_oss::*;
 
+#[cfg(feature = "storage-jindo")]
+mod storage_jindo;
+#[cfg(feature = "storage-jindo")]
+use storage_jindo::*;
+
 #[cfg(feature = "storage-s3")]
 mod storage_s3;
 #[cfg(feature = "storage-s3")]

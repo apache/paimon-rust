@@ -83,13 +83,80 @@ fn pyarrow_compatible_batch(batch: &RecordBatch) -> arrow::error::Result<RecordB
     RecordBatch::try_new_with_options(schema, columns, &options)
 }
 
-fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
+const OSS_IMPL: &str = "fs.oss.impl";
+const JINDO_LIBRARY_PATH: &str = "fs.jindo.library.path";
+
+fn discover_pyjindo_library() -> Option<PathBuf> {
+    Python::attach(|py| {
+        let spec = py
+            .import("importlib.util")
+            .ok()?
+            .call_method1("find_spec", ("pyjindo",))
+            .ok()?;
+        if spec.is_none() {
+            return None;
+        }
+        let origin = PathBuf::from(spec.getattr("origin").ok()?.extract::<String>().ok()?);
+        pyjindo_library_in(origin.parent()?)
+    })
+}
+
+fn pyjindo_library_in(directory: &std::path::Path) -> Option<PathBuf> {
+    let names = if cfg!(target_os = "macos") {
+        ["libjindosdk_c.dylib", "libjindosdk_python.dylib"]
+    } else {
+        ["libjindosdk_c.so", "libjindosdk_python.so"]
+    };
+    names
+        .iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+fn build_paimon_catalog(
+    mut catalog_options: HashMap<String, String>,
+) -> PyResult<Arc<dyn Catalog>> {
+    let use_jindo = catalog_options
+        .get(OSS_IMPL)
+        .is_some_and(|value| value.eq_ignore_ascii_case("jindo"));
+    if use_jindo && !catalog_options.contains_key(JINDO_LIBRARY_PATH) {
+        if let Some(path) = discover_pyjindo_library() {
+            catalog_options.insert(JINDO_LIBRARY_PATH.to_string(), path.display().to_string());
+        }
+    }
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
         let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
         Ok::<_, PyErr>(catalog)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn test_find_pyjindo_library() {
+        let directory = std::env::temp_dir().join(format!(
+            "paimon-rust-pyjindo-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let library = directory.join(if cfg!(target_os = "macos") {
+            "libjindosdk_python.dylib"
+        } else {
+            "libjindosdk_python.so"
+        });
+        fs::write(&library, []).unwrap();
+
+        assert_eq!(pyjindo_library_in(&directory), Some(library));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 fn ffi_logical_codec_from_pycapsule(obj: Bound<'_, PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
