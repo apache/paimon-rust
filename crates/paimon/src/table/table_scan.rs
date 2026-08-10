@@ -31,7 +31,7 @@ use super::stats_filter::{
     data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
     ResolvedStatsSchema,
 };
-use super::Table;
+use super::{find_field_id_by_name, Table};
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
@@ -394,14 +394,27 @@ fn split_row_ranges_for_files(
     Ok(Some(split_ranges))
 }
 
+fn scan_predicate_field_ids(predicates: &[Predicate], schema_fields: &[DataField]) -> HashSet<i32> {
+    let mut leaf_refs = Vec::new();
+    for predicate in predicates {
+        crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut leaf_refs);
+    }
+    leaf_refs
+        .into_iter()
+        // `_ROW_ID` uses a placeholder leaf index, so match the scanner's name-based resolution.
+        .filter_map(|(column, _)| find_field_id_by_name(schema_fields, column))
+        .collect()
+}
+
 fn retain_index_manifest_entry(
     entry: &IndexManifestEntry,
     global_index_needed: bool,
     deletion_vectors_needed: bool,
 ) -> bool {
-    (deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-        || (global_index_needed
-            && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some())
+    entry.kind == FileKind::Add
+        && ((deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+            || (global_index_needed
+                && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some()))
 }
 
 fn retain_index_manifest_entry_for_scan(
@@ -409,18 +422,28 @@ fn retain_index_manifest_entry_for_scan(
     global_index_needed: bool,
     deletion_vectors_needed: bool,
     partition_filter: Option<&PartitionFilter>,
+    predicate_field_ids: &HashSet<i32>,
 ) -> crate::Result<bool> {
     if !retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed) {
         return Ok(false);
     }
-    // Deletion vectors are selected by partition and bucket when splits are built.
+    if let Some(filter) = partition_filter {
+        if !filter.matches_entry(&entry.partition)? {
+            return Ok(false);
+        }
+    }
     if normalize_sorted_global_index_type(&entry.index_file.index_type).is_none() {
         return Ok(true);
     }
-    partition_filter
-        .map(|filter| filter.matches_entry(&entry.partition))
-        .transpose()
-        .map(|matched| matched.unwrap_or(true))
+    let Some(global_index) = entry.index_file.global_index_meta.as_ref() else {
+        // Keep malformed entries so the scanner can preserve fail-loud validation.
+        return Ok(true);
+    };
+    Ok(predicate_field_ids.contains(&global_index.index_field_id)
+        || global_index.extra_field_ids.as_ref().is_some_and(|ids| {
+            ids.iter()
+                .any(|field_id| predicate_field_ids.contains(field_id))
+        }))
 }
 
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
@@ -1256,6 +1279,11 @@ impl<'a> PaimonTableScan<'a> {
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
+        let predicate_field_ids = if global_index_needed {
+            scan_predicate_field_ids(&self.data_predicates, self.table.schema().fields())
+        } else {
+            HashSet::new()
+        };
         let mut entries = Vec::new();
         for entry in IndexManifest::read(self.table.file_io(), &path).await? {
             if retain_index_manifest_entry_for_scan(
@@ -1263,6 +1291,7 @@ impl<'a> PaimonTableScan<'a> {
                 global_index_needed,
                 deletion_vectors_needed,
                 self.partition_filter.as_ref(),
+                &predicate_field_ids,
             )? {
                 entries.push(entry);
             }
@@ -2078,17 +2107,18 @@ mod tests {
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
         prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
         retain_index_manifest_entry_for_scan, retain_manifest_entry_row_ranges,
-        retain_manifest_row_ranges, should_skip_level_zero_for_scan, split_row_ranges_for_files,
-        LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex, TableScan,
+        retain_manifest_row_ranges, scan_predicate_field_ids, should_skip_level_zero_for_scan,
+        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
+        TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
         ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
-        FileKind, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta,
-        Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema, SchemaChange,
-        Snapshot, TableSchema, VarCharType,
+        FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry,
+        ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema,
+        SchemaChange, Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -4183,6 +4213,10 @@ mod tests {
             retained(true, true),
             vec!["DELETION_VECTORS", "btree", "bitmap"]
         );
+
+        let mut deleted = entry("btree");
+        deleted.kind = FileKind::Delete;
+        assert!(!retain_index_manifest_entry(&deleted, true, false));
     }
 
     #[test]
@@ -4202,6 +4236,7 @@ mod tests {
             )],
         )
         .unwrap();
+        let predicate_field_ids = HashSet::from([1]);
         let entry = |partition, index_type: &str| IndexManifestEntry {
             version: 1,
             kind: FileKind::Add,
@@ -4213,15 +4248,23 @@ mod tests {
                 file_size: 1,
                 row_count: 1,
                 deletion_vectors_ranges: None,
-                global_index_meta: None,
+                global_index_meta: (index_type == "btree").then_some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 0,
+                    index_field_id: 1,
+                    extra_field_ids: None,
+                    index_meta: None,
+                    source_meta: None,
+                }),
             },
         };
 
         assert!(retain_index_manifest_entry_for_scan(
-            &entry(matching_partition, "btree"),
+            &entry(matching_partition.clone(), "btree"),
             true,
             false,
             Some(&filter),
+            &predicate_field_ids,
         )
         .unwrap());
         assert!(!retain_index_manifest_entry_for_scan(
@@ -4229,15 +4272,85 @@ mod tests {
             true,
             false,
             Some(&filter),
+            &predicate_field_ids,
         )
         .unwrap());
-        assert!(retain_index_manifest_entry_for_scan(
+        assert!(!retain_index_manifest_entry_for_scan(
             &entry(partition(8), "DELETION_VECTORS"),
             true,
             true,
             Some(&filter),
+            &predicate_field_ids,
         )
         .unwrap());
+        assert!(retain_index_manifest_entry_for_scan(
+            &entry(matching_partition, "DELETION_VECTORS"),
+            false,
+            true,
+            Some(&filter),
+            &predicate_field_ids,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_retain_index_manifest_entries_for_predicate_fields() {
+        let entry = |index_field_id, extra_field_ids| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: Vec::new(),
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "btree".to_string(),
+                file_name: format!("btree-{index_field_id}.idx"),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 0,
+                    index_field_id,
+                    extra_field_ids,
+                    index_meta: None,
+                    source_meta: None,
+                }),
+            },
+        };
+        let predicate_field_ids = HashSet::from([2]);
+        let retained = |entry: &IndexManifestEntry| {
+            retain_index_manifest_entry_for_scan(entry, true, false, None, &predicate_field_ids)
+                .unwrap()
+        };
+
+        assert!(retained(&entry(2, None)));
+        assert!(retained(&entry(1, Some(vec![2]))));
+        assert!(!retained(&entry(1, Some(vec![3]))));
+
+        let mut missing_meta = entry(2, None);
+        missing_meta.index_file.global_index_meta = None;
+        assert!(
+            retained(&missing_meta),
+            "malformed sorted entries must reach scanner validation"
+        );
+    }
+
+    #[test]
+    fn test_scan_predicate_field_ids_resolve_by_name() {
+        let fields = vec![
+            DataField::new(10, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(20, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let predicate = Predicate::and(vec![
+            PredicateBuilder::new(&fields)
+                .equal("value", Datum::Int(1))
+                .unwrap(),
+            crate::spec::row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(7)]),
+        ]);
+
+        assert_eq!(
+            scan_predicate_field_ids(&[predicate], &fields),
+            HashSet::from([20])
+        );
     }
 
     #[tokio::test]
