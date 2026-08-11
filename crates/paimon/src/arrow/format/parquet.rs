@@ -1395,6 +1395,10 @@ impl StatsAccessor for ParquetPageStats<'_> {
         }
         page_index_value_to_datum(self.column_index, self.page_idx, data_type, false)
     }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        true
+    }
 }
 
 /// Decode a per-page min/max from a [`ColumnIndexMetaData`] into a [`Datum`].
@@ -3484,6 +3488,22 @@ mod tests {
             .unwrap()
             .expect("all pages should be skipped");
         assert_eq!(sel.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_in_keeps_only_matching_page() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let predicates = vec![id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Int(35), Datum::Int(1000)],
+        )];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("non-matching pages should be skipped");
+        assert_eq!(sel.row_count(), 10);
     }
 
     #[tokio::test]
