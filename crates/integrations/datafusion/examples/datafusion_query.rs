@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })?;
 
     // Open the local Paimon catalog
-    let catalog = create_catelog(warehouse).await?;
+    let catalog = create_catalog(warehouse).await?;
 
     // Load the users table
     let identifier = Identifier::new("my_db", "users");
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn create_catelog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
+pub async fn create_catalog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let catalog = CatalogFactory::create(options).await?;

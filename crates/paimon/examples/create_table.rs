@@ -30,15 +30,19 @@ use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
 // cargo run --package paimon --example create_table -- /path/to/warehouse
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let warehouse = std::env::args().nth(1).ok_or_else(|| {
+    let mut args = std::env::args().skip(1);
+
+    let warehouse = args.next().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: cargo run --package paimon --example create_table -- <warehouse-path>",
+            "usage: cargo run --package paimon --example create_table -- <warehouse-path> ",
         )
     })?;
 
+    let overwrite = args.any(|arg| arg == "--overwrite");
+
     // Open local catalog
-    let catalog = create_catelog(warehouse).await?;
+    let catalog = create_catalog(warehouse).await?;
 
     // Create new database
     catalog
@@ -63,11 +67,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(error) => return Err(error.into()),
     };
 
-    // if exists, drop and create fresh table and data
     if table_exists {
+        if !overwrite {
+            return Err(format!(
+                "table {} already exists, pass --overwrite to automatically drop and re-create it",
+                identifier
+            )
+            .into());
+        }
+
         catalog.drop_table(&identifier, false).await?;
     }
-
     catalog.create_table(&identifier, schema, false).await?;
 
     let table = catalog.get_table(&identifier).await?;
@@ -114,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn create_catelog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
+pub async fn create_catalog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let catalog = CatalogFactory::create(options).await?;
