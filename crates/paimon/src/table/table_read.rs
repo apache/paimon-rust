@@ -41,6 +41,8 @@ use futures::{stream, StreamExt};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+const MAX_MERGE_INPUT_STREAMS: usize = 256;
+
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
 ///
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
@@ -684,7 +686,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
-                max_merge_input_streams: Some(256),
+                max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
                 // Diff primes the before and after streams in sequence. Keeping
                 // a row-group permit across yielded batches can otherwise let
                 // the first side block the second side indefinitely.
@@ -772,9 +774,10 @@ impl<'a> PaimonTableRead<'a> {
             return self.read_raw(data_splits);
         }
 
-        // Deletion-vector tables read raw by design: stale versions of a key
-        // are masked by DVs, not merged, and KeyValueFileReader does not
-        // support DVs. Keep the plain level-0 dispatch for them.
+        // Compacted deletion-vector splits read raw: their stale versions are
+        // masked directly by DVs. A split containing level-0 data goes through
+        // the key merge; KeyValueFileReader applies any attached per-file DVs
+        // before merging the uncompacted versions.
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
@@ -824,7 +827,9 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: false,
-                max_merge_input_streams: None,
+                max_merge_input_streams: (core_options.deletion_vectors_enabled()
+                    && core_options.deletion_vectors_merge_on_read())
+                .then_some(MAX_MERGE_INPUT_STREAMS),
                 parquet_read_budget: Some(self.parquet_read_budget()?),
             },
         );
@@ -1440,8 +1445,9 @@ fn scalar_compare(
 /// planning treats the missing stat as "no deletes" for compatibility, so the
 /// read side must fall back to the merge reader, which drops them.
 ///
-/// Deletion-vector tables keep the plain level-0 dispatch: stale versions are
-/// masked by DVs and KeyValueFileReader does not support DVs.
+/// Deletion-vector tables merge only splits containing level-0 files. Fully
+/// compacted splits stay on the raw path, while the merge reader applies any
+/// attached DVs before reconciling uncompacted key versions.
 fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
     if dv_enabled {
         return split.data_files().iter().any(|f| f.level == 0);

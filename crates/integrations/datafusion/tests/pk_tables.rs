@@ -2110,11 +2110,8 @@ async fn test_pk_partitioned_fixed_bucket_predicate_query() {
 
 // ======================= DV + Deduplicate Regression =======================
 
-/// Regression: DV-enabled Deduplicate PK table must not error on read.
-/// Before the fix, removing the DV guard caused level-0 files to reach
-/// KeyValueFileReader which rejects deletion-vector files with a hard error.
-/// With the guard restored, level-0 files are skipped in scan (DV mode relies
-/// on compaction to produce higher-level files).
+/// DV-enabled Deduplicate PK tables keep the existing compacted-only behavior
+/// unless merge-on-read is explicitly enabled.
 #[tokio::test]
 async fn test_pk_dv_deduplicate_read_no_error() {
     let (_tmp, sql_context) = setup_sql_context().await;
@@ -2146,11 +2143,8 @@ async fn test_pk_dv_deduplicate_read_no_error() {
         .await
         .unwrap();
 
-    // Read must not error. DV mode skips level-0 files, so only compacted
-    // (level > 0) files are visible. Without compaction, all files are level-0
-    // and get skipped — count may be 0, but the read must succeed without error.
-    // Before the fix, this would hard-fail with "KeyValueFileReader does not
-    // support deletion vectors".
+    // The default remains compacted-only: level-0 files are skipped, so the
+    // read may be empty before compaction but must remain valid.
     let result = sql_context
         .sql("SELECT * FROM paimon.test_db.t_dv_dedup")
         .await
@@ -2161,6 +2155,61 @@ async fn test_pk_dv_deduplicate_read_no_error() {
         result.is_ok(),
         "DV + Deduplicate read should not error: {:?}",
         result.err()
+    );
+}
+
+/// Merge-on-read makes level-0 files visible and resolves overlapping primary
+/// keys before applying the residual predicate.
+#[tokio::test]
+async fn test_pk_dv_merge_on_read_reads_level_zero() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_dv_mor (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'deletion-vectors.enabled' = 'true',
+                'deletion-vectors.merge-on-read' = 'true',
+                'source.split.target-size' = '1b',
+                'source.split.open-file-cost' = '1b'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_dv_mor VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_dv_mor VALUES (2, 200), (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_dv_mor ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 10), (2, 200), (3, 30)]);
+
+    let stale_rows = collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_dv_mor WHERE value = 20",
+    )
+    .await;
+    assert!(
+        stale_rows.is_empty(),
+        "the residual predicate must run after primary-key merging"
     );
 }
 

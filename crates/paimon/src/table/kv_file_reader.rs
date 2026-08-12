@@ -31,6 +31,7 @@ use super::sort_merge::{
     SortMergeReaderBuilder,
 };
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
     BigIntType, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
@@ -39,7 +40,7 @@ use crate::spec::{
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
-use crate::{DataSplit, Error};
+use crate::{DataSplit, DeletionFile, Error};
 use arrow_array::{RecordBatch, RecordBatchOptions};
 
 use async_stream::try_stream;
@@ -529,15 +530,29 @@ impl KeyValueFileReader {
 
         Ok(try_stream! {
             for split_group in &split_groups {
-                // DV mode should not reach KeyValueFileReader.
+                // A deletion-vector merge-on-read split can mix compacted
+                // sources carrying DVs with uncompacted level-0 files. Keep
+                // only the small per-file metadata here; load each bitmap when
+                // its sorted run reaches that physical file.
+                let mut deletion_files_by_split =
+                    HashMap::<usize, Arc<HashMap<String, DeletionFile>>>::new();
                 for split in split_group {
-                    if split
-                        .data_deletion_files()
-                        .is_some_and(|files| files.iter().any(Option::is_some))
-                    {
-                        Err(Error::Unsupported {
-                            message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                        })?;
+                    let Some(deletion_files) = split.data_deletion_files() else {
+                        continue;
+                    };
+                    let by_name = split
+                        .data_files()
+                        .iter()
+                        .zip(deletion_files.iter())
+                        .filter_map(|(data_file, deletion_file)| {
+                            deletion_file
+                                .as_ref()
+                                .map(|file| (data_file.file_name.clone(), file.clone()))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    if !by_name.is_empty() {
+                        deletion_files_by_split
+                            .insert(Arc::as_ptr(split) as usize, Arc::new(by_name));
                     }
                 }
                 for merge_group in plan_merge_groups(
@@ -570,6 +585,8 @@ impl KeyValueFileReader {
                         .with_batch_size(Some(read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone());
                         let run_schema_manager = schema_manager.clone();
+                        let run_file_io = file_io.clone();
+                        let deletion_files_by_split = deletion_files_by_split.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
                             for MergeFile { split, file: file_meta } in files {
                                 let data_fields: Option<Vec<DataField>> =
@@ -577,14 +594,24 @@ impl KeyValueFileReader {
                                         let data_schema =
                                             run_schema_manager.schema(file_meta.schema_id).await?;
                                         Some(data_schema.fields().to_vec())
-                                    } else {
-                                        None
-                                    };
+                                } else {
+                                    None
+                                };
+                                let deletion_file = deletion_files_by_split
+                                    .get(&(Arc::as_ptr(&split) as usize))
+                                    .and_then(|files| files.get(&file_meta.file_name))
+                                    .cloned();
+                                let deletion_vector = match deletion_file {
+                                    Some(file) => Some(Arc::new(
+                                        DeletionVectorFactory::read(&run_file_io, &file).await?,
+                                    )),
+                                    None => None,
+                                };
                                 let mut file_stream = reader.read_single_file_stream(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
-                                    None,
+                                    deletion_vector,
                                     split.row_ranges().map(|ranges| ranges.to_vec()),
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
@@ -693,20 +720,24 @@ impl KeyValueFileReader {
 mod tests {
     use super::*;
     use crate::catalog::Identifier;
+    use crate::deletion_vector::DeletionVector;
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, BinaryRow, DataFileMeta, DataType, Datum, IntType,
         PredicateBuilder, Schema, TableSchema, VarCharType,
     };
-    use crate::table::source::DataSplitBuilder;
+    use crate::table::source::{DataSplitBuilder, DeletionFile};
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
     use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use bytes::Bytes;
     use futures::TryStreamExt;
     use parquet::arrow::AsyncArrowWriter;
     use parquet::file::metadata::ParquetMetaDataReader;
     use parquet::file::properties::WriterProperties;
+    use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -891,6 +922,35 @@ mod tests {
             .unwrap();
     }
 
+    async fn write_deletion_file(
+        file_io: &FileIO,
+        table_path: &str,
+        deleted_rows: &[u32],
+    ) -> DeletionFile {
+        let path = format!("{table_path}/index/dv");
+        file_io
+            .mkdirs(&format!("{table_path}/index/"))
+            .await
+            .unwrap();
+        let bitmap = deleted_rows.iter().copied().collect::<RoaringBitmap>();
+        let bytes = DeletionVector::from_bitmap(bitmap)
+            .serialize_to_bytes()
+            .unwrap();
+        let bitmap_length = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        file_io
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        DeletionFile::new(
+            path,
+            0,
+            i64::from(bitmap_length),
+            Some(deleted_rows.len() as i64),
+        )
+    }
+
     async fn read_rows(
         table: &Table,
         projection: Option<&[&str]>,
@@ -944,6 +1004,225 @@ mod tests {
             first_row_id: None,
             write_cols: None,
         }
+    }
+
+    /// Java-compatible DV merge-on-read is a batch visibility override: the
+    /// default still hides uncompacted level-0 files, while a dynamic override
+    /// includes them and merges overlapping key versions. A tiny split target
+    /// makes this also catch planners that incorrectly separate overlapping
+    /// files into independent raw splits.
+    #[tokio::test]
+    async fn dv_merge_on_read_exposes_and_merges_level_zero_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/dv_merge_on_read_level_zero";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("deletion-vectors.enabled", "true"),
+                ("source.split.target-size", "1b"),
+                ("source.split.open-file-cost", "1b"),
+            ],
+        );
+
+        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+
+        let hidden_plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        assert!(
+            hidden_plan.splits().is_empty(),
+            "DV batch reads must keep hiding level-0 files by default"
+        );
+
+        let merge_on_read = table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".to_string(),
+            "true".to_string(),
+        )]));
+        let read_builder = merge_on_read.new_read_builder();
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        assert_eq!(
+            plan.splits().len(),
+            1,
+            "overlapping versions must share one split"
+        );
+        assert_eq!(plan.splits()[0].data_files().len(), 2);
+        assert!(!plan.splits()[0].raw_convertible());
+
+        let batches = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20, 30]);
+
+        let stale_filter = PredicateBuilder::new(merge_on_read.schema().fields())
+            .equal("value", Datum::Int(10))
+            .unwrap();
+        let stale_batches = read_rows(&merge_on_read, None, Some(stale_filter)).await;
+        assert_eq!(
+            stale_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            0,
+            "a predicate matching only the superseded L0 value must not resurrect it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_dv_merge_on_read_is_ignored_without_deletion_vectors() {
+        let file_io = test_file_io();
+        let table_path = "memory:/ignored_dynamic_dv_merge_on_read";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+
+        let merge_on_read = table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".to_string(),
+            "true".to_string(),
+        )]));
+        let batches = read_rows(&merge_on_read, None, None).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20, 30]);
+    }
+
+    /// A MOR split can contain both uncompacted records and compacted source
+    /// files with deletion vectors. DV filtering must happen per physical file
+    /// before the surviving records enter the key merge; otherwise a deleted
+    /// key with no replacement is resurrected.
+    #[tokio::test]
+    async fn dv_merge_on_read_applies_deletion_vectors_before_key_merge() {
+        let file_io = test_file_io();
+        let table_path = "memory:/dv_merge_on_read_with_dv";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("deletion-vectors.enabled", "true"),
+                ("deletion-vectors.merge-on-read", "true"),
+            ],
+        );
+
+        write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 3], vec![Some(11), Some(30)])).await;
+
+        let all_files = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan()
+            .await
+            .unwrap();
+        let mut files = all_files
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files().iter().cloned())
+            .collect::<Vec<_>>();
+        files.sort_by_key(|file| file.min_sequence_number);
+        assert_eq!(files.len(), 2);
+        files[0].level = 1;
+
+        let deletion_file = write_deletion_file(&file_io, table_path, &[1]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(2)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_data_deletion_files(vec![Some(deletion_file), None])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+
+        let batches = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![1, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 30]);
+    }
+
+    /// Disjoint files in one split are consumed as sequential merge groups. A
+    /// DV attached to a late file must not be read before an earlier group can
+    /// emit its output.
+    #[tokio::test]
+    async fn dv_merge_on_read_loads_deletion_vectors_per_file() {
+        let file_io = test_file_io();
+        let table_path = "memory:/dv_merge_on_read_lazy_dv";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("deletion-vectors.enabled", "true"),
+                ("deletion-vectors.merge-on-read", "true"),
+            ],
+        );
+
+        let mut files = Vec::new();
+        for i in 0..10 {
+            files.push(
+                write_multi_row_group_kv_file(
+                    &file_io,
+                    table_path,
+                    &format!("part-{i}.parquet"),
+                    i * 1_000,
+                    i64::from(i),
+                    i,
+                )
+                .await,
+            );
+        }
+        let mut deletion_files = vec![None; files.len()];
+        deletion_files[9] = Some(DeletionFile::new(
+            format!("{table_path}/index/not-yet-read.dv"),
+            0,
+            1,
+            Some(1),
+        ));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_data_deletion_files(deletion_files)
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+
+        let mut stream = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("the first output batch")
+            .expect("a late deletion vector must be loaded lazily");
+        assert_eq!(first.num_rows(), 128);
+
+        let err = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        assert!(
+            err.to_string().contains("not-yet-read.dv"),
+            "the late file must still surface its missing DV when reached: {err:?}"
+        );
     }
 
     fn int_key(value: i32) -> Vec<u8> {
@@ -1168,6 +1447,47 @@ mod tests {
         assert!(
             matches!(err, Error::Unsupported { message } if message.contains("sorted-run input streams")),
             "KV merge must fail before opening an unbounded number of sorted-run inputs"
+        );
+    }
+
+    #[tokio::test]
+    async fn dv_mor_table_read_bounds_merge_fan_in() {
+        let file_io = test_file_io();
+        let table_path = "memory:/dv_mor_merge_fan_in_limit";
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("deletion-vectors.enabled", "true"),
+                ("deletion-vectors.merge-on-read", "true"),
+            ],
+        );
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(
+                (0..257)
+                    .map(|i| dummy_data_file(format!("file-{i}.parquet")))
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+
+        let err = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { message } if message.contains("sorted-run input streams")),
+            "DV merge-on-read must reject unbounded production merge fan-in"
         );
     }
 
