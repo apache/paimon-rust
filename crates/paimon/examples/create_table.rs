@@ -26,16 +26,23 @@ use paimon::spec::{DataType, IntType, Schema, VarCharType};
 use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
 
 // This example creates a paimon table and inserts test data
-// set the catalog path and run example using:
-// cargo run --package paimon --example create_table
+// Run the example by passing the catalog warehouse path after `--`:
+// cargo run --package paimon --example create_table -- /path/to/warehouse
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let warehouse = std::env::args().nth(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage: cargo run --package paimon --example create_table -- <warehouse-path>",
+        )
+    })?;
+
     // Open local catalog
-    let catalog = create_catelog().await?;
+    let catalog = create_catelog(warehouse).await?;
 
     // Create new database
     catalog
-        .create_database("my_db", false, HashMap::new())
+        .create_database("my_db", true, HashMap::new())
         .await?;
 
     // Define table schema and its data types
@@ -49,7 +56,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let identifier = Identifier::new("my_db", "users");
 
-    // create table
+    // Check if table exists in catalog
+    let table_exists = match catalog.get_table(&identifier).await {
+        Ok(_) => true,
+        Err(paimon::Error::TableNotExist { .. }) => false,
+        Err(error) => return Err(error.into()),
+    };
+
+    // if exists, drop and create fresh table and data
+    if table_exists {
+        catalog.drop_table(&identifier, false).await?;
+    }
+
     catalog.create_table(&identifier, schema, false).await?;
 
     let table = catalog.get_table(&identifier).await?;
@@ -96,9 +114,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn create_catelog() -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
+pub async fn create_catelog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
     let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, "/path-to/testdata");
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
     let catalog = CatalogFactory::create(options).await?;
     Ok(catalog)
 }

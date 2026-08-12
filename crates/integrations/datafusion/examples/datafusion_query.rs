@@ -27,11 +27,19 @@ use paimon_datafusion::PaimonTableProvider;
 // using the DataFusion DataFrame API.
 //
 // Before running this example, create the sample table at
-// examples/create_table
+// examples/create_table, then pass the catalog warehouse path:
+// cargo run --package paimon-datafusion --example datafusion_query -- /path/to/warehouse
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let warehouse = std::env::args().nth(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage: cargo run --package paimon-datafusion --example datafusion_query -- <warehouse-path>",
+        )
+    })?;
+
     // Open the local Paimon catalog
-    let catalog = create_catelog().await?;
+    let catalog = create_catelog(warehouse).await?;
 
     // Load the users table
     let identifier = Identifier::new("my_db", "users");
@@ -69,9 +77,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn create_catelog() -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
+pub async fn create_catelog(warehouse: String) -> Result<Arc<dyn Catalog>, Box<dyn Error>> {
     let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, "/path-to/testdata");
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
     let catalog = CatalogFactory::create(options).await?;
     Ok(catalog)
 }
