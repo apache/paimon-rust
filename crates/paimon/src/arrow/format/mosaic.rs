@@ -264,6 +264,10 @@ impl StatsAccessor for MosaicRowGroupStats<'_> {
     fn max_value(&self, index: usize, data_type: &PaimonDataType) -> Option<Datum> {
         mosaic_value_to_datum(self.column_stats(index)?.max.as_ref()?, data_type)
     }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        true
+    }
 }
 
 impl MosaicRowGroupStats<'_> {
@@ -873,6 +877,32 @@ mod tests {
             .await
     }
 
+    async fn read_ranges_with_predicates(
+        data: Bytes,
+        read_fields: &[DataField],
+        predicates: &FilePredicates,
+    ) -> crate::Result<Vec<Range<u64>>> {
+        let file_size = data.len() as u64;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let _: Vec<RecordBatch> = MosaicFormatReader
+            .read_batch_stream(
+                Box::new(TrackingFileRead {
+                    data,
+                    calls: Arc::clone(&calls),
+                }),
+                file_size,
+                read_fields,
+                Some(predicates),
+                None,
+                None,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        let ranges = calls.lock().unwrap().clone();
+        Ok(ranges)
+    }
+
     fn collect_i32_column(batches: &[RecordBatch], column_index: usize) -> Vec<i32> {
         batches
             .iter()
@@ -1189,6 +1219,83 @@ mod tests {
             .unwrap();
 
         assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_row_group_in_min_max_pruning() {
+        let fields = vec![data_fields()[0].clone()];
+        let builder = PredicateBuilder::new(&fields);
+        let mapping = [Some(0)];
+        let stats = |min, max| {
+            [ColumnStats {
+                column_index: 0,
+                null_count: 0,
+                min,
+                max,
+            }]
+        };
+        let may_match = |stats: &[ColumnStats], literals: Vec<Datum>| {
+            let predicate = builder.is_in("id", literals).unwrap();
+            row_group_may_match(10, stats, &mapping, &[predicate], &fields).unwrap()
+        };
+
+        let valid_stats = stats(
+            Some(MosaicValue::Integer(10)),
+            Some(MosaicValue::Integer(20)),
+        );
+        assert!(!may_match(
+            &valid_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+        assert!(may_match(&valid_stats, vec![Datum::Int(1), Datum::Int(15)]));
+        assert!(may_match(&[], vec![Datum::Int(1), Datum::Int(30)]));
+
+        let damaged_stats = stats(
+            Some(MosaicValue::Integer(20)),
+            Some(MosaicValue::Integer(10)),
+        );
+        assert!(may_match(
+            &damaged_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+
+        let incomparable_stats = stats(
+            Some(MosaicValue::String(b"a".to_vec())),
+            Some(MosaicValue::String(b"z".to_vec())),
+        );
+        assert!(may_match(
+            &incomparable_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_in_pruning_skips_mosaic_column_reads() {
+        let fields = data_fields();
+        let projected = vec![fields[0].clone()];
+        let builder = PredicateBuilder::new(&fields);
+        let eq_predicates = predicate_file_predicates(
+            fields.clone(),
+            vec![builder.equal("id", Datum::Int(99)).unwrap()],
+        );
+        let in_predicates = predicate_file_predicates(
+            fields.clone(),
+            vec![builder
+                .is_in("id", vec![Datum::Int(99), Datum::Int(100)])
+                .unwrap()],
+        );
+        let data = multi_row_group_mosaic(vec!["id".to_string()]);
+
+        let eq_reads = read_ranges_with_predicates(data.clone(), &projected, &eq_predicates)
+            .await
+            .unwrap();
+        let in_reads = read_ranges_with_predicates(data, &projected, &in_predicates)
+            .await
+            .unwrap();
+        assert_eq!(
+            in_reads, eq_reads,
+            "an all-outside IN should not read row-group column data"
+        );
     }
 
     #[tokio::test]
