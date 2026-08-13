@@ -28,7 +28,7 @@ use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
 // This example creates a paimon table and inserts test data
 // Run the example by passing the catalog warehouse path first after `--`:
 // Eg: cargo run --package paimon --example create_table -- /path/to/warehouse --overwrite
-// Use optional `--overwrite` after the warehouse path to automatically drop and re-create
+// Use optional --overwrite flag after the warehouse path to automatically drop and re-create
 // the table if it already exists.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
