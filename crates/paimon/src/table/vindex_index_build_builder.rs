@@ -410,7 +410,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             message: format!("vindex training task failed: {e}"),
             source: None,
         })?
-        .map_err(|e| Error::DataInvalid {
+        .map_err(|e| Error::UnexpectedError {
             message: format!("Failed to train or add vectors to vindex index: {e}"),
             source: Some(Box::new(e)),
         })?;
@@ -950,7 +950,7 @@ fn checked_std_vector_bytes(row_count: usize, dimension: usize) -> std::io::Resu
 }
 
 fn checked_training_vector_count(row_count: usize, ratio: f64) -> Result<usize> {
-    if row_count == 0 || !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) || ratio == 0.0 {
+    if row_count == 0 || !(ratio > 0.0 && ratio <= 1.0) {
         return Err(Error::DataInvalid {
             message: format!(
                 "Invalid vindex training sample: row_count={row_count}, ratio={ratio}; expected a positive row count and ratio in (0, 1]"
@@ -973,37 +973,6 @@ fn checked_training_sample_index(sample: usize, rows: usize, samples: usize) -> 
             message: "vindex training sample index overflows usize".to_string(),
             source: None,
         })
-}
-
-#[cfg(test)]
-fn extract_vectors_from_batches(
-    batches: &[RecordBatch],
-    index_column: &str,
-    dimension: i32,
-    row_range_start: i64,
-    expected_row_count: i64,
-) -> Result<Vec<f32>> {
-    let dimension = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
-        message: format!("Invalid vindex dimension: {dimension}"),
-        source: Some(Box::new(e)),
-    })?;
-    let mut expected_row_id = row_range_start;
-    let mut vectors = Vec::new();
-    for batch in batches {
-        vectors.extend_from_slice(
-            validate_vector_batch(batch, index_column, dimension, &mut expected_row_id)?.values,
-        );
-    }
-    if expected_row_id - row_range_start != expected_row_count {
-        return Err(Error::DataInvalid {
-            message: format!(
-                "vindex vector extraction expected {expected_row_count} rows, got {}",
-                expected_row_id - row_range_start
-            ),
-            source: None,
-        });
-    }
-    Ok(vectors)
 }
 
 fn checked_i32(value: u64, context: &str) -> Result<i32> {
@@ -1218,6 +1187,36 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn extract_vectors_from_batches(
+        batches: &[RecordBatch],
+        index_column: &str,
+        dimension: i32,
+        row_range_start: i64,
+        expected_row_count: i64,
+    ) -> Result<Vec<f32>> {
+        let dimension = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid vindex dimension: {dimension}"),
+            source: Some(Box::new(e)),
+        })?;
+        let mut expected_row_id = row_range_start;
+        let mut vectors = Vec::new();
+        for batch in batches {
+            vectors.extend_from_slice(
+                validate_vector_batch(batch, index_column, dimension, &mut expected_row_id)?.values,
+            );
+        }
+        if expected_row_id - row_range_start != expected_row_count {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector extraction expected {expected_row_count} rows, got {}",
+                    expected_row_id - row_range_start
+                ),
+                source: None,
+            });
+        }
+        Ok(vectors)
     }
 
     #[test]

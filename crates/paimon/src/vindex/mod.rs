@@ -261,7 +261,7 @@ fn resolve_train_sample_ratio(
         .map_err(|_| crate::Error::ConfigInvalid {
             message: format!("Invalid vindex train.sample-ratio: '{value}'"),
         })?;
-    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) || ratio == 0.0 {
+    if !(ratio > 0.0 && ratio <= 1.0) {
         return Err(crate::Error::ConfigInvalid {
             message: format!(
                 "Invalid vindex train.sample-ratio: {value}; expected a finite value in (0, 1]"
