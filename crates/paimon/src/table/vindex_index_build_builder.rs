@@ -28,7 +28,7 @@ use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+use paimon_vindex_core::index::{VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -176,8 +176,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     index_column,
                     dimension,
                     index_field.id(),
-                    vindex_options.config.clone(),
-                    vindex_options.train_sample_ratio,
+                    &vindex_options,
                     index_meta.clone(),
                 )
                 .await
@@ -206,8 +205,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_column: &str,
         dimension: i32,
         index_field_id: i32,
-        config: VectorIndexConfig,
-        train_sample_ratio: f64,
+        options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
     ) -> Result<IndexFileMeta> {
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
@@ -227,7 +225,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         }
         let expected_bytes = checked_vector_bytes(row_count_usize, dimension_usize)?;
         let training_vector_count =
-            checked_training_vector_count(row_count_usize, train_sample_ratio)?;
+            checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
         let training_buffer_rows =
             (VECTOR_BUFFER_BYTES / checked_vector_bytes(1, dimension_usize)?).max(1);
         let training_buffer_floats = training_buffer_rows
@@ -237,10 +235,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        let mut trainer = VectorIndexTrainer::new(config).map_err(|e| Error::DataInvalid {
-            message: format!("Failed to initialize vindex trainer: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+        let mut trainer =
+            VectorIndexTrainer::new(options.config.clone()).map_err(|e| Error::DataInvalid {
+                message: format!("Failed to initialize vindex trainer: {e}"),
+                source: Some(Box::new(e)),
+            })?;
         let raw_file = tempfile::tempfile().map_err(|e| Error::UnexpectedError {
             message: format!("Failed to create temporary vindex vector file: {e}"),
             source: Some(Box::new(e)),
