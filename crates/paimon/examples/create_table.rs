@@ -26,8 +26,10 @@ use paimon::spec::{DataType, IntType, Schema, VarCharType};
 use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
 
 // This example creates a paimon table and inserts test data
-// Run the example by passing the catalog warehouse path after `--`:
-// cargo run --package paimon --example create_table -- /path/to/warehouse
+// Run the example by passing the catalog warehouse path first after `--`:
+// Eg: cargo run --package paimon --example create_table -- /path/to/warehouse --overwrite
+// Use optional `--overwrite` after the warehouse path to automatically drop and re-create
+// the table if it already exists.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
@@ -35,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let warehouse = args.next().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: cargo run --package paimon --example create_table -- <warehouse-path> ",
+            "usage: cargo run --package paimon --example create_table -- <warehouse-path> --overwrite",
         )
     })?;
 
