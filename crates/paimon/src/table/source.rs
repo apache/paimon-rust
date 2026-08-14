@@ -20,6 +20,7 @@
 //! Reference: [org.apache.paimon.table.source](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/).
 
 use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout};
+use crate::table::query_auth::QueryAuthGrant;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -500,9 +501,33 @@ pub struct DataSplit {
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
     raw_convertible: bool,
+    /// Mirrors Java `QueryAuthSplit`, but is dropped by serialization, so a
+    /// plan must be read where it was made.
+    #[serde(skip)]
+    query_auth_grant: Option<Arc<QueryAuthGrant>>,
+    /// That this split came from a `query-auth.enabled` table. Unlike the grant
+    /// it survives serialization, so a round-tripped split fails closed.
+    #[serde(default)]
+    query_auth_required: bool,
 }
 
 impl DataSplit {
+    /// Marks the split as needing authorization whether or not a grant came
+    /// with it, so a plan that produced none still refuses at the read.
+    pub(crate) fn planned(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
+        self.query_auth_required = true;
+        self.query_auth_grant = grant;
+        self
+    }
+
+    pub(crate) fn query_auth_required(&self) -> bool {
+        self.query_auth_required
+    }
+
+    pub(crate) fn query_auth_grant(&self) -> Option<&Arc<QueryAuthGrant>> {
+        self.query_auth_grant.as_ref()
+    }
+
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
@@ -683,10 +708,23 @@ impl DataSplit {
         DataSplitBuilder::new()
     }
 
+    /// The Java-compatible frames have no field for the marker, so a reader would
+    /// rebuild the split without it. Serde keeps it; these two must refuse.
+    fn ensure_serializable_without_grant(&self) -> crate::Result<()> {
+        if self.query_auth_required {
+            return Err(crate::table::query_auth::unsupported(
+                "a split of such a table cannot be serialized to the cross-language \
+                 format, which has no field to carry the authorization with it",
+            ));
+        }
+        Ok(())
+    }
+
     /// Serialize the DataSplit fields to Java `DataSplit#serialize` (version 9) binary.
     /// Byte-compatible with `compatibility/datasplit-v9`. Row ranges are not part of the
     /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        self.ensure_serializable_without_grant()?;
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
@@ -848,6 +886,7 @@ impl DataSplit {
     /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        self.ensure_serializable_without_grant()?;
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
@@ -1274,6 +1313,8 @@ impl DataSplitBuilder {
             }
         }
         Ok(DataSplit {
+            query_auth_grant: None,
+            query_auth_required: false,
             snapshot_id: self.snapshot_id,
             partition: Arc::new(partition),
             bucket: self.bucket,
@@ -1309,6 +1350,17 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+
+    /// Stamps the grant every split of this plan was authorized under.
+    pub(crate) fn planned(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
+        if grant.is_some() {
+            self.splits = std::mem::take(&mut self.splits)
+                .into_iter()
+                .map(|split| split.planned(grant.clone()))
+                .collect();
+        }
+        self
     }
 
     /// Sum of data-file bytes referenced by this plan.
@@ -1984,6 +2036,31 @@ mod tests {
     }
 
     // Same hardening for the IndexedSplit row-ranges count in the SPLIT_V1 frame.
+    #[test]
+    fn test_a_marked_split_refuses_the_cross_language_formats() {
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
+            .with_bucket(0)
+            .with_bucket_path("p".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap()
+            .planned(None);
+        for bytes in [split.serialize(), split.serialize_split_v1()] {
+            let Err(err) = bytes else {
+                panic!("the marker has nowhere to go in these formats")
+            };
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "{err:?}"
+            );
+        }
+    }
+
     #[test]
     fn deserialize_split_v1_rejects_huge_ranges_count_without_aborting() {
         let split = DataSplitBuilder::new()

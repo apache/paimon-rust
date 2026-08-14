@@ -103,7 +103,15 @@ impl<'a> FormatTableRead<'a> {
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         let core_options = self.table.schema().core_options();
-        core_options.ensure_read_authorized()?;
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        // Sync, so the marker stands in for asking the server.
+        if core_options.query_auth_enabled()
+            || data_splits.iter().any(|split| split.query_auth_required())
+        {
+            return Err(super::query_auth::unsupported(
+                "a format table cannot apply a row filter or column masking",
+            ));
+        }
         // Mapping the conjunct onto the data fields drops it, so the read would
         // silently ignore the filter. Guard on the read path, not the builder:
         // `TableRead` is public and can be constructed and filtered directly.

@@ -63,6 +63,8 @@ const FULL_TEXT_INDEX_SEARCH_CONCURRENCY: usize = 8;
 /// Reference: `org.apache.paimon.table.source.FullTextSearchBuilder`
 pub struct FullTextSearchBuilder<'a> {
     table: &'a Table,
+    /// Set when the caller already asked, so a delegated search does not repeat it.
+    authorized: bool,
     text_column: Option<String>,
     query_text: Option<String>,
     limit: Option<usize>,
@@ -70,8 +72,15 @@ pub struct FullTextSearchBuilder<'a> {
 }
 
 impl<'a> FullTextSearchBuilder<'a> {
+    /// The caller already asked the server for this operation.
+    pub(crate) fn assume_authorized(mut self) -> Self {
+        self.authorized = true;
+        self
+    }
+
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
+            authorized: false,
             table,
             text_column: None,
             query_text: None,
@@ -117,7 +126,11 @@ impl<'a> FullTextSearchBuilder<'a> {
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a full-text search")
+                .await?;
+        }
         let text_column =
             self.text_column
                 .as_deref()
@@ -204,7 +217,11 @@ impl<'a> FullTextSearchBuilder<'a> {
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a full-text search")
+                .await?;
+        }
         let text_column =
             self.text_column
                 .as_deref()

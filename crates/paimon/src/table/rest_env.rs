@@ -19,6 +19,7 @@
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
+use crate::api::GetTableResponse;
 use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::Options;
 use crate::error::Error;
@@ -79,6 +80,80 @@ impl RESTEnv {
     /// Get the REST API client.
     pub fn api(&self) -> &Arc<RESTApi> {
         &self.api
+    }
+
+    /// Bracketed by a freshness check: the response names no table, so a drop
+    /// and re-create in between would let a replacement's grant serve this one.
+    pub(crate) async fn table_query_auth(
+        &self,
+        branch: &str,
+        schema_id: i64,
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.current_table_checked(schema_id).await?;
+        let response = self
+            .api
+            .auth_table_query(&self.branch_identifier(branch), select)
+            .await?;
+        self.current_table_checked(schema_id).await?;
+        Ok(response)
+    }
+
+    /// Asserts nothing about identity: an ordinary table must not inherit a
+    /// freshness restriction.
+    pub(crate) async fn current_table(&self) -> Result<GetTableResponse> {
+        self.api.get_table(&self.identifier).await
+    }
+
+    /// Refused unless the name still resolves to the loaded table — a missing
+    /// identity too, which checks nothing.
+    pub(crate) async fn current_table_checked(&self, schema_id: i64) -> Result<GetTableResponse> {
+        let response = self.current_table().await?;
+        let name = self.identifier.full_name();
+        let drifted = |what: &str, from: String, to: String| crate::Error::DataInvalid {
+            message: format!(
+                "table '{name}' now resolves to {what} {to}, not the {from} this handle was \
+                 loaded with; re-load the table before reading it"
+            ),
+            source: None,
+        };
+        match response.id.as_deref() {
+            Some(uuid) if uuid == self.uuid => {}
+            Some(uuid) => return Err(drifted("uuid", self.uuid.clone(), uuid.to_string())),
+            None => {
+                return Err(drifted(
+                    "uuid",
+                    self.uuid.clone(),
+                    "nothing the server reports".to_string(),
+                ))
+            }
+        }
+        match response.schema_id {
+            Some(id) if id == schema_id => Ok(response),
+            Some(id) => Err(drifted("schema", schema_id.to_string(), id.to_string())),
+            None => Err(drifted(
+                "schema",
+                schema_id.to_string(),
+                "nothing the server reports".to_string(),
+            )),
+        }
+    }
+
+    /// `db.table$branch_<name>`, as Java names a branch. Only the auth call uses it.
+    fn branch_identifier(&self, branch: &str) -> Identifier {
+        if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            return self.identifier.clone();
+        }
+        Identifier::new(
+            self.identifier.database(),
+            format!(
+                "{}{}{}{}",
+                self.identifier.object(),
+                crate::catalog::SYSTEM_TABLE_SPLITTER,
+                crate::catalog::SYSTEM_BRANCH_PREFIX,
+                branch
+            ),
+        )
     }
 
     /// Get the table identifier.
@@ -219,7 +294,8 @@ impl RESTEnv {
             table_path,
             table_schema,
             Some(rest_env),
-        ))
+        )
+        .with_query_auth_session())
     }
 
     pub(crate) async fn build_object_table(

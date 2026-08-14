@@ -476,8 +476,11 @@ pub struct GetTableTokenResponse {
 
 /// Response for auth table query: the per-user row filter and column masking the
 /// client must enforce at read time for a `query-auth.enabled` table.
+///
+/// Unknown fields are rejected: an absent one reads as "no rule", so protocol
+/// drift would look like an unrestricted grant.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthTableQueryResponse {
     /// JSON-serialized row-filter predicates, ANDed together. Empty/None = no filter.
     pub filter: Option<Vec<String>>,
@@ -495,6 +498,18 @@ impl AuthTableQueryResponse {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_auth_table_query_response_rejects_unknown_fields() {
+        let drifted = r#"{"rowFilter":["restricted"]}"#;
+        assert!(
+            serde_json::from_str::<AuthTableQueryResponse>(drifted).is_err(),
+            "an auth response this client does not understand must not parse"
+        );
+        assert!(serde_json::from_str::<AuthTableQueryResponse>("{}")
+            .unwrap()
+            .is_unrestricted());
+    }
     use super::*;
 
     #[test]

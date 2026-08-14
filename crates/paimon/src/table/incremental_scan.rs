@@ -149,6 +149,18 @@ impl IncrementalPlan {
         &self.splits
     }
 
+    /// Whether any underlying split came from a query-auth plan. Unlike
+    /// [`Self::data_splits`] this sees the diff pairs too.
+    pub(crate) fn any_query_auth_required(&self) -> bool {
+        self.splits.iter().any(|split| match split {
+            IncrementalSplit::Data(split) => split.query_auth_required(),
+            IncrementalSplit::DiffPair { before, after } => before
+                .iter()
+                .chain(after)
+                .any(DataSplit::query_auth_required),
+        })
+    }
+
     pub fn data_splits(&self) -> Vec<DataSplit> {
         self.splits
             .iter()
@@ -244,7 +256,13 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
-        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let core_options = crate::spec::CoreOptions::new(self.table.schema().options());
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        if self.table.server_query_auth_enabled().await? {
+            return Err(super::query_auth::unsupported(
+                "an incremental read cannot apply a row filter or column masking",
+            ));
+        }
         let mode = self.resolve_mode();
         self.validate_snapshot_range(mode).await?;
         if self.start_exclusive == self.end_inclusive {

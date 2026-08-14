@@ -181,6 +181,8 @@ fn vindex_concurrency_limits(
 
 pub struct VectorSearchBuilder<'a> {
     table: &'a Table,
+    /// Set when the caller already asked, so a delegated search does not repeat it.
+    authorized: bool,
     vector_column: Option<String>,
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
@@ -191,6 +193,8 @@ pub struct VectorSearchBuilder<'a> {
 
 pub struct BatchVectorSearchBuilder<'a> {
     table: &'a Table,
+    /// Set when the caller already asked, so a delegated search does not repeat it.
+    authorized: bool,
     vector_column: Option<String>,
     query_vectors: Option<Vec<Vec<f32>>>,
     limit: Option<usize>,
@@ -272,8 +276,15 @@ pub(crate) struct PkVectorRouteResult {
 }
 
 impl<'a> VectorSearchBuilder<'a> {
+    /// The caller already asked the server for this operation.
+    pub(crate) fn assume_authorized(mut self) -> Self {
+        self.authorized = true;
+        self
+    }
+
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
+            authorized: false,
             table,
             vector_column: None,
             query_vector: None,
@@ -338,7 +349,11 @@ impl<'a> VectorSearchBuilder<'a> {
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a vector search")
+                .await?;
+        }
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -378,7 +393,7 @@ impl<'a> VectorSearchBuilder<'a> {
             }
         }
 
-        let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
+        let mut batch_builder = BatchVectorSearchBuilder::new(self.table).assume_authorized();
         batch_builder
             .with_vector_column(vector_column)
             .with_query_vectors(vec![query_vector.clone()])
@@ -402,7 +417,11 @@ impl<'a> VectorSearchBuilder<'a> {
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a vector search")
+                .await?;
+        }
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1467,8 +1486,15 @@ async fn plan_and_search_pk_candidates_batch(
 }
 
 impl<'a> BatchVectorSearchBuilder<'a> {
+    /// The caller already asked the server for this operation.
+    pub(crate) fn assume_authorized(mut self) -> Self {
+        self.authorized = true;
+        self
+    }
+
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
+            authorized: false,
             table,
             vector_column: None,
             query_vectors: None,
@@ -1548,7 +1574,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         let total_start = timing_enabled.then(Instant::now);
         // The builder target is authoritative for current auth/type policy.
         // A prepared filter only pins a snapshot and may carry older options.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a vector search")
+                .await?;
+        }
         if let Some(prepared) = &self.prepared_filter {
             if !same_vector_search_table(self.table, prepared.table()) {
                 return Err(crate::Error::DataInvalid {
@@ -1571,7 +1601,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             .map(PreparedVectorSearchFilter::table)
             .unwrap_or(self.table);
         let core = CoreOptions::new(execution_table.schema().options());
-        core.ensure_read_authorized()?;
+        core.ensure_type_paimon_served(&execution_table.identifier().full_name())?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -1761,7 +1791,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     pub async fn execute_read(&self) -> crate::Result<Vec<ArrowRecordBatchStream>> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        core.ensure_read_authorized()?;
+        if !self.authorized {
+            self.table
+                .ensure_read_authorized_live("a vector search")
+                .await?;
+        }
         let vector_column =
             self.vector_column
                 .as_deref()
