@@ -646,6 +646,7 @@ fn should_skip_level_zero_for_scan(
     scan_all_files: bool,
     has_primary_keys: bool,
     deletion_vectors_enabled: bool,
+    deletion_vectors_merge_on_read: bool,
     merge_engine: crate::Result<crate::spec::MergeEngine>,
 ) -> bool {
     if scan_all_files {
@@ -655,7 +656,8 @@ fn should_skip_level_zero_for_scan(
         return false;
     }
 
-    deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+    (deletion_vectors_enabled && !deletion_vectors_merge_on_read)
+        || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
 }
 
 fn is_system_field_id(field_id: i32) -> bool {
@@ -1180,6 +1182,7 @@ impl<'a> PaimonTableScan<'a> {
             self.scan_all_files,
             has_primary_keys,
             deletion_vectors_enabled,
+            core_options.deletion_vectors_merge_on_read(),
             core_options.merge_engine(),
         );
 
@@ -1382,8 +1385,10 @@ impl<'a> PaimonTableScan<'a> {
     /// `KeyValueFileReader`.
     ///
     /// Exempt (full predicates kept):
-    /// - Deletion-vector tables: they read raw with per-row masks, stats are
-    ///   a superset of live rows, full pruning stays safe.
+    /// - Deletion-vector tables without merge-on-read: they read raw with
+    ///   per-row masks, stats are a superset of live rows, full pruning stays
+    ///   safe. With merge-on-read enabled, visible L0 versions require the
+    ///   same key-only pruning rule as an ordinary PK merge read.
     /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
     ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
     ///   read path — pruning a file drops exactly the rows the raw path's
@@ -1393,13 +1398,17 @@ impl<'a> PaimonTableScan<'a> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema().options());
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let deletion_vectors_merge_on_read = core_options.deletion_vectors_merge_on_read();
         // An unknown merge engine stays conservative (key-only pruning); the
         // read side fails on it anyway before returning rows.
         let first_row = matches!(
             core_options.merge_engine(),
             Ok(crate::spec::MergeEngine::FirstRow)
         );
-        if has_primary_keys && !deletion_vectors_enabled && !first_row {
+        if has_primary_keys
+            && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
+            && !first_row
+        {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
                 self.table.schema().fields(),
@@ -1873,10 +1882,12 @@ impl<'a> PaimonTableScan<'a> {
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
         //
-        // Deletion-vector and first-row tables read without merging (stale rows
-        // are masked by DVs / level-0 is skipped), so they keep plain size-based
-        // packing like Java's MergeTreeSplitGenerator fast path.
-        let read_merges_overlapping_keys = !core_options.deletion_vectors_enabled()
+        // Deletion-vector tables without merge-on-read and first-row tables read
+        // without merging (stale rows are masked by DVs / level-0 is skipped),
+        // so they keep plain size-based packing. DV merge-on-read includes L0
+        // files and must preserve overlapping key ranges just like ordinary MOR.
+        let read_merges_overlapping_keys = (!core_options.deletion_vectors_enabled()
+            || core_options.deletion_vectors_merge_on_read())
             && !matches!(
                 core_options.merge_engine(),
                 Ok(crate::spec::MergeEngine::FirstRow)
@@ -2799,6 +2810,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
     }
@@ -2809,7 +2821,26 @@ mod tests {
             true,
             true,
             false,
+            false,
             Ok(crate::spec::MergeEngine::FirstRow),
+        ));
+    }
+
+    #[test]
+    fn test_dv_merge_on_read_controls_batch_level_zero_visibility() {
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            true,
+            Ok(crate::spec::MergeEngine::Deduplicate),
         ));
     }
 
@@ -3589,6 +3620,57 @@ mod tests {
         assert!(
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "key conjuncts must still prune PK-table files: {trace:?}"
+        );
+    }
+
+    /// Enabling DV merge-on-read puts the table back on a key-merge path for
+    /// visible level-0 files. Non-key stats pruning is therefore unsafe for the
+    /// same reason as ordinary MOR: pruning the newest version can resurrect an
+    /// older matching value.
+    #[tokio::test]
+    async fn test_dv_merge_on_read_stats_pruning_ignores_non_key_conjuncts() {
+        let table_path = "memory:/test_dv_mor_stats_gate";
+        let table = pk_stats_gate_table(table_path).copy_with_options(HashMap::from([
+            ("deletion-vectors.enabled".to_string(), "true".to_string()),
+            (
+                "deletion-vectors.merge-on-read".to_string(),
+                "true".to_string(),
+            ),
+        ]));
+        setup_scan_trace_dirs(&table).await;
+
+        let mut old = pk_stats_file("old-version.parquet", (1, 5), (100, 200));
+        old.level = 1;
+        let mut new = pk_stats_file("new-version.parquet", (1, 5), (10, 60));
+        new.level = 1;
+        TableCommit::new(table.clone(), "dv-mor-gate-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![old, new],
+            )])
+            .await
+            .unwrap();
+
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let value_filter = PredicateBuilder::new(&fields)
+            .greater_than("value", Datum::Int(90))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(value_filter);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(trace.manifest_entries_pruned_by_data_stats, 0);
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            2,
+            "both key versions must reach the merge path"
         );
     }
 

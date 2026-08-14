@@ -3049,6 +3049,47 @@ mod tests {
     }
 
     #[test]
+    fn test_deletion_vector_merge_on_read_is_ignored_without_deletion_vectors() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("deletion-vectors.merge-on-read", "true")
+            .build()
+            .unwrap();
+        assert_eq!(
+            schema
+                .options()
+                .get("deletion-vectors.merge-on-read")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .build()
+                .unwrap(),
+        );
+        let changed = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "deletion-vectors.merge-on-read".to_string(),
+                "true".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            changed
+                .options()
+                .get("deletion-vectors.merge-on-read")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn test_deletion_vector_schema_validation_rejects_incompatible_changelog_producers() {
         for (producer, expected_message) in [
             ("full-compaction", "NONE/INPUT/LOOKUP"),

@@ -208,18 +208,28 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
-        self.try_commit(
-            CommitEntriesPlan::Direct {
-                entries,
-                changelog_entries,
-                new_index_entries,
-                check_from_snapshot,
-            },
-            Some(expected_snapshot_id),
-            commit_identifier,
-            false,
-        )
-        .await
+        let result = self
+            .try_commit(
+                CommitEntriesPlan::Direct {
+                    entries,
+                    changelog_entries,
+                    new_index_entries,
+                    check_from_snapshot,
+                },
+                Some(expected_snapshot_id),
+                commit_identifier,
+                false,
+            )
+            .await;
+        if let Err(error) = result {
+            // Storage and REST errors can be indeterminate: the snapshot may
+            // already reference these files even though the response failed.
+            if matches!(&error, crate::Error::DataInvalid { .. }) {
+                let _ = self.abort(&commit_messages).await;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Overwrite partitions with new data.
@@ -3588,6 +3598,17 @@ mod tests {
             .await
             .unwrap();
 
+        let index_path = format!("{table_path}/index/lumina-0.index");
+        file_io
+            .mkdirs(&format!("{table_path}/index/"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
         let mut message = CommitMessage::new(vec![], 0, vec![]);
         message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
         let result = commit.commit_if_latest_snapshot(vec![message], 0).await;
@@ -3603,6 +3624,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
+        assert!(!file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]

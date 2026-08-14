@@ -21,18 +21,22 @@ use crate::spec::{
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::{
-    CommitMessage, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
+    CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
-use bytes::Bytes;
+use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+use paimon_vindex_core::index::{VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
+const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct VindexIndexBuildBuilder<'a> {
     table: &'a Table,
@@ -155,35 +159,42 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let shard_count = shards.len();
-        let mut messages = Vec::with_capacity(shard_count);
-        for shard in shards {
-            let vectors = extract_vectors(self.table, &shard, index_column, dimension).await?;
-            let index_file = self
-                .build_index_file(
-                    &shard,
-                    &vectors,
-                    dimension,
-                    index_field.id(),
-                    vindex_options.config.clone(),
-                    index_meta.clone(),
-                )
-                .await?;
-            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
-            message.new_index_files = vec![index_file];
-            messages.push(message);
-        }
-
-        TableCommit::new(
+        let commit = TableCommit::new(
             self.table.clone(),
             format!(
                 "global-index-{}-create-{}",
                 self.index_type,
                 uuid::Uuid::new_v4()
             ),
-        )
-        .commit_if_latest_snapshot(messages, snapshot.id())
-        .await?;
+        );
+        let shard_count = shards.len();
+        let mut messages = Vec::with_capacity(shard_count);
+        for shard in shards {
+            let index_file = match self
+                .build_index_file(
+                    &shard,
+                    index_column,
+                    dimension,
+                    index_field.id(),
+                    &vindex_options,
+                    index_meta.clone(),
+                )
+                .await
+            {
+                Ok(index_file) => index_file,
+                Err(error) => {
+                    let _ = commit.abort(&messages).await;
+                    return Err(error);
+                }
+            };
+            let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
+            message.new_index_files = vec![index_file];
+            messages.push(message);
+        }
+
+        commit
+            .commit_if_latest_snapshot(messages, snapshot.id())
+            .await?;
 
         Ok(shard_count)
     }
@@ -191,42 +202,217 @@ impl<'a> VindexIndexBuildBuilder<'a> {
     async fn build_index_file(
         &self,
         shard: &VindexIndexShard,
-        vectors: &[f32],
+        index_column: &str,
         dimension: i32,
         index_field_id: i32,
-        config: VectorIndexConfig,
+        options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
     ) -> Result<IndexFileMeta> {
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-        validate_vector_buffer(vectors, row_count, dimension)?;
         let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
             message: format!("Invalid vindex row count: {row_count}"),
             source: Some(Box::new(e)),
         })?;
-        let ids = (0..i64::from(row_count)).collect::<Vec<_>>();
-
-        let training =
-            VectorIndexTrainer::train(config, vectors, row_count_usize).map_err(|e| {
-                Error::DataInvalid {
-                    message: format!("Failed to train vindex index: {e}"),
-                    source: Some(Box::new(e)),
-                }
-            })?;
-        let mut writer = VectorIndexWriter::new(training);
-        writer
-            .add_vectors(&ids, vectors, row_count_usize)
-            .map_err(|e| Error::DataInvalid {
-                message: format!("Failed to add vectors to vindex index: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-        let mut bytes = Vec::new();
-        {
-            let mut output = PosWriter::new(&mut bytes);
-            writer.write(&mut output).map_err(|e| Error::DataInvalid {
-                message: format!("Failed to serialize vindex index: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let dimension_usize = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid vindex dimension: {dimension}"),
+            source: Some(Box::new(e)),
+        })?;
+        if dimension_usize == 0 {
+            return Err(Error::DataInvalid {
+                message: "vindex vector dimension must be positive".to_string(),
+                source: None,
+            });
         }
+        let expected_bytes = checked_vector_bytes(row_count_usize, dimension_usize)?;
+        let training_vector_count =
+            checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
+        let training_buffer_rows =
+            (VECTOR_BUFFER_BYTES / checked_vector_bytes(1, dimension_usize)?).max(1);
+        let training_buffer_floats = training_buffer_rows
+            .checked_mul(dimension_usize)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex training buffer length overflows usize".to_string(),
+                source: None,
+            })?;
+
+        let mut trainer =
+            VectorIndexTrainer::new(options.config.clone()).map_err(|e| Error::DataInvalid {
+                message: format!("Failed to initialize vindex trainer: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        let raw_file = tempfile::tempfile().map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to create temporary vindex vector file: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+        let mut raw_file = tokio::fs::File::from_std(raw_file);
+        let split = data_split_for_shard(shard)?;
+        let mut read_builder = self.table.new_read_builder();
+        read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+        let read = read_builder.new_read()?;
+        let mut batches = read.to_arrow(&[split])?;
+        let mut expected_row_id = shard.row_range_start;
+        let mut rows_seen = 0usize;
+        let mut bytes_written = 0usize;
+        let mut next_training_sample = 0usize;
+        let mut training_buffer = Vec::with_capacity(training_buffer_floats);
+
+        while let Some(batch) = batches.try_next().await? {
+            let vectors =
+                validate_vector_batch(&batch, index_column, dimension_usize, &mut expected_row_id)?;
+            let batch_end =
+                rows_seen
+                    .checked_add(vectors.row_count)
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "vindex streamed row count overflows usize".to_string(),
+                        source: None,
+                    })?;
+
+            if training_vector_count == row_count_usize {
+                trainer
+                    .add_training_vectors_mut(vectors.values, vectors.row_count)
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to add vindex training vectors: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+            } else {
+                while next_training_sample < training_vector_count {
+                    let sample_row = checked_training_sample_index(
+                        next_training_sample,
+                        row_count_usize,
+                        training_vector_count,
+                    )?;
+                    if sample_row >= batch_end {
+                        break;
+                    }
+                    let start = (sample_row - rows_seen) * dimension_usize;
+                    training_buffer
+                        .extend_from_slice(&vectors.values[start..start + dimension_usize]);
+                    next_training_sample += 1;
+                    if training_buffer.len() == training_buffer_floats {
+                        trainer
+                            .add_training_vectors_mut(
+                                &training_buffer,
+                                training_buffer.len() / dimension_usize,
+                            )
+                            .map_err(|e| Error::DataInvalid {
+                                message: format!("Failed to add vindex training vectors: {e}"),
+                                source: Some(Box::new(e)),
+                            })?;
+                        training_buffer.clear();
+                    }
+                }
+            }
+
+            raw_file
+                .write_all(vectors.bytes)
+                .await
+                .map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to spill vindex vectors: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            bytes_written = bytes_written
+                .checked_add(vectors.bytes.len())
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "vindex spilled byte count overflows usize".to_string(),
+                    source: None,
+                })?;
+            rows_seen = batch_end;
+        }
+
+        if !training_buffer.is_empty() {
+            trainer
+                .add_training_vectors_mut(&training_buffer, training_buffer.len() / dimension_usize)
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("Failed to add vindex training vectors: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+        }
+        if rows_seen != row_count_usize
+            || expected_row_id
+                != shard
+                    .row_range_end
+                    .checked_add(1)
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "vindex row range end overflows i64".to_string(),
+                        source: None,
+                    })?
+            || (training_vector_count != row_count_usize
+                && next_training_sample != training_vector_count)
+            || bytes_written != expected_bytes
+        {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex streamed data mismatch: rows={rows_seen}/{row_count_usize}, training={next_training_sample}/{training_vector_count}, bytes={bytes_written}/{expected_bytes}"
+                ),
+                source: None,
+            });
+        }
+        raw_file.flush().await.map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to flush temporary vindex vector file: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+        let raw_file_len = raw_file
+            .metadata()
+            .await
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to inspect temporary vindex vector file: {e}"),
+                source: Some(Box::new(e)),
+            })?
+            .len();
+        if raw_file_len != expected_bytes as u64 {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "temporary vindex vector file size mismatch: {raw_file_len}/{expected_bytes}"
+                ),
+                source: None,
+            });
+        }
+        let raw_file = raw_file.into_std().await;
+
+        let writer = tokio::task::spawn_blocking(move || -> std::io::Result<VectorIndexWriter> {
+            let training = trainer.finish()?;
+            let mut writer = VectorIndexWriter::new(training);
+            let mut raw_file = raw_file;
+            raw_file.seek(SeekFrom::Start(0))?;
+            let batch_rows = training_buffer_rows.min(row_count_usize);
+            let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
+            let mut buffer = MutableBuffer::new(batch_bytes);
+            let mut ids = Vec::with_capacity(batch_rows);
+            let mut rows_added = 0usize;
+            while rows_added < row_count_usize {
+                let rows = batch_rows.min(row_count_usize - rows_added);
+                buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
+                raw_file.read_exact(buffer.as_slice_mut())?;
+                ids.clear();
+                for row in rows_added..rows_added + rows {
+                    ids.push(i64::try_from(row).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "vindex row id does not fit i64",
+                        )
+                    })?);
+                }
+                writer.add_vectors(&ids, buffer.typed_data::<f32>(), rows)?;
+                rows_added += rows;
+            }
+            let mut trailing = [0u8; 1];
+            if raw_file.read(&mut trailing)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "temporary vindex vector file contains trailing bytes",
+                ));
+            }
+            Ok(writer)
+        })
+        .await
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("vindex training task failed: {e}"),
+            source: None,
+        })?
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to train or add vectors to vindex index: {e}"),
+            source: Some(Box::new(e)),
+        })?;
 
         self.table
             .file_io()
@@ -245,13 +431,38 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             self.table.location().trim_end_matches('/'),
             file_name
         );
-        self.table
-            .file_io()
-            .new_output(&index_path)?
-            .write(Bytes::from(bytes))
-            .await?;
-
-        let status = self.table.file_io().get_status(&index_path).await?;
+        let write_result = async {
+            let async_writer = self
+                .table
+                .file_io()
+                .new_output(&index_path)?
+                .async_writer()
+                .await?;
+            let mut output = SyncIoBridge::new(async_writer);
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let mut writer = writer;
+                writer.write(&mut PosWriter::new(&mut output))?;
+                output.shutdown()
+            })
+            .await
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("vindex serialization task failed: {e}"),
+                source: None,
+            })?
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to stream vindex index: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            self.table.file_io().get_status(&index_path).await
+        }
+        .await;
+        let status = match write_result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = self.table.file_io().delete_file(&index_path).await;
+                return Err(error);
+            }
+        };
         Ok(IndexFileMeta {
             index_type: self.index_type.clone(),
             file_name,
@@ -546,13 +757,8 @@ fn bucket_path(
     ))
 }
 
-async fn extract_vectors(
-    table: &Table,
-    shard: &VindexIndexShard,
-    index_column: &str,
-    dimension: i32,
-) -> Result<Vec<f32>> {
-    let split = DataSplitBuilder::new()
+fn data_split_for_shard(shard: &VindexIndexShard) -> Result<DataSplit> {
+    DataSplitBuilder::new()
         .with_snapshot(shard.snapshot_id)
         .with_partition(shard.partition.clone())
         .with_bucket(shard.source_bucket)
@@ -563,162 +769,209 @@ async fn extract_vectors(
             shard.row_range_start,
             shard.row_range_end,
         )])
-        .build()?;
-
-    let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
-    let read = read_builder.new_read()?;
-    let batches = read.to_arrow(&[split])?.try_collect::<Vec<_>>().await?;
-    extract_vectors_from_batches(
-        &batches,
-        index_column,
-        dimension,
-        shard.row_range_start,
-        i64::from(checked_row_count(
-            shard.row_range_start,
-            shard.row_range_end,
-        )?),
-    )
+        .build()
 }
 
-fn extract_vectors_from_batches(
-    batches: &[RecordBatch],
+struct ValidatedVectorBatch<'a> {
+    values: &'a [f32],
+    bytes: &'a [u8],
+    row_count: usize,
+}
+
+fn validate_vector_batch<'a>(
+    batch: &'a RecordBatch,
     index_column: &str,
-    dimension: i32,
-    row_range_start: i64,
-    expected_row_count: i64,
-) -> Result<Vec<f32>> {
-    let dimension = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
-        message: format!("Invalid vindex dimension: {dimension}"),
-        source: Some(Box::new(e)),
-    })?;
-    let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let mut vectors = Vec::with_capacity(row_count * dimension);
-    let mut expected_row_id = row_range_start;
-    for batch in batches {
-        let vector_index =
-            batch
-                .schema()
-                .index_of(index_column)
-                .map_err(|e| Error::DataInvalid {
-                    message: format!("Vector column '{index_column}' not found in read batch: {e}"),
-                    source: None,
-                })?;
-        let row_id_index =
-            batch
-                .schema()
-                .index_of(ROW_ID_FIELD_NAME)
-                .map_err(|e| Error::DataInvalid {
-                    message: format!("_ROW_ID column not found in read batch: {e}"),
-                    source: None,
-                })?;
-        let column = batch.column(vector_index);
-        enum VectorLayout<'a> {
-            List(&'a ListArray),
-            Fixed(&'a FixedSizeListArray),
-        }
-        let layout = if let Some(a) = column.as_any().downcast_ref::<ListArray>() {
-            VectorLayout::List(a)
-        } else if let Some(a) = column.as_any().downcast_ref::<FixedSizeListArray>() {
-            VectorLayout::Fixed(a)
-        } else {
+    dimension: usize,
+    expected_row_id: &mut i64,
+) -> Result<ValidatedVectorBatch<'a>> {
+    let vector_index = batch
+        .schema()
+        .index_of(index_column)
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Vector column '{index_column}' not found in read batch: {e}"),
+            source: None,
+        })?;
+    let row_id_index =
+        batch
+            .schema()
+            .index_of(ROW_ID_FIELD_NAME)
+            .map_err(|e| Error::DataInvalid {
+                message: format!("_ROW_ID column not found in read batch: {e}"),
+                source: None,
+            })?;
+    let column = batch.column(vector_index);
+    let (values, start, end) = if let Some(array) = column.as_any().downcast_ref::<ListArray>() {
+        if array.null_count() != 0 {
             return Err(Error::DataInvalid {
-                message:
-                    "vindex vector extraction requires Arrow List<Float32> or FixedSizeList<Float32>"
-                        .to_string(),
+                message: "vindex vector extraction found null vector row".to_string(),
                 source: None,
             });
-        };
-        let values = match layout {
-            VectorLayout::List(a) => a.values(),
-            VectorLayout::Fixed(a) => a.values(),
         }
+        let offsets = array.value_offsets();
+        for offsets in offsets.windows(2) {
+            let actual = offsets[1] - offsets[0];
+            if actual != dimension as i32 {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "vindex vector dimension mismatch: expected {dimension}, got {actual}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        let start = usize::try_from(offsets[0]).map_err(|e| Error::DataInvalid {
+            message: "vindex vector offset is negative".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+        let end = usize::try_from(offsets[offsets.len() - 1]).map_err(|e| Error::DataInvalid {
+            message: "vindex vector offset is negative".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+        (array.values(), start, end)
+    } else if let Some(array) = column.as_any().downcast_ref::<FixedSizeListArray>() {
+        let actual = usize::try_from(array.value_length()).map_err(|e| Error::DataInvalid {
+            message: format!(
+                "Invalid vindex FixedSizeList dimension: {}",
+                array.value_length()
+            ),
+            source: Some(Box::new(e)),
+        })?;
+        if actual != dimension {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector dimension mismatch: expected {dimension}, got {actual}"
+                ),
+                source: None,
+            });
+        }
+        if array.null_count() != 0 {
+            return Err(Error::DataInvalid {
+                message: "vindex vector extraction found null vector row".to_string(),
+                source: None,
+            });
+        }
+        let end = batch
+            .num_rows()
+            .checked_mul(dimension)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex batch vector length overflows usize".to_string(),
+                source: None,
+            })?;
+        (array.values(), 0, end)
+    } else {
+        return Err(Error::DataInvalid {
+            message:
+                "vindex vector extraction requires Arrow List<Float32> or FixedSizeList<Float32>"
+                    .to_string(),
+            source: None,
+        });
+    };
+    let values = values
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| Error::DataInvalid {
             message: "vindex vector extraction requires Float32 vector elements".to_string(),
             source: None,
         })?;
-        let row_ids = batch
-            .column(row_id_index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
+    if values.null_count() != 0
+        && values
+            .nulls()
+            .is_some_and(|nulls| nulls.slice(start, end - start).null_count() != 0)
+    {
+        return Err(Error::DataInvalid {
+            message: "vindex vector extraction found null vector element".to_string(),
+            source: None,
+        });
+    }
+    let row_ids = batch
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: "vindex vector extraction requires non-null Int64 _ROW_ID".to_string(),
+            source: None,
+        })?;
+    if row_ids.null_count() != 0 {
+        return Err(Error::DataInvalid {
+            message: "vindex vector extraction found null _ROW_ID".to_string(),
+            source: None,
+        });
+    }
+    for row_id in row_ids.values() {
+        if *row_id != *expected_row_id {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector extraction expected _ROW_ID {}, got {}",
+                    expected_row_id, row_id
+                ),
+                source: None,
+            });
+        }
+        *expected_row_id = expected_row_id
+            .checked_add(1)
             .ok_or_else(|| Error::DataInvalid {
-                message: "vindex vector extraction requires non-null Int64 _ROW_ID".to_string(),
+                message: "vindex expected row id overflows i64".to_string(),
                 source: None,
             })?;
-
-        for row in 0..batch.num_rows() {
-            if row_ids.is_null(row) {
-                return Err(Error::DataInvalid {
-                    message: "vindex vector extraction found null _ROW_ID".to_string(),
-                    source: None,
-                });
-            }
-            let row_id = row_ids.value(row);
-            if row_id != expected_row_id {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "vindex vector extraction expected _ROW_ID {}, got {}",
-                        expected_row_id, row_id
-                    ),
-                    source: None,
-                });
-            }
-            expected_row_id += 1;
-
-            let is_null = match layout {
-                VectorLayout::List(a) => a.is_null(row),
-                VectorLayout::Fixed(a) => a.is_null(row),
-            };
-            if is_null {
-                return Err(Error::DataInvalid {
-                    message: "vindex vector extraction found null vector row".to_string(),
-                    source: None,
-                });
-            }
-            let (start, end) = match layout {
-                VectorLayout::List(a) => {
-                    let offsets = a.value_offsets();
-                    (offsets[row] as usize, offsets[row + 1] as usize)
-                }
-                VectorLayout::Fixed(a) => {
-                    let len = a.value_length() as usize;
-                    (row * len, (row + 1) * len)
-                }
-            };
-            if end - start != dimension {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "vindex vector dimension mismatch: expected {}, got {}",
-                        dimension,
-                        end - start
-                    ),
-                    source: None,
-                });
-            }
-            for value_index in start..end {
-                if values.is_null(value_index) {
-                    return Err(Error::DataInvalid {
-                        message: "vindex vector extraction found null vector element".to_string(),
-                        source: None,
-                    });
-                }
-                vectors.push(values.value(value_index));
-            }
-        }
     }
-    let actual_row_count = expected_row_id - row_range_start;
-    if actual_row_count != expected_row_count {
+
+    let byte_start = checked_vector_bytes(start, 1)?;
+    let byte_end = checked_vector_bytes(end, 1)?;
+    Ok(ValidatedVectorBatch {
+        values: &values.values()[start..end],
+        bytes: &values.values().inner().as_slice()[byte_start..byte_end],
+        row_count: batch.num_rows(),
+    })
+}
+
+fn checked_vector_bytes(row_count: usize, dimension: usize) -> Result<usize> {
+    row_count
+        .checked_mul(dimension)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "vindex vector byte length overflows: row_count={row_count}, dimension={dimension}"
+            ),
+            source: None,
+        })
+}
+
+fn checked_std_vector_bytes(row_count: usize, dimension: usize) -> std::io::Result<usize> {
+    row_count
+        .checked_mul(dimension)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vindex vector byte length overflows usize",
+            )
+        })
+}
+
+fn checked_training_vector_count(row_count: usize, ratio: f64) -> Result<usize> {
+    if row_count == 0 || !(ratio > 0.0 && ratio <= 1.0) {
         return Err(Error::DataInvalid {
             message: format!(
-                "vindex vector extraction expected {} rows, got {}",
-                expected_row_count, actual_row_count
+                "Invalid vindex training sample: row_count={row_count}, ratio={ratio}; expected a positive row count and ratio in (0, 1]"
             ),
             source: None,
         });
     }
-    Ok(vectors)
+    Ok(((row_count as f64 * ratio).ceil() as usize).clamp(1, row_count))
+}
+
+fn checked_training_sample_index(sample: usize, rows: usize, samples: usize) -> Result<usize> {
+    sample
+        .checked_mul(rows / samples)
+        .and_then(|base| {
+            sample
+                .checked_mul(rows % samples)
+                .and_then(|remainder| base.checked_add(remainder / samples))
+        })
+        .ok_or_else(|| Error::DataInvalid {
+            message: "vindex training sample index overflows usize".to_string(),
+            source: None,
+        })
 }
 
 fn checked_i32(value: u64, context: &str) -> Result<i32> {
@@ -742,49 +995,16 @@ fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
             source: None,
         });
     }
-    i32::try_from(row_range_end - row_range_start + 1).map_err(|_| Error::DataInvalid {
-        message: format!(
-            "vindex row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
-        ),
-        source: None,
-    })
-}
-
-fn validate_vector_buffer(vectors: &[f32], row_count: i32, dimension: i32) -> Result<()> {
-    if row_count <= 0 {
-        return Err(Error::DataInvalid {
-            message: format!("vindex shard row count must be positive, got: {row_count}"),
-            source: None,
-        });
-    }
-    if dimension <= 0 {
-        return Err(Error::DataInvalid {
-            message: format!("vindex vector dimension must be positive, got: {dimension}"),
-            source: None,
-        });
-    }
-    let row_count = row_count as usize;
-    let dimension = dimension as usize;
-    let expected_len = row_count
-        .checked_mul(dimension)
+    row_range_end
+        .checked_sub(row_range_start)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| i32::try_from(count).ok())
         .ok_or_else(|| Error::DataInvalid {
             message: format!(
-                "vindex vector buffer length overflows: row_count={row_count}, dimension={dimension}"
+                "vindex row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
             ),
             source: None,
-        })?;
-    if vectors.len() != expected_len {
-        return Err(Error::DataInvalid {
-            message: format!(
-                "vindex vector buffer length {} does not match row_count={} and dimension={}",
-                vectors.len(),
-                row_count,
-                dimension
-            ),
-            source: None,
-        });
-    }
-    Ok(())
+        })
 }
 
 #[cfg(test)]
@@ -798,7 +1018,7 @@ mod tests {
     };
     use crate::table::TableWrite;
     use crate::vindex::IVF_FLAT_IDENTIFIER;
-    use arrow_array::builder::{Float32Builder, Int64Builder, ListBuilder};
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, Int64Builder, ListBuilder};
     use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};
@@ -968,6 +1188,36 @@ mod tests {
         .unwrap()
     }
 
+    fn extract_vectors_from_batches(
+        batches: &[RecordBatch],
+        index_column: &str,
+        dimension: i32,
+        row_range_start: i64,
+        expected_row_count: i64,
+    ) -> Result<Vec<f32>> {
+        let dimension = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid vindex dimension: {dimension}"),
+            source: Some(Box::new(e)),
+        })?;
+        let mut expected_row_id = row_range_start;
+        let mut vectors = Vec::new();
+        for batch in batches {
+            vectors.extend_from_slice(
+                validate_vector_batch(batch, index_column, dimension, &mut expected_row_id)?.values,
+            );
+        }
+        if expected_row_id - row_range_start != expected_row_count {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector extraction expected {expected_row_count} rows, got {}",
+                    expected_row_id - row_range_start
+                ),
+                source: None,
+            });
+        }
+        Ok(vectors)
+    }
+
     #[test]
     fn test_extract_vectors_accepts_list_float32_and_row_ids() {
         let batch = vector_batch(
@@ -993,6 +1243,72 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("dimension mismatch"))
         );
+    }
+
+    #[test]
+    fn test_extract_vectors_handles_sliced_list_offsets() {
+        let batch = vector_batch(
+            vec![
+                Some(vec![None, Some(0.0)]),
+                Some(vec![Some(1.0), Some(2.0)]),
+                Some(vec![Some(3.0), Some(4.0)]),
+            ],
+            vec![Some(9), Some(10), Some(11)],
+        )
+        .slice(1, 2);
+
+        let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
+
+        assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_extract_vectors_handles_sliced_fixed_size_list() {
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for row in [[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]] {
+            vectors.values().append_slice(&row);
+            vectors.append(true);
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", ArrowDataType::Float32, true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(vectors.finish()) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9, 10, 11])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+        .slice(1, 2);
+
+        let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
+
+        assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_training_sample_count_and_indexes_match_java() {
+        assert_eq!(checked_training_vector_count(10, 0.01).unwrap(), 1);
+        assert_eq!(checked_training_vector_count(10, 0.25).unwrap(), 3);
+        assert_eq!(checked_training_vector_count(10, 1.0).unwrap(), 10);
+        assert_eq!(checked_training_vector_count(3, 0.9).unwrap(), 3);
+        assert_eq!(
+            (0..4)
+                .map(|sample| checked_training_sample_index(sample, 10, 4).unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 5, 7]
+        );
+        assert!(checked_vector_bytes(usize::MAX, 2).is_err());
+        assert!(checked_training_sample_index(usize::MAX, usize::MAX, 1).is_err());
     }
 
     fn test_table_with_io(file_io: FileIO, table_path: &str, schema: Schema) -> Table {
@@ -1177,12 +1493,8 @@ mod tests {
         let table = vindex_e2e_table(table_path, "10");
         setup_dirs(table.file_io(), table_path).await;
 
-        write_vectors(
-            &table,
-            vec![1, 2, 3],
-            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
-        )
-        .await;
+        write_vectors(&table, vec![1, 2], vec![vec![1.0, 0.0], vec![0.0, 1.0]]).await;
+        write_vectors(&table, vec![3], vec![vec![1.0, 1.0]]).await;
 
         // Fully index the coverage via a synthetic manifest entry.
         let coverage = data_row_id_coverage(&table).await;
@@ -1240,6 +1552,10 @@ mod tests {
         let first_built = table
             .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
             .with_index_column("embedding")
+            .with_options(HashMap::from([(
+                "ivf-flat.train.sample-ratio".to_string(),
+                "0.9".to_string(),
+            )]))
             .execute()
             .await
             .unwrap();
@@ -1255,7 +1571,7 @@ mod tests {
             .iter()
             .map(|f| f.file_name.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(!first_names.is_empty(), "build #1 must write index files");
+        assert_eq!(first_names.len(), 1, "one shard must write one index file");
 
         // Append a second batch (new row-ids [n..]).
         write_vectors(
@@ -1305,6 +1621,34 @@ mod tests {
                 meta.row_range_end
             );
         }
+    }
+
+    #[tokio::test]
+    async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
+        let table_path = "memory:/test_vindex_abort_written_shard";
+        let table = vindex_e2e_table(table_path, "2");
+        setup_dirs(table.file_io(), table_path).await;
+        write_vectors(
+            &table,
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0]],
+        )
+        .await;
+
+        let error = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .expect_err("the second shard has an invalid vector dimension");
+
+        assert!(error.to_string().contains("dimension mismatch"));
+        assert!(table
+            .file_io()
+            .list_status(&format!("{table_path}/{INDEX_DIR}/"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// A field that already carries a DIFFERENT index type (`lumina`) over an

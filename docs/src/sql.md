@@ -1024,6 +1024,7 @@ Supported vindex options:
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | `256` | all vindex types | Number of IVF lists. |
+| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
 
@@ -1982,6 +1983,14 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
 | `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
 
+For deletion-vector-enabled primary-key tables using the default `deduplicate`
+engine, batch scans hide uncompacted level-0 files by default. Set
+`'deletion-vectors.merge-on-read' = 'true'` to include those files and merge
+their key versions on read. Existing deletion vectors are applied before the
+key merge. This option affects batch snapshot reads only; it does not change
+streaming or changelog behavior. It takes effect only when
+`'deletion-vectors.enabled' = 'true'`; otherwise it is ignored.
+
 Rust supports the basic partial-update engine with latest-non-null semantics.
 Set either `'ignore-delete' = 'true'` or
 `'partial-update.ignore-delete' = 'true'` to ignore `DELETE` and
@@ -2086,6 +2095,7 @@ the normal physical format without wrapping the writer.
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
+| `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
 
 Cross-partition updates are not configured by an option: a primary-key table is
