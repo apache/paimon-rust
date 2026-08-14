@@ -48,6 +48,8 @@ struct VindexBatchStats {
     batch_index_parallelism: usize,
 }
 
+type VindexBatchSearchResult = (Vec<Option<HashMap<u64, f32>>>, Option<VindexBatchStats>);
+
 trait ErasedSeekRead: Send {
     fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
 
@@ -433,7 +435,7 @@ fn search_batch_vindex(
     vector_searches: &[VectorSearch],
     shard_concurrency: usize,
     timing_enabled: bool,
-) -> crate::Result<(Vec<Option<HashMap<u64, f32>>>, Option<VindexBatchStats>)> {
+) -> crate::Result<VindexBatchSearchResult> {
     let mut results: Vec<Option<HashMap<u64, f32>>> =
         (0..vector_searches.len()).map(|_| None).collect();
     let mut groups: Vec<(PreparedSearch, Vec<usize>)> = Vec::new();
