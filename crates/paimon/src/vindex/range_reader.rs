@@ -16,11 +16,13 @@
 // under the License.
 
 use crate::io::FileRead;
+use crate::vindex::vector_search_timing_enabled;
 use bytes::Bytes;
 use futures::future::try_join_all;
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::io;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 const SCALAR_READ_MAX: usize = 64;
@@ -54,6 +56,36 @@ struct MergedRange {
     requested_bytes: u64,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct RangeIoStats {
+    logical_ranges: AtomicU64,
+    requested_bytes: AtomicU64,
+    file_read_calls: AtomicU64,
+    returned_bytes: AtomicU64,
+    read_ahead_hits: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RangeIoStatsSnapshot {
+    pub(crate) logical_ranges: u64,
+    pub(crate) requested_bytes: u64,
+    pub(crate) file_read_calls: u64,
+    pub(crate) returned_bytes: u64,
+    pub(crate) read_ahead_hits: u64,
+}
+
+impl RangeIoStats {
+    pub(crate) fn snapshot(&self) -> RangeIoStatsSnapshot {
+        RangeIoStatsSnapshot {
+            logical_ranges: self.logical_ranges.load(Ordering::Relaxed),
+            requested_bytes: self.requested_bytes.load(Ordering::Relaxed),
+            file_read_calls: self.file_read_calls.load(Ordering::Relaxed),
+            returned_bytes: self.returned_bytes.load(Ordering::Relaxed),
+            read_ahead_hits: self.read_ahead_hits.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Bridges vindex-core's synchronous positional reads to Paimon's asynchronous
 /// range reader. This type is consumed from a blocking search task; it captures
 /// the surrounding Tokio runtime so remote storage reads still run asynchronously.
@@ -64,6 +96,7 @@ pub(crate) struct VindexFileReader {
     file_size: u64,
     path: String,
     scalar_cache: Option<CachedRange>,
+    stats: Option<Arc<RangeIoStats>>,
 }
 
 impl VindexFileReader {
@@ -97,7 +130,12 @@ impl VindexFileReader {
             file_size,
             path,
             scalar_cache: None,
+            stats: vector_search_timing_enabled().then(|| Arc::new(RangeIoStats::default())),
         }
+    }
+
+    pub(crate) fn range_io_stats(&self) -> Option<Arc<RangeIoStats>> {
+        self.stats.clone()
     }
 
     fn validate_range(&self, pos: u64, len: usize) -> io::Result<Range<u64>> {
@@ -127,6 +165,9 @@ impl VindexFileReader {
         if buf.len() <= SCALAR_READ_MAX {
             if let Some(cache) = &self.scalar_cache {
                 if cache.contains(&range) {
+                    if let Some(stats) = &self.stats {
+                        stats.read_ahead_hits.fetch_add(1, Ordering::Relaxed);
+                    }
                     let start = (range.start - cache.start) as usize;
                     buf.copy_from_slice(&cache.data[start..start + buf.len()]);
                     return Ok(());
@@ -163,17 +204,22 @@ impl VindexFileReader {
         let permits = Arc::clone(&self.permits);
         let path = self.path.clone();
         let requested = ranges.to_vec();
+        let stats = self.stats.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         self.runtime.spawn(async move {
             let fetched = try_join_all(requested.iter().cloned().map(|range| {
                 let reader = Arc::clone(&reader);
                 let permits = Arc::clone(&permits);
                 let path = path.clone();
+                let stats = stats.clone();
                 async move {
                     let _permit = permits.acquire_owned().await.map_err(|_| {
                         io::Error::other("vindex range read concurrency limiter closed")
                     })?;
                     let expected = (range.end - range.start) as usize;
+                    if let Some(stats) = &stats {
+                        stats.file_read_calls.fetch_add(1, Ordering::Relaxed);
+                    }
                     let data = reader.read(range.clone()).await.map_err(|error| {
                         io::Error::other(format!(
                             "failed to read vindex file '{path}' range {}..{}: {error}",
@@ -190,6 +236,11 @@ impl VindexFileReader {
                                 data.len()
                             ),
                         ));
+                    }
+                    if let Some(stats) = &stats {
+                        stats
+                            .returned_bytes
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
                     }
                     Ok(data)
                 }
@@ -266,6 +317,20 @@ impl VindexFileReader {
 
 impl SeekRead for VindexFileReader {
     fn pread(&mut self, requests: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        if let Some(stats) = &self.stats {
+            let (logical_ranges, requested_bytes) = requests
+                .iter()
+                .filter(|request| !request.buf.is_empty())
+                .fold((0u64, 0u64), |(ranges, bytes), request| {
+                    (ranges + 1, bytes.saturating_add(request.buf.len() as u64))
+                });
+            stats
+                .logical_ranges
+                .fetch_add(logical_ranges, Ordering::Relaxed);
+            stats
+                .requested_bytes
+                .fetch_add(requested_bytes, Ordering::Relaxed);
+        }
         let non_empty = requests
             .iter()
             .filter(|request| !request.buf.is_empty())
@@ -289,6 +354,7 @@ impl SeekRead for VindexFileReader {
             file_size: self.file_size,
             path: self.path.clone(),
             scalar_cache: None,
+            stats: self.stats.clone(),
         }))
     }
 
@@ -590,6 +656,85 @@ mod tests {
         assert_eq!(reader.read_capabilities(), SeekReadCapabilities::default());
         let cloned = reader.try_clone_reader().unwrap().unwrap();
         assert_eq!(cloned.read_capabilities(), SeekReadCapabilities::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn range_io_stats_are_shared_across_clones() {
+        let data = Bytes::from(vec![7u8; 1024]);
+        let source: Arc<dyn FileRead> = TrackingRead::new(data.clone());
+        let mut reader = VindexFileReader::new(
+            source,
+            tokio::runtime::Handle::current(),
+            data.len() as u64,
+            "index".to_string(),
+        );
+        let stats = Arc::new(RangeIoStats::default());
+        reader.stats = Some(Arc::clone(&stats));
+        let mut cloned = reader.try_clone_reader().unwrap().unwrap();
+
+        tokio::task::spawn_blocking(move || {
+            let mut first = [0u8; 128];
+            reader
+                .pread(&mut [ReadRequest::new(0, &mut first)])
+                .unwrap();
+            let mut second = [0u8; 128];
+            cloned
+                .pread(&mut [ReadRequest::new(128, &mut second)])
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stats.snapshot(),
+            RangeIoStatsSnapshot {
+                logical_ranges: 2,
+                requested_bytes: 256,
+                file_read_calls: 2,
+                returned_bytes: 256,
+                read_ahead_hits: 0,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn range_io_stats_count_coalesced_reads() {
+        let data = Bytes::from(vec![7u8; 100_000]);
+        let source: Arc<dyn FileRead> = TrackingRead::new(data.clone());
+        let mut reader = VindexFileReader::new(
+            source,
+            tokio::runtime::Handle::current(),
+            data.len() as u64,
+            "index".to_string(),
+        );
+        let stats = Arc::new(RangeIoStats::default());
+        reader.stats = Some(Arc::clone(&stats));
+
+        tokio::task::spawn_blocking(move || {
+            let mut first = [0u8; 4];
+            let mut second = [0u8; 4];
+            let mut third = [0u8; 4];
+            reader
+                .pread(&mut [
+                    ReadRequest::new(0, &mut first),
+                    ReadRequest::new(8, &mut second),
+                    ReadRequest::new(20_000, &mut third),
+                ])
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stats.snapshot(),
+            RangeIoStatsSnapshot {
+                logical_ranges: 3,
+                requested_bytes: 12,
+                file_read_calls: 2,
+                returned_bytes: 16,
+                read_ahead_hits: 0,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

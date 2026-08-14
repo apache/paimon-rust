@@ -24,6 +24,7 @@ pub mod pkvector;
 use crate::spec::{DataField, DataType};
 use paimon_vindex_core::index::VectorIndexConfig;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const IVF_FLAT_IDENTIFIER: &str = "ivf-flat";
 pub const IVF_PQ_IDENTIFIER: &str = "ivf-pq";
@@ -33,6 +34,12 @@ const DEFAULT_METRIC: &str = "inner_product";
 const DEFAULT_NLIST: &str = "256";
 const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
+const VECTOR_SEARCH_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_SEARCH_TIMING";
+
+pub(crate) fn vector_search_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(VECTOR_SEARCH_TIMING_ENV).is_some_and(|v| v == "1"))
+}
 
 pub fn is_vindex_index_type(index_type: &str) -> bool {
     matches!(index_type, IVF_FLAT_IDENTIFIER | IVF_PQ_IDENTIFIER)

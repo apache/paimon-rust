@@ -3291,11 +3291,20 @@ mod tests {
     /// pages. `id` runs 0..total_rows so page `p` covers ids
     /// `[p*page_row_limit, (p+1)*page_row_limit)`.
     async fn write_multi_page_parquet(page_row_limit: usize, total_rows: i32) -> Vec<u8> {
+        write_multi_page_parquet_with_offset_index(page_row_limit, total_rows, true).await
+    }
+
+    async fn write_multi_page_parquet_with_offset_index(
+        page_row_limit: usize,
+        total_rows: i32,
+        write_offset_index: bool,
+    ) -> Vec<u8> {
         let schema = writer_arrow_schema();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_data_page_row_count_limit(page_row_limit)
             .set_write_batch_size(page_row_limit)
             .set_max_row_group_row_count(Some(total_rows as usize))
+            .set_offset_index_disabled(!write_offset_index)
             .build();
         let mut buf: Vec<u8> = Vec::new();
         {
@@ -3333,6 +3342,10 @@ mod tests {
                 .iter()
                 .map(|range| range.end - range.start)
                 .sum()
+        }
+
+        fn read_calls(&self) -> usize {
+            self.ranges.lock().unwrap().len()
         }
 
         fn reset(&self) {
@@ -3429,6 +3442,92 @@ mod tests {
             selected_bytes * 2 < all_bytes,
             "selected read used {selected_bytes} bytes; full read used {all_bytes} bytes"
         );
+    }
+
+    async fn read_row_ranges(data: Bytes, row_ranges: Vec<RowRange>) -> (usize, usize, u64) {
+        let file_size = data.len() as u64;
+        let file_read = TrackingFileRead::new(data);
+        let tracker = file_read.clone();
+        let fields = vec![int_field("id"), int_field("value")];
+        let stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(file_read),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                Some(row_ranges),
+            )
+            .await
+            .unwrap();
+        tracker.reset();
+        let rows = stream
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        (rows, tracker.read_calls(), tracker.bytes_read())
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled refine I/O diagnostic"]
+    async fn refine_io_amplification_clustered() {
+        let data = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let requested_payload_bytes = 4 * std::mem::size_of::<i32>();
+        let (rows, read_calls, actual_bytes) =
+            read_row_ranges(data, vec![RowRange::new(30, 33)]).await;
+
+        eprintln!(
+            "event=refine_io_amplification scenario=clustered rows={} read_calls={} actual_bytes={} requested_payload_bytes={}",
+            rows, read_calls, actual_bytes, requested_payload_bytes
+        );
+        assert_eq!(rows, 4);
+        assert!(actual_bytes >= requested_payload_bytes as u64);
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled refine I/O diagnostic"]
+    async fn refine_io_amplification_scattered() {
+        let data = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let (_, clustered_calls, clustered_bytes) =
+            read_row_ranges(data.clone(), vec![RowRange::new(30, 33)]).await;
+        let ranges = vec![
+            RowRange::new(1, 1),
+            RowRange::new(21, 21),
+            RowRange::new(41, 41),
+            RowRange::new(61, 61),
+        ];
+        let requested_payload_bytes = ranges.len() * std::mem::size_of::<i32>();
+        let (rows, read_calls, actual_bytes) = read_row_ranges(data, ranges).await;
+
+        eprintln!(
+            "event=refine_io_amplification scenario=scattered rows={} read_calls={} actual_bytes={} requested_payload_bytes={}",
+            rows, read_calls, actual_bytes, requested_payload_bytes
+        );
+        assert_eq!(rows, 4);
+        assert!(read_calls >= clustered_calls);
+        assert!(actual_bytes >= clustered_bytes);
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled refine I/O diagnostic"]
+    async fn refine_io_amplification_without_offset_index() {
+        let data = Bytes::from(write_multi_page_parquet_with_offset_index(10, 80, false).await);
+        assert!(load_metadata_with_page_index(&data, true)
+            .offset_index()
+            .is_none());
+        let requested_payload_bytes = std::mem::size_of::<i32>();
+        let (rows, read_calls, actual_bytes) =
+            read_row_ranges(data, vec![RowRange::new(35, 35)]).await;
+
+        eprintln!(
+            "event=refine_io_amplification scenario=without_offset_index rows={} read_calls={} actual_bytes={} requested_payload_bytes={}",
+            rows, read_calls, actual_bytes, requested_payload_bytes
+        );
+        assert_eq!(rows, 1);
+        assert!(actual_bytes > requested_payload_bytes as u64);
     }
 
     /// Parse metadata from in-memory parquet bytes, optionally loading the page

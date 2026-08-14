@@ -60,7 +60,7 @@ use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::range_reader::VindexFileReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
-use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
+use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled, VindexVectorIndexOptions};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use futures::{stream, TryStreamExt};
@@ -72,6 +72,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const INDEX_DIR: &str = "index";
 
@@ -1152,6 +1153,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     }
 
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        let timing_enabled = vector_search_timing_enabled();
+        let total_start = timing_enabled.then(Instant::now);
         // Fail closed: like `execute_read` and the single-query builder, this
         // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
         // so it must refuse a `query-auth.enabled` table before any fast path
@@ -1227,12 +1230,32 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             .collect::<crate::Result<Vec<_>>>()?;
 
         let snapshot_manager = self.table.snapshot_manager();
+        let setup = total_start.map_or(Duration::ZERO, |start| start.elapsed());
 
+        let snapshot_start = timing_enabled.then(Instant::now);
         let snapshot = match crate::table::time_travel::resolve_snapshot(self.table).await? {
             Some(s) => s,
-            None => return Ok(vec![SearchResult::empty(); vector_searches.len()]),
+            None => {
+                let snapshot = snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
+                let results = vec![SearchResult::empty(); vector_searches.len()];
+                if let Some(total_start) = total_start {
+                    let total = total_start.elapsed();
+                    let unattributed = total.saturating_sub(setup.saturating_add(snapshot));
+                    eprintln!(
+                        "event=paimon_vector_search_api nq={} index_entries=0 result_count=0 total_ms={:.3} setup_ms={:.3} snapshot_ms={:.3} manifest_ms=0.000 evaluate_ms=0.000 unattributed_ms={:.3}",
+                        vector_searches.len(),
+                        total.as_secs_f64() * 1000.0,
+                        setup.as_secs_f64() * 1000.0,
+                        snapshot.as_secs_f64() * 1000.0,
+                        unattributed.as_secs_f64() * 1000.0,
+                    );
+                }
+                return Ok(results);
+            }
         };
+        let snapshot_elapsed = snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
 
+        let manifest_start = timing_enabled.then(Instant::now);
         let index_entries = match snapshot.index_manifest() {
             Some(index_manifest_name) => {
                 let manifest_path = snapshot_manager.manifest_path(index_manifest_name);
@@ -1240,8 +1263,10 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             }
             None => Vec::new(),
         };
+        let manifest = manifest_start.map_or(Duration::ZERO, |start| start.elapsed());
 
-        evaluate_batch_vector_search(
+        let evaluate_start = timing_enabled.then(Instant::now);
+        let results = evaluate_batch_vector_search(
             VectorSearchEvaluation {
                 table: Some(self.table),
                 file_io: self.table.file_io(),
@@ -1253,7 +1278,32 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             &index_entries,
             &vector_searches,
         )
-        .await
+        .await?;
+        if let (Some(total_start), Some(evaluate_start)) = (total_start, evaluate_start) {
+            let total = total_start.elapsed();
+            let evaluate = evaluate_start.elapsed();
+            let children = setup
+                .saturating_add(snapshot_elapsed)
+                .saturating_add(manifest)
+                .saturating_add(evaluate);
+            let result_count = results
+                .iter()
+                .map(|result| result.row_ids.len())
+                .sum::<usize>();
+            eprintln!(
+                "event=paimon_vector_search_api nq={} index_entries={} result_count={} total_ms={:.3} setup_ms={:.3} snapshot_ms={:.3} manifest_ms={:.3} evaluate_ms={:.3} unattributed_ms={:.3}",
+                vector_searches.len(),
+                index_entries.len(),
+                result_count,
+                total.as_secs_f64() * 1000.0,
+                setup.as_secs_f64() * 1000.0,
+                snapshot_elapsed.as_secs_f64() * 1000.0,
+                manifest.as_secs_f64() * 1000.0,
+                evaluate.as_secs_f64() * 1000.0,
+                total.saturating_sub(children).as_secs_f64() * 1000.0,
+            );
+        }
+        Ok(results)
     }
 
     /// Run a batch of vector searches and materialize each query's matching rows as
@@ -1408,6 +1458,12 @@ struct VectorSearchEvaluation<'a> {
     next_row_id: Option<i64>,
 }
 
+#[derive(Default)]
+struct IndexSearchTiming {
+    permit_wait: Duration,
+    file_reader_open: Duration,
+}
+
 #[cfg(test)]
 async fn evaluate_vector_search(
     evaluation: VectorSearchEvaluation<'_>,
@@ -1429,6 +1485,8 @@ async fn evaluate_batch_vector_search(
     index_entries: &[IndexManifestEntry],
     vector_searches: &[VectorSearch],
 ) -> crate::Result<Vec<SearchResult>> {
+    let timing_enabled = vector_search_timing_enabled();
+    let total_start = timing_enabled.then(Instant::now);
     if vector_searches.is_empty() {
         return Ok(Vec::new());
     }
@@ -1480,6 +1538,7 @@ async fn evaluate_batch_vector_search(
         return Ok(vec![SearchResult::empty(); vector_searches.len()]);
     }
 
+    let deletion_vector_start = timing_enabled.then(Instant::now);
     let deleted_row_index = if core_options.data_evolution_enabled() {
         match evaluation.table {
             Some(table) => {
@@ -1492,6 +1551,7 @@ async fn evaluate_batch_vector_search(
     } else {
         None
     };
+    let deletion_vector = deletion_vector_start.map_or(Duration::ZERO, |start| start.elapsed());
 
     let max_limit = vector_searches
         .iter()
@@ -1509,8 +1569,16 @@ async fn evaluate_batch_vector_search(
     };
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
+    let vector_entry_count = vector_entries.len();
+    let mut permit_wait = Duration::ZERO;
+    let mut file_reader_open = Duration::ZERO;
+    let mut index_search = Duration::ZERO;
+    let mut merge = Duration::ZERO;
+    let mut refine = Duration::ZERO;
+    let mut raw_fallback = Duration::ZERO;
     let mut merged = vec![SearchResult::empty(); vector_searches.len()];
     if !vector_entries.is_empty() {
+        let index_search_start = timing_enabled.then(Instant::now);
         let concurrency = core_options.global_index_thread_num()?;
         if concurrency > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(crate::Error::DataInvalid {
@@ -1551,9 +1619,13 @@ async fn evaluate_batch_vector_search(
                 options.extend(search_options.clone());
                 let input = evaluation.file_io.new_input(&path);
                 async move {
+                    let permit_start = timing_enabled.then(Instant::now);
                     let permit = acquire_process_global_search_permit(concurrency).await?;
+                    let permit_wait =
+                        permit_start.map_or(Duration::ZERO, |start| start.elapsed());
                     let input = input?;
                     let query_count = vector_searches.len();
+                    let mut file_reader_open = Duration::ZERO;
                     let io_meta =
                         GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
                     let results = match backend {
@@ -1585,6 +1657,8 @@ async fn evaluate_batch_vector_search(
                         VectorIndexBackend::Vindex => {
                             match tokio::runtime::Handle::try_current() {
                                 Ok(runtime) => {
+                                    let file_reader_open_start =
+                                        timing_enabled.then(Instant::now);
                                     let file_reader = input.reader().await.map_err(|e| {
                                         crate::Error::DataInvalid {
                                             message: format!(
@@ -1594,6 +1668,8 @@ async fn evaluate_batch_vector_search(
                                             source: None,
                                         }
                                     })?;
+                                    file_reader_open = file_reader_open_start
+                                        .map_or(Duration::ZERO, |start| start.elapsed());
                                     let source = VindexFileReader::new_with_permits(
                                         Arc::new(file_reader),
                                         runtime,
@@ -1601,16 +1677,31 @@ async fn evaluate_batch_vector_search(
                                         file_size,
                                         file_name.clone(),
                                     );
-                                    execute_vindex_searches(
+                                    let range_io_stats = source.range_io_stats();
+                                    let results = execute_vindex_searches(
                                         io_meta,
                                         options,
                                         vector_searches,
                                         source,
-                                        file_name,
+                                        file_name.clone(),
                                         concurrency,
                                         permit,
                                     )
-                                    .await?
+                                    .await?;
+                                    if let Some(stats) = range_io_stats {
+                                        let stats = stats.snapshot();
+                                        eprintln!(
+                                            "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={}",
+                                            file_name,
+                                            query_count,
+                                            stats.logical_ranges,
+                                            stats.requested_bytes,
+                                            stats.file_read_calls,
+                                            stats.returned_bytes,
+                                            stats.read_ahead_hits,
+                                        );
+                                    }
+                                    results
                                 }
                                 Err(_) if query_count > 1 => {
                                     let data = input.read().await.map_err(|e| {
@@ -1655,7 +1746,7 @@ async fn evaluate_batch_vector_search(
                         });
                     }
 
-                    Ok::<_, crate::Error>(
+                    Ok::<_, crate::Error>((
                         results
                             .into_iter()
                             .map(|result| match result {
@@ -1664,20 +1755,30 @@ async fn evaluate_batch_vector_search(
                                 None => SearchResult::empty(),
                             })
                             .collect::<Vec<_>>(),
-                    )
+                        IndexSearchTiming {
+                            permit_wait,
+                            file_reader_open,
+                        },
+                    ))
                 }
             })
             .collect();
 
         let results = drain_indexed_jobs(futures.into_iter(), concurrency).await?;
-        for per_entry in &results {
+        index_search = index_search_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let merge_start = timing_enabled.then(Instant::now);
+        for (per_entry, entry_timing) in &results {
+            permit_wait = permit_wait.saturating_add(entry_timing.permit_wait);
+            file_reader_open = file_reader_open.saturating_add(entry_timing.file_reader_open);
             for (query_index, result) in per_entry.iter().enumerate() {
                 merged[query_index] = merged[query_index].or(result);
             }
         }
+        merge = merge_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
     if refine_factor != 0 {
+        let refine_start = timing_enabled.then(Instant::now);
         merged = maybe_rerank_indexed_batch_results(
             evaluation,
             index_entries,
@@ -1688,9 +1789,11 @@ async fn evaluate_batch_vector_search(
             index_search_limit,
         )
         .await?;
+        refine = refine_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
     if search_mode != GlobalIndexSearchMode::Fast {
+        let raw_fallback_start = timing_enabled.then(Instant::now);
         let detail_ranges = if search_mode == GlobalIndexSearchMode::Detail {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search in detail mode requires table context".to_string(),
@@ -1714,7 +1817,8 @@ async fn evaluate_batch_vector_search(
                 message: "Vector raw search requires table context".to_string(),
                 source: None,
             })?;
-            let metric = resolve_raw_vector_metric(
+            let metric_start = timing_enabled.then(Instant::now);
+            let (metric, metric_bytes) = resolve_raw_vector_metric(
                 evaluation.file_io,
                 table_path,
                 evaluation.table_options,
@@ -1723,15 +1827,35 @@ async fn evaluate_batch_vector_search(
                 field_name,
             )
             .await?;
-            let raw_results =
+            let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
+            let (raw_results, raw_timing) =
                 read_raw_batch_vector_search(table, vector_searches, &raw_ranges, metric).await?;
+            if let Some(raw_timing) = raw_timing {
+                eprintln!(
+                    "event=paimon_vector_raw_fallback nq={} row_ranges={} metric_resolve_ms={:.3} metric_index_bytes={} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_raw_read_ms={:.3}",
+                    vector_searches.len(),
+                    raw_ranges.len(),
+                    metric_resolve.as_secs_f64() * 1000.0,
+                    metric_bytes,
+                    raw_timing.plan.as_secs_f64() * 1000.0,
+                    raw_timing.split_count,
+                    raw_timing.file_count,
+                    raw_timing.stream_wait.as_secs_f64() * 1000.0,
+                    raw_timing.score_cpu.as_secs_f64() * 1000.0,
+                    raw_timing.batch_count,
+                    raw_timing.row_count,
+                    raw_timing.total.as_secs_f64() * 1000.0,
+                );
+            }
             for (query_index, result) in raw_results.iter().enumerate() {
                 merged[query_index] = merged[query_index].or(result);
             }
         }
+        raw_fallback = raw_fallback_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
-    merged
+    let finalize_start = timing_enabled.then(Instant::now);
+    let results = merged
         .into_iter()
         .zip(vector_searches)
         .map(|(result, vector_search)| {
@@ -1739,7 +1863,40 @@ async fn evaluate_batch_vector_search(
                 .without_deleted_row_ranges(deleted_row_index.as_ref())?
                 .top_k(vector_search.limit))
         })
-        .collect()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let finalize = finalize_start.map_or(Duration::ZERO, |start| start.elapsed());
+    if let Some(total_start) = total_start {
+        let total = total_start.elapsed();
+        let children = deletion_vector
+            .saturating_add(index_search)
+            .saturating_add(merge)
+            .saturating_add(refine)
+            .saturating_add(raw_fallback)
+            .saturating_add(finalize);
+        let result_count = results
+            .iter()
+            .map(|result| result.row_ids.len())
+            .sum::<usize>();
+        eprintln!(
+            "event=paimon_vector_search_evaluate nq={} index_entries={} index_files={} result_count={} refine_factor={} total_ms={:.3} deletion_vector_ms={:.3} index_search_ms={:.3} global_permit_wait_ms={:.3} file_reader_open_ms={:.3} merge_ms={:.3} refine_ms={:.3} raw_fallback_ms={:.3} finalize_ms={:.3} unattributed_ms={:.3}",
+            vector_searches.len(),
+            index_entries.len(),
+            vector_entry_count,
+            result_count,
+            refine_factor,
+            total.as_secs_f64() * 1000.0,
+            deletion_vector.as_secs_f64() * 1000.0,
+            index_search.as_secs_f64() * 1000.0,
+            permit_wait.as_secs_f64() * 1000.0,
+            file_reader_open.as_secs_f64() * 1000.0,
+            merge.as_secs_f64() * 1000.0,
+            refine.as_secs_f64() * 1000.0,
+            raw_fallback.as_secs_f64() * 1000.0,
+            finalize.as_secs_f64() * 1000.0,
+            total.saturating_sub(children).as_secs_f64() * 1000.0,
+        );
+    }
+    Ok(results)
 }
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
@@ -2292,12 +2449,16 @@ async fn maybe_rerank_indexed_batch_results(
     results: Vec<SearchResult>,
     index_search_limit: usize,
 ) -> crate::Result<Vec<SearchResult>> {
+    let timing_enabled = vector_search_timing_enabled();
+    let total_start = timing_enabled.then(Instant::now);
     let mut candidate_searches = Vec::with_capacity(vector_searches.len());
     let mut candidate_results = Vec::with_capacity(vector_searches.len());
     let mut union_candidates = RoaringTreemap::new();
+    let mut candidate_references = 0usize;
 
     for (result, vector_search) in results.into_iter().zip(vector_searches) {
         let candidates = result.top_k(index_search_limit);
+        candidate_references = candidate_references.saturating_add(candidates.row_ids.len());
         let mut include_row_ids = RoaringTreemap::new();
         for &row_id in &candidates.row_ids {
             include_row_ids.insert(row_id);
@@ -2318,8 +2479,10 @@ async fn maybe_rerank_indexed_batch_results(
         message: "Vector index rerank requires table context".to_string(),
         source: None,
     })?;
+    let unique_candidates = union_candidates.len();
     let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
-    let metric = resolve_raw_vector_metric(
+    let metric_start = timing_enabled.then(Instant::now);
+    let (metric, metric_index_bytes) = resolve_raw_vector_metric(
         evaluation.file_io,
         evaluation.table_path.trim_end_matches('/'),
         evaluation.table_options,
@@ -2328,8 +2491,30 @@ async fn maybe_rerank_indexed_batch_results(
         field_name,
     )
     .await?;
+    let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
 
-    read_raw_batch_vector_search(table, &candidate_searches, &raw_ranges, metric).await
+    let (results, raw_timing) =
+        read_raw_batch_vector_search(table, &candidate_searches, &raw_ranges, metric).await?;
+    if let (Some(total_start), Some(raw_timing)) = (total_start, raw_timing) {
+        eprintln!(
+            "event=paimon_vector_refine nq={} candidate_references={} unique_candidates={} row_ranges={} metric_resolve_ms={:.3} metric_index_bytes={} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_refine_ms={:.3}",
+            vector_searches.len(),
+            candidate_references,
+            unique_candidates,
+            raw_ranges.len(),
+            metric_resolve.as_secs_f64() * 1000.0,
+            metric_index_bytes,
+            raw_timing.plan.as_secs_f64() * 1000.0,
+            raw_timing.split_count,
+            raw_timing.file_count,
+            raw_timing.stream_wait.as_secs_f64() * 1000.0,
+            raw_timing.score_cpu.as_secs_f64() * 1000.0,
+            raw_timing.batch_count,
+            raw_timing.row_count,
+            total_start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    Ok(results)
 }
 
 fn sorted_row_ids_to_row_ranges(
@@ -2509,7 +2694,7 @@ async fn resolve_raw_vector_metric(
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
-) -> crate::Result<RawVectorMetric> {
+) -> crate::Result<(RawVectorMetric, usize)> {
     for entry in index_entries {
         if entry.kind != FileKind::Add {
             continue;
@@ -2529,7 +2714,7 @@ async fn resolve_raw_vector_metric(
                 if let Some(index_meta) = global_meta.index_meta.as_ref() {
                     if !index_meta.is_empty() {
                         let metric = LuminaIndexMeta::deserialize(index_meta)?.metric()?;
-                        return Ok(RawVectorMetric::from_lumina(metric));
+                        return Ok((RawVectorMetric::from_lumina(metric), 0));
                     }
                 }
             }
@@ -2543,6 +2728,7 @@ async fn resolve_raw_vector_metric(
                     ),
                     source: None,
                 })?;
+                let index_bytes = bytes.len();
                 let reader = VIndexReader::open(Cursor::new(bytes.to_vec())).map_err(|e| {
                     crate::Error::DataInvalid {
                         message: format!(
@@ -2552,12 +2738,15 @@ async fn resolve_raw_vector_metric(
                         source: Some(Box::new(e)),
                     }
                 })?;
-                return Ok(RawVectorMetric::from_vindex(reader.metadata().metric));
+                return Ok((
+                    RawVectorMetric::from_vindex(reader.metadata().metric),
+                    index_bytes,
+                ));
             }
         }
     }
 
-    configured_raw_vector_metric(table_options, field_name)
+    Ok((configured_raw_vector_metric(table_options, field_name)?, 0))
 }
 
 fn configured_raw_vector_metric(
@@ -2598,17 +2787,31 @@ fn configured_raw_vector_metric(
     Ok(inferred.unwrap_or(RawVectorMetric::L2))
 }
 
+#[derive(Default)]
+struct RawVectorReadTiming {
+    plan: Duration,
+    stream_wait: Duration,
+    score_cpu: Duration,
+    total: Duration,
+    split_count: usize,
+    file_count: usize,
+    batch_count: usize,
+    row_count: usize,
+}
+
 async fn read_raw_batch_vector_search(
     table: &Table,
     vector_searches: &[VectorSearch],
     raw_ranges: &[RowRange],
     metric: RawVectorMetric,
-) -> crate::Result<Vec<SearchResult>> {
+) -> crate::Result<(Vec<SearchResult>, Option<RawVectorReadTiming>)> {
+    let timing_enabled = vector_search_timing_enabled();
+    let total_start = timing_enabled.then(Instant::now);
     if vector_searches.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     if raw_ranges.is_empty() {
-        return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+        return Ok((vec![SearchResult::empty(); vector_searches.len()], None));
     }
 
     let field_name = &vector_searches[0].field_name;
@@ -2623,13 +2826,28 @@ async fn read_raw_batch_vector_search(
         });
     }
 
+    let plan_start = timing_enabled.then(Instant::now);
     let mut read_builder = table.new_read_builder();
     read_builder
         .with_projection(&[field_name.as_str(), ROW_ID_FIELD_NAME])?
         .with_row_ranges(raw_ranges.to_vec());
     let plan = read_builder.new_scan().plan().await?;
+    let plan_elapsed = plan_start.map_or(Duration::ZERO, |start| start.elapsed());
+    let split_count = plan.splits().len();
+    let file_count = plan
+        .splits()
+        .iter()
+        .map(|split| split.data_files().len())
+        .sum();
     if plan.splits().is_empty() {
-        return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+        return Ok((
+            vec![SearchResult::empty(); vector_searches.len()],
+            total_start.map(|start| RawVectorReadTiming {
+                plan: plan_elapsed,
+                total: start.elapsed(),
+                ..RawVectorReadTiming::default()
+            }),
+        ));
     }
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
@@ -2639,14 +2857,44 @@ async fn read_raw_batch_vector_search(
         .iter()
         .map(|vector_search| RawScoreTopK::new(vector_search.limit))
         .collect::<Vec<_>>();
-    while let Some(batch) = stream.try_next().await? {
+    let mut timing = timing_enabled.then(|| RawVectorReadTiming {
+        plan: plan_elapsed,
+        split_count,
+        file_count,
+        ..RawVectorReadTiming::default()
+    });
+    loop {
+        let stream_wait_start = timing_enabled.then(Instant::now);
+        let batch = stream.try_next().await?;
+        if let (Some(timing), Some(stream_wait_start)) = (&mut timing, stream_wait_start) {
+            timing.stream_wait = timing
+                .stream_wait
+                .saturating_add(stream_wait_start.elapsed());
+        }
+        let Some(batch) = batch else {
+            break;
+        };
+        if let Some(timing) = &mut timing {
+            timing.batch_count += 1;
+            timing.row_count = timing.row_count.saturating_add(batch.num_rows());
+        }
+        let score_start = timing_enabled.then(Instant::now);
         collect_raw_batch_vector_batch(&batch, vector_searches, metric, &scoring_plan, &mut top_k)?;
+        if let (Some(timing), Some(score_start)) = (&mut timing, score_start) {
+            timing.score_cpu = timing.score_cpu.saturating_add(score_start.elapsed());
+        }
     }
 
-    Ok(top_k
-        .into_iter()
-        .map(RawScoreTopK::into_search_result)
-        .collect())
+    if let (Some(timing), Some(total_start)) = (&mut timing, total_start) {
+        timing.total = total_start.elapsed();
+    }
+    Ok((
+        top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .collect(),
+        timing,
+    ))
 }
 
 struct RawScoringPlan {

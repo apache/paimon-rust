@@ -17,6 +17,7 @@
 
 use crate::spec::CoreOptions;
 use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
+use crate::vindex::vector_search_timing_enabled;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
     VectorIndexMetadata, VectorIndexReader as VIndexReader, VectorSearchParams,
@@ -25,10 +26,27 @@ use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io;
+use std::time::{Duration, Instant};
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
 const NATIVE_BATCH_OPERATION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct VindexLoadTiming {
+    vindex_open: Duration,
+    metadata: Duration,
+    optimize: Duration,
+}
+
+#[derive(Default)]
+struct VindexBatchStats {
+    native_chunk_queries: Vec<usize>,
+    scalar_chunk_count: usize,
+    max_chunk_size: usize,
+    memory_budget_bytes: usize,
+    batch_index_parallelism: usize,
+}
 
 trait ErasedSeekRead: Send {
     fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
@@ -81,6 +99,9 @@ pub struct VindexVectorGlobalIndexReader {
     batch_shard_concurrency: Option<usize>,
     reader: Option<VIndexReader<VindexInput>>,
     metadata: Option<VectorIndexMetadata>,
+    timing_enabled: bool,
+    load_timing: VindexLoadTiming,
+    batch_stats: Option<VindexBatchStats>,
 }
 
 impl VindexVectorGlobalIndexReader {
@@ -91,6 +112,9 @@ impl VindexVectorGlobalIndexReader {
             batch_shard_concurrency: None,
             reader: None,
             metadata: None,
+            timing_enabled: vector_search_timing_enabled(),
+            load_timing: VindexLoadTiming::default(),
+            batch_stats: None,
         }
     }
 
@@ -113,8 +137,52 @@ impl VindexVectorGlobalIndexReader {
         vector_searches: &[VectorSearch],
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        let total_start = self.timing_enabled.then(Instant::now);
         self.ensure_loaded(stream_fn, |_| Ok(()))?;
-        self.search_batch(vector_searches)
+        let search_start = self.timing_enabled.then(Instant::now);
+        let results = self.search_batch(vector_searches)?;
+        if let (Some(total_start), Some(search_start), Some(stats)) =
+            (total_start, search_start, self.batch_stats.as_ref())
+        {
+            let total = total_start.elapsed();
+            let native_search = search_start.elapsed();
+            let load = self
+                .load_timing
+                .vindex_open
+                .saturating_add(self.load_timing.metadata)
+                .saturating_add(self.load_timing.optimize);
+            let unattributed = total.saturating_sub(load.saturating_add(native_search));
+            let chunk_queries = stats
+                .native_chunk_queries
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let nprobe = self
+                .options
+                .get(NPROBE_PARAMETER)
+                .map(String::as_str)
+                .unwrap_or("16");
+            eprintln!(
+                "event=paimon_vindex_reader file={} nq={} nprobe={} batch_index_parallelism={} memory_budget_bytes={} max_chunk_size={} native_chunk_count={} native_chunk_queries={} scalar_chunk_count={} total_ms={:.3} vindex_open_ms={:.3} metadata_ms={:.3} optimize_ms={:.3} native_search_wall_ms={:.3} unattributed_ms={:.3}",
+                self.io_meta.file_path,
+                vector_searches.len(),
+                nprobe,
+                stats.batch_index_parallelism,
+                stats.memory_budget_bytes,
+                stats.max_chunk_size,
+                stats.native_chunk_queries.len(),
+                chunk_queries,
+                stats.scalar_chunk_count,
+                total.as_secs_f64() * 1000.0,
+                self.load_timing.vindex_open.as_secs_f64() * 1000.0,
+                self.load_timing.metadata.as_secs_f64() * 1000.0,
+                self.load_timing.optimize.as_secs_f64() * 1000.0,
+                native_search.as_secs_f64() * 1000.0,
+                unattributed.as_secs_f64() * 1000.0,
+            );
+        }
+        Ok(results)
     }
 
     #[cfg(test)]
@@ -168,13 +236,16 @@ impl VindexVectorGlobalIndexReader {
                 message: "vindex metadata not initialized".to_string(),
                 source: None,
             })?;
-        search_batch_vindex(
+        let (results, batch_stats) = search_batch_vindex(
             reader,
             metadata,
             &self.options,
             vector_searches,
             shard_concurrency,
-        )
+            self.timing_enabled,
+        )?;
+        self.batch_stats = batch_stats;
+        Ok(results)
     }
 
     fn search(&mut self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
@@ -227,9 +298,11 @@ impl VindexVectorGlobalIndexReader {
         O: FnOnce(&mut VIndexReader<VindexInput>) -> crate::Result<()>,
     {
         if self.reader.is_some() {
+            self.load_timing = VindexLoadTiming::default();
             return validate(self.metadata()?);
         }
 
+        let open_start = self.timing_enabled.then(Instant::now);
         let source = stream_fn(&self.io_meta.file_path)?;
         let mut reader = VIndexReader::open(VindexInput::new(source)).map_err(|e| {
             crate::Error::DataInvalid {
@@ -237,12 +310,22 @@ impl VindexVectorGlobalIndexReader {
                 source: Some(Box::new(e)),
             }
         })?;
+        let vindex_open = open_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let metadata_start = self.timing_enabled.then(Instant::now);
         let metadata = reader.metadata();
+        let metadata_elapsed = metadata_start.map_or(Duration::ZERO, |start| start.elapsed());
         validate(&metadata)?;
+        let optimize_start = self.timing_enabled.then(Instant::now);
         optimize(&mut reader)?;
+        let optimize_elapsed = optimize_start.map_or(Duration::ZERO, |start| start.elapsed());
 
         self.reader = Some(reader);
         self.metadata = Some(metadata);
+        self.load_timing = VindexLoadTiming {
+            vindex_open,
+            metadata: metadata_elapsed,
+            optimize: optimize_elapsed,
+        };
         Ok(())
     }
 }
@@ -349,10 +432,16 @@ fn search_batch_vindex(
     options: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
     shard_concurrency: usize,
-) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+    timing_enabled: bool,
+) -> crate::Result<(Vec<Option<HashMap<u64, f32>>>, Option<VindexBatchStats>)> {
     let mut results: Vec<Option<HashMap<u64, f32>>> =
         (0..vector_searches.len()).map(|_| None).collect();
     let mut groups: Vec<(PreparedSearch, Vec<usize>)> = Vec::new();
+    let mut batch_stats = timing_enabled.then(|| VindexBatchStats {
+        memory_budget_bytes: NATIVE_BATCH_OPERATION_WORKING_SET_BYTES / shard_concurrency.max(1),
+        batch_index_parallelism: shard_concurrency,
+        ..VindexBatchStats::default()
+    });
 
     for (index, search) in vector_searches.iter().enumerate() {
         let Some(prepared) = prepare_search(metadata, options, search)? else {
@@ -367,8 +456,14 @@ fn search_batch_vindex(
 
     for (prepared, indices) in groups {
         let chunk_size = native_batch_chunk_size(metadata, &prepared, shard_concurrency);
+        if let Some(stats) = &mut batch_stats {
+            stats.max_chunk_size = stats.max_chunk_size.max(chunk_size);
+        }
         for indices in indices.chunks(chunk_size) {
             if indices.len() == 1 {
+                if let Some(stats) = &mut batch_stats {
+                    stats.scalar_chunk_count += 1;
+                }
                 let index = indices[0];
                 let (labels, distances) =
                     execute_scalar_search(reader, &vector_searches[index], &prepared)?;
@@ -377,6 +472,9 @@ fn search_batch_vindex(
                     results[index] = Some(map);
                 }
                 continue;
+            }
+            if let Some(stats) = &mut batch_stats {
+                stats.native_chunk_queries.push(indices.len());
             }
 
             let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
@@ -425,7 +523,7 @@ fn search_batch_vindex(
         }
     }
 
-    Ok(results)
+    Ok((results, batch_stats))
 }
 
 fn native_batch_chunk_size(
