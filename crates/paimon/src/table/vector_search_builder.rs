@@ -2540,33 +2540,35 @@ async fn resolve_raw_vector_metric(
                         serde_json::from_slice::<HashMap<String, String>>(index_meta)
                     {
                         if let Some(metric) = options.get("metric") {
-                            return RawVectorMetric::parse(metric);
+                            if let Some(metric) =
+                                RawVectorMetric::parse_normalized(&normalize_metric(metric))
+                            {
+                                return Ok(metric);
+                            }
                         }
                     }
                 }
                 let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
                 let input = file_io.new_input(&path)?;
-                let file_reader = input
-                    .reader()
-                    .await
-                    .map_err(|e| crate::Error::DataInvalid {
-                        message: format!(
-                            "Failed to read vindex index file '{}' for raw search metric: {}",
-                            entry.index_file.file_name, e
-                        ),
-                        source: Some(Box::new(e)),
-                    })?;
-                let header_size =
-                    (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64);
-                let bytes = file_reader.read(0..header_size).await.map_err(|e| {
-                    crate::Error::DataInvalid {
-                        message: format!(
-                            "Failed to read vindex index file '{}' for raw search metric: {}",
-                            entry.index_file.file_name, e
-                        ),
-                        source: Some(Box::new(e)),
-                    }
-                })?;
+                let read_error = |e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to read vindex index file '{}' for raw search metric: {}",
+                        entry.index_file.file_name, e
+                    ),
+                    source: Some(Box::new(e)),
+                };
+                let header_size = if entry.index_file.file_size > 0 {
+                    (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
+                } else {
+                    input
+                        .metadata()
+                        .await
+                        .map_err(&read_error)?
+                        .size
+                        .min(DISKANN_HEADER_SIZE as u64)
+                };
+                let file_reader = input.reader().await.map_err(&read_error)?;
+                let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
                 let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| {
                     crate::Error::DataInvalid {
                         message: format!(
@@ -3222,7 +3224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_raw_vector_metric_reads_vindex_header_for_legacy_metadata() {
+    async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let index = build_vindex_segment_bytes("inner_product");
         file_io
@@ -3231,27 +3233,33 @@ mod tests {
             .write(bytes::Bytes::from(index.clone()))
             .await
             .unwrap();
-        let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
-        entry.index_file.file_size = index.len() as i64;
-        entry
-            .index_file
-            .global_index_meta
-            .as_mut()
-            .unwrap()
-            .index_meta = Some(b"{}".to_vec());
+        for (file_size, index_meta) in [
+            (index.len() as i64, br#"{"metric":"euclidean"}"#.to_vec()),
+            (0, b"{}".to_vec()),
+            (-1, b"{}".to_vec()),
+        ] {
+            let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+            entry.index_file.file_size = file_size;
+            entry
+                .index_file
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .index_meta = Some(index_meta);
 
-        let metric = resolve_raw_vector_metric(
-            &file_io,
-            "memory:///test_table",
-            &HashMap::new(),
-            &[entry],
-            2,
-            "embedding",
-        )
-        .await
-        .unwrap();
+            let metric = resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &HashMap::new(),
+                &[entry],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(metric, RawVectorMetric::InnerProduct);
+            assert_eq!(metric, RawVectorMetric::InnerProduct);
+        }
     }
 
     #[test]
