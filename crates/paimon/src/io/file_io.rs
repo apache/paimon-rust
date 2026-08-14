@@ -88,6 +88,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
+        let supports_cheap_range_reads = self.storage.supports_cheap_range_reads();
         let (op, relative_path) = self.storage.create(path)?;
         let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(InputFile {
@@ -100,6 +101,7 @@ impl FileIO {
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
+            supports_cheap_range_reads,
         })
     }
 
@@ -107,6 +109,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> Result<OutputFile> {
+        let supports_cheap_range_reads = self.storage.supports_cheap_range_reads();
         let (op, relative_path) = self.storage.create(path)?;
         let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(OutputFile {
@@ -119,6 +122,7 @@ impl FileIO {
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
+            supports_cheap_range_reads,
         })
     }
 
@@ -437,6 +441,15 @@ impl FileIOBuilder {
 #[async_trait::async_trait]
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
+
+    /// Returns whether small positioned range reads are cheap enough to prefer
+    /// exact metadata reads over fixed-size prefetching.
+    ///
+    /// The conservative default keeps prefetching for custom readers unless
+    /// they explicitly opt in.
+    fn supports_cheap_range_reads(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]
@@ -446,18 +459,27 @@ impl FileRead for opendal::Reader {
     }
 }
 
-enum InputFileReader {
+enum InputFileReaderInner {
     Direct(opendal::Reader),
     Cached(CachedFileReader),
+}
+
+struct InputFileReader {
+    inner: InputFileReaderInner,
+    supports_cheap_range_reads: bool,
 }
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        match self {
-            Self::Direct(reader) => FileRead::read(reader, range).await,
-            Self::Cached(reader) => FileRead::read(reader, range).await,
+        match &self.inner {
+            InputFileReaderInner::Direct(reader) => FileRead::read(reader, range).await,
+            InputFileReaderInner::Cached(reader) => FileRead::read(reader, range).await,
         }
+    }
+
+    fn supports_cheap_range_reads(&self) -> bool {
+        self.supports_cheap_range_reads
     }
 }
 
@@ -573,6 +595,7 @@ pub struct InputFile {
     relative_path: String,
     cache_path: String,
     cache: Option<Arc<LocalCache>>,
+    supports_cheap_range_reads: bool,
 }
 
 impl InputFile {
@@ -625,26 +648,31 @@ impl InputFile {
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
         let reader = self.op.reader(&self.relative_path).await?;
-        let Some(cache) = &self.cache else {
-            return Ok(InputFileReader::Direct(reader));
-        };
-        let read_token = cache.read_token(&self.cache_path);
-        let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
-            size
+        let inner = if let Some(cache) = &self.cache {
+            let read_token = cache.read_token(&self.cache_path);
+            let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
+                size
+            } else {
+                let size = self.op.stat(&self.relative_path).await?.content_length();
+                cache
+                    .put_file_size(&self.cache_path, size, &read_token)
+                    .await;
+                size
+            };
+            InputFileReaderInner::Cached(CachedFileReader::new_with_token(
+                Arc::new(reader),
+                &self.cache_path,
+                size,
+                cache.clone(),
+                read_token,
+            ))
         } else {
-            let size = self.op.stat(&self.relative_path).await?.content_length();
-            cache
-                .put_file_size(&self.cache_path, size, &read_token)
-                .await;
-            size
+            InputFileReaderInner::Direct(reader)
         };
-        Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
-            Arc::new(reader),
-            &self.cache_path,
-            size,
-            cache.clone(),
-            read_token,
-        )))
+        Ok(InputFileReader {
+            inner,
+            supports_cheap_range_reads: self.supports_cheap_range_reads,
+        })
     }
 }
 
@@ -657,6 +685,7 @@ pub struct OutputFile {
     relative_path: String,
     cache_path: String,
     cache: Option<Arc<LocalCache>>,
+    supports_cheap_range_reads: bool,
 }
 
 impl OutputFile {
@@ -676,6 +705,7 @@ impl OutputFile {
             relative_path: self.relative_path,
             cache_path: self.cache_path,
             cache,
+            supports_cheap_range_reads: self.supports_cheap_range_reads,
         }
     }
 
@@ -1140,6 +1170,15 @@ mod input_output_test {
         FileIOBuilder::new("file").build().unwrap()
     }
 
+    #[cfg(feature = "storage-memory")]
+    fn setup_custom_fs_file_io() -> FileIO {
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+        FileIOBuilder::new("")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap()
+    }
+
     fn setup_cached_fs_file_io(cache_directory: &std::path::Path) -> FileIO {
         let mut options = Options::new();
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
@@ -1208,6 +1247,34 @@ mod input_output_test {
         let partial_content = reader.read(0..5).await.unwrap(); // read "hello"
 
         assert_eq!(&partial_content[..], b"hello");
+
+        file_io.delete_file(path).await.unwrap();
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_memory_reader_reports_cheap_range_reads() {
+        let file_io = setup_memory_file_io();
+        let path = "memory:/test_memory_reader_range_capability";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from_static(b"test")).await.unwrap();
+
+        let reader = output.to_input_file().reader().await.unwrap();
+        assert!(reader.supports_cheap_range_reads());
+
+        file_io.delete_file(path).await.unwrap();
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_custom_fs_reader_keeps_conservative_range_capability() {
+        let file_io = setup_custom_fs_file_io();
+        let path = "/test_custom_fs_reader_range_capability";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from_static(b"test")).await.unwrap();
+
+        let reader = output.to_input_file().reader().await.unwrap();
+        assert!(!reader.supports_cheap_range_reads());
 
         file_io.delete_file(path).await.unwrap();
     }
