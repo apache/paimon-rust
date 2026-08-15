@@ -24,40 +24,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::AsyncWriteExt;
 
+use super::state::{BlockKey, CacheCoordinator, LogicalPath};
+
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
 const CACHE_FORMAT_VERSION: u8 = 2;
 const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 1 + 4 + 4 + 8 + 8 + 8;
 const CHECKSUM_LEN: usize = 4;
 const MAX_CACHE_KEY_HEADER_LEN: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct BlockKey {
-    namespace: String,
-    path: String,
-    block_size: u64,
-    block_index: u64,
-}
-
 impl BlockKey {
-    #[cfg(test)]
-    pub(super) fn new(path: impl Into<String>, block_size: u64, block_index: u64) -> Self {
-        Self::with_namespace("", path, block_size, block_index)
-    }
-
-    pub(super) fn with_namespace(
-        namespace: impl Into<String>,
-        path: impl Into<String>,
-        block_size: u64,
-        block_index: u64,
-    ) -> Self {
-        Self {
-            namespace: namespace.into(),
-            path: path.into(),
-            block_size,
-            block_index,
-        }
-    }
-
     pub(super) fn cache_relative_path(&self) -> PathBuf {
         let mut digest = Sha256::new();
         digest.update([CACHE_FORMAT_VERSION]);
@@ -86,49 +61,15 @@ pub(super) struct DiskCache {
     root: PathBuf,
     state: Mutex<CacheState>,
     recovered: tokio::sync::OnceCell<()>,
-    in_flight: tokio::sync::Mutex<HashMap<BlockKey, Weak<tokio::sync::Mutex<()>>>>,
-    path_states: Mutex<HashMap<LogicalPath, Weak<PathCacheState>>>,
-    prefix_barrier: tokio::sync::RwLock<()>,
+    coordinator: Arc<CacheCoordinator>,
 }
 
 #[derive(Debug, Default)]
 struct CacheState {
     entries: IndexMap<BlockKey, u64>,
     paths: HashMap<LogicalPath, HashSet<BlockKey>>,
-    file_sizes: IndexMap<LogicalPath, u64>,
     current_size: u64,
     max_size: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct LogicalPath {
-    namespace: String,
-    path: String,
-}
-
-#[derive(Debug)]
-struct PathCacheState {
-    generation: std::sync::atomic::AtomicU64,
-    publish_gate: tokio::sync::RwLock<()>,
-}
-
-#[derive(Clone)]
-pub(in crate::io) struct CacheReadToken {
-    generation: u64,
-    state: Arc<PathCacheState>,
-}
-
-impl CacheReadToken {
-    pub(super) fn is_current(&self) -> bool {
-        self.state
-            .generation
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == self.generation
-    }
-
-    pub(super) async fn publish_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.state.publish_gate.read().await
-    }
 }
 
 impl DiskCache {
@@ -167,9 +108,7 @@ impl DiskCache {
                 ..CacheState::default()
             }),
             recovered: tokio::sync::OnceCell::new(),
-            in_flight: tokio::sync::Mutex::new(HashMap::new()),
-            path_states: Mutex::new(HashMap::new()),
-            prefix_barrier: tokio::sync::RwLock::new(()),
+            coordinator: Arc::new(CacheCoordinator::default()),
         }
     }
 
@@ -182,7 +121,7 @@ impl DiskCache {
         };
     }
 
-    async fn ensure_recovered(&self) {
+    pub(super) async fn ensure_recovered(&self) {
         self.recovered
             .get_or_init(|| async {
                 let root = self.root.clone();
@@ -218,92 +157,8 @@ impl DiskCache {
         self.evict_over_limit().await;
     }
 
-    pub(super) fn read_token(&self, namespace: &str, path: &str) -> CacheReadToken {
-        let state = self.path_state(namespace, path);
-        CacheReadToken {
-            generation: state.generation.load(std::sync::atomic::Ordering::SeqCst),
-            state,
-        }
-    }
-
-    pub(super) async fn prefix_read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.prefix_barrier.read().await
-    }
-
-    fn path_state(&self, namespace: &str, path: &str) -> Arc<PathCacheState> {
-        let logical_path = LogicalPath {
-            namespace: namespace.to_string(),
-            path: path.to_string(),
-        };
-        let mut states = self
-            .path_states
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(state) = states.get(&logical_path).and_then(Weak::upgrade) {
-            return state;
-        }
-        if states.len() >= 1024 {
-            states.retain(|_, state| state.strong_count() > 0);
-        }
-        let state = Arc::new(PathCacheState {
-            generation: std::sync::atomic::AtomicU64::new(0),
-            publish_gate: tokio::sync::RwLock::new(()),
-        });
-        states.insert(logical_path, Arc::downgrade(&state));
-        state
-    }
-
-    pub(super) async fn block_load_lock(&self, key: &BlockKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut in_flight = self.in_flight.lock().await;
-        if let Some(lock) = in_flight.get(key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        if in_flight.len() >= 1024 {
-            in_flight.retain(|_, lock| lock.strong_count() > 0);
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        in_flight.insert(key.clone(), Arc::downgrade(&lock));
-        lock
-    }
-
-    pub(super) async fn release_block_load_lock(
-        &self,
-        key: &BlockKey,
-        lock: &Arc<tokio::sync::Mutex<()>>,
-    ) {
-        let mut in_flight = self.in_flight.lock().await;
-        if Arc::strong_count(lock) == 1
-            && in_flight
-                .get(key)
-                .and_then(Weak::upgrade)
-                .is_some_and(|current| Arc::ptr_eq(&current, lock))
-        {
-            in_flight.remove(key);
-        }
-    }
-
-    pub(super) fn file_size(&self, namespace: &str, path: &str) -> Option<u64> {
-        let logical_path = LogicalPath {
-            namespace: namespace.to_string(),
-            path: path.to_string(),
-        };
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let size = state.file_sizes.shift_remove(&logical_path)?;
-        state.file_sizes.insert(logical_path, size);
-        Some(size)
-    }
-
-    pub(super) fn put_file_size(&self, namespace: &str, path: &str, size: u64, capacity: usize) {
-        let logical_path = LogicalPath {
-            namespace: namespace.to_string(),
-            path: path.to_string(),
-        };
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.file_sizes.shift_remove(&logical_path);
-        state.file_sizes.insert(logical_path, size);
-        while state.file_sizes.len() > capacity {
-            state.file_sizes.shift_remove_index(0);
-        }
+    pub(super) fn coordinator(&self) -> Arc<CacheCoordinator> {
+        self.coordinator.clone()
     }
 
     pub(super) async fn get_block(&self, key: &BlockKey) -> Option<Bytes> {
@@ -411,12 +266,6 @@ impl DiskCache {
 
     pub(super) async fn invalidate_path(&self, namespace: &str, path: &str) {
         self.ensure_recovered().await;
-        let _prefix_guard = self.prefix_barrier.read().await;
-        let path_state = self.path_state(namespace, path);
-        let _publish_guard = path_state.publish_gate.write().await;
-        path_state
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.invalidate_matching(|logical_path| {
             logical_path.namespace == namespace && logical_path.path == path
         })
@@ -439,30 +288,9 @@ impl DiskCache {
 
     pub(super) async fn invalidate_prefix(&self, namespace: &str, prefix: &str) {
         self.ensure_recovered().await;
-        let _prefix_guard = self.prefix_barrier.write().await;
         let prefix = prefix.trim_end_matches('/');
-        let mut states = {
-            let states = self
-                .path_states
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            states
-                .iter()
-                .filter(|(path, _)| logical_path_matches_prefix(path, namespace, prefix))
-                .filter_map(|(path, state)| Weak::upgrade(state).map(|state| (path.clone(), state)))
-                .collect::<Vec<_>>()
-        };
-        states.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let mut publish_guards = Vec::with_capacity(states.len());
-        for (_, state) in &states {
-            publish_guards.push(state.publish_gate.write().await);
-            state
-                .generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
         self.invalidate_matching(|path| logical_path_matches_prefix(path, namespace, prefix))
             .await;
-        drop(publish_guards);
     }
 
     async fn invalidate_matching(&self, matches: impl Fn(&LogicalPath) -> bool) {
@@ -478,7 +306,6 @@ impl DiskCache {
             for key in &keys {
                 remove_state_entry(&mut state, key);
             }
-            state.file_sizes.retain(|path, _| !matches(path));
             keys
         };
         for key in keys {
@@ -579,10 +406,7 @@ fn collect_evictions(state: &mut CacheState) -> Vec<BlockKey> {
 }
 
 fn logical_path(key: &BlockKey) -> LogicalPath {
-    LogicalPath {
-        namespace: key.namespace.clone(),
-        path: key.path.clone(),
-    }
+    LogicalPath::from_key(key)
 }
 
 fn logical_path_matches_prefix(path: &LogicalPath, namespace: &str, prefix: &str) -> bool {

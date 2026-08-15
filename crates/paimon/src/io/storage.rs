@@ -39,6 +39,8 @@ use std::sync::MutexGuard;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
+#[cfg(feature = "storage-oss")]
+use super::OssStorageConfig;
 use opendal::Operator;
 #[cfg(feature = "storage-cos")]
 use opendal_service_cos::CosConfig;
@@ -48,8 +50,6 @@ use opendal_service_gcs::GcsConfig;
 use opendal_service_hdfs_native::HdfsNativeConfig;
 #[cfg(feature = "storage-obs")]
 use opendal_service_obs::ObsConfig;
-#[cfg(feature = "storage-oss")]
-use opendal_service_oss::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal_service_s3::S3Config;
 #[cfg(any(
@@ -77,7 +77,7 @@ pub enum Storage {
     LocalFs { op: Operator },
     #[cfg(feature = "storage-oss")]
     Oss {
-        config: Box<OssConfig>,
+        config: Box<OssStorageConfig>,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-s3")]
@@ -412,7 +412,7 @@ impl Storage {
 
     #[cfg(feature = "storage-oss")]
     fn cached_oss_operator(
-        config: &OssConfig,
+        config: &OssStorageConfig,
         operators: &Mutex<HashMap<String, Operator>>,
         path: &str,
         bucket: &str,

@@ -21,6 +21,11 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::io::FileIO;
 use crate::spec::{
@@ -59,6 +64,8 @@ struct ScopeFileSet {
     manifest_files: HashMap<String, i64>,
     data_files: HashMap<String, i64>,
     index_files: HashMap<String, i64>,
+    #[cfg(test)]
+    drop_signal: Option<Arc<AtomicBool>>,
 }
 
 impl ScopeFileSet {
@@ -83,6 +90,15 @@ impl ScopeFileSet {
         }
         for (k, v) in &other.index_files {
             self.index_files.entry(k.clone()).or_insert(*v);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopeFileSet {
+    fn drop(&mut self) {
+        if let Some(signal) = &self.drop_signal {
+            signal.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -193,58 +209,63 @@ pub async fn collect_referenced_files_summary(
     let mut main_files = main_files;
     main_files.merge(&tag_files);
 
-    // 2. Branch file sets (all branches concurrently)
+    // 2. Branch file sets
     let bm = BranchManager::new(file_io.clone(), table_location.to_string());
     let branch_names = bm.list_all().await?;
 
-    let sm_ref = &sm;
-    let branch_futures: Vec<_> = branch_names
-        .iter()
-        .map(|branch_name| {
-            let branch_sm = sm.with_branch(branch_name);
-            let branch_tm = tm.with_branch(branch_name);
-            async move {
-                // Branch SM reads snapshot/tag files from branch path,
-                // but manifest paths are always resolved from the table root.
-                let (mut branch_files, branch_tag_files) = tokio::try_join!(
-                    collect_scope_files(
-                        file_io,
-                        &branch_sm,
-                        sm_ref,
-                        manifest_cache_ref,
-                        extra_resolver_ref
-                    ),
-                    collect_tag_files(
-                        file_io,
-                        &branch_sm,
-                        sm_ref,
-                        &branch_tm,
-                        manifest_cache_ref,
-                        extra_resolver_ref
-                    ),
-                )?;
-                branch_files.merge(&branch_tag_files);
-                Ok::<_, crate::Error>(branch_files)
-            }
-        })
-        .collect();
-    let branch_results = try_join_all(branch_futures).await?;
-
-    // 3. Assemble output: total, main, branches
     let mut total_files = ScopeFileSet::default();
     total_files.merge(&main_files);
-    for bs in &branch_results {
-        total_files.merge(bs);
+    let mut branch_summaries = Vec::with_capacity(branch_names.len());
+    for branch_name in &branch_names {
+        let branch_sm = sm.with_branch(branch_name);
+        let branch_tm = tm.with_branch(branch_name);
+
+        // Branch SM reads snapshot/tag files from branch path, but manifest paths
+        // are always resolved from the table root. Process one branch at a time
+        // so completed branch file sets can be summarized and released.
+        let (mut branch_files, branch_tag_files) = tokio::try_join!(
+            collect_scope_files(
+                file_io,
+                &branch_sm,
+                &sm,
+                manifest_cache_ref,
+                extra_resolver_ref
+            ),
+            collect_tag_files(
+                file_io,
+                &branch_sm,
+                &sm,
+                &branch_tm,
+                manifest_cache_ref,
+                extra_resolver_ref
+            ),
+        )?;
+        branch_files.merge(&branch_tag_files);
+        total_files.merge(&branch_files);
+        branch_summaries.push(branch_files.to_summary(&format!("branch:{branch_name}")));
     }
 
+    // 3. Assemble output: total, main, branches
     let mut result = vec![
         total_files.to_summary("total"),
         main_files.to_summary("branch:main"),
     ];
-    for (name, files) in branch_names.iter().zip(&branch_results) {
-        result.push(files.to_summary(&format!("branch:{name}")));
-    }
+    result.extend(branch_summaries);
     Ok(result)
+}
+
+async fn merge_scope_file_sets<S>(scope_file_sets: S) -> crate::Result<ScopeFileSet>
+where
+    S: futures::TryStream<Ok = Option<ScopeFileSet>, Error = crate::Error>,
+{
+    scope_file_sets
+        .try_fold(ScopeFileSet::default(), |mut merged, files| async move {
+            if let Some(files) = files {
+                merged.merge(&files);
+            }
+            Ok(merged)
+        })
+        .await
 }
 
 async fn collect_scope_files(
@@ -256,30 +277,25 @@ async fn collect_scope_files(
 ) -> crate::Result<ScopeFileSet> {
     let snapshot_ids = sm.list_all_ids().await?;
 
-    let per_snapshot: Vec<Option<ScopeFileSet>> = stream::iter(snapshot_ids)
-        .map(|snapshot_id| {
-            let sm = sm.clone();
-            async move {
-                collect_single_snapshot_files(
-                    file_io,
-                    &sm,
-                    manifest_sm,
-                    snapshot_id,
-                    manifest_cache,
-                    extra_resolver,
-                )
-                .await
-            }
-        })
-        .buffer_unordered(SNAPSHOT_CONCURRENCY)
-        .try_collect()
-        .await?;
-
-    let mut merged = ScopeFileSet::default();
-    for fs in per_snapshot.into_iter().flatten() {
-        merged.merge(&fs);
-    }
-    Ok(merged)
+    merge_scope_file_sets(
+        stream::iter(snapshot_ids)
+            .map(|snapshot_id| {
+                let sm = sm.clone();
+                async move {
+                    collect_single_snapshot_files(
+                        file_io,
+                        &sm,
+                        manifest_sm,
+                        snapshot_id,
+                        manifest_cache,
+                        extra_resolver,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(SNAPSHOT_CONCURRENCY),
+    )
+    .await
 }
 
 async fn collect_tag_files(
@@ -292,30 +308,25 @@ async fn collect_tag_files(
 ) -> crate::Result<ScopeFileSet> {
     let tag_names = tm.list_all_names().await?;
 
-    let tag_futures: Vec<_> = tag_names
-        .iter()
-        .map(|tag_name| async move {
-            let snapshot = match tm.get(tag_name).await? {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            collect_snapshot_files(
-                file_io,
-                manifest_sm,
-                &snapshot,
-                manifest_cache,
-                extra_resolver,
-            )
-            .await
-        })
-        .collect();
-    let tag_results = try_join_all(tag_futures).await?;
-
-    let mut merged = ScopeFileSet::default();
-    for fs in tag_results.into_iter().flatten() {
-        merged.merge(&fs);
-    }
-    Ok(merged)
+    merge_scope_file_sets(
+        stream::iter(tag_names)
+            .map(|tag_name| async move {
+                let snapshot = match tm.get(&tag_name).await? {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                collect_snapshot_files(
+                    file_io,
+                    manifest_sm,
+                    &snapshot,
+                    manifest_cache,
+                    extra_resolver,
+                )
+                .await
+            })
+            .buffered(SNAPSHOT_CONCURRENCY),
+    )
+    .await
 }
 
 async fn collect_single_snapshot_files(
@@ -847,6 +858,32 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_merge_scope_file_sets_drops_completed_results_incrementally() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut first = ScopeFileSet::default();
+        first.data_files.insert("shared".to_string(), 1);
+        first.drop_signal = Some(dropped.clone());
+
+        let second_poll_signal = dropped.clone();
+        let scope_file_sets = stream::once(async { Ok::<_, crate::Error>(Some(first)) }).chain(
+            stream::once(async move {
+                assert!(
+                    second_poll_signal.load(Ordering::SeqCst),
+                    "the previous completed scope must be dropped before polling the next one"
+                );
+                let mut second = ScopeFileSet::default();
+                second.data_files.insert("new".to_string(), 2);
+                Ok(Some(second))
+            }),
+        );
+
+        let merged = merge_scope_file_sets(scope_file_sets).await.unwrap();
+        assert_eq!(merged.data_files.len(), 2);
+        assert_eq!(merged.data_files["shared"], 1);
+        assert_eq!(merged.data_files["new"], 2);
+    }
+
     #[test]
     fn test_extra_file_resolver_uses_external_path_parent() {
         use crate::spec::stats::BinaryTableStats;
@@ -1247,8 +1284,12 @@ mod tests {
             .build();
         sm.commit_snapshot(&main_snapshot).await.unwrap();
 
-        // Create branch b1 with NO snapshots
+        // Create branches out of order to verify stable output ordering.
         let bm = BranchManager::new(file_io.clone(), table_path.to_string());
+        file_io
+            .mkdirs(&format!("{}/", bm.branch_path("b2")))
+            .await
+            .unwrap();
         bm.create_branch("b1").await.unwrap();
 
         // Create a tag under branch b1 that references the readable manifest lists
@@ -1270,11 +1311,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Should have: total, branch:main, branch:b1
-        assert_eq!(result.len(), 3);
+        // Should have sorted branch rows even though b2 was created first.
+        assert_eq!(result.len(), 4);
         assert_eq!(result[0].source, "total");
         assert_eq!(result[1].source, "branch:main");
         assert_eq!(result[2].source, "branch:b1");
+        assert_eq!(result[3].source, "branch:b2");
 
         // branch:b1 must have non-zero counts from the branch tag's readable manifests.
         // The manifest list + manifest file + delta manifest list = 3 manifest files.

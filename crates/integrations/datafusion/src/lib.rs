@@ -81,7 +81,7 @@ pub use full_text_search::{register_full_text_search, FullTextSearchFunction};
 pub use hybrid_search::{register_hybrid_search, HybridSearchFunction};
 pub use physical_plan::PaimonTableScan;
 pub use relation_planner::PaimonRelationPlanner;
-pub use sql_context::SQLContext;
+pub use sql_context::{SQLContext, SQLContextBuilder};
 pub use table::PaimonTableProvider;
 pub use variant_functions::register_variant_functions;
 pub use vector_search::{register_vector_search, VectorSearchFunction};

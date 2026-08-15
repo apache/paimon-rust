@@ -17,7 +17,10 @@
 
 use super::{FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
+use crate::arrow::filtering::{
+    predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
+};
+use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
 use crate::io::FileRead;
 use crate::spec::{DataField, DataType as PaimonDataType, Datum, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -53,6 +56,11 @@ impl FormatFileReader for MosaicFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // This reader only prunes row groups by stats, and stats cannot decide a
+        // `_ROW_ID` predicate, so nothing would enforce it.
+        if let Some(fp) = predicates {
+            crate::table::row_id_predicate::reject_row_id_filter(&fp.predicates, "mosaic files")?;
+        }
         let handle = tokio::runtime::Handle::try_current().map_err(|e| Error::UnexpectedError {
             message: "Mosaic reader requires a Tokio runtime".to_string(),
             source: Some(Box::new(e)),
@@ -129,26 +137,37 @@ fn read_mosaic_batches_blocking(
         .iter()
         .map(|column| column.name.as_str())
         .collect::<HashSet<_>>();
-    let existing_read_fields = read_fields
+    // Residual filtering needs every predicate column, including columns that
+    // are not part of the requested projection. DataFileReader drops extras by
+    // name after this format reader returns.
+    let scan_fields = widen_scan_fields(&read_fields, predicates.as_ref());
+    let existing_scan_fields = scan_fields
         .iter()
         .filter(|field| file_column_names.contains(field.name()))
         .cloned()
         .collect::<Vec<_>>();
-    let read_schema = build_target_arrow_schema(&existing_read_fields)?;
+    // A Mosaic file may physically omit columns still declared by its logical
+    // schema. Remap against the columns actually scanned so missing predicate
+    // columns use the existing all-NULL semantics before stats and residuals.
+    let predicates = predicates.map(|predicates| FilePredicates {
+        predicates: remap_predicates_to_file(
+            &predicates.predicates,
+            &predicates.file_fields,
+            &existing_scan_fields,
+        )
+        .predicates,
+        row_filter_factory: None,
+        file_fields: existing_scan_fields.clone(),
+    });
+    let read_schema = build_target_arrow_schema(&existing_scan_fields)?;
     validate_mosaic_schema(&read_schema)?;
-    let projected_names = existing_read_fields
+    let projected_names = existing_scan_fields
         .iter()
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
-    let all_projected_columns_missing = !read_fields.is_empty() && projected_names.is_empty();
-    let predicate_state = predicates.map(|predicates| {
-        let file_column_indices =
-            build_file_column_indices(mosaic_reader.schema(), &predicates.file_fields);
-        (
-            predicates.predicates,
-            predicates.file_fields,
-            file_column_indices,
-        )
+    let all_scan_columns_missing = !scan_fields.is_empty() && projected_names.is_empty();
+    let predicate_column_indices = predicates.as_ref().map(|predicates| {
+        build_file_column_indices(mosaic_reader.schema(), &predicates.file_fields)
     });
 
     let mut row_group_start = 0usize;
@@ -175,7 +194,9 @@ fn read_mosaic_batches_blocking(
             }
         }
 
-        if let Some((predicates, file_fields, file_column_indices)) = &predicate_state {
+        if let (Some(predicates), Some(file_column_indices)) =
+            (predicates.as_ref(), predicate_column_indices.as_ref())
+        {
             let row_group_stats = mosaic_reader
                 .row_group_stats(row_group_index)
                 .map_err(mosaic_read_error)?;
@@ -183,14 +204,14 @@ fn read_mosaic_batches_blocking(
                 row_group_rows,
                 row_group_stats,
                 file_column_indices,
-                predicates,
-                file_fields,
+                &predicates.predicates,
+                &predicates.file_fields,
             )? {
                 continue;
             }
         }
 
-        let batch = if all_projected_columns_missing {
+        let batch = if all_scan_columns_missing {
             let row_count = selected_slices
                 .as_ref()
                 .map_or(row_group_rows, |slices| selected_row_count(slices));
@@ -206,6 +227,12 @@ fn read_mosaic_batches_blocking(
 
             let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
             take_row_slices(batch, selected_slices.as_deref(), &read_schema)?
+        };
+        let batch = match predicates.as_ref() {
+            Some(predicates) => {
+                filter_record_batch_by_predicates(batch, predicates, &existing_scan_fields)?
+            }
+            None => batch,
         };
         for chunk in split_batch(batch, batch_size) {
             if !send_batch(chunk) {
@@ -237,6 +264,10 @@ impl StatsAccessor for MosaicRowGroupStats<'_> {
 
     fn max_value(&self, index: usize, data_type: &PaimonDataType) -> Option<Datum> {
         mosaic_value_to_datum(self.column_stats(index)?.max.as_ref()?, data_type)
+    }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        true
     }
 }
 
@@ -847,6 +878,32 @@ mod tests {
             .await
     }
 
+    async fn read_ranges_with_predicates(
+        data: Bytes,
+        read_fields: &[DataField],
+        predicates: &FilePredicates,
+    ) -> crate::Result<Vec<Range<u64>>> {
+        let file_size = data.len() as u64;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let _: Vec<RecordBatch> = MosaicFormatReader
+            .read_batch_stream(
+                Box::new(TrackingFileRead {
+                    data,
+                    calls: Arc::clone(&calls),
+                }),
+                file_size,
+                read_fields,
+                Some(predicates),
+                None,
+                None,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        let ranges = calls.lock().unwrap().clone();
+        Ok(ranges)
+    }
+
     fn collect_i32_column(batches: &[RecordBatch], column_index: usize) -> Vec<i32> {
         batches
             .iter()
@@ -953,6 +1010,28 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(4), 5);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_predicate_is_rejected() {
+        let data = write_mosaic(&sample_batch());
+        let fields = data_fields();
+        let predicates = FilePredicates {
+            predicates: vec![crate::spec::row_id_leaf(
+                crate::spec::PredicateOperator::NotEq,
+                vec![Datum::Long(101)],
+            )],
+            row_filter_factory: None,
+            file_fields: fields.clone(),
+        };
+        let err = read_batches_with_predicates(data, &fields, Some(&predicates), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Unsupported { message } if message.contains("_ROW_ID")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1112,7 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_predicate_prunes_non_matching_row_groups() {
+    async fn test_read_predicate_prunes_and_filters_row_groups() {
         let fields = data_fields();
         let builder = PredicateBuilder::new(&fields);
         let predicates = predicate_file_predicates(
@@ -1124,7 +1203,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![10, 11]);
+        assert_eq!(collect_i32_column(&batches, 0), vec![10]);
     }
 
     #[tokio::test]
@@ -1143,8 +1222,85 @@ mod tests {
         assert!(batches.is_empty());
     }
 
+    #[test]
+    fn test_row_group_in_min_max_pruning() {
+        let fields = vec![data_fields()[0].clone()];
+        let builder = PredicateBuilder::new(&fields);
+        let mapping = [Some(0)];
+        let stats = |min, max| {
+            [ColumnStats {
+                column_index: 0,
+                null_count: 0,
+                min,
+                max,
+            }]
+        };
+        let may_match = |stats: &[ColumnStats], literals: Vec<Datum>| {
+            let predicate = builder.is_in("id", literals).unwrap();
+            row_group_may_match(10, stats, &mapping, &[predicate], &fields).unwrap()
+        };
+
+        let valid_stats = stats(
+            Some(MosaicValue::Integer(10)),
+            Some(MosaicValue::Integer(20)),
+        );
+        assert!(!may_match(
+            &valid_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+        assert!(may_match(&valid_stats, vec![Datum::Int(1), Datum::Int(15)]));
+        assert!(may_match(&[], vec![Datum::Int(1), Datum::Int(30)]));
+
+        let damaged_stats = stats(
+            Some(MosaicValue::Integer(20)),
+            Some(MosaicValue::Integer(10)),
+        );
+        assert!(may_match(
+            &damaged_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+
+        let incomparable_stats = stats(
+            Some(MosaicValue::String(b"a".to_vec())),
+            Some(MosaicValue::String(b"z".to_vec())),
+        );
+        assert!(may_match(
+            &incomparable_stats,
+            vec![Datum::Int(1), Datum::Int(30)]
+        ));
+    }
+
     #[tokio::test]
-    async fn test_read_predicate_missing_stats_fails_open() {
+    async fn test_in_pruning_skips_mosaic_column_reads() {
+        let fields = data_fields();
+        let projected = vec![fields[0].clone()];
+        let builder = PredicateBuilder::new(&fields);
+        let eq_predicates = predicate_file_predicates(
+            fields.clone(),
+            vec![builder.equal("id", Datum::Int(99)).unwrap()],
+        );
+        let in_predicates = predicate_file_predicates(
+            fields.clone(),
+            vec![builder
+                .is_in("id", vec![Datum::Int(99), Datum::Int(100)])
+                .unwrap()],
+        );
+        let data = multi_row_group_mosaic(vec!["id".to_string()]);
+
+        let eq_reads = read_ranges_with_predicates(data.clone(), &projected, &eq_predicates)
+            .await
+            .unwrap();
+        let in_reads = read_ranges_with_predicates(data, &projected, &in_predicates)
+            .await
+            .unwrap();
+        assert_eq!(
+            in_reads, eq_reads,
+            "an all-outside IN should not read row-group column data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_predicate_missing_stats_still_filters_rows() {
         let fields = data_fields();
         let builder = PredicateBuilder::new(&fields);
         let predicates = predicate_file_predicates(
@@ -1156,7 +1312,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert!(collect_i32_column(&batches, 0).is_empty());
     }
 
     #[tokio::test]
@@ -1194,7 +1350,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(collect_i32_column(&batches, 0), vec![30, 40]);
+        assert_eq!(collect_i32_column(&batches, 0), vec![30]);
     }
 
     #[tokio::test]
@@ -1244,13 +1400,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_predicate_missing_column_false_prunes_all_row_groups() {
-        let fields = data_fields();
-        let predicates = predicate_file_predicates(fields.clone(), vec![Predicate::AlwaysFalse]);
-        let projected = vec![
-            fields[0].clone(),
-            field(3, "new_score", DataType::Int(IntType::with_nullable(true))),
-        ];
+    async fn test_read_predicate_missing_column_comparison_prunes_all_row_groups() {
+        let mut fields = data_fields();
+        let missing_field = field(3, "new_score", DataType::Int(IntType::with_nullable(true)));
+        fields.push(missing_field.clone());
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("new_score", Datum::Int(1))
+            .unwrap();
+        let predicates = predicate_file_predicates(fields.clone(), vec![predicate]);
+        let projected = vec![fields[0].clone(), missing_field];
         let data = multi_row_group_mosaic(vec!["id".to_string()]);
         let batches = read_batches_with_predicates(data, &projected, Some(&predicates), None)
             .await
@@ -1261,12 +1419,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_predicate_missing_column_is_null_keeps_row_groups() {
-        let fields = data_fields();
-        let predicates = predicate_file_predicates(fields.clone(), vec![Predicate::AlwaysTrue]);
-        let projected = vec![
-            fields[0].clone(),
-            field(3, "new_score", DataType::Int(IntType::with_nullable(true))),
-        ];
+        let mut fields = data_fields();
+        let missing_field = field(3, "new_score", DataType::Int(IntType::with_nullable(true)));
+        fields.push(missing_field.clone());
+        let predicate = PredicateBuilder::new(&fields).is_null("new_score").unwrap();
+        let predicates = predicate_file_predicates(fields.clone(), vec![predicate]);
+        let projected = vec![fields[0].clone(), missing_field];
         let data = multi_row_group_mosaic(vec!["id".to_string()]);
         let batches = read_batches_with_predicates(data, &projected, Some(&predicates), None)
             .await

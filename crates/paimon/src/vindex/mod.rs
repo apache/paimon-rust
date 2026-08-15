@@ -33,6 +33,7 @@ const DEFAULT_METRIC: &str = "inner_product";
 const DEFAULT_NLIST: &str = "256";
 const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
+const DEFAULT_TRAIN_SAMPLE_RATIO: f64 = 1.0;
 
 pub fn is_vindex_index_type(index_type: &str) -> bool {
     matches!(index_type, IVF_FLAT_IDENTIFIER | IVF_PQ_IDENTIFIER)
@@ -50,6 +51,7 @@ pub(crate) fn native_index_type(index_type: &str) -> Option<&'static str> {
 pub(crate) struct VindexVectorIndexOptions {
     pub config: VectorIndexConfig,
     pub native_options: HashMap<String, String>,
+    pub train_sample_ratio: f64,
 }
 
 impl VindexVectorIndexOptions {
@@ -132,9 +134,12 @@ impl VindexVectorIndexOptions {
                 source: Some(Box::new(e)),
             }
         })?;
+        let train_sample_ratio =
+            resolve_train_sample_ratio(table_options, user_options, index_type, field.name())?;
         Ok(Self {
             config,
             native_options,
+            train_sample_ratio,
         })
     }
 
@@ -220,10 +225,50 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
 
 fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
     match suffix {
-        "dimension" | "nlist" | "distance.metric" => true,
+        "dimension" | "nlist" | "distance.metric" | "train.sample-ratio" => true,
         "pq.m" | "pq.use-opq" => index_type == IVF_PQ_IDENTIFIER,
         _ => false,
     }
+}
+
+fn resolve_train_sample_ratio(
+    table_options: &HashMap<String, String>,
+    user_options: &HashMap<String, String>,
+    index_type: &str,
+    field_name: &str,
+) -> crate::Result<f64> {
+    let mut value = None;
+    for options in [user_options, table_options] {
+        for key in [
+            format!("fields.{field_name}.train.sample-ratio"),
+            format!("{index_type}.train.sample-ratio"),
+        ] {
+            if let Some(candidate) = options.get(&key) {
+                value = Some(candidate.as_str());
+                break;
+            }
+        }
+        if value.is_some() {
+            break;
+        }
+    }
+
+    let Some(value) = value else {
+        return Ok(DEFAULT_TRAIN_SAMPLE_RATIO);
+    };
+    let ratio = value
+        .parse::<f64>()
+        .map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("Invalid vindex train.sample-ratio: '{value}'"),
+        })?;
+    if !(ratio > 0.0 && ratio <= 1.0) {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Invalid vindex train.sample-ratio: {value}; expected a finite value in (0, 1]"
+            ),
+        });
+    }
+    Ok(ratio)
 }
 
 fn resolve_dimension(
@@ -377,6 +422,72 @@ mod tests {
             options.native_options.get("nlist").map(String::as_str),
             Some("2")
         );
+    }
+
+    #[test]
+    fn test_vindex_options_train_sample_ratio_default_and_precedence() {
+        let defaults = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &HashMap::new(),
+            IVF_FLAT_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(defaults.train_sample_ratio, 1.0);
+
+        let table_options = HashMap::from([
+            ("ivf-flat.train.sample-ratio".to_string(), "0.5".to_string()),
+            (
+                "fields.embedding.train.sample-ratio".to_string(),
+                "0.25".to_string(),
+            ),
+        ]);
+        let user_options =
+            HashMap::from([("ivf-flat.train.sample-ratio".to_string(), "0.1".to_string())]);
+        let options = VindexVectorIndexOptions::new(
+            &table_options,
+            &user_options,
+            IVF_FLAT_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(options.train_sample_ratio, 0.1);
+
+        let field_user_options = HashMap::from([
+            ("ivf-flat.train.sample-ratio".to_string(), "0.5".to_string()),
+            (
+                "fields.embedding.train.sample-ratio".to_string(),
+                "1.0".to_string(),
+            ),
+        ]);
+        let options = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &field_user_options,
+            IVF_FLAT_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(options.train_sample_ratio, 1.0);
+        assert!(!options.native_options.contains_key("train.sample-ratio"));
+    }
+
+    #[test]
+    fn test_vindex_options_reject_invalid_train_sample_ratio() {
+        for value in ["0", "-0.1", "1.1", "NaN", "inf", "not-a-number"] {
+            let user_options =
+                HashMap::from([("ivf-flat.train.sample-ratio".to_string(), value.to_string())]);
+            let err = VindexVectorIndexOptions::new(
+                &HashMap::new(),
+                &user_options,
+                IVF_FLAT_IDENTIFIER,
+                &array_float_field(),
+            )
+            .expect_err("invalid ratio should be rejected");
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { message } if message.contains("train.sample-ratio")),
+                "value {value} returned unexpected error"
+            );
+        }
     }
 
     #[test]

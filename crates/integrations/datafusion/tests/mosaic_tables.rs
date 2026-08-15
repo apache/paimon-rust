@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
+use paimon::catalog::Identifier;
+use paimon::spec::{Datum, PredicateBuilder};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
 
@@ -182,4 +185,39 @@ async fn test_read_pypaimon_mosaic_fixture() {
         .await,
     );
     assert_eq!(filtered_rows, vec![(2, "Bob".to_string(), 20)]);
+}
+
+#[tokio::test]
+async fn test_direct_core_read_applies_mosaic_filter_exactly() {
+    let (_tmp, warehouse) = extract_test_warehouse();
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
+    let table = catalog
+        .get_table(&Identifier::new("default", FIXTURE_TABLE))
+        .await
+        .expect("Failed to load Mosaic fixture table");
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("Failed to plan Mosaic fixture scan");
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("id", Datum::Int(2))
+        .expect("Failed to build id predicate");
+    let read = paimon::table::TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+        .with_filter(predicate);
+    let batches = read
+        .to_arrow(plan.splits())
+        .expect("Failed to create direct core stream")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("Failed to read Mosaic fixture directly");
+
+    assert_eq!(
+        collect_id_name_score(&batches),
+        vec![(2, "Bob".to_string(), 20)]
+    );
 }

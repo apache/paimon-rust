@@ -149,6 +149,11 @@ fn read_vortex_batches(
             })?;
 
     if scan_fields.is_empty() {
+        // `_ROW_ID` never widens the scan, so this fast path has nothing to
+        // evaluate it against and would treat the predicate as matching.
+        if let Some(fp) = predicates.as_ref() {
+            crate::table::row_id_predicate::reject_row_id_filter(&fp.predicates, "this read")?;
+        }
         let row_count = if constant_predicates_match(predicates.as_ref()) {
             match &row_selection {
                 Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),

@@ -214,4 +214,127 @@ mod tests {
             matches!(err, Error::DataInvalid { message, .. } if message.contains("trailing bytes"))
         );
     }
+
+    /// Assemble a payload from parts so that individual header fields can be
+    /// corrupted independently of what [`BlobViewStruct::serialize`] would emit.
+    fn payload(
+        version: u8,
+        magic: u64,
+        identifier_length: i32,
+        identifier_bytes: &[u8],
+        field_id: i32,
+        row_id: i64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(version);
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf.extend_from_slice(&identifier_length.to_le_bytes());
+        buf.extend_from_slice(identifier_bytes);
+        buf.extend_from_slice(&field_id.to_le_bytes());
+        buf.extend_from_slice(&row_id.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_rejects_empty_payload() {
+        let err = BlobViewStruct::deserialize(&[]).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. } if message.contains("too short")),
+            "expected too-short error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_unsupported_version() {
+        let bytes = payload(CURRENT_VERSION + 1, MAGIC, 9, b"db.source", 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { ref message }
+                if message.contains("Expecting BlobViewStruct version")),
+            "expected version error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_bad_magic() {
+        let bytes = payload(CURRENT_VERSION, !MAGIC, 9, b"db.source", 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. }
+                if message.contains("missing magic header")),
+            "expected magic error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_negative_identifier_length() {
+        let bytes = payload(CURRENT_VERSION, MAGIC, -1, b"db.source", 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. }
+                if message.contains("negative identifier length")),
+            "expected negative-length error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_identifier_length_exceeding_data_size() {
+        let bytes = payload(CURRENT_VERSION, MAGIC, 64, b"db.source", 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. }
+                if message.contains("identifier length exceeds data size")),
+            "expected length-overflow error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_non_utf8_identifier() {
+        let invalid = [b'd', b'b', b'.', 0xFF];
+        let bytes = payload(CURRENT_VERSION, MAGIC, 4, &invalid, 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. }
+                if message.contains("Invalid UTF-8 in BlobViewStruct identifier")),
+            "expected UTF-8 error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_identifier_without_database() {
+        let bytes = payload(CURRENT_VERSION, MAGIC, 6, b"source", 3, 42);
+
+        let err = BlobViewStruct::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. }
+                if message.contains("must be 'database.table'")),
+            "expected identifier-shape error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_blob_view_struct_rejects_short_and_mismatched_payloads() {
+        assert!(!BlobViewStruct::is_blob_view_struct(&[0u8; 8]));
+        assert!(!BlobViewStruct::is_blob_view_struct(&payload(
+            CURRENT_VERSION + 1,
+            MAGIC,
+            9,
+            b"db.source",
+            3,
+            42
+        )));
+        assert!(!BlobViewStruct::is_blob_view_struct(&payload(
+            CURRENT_VERSION,
+            !MAGIC,
+            9,
+            b"db.source",
+            3,
+            42
+        )));
+    }
 }

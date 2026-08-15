@@ -104,6 +104,10 @@ impl<'a> FormatTableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         let core_options = self.table.schema().core_options();
         core_options.ensure_read_authorized()?;
+        // Mapping the conjunct onto the data fields drops it, so the read would
+        // silently ignore the filter. Guard on the read path, not the builder:
+        // `TableRead` is public and can be constructed and filtered directly.
+        super::row_id_predicate::reject_row_id_filter(&self.data_predicates, "format tables")?;
         let read_type = self.read_type.clone();
         let output_schema = build_target_arrow_schema(&read_type)?;
         let partition_keys = self.table.schema().partition_keys().to_vec();

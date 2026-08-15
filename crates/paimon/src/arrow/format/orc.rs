@@ -17,7 +17,7 @@
 
 use super::{FilePredicates, FormatFileReader};
 use crate::io::FileRead;
-use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use async_trait::async_trait;
@@ -222,6 +222,7 @@ fn build_orc_leaf_predicate(
     file_fields: &[DataField],
 ) -> Option<orc_rust::predicate::Predicate> {
     let Predicate::Leaf {
+        column,
         index,
         op,
         literals,
@@ -230,6 +231,10 @@ fn build_orc_leaf_predicate(
     else {
         return None;
     };
+    // Not in the file, and its index would push the wrong column down.
+    if is_row_id_column(column) {
+        return None;
+    }
     let file_field = file_fields.get(*index)?;
     let column = file_field.name();
 

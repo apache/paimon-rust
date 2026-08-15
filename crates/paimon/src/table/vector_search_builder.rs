@@ -17,14 +17,14 @@
 
 use crate::arrow::format::FilePredicates;
 use crate::arrow::residual::{evaluate_predicates_mask, widen_scan_fields};
-use crate::io::FileIO;
+use crate::io::{FileIO, FileRead};
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{
     is_lumina_index_type, LuminaIndexMeta, LuminaVectorIndexOptions, LuminaVectorMetric,
 };
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
-    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
+    IndexFileMeta, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::data_file_reader::DataFileReader;
@@ -64,6 +64,7 @@ use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use futures::{stream, TryStreamExt};
+use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use paimon_vindex_core::io::SeekRead;
@@ -762,7 +763,7 @@ async fn plan_and_search_pk_candidates_batch(
             source: None,
         })?;
 
-    let search_mode = core.global_index_search_mode()?;
+    let search_mode = core.vector_index_search_mode()?;
     let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
 
     // A non-positive limit is invalid regardless of the plan; reject it before
@@ -1442,7 +1443,7 @@ async fn evaluate_batch_vector_search(
 
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
-    let search_mode = core_options.global_index_search_mode()?;
+    let search_mode = core_options.vector_index_search_mode()?;
     let field_name = &vector_searches[0].field_name;
     if vector_searches
         .iter()
@@ -2155,19 +2156,6 @@ pub(crate) fn reorder_and_strip_position(
     Ok(vec![projected])
 }
 
-/// The `_ROW_ID` field to append to a data-evolution read type so the reader
-/// fills each row's global id. Mirrors the field the `DataEvolutionReader`
-/// recognizes (Int64 / `BigInt`, nullable): a data file lacking `first_row_id`
-/// yields nulls here, which `attach_scores_by_row_id` then fails loud on rather
-/// than mis-aligning scores.
-fn row_id_data_field() -> DataField {
-    DataField::new(
-        ROW_ID_FIELD_ID,
-        ROW_ID_FIELD_NAME.to_string(),
-        DataType::BigInt(BigIntType::with_nullable(true)),
-    )
-}
-
 /// Collect materialized DE rows, join each row's `(rank, score)` by its global
 /// `_ROW_ID`, reorder to the search rank order, append the `__paimon_search_score`
 /// column, and drop `_ROW_ID`. Every row must map to a search candidate and the
@@ -2554,16 +2542,41 @@ async fn resolve_raw_vector_metric(
                 }
             }
             VectorIndexBackend::Vindex => {
+                if let Some(index_meta) = global_meta.index_meta.as_ref() {
+                    if let Ok(options) =
+                        serde_json::from_slice::<HashMap<String, String>>(index_meta)
+                    {
+                        if let Some(metric) = options.get("metric") {
+                            if let Some(metric) =
+                                RawVectorMetric::parse_normalized(&normalize_metric(metric))
+                            {
+                                return Ok(metric);
+                            }
+                        }
+                    }
+                }
                 let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
                 let input = file_io.new_input(&path)?;
-                let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
+                let read_error = |e| crate::Error::DataInvalid {
                     message: format!(
                         "Failed to read vindex index file '{}' for raw search metric: {}",
                         entry.index_file.file_name, e
                     ),
-                    source: None,
-                })?;
-                let reader = VIndexReader::open(Cursor::new(bytes.to_vec())).map_err(|e| {
+                    source: Some(Box::new(e)),
+                };
+                let header_size = if entry.index_file.file_size > 0 {
+                    (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
+                } else {
+                    input
+                        .metadata()
+                        .await
+                        .map_err(&read_error)?
+                        .size
+                        .min(DISKANN_HEADER_SIZE as u64)
+                };
+                let file_reader = input.reader().await.map_err(&read_error)?;
+                let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
+                let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| {
                     crate::Error::DataInvalid {
                         message: format!(
                             "Failed to open paimon-vindex-core reader for raw search metric: {}",
@@ -3187,6 +3200,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_resolve_raw_vector_metric_uses_vindex_manifest_metadata() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut entry = make_lumina_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+        let index_meta = serde_json::to_vec(&HashMap::from([(
+            "metric".to_string(),
+            "cosine".to_string(),
+        )]))
+        .unwrap();
+        entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .index_meta = Some(index_meta);
+
+        let metric = resolve_raw_vector_metric(
+            &file_io,
+            "memory:///test_table",
+            &HashMap::new(),
+            &[entry],
+            2,
+            "embedding",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metric, RawVectorMetric::Cosine);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let index = build_vindex_segment_bytes("inner_product");
+        file_io
+            .new_output("memory:///test_table/index/test.idx")
+            .unwrap()
+            .write(bytes::Bytes::from(index.clone()))
+            .await
+            .unwrap();
+        for (file_size, index_meta) in [
+            (index.len() as i64, br#"{"metric":"euclidean"}"#.to_vec()),
+            (0, b"{}".to_vec()),
+            (-1, b"{}".to_vec()),
+        ] {
+            let mut entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+            entry.index_file.file_size = file_size;
+            entry
+                .index_file
+                .global_index_meta
+                .as_mut()
+                .unwrap()
+                .index_meta = Some(index_meta);
+
+            let metric = resolve_raw_vector_metric(
+                &file_io,
+                "memory:///test_table",
+                &HashMap::new(),
+                &[entry],
+                2,
+                "embedding",
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(metric, RawVectorMetric::InnerProduct);
+        }
+    }
+
     #[test]
     fn test_configured_refine_factor_precedence_and_aliases() {
         let table_options = HashMap::from([(
@@ -3494,7 +3576,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
-        let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
+        let options = HashMap::from([("vector-index.search-mode".to_string(), "full".to_string())]);
 
         let err = evaluate_vector_search(
             eval_context(&file_io, &options, &fields, Some(10)),

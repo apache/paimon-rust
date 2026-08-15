@@ -933,6 +933,7 @@ pub(crate) async fn bucket_search_batch(
 mod tests {
     use super::*;
     use crate::spec::PrimaryKeyIndexSourceFile as PkVectorSourceFile;
+    use crate::vindex::executor::ensure_global_index_executor_capacity;
     use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
     use crate::vindex::pkvector::exact::exact_search;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
@@ -2416,13 +2417,117 @@ mod tests {
         );
     }
 
+    const SCORER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const SCORER_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    static GATED_SCORER_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    async fn lock_gated_scorer_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        GATED_SCORER_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    type ScorerIdentity = (usize, String);
+    type StartedScorer = (ScorerIdentity, std::sync::mpsc::Sender<()>);
+
+    /// Reports a scorer's identity to the test task, then blocks until that task
+    /// releases it. Both sides use timeouts so a scheduling regression fails instead
+    /// of hanging the suite.
+    #[derive(Clone)]
+    struct ScorerGate {
+        started: tokio::sync::mpsc::UnboundedSender<StartedScorer>,
+    }
+
+    impl ScorerGate {
+        fn wait_for_release(&self, query_id: usize, segment: &str) -> crate::Result<()> {
+            let (release, released) = std::sync::mpsc::channel();
+            self.started
+                .send(((query_id, segment.to_string()), release))
+                .map_err(|_| data_invalid("scorer gate closed before recording a start"))?;
+            released
+                .recv_timeout(SCORER_RELEASE_TIMEOUT)
+                .map_err(|error| {
+                    data_invalid(format!(
+                        "scorer gate did not release query {query_id} segment '{segment}': {error}"
+                    ))
+                })?;
+            Ok(())
+        }
+    }
+
+    fn scorer_gate() -> (
+        ScorerGate,
+        tokio::sync::mpsc::UnboundedReceiver<StartedScorer>,
+    ) {
+        let (started, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (ScorerGate { started }, receiver)
+    }
+
+    async fn wait_for_started_scorers(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<StartedScorer>,
+        count: usize,
+    ) -> Result<Vec<StartedScorer>, String> {
+        let mut scorers = Vec::with_capacity(count);
+        while scorers.len() < count {
+            let scorer = match tokio::time::timeout(SCORER_START_TIMEOUT, receiver.recv()).await {
+                Ok(Some(scorer)) => scorer,
+                Ok(None) => {
+                    return Err("scorer gate closed before all starts arrived".to_string());
+                }
+                Err(_) => {
+                    receiver.close();
+                    return Err(format!(
+                        "timed out waiting for {count} scorer starts; observed {}",
+                        scorers.len()
+                    ));
+                }
+            };
+            scorers.push(scorer);
+        }
+        Ok(scorers)
+    }
+
+    fn release_started_scorers(scorers: Vec<StartedScorer>) -> Vec<ScorerIdentity> {
+        let mut identities = Vec::with_capacity(scorers.len());
+        for (identity, release) in scorers {
+            identities.push(identity);
+            let _ = release.send(());
+        }
+        identities.sort();
+        identities
+    }
+
+    async fn expect_started_scorers(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<StartedScorer>,
+        expected: &[(usize, &str)],
+    ) -> Result<(), String> {
+        let scorers = wait_for_started_scorers(receiver, expected.len()).await?;
+        let observed = release_started_scorers(scorers);
+        let mut expected = expected
+            .iter()
+            .map(|(query_id, segment)| (*query_id, (*segment).to_string()))
+            .collect::<Vec<_>>();
+        expected.sort();
+        if observed != expected {
+            return Err(format!(
+                "unexpected scorer starts: expected {expected:?}, observed {observed:?}"
+            ));
+        }
+        Ok(())
+    }
+
     /// ANN searcher probe that records the peak number of `search_batch` calls
-    /// running simultaneously. Each call does a real blocking sleep so overlapping
-    /// calls are observable; `peak` is the max concurrent count seen. Mirrors the
-    /// blocking CPU nature of the real vindex scorer.
+    /// running simultaneously. Concurrency tests attach a gate so the test task can
+    /// inspect which scorers are active before releasing them.
     struct PeakProbeAnn {
         inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        gate: Option<ScorerGate>,
+        query_id: usize,
+        gated_segment: Option<&'static str>,
     }
     impl PkVectorAnnSearcher for PeakProbeAnn {
         fn load_segment(
@@ -2433,7 +2538,7 @@ mod tests {
         }
         fn search_batch(
             &self,
-            _segment: &BucketAnnSegment,
+            segment: &BucketAnnSegment,
             _segment_bytes: Bytes,
             queries: &[&[f32]],
             _metric: VectorSearchMetric,
@@ -2446,8 +2551,18 @@ mod tests {
             use std::sync::atomic::Ordering::SeqCst;
             let current = self.inflight.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(current, SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let gate_result = if let Some(gate) = &self.gate {
+                if self.gated_segment.is_none_or(|gated| gated == segment.path) {
+                    gate.wait_for_release(self.query_id, &segment.path)
+                } else {
+                    Ok(())
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            };
             self.inflight.fetch_sub(1, SeqCst);
+            gate_result?;
             Ok(queries.iter().map(|_| Vec::new()).collect())
         }
     }
@@ -2457,6 +2572,7 @@ mod tests {
     /// test can assert how many segment searches ran at once.
     fn n_segment_bucket(
         n: usize,
+        gate: Option<ScorerGate>,
     ) -> (
         Vec<BucketAnnSegment>,
         Vec<BucketActiveFile>,
@@ -2479,42 +2595,45 @@ mod tests {
         let probe = std::sync::Arc::new(PeakProbeAnn {
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             peak: peak.clone(),
+            gate,
+            query_id: 0,
+            gated_segment: None,
         });
         (segments, actives, probe, peak)
     }
 
     #[tokio::test]
     async fn ann_segments_search_in_parallel_at_concurrency_above_one() {
-        // Two ANN segments in one bucket. At concurrency 4 their (blocking) searches
-        // must overlap: peak simultaneous ANN calls must exceed 1. A serial ANN loop
-        // yields peak == 1 and fails this assertion.
-        let (segments, active_files, probe, peak) = n_segment_bucket(2);
+        let _test_guard = lock_gated_scorer_tests().await;
+        ensure_global_index_executor_capacity(4);
+        let (gate, mut started) = scorer_gate();
+        let (segments, active_files, probe, _peak) = n_segment_bucket(2, Some(gate));
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
         let factory = unreachable_search();
-        let out = bucket_search(
-            Some(searcher),
-            &segments,
-            &active_files,
-            &HashMap::new(),
-            &factory,
-            &[0.0, 0.0],
-            VectorSearchMetric::L2,
-            8,
-            8,
-            &HashMap::new(),
-            false,
-            None,
-            4,
-            Some(SearchBudget::per_query_only(4)),
-        )
-        .await
-        .unwrap();
+        let search = async {
+            bucket_search(
+                Some(searcher),
+                &segments,
+                &active_files,
+                &HashMap::new(),
+                &factory,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                &HashMap::new(),
+                false,
+                None,
+                4,
+                Some(SearchBudget::per_query_only(4)),
+            )
+            .await
+        };
+        let observe = expect_started_scorers(&mut started, &[(0, "seg-0"), (0, "seg-1")]);
+        let (out, observed) = tokio::join!(search, observe);
+        observed.expect("two ANN segment scorers must start before release");
+        let out = out.unwrap();
         assert!(out.indexed.is_empty());
-        assert!(
-            peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "ANN segment searches must run in parallel at concurrency 4; observed peak {}",
-            peak.load(std::sync::atomic::Ordering::SeqCst)
-        );
     }
 
     #[tokio::test]
@@ -2522,7 +2641,7 @@ mod tests {
         // At concurrency 1 the ANN segments must NOT overlap: peak simultaneous
         // calls is exactly 1 (still off the async worker on the dedicated executor,
         // but one at a time). Guards the one-worker budget without regressing inline.
-        let (segments, active_files, probe, peak) = n_segment_bucket(3);
+        let (segments, active_files, probe, peak) = n_segment_bucket(3, None);
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
         let factory = unreachable_search();
         bucket_search(
@@ -2555,35 +2674,66 @@ mod tests {
         // Four ANN segments, shared budget of 2: at most 2 segment searches may run
         // at once even though concurrency (fan-out width) is 4. Mirrors Java's single
         // shared pool sized to threadNum capping total in-flight leaf work.
-        let (segments, active_files, probe, peak) = n_segment_bucket(4);
+        let _test_guard = lock_gated_scorer_tests().await;
+        ensure_global_index_executor_capacity(4);
+        let (gate, mut started) = scorer_gate();
+        let (segments, active_files, probe, peak) = n_segment_bucket(4, Some(gate));
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
         let factory = unreachable_search();
-        bucket_search(
-            Some(searcher),
-            &segments,
-            &active_files,
-            &HashMap::new(),
-            &factory,
-            &[0.0, 0.0],
-            VectorSearchMetric::L2,
-            8,
-            8,
-            &HashMap::new(),
-            false,
-            None,
-            4,
-            Some(SearchBudget::per_query_only(2)),
-        )
-        .await
-        .unwrap();
-        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            observed <= 2,
-            "shared budget must cap concurrent ANN segment searches at 2; observed {observed}"
+        let shared = Arc::new(Semaphore::new(2));
+        let search = async {
+            bucket_search(
+                Some(searcher),
+                &segments,
+                &active_files,
+                &HashMap::new(),
+                &factory,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                &HashMap::new(),
+                false,
+                None,
+                4,
+                Some(SearchBudget::shared_for_test(shared.clone())),
+            )
+            .await
+        };
+        let observe = async {
+            let first = wait_for_started_scorers(&mut started, 2).await?;
+            let first_available = shared.available_permits();
+            let mut identities = release_started_scorers(first);
+
+            let second = wait_for_started_scorers(&mut started, 2).await?;
+            let second_available = shared.available_permits();
+            identities.extend(release_started_scorers(second));
+            identities.sort();
+            Ok::<_, String>((identities, [first_available, second_available]))
+        };
+        let (out, observed) = tokio::join!(search, observe);
+        let (identities, available_permits) =
+            observed.expect("all four gated ANN scorers must start in two waves");
+        out.unwrap();
+        assert_eq!(
+            identities,
+            vec![
+                (0, "seg-0".to_string()),
+                (0, "seg-1".to_string()),
+                (0, "seg-2".to_string()),
+                (0, "seg-3".to_string()),
+            ],
+            "every ANN segment must pass through the controlled gate exactly once"
         );
-        assert!(
-            observed >= 2,
-            "test must actually exercise ANN overlap; observed {observed}"
+        assert_eq!(
+            available_permits,
+            [0, 0],
+            "both shared-budget permits must remain held while each scorer wave is gated"
+        );
+        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 2,
+            "shared budget must cap concurrent ANN segment searches at exactly 2"
         );
     }
 
@@ -2594,7 +2744,7 @@ mod tests {
         // validation, BEFORE any segment search leaf is spawned — so the probe's
         // peak stays 0. Guards Codex's "validate all segments before launching any
         // job" requirement.
-        let (mut segments, _active_files, probe, peak) = n_segment_bucket(2);
+        let (mut segments, _active_files, probe, peak) = n_segment_bucket(2, None);
         // Break segment 1's source row count vs the active file (active says 2).
         segments[1] = BucketAnnSegment {
             source_meta: meta(&[("cov-1", 99)]),
@@ -2638,35 +2788,38 @@ mod tests {
         // Multi-query (2 queries) routes through the `bucket_search_batch` multi-query
         // path (not the batch-of-one short-circuit), so this covers the batch ANN
         // parallel loop specifically. Two segments at concurrency 4 must overlap.
-        let (segments, active_files, probe, peak) = n_segment_bucket(2);
+        let _test_guard = lock_gated_scorer_tests().await;
+        ensure_global_index_executor_capacity(4);
+        let (gate, mut started) = scorer_gate();
+        let (segments, active_files, probe, _peak) = n_segment_bucket(2, Some(gate));
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
         let factory = unreachable_search();
         let q0: &[f32] = &[0.0, 0.0];
         let q1: &[f32] = &[1.0, 1.0];
-        let out = bucket_search_batch(
-            Some(searcher),
-            &segments,
-            &active_files,
-            &HashMap::new(),
-            &factory,
-            &[q0, q1],
-            VectorSearchMetric::L2,
-            8,
-            8,
-            &HashMap::new(),
-            false,
-            None,
-            4,
-            Some(SearchBudget::per_query_only(4)),
-        )
-        .await
-        .unwrap();
+        let search = async {
+            bucket_search_batch(
+                Some(searcher),
+                &segments,
+                &active_files,
+                &HashMap::new(),
+                &factory,
+                &[q0, q1],
+                VectorSearchMetric::L2,
+                8,
+                8,
+                &HashMap::new(),
+                false,
+                None,
+                4,
+                Some(SearchBudget::per_query_only(4)),
+            )
+            .await
+        };
+        let observe = expect_started_scorers(&mut started, &[(0, "seg-0"), (0, "seg-1")]);
+        let (out, observed) = tokio::join!(search, observe);
+        observed.expect("two batch ANN segment scorers must start before release");
+        let out = out.unwrap();
         assert_eq!(out.len(), 2, "one result list per query");
-        assert!(
-            peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "batch ANN segment searches must run in parallel at concurrency 4; observed peak {}",
-            peak.load(std::sync::atomic::Ordering::SeqCst)
-        );
     }
 
     /// ANN searcher whose `search_batch` panics, exercising the dedicated
@@ -2700,7 +2853,7 @@ mod tests {
         // A panic inside the dedicated-executor ANN leaf must surface as a mapped
         // `UnexpectedError` ("ANN segment search task failed"), not abort the runtime
         // or hang. Uses the parallel path (concurrency 4).
-        let (segments, active_files, _probe, _peak) = n_segment_bucket(1);
+        let (segments, active_files, _probe, _peak) = n_segment_bucket(1, None);
         let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(PanicAnn);
         let factory = unreachable_search();
         let err = bucket_search(
@@ -2779,7 +2932,7 @@ mod tests {
         // are slow. The drain must (a) run ALL 4 scorers to completion even though
         // seg-1 errors early, and (b) surface seg-1's error (lowest index), not seg-2's
         // and not whichever finished first.
-        let (segments, active_files, _probe, _peak) = n_segment_bucket(4);
+        let (segments, active_files, _probe, _peak) = n_segment_bucket(4, None);
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(DrainProbeAnn {
             completed: completed.clone(),
@@ -2819,41 +2972,6 @@ mod tests {
         );
     }
 
-    /// ANN searcher that records peak concurrent calls into an EXTERNALLY shared
-    /// counter, so two independent `bucket_search` invocations can observe their
-    /// combined in-flight count. Each call blocks briefly so overlap is observable.
-    struct SharedPeakAnn {
-        inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl PkVectorAnnSearcher for SharedPeakAnn {
-        fn load_segment(
-            &self,
-            segment: &BucketAnnSegment,
-        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
-            empty_ann_loader(segment)
-        }
-        fn search_batch(
-            &self,
-            _segment: &BucketAnnSegment,
-            _segment_bytes: Bytes,
-            queries: &[&[f32]],
-            _metric: VectorSearchMetric,
-            _limit: usize,
-            _active_source_files: &HashSet<String>,
-            _dvs: &HashMap<String, Arc<DeletionVector>>,
-            _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
-            use std::sync::atomic::Ordering::SeqCst;
-            let current = self.inflight.fetch_add(1, SeqCst) + 1;
-            self.peak.fetch_max(current, SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            self.inflight.fetch_sub(1, SeqCst);
-            Ok(queries.iter().map(|_| Vec::new()).collect())
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shared_budget_caps_ann_across_concurrent_searches() {
         // Two independent searches (simulating two concurrent PK-vector queries), each
@@ -2863,17 +2981,26 @@ mod tests {
         // queries, which is what the process-global static does in production. Before
         // the fix, each query built its own Semaphore, so the combined peak could
         // reach 2 (segments) x 2 (queries) = 4.
+        let _test_guard = lock_gated_scorer_tests().await;
+        ensure_global_index_executor_capacity(4);
+        let (gate, mut started) = scorer_gate();
         let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shared = Arc::new(Semaphore::new(2));
 
-        let run = |budget: SearchBudget| {
+        let run = |query_id: usize, budget: SearchBudget| {
+            let gate = gate.clone();
             let inflight = inflight.clone();
             let peak = peak.clone();
             async move {
-                let (segments, active_files, _p, _pk) = n_segment_bucket(2);
-                let searcher: Arc<dyn PkVectorAnnSearcher> =
-                    Arc::new(SharedPeakAnn { inflight, peak });
+                let (segments, active_files, _p, _pk) = n_segment_bucket(2, None);
+                let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(PeakProbeAnn {
+                    inflight,
+                    peak,
+                    gate: Some(gate),
+                    query_id,
+                    gated_segment: Some("seg-0"),
+                });
                 let factory = unreachable_search();
                 bucket_search(
                     Some(searcher),
@@ -2891,24 +3018,39 @@ mod tests {
                     4,
                     Some(budget),
                 )
-                .await
-                .unwrap();
+                .await?;
+                Ok::<_, crate::Error>(())
             }
         };
 
         // Both searches share the SAME budget semaphore.
-        let a = run(SearchBudget::shared_for_test(shared.clone()));
-        let b = run(SearchBudget::shared_for_test(shared.clone()));
-        tokio::join!(a, b);
+        let a = run(0, SearchBudget::shared_for_test(shared.clone()));
+        let b = run(1, SearchBudget::shared_for_test(shared.clone()));
+        let observe = async {
+            let scorers = wait_for_started_scorers(&mut started, 2).await?;
+            let available_permits = shared.available_permits();
+            let identities = release_started_scorers(scorers);
+            Ok::<_, String>((identities, available_permits))
+        };
+        let (a_out, b_out, observed) = tokio::join!(a, b, observe);
+        let (identities, available_permits) =
+            observed.expect("one scorer from each query must start before release");
+        a_out.unwrap();
+        b_out.unwrap();
+        assert_eq!(
+            identities,
+            vec![(0, "seg-0".to_string()), (1, "seg-0".to_string())],
+            "the controlled gate must observe scorer overlap across both queries"
+        );
+        assert_eq!(
+            available_permits, 0,
+            "both shared-budget permits must be held by the gated cross-query scorers"
+        );
 
         let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            observed <= 2,
-            "shared budget must cap ANN across concurrent searches at 2; observed {observed}"
-        );
-        assert!(
-            observed >= 2,
-            "test must actually exercise cross-search overlap; observed {observed}"
+        assert_eq!(
+            observed, 2,
+            "shared budget must cap ANN across concurrent searches at exactly 2"
         );
     }
 

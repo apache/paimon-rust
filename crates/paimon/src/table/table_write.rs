@@ -44,7 +44,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::{SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +56,27 @@ enum FileWriter {
     AppendDedicated(Box<AppendDedicatedFormatFileWriter>),
     KeyValue(KeyValueFileWriter),
     Postpone(PostponeFileWriter),
+}
+
+pub(super) fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
+    if row_indices.len() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+    let indices =
+        arrow_array::UInt32Array::from(row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to take rows: {e}"),
+            source: None,
+        })?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| crate::Error::DataInvalid {
+        message: format!("Failed to create sub-batch: {e}"),
+        source: None,
+    })
 }
 
 impl FileWriter {
@@ -112,6 +133,7 @@ pub struct TableWrite {
     changelog_file_format: String,
     changelog_file_compression: String,
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
+    sequence_snapshot: Option<Option<Snapshot>>,
     commit_user: String,
     /// Bucket assignment strategy (fixed, dynamic, or cross-partition).
     bucket_assigner: BucketAssignerEnum,
@@ -136,6 +158,9 @@ pub struct TableWrite {
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
+        // A dynamic-bucket write reads the persisted PK hash index; the rest are
+        // refused too, since their commit is blocked anyway.
+        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
@@ -379,6 +404,7 @@ impl TableWrite {
             changelog_file_format,
             changelog_file_compression,
             partition_seq_cache: HashMap::new(),
+            sequence_snapshot: None,
             commit_user,
             bucket_assigner,
             is_overwrite,
@@ -397,11 +423,17 @@ impl TableWrite {
     /// bucket → (max_sequence_number + 1) for each bucket in that partition.
     async fn scan_partition_sequence_numbers(
         table: &Table,
+        sequence_snapshot: Option<Option<Snapshot>>,
         partition_bytes: &[u8],
     ) -> crate::Result<HashMap<i32, i64>> {
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
-        let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
+        let latest_snapshot = match sequence_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                let snapshot_manager =
+                    SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+                snapshot_manager.get_latest_snapshot().await?
+            }
+        };
         let mut bucket_seq: HashMap<i32, i64> = HashMap::new();
         if let Some(snapshot) = latest_snapshot {
             let partition_filter = Self::build_partition_filter(table, partition_bytes)?;
@@ -418,6 +450,17 @@ impl TableWrite {
             }
         }
         Ok(bucket_seq)
+    }
+
+    pub(super) async fn pin_sequence_snapshot(&mut self) -> Result<i64> {
+        let snapshot_manager = SnapshotManager::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+        );
+        let snapshot = snapshot_manager.get_latest_snapshot().await?;
+        let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
+        self.sequence_snapshot = Some(snapshot);
+        Ok(snapshot_id)
     }
 
     /// Build a partition filter from serialized partition bytes.
@@ -450,17 +493,9 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.validate_write_batch_schema(batch)?;
-
-        if batch.num_rows() == 0 {
+        let Some(batch) = self.normalize_write_batch(batch).await? else {
             return Ok(());
-        }
-
-        let batch = self.normalize_evolved_storage_fields(batch).await?;
-        let batch = self.enrich_rowkind_batch(&batch)?;
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
+        };
 
         let grouped = self.divide_by_partition_bucket(&batch).await?;
         for ((partition_bytes, bucket), sub_batch) in grouped {
@@ -506,6 +541,28 @@ impl TableWrite {
                 source: Some(Box::new(error)),
             }
         })
+    }
+
+    pub(super) async fn normalize_write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>> {
+        self.validate_write_batch_schema(batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let batch = self.normalize_evolved_storage_fields(batch).await?;
+        let batch = self.enrich_rowkind_batch(&batch)?;
+        Ok((batch.num_rows() != 0).then_some(batch))
+    }
+
+    pub(super) async fn write_partition_bucket_batch(
+        &mut self,
+        partition: Vec<u8>,
+        bucket: i32,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        self.write_bucket(partition, bucket, batch).await
     }
 
     fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
@@ -658,7 +715,7 @@ impl TableWrite {
             || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
             || !output.deletes.is_empty();
         for (key, row_indices) in groups {
-            let sub_batch = Self::take_rows(batch, &row_indices)?;
+            let sub_batch = take_rows(batch, &row_indices)?;
             let sub_batch = if needs_value_kind && !batch_has_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
@@ -676,36 +733,13 @@ impl TableWrite {
                     .push(*row_idx);
             }
             for (key, row_indices) in delete_groups {
-                let sub_batch = Self::take_rows(batch, &row_indices)?;
+                let sub_batch = take_rows(batch, &row_indices)?;
                 let delete_batch = Self::add_value_kind_column(&sub_batch, 1)?;
                 result.push((key, delete_batch));
             }
         }
 
         Ok(result)
-    }
-
-    /// Extract rows from a batch by indices.
-    fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> Result<RecordBatch> {
-        if row_indices.len() == batch.num_rows() {
-            return Ok(batch.clone());
-        }
-        let indices = arrow_array::UInt32Array::from(
-            row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-        );
-        let columns: Vec<Arc<dyn arrow_array::Array>> = batch
-            .columns()
-            .iter()
-            .map(|col| arrow_select::take::take(col.as_ref(), &indices, None))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to take rows: {e}"),
-                source: None,
-            })?;
-        RecordBatch::try_new(batch.schema(), columns).map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to create sub-batch: {e}"),
-            source: None,
-        })
     }
 
     /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
@@ -763,7 +797,7 @@ impl TableWrite {
         if keep_rows.is_empty() {
             return Ok(RecordBatch::new_empty(batch.schema()));
         }
-        let filtered = Self::take_rows(batch, &keep_rows)?;
+        let filtered = take_rows(batch, &keep_rows)?;
         Self::add_per_row_value_kind_column(&filtered, kinds)
     }
 
@@ -989,8 +1023,11 @@ impl TableWrite {
         // Lazily scan partition sequence numbers on first writer creation per partition.
         // Overwrite mode skips this — old data will be replaced, so seq starts at 0.
         if !self.is_overwrite && !self.partition_seq_cache.contains_key(partition_bytes) {
+            let table = self.table.clone();
+            let sequence_snapshot = self.sequence_snapshot.clone();
             let bucket_seq =
-                Self::scan_partition_sequence_numbers(&self.table, partition_bytes).await?;
+                Self::scan_partition_sequence_numbers(&table, sequence_snapshot, partition_bytes)
+                    .await?;
             self.partition_seq_cache
                 .insert(partition_bytes.to_vec(), bucket_seq);
         }
@@ -1032,7 +1069,7 @@ impl TableWrite {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::table) mod tests {
     use super::*;
     use crate::arrow::format::create_format_reader;
     use crate::catalog::Identifier;
@@ -1040,8 +1077,8 @@ mod tests {
     use crate::spec::{
         bucket_dir_name, BigIntType, BinaryRow, BinaryRowBuilder, BinaryType, BlobType, DataField,
         DataType, Datum, DecimalType, FileKind, FloatType, IndexManifest, IntType,
-        LocalZonedTimestampType, Manifest, ManifestList, PredicateBuilder, Schema, TableSchema,
-        TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
+        LocalZonedTimestampType, Manifest, ManifestList, PredicateBuilder, Schema, SchemaChange,
+        TableSchema, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VectorType,
         SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
         VALUE_KIND_FIELD_NAME,
     };
@@ -1051,9 +1088,10 @@ mod tests {
     use arrow_schema::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
     };
+    use bytes::Bytes;
     use std::sync::Arc;
 
-    fn test_file_io() -> FileIO {
+    pub(in crate::table) fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
     }
 
@@ -1111,6 +1149,67 @@ mod tests {
             .is_some_and(|field_ids| field_ids.is_empty()));
     }
 
+    #[tokio::test]
+    async fn test_normalize_write_batch_applies_evolved_storage_constraints() {
+        let file_io = test_file_io();
+        let table_path = "memory:/evolved_postpone_normalization";
+        let initial = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::new(10).unwrap()))
+                .primary_key(["id"])
+                .option("bucket", "-2")
+                .build()
+                .unwrap(),
+        );
+        let current = initial
+            .apply_changes(vec![SchemaChange::update_column_type(
+                "name".to_string(),
+                DataType::VarChar(VarCharType::new(3).unwrap()),
+            )])
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "evolved_postpone_normalization"),
+            table_path.to_string(),
+            current,
+            None,
+        );
+        let schema_path = table.schema_manager().schema_path(initial.id());
+        file_io
+            .mkdirs(schema_path.rsplit_once('/').unwrap().0)
+            .await
+            .unwrap();
+        file_io
+            .new_output(&schema_path)
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&initial).unwrap()))
+            .await
+            .unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, true),
+                ArrowField::new("name", ArrowDataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["abcdef"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let normalized = writer.normalize_write_batch(&batch).await.unwrap().unwrap();
+        let names = normalized
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "abc");
+    }
+
     fn test_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
@@ -1146,7 +1245,7 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+    pub(in crate::table) async fn setup_dirs(file_io: &FileIO, table_path: &str) {
         file_io
             .mkdirs(&format!("{table_path}/snapshot/"))
             .await
@@ -1157,7 +1256,7 @@ mod tests {
             .unwrap();
     }
 
-    fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+    pub(in crate::table) fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new("value", ArrowDataType::Int32, false),
@@ -3736,7 +3835,7 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+    pub(in crate::table) fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_postpone_table"),
@@ -3759,7 +3858,10 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
-    fn test_postpone_partitioned_table(file_io: &FileIO, table_path: &str) -> Table {
+    pub(in crate::table) fn test_postpone_partitioned_table(
+        file_io: &FileIO,
+        table_path: &str,
+    ) -> Table {
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_postpone_table"),
@@ -3769,7 +3871,11 @@ mod tests {
         )
     }
 
-    fn make_partitioned_batch_3col(pts: Vec<&str>, ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+    pub(in crate::table) fn make_partitioned_batch_3col(
+        pts: Vec<&str>,
+        ids: Vec<i32>,
+        values: Vec<i32>,
+    ) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("pt", ArrowDataType::Utf8, false),
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -4294,7 +4400,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn read_id_value_rows(table: &Table) -> Vec<(i32, i32)> {
+    pub(in crate::table) async fn read_id_value_rows(table: &Table) -> Vec<(i32, i32)> {
         let rb = table.new_read_builder();
         let plan = rb.new_scan().plan().await.unwrap();
         let read = rb.new_read().unwrap();

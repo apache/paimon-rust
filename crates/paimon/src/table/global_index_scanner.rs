@@ -826,22 +826,26 @@ impl GlobalIndexScanner {
     /// Get a cached reader or open a new one for the given file.
     async fn get_or_open_reader(
         &self,
-        file_name: &str,
+        entry: &GlobalIndexEntry,
         meta: &BTreeIndexMeta,
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
         // Try to take from cache
         {
             let mut cache = self.reader_cache.lock().unwrap();
-            if let Some(reader) = cache.remove(file_name) {
+            if let Some(reader) = cache.remove(&entry.file_name) {
                 return Ok(OpenedGlobalIndexReader::BTree(reader));
             }
         }
 
         // Open new reader
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, file_name);
+        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
         let input = self.file_io.new_input(&path)?;
-        let file_size = input.metadata().await?.size;
+        let file_size = if entry.file_size > 0 {
+            entry.file_size as u64
+        } else {
+            input.metadata().await?.size
+        };
         let file_reader = input.reader().await?;
 
         let cmp = make_key_comparator(data_type);
@@ -849,7 +853,7 @@ impl GlobalIndexScanner {
             .await
             .map(OpenedGlobalIndexReader::BTree)
             .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to open BTree index file: {file_name}"),
+                message: format!("Failed to open BTree index file: {}", entry.file_name),
                 source: Some(Box::new(e)),
             })
     }
@@ -861,12 +865,9 @@ impl GlobalIndexScanner {
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
         match entry.index_type {
-            GlobalIndexFileKind::BTree => {
-                self.get_or_open_reader(&entry.file_name, meta, data_type)
-                    .await
-            }
+            GlobalIndexFileKind::BTree => self.get_or_open_reader(entry, meta, data_type).await,
             GlobalIndexFileKind::Bitmap => self
-                .open_bitmap_reader(&entry.file_name)
+                .open_bitmap_reader(entry)
                 .await
                 .map(OpenedGlobalIndexReader::Bitmap)
                 .map_err(|e| crate::Error::DataInvalid {
@@ -881,18 +882,22 @@ impl GlobalIndexScanner {
 
     async fn open_bitmap_reader(
         &self,
-        file_name: &str,
+        entry: &GlobalIndexEntry,
     ) -> std::io::Result<BitmapGlobalIndexReader> {
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, file_name);
+        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
         let input = self
             .file_io
             .new_input(&path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let file_size = input
-            .metadata()
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .size;
+        let file_size = if entry.file_size > 0 {
+            entry.file_size as u64
+        } else {
+            input
+                .metadata()
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .size
+        };
         let file_reader = input
             .reader()
             .await
@@ -2169,10 +2174,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_evaluate_global_index_eq() {
-        let (file_io, table_path, file_name, _tmp) =
+        let (file_io, table_path, file_name, tmp) =
             setup_testdata_table("btree_int_100_no_compress.bin");
         let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
-        let entries = vec![make_global_index_entry(&file_name, 1, 0, 99, &meta)];
+        let mut entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        entry.index_file.file_size = std::fs::metadata(tmp.path().join("index").join(&file_name))
+            .unwrap()
+            .len() as i64;
+        let entries = vec![entry];
         let fields = int_schema_fields();
 
         // key=50 -> row_id=25, offset by row_range_start=0 -> global row_id=25
@@ -2190,6 +2199,31 @@ mod tests {
                 .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(25, 25)]);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_global_index_uses_known_file_size() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let mut entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        entry.index_file.file_size = 1;
+
+        let error = evaluate_global_index_fast(
+            &file_io,
+            &table_path,
+            &[entry],
+            &[int_eq("id", 0, 50)],
+            &int_schema_fields(),
+        )
+        .await
+        .expect_err("the known file size should be used without a metadata lookup");
+
+        assert!(matches!(
+            error,
+            crate::Error::DataInvalid { message, .. }
+                if message.contains("Failed to open BTree index file")
+        ));
     }
 
     #[tokio::test]
@@ -2305,15 +2339,19 @@ mod tests {
     #[tokio::test]
     async fn test_evaluate_java_bitmap_golden_index_eq_and_null() {
         let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
-        let (file_io, table_path, file_name, meta, _tmp) = setup_java_bitmap_testdata_table();
-        let entries = vec![make_global_index_entry_with_type(
+        let (file_io, table_path, file_name, meta, tmp) = setup_java_bitmap_testdata_table();
+        let mut entry = make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
             109,
             &meta,
-        )];
+        );
+        entry.index_file.file_size = std::fs::metadata(tmp.path().join("index").join(&file_name))
+            .unwrap()
+            .len() as i64;
+        let entries = vec![entry];
         let fields = string_schema_fields();
         assert_eq!(meta.first_key, Some(b"alpha".to_vec()));
         assert_eq!(meta.last_key, Some(b"office".to_vec()));
@@ -2660,15 +2698,20 @@ mod tests {
     #[tokio::test]
     async fn test_evaluate_java_bitmap_golden_index_string_fallback_scan() {
         let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
-        let (file_io, table_path, file_name, meta, _tmp) = setup_java_bitmap_testdata_table();
-        let entries = vec![make_global_index_entry_with_type(
+        let (file_io, table_path, file_name, meta, tmp) = setup_java_bitmap_testdata_table();
+        let file_size = std::fs::metadata(tmp.path().join("index").join(&file_name))
+            .unwrap()
+            .len() as i64;
+        let mut entry = make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
             109,
             &meta,
-        )];
+        );
+        entry.index_file.file_size = file_size;
+        let entries = vec![entry];
         let fields = string_schema_fields();
 
         let ends_with_predicates = vec![Predicate::Leaf {
@@ -2747,15 +2790,16 @@ mod tests {
         .unwrap();
         assert_eq!(less_than_result.unwrap(), vec![RowRange::new(100, 102)]);
 
-        let mut over_limit_entries = vec![make_global_index_entry_with_type(
+        let mut over_limit_entry = make_global_index_entry_with_type(
             BITMAP_GLOBAL_INDEX_TYPE,
             &file_name,
             1,
             100,
             109,
             &meta,
-        )];
-        over_limit_entries[0].index_file.file_size = 2;
+        );
+        over_limit_entry.index_file.file_size = file_size;
+        let over_limit_entries = vec![over_limit_entry];
         let over_limit_less_than = evaluate_global_index_fast_with_fallback_size(
             &file_io,
             &table_path,
@@ -2763,7 +2807,7 @@ mod tests {
             &less_than_predicates,
             &fields,
             i64::MAX,
-            1,
+            file_size - 1,
         )
         .await
         .unwrap();
@@ -2786,7 +2830,7 @@ mod tests {
             &no_match_contains,
             &fields,
             i64::MAX,
-            1,
+            file_size - 1,
         )
         .await
         .unwrap();
@@ -2818,7 +2862,7 @@ mod tests {
             &direct_with_over_limit_fallback,
             &fields,
             i64::MAX,
-            1,
+            file_size - 1,
         )
         .await
         .unwrap();

@@ -50,6 +50,9 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        // Dropping an index reads the index manifest.
+        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         self.table.ensure_not_branch_reference_for_write()?;
 
         let index_type =
@@ -169,6 +172,53 @@ mod tests {
     use crate::table::TableCommit;
     use chrono::{DateTime, Utc};
     use indexmap::IndexMap;
+
+    #[tokio::test]
+    async fn test_query_auth_table_refuses_index_builds_and_drops() {
+        let table = crate::table::query_auth_table();
+
+        let refused = |err: crate::Error, what: &str| {
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "{what} on a query-auth.enabled table must fail closed, got {err:?}"
+            );
+        };
+
+        refused(
+            table
+                .new_global_index_drop_builder()
+                .with_index_type("btree")
+                .execute()
+                .await
+                .unwrap_err(),
+            "dropping a global index",
+        );
+        refused(
+            table
+                .new_btree_global_index_build_builder()
+                .execute()
+                .await
+                .unwrap_err(),
+            "building a BTree global index",
+        );
+        refused(
+            table
+                .new_vindex_index_build_builder("vector")
+                .execute()
+                .await
+                .unwrap_err(),
+            "building a vector index",
+        );
+        refused(
+            table
+                .new_lumina_index_build_builder()
+                .execute()
+                .await
+                .unwrap_err(),
+            "building a lumina index",
+        );
+    }
 
     fn test_table(table_path: &str) -> Table {
         let schema = Schema::builder()

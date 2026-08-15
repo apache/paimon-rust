@@ -45,7 +45,7 @@
 //! must not reference any vortex-specific types.
 
 use crate::arrow::format::FilePredicates;
-use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::Error;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
@@ -159,41 +159,51 @@ fn evaluate_predicate_mask(
             })))
         }
         Predicate::Leaf {
+            column,
             index,
             op,
             literals,
             data_type: predicate_data_type,
-            ..
         } => {
-            let Some(file_field) = file_fields.get(*index) else {
-                return Ok(None);
+            // Resolve the batch column by NAME, but pick that name carefully: a
+            // real column may be renamed in the file, so its batch name comes
+            // from `file_fields[index]`; `_ROW_ID` is absent from `file_fields`
+            // and only its own name is meaningful. Java's `PredicateRemapper`
+            // rebinds by name too.
+            let file_field = if is_row_id_column(column) {
+                None
+            } else {
+                match file_fields.get(*index) {
+                    Some(field) => Some(field),
+                    None => return Ok(None),
+                }
             };
-            // Resolve the predicate column in the batch by NAME against the batch's
-            // own schema. We must not index by the column's position in
-            // `scan_fields`: a reader's emitted batch may order columns by its file
-            // schema (e.g. ORC `ProjectionMask::named_roots`), not by `scan_fields`
-            // order, so positional indexing can select the wrong column (and
-            // compare mismatched types). `scan_fields` is used only to detect the
-            // Gap-A "predicate column not scanned" bug below.
-            let column = batch
+            let field_name = file_field.map_or(column.as_str(), DataField::name);
+            let field_type = file_field.map_or(predicate_data_type, DataField::data_type);
+            // Never index by position in `scan_fields`: a reader's emitted batch
+            // may order columns by its file schema (e.g. ORC
+            // `ProjectionMask::named_roots`) rather than by `scan_fields` order.
+            // `scan_fields` is used only for the Gap-A guard below.
+            let array = batch
                 .schema()
-                .index_of(file_field.name())
+                .index_of(field_name)
                 .ok()
                 .map(|batch_index| batch.column(batch_index));
-            let Some(column) = column else {
-                // The predicate column exists in the file schema but is absent
-                // from the batch actually scanned — this is the Gap-A bug (a
-                // reader that did not widen its scan to include predicate columns
-                // before filtering). It must never happen. Fail loudly in
-                // debug/test builds; degrade to a skip (rather than panic) in
-                // release. `scan_fields` is unused for resolution now (we look up
-                // by name in the batch), so touch it here only to keep the guard
-                // message informative.
+            let Some(array) = array else {
                 let _ = scan_fields;
+                if file_field.is_none() {
+                    // Backstop for residuals applied to a predicate-free reader
+                    // (PK merge output, vector search); readers that own their
+                    // predicates reject earlier.
+                    return Err(crate::table::row_id_predicate::unsupported_row_id_filter(
+                        "this read",
+                    ));
+                }
+                // A real column missing here is a reader bug: it did not widen
+                // its scan to the predicate columns.
                 debug_assert!(
                     false,
-                    "residual predicate column '{}' exists in file_fields but is missing from the scanned batch; the reader must widen its scan to include predicate columns",
-                    file_field.name()
+                    "residual predicate column '{field_name}' is missing from the scanned batch; the reader must widen its scan to include predicate columns"
                 );
                 return Ok(None);
             };
@@ -206,16 +216,14 @@ fn evaluate_predicate_mask(
             // column up to the predicate type first — then the literal is always
             // representable and the comparison is exact.
             let predicate_arrow_type = crate::arrow::paimon_type_to_arrow(predicate_data_type)?;
-            let mask = if column.data_type() == &predicate_arrow_type {
-                evaluate_exact_leaf_predicate(column, file_field.data_type(), *op, literals)
+            let mask = if array.data_type() == &predicate_arrow_type {
+                evaluate_exact_leaf_predicate(array, field_type, *op, literals)
             } else {
-                let cast_column = arrow_cast::cast(column, &predicate_arrow_type).map_err(|e| {
+                let cast_column = arrow_cast::cast(array, &predicate_arrow_type).map_err(|e| {
                     Error::DataInvalid {
                         message: format!(
-                            "Failed to cast residual column '{}' from {:?} to {:?}: {e}",
-                            file_field.name(),
-                            column.data_type(),
-                            predicate_arrow_type
+                            "Failed to cast residual column '{field_name}' from {:?} to {predicate_arrow_type:?}: {e}",
+                            array.data_type()
                         ),
                         source: Some(Box::new(e)),
                     }
@@ -251,11 +259,15 @@ pub(crate) fn widen_scan_fields(
     let mut fields = read_fields.to_vec();
 
     if let Some(fp) = predicates {
-        let mut predicate_indices = Vec::new();
+        let mut refs = Vec::new();
         for predicate in &fp.predicates {
-            collect_predicate_field_indices(predicate, &mut predicate_indices);
+            collect_predicate_leaf_refs(predicate, &mut refs);
         }
-        for index in predicate_indices {
+        for (name, index) in refs {
+            // Not read from the file, so there is nothing to widen with.
+            if is_row_id_column(name) {
+                continue;
+            }
             if let Some(field) = fp.file_fields.get(index) {
                 push_unique_scan_field(&mut fields, field);
             }
@@ -265,15 +277,22 @@ pub(crate) fn widen_scan_fields(
     fields
 }
 
-pub(crate) fn collect_predicate_field_indices(predicate: &Predicate, indices: &mut Vec<usize>) {
+/// Collect every leaf as `(column name, leaf index)`.
+///
+/// Callers that resolve a leaf positionally must check the name first — see
+/// [`crate::spec::is_row_id_column`].
+pub(crate) fn collect_predicate_leaf_refs<'a>(
+    predicate: &'a Predicate,
+    refs: &mut Vec<(&'a str, usize)>,
+) {
     match predicate {
-        Predicate::Leaf { index, .. } => indices.push(*index),
+        Predicate::Leaf { column, index, .. } => refs.push((column.as_str(), *index)),
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {
-                collect_predicate_field_indices(child, indices);
+                collect_predicate_leaf_refs(child, refs);
             }
         }
-        Predicate::Not(inner) => collect_predicate_field_indices(inner, indices),
+        Predicate::Not(inner) => collect_predicate_leaf_refs(inner, refs),
         Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
     }
 }
@@ -972,7 +991,7 @@ fn float64_literal(literal: &Datum) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{IntType, VarCharType};
+    use crate::spec::{row_id_leaf, IntType, VarCharType, ROW_ID_FIELD_NAME};
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
@@ -1452,6 +1471,61 @@ mod tests {
         let fp = file_predicates(vec![pred], vec![name.clone(), age]);
         let scan_fields = vec![name];
         let _ = filter_record_batch_by_predicates(batch, &fp, &scan_fields);
+    }
+
+    fn batch_with_row_id(values: Vec<i32>, row_ids: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("v", ArrowDataType::Int32, true),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(values)),
+                Arc::new(arrow_array::Int64Array::from(row_ids)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_row_id_leaf_resolves_by_name_not_by_placeholder_index() {
+        let v = int_field(1, "v");
+        let batch = batch_with_row_id(vec![99, 7, 7], vec![1, 2, 3]);
+        let pred = row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)]);
+        let fp = file_predicates(vec![pred], vec![v.clone()]);
+        let out = filter_record_batch_by_predicates(batch, &fp, &[v]).unwrap();
+        assert_eq!(int_values(&out), vec![99]);
+    }
+
+    #[test]
+    fn test_row_id_leaf_inside_a_disjunction_resolves_by_name() {
+        let v = int_field(1, "v");
+        let batch = batch_with_row_id(vec![99, 7, 5], vec![1, 2, 3]);
+        let pred = Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)]),
+            leaf(
+                0,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Eq,
+                vec![Datum::Int(7)],
+            ),
+        ]);
+        let fp = file_predicates(vec![pred], vec![v.clone()]);
+        let out = filter_record_batch_by_predicates(batch, &fp, &[v]).unwrap();
+        assert_eq!(int_values(&out), vec![99, 7]);
+    }
+
+    #[test]
+    fn test_widen_scan_fields_skips_system_columns() {
+        let other = int_field(1, "other");
+        let v = int_field(2, "v");
+        let fp = file_predicates(
+            vec![row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)])],
+            vec![other, v.clone()],
+        );
+        let widened = widen_scan_fields(std::slice::from_ref(&v), Some(&fp));
+        assert_eq!(widened, vec![v]);
     }
 
     #[test]

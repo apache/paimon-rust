@@ -23,7 +23,9 @@ use crate::predicate_stats::{
     data_leaf_may_match, data_leaf_must_match, missing_field_may_match, missing_field_must_match,
     predicates_may_match_with_schema, StatsAccessor,
 };
-use crate::spec::{extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate};
+use crate::spec::{
+    extract_datum, is_row_id_column, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,9 +37,24 @@ pub(super) struct FileStatsRows {
     null_counts: Vec<Option<i64>>,
     supports_in_min_max_pruning: bool,
     /// Maps schema field index → stats index. `None` means identity mapping
-    /// (stats cover all schema fields in order). `Some` is used when
-    /// `value_stats_cols` or `write_cols` is present (dense mode).
+    /// (stats cover all schema fields in order). `Some` maps dense stats such
+    /// as `value_stats_cols`, `write_cols`, or trimmed primary-key stats.
     stats_col_mapping: Option<Vec<Option<usize>>>,
+}
+
+fn dense_stats_col_mapping(
+    schema_fields: &[DataField],
+    stats_columns: &[String],
+) -> Vec<Option<usize>> {
+    let col_index: HashMap<&str, usize> = stats_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i))
+        .collect();
+    schema_fields
+        .iter()
+        .map(|field| col_index.get(field.name()).copied())
+        .collect()
 }
 
 impl FileStatsRows {
@@ -64,31 +81,11 @@ impl FileStatsRows {
     /// When `value_stats_cols` is `Some`, stats are in dense mode — only covering those
     /// columns, and the mapping from schema field index to stats index is built by name.
     pub(super) fn from_data_file(file: &DataFileMeta, schema_fields: &[DataField]) -> Self {
-        let stats_col_mapping = if let Some(cols) = &file.value_stats_cols {
-            let col_index: HashMap<&str, usize> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.as_str(), i))
-                .collect();
-            let mapping: Vec<Option<usize>> = schema_fields
-                .iter()
-                .map(|field| col_index.get(field.name()).copied())
-                .collect();
-            Some(mapping)
-        } else if let Some(cols) = &file.write_cols {
-            let col_index: HashMap<&str, usize> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.as_str(), i))
-                .collect();
-            let mapping: Vec<Option<usize>> = schema_fields
-                .iter()
-                .map(|field| col_index.get(field.name()).copied())
-                .collect();
-            Some(mapping)
-        } else {
-            None
-        };
+        let stats_col_mapping = file
+            .value_stats_cols
+            .as_ref()
+            .or(file.write_cols.as_ref())
+            .map(|cols| dense_stats_col_mapping(schema_fields, cols));
 
         Self {
             row_count: file.row_count,
@@ -97,6 +94,25 @@ impl FileStatsRows {
             null_counts: file.value_stats.null_counts().clone(),
             supports_in_min_max_pruning: true,
             stats_col_mapping,
+        }
+    }
+
+    /// Build file stats from `_KEY_STATS`.
+    ///
+    /// Key stats are dense and follow the table's trimmed primary-key order
+    /// (primary-key columns with partition columns removed).
+    pub(super) fn from_key_stats(
+        file: &DataFileMeta,
+        schema_fields: &[DataField],
+        key_fields: &[String],
+    ) -> Self {
+        Self {
+            row_count: file.row_count,
+            min_values: BinaryRow::from_serialized_bytes(file.key_stats.min_values()).ok(),
+            max_values: BinaryRow::from_serialized_bytes(file.key_stats.max_values()).ok(),
+            null_counts: file.key_stats.null_counts().clone(),
+            supports_in_min_max_pruning: true,
+            stats_col_mapping: Some(dense_stats_col_mapping(schema_fields, key_fields)),
         }
     }
 
@@ -145,47 +161,96 @@ impl StatsAccessor for FileStatsRows {
 #[derive(Debug)]
 pub(super) struct ResolvedStatsSchema {
     file_fields: Vec<DataField>,
+    key_fields: Vec<String>,
 }
 
 fn identity_field_mapping(num_fields: usize) -> Vec<Option<usize>> {
     (0..num_fields).map(Some).collect()
 }
 
+fn has_always_false(predicates: &[Predicate], key_predicates: &[Predicate]) -> bool {
+    predicates
+        .iter()
+        .chain(key_predicates)
+        .any(|p| matches!(p, Predicate::AlwaysFalse))
+}
+
+fn matches_file_stats(
+    file: &DataFileMeta,
+    predicates: &[Predicate],
+    key_predicates: &[Predicate],
+    field_mapping: &[Option<usize>],
+    schema_fields: &[DataField],
+    key_fields: &[String],
+) -> bool {
+    let value_stats = FileStatsRows::from_data_file(file, schema_fields);
+    if !predicates_may_match_with_schema(predicates, &value_stats, field_mapping, schema_fields) {
+        return false;
+    }
+
+    if key_predicates.is_empty() {
+        return true;
+    }
+
+    let key_stats = FileStatsRows::from_key_stats(file, schema_fields, key_fields);
+    predicates_may_match_with_schema(key_predicates, &key_stats, field_mapping, schema_fields)
+}
+
 /// Check whether a data file *may* contain rows matching all `predicates`.
+///
+/// Value predicates are evaluated against `_VALUE_STATS`; primary-key
+/// predicates are additionally evaluated against `_KEY_STATS`. Both sources
+/// must report that the file may match.
 ///
 /// Pruning is evaluated per file and fails open when stats cannot be
 /// interpreted safely, including schema mismatches, incompatible stats arity,
 /// and missing or corrupted stats.
-pub(super) fn data_file_matches_predicates(
+pub(super) fn data_file_matches_predicates_with_key_stats(
     file: &DataFileMeta,
     predicates: &[Predicate],
+    key_predicates: &[Predicate],
     current_schema_id: i64,
     schema_fields: &[DataField],
+    key_fields: &[String],
 ) -> bool {
-    if predicates.is_empty() {
+    if predicates.is_empty() && key_predicates.is_empty() {
         return true;
     }
 
-    if predicates
-        .iter()
-        .any(|p| matches!(p, Predicate::AlwaysFalse))
-    {
+    if has_always_false(predicates, key_predicates) {
         return false;
-    }
-    if predicates
-        .iter()
-        .all(|p| matches!(p, Predicate::AlwaysTrue))
-    {
-        return true;
     }
 
     if file.schema_id != current_schema_id {
         return true;
     }
 
-    let stats = FileStatsRows::from_data_file(file, schema_fields);
     let field_mapping = identity_field_mapping(schema_fields.len());
-    predicates_may_match_with_schema(predicates, &stats, &field_mapping, schema_fields)
+    matches_file_stats(
+        file,
+        predicates,
+        key_predicates,
+        &field_mapping,
+        schema_fields,
+        key_fields,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn data_file_matches_predicates(
+    file: &DataFileMeta,
+    predicates: &[Predicate],
+    current_schema_id: i64,
+    schema_fields: &[DataField],
+) -> bool {
+    data_file_matches_predicates_with_key_stats(
+        file,
+        predicates,
+        &[],
+        current_schema_id,
+        schema_fields,
+        &[],
+    )
 }
 
 async fn resolve_stats_schema(
@@ -202,11 +267,15 @@ async fn resolve_stats_schema(
     let resolved = if file_schema_id == table_schema.id() {
         Some(Arc::new(ResolvedStatsSchema {
             file_fields: current_fields.to_vec(),
+            key_fields: table_schema.trimmed_primary_keys(),
         }))
     } else {
         let file_schema = table.schema_manager().schema(file_schema_id).await.ok()?;
         let file_fields = file_schema.fields().to_vec();
-        Some(Arc::new(ResolvedStatsSchema { file_fields }))
+        Some(Arc::new(ResolvedStatsSchema {
+            file_fields,
+            key_fields: file_schema.trimmed_primary_keys(),
+        }))
     };
 
     schema_cache.insert(file_schema_id, resolved.clone());
@@ -217,18 +286,25 @@ pub(super) async fn data_file_matches_predicates_for_table(
     table: &Table,
     file: &DataFileMeta,
     predicates: &[Predicate],
+    key_predicates: &[Predicate],
     schema_cache: &mut HashMap<i64, Option<Arc<ResolvedStatsSchema>>>,
 ) -> bool {
-    if predicates.is_empty() {
+    if predicates.is_empty() && key_predicates.is_empty() {
         return true;
     }
 
+    if has_always_false(predicates, key_predicates) {
+        return false;
+    }
+
     if file.schema_id == table.schema().id() {
-        return data_file_matches_predicates(
+        return data_file_matches_predicates_with_key_stats(
             file,
             predicates,
+            key_predicates,
             table.schema().id(),
             table.schema().fields(),
+            &table.schema().trimmed_primary_keys(),
         );
     }
 
@@ -238,16 +314,22 @@ pub(super) async fn data_file_matches_predicates_for_table(
 
     let file_predicates =
         remap_predicates_to_file(predicates, table.schema().fields(), &resolved.file_fields);
-    if file_predicates.predicates.is_empty() {
+    let file_key_predicates = remap_predicates_to_file(
+        key_predicates,
+        table.schema().fields(),
+        &resolved.file_fields,
+    );
+    if file_predicates.predicates.is_empty() && file_key_predicates.predicates.is_empty() {
         return true;
     }
-    let stats = FileStatsRows::from_data_file(file, &resolved.file_fields);
     let field_mapping = identity_field_mapping(resolved.file_fields.len());
-    predicates_may_match_with_schema(
+    matches_file_stats(
+        file,
         &file_predicates.predicates,
-        &stats,
+        &file_key_predicates.predicates,
         &field_mapping,
         &resolved.file_fields,
+        &resolved.key_fields,
     )
 }
 
@@ -386,6 +468,8 @@ fn data_evolution_predicate_may_match(
             file_stats,
             row_count,
         ),
+        // `_ROW_ID` has no column stats, so never prune a group on it.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => true,
         Predicate::Leaf {
             index,
             data_type,
@@ -449,6 +533,8 @@ fn data_evolution_predicate_must_match(
             file_stats,
             row_count,
         ),
+        // Stats cannot decide `_ROW_ID`, so it never provably matches.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => false,
         Predicate::Leaf {
             index,
             data_type,

@@ -35,13 +35,46 @@ use url::Url;
 use super::cache::{CachedFileReader, LocalCache};
 use super::Storage;
 
-#[derive(Clone, Debug)]
+#[async_trait::async_trait]
+pub(crate) trait FileIOProvider: std::fmt::Debug + Send + Sync {
+    async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
+}
+
+#[derive(Clone)]
 pub struct FileIO {
     storage: Arc<Storage>,
     cache: Option<Arc<LocalCache>>,
+    provider: Option<Arc<dyn FileIOProvider>>,
+}
+
+impl std::fmt::Debug for FileIO {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileIO")
+            .field("storage", &self.storage)
+            .field("cache", &self.cache)
+            .field("provider", &self.provider)
+            .finish()
+    }
 }
 
 impl FileIO {
+    pub(crate) fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
+        let (op, relative_path) = self.storage.create(path)?;
+        Ok((op, relative_path.into_owned()))
+    }
+
+    async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+        match &self.provider {
+            Some(provider) => provider.create(path).await,
+            None => self.create_static(path),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn has_local_cache(&self) -> bool {
         self.cache.is_some()
@@ -100,6 +133,7 @@ impl FileIO {
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
+            provider: self.provider.clone(),
         })
     }
 
@@ -119,6 +153,7 @@ impl FileIO {
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
+            provider: self.provider.clone(),
         })
     }
 
@@ -126,7 +161,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         let meta = op
             .stat(relative_path.as_ref())
             .await
@@ -150,7 +185,7 @@ impl FileIO {
     ///
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         // `relative_path` is a byte-suffix of `path` for object stores and POSIX
         // local paths, so this recovers the scheme/root prefix. For a Windows
         // local path the relative form only swaps `\`->`/` (length-preserving),
@@ -188,7 +223,7 @@ impl FileIO {
 
     /// List all files recursively under the given directory path.
     pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         // See `list_status`: `relative_path` is a byte-suffix of `path` except
         // for Windows local paths, where it only swaps separators (same length).
         let base_path = &path[..path.len() - relative_path.len()];
@@ -230,7 +265,7 @@ impl FileIO {
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
     pub async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
 
         op.exists(relative_path.as_ref())
             .await
@@ -241,7 +276,7 @@ impl FileIO {
 
     /// Check if a directory exists.
     pub async fn exists_dir(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         let dir_path = normalize_root(relative_path.as_ref());
 
         op.exists(&dir_path).await.context(IoUnexpectedSnafu {
@@ -253,7 +288,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         let cache_path = cache_object_path(&op, relative_path.as_ref());
 
         op.delete(relative_path.as_ref())
@@ -272,7 +307,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L139>
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         let cache_path = cache_object_path(&op, relative_path.as_ref());
 
         op.delete_with(relative_path.as_ref())
@@ -294,7 +329,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L150>
     pub async fn mkdirs(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let (op, relative_path) = self.create(path).await?;
         // Opendal create_dir expects the path to end with `/` to indicate a directory.
         let dir_path = normalize_root(relative_path.as_ref());
         op.create_dir(&dir_path).await.context(IoUnexpectedSnafu {
@@ -319,8 +354,8 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let (op_src, relative_path_src) = self.storage.create(src)?;
-        let (op_dst, relative_path_dst) = self.storage.create(dst)?;
+        let (op_src, relative_path_src) = self.create(src).await?;
+        let (op_dst, relative_path_dst) = self.create(dst).await?;
         let cache_path_src = cache_object_path(&op_src, relative_path_src.as_ref());
         let cache_path_dst = cache_object_path(&op_dst, relative_path_dst.as_ref());
 
@@ -430,6 +465,7 @@ impl FileIOBuilder {
         Ok(FileIO {
             storage: Arc::new(storage),
             cache,
+            provider: None,
         })
     }
 }
@@ -573,19 +609,37 @@ pub struct InputFile {
     relative_path: String,
     cache_path: String,
     cache: Option<Arc<LocalCache>>,
+    provider: Option<Arc<dyn FileIOProvider>>,
 }
 
 impl InputFile {
+    async fn resolve(&self) -> crate::Result<(Operator, String, String)> {
+        match &self.provider {
+            Some(provider) => {
+                let (op, relative_path) = provider.create(&self.path).await?;
+                let cache_path = cache_object_path(&op, &relative_path);
+                Ok((op, relative_path, cache_path))
+            }
+            None => Ok((
+                self.op.clone(),
+                self.relative_path.clone(),
+                self.cache_path.clone(),
+            )),
+        }
+    }
+
     pub fn location(&self) -> &str {
         &self.path
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.relative_path).await?)
+        let (op, relative_path, _) = self.resolve().await?;
+        Ok(op.exists(&relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
-        let meta = self.op.stat(&self.relative_path).await?;
+        let (op, relative_path, _) = self.resolve().await?;
+        let meta = op.stat(&relative_path).await?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -598,49 +652,41 @@ impl InputFile {
     }
 
     pub async fn read(&self) -> crate::Result<Bytes> {
+        let (op, relative_path, cache_path) = self.resolve().await?;
         let Some(cache) = &self.cache else {
-            return Ok(self.op.read(&self.relative_path).await?.to_bytes());
+            return Ok(op.read(&relative_path).await?.to_bytes());
         };
-        let read_token = cache.read_token(&self.cache_path);
-        let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
+        let read_token = cache.read_token(&cache_path);
+        let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
-            let size = self.op.stat(&self.relative_path).await?.content_length();
-            cache
-                .put_file_size(&self.cache_path, size, &read_token)
-                .await;
+            let size = op.stat(&relative_path).await?.content_length();
+            cache.put_file_size(&cache_path, size, &read_token).await;
             size
         };
-        let delegate = Arc::new(self.op.reader(&self.relative_path).await?);
-        CachedFileReader::new_with_token(
-            delegate,
-            &self.cache_path,
-            size,
-            cache.clone(),
-            read_token,
-        )
-        .read_full()
-        .await
+        let delegate = Arc::new(op.reader(&relative_path).await?);
+        CachedFileReader::new_with_token(delegate, &cache_path, size, cache.clone(), read_token)
+            .read_full()
+            .await
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
-        let reader = self.op.reader(&self.relative_path).await?;
+        let (op, relative_path, cache_path) = self.resolve().await?;
+        let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct(reader));
         };
-        let read_token = cache.read_token(&self.cache_path);
-        let size = if let Some(size) = cache.file_size(&self.cache_path, &read_token).await {
+        let read_token = cache.read_token(&cache_path);
+        let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
-            let size = self.op.stat(&self.relative_path).await?.content_length();
-            cache
-                .put_file_size(&self.cache_path, size, &read_token)
-                .await;
+            let size = op.stat(&relative_path).await?.content_length();
+            cache.put_file_size(&cache_path, size, &read_token).await;
             size
         };
         Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
             Arc::new(reader),
-            &self.cache_path,
+            &cache_path,
             size,
             cache.clone(),
             read_token,
@@ -657,15 +703,32 @@ pub struct OutputFile {
     relative_path: String,
     cache_path: String,
     cache: Option<Arc<LocalCache>>,
+    provider: Option<Arc<dyn FileIOProvider>>,
 }
 
 impl OutputFile {
+    async fn resolve(&self) -> crate::Result<(Operator, String, String)> {
+        match &self.provider {
+            Some(provider) => {
+                let (op, relative_path) = provider.create(&self.path).await?;
+                let cache_path = cache_object_path(&op, &relative_path);
+                Ok((op, relative_path, cache_path))
+            }
+            None => Ok((
+                self.op.clone(),
+                self.relative_path.clone(),
+                self.cache_path.clone(),
+            )),
+        }
+    }
+
     pub fn location(&self) -> &str {
         &self.path
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        Ok(self.op.exists(&self.relative_path).await?)
+        let (op, relative_path, _) = self.resolve().await?;
+        Ok(op.exists(&relative_path).await?)
     }
 
     pub fn to_input_file(self) -> InputFile {
@@ -676,6 +739,7 @@ impl OutputFile {
             relative_path: self.relative_path,
             cache_path: self.cache_path,
             cache,
+            provider: self.provider,
         }
     }
 
@@ -686,21 +750,28 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let writer: Box<dyn FileWrite> = Box::new(self.opendal_writer().await?);
+        let (op, relative_path, cache_path) = self.resolve().await?;
+        let writer: Box<dyn FileWrite> = Box::new(
+            op.writer_with(&relative_path)
+                .chunk(8 * 1024 * 1024)
+                .await?,
+        );
         let Some(cache) = &self.cache else {
             return Ok(writer);
         };
         Ok(Box::new(CacheInvalidatingWriter {
             delegate: writer,
             cache: cache.clone(),
-            path: self.cache_path.clone(),
+            path: cache_path,
         }))
     }
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
+        let (op, relative_path, cache_path) = self.resolve().await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
-            self.opendal_writer()
+            op.writer_with(&relative_path)
+                .chunk(8 * 1024 * 1024)
                 .await?
                 .into_futures_async_write()
                 .compat_write(),
@@ -711,14 +782,10 @@ impl OutputFile {
         Ok(Box::new(CacheInvalidatingAsyncWriter {
             delegate: writer,
             cache: cache.clone(),
-            path: self.cache_path.clone(),
+            path: cache_path,
             delegate_shutdown: false,
             invalidation: None,
         }))
-    }
-
-    async fn opendal_writer(&self) -> crate::Result<opendal::Writer> {
-        Ok(self.op.writer(&self.relative_path).await?)
     }
 }
 

@@ -23,6 +23,9 @@ pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
+const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
+const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
+const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
@@ -78,12 +81,14 @@ const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
+pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
+    "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
     "alter-column-null-to-not-null.disabled";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
-const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
+pub(crate) const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";
@@ -95,8 +100,12 @@ const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
 const DIFF_PARALLELISM_OPTION: &str = "diff.parallelism";
 const DEFAULT_DIFF_PARALLELISM: usize = 4;
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
-const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
-const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
+/// Java types `commit.timeout` as a duration with no default and treats an
+/// absent value as `Long.MAX_VALUE`, i.e. the retry budget alone bounds the
+/// loop. `u64::MAX` is the equivalent sentinel here: the value is only ever
+/// compared against elapsed time, never used in arithmetic.
+const DEFAULT_COMMIT_TIMEOUT_MS: u64 = u64::MAX;
+const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 10;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
@@ -105,7 +114,7 @@ pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
 const INCREMENTAL_BETWEEN_OPTION: &str = "incremental-between";
 const INCREMENTAL_BETWEEN_TIMESTAMP_OPTION: &str = "incremental-between-timestamp";
 const INCREMENTAL_BETWEEN_SCAN_MODE_OPTION: &str = "incremental-between-scan-mode";
-const SCAN_WATERMARK_OPTION: &str = "scan.watermark";
+pub const SCAN_WATERMARK_OPTION: &str = "scan.watermark";
 const SCAN_MODE_OPTION: &str = "scan.mode";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
@@ -300,9 +309,12 @@ pub struct CoreOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimeTravelSelector<'a> {
     TimestampMillis(i64),
+    /// `scan.watermark`: batch time travel to the earliest snapshot whose
+    /// watermark is greater than or equal to the value (millis).
+    Watermark(i64),
     /// `scan.version` (SQL `VERSION AS OF`): ambiguous by design. Resolved at
-    /// scan time as tag name (if a tag exists) → snapshot id (if parseable) →
-    /// error. `option_name` is kept for error attribution.
+    /// scan time as tag name (if a tag exists) → `watermark-<value>` → snapshot
+    /// id (if parseable) → error. `option_name` is kept for error attribution.
     Version {
         value: &'a str,
         option_name: &'static str,
@@ -417,7 +429,6 @@ impl<'a> CoreOptions<'a> {
             INCREMENTAL_BETWEEN_OPTION,
             INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
             INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
-            SCAN_WATERMARK_OPTION,
         ] {
             if self.options.contains_key(key) {
                 return Err(crate::Error::Unsupported {
@@ -433,6 +444,7 @@ impl<'a> CoreOptions<'a> {
                     SCAN_SNAPSHOT_ID_OPTION,
                     SCAN_TAG_NAME_OPTION,
                     SCAN_VERSION_OPTION,
+                    SCAN_WATERMARK_OPTION,
                 ]
             } else if mode.eq_ignore_ascii_case("from-timestamp") {
                 &[SCAN_TIMESTAMP_MILLIS_OPTION]
@@ -462,6 +474,18 @@ impl<'a> CoreOptions<'a> {
     pub fn deletion_vectors_enabled(&self) -> bool {
         self.options
             .get(DELETION_VECTORS_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether reads expose the `_SEQUENCE_NUMBER` system column
+    /// (`table-read.sequence-number.enabled`, default `false`).
+    ///
+    /// Only meaningful for primary-key tables: the sequence number lives in the
+    /// merge key, so an append table has no such column to project.
+    pub fn table_read_sequence_number_enabled(&self) -> bool {
+        self.options
+            .get(TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
@@ -621,18 +645,36 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        match self
-            .options
-            .get(GLOBAL_INDEX_SEARCH_MODE_OPTION)
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref()
-            .unwrap_or("fast")
-        {
+        self.index_search_mode(GLOBAL_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn scalar_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn vector_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(VECTOR_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn full_text_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(FULL_TEXT_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    fn index_search_mode(&self, family_option: &str) -> crate::Result<GlobalIndexSearchMode> {
+        let (option, value) = if let Some(value) = self.options.get(family_option) {
+            (family_option, value)
+        } else if let Some(value) = self.options.get(GLOBAL_INDEX_SEARCH_MODE_OPTION) {
+            (GLOBAL_INDEX_SEARCH_MODE_OPTION, value)
+        } else {
+            return Ok(GlobalIndexSearchMode::Fast);
+        };
+
+        match value.to_ascii_lowercase().as_str() {
             "fast" => Ok(GlobalIndexSearchMode::Fast),
             "full" => Ok(GlobalIndexSearchMode::Full),
             "detail" => Ok(GlobalIndexSearchMode::Detail),
             other => Err(crate::Error::ConfigInvalid {
-                message: format!("Unsupported global-index.search-mode: {other}"),
+                message: format!("Unsupported {option}: {other}"),
             }),
         }
     }
@@ -658,8 +700,8 @@ impl<'a> CoreOptions<'a> {
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
     /// search. A value of `1` reproduces strict sequential execution. A
-    /// non-positive value is a misconfiguration and fails loud rather than being
-    /// silently clamped.
+    /// non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`], is a
+    /// misconfiguration and fails loud rather than being silently clamped.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?
@@ -810,9 +852,12 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(4);
+        let mut selectors = Vec::with_capacity(5);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        if self.options.contains_key(SCAN_WATERMARK_OPTION) {
+            selectors.push(SCAN_WATERMARK_OPTION);
         }
         if self.options.contains_key(SCAN_VERSION_OPTION) {
             selectors.push(SCAN_VERSION_OPTION);
@@ -844,6 +889,8 @@ impl<'a> CoreOptions<'a> {
 
         if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else if let Some(watermark) = self.parse_i64_option(SCAN_WATERMARK_OPTION)? {
+            Ok(Some(TimeTravelSelector::Watermark(watermark)))
         } else if let Some(value) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
             Ok(Some(TimeTravelSelector::Version {
                 value,
@@ -892,24 +939,32 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRIES)
     }
 
+    /// Commit timeout (`commit.timeout`), in milliseconds.
+    ///
+    /// Defaults to unbounded, matching Java: with no timeout configured, only
+    /// `commit.max-retries` bounds the commit retry loop.
     pub fn commit_timeout_ms(&self) -> u64 {
         self.options
             .get(COMMIT_TIMEOUT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_TIMEOUT_MS)
     }
 
+    /// Initial backoff before the first commit retry (`commit.min-retry-wait`),
+    /// in milliseconds. Doubles per retry up to [`Self::commit_max_retry_wait_ms`].
     pub fn commit_min_retry_wait_ms(&self) -> u64 {
         self.options
             .get(COMMIT_MIN_RETRY_WAIT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_MIN_RETRY_WAIT_MS)
     }
 
+    /// Backoff ceiling between commit retries (`commit.max-retry-wait`), in
+    /// milliseconds.
     pub fn commit_max_retry_wait_ms(&self) -> u64 {
         self.options
             .get(COMMIT_MAX_RETRY_WAIT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRY_WAIT_MS)
     }
 
@@ -1345,6 +1400,40 @@ fn parse_memory_size(value: &str) -> Option<i64> {
     num.checked_mul(multiplier)
 }
 
+/// Parse a duration string to milliseconds, mirroring Java Paimon's
+/// `TimeUtils.parseDuration`.
+///
+/// Accepts every unit label Java accepts — `d`/`day(s)`, `h`/`hour(s)`,
+/// `min`/`m`/`minute(s)`, `s`/`sec(s)`/`second(s)`, `ms`/`milli(s)`/
+/// `millisecond(s)`, `µs`/`micro(s)`/`microsecond(s)`, `ns`/`nano(s)`/
+/// `nanosecond(s)` — plus a bare number, which Java reads as milliseconds.
+/// Sub-millisecond units are truncated towards zero, as `Duration.toMillis()`
+/// does. Returns `None` for an empty string, a missing or non-numeric number,
+/// an unrecognized unit, or a value that would overflow `u64`, matching the
+/// inputs on which Java throws.
+fn parse_duration_millis(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let pos = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num_str, unit_str) = value.split_at(pos);
+    let num: u64 = num_str.trim().parse().ok()?;
+    match unit_str.trim().to_ascii_lowercase().as_str() {
+        "d" | "day" | "days" => num.checked_mul(24 * 60 * 60 * 1000),
+        "h" | "hour" | "hours" => num.checked_mul(60 * 60 * 1000),
+        "min" | "m" | "minute" | "minutes" => num.checked_mul(60 * 1000),
+        "s" | "sec" | "secs" | "second" | "seconds" => num.checked_mul(1000),
+        "" | "ms" | "milli" | "millis" | "millisecond" | "milliseconds" => Some(num),
+        "µs" | "micro" | "micros" | "microsecond" | "microseconds" => Some(num / 1_000),
+        "ns" | "nano" | "nanos" | "nanosecond" | "nanoseconds" => Some(num / 1_000_000),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,6 +1609,54 @@ mod tests {
             let core = CoreOptions::new(&options);
             assert_eq!(core.global_index_search_mode().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn test_family_index_search_mode_precedence() {
+        let legacy = HashMap::from([(
+            GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+            "full".to_string(),
+        )]);
+        let legacy_core = CoreOptions::new(&legacy);
+        for actual in [
+            legacy_core.scalar_index_search_mode().unwrap(),
+            legacy_core.vector_index_search_mode().unwrap(),
+            legacy_core.full_text_index_search_mode().unwrap(),
+        ] {
+            assert_eq!(actual, GlobalIndexSearchMode::Full);
+        }
+
+        let family = HashMap::from([
+            (
+                GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "full".to_string(),
+            ),
+            (
+                SCALAR_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "fast".to_string(),
+            ),
+            (
+                VECTOR_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "detail".to_string(),
+            ),
+            (
+                FULL_TEXT_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "fast".to_string(),
+            ),
+        ]);
+        let family_core = CoreOptions::new(&family);
+        assert_eq!(
+            family_core.scalar_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
+        assert_eq!(
+            family_core.vector_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Detail
+        );
+        assert_eq!(
+            family_core.full_text_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
     }
 
     #[test]
@@ -1765,6 +1902,10 @@ mod tests {
                 "unit '{unit}' should parse case-insensitively with a space"
             );
         }
+
+        for unit in ["kib", "mib", "gib", "tib"] {
+            assert_eq!(parse_memory_size(&format!("3{unit}")), None);
+        }
     }
 
     #[test]
@@ -1787,6 +1928,76 @@ mod tests {
         assert_eq!(parse_memory_size("128 megabytes"), None);
         assert_eq!(parse_memory_size("mb"), None);
         assert_eq!(parse_memory_size("-1"), None);
+    }
+
+    #[test]
+    fn test_parse_duration_millis_accepts_every_java_unit_spelling() {
+        // Every label in Java `TimeUtils.TimeUnit`, plus the bare number that
+        // Java reads as milliseconds.
+        for (input, expected) in [
+            ("60000", 60_000),
+            ("2 d", 2 * 24 * 60 * 60 * 1000),
+            ("2 day", 2 * 24 * 60 * 60 * 1000),
+            ("2 days", 2 * 24 * 60 * 60 * 1000),
+            ("3 h", 3 * 60 * 60 * 1000),
+            ("3 hour", 3 * 60 * 60 * 1000),
+            ("3 hours", 3 * 60 * 60 * 1000),
+            ("2 min", 120_000),
+            ("2 m", 120_000),
+            ("2 minute", 120_000),
+            ("2 minutes", 120_000),
+            ("30 s", 30_000),
+            ("30 sec", 30_000),
+            ("30 secs", 30_000),
+            ("30 second", 30_000),
+            ("30 seconds", 30_000),
+            ("500 ms", 500),
+            ("500 milli", 500),
+            ("500 millis", 500),
+            ("500 millisecond", 500),
+            ("500 milliseconds", 500),
+            ("1500 µs", 1),
+            ("1500 micros", 1),
+            ("1500000 ns", 1),
+            ("1500000 nanoseconds", 1),
+        ] {
+            assert_eq!(
+                parse_duration_millis(input),
+                Some(expected),
+                "unexpected result for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_millis_is_case_and_space_insensitive() {
+        // Java lowercases the unit label and trims around it.
+        assert_eq!(parse_duration_millis("2MIN"), Some(120_000));
+        assert_eq!(parse_duration_millis("  30   S  "), Some(30_000));
+    }
+
+    #[test]
+    fn test_parse_duration_millis_rejects_unknown_and_malformed_input() {
+        assert_eq!(parse_duration_millis("2 weeks"), None);
+        assert_eq!(parse_duration_millis("min"), None);
+        assert_eq!(parse_duration_millis(""), None);
+        assert_eq!(parse_duration_millis("-5"), None);
+        // Java raises "numeric overflow" here; `None` lets callers fall back to
+        // their default instead of wrapping.
+        assert_eq!(parse_duration_millis("9223372036854775807 d"), None);
+    }
+
+    #[test]
+    fn test_commit_wait_options_accept_java_duration_strings() {
+        let options = HashMap::from([
+            (COMMIT_TIMEOUT_OPTION.to_string(), "2 min".to_string()),
+            (COMMIT_MIN_RETRY_WAIT_OPTION.to_string(), "1 s".to_string()),
+            (COMMIT_MAX_RETRY_WAIT_OPTION.to_string(), "30 s".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.commit_timeout_ms(), 120_000);
+        assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
+        assert_eq!(core.commit_max_retry_wait_ms(), 30_000);
     }
 
     #[test]
@@ -2042,8 +2253,8 @@ mod tests {
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), -1);
         assert_eq!(core.commit_max_retries(), 10);
-        assert_eq!(core.commit_timeout_ms(), 120_000);
-        assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
+        assert_eq!(core.commit_timeout_ms(), u64::MAX);
+        assert_eq!(core.commit_min_retry_wait_ms(), 10);
         assert_eq!(core.commit_max_retry_wait_ms(), 10_000);
         assert!(!core.row_tracking_enabled());
         assert_eq!(core.manifest_compression(), "zstd");
@@ -2147,6 +2358,41 @@ mod tests {
     }
 
     #[test]
+    fn test_watermark_maps_to_watermark_selector() {
+        let options = HashMap::from([(SCAN_WATERMARK_OPTION.to_string(), "1234".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .try_time_travel_selector()
+                .unwrap(),
+            Some(TimeTravelSelector::Watermark(1234))
+        );
+
+        // Strict numeric parsing, like scan.timestamp-millis.
+        let options = HashMap::from([(SCAN_WATERMARK_OPTION.to_string(), "abc".to_string())]);
+        assert!(CoreOptions::new(&options)
+            .try_time_travel_selector()
+            .is_err());
+    }
+
+    #[test]
+    fn test_watermark_conflicts_with_other_selectors() {
+        let options = HashMap::from([
+            (SCAN_WATERMARK_OPTION.to_string(), "1".to_string()),
+            (SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "2".to_string()),
+        ]);
+        let err = CoreOptions::new(&options)
+            .try_time_travel_selector()
+            .unwrap_err();
+        match err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains(SCAN_WATERMARK_OPTION));
+                assert!(message.contains(SCAN_TIMESTAMP_MILLIS_OPTION));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_snapshot_id_conflicts_with_version_lists_original_keys() {
         let options = HashMap::from([
             (SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string()),
@@ -2238,7 +2484,6 @@ mod tests {
             "incremental-between",
             "incremental-between-timestamp",
             "incremental-between-scan-mode",
-            "scan.watermark",
         ] {
             let options = HashMap::from([(key.to_string(), "x".to_string())]);
             let err = CoreOptions::new(&options)
@@ -2276,6 +2521,7 @@ mod tests {
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
             SCAN_VERSION_OPTION,
+            SCAN_WATERMARK_OPTION,
         ] {
             let options = HashMap::from([
                 ("scan.mode".to_string(), "from-snapshot".to_string()),

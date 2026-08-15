@@ -66,6 +66,49 @@ def test_with_limit():
         assert plan is not None
 
 
+def test_with_row_ranges():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.de (id INT, name STRING) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.rdb.de (id, name)
+            VALUES (1, 'a'), (2, 'b'), (3, 'c')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.de")
+        builder = table.new_read_builder().with_row_ranges([(0, 1)])
+        plan = builder.new_scan().plan()
+        batches = builder.new_read().read(plan.splits())
+        assert pa.Table.from_batches(batches).column("id").to_pylist() == [1, 2]
+
+        restored_splits = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
+        restored_batches = builder.new_read().read(restored_splits)
+        assert pa.Table.from_batches(restored_batches).column("id").to_pylist() == [1, 2]
+
+        empty_builder = table.new_read_builder().with_row_ranges([])
+        empty_plan = empty_builder.new_scan().plan()
+        assert empty_plan.splits() == []
+        assert empty_builder.new_read().read(empty_plan.splits()) == []
+
+        with pytest.raises(ValueError, match="start 2 exceeds end 1"):
+            table.new_read_builder().with_row_ranges([(2, 1)])
+
+
+def test_format_table_rejects_row_ranges():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.ft (id INT) WITH (
+            'type' = 'format-table',
+            'file.format' = 'parquet')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.ft")
+
+        with pytest.raises(NotImplementedError, match="not supported for format tables"):
+            table.new_read_builder().with_row_ranges([]).new_scan().plan()
+
+
 def test_plan_len():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
@@ -567,6 +610,16 @@ def test_time_travel_unresolved_snapshot_raises():
             table.new_read_builder({"scan.snapshot-id": "999"})
 
 
+def test_time_travel_unresolved_watermark_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        # The Rust commit path never writes watermarks, so no snapshot matches;
+        # the binding must raise instead of silently reading latest.
+        with pytest.raises(ValueError, match="did not resolve"):
+            table.new_read_builder({"scan.watermark": "1"})
+
+
 def test_unsupported_scan_option_raises_not_implemented():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
@@ -657,6 +710,16 @@ def test_time_travel_conflicting_selectors_raises():
         # both offending keys are named
         assert "scan.snapshot-id" in str(exc.value)
         assert "scan.tag-name" in str(exc.value)
+
+
+def test_time_travel_watermark_conflicting_selector_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(ValueError, match="Only one time-travel selector") as exc:
+            table.new_read_builder({"scan.watermark": "1", "scan.snapshot-id": "1"})
+        assert "scan.watermark" in str(exc.value)
+        assert "scan.snapshot-id" in str(exc.value)
 
 
 def test_split_serialize_produces_split_v1_binary():

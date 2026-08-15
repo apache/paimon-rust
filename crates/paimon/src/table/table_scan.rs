@@ -27,11 +27,11 @@ use super::global_index_types::normalize_sorted_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
-    data_evolution_group_matches_predicates, data_file_matches_predicates,
-    data_file_matches_predicates_for_table, group_by_overlapping_row_id, FileStatsRows,
+    data_evolution_group_matches_predicates, data_file_matches_predicates_for_table,
+    data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
     ResolvedStatsSchema,
 };
-use super::Table;
+use super::{find_field_id_by_name, Table};
 use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
@@ -51,6 +51,7 @@ use crate::table::source::{
 };
 use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -122,8 +123,10 @@ async fn read_all_manifest_entries(
     partition_filter: Option<&PartitionFilter>,
     partition_fields: &[DataField],
     data_predicates: &[Predicate],
+    key_predicates: &[Predicate],
     current_schema_id: i64,
     schema_fields: &[DataField],
+    key_fields: &[String],
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
     bucket_function_type: BucketFunctionType,
@@ -238,12 +241,14 @@ async fn read_all_manifest_entries(
                         counters.pruned_by_level += 1;
                         continue;
                     }
-                    if !data_predicates.is_empty()
-                        && !data_file_matches_predicates(
+                    if (!data_predicates.is_empty() || !key_predicates.is_empty())
+                        && !data_file_matches_predicates_with_key_stats(
                             entry.file(),
                             data_predicates,
+                            key_predicates,
                             current_schema_id,
                             schema_fields,
+                            key_fields,
                         )
                     {
                         counters.pruned_by_data_stats += 1;
@@ -383,14 +388,22 @@ fn split_row_ranges_for_files(
             .flat_map(|file| intersect_ranges_with_file(ranges, file))
             .collect(),
     );
-    if split_ranges.is_empty() {
-        return Err(crate::Error::DataInvalid {
-            message: "Planned data-evolution split does not overlap selected row ranges"
-                .to_string(),
-            source: None,
-        });
-    }
+    // Empty means this split holds none of the selected rows. Only data
+    // evolution prunes such splits away up front (`RowRangeIndex`), so on a
+    // row-tracking table they reach here legitimately and the caller drops them.
     Ok(Some(split_ranges))
+}
+
+fn scan_predicate_field_ids(predicates: &[Predicate], schema_fields: &[DataField]) -> HashSet<i32> {
+    let mut leaf_refs = Vec::new();
+    for predicate in predicates {
+        crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut leaf_refs);
+    }
+    leaf_refs
+        .into_iter()
+        // `_ROW_ID` uses a placeholder leaf index, so match the scanner's name-based resolution.
+        .filter_map(|(column, _)| find_field_id_by_name(schema_fields, column))
+        .collect()
 }
 
 fn retain_index_manifest_entry(
@@ -398,9 +411,39 @@ fn retain_index_manifest_entry(
     global_index_needed: bool,
     deletion_vectors_needed: bool,
 ) -> bool {
-    (deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-        || (global_index_needed
-            && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some())
+    entry.kind == FileKind::Add
+        && ((deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+            || (global_index_needed
+                && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some()))
+}
+
+fn retain_index_manifest_entry_for_scan(
+    entry: &IndexManifestEntry,
+    global_index_needed: bool,
+    deletion_vectors_needed: bool,
+    partition_filter: Option<&PartitionFilter>,
+    predicate_field_ids: &HashSet<i32>,
+) -> crate::Result<bool> {
+    if !retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed) {
+        return Ok(false);
+    }
+    if let Some(filter) = partition_filter {
+        if !filter.matches_entry(&entry.partition)? {
+            return Ok(false);
+        }
+    }
+    if normalize_sorted_global_index_type(&entry.index_file.index_type).is_none() {
+        return Ok(true);
+    }
+    let Some(global_index) = entry.index_file.global_index_meta.as_ref() else {
+        // Keep malformed entries so the scanner can preserve fail-loud validation.
+        return Ok(true);
+    };
+    Ok(predicate_field_ids.contains(&global_index.index_field_id)
+        || global_index.extra_field_ids.as_ref().is_some_and(|ids| {
+            ids.iter()
+                .any(|field_id| predicate_field_ids.contains(field_id))
+        }))
 }
 
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
@@ -542,7 +585,30 @@ impl LimitPushdownAccumulator {
     }
 }
 
-type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
+type PartitionDataFileGroups = IndexMap<Vec<u8>, IndexMap<i32, (i32, Vec<DataFileMeta>)>>;
+type BucketDataFileGroup = ((Vec<u8>, i32), (i32, Vec<DataFileMeta>));
+
+fn group_data_files_by_partition_bucket(entries: Vec<ManifestEntry>) -> Vec<BucketDataFileGroup> {
+    let mut partitions = PartitionDataFileGroups::new();
+    for entry in entries {
+        let (partition, bucket, total_buckets, file) = entry.into_parts();
+        partitions
+            .entry(partition)
+            .or_default()
+            .entry(bucket)
+            .or_insert_with(|| (total_buckets, Vec::new()))
+            .1
+            .push(file);
+    }
+
+    let mut groups = Vec::new();
+    for (partition, buckets) in partitions {
+        for (bucket, files) in buckets {
+            groups.push(((partition.clone(), bucket), files));
+        }
+    }
+    groups
+}
 
 #[derive(Clone, Copy)]
 struct GlobalIndexScanSettings {
@@ -580,6 +646,7 @@ fn should_skip_level_zero_for_scan(
     scan_all_files: bool,
     has_primary_keys: bool,
     deletion_vectors_enabled: bool,
+    deletion_vectors_merge_on_read: bool,
     merge_engine: crate::Result<crate::spec::MergeEngine>,
 ) -> bool {
     if scan_all_files {
@@ -589,7 +656,8 @@ fn should_skip_level_zero_for_scan(
         return false;
     }
 
-    deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+    (deletion_vectors_enabled && !deletion_vectors_merge_on_read)
+        || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
 }
 
 fn is_system_field_id(field_id: i32) -> bool {
@@ -795,6 +863,7 @@ impl<'a> TableScan<'a> {
                 table,
                 partition_filter,
                 limit,
+                row_ranges,
             )))
         } else {
             Self(TableScanKind::Paimon(PaimonTableScan::new(
@@ -820,7 +889,9 @@ impl<'a> TableScan<'a> {
             TableScanKind::Paimon(scan) => {
                 Self(TableScanKind::Paimon(scan.with_row_ranges(ranges)))
             }
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+            TableScanKind::Format(scan) => {
+                Self(TableScanKind::Format(scan.with_row_ranges(ranges)))
+            }
         }
     }
 
@@ -963,13 +1034,9 @@ impl<'a> PaimonTableScan<'a> {
     /// Set row ranges for scan-time filtering.
     ///
     /// This replaces any existing row_ranges. Typically used to inject
-    /// results from global index lookups (e.g. full-text search).
+    /// results from global index lookups. An empty vector selects no rows.
     pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
-        self.row_ranges = if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        };
+        self.row_ranges = Some(ranges);
         self
     }
 
@@ -990,13 +1057,15 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
-    /// - only one of `scan.version`, `scan.timestamp-millis`,
+    /// - only one of `scan.version`, `scan.timestamp-millis`, `scan.watermark`,
     ///   `scan.snapshot-id`, `scan.tag-name` may be set
-    /// - `scan.version` → tag name (if exists) → snapshot id (if parseable) →
-    ///   error (ambiguous by design, like SQL `VERSION AS OF`)
+    /// - `scan.version` → tag name (if exists) → `watermark-<value>` → snapshot
+    ///   id (if parseable) → error (ambiguous by design, like SQL `VERSION AS OF`)
     /// - `scan.snapshot-id` → snapshot id only (never a tag lookup)
     /// - `scan.tag-name` → tag name only (never parsed as a snapshot id)
     /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
+    /// - `scan.watermark` → find the earliest snapshot with watermark >= that
+    ///   value (snapshots without a watermark are skipped)
     /// - otherwise → read the latest snapshot
     ///
     /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
@@ -1113,6 +1182,7 @@ impl<'a> PaimonTableScan<'a> {
             self.scan_all_files,
             has_primary_keys,
             deletion_vectors_enabled,
+            core_options.deletion_vectors_merge_on_read(),
             core_options.merge_engine(),
         );
 
@@ -1123,6 +1193,8 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             self.stats_pruning_predicates()
         };
+        let key_fields = self.table.schema().trimmed_primary_keys();
+        let pushdown_key_predicates = self.key_stats_predicates(&pushdown_data_predicates);
 
         let bucket_key_fields: Vec<DataField> = if self.bucket_predicate.is_none() {
             Vec::new()
@@ -1158,8 +1230,10 @@ impl<'a> PaimonTableScan<'a> {
             self.partition_filter.as_ref(),
             &partition_fields,
             &pushdown_data_predicates,
+            &pushdown_key_predicates,
             self.table.schema().id(),
             self.table.schema().fields(),
+            &key_fields,
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
             bucket_function_type,
@@ -1186,7 +1260,7 @@ impl<'a> PaimonTableScan<'a> {
             !self.data_predicates.is_empty(),
         ) {
             Ok(Some(GlobalIndexScanSettings {
-                search_mode: core_options.global_index_search_mode()?,
+                search_mode: core_options.scalar_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
             }))
         } else {
@@ -1208,17 +1282,29 @@ impl<'a> PaimonTableScan<'a> {
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
+        let predicate_field_ids = if global_index_needed {
+            scan_predicate_field_ids(&self.data_predicates, self.table.schema().fields())
+        } else {
+            HashSet::new()
+        };
+        let mut entries = Vec::new();
+        for entry in IndexManifest::read(self.table.file_io(), &path).await? {
+            if retain_index_manifest_entry_for_scan(
+                &entry,
+                global_index_needed,
+                deletion_vectors_needed,
+                self.partition_filter.as_ref(),
+                &predicate_field_ids,
+            )? {
+                entries.push(entry);
+            }
+        }
         let entries = super::global_index_build_common::retain_schema_compatible_entries(
             self.table,
-            IndexManifest::read(self.table.file_io(), &path).await?,
+            entries,
             |entry| normalize_sorted_global_index_type(&entry.index_file.index_type).is_some(),
         )
-        .await?
-        .into_iter()
-        .filter(|entry| {
-            retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
-        })
-        .collect();
+        .await?;
         Ok(Some(entries))
     }
 
@@ -1305,8 +1391,10 @@ impl<'a> PaimonTableScan<'a> {
     /// `KeyValueFileReader`.
     ///
     /// Exempt (full predicates kept):
-    /// - Deletion-vector tables: they read raw with per-row masks, stats are
-    ///   a superset of live rows, full pruning stays safe.
+    /// - Deletion-vector tables without merge-on-read: they read raw with
+    ///   per-row masks, stats are a superset of live rows, full pruning stays
+    ///   safe. With merge-on-read enabled, visible L0 versions require the
+    ///   same key-only pruning rule as an ordinary PK merge read.
     /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
     ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
     ///   read path — pruning a file drops exactly the rows the raw path's
@@ -1316,13 +1404,17 @@ impl<'a> PaimonTableScan<'a> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema().options());
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let deletion_vectors_merge_on_read = core_options.deletion_vectors_merge_on_read();
         // An unknown merge engine stays conservative (key-only pruning); the
         // read side fails on it anyway before returning rows.
         let first_row = matches!(
             core_options.merge_engine(),
             Ok(crate::spec::MergeEngine::FirstRow)
         );
-        if has_primary_keys && !deletion_vectors_enabled && !first_row {
+        if has_primary_keys
+            && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
+            && !first_row
+        {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
                 self.table.schema().fields(),
@@ -1331,6 +1423,16 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             self.data_predicates.clone()
         }
+    }
+
+    /// Project file-safe predicates onto trimmed primary-key columns while
+    /// preserving table-schema field indices.
+    fn key_stats_predicates(&self, predicates: &[Predicate]) -> Vec<Predicate> {
+        let key_fields = self.table.schema().trimmed_primary_keys();
+        if key_fields.is_empty() {
+            return Vec::new();
+        }
+        retain_primary_key_conjuncts(predicates, self.table.schema().fields(), &key_fields)
     }
 
     /// Plan data splits from a snapshot's delta manifest list (APPEND deltas).
@@ -1441,10 +1543,16 @@ impl<'a> PaimonTableScan<'a> {
                         .to_string(),
             });
         }
-        if self.row_ranges.is_some() {
+        // Both forms: without `first_row_id` a filter stays an ordinary data
+        // predicate instead of becoming a row range.
+        if self.row_ranges.is_some()
+            || self
+                .data_predicates
+                .iter()
+                .any(super::row_id_predicate::references_row_id)
+        {
             return Err(crate::Error::Unsupported {
-                message: "Batch incremental Diff does not support _ROW_ID row-range filters"
-                    .to_string(),
+                message: "Batch incremental Diff does not support _ROW_ID filters".to_string(),
             });
         }
         // A limit hint cannot be pushed into either side of a Diff: truncating
@@ -1701,6 +1809,7 @@ impl<'a> PaimonTableScan<'a> {
         // For non-data-evolution tables, cross-schema files were kept (fail-open)
         // by the pushdown. Apply the full schema-aware filter for those files.
         let stats_pruning_predicates = self.stats_pruning_predicates();
+        let key_stats_predicates = self.key_stats_predicates(&stats_pruning_predicates);
         let entries = if stats_pruning_predicates.is_empty() || data_evolution_enabled {
             entries
         } else {
@@ -1724,6 +1833,7 @@ impl<'a> PaimonTableScan<'a> {
                             self.table,
                             entry.file(),
                             &stats_pruning_predicates,
+                            &key_stats_predicates,
                             &mut schema_cache,
                         )
                         .await
@@ -1757,14 +1867,7 @@ impl<'a> PaimonTableScan<'a> {
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
-        let mut groups: BucketDataFileGroups = HashMap::with_capacity(entries.len());
-        for e in entries {
-            let (partition, bucket, total_buckets, file) = e.into_parts();
-            let entry = groups
-                .entry((partition, bucket))
-                .or_insert_with(|| (total_buckets, Vec::new()));
-            entry.1.push(file);
-        }
+        let groups = group_data_files_by_partition_bucket(entries);
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
@@ -1785,10 +1888,12 @@ impl<'a> PaimonTableScan<'a> {
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
         //
-        // Deletion-vector and first-row tables read without merging (stale rows
-        // are masked by DVs / level-0 is skipped), so they keep plain size-based
-        // packing like Java's MergeTreeSplitGenerator fast path.
-        let read_merges_overlapping_keys = !core_options.deletion_vectors_enabled()
+        // Deletion-vector tables without merge-on-read and first-row tables read
+        // without merging (stale rows are masked by DVs / level-0 is skipped),
+        // so they keep plain size-based packing. DV merge-on-read includes L0
+        // files and must preserve overlapping key ranges just like ordinary MOR.
+        let read_merges_overlapping_keys = (!core_options.deletion_vectors_enabled()
+            || core_options.deletion_vectors_merge_on_read())
             && !matches!(
                 core_options.merge_engine(),
                 Ok(crate::spec::MergeEngine::FirstRow)
@@ -1957,6 +2062,12 @@ impl<'a> PaimonTableScan<'a> {
 
                 let split_row_ranges =
                     split_row_ranges_for_files(effective_row_ranges.as_deref(), &file_group)?;
+                if split_row_ranges
+                    .as_deref()
+                    .is_some_and(<[RowRange]>::is_empty)
+                {
+                    continue;
+                }
 
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
@@ -2015,25 +2126,28 @@ impl<'a> PaimonTableScan<'a> {
 mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
-        manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
-        retain_index_manifest_entry, retain_manifest_entry_row_ranges, retain_manifest_row_ranges,
-        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
-        PaimonTableScan, RowRangeIndex, TableScan,
+        group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
+        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
+        retain_index_manifest_entry_for_scan, retain_manifest_entry_row_ranges,
+        retain_manifest_row_ranges, scan_predicate_field_ids, should_skip_level_zero_for_scan,
+        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
+        TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind,
-        IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta, Predicate,
-        PredicateBuilder, PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema,
-        VarCharType,
+        stats::BinaryTableStats, ArrayType, BigIntType, BinaryRow, BinaryRowBuilder,
+        BucketFunctionType, ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum,
+        DeletionVectorMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType,
+        ManifestEntry, ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator,
+        Schema as PaimonSchema, SchemaChange, Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
     use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, RowRange};
     use crate::table::stats_filter::{
         data_evolution_group_matches_predicates, data_file_matches_predicates,
+        data_file_matches_predicates_for_table, data_file_matches_predicates_with_key_stats,
         group_by_overlapping_row_id,
     };
     use crate::table::{CommitMessage, Table, TableCommit};
@@ -2262,9 +2376,11 @@ mod tests {
             if message.contains("missing or invalid row-id range")));
 
         let outside = make_evo_file("outside", 1, 2, 0, Some(10));
-        let error = split_row_ranges_for_files(Some(&ranges), &[outside]).unwrap_err();
-        assert!(matches!(error, Error::DataInvalid { message, .. }
-            if message.contains("does not overlap selected row ranges")));
+        assert_eq!(
+            split_row_ranges_for_files(Some(&ranges), &[outside]).unwrap(),
+            Some(Vec::new()),
+            "a split holding none of the selected rows is dropped, not an error"
+        );
     }
 
     fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
@@ -2309,6 +2425,41 @@ mod tests {
 
     fn file_names_from_files(files: &[DataFileMeta]) -> Vec<&str> {
         files.iter().map(|file| file.file_name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_partition_bucket_groups_preserve_manifest_order() {
+        let entry = |partition: &[u8], bucket: i32, name: &str| {
+            ManifestEntry::new(
+                FileKind::Add,
+                partition.to_vec(),
+                bucket,
+                2,
+                make_evo_file(name, 1, 1, 1, None),
+                2,
+            )
+        };
+        let groups = group_data_files_by_partition_bucket(vec![
+            entry(b"b", 1, "b-1.parquet"),
+            entry(b"a", 0, "a.parquet"),
+            entry(b"b", 0, "b-0.parquet"),
+            entry(b"b", 1, "b-1-next.parquet"),
+        ]);
+
+        let ordered = groups
+            .iter()
+            .map(|((partition, bucket), (_, files))| {
+                (partition.as_slice(), *bucket, file_names_from_files(files))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                (b"b".as_slice(), 1, vec!["b-1.parquet", "b-1-next.parquet"]),
+                (b"b".as_slice(), 0, vec!["b-0.parquet"]),
+                (b"a".as_slice(), 0, vec!["a.parquet"]),
+            ]
+        );
     }
 
     #[test]
@@ -2482,6 +2633,15 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_scan_with_empty_row_ranges_is_preserved() {
+        let table = limit_test_table();
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None)
+            .with_row_ranges(Vec::new());
+
+        assert_eq!(scan.row_ranges, Some(Vec::new()));
     }
 
     fn limit_test_split(file_name: &str, row_count: i64) -> DataSplit {
@@ -2661,6 +2821,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
     }
@@ -2671,7 +2832,26 @@ mod tests {
             true,
             true,
             false,
+            false,
             Ok(crate::spec::MergeEngine::FirstRow),
+        ));
+    }
+
+    #[test]
+    fn test_dv_merge_on_read_controls_batch_level_zero_visibility() {
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            true,
+            Ok(crate::spec::MergeEngine::Deduplicate),
         ));
     }
 
@@ -3134,6 +3314,217 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_data_file_matches_composite_key_stats_in_primary_key_order() {
+        let fields = vec![
+            DataField::new(0, "key_a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "payload".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "key_b".to_string(), DataType::Int(IntType::new())),
+        ];
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+        );
+        file.value_stats_cols = Some(Vec::new());
+        // key_stats order is [key_b, key_a], independent of table field order.
+        file.key_stats = BinaryTableStats::new(
+            two_int_stats_row(Some(100), Some(10)),
+            two_int_stats_row(Some(200), Some(20)),
+            vec![Some(0), Some(0)],
+        );
+        let key_fields = vec!["key_b".to_string(), "key_a".to_string()];
+        let pb = PredicateBuilder::new(&fields);
+
+        let key_a_out_of_range = pb.equal("key_a", Datum::Int(150)).unwrap();
+        assert!(!data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&key_a_out_of_range),
+            std::slice::from_ref(&key_a_out_of_range),
+            TEST_SCHEMA_ID,
+            &fields,
+            &key_fields,
+        ));
+
+        let key_b_in_range = pb.equal("key_b", Datum::Int(150)).unwrap();
+        assert!(data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&key_b_in_range),
+            std::slice::from_ref(&key_b_in_range),
+            TEST_SCHEMA_ID,
+            &fields,
+            &key_fields,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_data_file_matches_key_stats_across_renamed_reordered_schema() {
+        let old_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("payload", DataType::Int(IntType::new()))
+                .column("old_b", DataType::Int(IntType::new()))
+                .column("old_a", DataType::Int(IntType::new()))
+                .primary_key(["old_b", "old_a"])
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![
+                SchemaChange::rename_column("old_b".to_string(), "new_b".to_string()),
+                SchemaChange::rename_column("old_a".to_string(), "new_a".to_string()),
+                SchemaChange::update_column_position(ColumnMove::move_first("new_a".to_string())),
+            ])
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("test_db", "cross_schema_key_stats"),
+            "memory:/cross_schema_key_stats".to_string(),
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta_with_schema(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+            old_schema.id(),
+        );
+        file.value_stats_cols = Some(Vec::new());
+        // Old key_stats order is [old_b, old_a]. Current fields are reordered to
+        // [new_a, payload, new_b], while field IDs remain [2, 0, 1].
+        file.key_stats = BinaryTableStats::new(
+            two_int_stats_row(Some(100), Some(10)),
+            two_int_stats_row(Some(200), Some(20)),
+            vec![Some(0), Some(0)],
+        );
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let new_a_out_of_range = pb.equal("new_a", Datum::Int(150)).unwrap();
+        let new_b_in_range = pb.equal("new_b", Datum::Int(150)).unwrap();
+        let mut schema_cache = HashMap::new();
+
+        assert!(
+            !data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                std::slice::from_ref(&new_a_out_of_range),
+                std::slice::from_ref(&new_a_out_of_range),
+                &mut schema_cache,
+            )
+            .await
+        );
+        assert!(
+            data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                std::slice::from_ref(&new_b_in_range),
+                std::slice::from_ref(&new_b_in_range),
+                &mut schema_cache,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_schema_stats_skip_evolved_values_but_keep_key_pruning() {
+        let old_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![SchemaChange::update_column_type(
+                "payload".to_string(),
+                DataType::BigInt(BigIntType::new()),
+            )])
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("test_db", "cross_schema_type_stats"),
+            "memory:/cross_schema_type_stats".to_string(),
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let mut file = test_data_file_meta_with_schema(
+            two_int_stats_row(Some(10), Some(100)),
+            two_int_stats_row(Some(20), Some(200)),
+            vec![Some(0), Some(0)],
+            5,
+            old_schema.id(),
+        );
+        file.key_stats = BinaryTableStats::new(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+        );
+
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let evolved_value = predicates.equal("payload", Datum::Long(1_000)).unwrap();
+        let stable_key = predicates.equal("id", Datum::Int(1_000)).unwrap();
+        let mut schema_cache = HashMap::new();
+
+        assert!(
+            data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                &[evolved_value],
+                &[],
+                &mut schema_cache,
+            )
+            .await,
+            "old physical stats must not prune a type-evolved value predicate"
+        );
+        assert!(
+            !data_file_matches_predicates_for_table(
+                &table,
+                &file,
+                &[],
+                &[stable_key],
+                &mut schema_cache,
+            )
+            .await,
+            "stable primary-key stats should still prune across schemas"
+        );
+    }
+
+    #[test]
+    fn test_data_file_matches_corrupt_key_stats_fails_open() {
+        let fields = int_field();
+        let empty_stats = BinaryTableStats::empty();
+        let mut file = test_data_file_meta(
+            empty_stats.min_values().to_vec(),
+            empty_stats.max_values().to_vec(),
+            Vec::new(),
+            5,
+        );
+        file.value_stats_cols = Some(Vec::new());
+        file.key_stats = BinaryTableStats::new(vec![0], vec![0], vec![Some(0)]);
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(30))
+            .unwrap();
+
+        assert!(data_file_matches_predicates_with_key_stats(
+            &file,
+            std::slice::from_ref(&predicate),
+            std::slice::from_ref(&predicate),
+            TEST_SCHEMA_ID,
+            &fields,
+            &["id".to_string()],
+        ));
+    }
+
     #[tokio::test]
     async fn test_plan_with_trace_records_between_data_stats_pruning() {
         let table_path = "memory:/test_plan_with_trace_records_between_data_stats_pruning";
@@ -3308,6 +3699,57 @@ mod tests {
         assert!(
             trace.manifest_entries_pruned_by_data_stats >= 2,
             "key conjuncts must still prune PK-table files: {trace:?}"
+        );
+    }
+
+    /// Enabling DV merge-on-read puts the table back on a key-merge path for
+    /// visible level-0 files. Non-key stats pruning is therefore unsafe for the
+    /// same reason as ordinary MOR: pruning the newest version can resurrect an
+    /// older matching value.
+    #[tokio::test]
+    async fn test_dv_merge_on_read_stats_pruning_ignores_non_key_conjuncts() {
+        let table_path = "memory:/test_dv_mor_stats_gate";
+        let table = pk_stats_gate_table(table_path).copy_with_options(HashMap::from([
+            ("deletion-vectors.enabled".to_string(), "true".to_string()),
+            (
+                "deletion-vectors.merge-on-read".to_string(),
+                "true".to_string(),
+            ),
+        ]));
+        setup_scan_trace_dirs(&table).await;
+
+        let mut old = pk_stats_file("old-version.parquet", (1, 5), (100, 200));
+        old.level = 1;
+        let mut new = pk_stats_file("new-version.parquet", (1, 5), (10, 60));
+        new.level = 1;
+        TableCommit::new(table.clone(), "dv-mor-gate-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![old, new],
+            )])
+            .await
+            .unwrap();
+
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let value_filter = PredicateBuilder::new(&fields)
+            .greater_than("value", Datum::Int(90))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(value_filter);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(trace.manifest_entries_pruned_by_data_stats, 0);
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            2,
+            "both key versions must reach the merge path"
         );
     }
 
@@ -3735,6 +4177,30 @@ mod tests {
     }
 
     #[test]
+    fn test_data_evolution_group_is_not_pruned_by_a_row_id_predicate() {
+        let fields = int_field();
+        let file = test_data_file_meta(
+            int_stats_row(Some(10)),
+            int_stats_row(Some(20)),
+            vec![Some(0)],
+            5,
+        );
+        let row_id =
+            crate::spec::row_id_leaf(crate::spec::PredicateOperator::GtEq, vec![Datum::Long(100)]);
+
+        assert!(data_evolution_group_matches_predicates(
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&row_id),
+            &fields,
+        ));
+        assert!(data_evolution_group_matches_predicates(
+            &[file],
+            &[Predicate::negate(row_id)],
+            &fields,
+        ));
+    }
+
+    #[test]
     fn test_data_evolution_group_matches_not_prunes_when_inner_must_match() {
         let fields = int_field();
         let file = test_data_file_meta(
@@ -3907,6 +4373,146 @@ mod tests {
         assert_eq!(
             retained(true, true),
             vec!["DELETION_VECTORS", "btree", "bitmap"]
+        );
+
+        let mut deleted = entry("btree");
+        deleted.kind = FileKind::Delete;
+        assert!(!retain_index_manifest_entry(&deleted, true, false));
+    }
+
+    #[test]
+    fn test_retain_index_manifest_entries_for_selected_partitions() {
+        let partition = |value| {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_int(0, value);
+            builder.build_serialized()
+        };
+        let matching_partition = partition(7);
+        let filter = PartitionFilter::from_partition_set(
+            HashSet::from([matching_partition.clone()]),
+            &[DataField::new(
+                0,
+                "dt".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+        )
+        .unwrap();
+        let predicate_field_ids = HashSet::from([1]);
+        let entry = |partition, index_type: &str| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition,
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: index_type.to_string(),
+                file_name: "btree.idx".to_string(),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: (index_type == "btree").then_some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 0,
+                    index_field_id: 1,
+                    extra_field_ids: None,
+                    index_meta: None,
+                    source_meta: None,
+                    build_schema_id: None,
+                }),
+            },
+        };
+
+        assert!(retain_index_manifest_entry_for_scan(
+            &entry(matching_partition.clone(), "btree"),
+            true,
+            false,
+            Some(&filter),
+            &predicate_field_ids,
+        )
+        .unwrap());
+        assert!(!retain_index_manifest_entry_for_scan(
+            &entry(partition(8), "btree"),
+            true,
+            false,
+            Some(&filter),
+            &predicate_field_ids,
+        )
+        .unwrap());
+        assert!(!retain_index_manifest_entry_for_scan(
+            &entry(partition(8), "DELETION_VECTORS"),
+            true,
+            true,
+            Some(&filter),
+            &predicate_field_ids,
+        )
+        .unwrap());
+        assert!(retain_index_manifest_entry_for_scan(
+            &entry(matching_partition, "DELETION_VECTORS"),
+            false,
+            true,
+            Some(&filter),
+            &predicate_field_ids,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_retain_index_manifest_entries_for_predicate_fields() {
+        let entry = |index_field_id, extra_field_ids| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: Vec::new(),
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "btree".to_string(),
+                file_name: format!("btree-{index_field_id}.idx"),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 0,
+                    row_range_end: 0,
+                    index_field_id,
+                    extra_field_ids,
+                    index_meta: None,
+                    source_meta: None,
+                    build_schema_id: None,
+                }),
+            },
+        };
+        let predicate_field_ids = HashSet::from([2]);
+        let retained = |entry: &IndexManifestEntry| {
+            retain_index_manifest_entry_for_scan(entry, true, false, None, &predicate_field_ids)
+                .unwrap()
+        };
+
+        assert!(retained(&entry(2, None)));
+        assert!(retained(&entry(1, Some(vec![2]))));
+        assert!(!retained(&entry(1, Some(vec![3]))));
+
+        let mut missing_meta = entry(2, None);
+        missing_meta.index_file.global_index_meta = None;
+        assert!(
+            retained(&missing_meta),
+            "malformed sorted entries must reach scanner validation"
+        );
+    }
+
+    #[test]
+    fn test_scan_predicate_field_ids_resolve_by_name() {
+        let fields = vec![
+            DataField::new(10, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(20, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let predicate = Predicate::and(vec![
+            PredicateBuilder::new(&fields)
+                .equal("value", Datum::Int(1))
+                .unwrap(),
+            crate::spec::row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(7)]),
+        ]);
+
+        assert_eq!(
+            scan_predicate_field_ids(&[predicate], &fields),
+            HashSet::from([20])
         );
     }
 

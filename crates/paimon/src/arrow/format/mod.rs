@@ -68,12 +68,11 @@ pub(crate) trait FormatFileReader: Send + Sync {
     /// requested output by name, so extra columns are harmless.
     ///
     /// Predicate exactness is per-format, NOT a blanket guarantee:
-    /// - Parquet, ORC, Avro, Row, and Vortex apply the predicate **exactly** —
+    /// - Parquet, ORC, Avro, Row, Mosaic, and Vortex apply the predicate **exactly** —
     ///   each emitted batch contains only rows matching the pushed-down predicate
     ///   (native pushdown for pruning + a row-level residual pass for the rest).
-    /// - Blob does not evaluate predicates at all; Mosaic applies only
-    ///   stats-level (row-group) pruning. For those, non-matching rows may
-    ///   survive and the caller must not assume exactness.
+    /// - Blob does not evaluate predicates at all. Non-matching rows may survive,
+    ///   and the caller must not assume exactness.
     /// `row_selection` is a pre-merged list of 0-based inclusive row ranges
     /// (DV + row_ranges already combined by the caller).
     async fn read_batch_stream(
@@ -230,6 +229,16 @@ fn supported_read_formats() -> Vec<&'static str> {
     ]
 }
 
+fn supported_write_formats() -> Vec<&'static str> {
+    vec![
+        ".parquet",
+        ".blob",
+        ".row",
+        #[cfg(feature = "vortex")]
+        ".vortex",
+    ]
+}
+
 /// Create a format writer that streams directly to storage.
 pub(crate) async fn create_format_writer(
     output: &OutputFile,
@@ -277,7 +286,39 @@ pub(crate) async fn create_format_writer(
             ));
         }
         Err(Error::Unsupported {
-            message: format!("unsupported write format: expected .parquet, .row, got: {path}"),
+            message: format!(
+                "unsupported write format: expected {}, got: {path}",
+                supported_write_formats().join(", ")
+            ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+
+    #[tokio::test]
+    async fn create_format_writer_error_lists_every_supported_format() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let output = file_io.new_output("memory:/unsupported/data.csv").unwrap();
+        let schema = Arc::new(arrow_schema::Schema::empty());
+
+        let err = match create_format_writer(&output, schema, "zstd", 1, None, None, None).await {
+            Ok(_) => panic!("csv is not a writable format"),
+            Err(err) => err,
+        };
+
+        let Error::Unsupported { message } = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        for format in supported_write_formats() {
+            assert!(
+                message.contains(format),
+                "{format} missing from write-format error: {message}"
+            );
+        }
+        assert!(message.contains("data.csv"), "message: {message}");
     }
 }

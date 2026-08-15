@@ -62,9 +62,12 @@ fn partitions_schema() -> SchemaRef {
         .get_or_init(|| {
             Arc::new(Schema::new(vec![
                 Field::new("partition", DataType::Utf8, true),
-                Field::new("record_count", DataType::Int64, false),
-                Field::new("file_size_in_bytes", DataType::Int64, false),
-                Field::new("file_count", DataType::Int64, false),
+                // Nullable because a statistic the catalog never had reported to it has no value to
+                // show. Declaring these non-null forced Partition::UNKNOWN to be rendered as -1,
+                // which reads as a measurement.
+                Field::new("record_count", DataType::Int64, true),
+                Field::new("file_size_in_bytes", DataType::Int64, true),
+                Field::new("file_count", DataType::Int64, true),
                 Field::new(
                     "last_update_time",
                     DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -78,7 +81,7 @@ fn partitions_schema() -> SchemaRef {
                 Field::new("created_by", DataType::Utf8, true),
                 Field::new("updated_by", DataType::Utf8, true),
                 Field::new("options", DataType::Utf8, true),
-                Field::new("total_buckets", DataType::Int32, false),
+                Field::new("total_buckets", DataType::Int32, true),
                 Field::new("done", DataType::Boolean, false),
             ]))
         })
@@ -159,22 +162,25 @@ impl TableProvider for PartitionsTable {
 
         let n = rows.len();
         let mut partition_strings: Vec<Option<String>> = Vec::with_capacity(n);
-        let mut record_counts = Vec::with_capacity(n);
-        let mut file_sizes = Vec::with_capacity(n);
-        let mut file_counts = Vec::with_capacity(n);
+        let mut record_counts: Vec<Option<i64>> = Vec::with_capacity(n);
+        let mut file_sizes: Vec<Option<i64>> = Vec::with_capacity(n);
+        let mut file_counts: Vec<Option<i64>> = Vec::with_capacity(n);
         let mut last_update_times: Vec<Option<i64>> = Vec::with_capacity(n);
         let mut created_ats: Vec<Option<i64>> = Vec::with_capacity(n);
         let mut created_bys: Vec<Option<String>> = Vec::with_capacity(n);
         let mut updated_bys: Vec<Option<String>> = Vec::with_capacity(n);
         let mut options_jsons: Vec<Option<String>> = Vec::with_capacity(n);
-        let mut total_buckets = Vec::with_capacity(n);
+        let mut total_buckets: Vec<Option<i32>> = Vec::with_capacity(n);
         let mut dones = Vec::with_capacity(n);
 
         for (s, p) in rows {
             partition_strings.push(Some(s));
-            record_counts.push(p.record_count);
-            file_sizes.push(p.file_size_in_bytes);
-            file_counts.push(p.file_count);
+            // A field nobody reported on shows as NULL. Passing the placeholder straight through
+            // would claim the partition holds -1 rows, and 0 would claim it is empty.
+            record_counts.push(Partition::is_known(p.record_count).then_some(p.record_count));
+            file_sizes
+                .push(Partition::is_known(p.file_size_in_bytes).then_some(p.file_size_in_bytes));
+            file_counts.push(Partition::is_known(p.file_count).then_some(p.file_count));
             // 0 marks "no creation_time on any file"; real wall-clock is never
             // <= 0 in practice, so this never nullifies a genuine timestamp.
             last_update_times.push(if p.last_file_creation_time > 0 {
@@ -197,7 +203,8 @@ impl TableProvider for PartitionsTable {
                     })
                     .transpose()?,
             );
-            total_buckets.push(p.total_buckets);
+            total_buckets
+                .push(Some(p.total_buckets).filter(|b| *b != Partition::UNKNOWN_TOTAL_BUCKETS));
             dones.push(p.done);
         }
 

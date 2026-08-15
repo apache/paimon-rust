@@ -25,8 +25,8 @@ use crate::arrow::{ParquetReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode, Predicate,
-    PredicateOperator,
+    is_row_id_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode,
+    Predicate, PredicateOperator,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -767,11 +767,11 @@ fn build_parquet_arrow_predicate(
     // the union of referenced Parquet roots, ordered exactly as the projected
     // RecordBatch. This preserves OR/NOT semantics; splitting it into leaf
     // RowFilters would incorrectly turn the expression into a conjunction.
-    let mut field_indices = Vec::new();
-    crate::arrow::residual::collect_predicate_field_indices(predicate, &mut field_indices);
-    let mut projected = field_indices
+    let mut leaf_refs = Vec::new();
+    crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut leaf_refs);
+    let mut projected = leaf_refs
         .into_iter()
-        .filter_map(|index| {
+        .filter_map(|(_, index)| {
             let field = file_fields.get(index)?;
             parquet_root_index(parquet_schema, field.name()).map(|root| (root, field.clone()))
         })
@@ -826,11 +826,19 @@ fn parquet_predicate_row_filter_accepted(
     match predicate {
         Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(true),
         Predicate::Leaf {
+            column,
             index,
             op,
             literals,
             ..
-        } => parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields),
+        } => parquet_leaf_row_filter_accepted(
+            parquet_schema,
+            column,
+            *index,
+            *op,
+            literals,
+            file_fields,
+        ),
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {
                 if !parquet_predicate_row_filter_accepted(parquet_schema, child, file_fields)? {
@@ -853,12 +861,18 @@ fn parquet_predicate_row_filter_accepted(
 /// an unsupported (but well-formed) leaf yields `Ok(false)`.
 fn parquet_leaf_row_filter_accepted(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    column: &str,
     index: usize,
     op: PredicateOperator,
     literals: &[Datum],
     file_fields: &[DataField],
 ) -> crate::Result<bool> {
     if !predicate_supported_for_parquet_row_filter(op) {
+        return Ok(false);
+    }
+    // Not in the file, so the decoder cannot evaluate it. Rejecting the leaf
+    // rejects any enclosing predicate too, leaving it to the post-scan residual.
+    if is_row_id_column(column) {
         return Ok(false);
     }
     let Some(file_field) = file_fields.get(index) else {
@@ -1003,6 +1017,10 @@ impl StatsAccessor for ParquetRowGroupStats<'_> {
             data_type,
             false,
         )
+    }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        true
     }
 }
 
@@ -1380,6 +1398,10 @@ impl StatsAccessor for ParquetPageStats<'_> {
             return None;
         }
         page_index_value_to_datum(self.column_index, self.page_idx, data_type, false)
+    }
+
+    fn supports_in_min_max_pruning(&self) -> bool {
+        true
     }
 }
 
@@ -2193,6 +2215,8 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::{StreamExt, TryStreamExt};
+    use parquet::file::properties::EnabledStatistics;
+    use parquet::file::statistics::Statistics as ParquetStatistics;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2241,6 +2265,32 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    #[test]
+    fn test_row_id_predicate_builds_no_decoder_row_filter() {
+        let fields = test_fields();
+        let schema = test_parquet_schema();
+        assert!(build_parquet_row_filter(
+            &schema,
+            &[crate::spec::row_id_leaf(
+                super::PredicateOperator::Eq,
+                vec![Datum::Long(1)]
+            )],
+            &fields
+        )
+        .expect("row filter should build")
+        .is_none());
+
+        let mixed = Predicate::or(vec![
+            crate::spec::row_id_leaf(super::PredicateOperator::Eq, vec![Datum::Long(1)]),
+            PredicateBuilder::new(&fields)
+                .equal("score", Datum::Int(7))
+                .expect("leaf should build"),
+        ]);
+        assert!(build_parquet_row_filter(&schema, &[mixed], &fields)
+            .expect("row filter should build")
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -3240,6 +3290,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Row-group statistics pruning
+    // -----------------------------------------------------------------------
+
+    async fn write_multi_row_group_parquet(
+        row_group_rows: usize,
+        total_rows: i32,
+        statistics: EnabledStatistics,
+    ) -> Vec<u8> {
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group_rows))
+            .set_statistics_enabled(statistics)
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let ids = (0..total_rows).collect::<Vec<_>>();
+        let values = ids.iter().map(|value| value * 10).collect::<Vec<_>>();
+        writer
+            .write(&writer_test_batch(&schema, ids, values))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_row_group_selection_in_uses_min_max_without_page_index() {
+        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk).await;
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        assert_eq!(metadata.row_groups().len(), 2);
+        assert!(metadata.column_index().is_none());
+        assert!(metadata.offset_index().is_none());
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let outside = vec![id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Int(-1), Datum::Int(30)],
+        )];
+        let selection =
+            super::build_predicate_row_selection(metadata.row_groups(), &outside, &fields)
+                .unwrap()
+                .expect("all row groups should be skipped");
+        assert_eq!(selection.row_count(), 0);
+
+        let overlapping = vec![id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Int(5), Datum::Int(30)],
+        )];
+        let selection =
+            super::build_predicate_row_selection(metadata.row_groups(), &overlapping, &fields)
+                .unwrap()
+                .expect("only the first row group should be kept");
+        assert_eq!(selection.row_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_row_group_selection_in_fails_open_on_unusable_stats() {
+        let fields = vec![int_field("id"), int_field("value")];
+        let predicates = vec![id_leaf(PredicateOperator::In, vec![Datum::Int(100)])];
+
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::None).await;
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        let selection =
+            super::build_predicate_row_selection(metadata.row_groups(), &predicates, &fields)
+                .unwrap();
+        assert!(selection.is_none(), "missing stats must fail open");
+
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::Chunk).await;
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        let mut damaged_row_group = metadata.row_groups()[0].clone();
+        let damaged_id_column = damaged_row_group
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_statistics(ParquetStatistics::new::<i32>(
+                Some(20),
+                Some(10),
+                None,
+                Some(0),
+                false,
+            ))
+            .build()
+            .unwrap();
+        damaged_row_group.columns_mut()[0] = damaged_id_column;
+        let selection =
+            super::build_predicate_row_selection(&[damaged_row_group], &predicates, &fields)
+                .unwrap();
+        assert!(selection.is_none(), "inverted stats must fail open");
+
+        let varchar_type = DataType::VarChar(VarCharType::new(20).unwrap());
+        let varchar_fields = vec![DataField::new(0, "id".to_string(), varchar_type)];
+        let varchar_predicates = vec![PredicateBuilder::new(&varchar_fields)
+            .is_in("id", vec![Datum::String("100".to_string())])
+            .unwrap()];
+        let selection = super::build_predicate_row_selection(
+            metadata.row_groups(),
+            &varchar_predicates,
+            &varchar_fields,
+        )
+        .unwrap();
+        assert!(selection.is_none(), "incomparable stats must fail open");
+    }
+
+    // -----------------------------------------------------------------------
     // Page-index (ColumnIndex / OffsetIndex) pruning
     // -----------------------------------------------------------------------
 
@@ -3447,6 +3601,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_page_selection_in_keeps_only_matching_page() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let predicates = vec![id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Int(35), Datum::Int(1000)],
+        )];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("non-matching pages should be skipped");
+        assert_eq!(sel.row_count(), 10);
+    }
+
+    #[tokio::test]
     async fn test_page_selection_range_keeps_overlapping_pages() {
         let bytes = write_multi_page_parquet(10, 80).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
@@ -3568,7 +3738,6 @@ mod tests {
         // (`ColumnIndexMetaData::NONE`) but still gets an OffsetIndex. Its
         // accessors panic rather than return None, so pruning must fail open
         // for that column instead of touching the index.
-        use parquet::file::properties::EnabledStatistics;
         use parquet::schema::types::ColumnPath;
 
         let schema = writer_arrow_schema();

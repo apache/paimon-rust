@@ -28,6 +28,7 @@ use crate::spec::{
     CoreOptions, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
     IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
     PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
+    POSTPONE_BUCKET,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::global_index_build_common::same_extra_field_ids;
@@ -49,6 +50,53 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
+
+fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
+    let mut owners = HashSet::new();
+    for message in messages {
+        let Some(total_buckets) = message.total_buckets else {
+            continue;
+        };
+        if total_buckets <= 0 || message.bucket < 0 || message.bucket >= total_buckets {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Invalid fixed bucket {} for total_buckets={total_buckets}; expected a bucket in [0, {total_buckets})",
+                    message.bucket
+                ),
+                source: None,
+            });
+        }
+        if message.new_files.is_empty() {
+            continue;
+        }
+        if !owners.insert((message.partition.as_slice(), message.bucket)) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Postpone fixed-bucket writer ownership conflict for bucket {}: route all rows for one partition and bucket to a single writer",
+                    message.bucket
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixed_bucket_commit_mode(messages: &[CommitMessage], overwrite: bool) -> Result<()> {
+    if messages.iter().any(|message| {
+        message.total_buckets.is_some() && message.is_fixed_bucket_overwrite() != overwrite
+    }) {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Commit messages were prepared for {} but submitted as {}",
+                if overwrite { "append" } else { "overwrite" },
+                if overwrite { "overwrite" } else { "append" },
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
 
 /// Table commit logic for Paimon write operations.
 ///
@@ -155,7 +203,11 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_fixed_bucket_commit_mode(&commit_messages, false)?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -198,7 +250,11 @@ impl TableCommit {
         expected_snapshot_id: i64,
         commit_identifier: i64,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_fixed_bucket_commit_mode(&commit_messages, false)?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
             return Ok(());
@@ -208,18 +264,28 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
-        self.try_commit(
-            CommitEntriesPlan::Direct {
-                entries,
-                changelog_entries,
-                new_index_entries,
-                check_from_snapshot,
-            },
-            Some(expected_snapshot_id),
-            commit_identifier,
-            false,
-        )
-        .await
+        let result = self
+            .try_commit(
+                CommitEntriesPlan::Direct {
+                    entries,
+                    changelog_entries,
+                    new_index_entries,
+                    check_from_snapshot,
+                },
+                Some(expected_snapshot_id),
+                commit_identifier,
+                false,
+            )
+            .await;
+        if let Err(error) = result {
+            // Storage and REST errors can be indeterminate: the snapshot may
+            // already reference these files even though the response failed.
+            if matches!(&error, crate::Error::DataInvalid { .. }) {
+                let _ = self.abort(&commit_messages).await;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Overwrite partitions with new data.
@@ -269,7 +335,11 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        validate_fixed_bucket_commit_mode(&commit_messages, true)?;
+        validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() && static_partitions.is_none() {
             return Ok(());
@@ -298,11 +368,14 @@ impl TableCommit {
             }
         }
 
+        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+
         self.try_commit(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,
                 new_index_entries,
+                check_from_snapshot,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -518,6 +591,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
@@ -531,6 +606,7 @@ impl TableCommit {
                 partition_filter: Some(partition_filter),
                 new_entries: vec![],
                 new_index_entries: vec![],
+                check_from_snapshot: None,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -596,6 +672,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(
@@ -603,6 +681,7 @@ impl TableCommit {
                 partition_filter: None,
                 new_entries: vec![],
                 new_index_entries: vec![],
+                check_from_snapshot: None,
                 cached_snapshot: None,
                 cached_entries: Vec::new(),
                 full_scan_count: 0,
@@ -1240,7 +1319,17 @@ impl TableCommit {
                 } else {
                     CommitKind::APPEND
                 };
-                let detect_conflicts = has_delete || check_from_snapshot.is_some();
+                let has_partition_bucket_counts = entries
+                    .iter()
+                    .any(|entry| entry.total_buckets() != self.total_buckets);
+                let has_postpone_entries = self.total_buckets == POSTPONE_BUCKET
+                    && entries.iter().any(|entry| {
+                        *entry.kind() == FileKind::Add && entry.bucket() == POSTPONE_BUCKET
+                    });
+                let detect_conflicts = has_delete
+                    || check_from_snapshot.is_some()
+                    || has_partition_bucket_counts
+                    || has_postpone_entries;
                 let base_data_files = if detect_conflicts {
                     self.check_deletion_vector_index_only_conflict(
                         latest_snapshot.as_ref(),
@@ -1298,12 +1387,17 @@ impl TableCommit {
                 let entries = self
                     .provide_overwrite_entries(plan, latest_snapshot)
                     .await?;
-                let (partition_filter, new_index_entries) = match plan {
+                let (partition_filter, new_index_entries, check_from_snapshot) = match plan {
                     CommitEntriesPlan::Overwrite {
                         partition_filter,
                         new_index_entries,
+                        check_from_snapshot,
                         ..
-                    } => (partition_filter.clone(), new_index_entries.clone()),
+                    } => (
+                        partition_filter.clone(),
+                        new_index_entries.clone(),
+                        *check_from_snapshot,
+                    ),
                     CommitEntriesPlan::Direct { .. } => unreachable!(),
                 };
                 let base_data_files = self
@@ -1312,7 +1406,7 @@ impl TableCommit {
                         retry_state,
                         &entries,
                         &CommitKind::OVERWRITE,
-                        None,
+                        check_from_snapshot,
                     )
                     .await?;
 
@@ -1854,6 +1948,22 @@ impl TableCommit {
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
 
+        // Validate delta entries before duplicate files are merged.
+        self.check_total_bucket_conflicts(delta_entries)?;
+        // Check the final layout so overwrite migration and rescaling remain valid.
+        let mut all_entries = base_entries.to_vec();
+        all_entries.extend(delta_entries.iter().cloned());
+        let merged_entries = merge_active_entries(all_entries);
+        self.check_total_bucket_conflicts(&merged_entries)?;
+        self.check_postpone_bucket_mixing(&merged_entries)?;
+        self.check_fixed_bucket_ownership_conflicts(
+            latest_snapshot,
+            delta_entries,
+            commit_kind,
+            check_from_snapshot,
+        )
+        .await?;
+
         if !self.data_evolution_enabled {
             return Ok(());
         }
@@ -1861,12 +1971,136 @@ impl TableCommit {
         let next_row_id = latest_snapshot.and_then(Snapshot::next_row_id);
         self.check_row_id_existence(base_entries, delta_entries, next_row_id)?;
 
-        let mut all_entries = base_entries.to_vec();
-        all_entries.extend(delta_entries.iter().cloned());
-        let merged_entries = merge_active_entries(all_entries);
         self.check_row_id_range_conflicts(commit_kind, check_from_snapshot, &merged_entries)?;
         self.check_row_id_from_snapshot(latest_snapshot, delta_entries, check_from_snapshot)
             .await
+    }
+
+    async fn check_fixed_bucket_ownership_conflicts(
+        &self,
+        latest_snapshot: Option<&Snapshot>,
+        entries: &[ManifestEntry],
+        commit_kind: &CommitKind,
+        check_from_snapshot: Option<i64>,
+    ) -> Result<()> {
+        let Some(check_from_snapshot) = check_from_snapshot else {
+            return Ok(());
+        };
+        let Some(latest_snapshot) = latest_snapshot else {
+            return Ok(());
+        };
+        if latest_snapshot.id() <= check_from_snapshot {
+            return Ok(());
+        }
+
+        let fixed_entries = entries
+            .iter()
+            .filter(|entry| {
+                *entry.kind() == FileKind::Add
+                    && entry.total_buckets() != self.total_buckets
+                    && entry.total_buckets() > 0
+            })
+            .collect::<Vec<_>>();
+        if fixed_entries.is_empty() {
+            return Ok(());
+        }
+        let owned_buckets = fixed_entries
+            .iter()
+            .map(|entry| (entry.partition(), entry.bucket()))
+            .collect::<HashSet<_>>();
+        let owned_partitions = fixed_entries
+            .iter()
+            .map(|entry| entry.partition())
+            .collect::<HashSet<_>>();
+        let partition_filter = self.build_entries_partition_filter(&fixed_entries)?;
+
+        for snapshot_id in check_from_snapshot.max(0) + 1..=latest_snapshot.id() {
+            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            let concurrent_entries = self
+                .read_delta_entries(partition_filter.as_ref(), &snapshot)
+                .await?;
+            for entry in concurrent_entries {
+                if commit_kind == &CommitKind::OVERWRITE
+                    && owned_partitions.contains(entry.partition())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket overwrite conflict: another commit wrote the same partition after snapshot {check_from_snapshot}"
+                        ),
+                        source: None,
+                    });
+                }
+                if *entry.kind() != FileKind::Add {
+                    continue;
+                }
+                if entry.bucket() == POSTPONE_BUCKET && owned_partitions.contains(entry.partition())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket writer conflict: another commit wrote bucket=-2 files for the same partition after snapshot {check_from_snapshot}"
+                        ),
+                        source: None,
+                    });
+                }
+                if owned_buckets.contains(&(entry.partition(), entry.bucket())) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Postpone fixed-bucket writer ownership conflict for bucket {}: another commit wrote the same partition and bucket after snapshot {check_from_snapshot}",
+                            entry.bucket()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_postpone_bucket_mixing(&self, active_entries: &[ManifestEntry]) -> Result<()> {
+        if self.total_buckets != POSTPONE_BUCKET {
+            return Ok(());
+        }
+        let fixed_partitions = active_entries
+            .iter()
+            .filter(|entry| {
+                *entry.kind() == FileKind::Add && entry.bucket() >= 0 && entry.total_buckets() > 0
+            })
+            .map(|entry| entry.partition())
+            .collect::<HashSet<_>>();
+        if active_entries.iter().any(|entry| {
+            *entry.kind() == FileKind::Add
+                && entry.bucket() == POSTPONE_BUCKET
+                && fixed_partitions.contains(entry.partition())
+        }) {
+            return Err(crate::Error::DataInvalid {
+                message: "Cannot mix bucket=-2 files and fixed buckets in the same partition; use a complete overwrite to migrate the partition"
+                    .to_string(),
+                source: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_total_bucket_conflicts(&self, entries: &[ManifestEntry]) -> Result<()> {
+        let mut bucket_counts: HashMap<Vec<u8>, i32> = HashMap::new();
+        for entry in entries {
+            if *entry.kind() != FileKind::Add || entry.bucket() < 0 || entry.total_buckets() <= 0 {
+                continue;
+            }
+            let partition = entry.partition().to_vec();
+            if let Some(previous) = bucket_counts.insert(partition, entry.total_buckets()) {
+                if previous != entry.total_buckets() {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Fixed-bucket conflict: one partition uses different total bucket counts {previous} and {}",
+                            entry.total_buckets()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn check_deletion_vector_index_only_conflict(
@@ -2557,6 +2791,8 @@ impl TableCommit {
             stats.file_size_in_bytes += sign * file.file_size;
             stats.file_count += sign;
             stats.last_file_creation_time = stats.last_file_creation_time.max(file_creation_time);
+            // Overwrite entries place replacement ADDs last.
+            stats.total_buckets = entry.total_buckets();
         }
 
         Ok(stats_map.into_values().collect())
@@ -2602,7 +2838,7 @@ impl TableCommit {
                         FileKind::Add,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         2,
                     )
@@ -2612,7 +2848,7 @@ impl TableCommit {
                         FileKind::Delete,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         2,
                     )
@@ -2632,7 +2868,7 @@ impl TableCommit {
                         FileKind::Add,
                         msg.partition.clone(),
                         msg.bucket,
-                        self.total_buckets,
+                        msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
                         0,
                     )
@@ -2704,6 +2940,7 @@ enum CommitEntriesPlan {
         partition_filter: Option<PartitionFilter>,
         new_entries: Vec<ManifestEntry>,
         new_index_entries: Vec<IndexManifestEntry>,
+        check_from_snapshot: Option<i64>,
         cached_snapshot: Option<Box<Snapshot>>,
         cached_entries: Vec<ManifestEntry>,
         full_scan_count: usize,
@@ -2906,9 +3143,44 @@ mod tests {
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
         BinaryRowBuilder, DataFileMeta, DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta,
-        ManifestList, TableSchema,
+        ManifestList, TableSchema, POSTPONE_BUCKET,
     };
     use chrono::{DateTime, Utc};
+
+    #[tokio::test]
+    async fn test_query_auth_table_refuses_commit_paths() {
+        let table = crate::table::query_auth_table();
+        let commit = TableCommit::new(table.clone(), "test-user".to_string());
+
+        let refused = |err: crate::Error, what: &str| {
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "{what} on a query-auth.enabled table must fail closed, got {err:?}"
+            );
+        };
+
+        refused(commit.commit(Vec::new()).await.unwrap_err(), "committing");
+        refused(
+            commit.overwrite(Vec::new(), None).await.unwrap_err(),
+            "overwriting",
+        );
+        refused(
+            commit.truncate_partitions(Vec::new()).await.unwrap_err(),
+            "truncating partitions",
+        );
+        refused(
+            commit.truncate_table().await.unwrap_err(),
+            "truncating the table",
+        );
+
+        refused(
+            crate::table::TableWrite::new(&table, "test-user".to_string())
+                .err()
+                .expect("opening a write must fail closed"),
+            "opening a write",
+        );
+    }
 
     fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
@@ -3092,6 +3364,7 @@ mod tests {
             partition_filter,
             new_entries,
             new_index_entries: vec![],
+            check_from_snapshot: None,
             cached_snapshot: None,
             cached_entries: Vec::new(),
             full_scan_count: 0,
@@ -3187,6 +3460,38 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].kind(), FileKind::Add);
         assert_eq!(entries[0].file().file_name, "data-0.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_writer_mode_mismatch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_writer_mode_mismatch";
+        setup_dirs(&file_io, table_path).await;
+        let commit = setup_commit(&file_io, table_path);
+
+        let mut append = CommitMessage::new(vec![], 0, vec![test_data_file("append.parquet", 1)]);
+        append.total_buckets = Some(1);
+        let error = commit.overwrite(vec![append], None).await.unwrap_err();
+        assert!(error.to_string().contains("submitted as overwrite"));
+
+        let mut overwrite =
+            CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 1)]);
+        overwrite.total_buckets = Some(1);
+        overwrite.mark_fixed_bucket_overwrite();
+        let error = commit.commit(vec![overwrite]).await.unwrap_err();
+        assert!(error.to_string().contains("submitted as append"));
+
+        assert!(latest_snapshot(&file_io, table_path).await.is_none());
+    }
+
+    #[test]
+    fn test_fixed_bucket_commit_mode_preserves_non_fixed_messages() {
+        let append = CommitMessage::new(vec![], 0, vec![]);
+        assert!(validate_fixed_bucket_commit_mode(&[append], true).is_ok());
+
+        let mut overwrite = CommitMessage::new(vec![], 0, vec![]);
+        overwrite.mark_fixed_bucket_overwrite();
+        assert!(validate_fixed_bucket_commit_mode(&[overwrite], false).is_ok());
     }
 
     #[tokio::test]
@@ -3601,6 +3906,17 @@ mod tests {
             .await
             .unwrap();
 
+        let index_path = format!("{table_path}/index/lumina-0.index");
+        file_io
+            .mkdirs(&format!("{table_path}/index/"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
         let mut message = CommitMessage::new(vec![], 0, vec![]);
         message.new_index_files = vec![test_global_index_file("lumina-0.index", 0, 0, 9)];
         let result = commit.commit_if_latest_snapshot(vec![message], 0).await;
@@ -3616,6 +3932,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
+        assert!(!file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]
@@ -4146,6 +4463,36 @@ mod tests {
         assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
         // 300 - 100 (delete a) + 50 (add a2) = 250
         assert_eq!(snapshot.total_record_count(), Some(250));
+
+        let partition = partition_bytes("a");
+        for (old_buckets, new_buckets) in [(-2, 4), (4, 8)] {
+            let entries = vec![
+                ManifestEntry::new(
+                    FileKind::Delete,
+                    partition.clone(),
+                    if old_buckets == POSTPONE_BUCKET {
+                        POSTPONE_BUCKET
+                    } else {
+                        0
+                    },
+                    old_buckets,
+                    test_data_file("old.parquet", 100),
+                    2,
+                ),
+                ManifestEntry::new(
+                    FileKind::Add,
+                    partition.clone(),
+                    0,
+                    new_buckets,
+                    test_data_file("new.parquet", 50),
+                    2,
+                ),
+            ];
+
+            let statistics = commit.generate_partition_statistics(&entries).unwrap();
+            assert_eq!(statistics.len(), 1);
+            assert_eq!(statistics[0].total_buckets, new_buckets);
+        }
     }
 
     #[tokio::test]

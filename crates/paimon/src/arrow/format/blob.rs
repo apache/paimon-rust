@@ -135,10 +135,15 @@ impl FormatFileReader for BlobFormatReader {
         reader: Box<dyn FileRead>,
         file_size: u64,
         read_fields: &[DataField],
-        _predicates: Option<&FilePredicates>,
+        predicates: Option<&FilePredicates>,
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // This reader evaluates no predicate at all, so nothing would enforce a
+        // `_ROW_ID` one.
+        if let Some(fp) = predicates {
+            crate::table::row_id_predicate::reject_row_id_filter(&fp.predicates, "blob files")?;
+        }
         let field_kind = validate_read_fields(read_fields)?;
 
         let target_schema = build_target_arrow_schema(read_fields)?;

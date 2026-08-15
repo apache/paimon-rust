@@ -71,6 +71,9 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        // Building the index scans the table's rows.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         self.table.ensure_not_branch_reference_for_write()?;
 
         if !is_lumina_index_type(&self.index_type) {

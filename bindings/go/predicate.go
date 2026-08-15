@@ -105,22 +105,22 @@ func StringDatum(v string) Datum {
 }
 
 // Date represents a date value as epoch days since 1970-01-01.
-// Usage: table.PredicateEqual("dt", paimon.Date(19000))
+// Usage: pb.Eq("dt", paimon.Date(19000))
 type Date int32
 
 // Time represents a time-of-day value as milliseconds since midnight.
-// Usage: table.PredicateEqual("t", paimon.Time(3600000))
+// Usage: pb.Eq("t", paimon.Time(3600000))
 type Time int32
 
 // Timestamp represents a timestamp without timezone (millis + sub-millis nanos).
-// Usage: table.PredicateEqual("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
+// Usage: pb.Eq("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
 type Timestamp struct {
 	Millis int64
 	Nanos  int32
 }
 
 // LocalZonedTimestamp represents a timestamp with local timezone semantics.
-// Usage: table.PredicateEqual("lzts", paimon.LocalZonedTimestamp{Millis: 1700000000000, Nanos: 0})
+// Usage: pb.Eq("lzts", paimon.LocalZonedTimestamp{Millis: 1700000000000, Nanos: 0})
 type LocalZonedTimestamp struct {
 	Millis int64
 	Nanos  int32
@@ -155,7 +155,7 @@ func NewDecimal(unscaled int64, precision, scale uint32) Decimal {
 }
 
 // Bytes represents a binary value.
-// Usage: table.PredicateEqual("data", paimon.Bytes(someSlice))
+// Usage: pb.Eq("data", paimon.Bytes(someSlice))
 type Bytes []byte
 
 // toDatum converts a Go value to a Datum for predicate comparison.

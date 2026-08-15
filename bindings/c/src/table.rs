@@ -227,8 +227,9 @@ pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
 }
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 4] = [
+const TIME_TRAVEL_SELECTORS: [&str; 5] = [
     "scan.timestamp-millis",
+    "scan.watermark",
     "scan.version",
     "scan.snapshot-id",
     "scan.tag-name",
@@ -300,8 +301,9 @@ pub unsafe extern "C" fn paimon_table_new_read_builder(
 
 /// Create a ReadBuilder from a Table with scan options (e.g. time-travel
 /// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` /
-/// `scan.version`). At most one time-travel selector may be set. A selector that
-/// does not resolve to a snapshot is an error (never a silent read-of-latest).
+/// `scan.watermark` / `scan.version`). At most one time-travel selector may be
+/// set. A selector that does not resolve to a snapshot is an error (never a
+/// silent read-of-latest).
 ///
 /// # Safety
 /// `table` must be a valid pointer. `options` must be a valid pointer to
@@ -2298,11 +2300,53 @@ mod tests {
     }
 
     #[test]
+    fn watermark_conflicting_with_other_selector_is_rejected() {
+        unsafe {
+            let table = boxed_test_table();
+            let k1 = CString::new("scan.watermark").unwrap();
+            let v1 = CString::new("1").unwrap();
+            let k2 = CString::new("scan.snapshot-id").unwrap();
+            let v2 = CString::new("1").unwrap();
+            let opts = [opt(&k1, &v1), opt(&k2, &v2)];
+            let (code, message) = assert_rb_err_code_message(
+                paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 2),
+            );
+            assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
+            assert!(
+                message.contains("scan.watermark") && message.contains("scan.snapshot-id"),
+                "message should name both selectors, got: {message}"
+            );
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn unresolved_watermark_does_not_silently_read_latest() {
+        unsafe {
+            // The test table commits no watermarks, so any watermark selector
+            // is unresolvable; the binding must error instead of falling back.
+            let table = boxed_test_table();
+            let k = CString::new("scan.watermark").unwrap();
+            let v = CString::new("1").unwrap();
+            let opts = [opt(&k, &v)];
+            let (code, message) = assert_rb_err_code_message(
+                paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 1),
+            );
+            assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
+            assert!(
+                message.contains("did not resolve"),
+                "message should report the selector did not resolve, got: {message}"
+            );
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
     fn unsupported_scan_option_is_rejected() {
         unsafe {
             let table = boxed_test_table();
-            let k = CString::new("scan.watermark").unwrap();
-            let v = CString::new("0").unwrap();
+            let k = CString::new("incremental-between").unwrap();
+            let v = CString::new("1,2").unwrap();
             let opts = [opt(&k, &v)];
             // Core's validate_scan_options rejects this before resolution; the
             // binding surfaces core's Unsupported code.

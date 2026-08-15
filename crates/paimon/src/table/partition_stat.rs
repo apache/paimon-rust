@@ -64,6 +64,8 @@ impl Table {
     ///
     /// Returns an empty Vec when the table has no snapshots yet.
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
+        // Manifests carry partition values and per-column stats.
+        CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
         let sm = SnapshotManager::new(self.file_io().clone(), self.location().to_string());
         let snapshot = match sm.get_latest_snapshot().await? {
             Some(s) => s,
@@ -188,6 +190,27 @@ mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataFileMeta, FileKind, ManifestEntry};
+
+    #[tokio::test]
+    async fn test_query_auth_table_refuses_partition_stats_and_listing() {
+        let table = crate::table::query_auth_table();
+        for (err, what) in [
+            (
+                table.partition_stats().await.unwrap_err(),
+                "partition stats",
+            ),
+            (
+                table.list_partitions().await.unwrap_err(),
+                "partition listing",
+            ),
+        ] {
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "{what} on a query-auth.enabled table must fail closed, got {err:?}"
+            );
+        }
+    }
 
     /// Build a minimal synthetic ManifestEntry for unit testing.
     /// Mirrors the helper used in `spec::manifest` tests.

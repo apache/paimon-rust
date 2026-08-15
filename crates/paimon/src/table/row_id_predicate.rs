@@ -19,7 +19,7 @@
 //!
 //! Reference: [org.apache.paimon.predicate.RowIdPredicateVisitor](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/predicate/RowIdPredicateVisitor.java)
 
-use crate::spec::{Datum, Predicate, PredicateOperator, ROW_ID_FIELD_NAME};
+use crate::spec::{is_row_id_column, Datum, Predicate, PredicateOperator};
 use crate::table::RowRange;
 
 /// Extract row ranges from `_ROW_ID` predicates in the given filter.
@@ -31,7 +31,7 @@ pub(crate) fn extract_row_id_ranges(predicate: &Predicate) -> Option<Vec<RowRang
             op,
             literals,
             ..
-        } if column == ROW_ID_FIELD_NAME => leaf_to_ranges(*op, literals),
+        } if is_row_id_column(column) => leaf_to_ranges(*op, literals),
         Predicate::And(children) => {
             // AND: intersect all _ROW_ID ranges
             let mut result: Option<Vec<RowRange>> = None;
@@ -46,48 +46,82 @@ pub(crate) fn extract_row_id_ranges(predicate: &Predicate) -> Option<Vec<RowRang
             result
         }
         Predicate::Or(children) => {
-            // OR: union all _ROW_ID ranges (all children must have _ROW_ID predicates)
+            // OR: union all _ROW_ID ranges (all children must have _ROW_ID predicates).
+            // An empty union is `Some(vec![])`, not `None`: the branches convert
+            // to "no rows", and reporting that as "nothing extracted" would let
+            // an enclosing AND skip the subtree and overstate its ranges.
             let mut all_ranges: Vec<RowRange> = Vec::new();
             for child in children {
                 let ranges = extract_row_id_ranges(child)?;
                 all_ranges.extend(ranges);
             }
-            if all_ranges.is_empty() {
-                None
-            } else {
-                Some(super::merge_row_ranges(all_ranges))
-            }
+            Some(super::merge_row_ranges(all_ranges))
         }
         _ => None,
     }
 }
 
-/// Remove `_ROW_ID` predicates from a filter, returning the remaining filter.
-/// Returns `None` if the entire filter is a `_ROW_ID` predicate.
-pub(crate) fn remove_row_id_filter(predicate: &Predicate) -> Option<Predicate> {
+/// Whether the extracted row ranges represent `conjunct` exactly, so it can be
+/// dropped from the residual.
+///
+/// Two things must hold. The conjunct must be built entirely from convertible
+/// `_ROW_ID` conditions — extraction ignores whatever it cannot convert, so its
+/// ranges are merely a superset and anything mixed leaves a remainder they do
+/// not carry. And extraction must actually have produced ranges *for this
+/// conjunct*: an `Or` whose branches are all empty yields `None`, which the
+/// enclosing `And` silently skips, so its ranges say nothing about it.
+pub(crate) fn ranges_represent_conjunct(conjunct: &Predicate) -> bool {
+    convertible_row_id_only(conjunct)
+        && extract_row_id_ranges(conjunct).is_some_and(|ranges| !ranges.is_empty())
+}
+
+fn convertible_row_id_only(predicate: &Predicate) -> bool {
     match predicate {
-        Predicate::Leaf { column, .. } if column == ROW_ID_FIELD_NAME => None,
-        Predicate::And(children) => {
-            let filtered: Vec<Predicate> =
-                children.iter().filter_map(remove_row_id_filter).collect();
-            match filtered.len() {
-                0 => None,
-                1 => Some(filtered.into_iter().next().unwrap()),
-                _ => Some(Predicate::and(filtered)),
-            }
+        Predicate::Leaf {
+            column,
+            op,
+            literals,
+            ..
+        } => is_row_id_column(column) && leaf_to_ranges(*op, literals).is_some(),
+        Predicate::And(children) | Predicate::Or(children) => {
+            children.iter().all(convertible_row_id_only)
         }
-        Predicate::Or(children) => {
-            let filtered: Vec<Predicate> =
-                children.iter().filter_map(remove_row_id_filter).collect();
-            if filtered.len() != children.len() {
-                // If any child was entirely _ROW_ID, the OR semantics change;
-                // conservatively keep the whole OR.
-                Some(predicate.clone())
-            } else {
-                Some(Predicate::or(filtered))
-            }
+        _ => false,
+    }
+}
+
+/// The error for a read that cannot evaluate a `_ROW_ID` predicate. `read` names
+/// the kind of read.
+///
+/// Only data-evolution reads attach the column; everywhere else the predicate is
+/// unenforceable, and every alternative is a silent wrong answer — a dropped
+/// conjunct, an all-null synthesized column, or a scan skipped entirely.
+pub(crate) fn unsupported_row_id_filter(read: &str) -> crate::Error {
+    crate::Error::Unsupported {
+        message: format!(
+            "filtering on '_ROW_ID' is not supported by {read}; it is available on \
+             data-evolution reads, or via row ranges"
+        ),
+    }
+}
+
+/// Reject a `_ROW_ID` predicate on a read that cannot synthesize row ids.
+pub(crate) fn reject_row_id_filter(predicates: &[Predicate], read: &str) -> crate::Result<()> {
+    if predicates.iter().any(references_row_id) {
+        return Err(unsupported_row_id_filter(read));
+    }
+    Ok(())
+}
+
+/// Whether any leaf of `predicate` references `_ROW_ID`.
+pub(crate) fn references_row_id(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Leaf { column, .. } => is_row_id_column(column),
+        Predicate::And(children) | Predicate::Or(children) => {
+            children.iter().any(references_row_id)
         }
-        other => Some(other.clone()),
+        Predicate::Not(inner) => references_row_id(inner),
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => false,
     }
 }
 
@@ -131,10 +165,12 @@ fn leaf_to_ranges(op: PredicateOperator, literals: &[Datum]) -> Option<Vec<RowRa
             Some(vec![RowRange::new(0, v - 1)])
         }
         PredicateOperator::In => {
+            // EVERY literal, or none: ranges standing for only part of the leaf
+            // would still read as the whole of it and drop the conjunct.
             let mut ranges: Vec<RowRange> = literals
                 .iter()
-                .filter_map(|d| datum_to_i64(d).map(|v| RowRange::new(v, v)))
-                .collect();
+                .map(|d| datum_to_i64(d).map(|v| RowRange::new(v, v)))
+                .collect::<Option<Vec<_>>>()?;
             if ranges.is_empty() {
                 return None;
             }
@@ -146,6 +182,11 @@ fn leaf_to_ranges(op: PredicateOperator, literals: &[Datum]) -> Option<Vec<RowRa
 }
 
 /// Intersect two sorted range lists.
+/// Intersect two range lists that are already sorted and merged.
+pub(crate) fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+    intersect_range_lists(a, b)
+}
+
 fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     let mut result = Vec::new();
     let (mut i, mut j) = (0, 0);
@@ -166,17 +207,42 @@ fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_a_partially_convertible_in_is_not_converted_at_all() {
+        let partial = row_id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Long(5), Datum::String("7".into())],
+        );
+        assert_eq!(extract_row_id_ranges(&partial), None);
+        assert!(!ranges_represent_conjunct(&partial));
+
+        let whole = row_id_leaf(PredicateOperator::In, vec![Datum::Long(5), Datum::Long(7)]);
+        assert_eq!(
+            extract_row_id_ranges(&whole),
+            Some(vec![RowRange::new(5, 5), RowRange::new(7, 7)])
+        );
+        assert!(ranges_represent_conjunct(&whole));
+    }
     use super::*;
+    use crate::spec::row_id_leaf;
     use crate::spec::{BigIntType, DataType};
 
-    fn row_id_leaf(op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
-        Predicate::Leaf {
-            column: ROW_ID_FIELD_NAME.to_string(),
+    #[test]
+    fn test_references_row_id_finds_nested_leaves() {
+        let other = Predicate::Leaf {
+            column: "v".to_string(),
             index: 0,
             data_type: DataType::BigInt(BigIntType::new()),
-            op,
-            literals,
-        }
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Long(7)],
+        };
+        let nested = Predicate::Not(Box::new(Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)]),
+            other.clone(),
+        ])));
+        assert!(references_row_id(&nested));
+        assert!(!references_row_id(&other));
     }
 
     fn data_leaf() -> Predicate {
@@ -240,24 +306,26 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_row_id_filter_leaf() {
-        let p = row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(10)]);
-        assert!(remove_row_id_filter(&p).is_none());
-    }
-
-    #[test]
-    fn test_remove_row_id_filter_and() {
-        let p = Predicate::and(vec![
-            row_id_leaf(PredicateOperator::GtEq, vec![Datum::Long(10)]),
+    fn test_ranges_represent_only_a_pure_row_id_conjunct() {
+        assert!(ranges_represent_conjunct(&row_id_leaf(
+            PredicateOperator::GtEq,
+            vec![Datum::Long(10)]
+        )));
+        assert!(!ranges_represent_conjunct(&row_id_leaf(
+            PredicateOperator::NotEq,
+            vec![Datum::Long(10)]
+        )));
+        assert!(!ranges_represent_conjunct(&data_leaf()));
+        assert!(!ranges_represent_conjunct(&Predicate::or(vec![
+            Predicate::and(vec![
+                row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)]),
+                data_leaf(),
+            ]),
             data_leaf(),
-        ]);
-        let result = remove_row_id_filter(&p).unwrap();
-        assert_eq!(result, data_leaf());
-    }
-
-    #[test]
-    fn test_remove_row_id_filter_keeps_non_row_id() {
-        let p = data_leaf();
-        assert_eq!(remove_row_id_filter(&p).unwrap(), data_leaf());
+        ])));
+        assert!(ranges_represent_conjunct(&Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(1)]),
+            row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(2)]),
+        ])));
     }
 }

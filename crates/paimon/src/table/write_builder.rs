@@ -153,8 +153,7 @@ impl<'a> PaimonWriteBuilder<'a> {
     }
 
     /// Mark writers created by this builder as overwrite-aware.
-    ///
-    /// The commit kind remains explicit at the commit call site.
+    /// Their messages must be submitted through [`TableCommit::overwrite`].
     pub fn with_overwrite(mut self) -> Self {
         self.overwrite = true;
         self
@@ -179,25 +178,7 @@ impl<'a> PaimonWriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
-        self.ensure_main_branch_write()?;
-        // A table with a time-travel selector reads a pinned snapshot (and may
-        // carry that snapshot's historical schema), so writing through the
-        // same copy would be inconsistent with what its reads observe — even
-        // when the pinned snapshot happens to share the current schema id.
-        // Java avoids this structurally (write paths use copyWithoutTimeTravel);
-        // here the same table copy can serve both reads and writes, so reject
-        // explicitly. Conflicting selectors (`Err`) cannot be valid for writes
-        // either. Commit-only flows (new_commit) stay untouched.
-        let selector =
-            crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
-        if !matches!(selector, Ok(None)) {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "Cannot write to a table with a time-travel option set \
-                          (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
-                        .to_string(),
-            });
-        }
+        ensure_table_write_allowed(self.table)?;
         let write = TableWrite::new(self.table, self.commit_user.clone())?;
         Ok(if self.overwrite {
             write.with_overwrite()
@@ -221,6 +202,21 @@ impl<'a> PaimonWriteBuilder<'a> {
     fn ensure_main_branch_write(&self) -> crate::Result<()> {
         self.table.ensure_not_branch_reference_for_write()
     }
+}
+
+pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
+    table.ensure_not_branch_reference_for_write()?;
+    // A time-travel table may carry a historical schema.
+    let selector =
+        crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
+    if !matches!(selector, Ok(None)) {
+        return Err(crate::Error::Unsupported {
+            message: "Cannot write to a table with a time-travel option set \
+                  (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
@@ -410,6 +406,7 @@ mod tests {
 
         let messages = write.prepare_commit().await.unwrap();
         assert_eq!(messages[0].bucket, POSTPONE_BUCKET);
+        assert_eq!(messages[0].total_buckets, None);
         assert!(
             messages[0].new_files[0]
                 .file_name
@@ -506,7 +503,7 @@ mod tests {
             "Overwrite-aware writer must not produce input changelog files"
         );
 
-        wb.new_commit().commit(messages).await.unwrap();
+        wb.new_commit().overwrite(messages, None).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
@@ -515,7 +512,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
     }
 
     #[test]

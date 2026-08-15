@@ -83,6 +83,9 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        // Building the index scans the table's rows.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         self.table.ensure_not_branch_reference_for_write()?;
 
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
@@ -1431,6 +1434,72 @@ mod tests {
                 expected_entries_read
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_full_search_includes_unindexed_rows() {
+        let mut options = table_options("2");
+        options.insert("scalar-index.search-mode".to_string(), "full".to_string());
+        let table = test_table_with_path(
+            "memory:/test_scalar_full_search_includes_unindexed_rows",
+            options,
+        );
+        setup_dirs(&table).await;
+
+        let mut first_write = TableWrite::new(&table, "writer-1".to_string()).unwrap();
+        first_write
+            .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "writer-1".to_string())
+            .commit(first_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+
+        let mut second_write = TableWrite::new(&table, "writer-2".to_string()).unwrap();
+        second_write
+            .write_arrow_batch(&data_batch(vec![3, 4], vec!["alice", "dave"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "writer-2".to_string())
+            .commit(second_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", crate::spec::Datum::String("alice".to_string()))
+            .unwrap();
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_filter(predicate);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let planned_ranges = merge_row_ranges(
+            plan.splits()
+                .iter()
+                .flat_map(|split| split.row_ranges().unwrap_or_default())
+                .cloned()
+                .collect(),
+        );
+
+        assert_eq!(
+            planned_ranges,
+            vec![RowRange::new(0, 0), RowRange::new(2, 3)]
+        );
+        assert_eq!(
+            scan_ids(
+                &table,
+                PredicateBuilder::new(table.schema().fields())
+                    .equal("name", crate::spec::Datum::String("alice".to_string()))
+                    .unwrap(),
+            )
+            .await,
+            vec![1, 3]
+        );
     }
 
     #[tokio::test]

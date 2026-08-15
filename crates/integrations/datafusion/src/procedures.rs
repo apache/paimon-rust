@@ -28,6 +28,9 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
 //! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'lumina', or a vindex type such as 'ivf-pq')
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
+//!
+//! The `index_type` argument of the three global index procedures is
+//! case-insensitive and surrounding whitespace is ignored.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,6 +45,7 @@ use datafusion::sql::sqlparser::ast::{
     FunctionArguments, ObjectName, Value as SqlValue,
 };
 use paimon::catalog::{Catalog, Identifier};
+use paimon::lumina::LUMINA_IDENTIFIER;
 use paimon::spec::Snapshot;
 use paimon::table::{
     normalize_global_index_type_for_drop, SnapshotManager, Table, TagManager,
@@ -50,6 +54,10 @@ use paimon::table::{
 use paimon::vindex::is_vindex_index_type;
 
 use crate::error::to_datafusion_error;
+
+/// Default `index_type` for the global index procedures when the argument is
+/// omitted, matching Java's `CreateGlobalIndexProcedure`.
+const DEFAULT_GLOBAL_INDEX_TYPE: &str = "btree";
 
 /// Resolve a snapshot by id: try live snapshot file first, then fall back to tag metadata.
 async fn resolve_snapshot_by_id(
@@ -527,9 +535,12 @@ async fn proc_create_lumina_index(
     let index_column = require_arg(args, "index_column")?;
     let mut builder = table.new_lumina_index_build_builder();
     builder.with_index_column(index_column);
-    if let Some(index_type) = args.get("index_type") {
-        builder.with_index_type(index_type);
-    }
+    let index_type = normalize_index_type(
+        args.get("index_type")
+            .map(String::as_str)
+            .unwrap_or(LUMINA_IDENTIFIER),
+    );
+    builder.with_index_type(&index_type);
     if let Some(options) = args.get("options") {
         builder.with_options(parse_key_value_options(options)?);
     }
@@ -545,10 +556,12 @@ async fn proc_create_global_index(
 ) -> DFResult<DataFrame> {
     let table = get_table(catalog, catalog_name, args).await?;
     let index_column = require_arg(args, "index_column")?;
-    let index_type = args
+    let index_type_arg = args
         .get("index_type")
         .map(String::as_str)
-        .unwrap_or("btree");
+        .unwrap_or(DEFAULT_GLOBAL_INDEX_TYPE);
+    let index_type = normalize_index_type(index_type_arg);
+    let index_type = index_type.as_str();
     if is_sorted_global_index_type(index_type) {
         if args.contains_key("options") {
             return Err(DataFusionError::NotImplemented(
@@ -569,9 +582,10 @@ async fn proc_create_global_index(
         }
         builder.execute().await.map_err(to_datafusion_error)?;
     } else {
+        // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
             "create_global_index only supports index_type => 'btree', 'bitmap', or vindex types \
-             ('ivf-flat', 'ivf-pq'), got '{index_type}'"
+             ('ivf-flat', 'ivf-pq'), got '{index_type_arg}'"
         )));
     }
     ok_result(ctx)
@@ -585,13 +599,16 @@ async fn proc_drop_global_index(
 ) -> DFResult<DataFrame> {
     let table = get_table(catalog, catalog_name, args).await?;
     let index_column = require_arg(args, "index_column")?;
-    let index_type = args
+    let index_type_arg = args
         .get("index_type")
         .map(String::as_str)
-        .unwrap_or("btree");
+        .unwrap_or(DEFAULT_GLOBAL_INDEX_TYPE);
+    let index_type = normalize_index_type(index_type_arg);
+    let index_type = index_type.as_str();
     if normalize_global_index_type_for_drop(index_type).is_none() {
+        // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
-            "unsupported global index type '{index_type}'; supported: {SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP}"
+            "unsupported global index type '{index_type_arg}'; supported: {SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP}"
         )));
     }
     if args.contains_key("partitions") {
@@ -612,8 +629,19 @@ async fn proc_drop_global_index(
     ok_result(ctx)
 }
 
+/// Precondition: `index_type` is already canonical (see `normalize_index_type`).
 fn is_sorted_global_index_type(index_type: &str) -> bool {
-    index_type.eq_ignore_ascii_case("btree") || index_type.eq_ignore_ascii_case("bitmap")
+    index_type == "btree" || index_type == "bitmap"
+}
+
+/// Canonicalize a procedure's `index_type` argument: trim, then lowercase.
+/// Mirrors `indexType.toLowerCase(Locale.ROOT).trim()` in Java's Flink and Spark
+/// `CreateGlobalIndexProcedure` / `DropGlobalIndexProcedure`. Normalizing at this
+/// boundary keeps the core builders' exact matching intact -- they are the analog
+/// of Java's `GlobalIndexer`, which likewise receives an already-canonical value
+/// and persists it into index metadata.
+fn normalize_index_type(index_type: &str) -> String {
+    index_type.trim().to_ascii_lowercase()
 }
 
 fn parse_key_value_options(options: &str) -> DFResult<HashMap<String, String>> {
@@ -767,5 +795,34 @@ mod tests {
 
         let result = earlier_or_equal_from_all(&sm, &tm, 1500).await.unwrap();
         assert_eq!(result.unwrap().id(), 1);
+    }
+
+    #[test]
+    fn test_normalize_index_type() {
+        // Casing and surrounding whitespace are both absorbed, matching Java's
+        // `indexType.toLowerCase(Locale.ROOT).trim()`.
+        assert_eq!(normalize_index_type("BTREE"), "btree");
+        assert_eq!(normalize_index_type(" btree "), "btree");
+        assert_eq!(normalize_index_type(" BitMap\t"), "bitmap");
+        assert_eq!(normalize_index_type("IVF-FLAT"), "ivf-flat");
+        assert_eq!(normalize_index_type("Ivf-Pq"), "ivf-pq");
+        assert_eq!(
+            normalize_index_type("Lumina-Vector-Ann"),
+            "lumina-vector-ann"
+        );
+        // Already canonical values are returned unchanged, and an unknown type
+        // is normalized but not rewritten -- the caller still rejects it.
+        assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");
+        assert_eq!(normalize_index_type(" Full-Text "), "full-text");
+    }
+
+    #[test]
+    fn test_sorted_global_index_type_predicate() {
+        assert!(is_sorted_global_index_type("btree"));
+        assert!(is_sorted_global_index_type("bitmap"));
+        assert!(!is_sorted_global_index_type("ivf-flat"));
+        assert!(!is_sorted_global_index_type("lumina"));
+        // The predicate requires a canonical input; callers normalize first.
+        assert!(!is_sorted_global_index_type("BTREE"));
     }
 }

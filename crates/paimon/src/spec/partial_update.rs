@@ -933,4 +933,89 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn test_validate_sequence_groups_rejects_unknown_field() {
+        let options = partial_update_options(&[("fields.version.sequence-group", "prcie")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_sequence_groups(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("prcie")
+                    && message.contains("does not exist in the table schema")),
+            "expected unknown sequence-group field error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_empty_listagg_field() {
+        let options = partial_update_options(&[("fields..list-agg-delimiter", ";")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "note".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Invalid partial-update listagg option")
+                    && message.contains("fields..list-agg-delimiter")),
+            "expected invalid listagg option error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_empty_aggregate_function_field() {
+        let options = partial_update_options(&[("fields..aggregate-function", "sum")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Invalid partial-update aggregate-function option")
+                    && message.contains("fields..aggregate-function")),
+            "expected invalid aggregate-function option error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_aggregate_functions_rejects_unknown_default_function() {
+        let options = partial_update_options(&[(FIELDS_DEFAULT_AGG_FUNCTION_OPTION, "sume")]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let err = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sume")
+                    && message.contains(FIELDS_DEFAULT_AGG_FUNCTION_OPTION)),
+            "expected unknown default aggregate function error, got {err:?}"
+        );
+    }
 }

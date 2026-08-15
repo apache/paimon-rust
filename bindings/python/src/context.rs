@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::compute::cast;
@@ -23,6 +24,8 @@ use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::CatalogProvider;
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
@@ -116,8 +119,8 @@ pub struct PaimonCatalog {
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
     #[new]
-    fn new(catalog_options: HashMap<String, String>) -> PyResult<Self> {
-        let catalog = build_paimon_catalog(catalog_options)?;
+    fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
+        let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
         let provider = Arc::new(
             PaimonCatalogProvider::new(
                 None,
@@ -145,21 +148,28 @@ impl PaimonCatalog {
     }
 
     /// List all databases in this catalog.
-    fn list_databases(&self) -> PyResult<Vec<String>> {
-        runtime()
-            .block_on(self.catalog.list_databases())
-            .map_err(to_py_err)
+    fn list_databases(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let catalog = Arc::clone(&self.catalog);
+        py.detach(|| {
+            runtime()
+                .block_on(catalog.list_databases())
+                .map_err(to_py_err)
+        })
     }
 
     /// List all tables in the given database.
-    fn list_tables(&self, database_name: &str) -> PyResult<Vec<String>> {
-        runtime()
-            .block_on(self.catalog.list_tables(database_name))
-            .map_err(to_py_err)
+    fn list_tables(&self, py: Python<'_>, database_name: &str) -> PyResult<Vec<String>> {
+        let catalog = Arc::clone(&self.catalog);
+        let database_name = database_name.to_string();
+        py.detach(|| {
+            runtime()
+                .block_on(catalog.list_tables(&database_name))
+                .map_err(to_py_err)
+        })
     }
 
     /// Get a table handle by `"db.table"` identifier.
-    fn get_table(&self, identifier: &str) -> PyResult<PyTable> {
+    fn get_table(&self, py: Python<'_>, identifier: &str) -> PyResult<PyTable> {
         let parts: Vec<&str> = identifier.splitn(2, '.').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(PyValueError::new_err(format!(
@@ -167,9 +177,12 @@ impl PaimonCatalog {
             )));
         }
         let id = Identifier::new(parts[0], parts[1]);
-        let table = runtime()
-            .block_on(self.catalog.get_table(&id))
-            .map_err(to_py_err)?;
+        let catalog = Arc::clone(&self.catalog);
+        let table = py.detach(|| {
+            runtime()
+                .block_on(catalog.get_table(&id))
+                .map_err(to_py_err)
+        })?;
         Ok(PyTable::new(Arc::new(table)))
     }
 }
@@ -181,6 +194,62 @@ pub struct PySQLContext {
 }
 
 impl PySQLContext {
+    fn build_sql_context(
+        memory_pool_type: Option<String>,
+        memory_pool_bytes: Option<usize>,
+        temp_directory: Option<PathBuf>,
+        max_temp_directory_size_bytes: Option<u64>,
+    ) -> PyResult<SQLContext> {
+        if memory_pool_type.is_some() && memory_pool_bytes.is_none() {
+            return Err(PyValueError::new_err(
+                "memory_pool_type requires memory_pool_bytes",
+            ));
+        }
+        if memory_pool_bytes == Some(0) {
+            return Err(PyValueError::new_err(
+                "memory_pool_bytes must be greater than zero",
+            ));
+        }
+        if temp_directory
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(PyValueError::new_err("temp_directory must not be empty"));
+        }
+
+        let has_runtime_config = memory_pool_bytes.is_some()
+            || temp_directory.is_some()
+            || max_temp_directory_size_bytes.is_some();
+        if !has_runtime_config {
+            return Ok(SQLContext::new());
+        }
+
+        let mut runtime_builder = RuntimeEnvBuilder::new();
+        if let Some(memory_pool_bytes) = memory_pool_bytes {
+            let memory_pool: Arc<dyn MemoryPool> =
+                match memory_pool_type.as_deref().unwrap_or("greedy") {
+                    "fair" => Arc::new(FairSpillPool::new(memory_pool_bytes)),
+                    "greedy" => Arc::new(GreedyMemoryPool::new(memory_pool_bytes)),
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unsupported memory_pool_type '{other}'; expected 'fair' or 'greedy'"
+                        )));
+                    }
+                };
+            runtime_builder = runtime_builder.with_memory_pool(memory_pool);
+        }
+        if let Some(temp_directory) = temp_directory {
+            runtime_builder = runtime_builder.with_temp_file_path(temp_directory);
+        }
+        if let Some(max_temp_directory_size_bytes) = max_temp_directory_size_bytes {
+            runtime_builder =
+                runtime_builder.with_max_temp_directory_size(max_temp_directory_size_bytes);
+        }
+
+        let runtime_env = runtime_builder.build_arc().map_err(df_to_py_err)?;
+        Ok(SQLContext::builder().with_runtime_env(runtime_env).build())
+    }
+
     fn vector_float32_type() -> ArrowDataType {
         ArrowDataType::List(Arc::new(ArrowField::new(
             "item",
@@ -325,9 +394,27 @@ impl PySQLContext {
 #[pymethods]
 impl PySQLContext {
     #[new]
-    fn new(py: Python<'_>) -> PyResult<Self> {
+    /// Creates a Paimon SQL context.
+    ///
+    /// `memory_pool_type` accepts `"greedy"` or `"fair"` and requires
+    /// `memory_pool_bytes`. When only `memory_pool_bytes` is provided, the
+    /// greedy pool is used. Temporary files can be directed to
+    /// `temp_directory` and bounded with `max_temp_directory_size_bytes`.
+    #[pyo3(signature = (*, memory_pool_type=None, memory_pool_bytes=None, temp_directory=None, max_temp_directory_size_bytes=None))]
+    fn new(
+        py: Python<'_>,
+        memory_pool_type: Option<String>,
+        memory_pool_bytes: Option<usize>,
+        temp_directory: Option<PathBuf>,
+        max_temp_directory_size_bytes: Option<u64>,
+    ) -> PyResult<Self> {
         let ctx = Self {
-            inner: SQLContext::new(),
+            inner: Self::build_sql_context(
+                memory_pool_type,
+                memory_pool_bytes,
+                temp_directory,
+                max_temp_directory_size_bytes,
+            )?,
         };
         if let Err(err) = ctx.register_multimodal_builtins(py) {
             Self::warn_multimodal_builtin_registration_failure(py, err);

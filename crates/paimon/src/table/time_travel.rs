@@ -22,6 +22,8 @@ use crate::table::{SnapshotManager, Table, TagManager};
 use crate::Error;
 use std::collections::HashMap;
 
+const WATERMARK_PREFIX: &str = "watermark-";
+
 /// Resolve the snapshot selected by the time-travel options, if any.
 ///
 /// Returns `Ok(None)` when no time-travel selector is configured. Returns an
@@ -45,13 +47,27 @@ pub(crate) async fn travel_to_snapshot(
                 }),
             }
         }
+        Some(TimeTravelSelector::Watermark(w)) => {
+            resolve_watermark(snapshot_manager, w).await.map(Some)
+        }
         Some(TimeTravelSelector::Version {
             value: v,
             option_name,
         }) => {
-            // `scan.version` is ambiguous by design: tag first, then snapshot id.
+            // Match Java TimeTravelUtil.adaptScanVersion: tag first, then the
+            // `watermark-<value>` prefix, then snapshot id.
             if tag_manager.tag_exists(v).await? {
                 resolve_tag(tag_manager, v).await.map(Some)
+            } else if let Some(raw_watermark) = v.strip_prefix(WATERMARK_PREFIX) {
+                let watermark = raw_watermark
+                    .parse::<i64>()
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!("{option_name} '{v}' has an invalid watermark value."),
+                        source: Some(Box::new(e)),
+                    })?;
+                resolve_watermark(snapshot_manager, watermark)
+                    .await
+                    .map(Some)
             } else if let Ok(id) = v.parse::<i64>() {
                 snapshot_manager.get_snapshot(id).await.map(Some)
             } else {
@@ -89,6 +105,22 @@ pub(crate) async fn travel_to_snapshot(
             }
         }
         None => Ok(None),
+    }
+}
+
+async fn resolve_watermark(
+    snapshot_manager: &SnapshotManager,
+    watermark: i64,
+) -> crate::Result<Snapshot> {
+    match snapshot_manager.later_or_equal_watermark(watermark).await? {
+        Some(snapshot) => Ok(snapshot),
+        // Mirrors Java StaticFromWatermarkStartingScanner's error.
+        None => Err(Error::DataInvalid {
+            message: format!(
+                "There is currently no snapshot later than or equal to watermark[{watermark}]"
+            ),
+            source: None,
+        }),
     }
 }
 
@@ -138,7 +170,7 @@ async fn resolve_tag(tag_manager: &TagManager, name: &str) -> crate::Result<Snap
 mod tests {
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
-    use crate::spec::{DataType, IntType, Schema, TableSchema};
+    use crate::spec::{CommitKind, DataType, IntType, Schema, Snapshot, TableSchema};
     use crate::table::{SnapshotManager, Table, TableCommit, TableWrite, TagManager};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -253,6 +285,39 @@ mod tests {
 
     fn latest_table(file_io: &FileIO, table_path: &str) -> Table {
         make_table(file_io, table_path, schema_v1())
+    }
+
+    /// Table whose snapshots carry watermarks, committed directly through
+    /// `SnapshotManager` (the Rust commit path never writes watermarks):
+    /// snapshot 1 (watermark 100), snapshot 2 (no watermark), snapshot 3
+    /// (watermark 300), all on schema 0.
+    async fn setup_watermark_table() -> (FileIO, String) {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/watermark_table";
+        for dir in ["snapshot", "manifest"] {
+            file_io
+                .mkdirs(&format!("{table_path}/{dir}/"))
+                .await
+                .unwrap();
+        }
+        write_schema_file(&file_io, table_path, &schema_v0()).await;
+        let sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        for (id, watermark) in [(1, Some(100)), (2, None), (3, Some(300))] {
+            let snapshot = Snapshot::builder()
+                .version(3)
+                .id(id)
+                .schema_id(0)
+                .base_manifest_list(format!("base-list-{id}"))
+                .delta_manifest_list(format!("delta-list-{id}"))
+                .commit_user("test-user".to_string())
+                .commit_identifier(0)
+                .commit_kind(CommitKind::APPEND)
+                .time_millis(1000 * id as u64)
+                .watermark(watermark)
+                .build();
+            sm.commit_snapshot(&snapshot).await.unwrap();
+        }
+        (file_io, table_path.to_string())
     }
 
     fn options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -503,16 +568,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_with_time_travel_rejects_unsupported_scan_option() {
-        let (file_io, table_path) = setup_evolved_table().await;
-        let table = latest_table(&file_io, &table_path);
-        let err = table
-            .copy_with_time_travel(options(&[("scan.watermark", "5")]))
+    async fn test_copy_with_time_travel_resolves_watermark() {
+        let (file_io, table_path) = setup_watermark_table().await;
+        let table = make_table(&file_io, &table_path, schema_v0());
+
+        // Exact match on snapshot 1; snapshot 2 carries no watermark and is skipped.
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.watermark", "100")]))
             .await
-            .expect_err("unsupported scan option must fail");
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(1));
+
+        // Between watermarks: the earliest snapshot with watermark >= the value.
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.watermark", "150")]))
+            .await
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(3));
+        assert!(traveled.has_resolved_travel_snapshot());
+    }
+
+    #[tokio::test]
+    async fn test_scan_version_resolves_java_watermark_prefix_after_tag() {
+        let (file_io, table_path) = setup_watermark_table().await;
+        let table = make_table(&file_io, &table_path, schema_v0());
+
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.version", "watermark-150")]))
+            .await
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(3));
+
+        // Java resolves an existing tag before interpreting the watermark prefix.
+        let sm = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let snapshot1 = sm.get_snapshot(1).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path.clone());
+        tm.create("watermark-150", &snapshot1).await.unwrap();
+        let tagged = table
+            .copy_with_time_travel(options(&[("scan.version", "watermark-150")]))
+            .await
+            .unwrap();
+        assert_eq!(tagged.travel_snapshot().map(|s| s.id()), Some(1));
+
+        let err =
+            super::travel_to_snapshot(&sm, &tm, &options(&[("scan.version", "watermark-invalid")]))
+                .await
+                .expect_err("invalid watermark version must fail");
         assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("scan.watermark"))
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("invalid watermark value")),
+            "expected watermark parse error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_watermark_without_matching_snapshot_fails_at_scan() {
+        let (file_io, table_path) = setup_watermark_table().await;
+        let table = make_table(&file_io, &table_path, schema_v0());
+
+        // Like Java tryTravelToSnapshot, resolution failure falls back silently...
+        let unresolved = table
+            .copy_with_time_travel(options(&[("scan.watermark", "301")]))
+            .await
+            .unwrap();
+        assert!(!unresolved.has_resolved_travel_snapshot());
+
+        // ...and the error surfaces at scan planning, naming the watermark.
+        let err = unresolved
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .expect_err("scan with unresolvable watermark must fail");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("watermark[301]")),
+            "expected watermark error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watermark_selector_change_invalidates_resolved_snapshot() {
+        let (file_io, table_path) = setup_watermark_table().await;
+        let table = make_table(&file_io, &table_path, schema_v0());
+
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.watermark", "100")]))
+            .await
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(1));
+
+        // Merging unrelated options keeps the resolved snapshot.
+        let recopied = traveled.copy_with_options(options(&[("k", "v")]));
+        assert_eq!(recopied.travel_snapshot().map(|s| s.id()), Some(1));
+
+        // Changing the watermark invalidates the cached resolution.
+        let changed = traveled.copy_with_options(options(&[("scan.watermark", "150")]));
+        assert!(changed.travel_snapshot().is_none());
     }
 
     #[tokio::test]

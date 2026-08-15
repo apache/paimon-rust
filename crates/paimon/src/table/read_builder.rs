@@ -210,7 +210,8 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set Data Evolution row ID ranges `[from, to]` (inclusive).
+    /// An empty vector selects no rows. Format tables are not supported.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -307,7 +308,11 @@ struct PaimonReadBuilder<'a> {
     projection_names: Option<Vec<String>>,
     filter: NormalizedFilter,
     limit: Option<usize>,
-    row_ranges: Option<Vec<RowRange>>,
+    /// Ranges the caller set. Each `with_row_ranges` replaces them.
+    explicit_row_ranges: Option<Vec<RowRange>>,
+    /// Ranges the current filter yields, recomputed whenever it is replaced.
+    /// Kept apart so neither setter discards the other's constraint.
+    derived_row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     parquet_read_budget: Option<Arc<crate::arrow::ParquetReadBudget>>,
 }
@@ -320,7 +325,8 @@ impl<'a> PaimonReadBuilder<'a> {
             projection_names: None,
             filter: NormalizedFilter::default(),
             limit: None,
-            row_ranges: None,
+            explicit_row_ranges: None,
+            derived_row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
         }
@@ -383,6 +389,7 @@ impl<'a> PaimonReadBuilder<'a> {
     /// the full predicate with an exact post-merge residual filter.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);
+        self.derived_row_ranges = None;
         self.try_extract_row_id_ranges();
         self
     }
@@ -399,31 +406,45 @@ impl<'a> PaimonReadBuilder<'a> {
         )
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
-        self.row_ranges = if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        };
+        self.explicit_row_ranges = Some(super::merge_row_ranges(ranges));
         self
     }
 
-    /// Extract `_ROW_ID` predicates from data_predicates into row_ranges.
-    /// Only runs when no explicit row_ranges have been set.
+    /// Both are independent restrictions, so a scan honours their intersection.
+    /// `None` on a side means unconstrained by it.
+    fn effective_row_ranges(&self) -> Option<Vec<RowRange>> {
+        match (&self.explicit_row_ranges, &self.derived_row_ranges) {
+            (Some(explicit), Some(derived)) => Some(
+                super::row_id_predicate::intersect_sorted_ranges(explicit, derived),
+            ),
+            (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+            (None, None) => None,
+        }
+    }
+
+    /// Derive row ranges from the `_ROW_ID` conjuncts. Independent of any
+    /// explicit ranges — the two compose.
     fn try_extract_row_id_ranges(&mut self) {
-        if self.row_ranges.is_some() || self.filter.data_predicates.is_empty() {
+        if self.filter.data_predicates.is_empty() {
+            return;
+        }
+        // Ranges select by `first_row_id`, which only row tracking assigns.
+        // Without it nothing enforces a derived range, so a conjunct handed over
+        // and dropped from the residual would return every row.
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if !core_options.row_tracking_enabled() && !core_options.data_evolution_enabled() {
             return;
         }
         let combined = Predicate::and(self.filter.data_predicates.clone());
         if let Some(ranges) = super::row_id_predicate::extract_row_id_ranges(&combined) {
-            self.row_ranges = Some(ranges);
-            self.filter.data_predicates = self
-                .filter
+            self.derived_row_ranges = Some(ranges);
+            // Ranges are a superset, so a conjunct leaves the residual only when
+            // they represent it exactly.
+            self.filter
                 .data_predicates
-                .iter()
-                .filter_map(super::row_id_predicate::remove_row_id_filter)
-                .collect();
+                .retain(|conjunct| !super::row_id_predicate::ranges_represent_conjunct(conjunct));
         }
     }
 
@@ -469,7 +490,7 @@ impl<'a> PaimonReadBuilder<'a> {
             self.filter.data_predicates.clone(),
             self.filter.bucket_predicate.clone(),
             self.limit,
-            self.row_ranges.clone(),
+            self.effective_row_ranges(),
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
@@ -609,11 +630,7 @@ pub(super) fn resolve_projected_fields(
         }
 
         if name == crate::spec::ROW_ID_FIELD_NAME {
-            resolved.push(DataField::new(
-                crate::spec::ROW_ID_FIELD_ID,
-                crate::spec::ROW_ID_FIELD_NAME.to_string(),
-                crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
-            ));
+            resolved.push(crate::spec::row_id_data_field());
             continue;
         }
 
@@ -662,11 +679,16 @@ fn projected_read_field_ids_with_predicates(
     table_fields: &[DataField],
 ) -> Option<HashSet<i32>> {
     let mut field_ids = projected_read_field_ids(read_type)?;
-    let mut predicate_indices = Vec::new();
+    let mut refs = Vec::new();
     for predicate in predicates {
-        crate::arrow::residual::collect_predicate_field_indices(predicate, &mut predicate_indices);
+        crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
     }
-    for index in predicate_indices {
+    for (name, index) in refs {
+        // Not in `table_fields`, and excluded from this set anyway — files never
+        // list it in `write_cols`.
+        if crate::spec::is_row_id_column(name) {
+            continue;
+        }
         let Some(field) = table_fields.get(index) else {
             // A malformed predicate must not make scan planning discard files.
             return None;
@@ -879,6 +901,27 @@ mod tests {
         )
     }
 
+    fn row_id_table(row_tracking: bool, data_evolution: bool) -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let mut builder = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["dt"]);
+        if row_tracking {
+            builder = builder.option("row-tracking.enabled", "true");
+        }
+        if data_evolution {
+            builder = builder.option("data-evolution.enabled", "true");
+        }
+        Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder-rowid".to_string(),
+            TableSchema::new(0, &builder.build().unwrap()),
+            None,
+        )
+    }
+
     fn simple_table() -> Table {
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
@@ -897,6 +940,62 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_with_empty_row_ranges_is_preserved() {
+        let table = simple_table();
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+
+        assert_eq!(
+            paimon_builder(&builder).effective_row_ranges(),
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_format_table_rejects_row_ranges() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("type", "format-table")
+            .option("file.format", "parquet")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "format_t"),
+            "memory:/format_t".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+        let error = builder.new_scan().plan().await.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
+
+        let error = table
+            .new_read_builder()
+            .new_scan()
+            .with_row_ranges(Vec::new())
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
+
+        // `new_read` must reject too: a caller that skips planning would otherwise
+        // read every row instead of the requested ranges.
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+        let error = builder.new_read().unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
     }
 
     fn dv_pk_table(table_path: &str, merge_engine: &str) -> Table {
@@ -1028,6 +1127,298 @@ mod tests {
         assert_eq!(
             super::projected_read_field_ids_with_predicates(&read_type, &[predicate], &fields,),
             Some(HashSet::from([1, 2]))
+        );
+    }
+
+    use crate::table::RowRange;
+
+    fn row_id_leaf(op: crate::spec::PredicateOperator, v: i64) -> Predicate {
+        crate::spec::row_id_leaf(op, vec![crate::spec::Datum::Long(v)])
+    }
+
+    #[test]
+    fn test_replacing_a_filter_drops_the_range_it_derived() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let mut builder = PaimonReadBuilder::new(&table);
+
+        builder.with_filter(row_id_leaf(PredicateOperator::Eq, 10));
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(10, 10)])
+        );
+
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", crate::spec::Datum::Int(7))
+                .unwrap(),
+        );
+        assert_eq!(builder.effective_row_ranges(), None);
+    }
+
+    #[test]
+    fn test_range_setters_do_not_consume_each_other() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let mut builder = PaimonReadBuilder::new(&table);
+
+        builder.with_filter(row_id_leaf(PredicateOperator::GtEq, 10));
+        builder.with_row_ranges(vec![RowRange::new(0, 20)]);
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(10, 20)])
+        );
+
+        builder.with_row_ranges(vec![RowRange::new(0, 30)]);
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(10, 30)])
+        );
+
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", crate::spec::Datum::Int(7))
+                .unwrap(),
+        );
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(0, 30)])
+        );
+    }
+
+    #[test]
+    fn test_an_explicit_range_survives_a_filter_replacement() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let mut builder = PaimonReadBuilder::new(&table);
+
+        builder.with_row_ranges(vec![RowRange::new(0, 20)]);
+        builder.with_filter(row_id_leaf(PredicateOperator::Eq, 10));
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(10, 10)])
+        );
+
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", crate::spec::Datum::Int(7))
+                .unwrap(),
+        );
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(0, 20)])
+        );
+    }
+
+    #[test]
+    fn test_inexactly_extracted_row_id_conjuncts_stay_residuals() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let mut builder = PaimonReadBuilder::new(&table);
+
+        let contradiction = Predicate::and(vec![
+            row_id_leaf(PredicateOperator::Eq, 1),
+            row_id_leaf(PredicateOperator::NotEq, 1),
+        ]);
+        builder.with_filter(contradiction);
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(1, 1)])
+        );
+        assert_eq!(
+            builder.filter.data_predicates,
+            vec![row_id_leaf(PredicateOperator::NotEq, 1)]
+        );
+
+        let mut exact = PaimonReadBuilder::new(&table);
+        exact.with_filter(row_id_leaf(PredicateOperator::GtEq, 10));
+        assert_eq!(
+            exact.effective_row_ranges(),
+            Some(vec![RowRange::new(10, i64::MAX)])
+        );
+        assert!(exact.filter.data_predicates.is_empty());
+    }
+
+    #[test]
+    fn test_a_mixed_conjunct_is_never_replaced_by_ranges() {
+        use crate::spec::{Datum, PredicateOperator};
+        let table = row_id_table(true, false);
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let disjunction = Predicate::or(vec![
+            Predicate::and(vec![
+                row_id_leaf(PredicateOperator::Eq, 1),
+                pb.equal("id", Datum::Int(7)).unwrap(),
+            ]),
+            pb.equal("dt", Datum::String("x".into())).unwrap(),
+        ]);
+        let mut builder = PaimonReadBuilder::new(&table);
+        builder.with_filter(Predicate::and(vec![
+            row_id_leaf(PredicateOperator::GtEq, 10),
+            disjunction.clone(),
+        ]));
+
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(10, i64::MAX)])
+        );
+        assert_eq!(builder.filter.data_predicates, vec![disjunction]);
+    }
+
+    #[test]
+    fn test_a_nested_empty_row_id_branch_does_not_widen_the_ranges() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let unsatisfiable = Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Gt, i64::MAX),
+            row_id_leaf(PredicateOperator::Lt, 0),
+        ]);
+        let mut builder = PaimonReadBuilder::new(&table);
+        builder.with_filter(Predicate::or(vec![
+            Predicate::and(vec![row_id_leaf(PredicateOperator::Eq, 6), unsatisfiable]),
+            row_id_leaf(PredicateOperator::Eq, 7),
+        ]));
+
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(7, 7)])
+        );
+        assert!(builder.filter.data_predicates.is_empty());
+    }
+
+    #[test]
+    fn test_a_format_table_rejects_a_row_id_filter() {
+        use crate::spec::PredicateOperator;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("type", "format-table")
+                .option("file.format", "parquet")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "ft"),
+            "memory:/ft".to_string(),
+            table_schema,
+            None,
+        );
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_filter(row_id_leaf(PredicateOperator::NotEq, 5));
+        let err = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[])
+            .err()
+            .expect("a _ROW_ID filter must be rejected");
+
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_an_empty_row_id_disjunction_stays_a_residual() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let unsatisfiable = Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Gt, i64::MAX),
+            row_id_leaf(PredicateOperator::Lt, 0),
+        ]);
+        let mut builder = PaimonReadBuilder::new(&table);
+        builder.with_filter(Predicate::and(vec![
+            row_id_leaf(PredicateOperator::Eq, 5),
+            unsatisfiable.clone(),
+        ]));
+
+        assert_eq!(builder.effective_row_ranges(), Some(Vec::new()));
+        assert_eq!(builder.filter.data_predicates, vec![unsatisfiable]);
+    }
+
+    #[test]
+    fn test_extraction_needs_a_table_whose_files_carry_row_ids() {
+        use crate::spec::PredicateOperator;
+        let plain_table = row_id_table(false, false);
+        let mut plain = PaimonReadBuilder::new(&plain_table);
+        plain.with_filter(row_id_leaf(PredicateOperator::GtEq, 102));
+        assert_eq!(
+            plain.effective_row_ranges(),
+            None,
+            "nothing to derive ranges from"
+        );
+        assert_eq!(
+            plain.filter.data_predicates.len(),
+            1,
+            "the conjunct must stay so the read can reject it"
+        );
+
+        for (row_tracking, data_evolution) in [(true, false), (false, true), (true, true)] {
+            let table = row_id_table(row_tracking, data_evolution);
+            let mut builder = PaimonReadBuilder::new(&table);
+            builder.with_filter(row_id_leaf(PredicateOperator::GtEq, 102));
+            assert_eq!(
+                builder.effective_row_ranges(),
+                Some(vec![RowRange::new(102, i64::MAX)]),
+                "row_tracking={row_tracking} data_evolution={data_evolution}"
+            );
+            assert!(builder.filter.data_predicates.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_an_explicit_range_intersects_a_derived_one() {
+        use crate::spec::PredicateOperator;
+        let table = row_id_table(true, false);
+        let mut builder = PaimonReadBuilder::new(&table);
+        builder.with_filter(Predicate::or(vec![
+            row_id_leaf(PredicateOperator::Eq, 1),
+            row_id_leaf(PredicateOperator::Eq, 8),
+        ]));
+        assert!(
+            builder.filter.data_predicates.is_empty(),
+            "handed to ranges"
+        );
+
+        builder.with_row_ranges(vec![RowRange::new(0, 5)]);
+
+        assert_eq!(
+            builder.effective_row_ranges(),
+            Some(vec![RowRange::new(1, 1)]),
+            "row 8 is outside the explicit range, row 1 satisfies both"
+        );
+    }
+
+    #[test]
+    fn test_row_id_filter_never_projects_onto_a_partition_key() {
+        let table = simple_table();
+        let row_id = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::GtEq,
+            vec![crate::spec::Datum::Long(10)],
+        );
+
+        let (partition_predicate, data_predicates) =
+            super::split_scan_predicates(&table, row_id.clone());
+        assert_eq!(partition_predicate, None);
+        assert_eq!(data_predicates, vec![row_id.clone()]);
+
+        assert!(!ReadBuilder::new(&table).is_exact_filter_pushdown(&row_id));
+    }
+
+    #[test]
+    fn test_projected_read_field_ids_ignore_system_predicate_fields() {
+        let fields = vec![
+            DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "payload".to_string(), DataType::Int(IntType::new())),
+        ];
+        let read_type = Some(vec![fields[1].clone()]);
+        let row_id = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::Eq,
+            vec![crate::spec::Datum::Long(1)],
+        );
+
+        assert_eq!(
+            super::projected_read_field_ids_with_predicates(&read_type, &[row_id], &fields),
+            Some(HashSet::from([2]))
         );
     }
 
@@ -1821,6 +2212,7 @@ mod tests {
             &Schema::builder()
                 .column("id", DataType::Int(IntType::new()))
                 .column("value", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -1856,8 +2248,8 @@ mod tests {
 
         // _ROW_ID predicates should be extracted into row_ranges
         let inner = paimon_builder(&builder);
-        assert!(inner.row_ranges.is_some());
-        let ranges = inner.row_ranges.as_ref().unwrap();
+        assert!(inner.effective_row_ranges().is_some());
+        let ranges = inner.effective_row_ranges().unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].from(), 10);
         assert_eq!(ranges[0].to(), 20);
@@ -1902,7 +2294,7 @@ mod tests {
         builder.with_filter(filter);
 
         // Explicit row_ranges should be preserved, not overwritten
-        let ranges = paimon_builder(&builder).row_ranges.as_ref().unwrap();
+        let ranges = paimon_builder(&builder).effective_row_ranges().unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].from(), 0);
         assert_eq!(ranges[0].to(), 5);

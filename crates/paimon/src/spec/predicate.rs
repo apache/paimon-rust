@@ -26,7 +26,7 @@
 use crate::error::*;
 use crate::spec::binary_row::BinaryRow;
 use crate::spec::types::DataType;
-use crate::spec::DataField;
+use crate::spec::{is_row_id_column, DataField};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -434,6 +434,9 @@ impl Predicate {
                 op,
                 literals,
             } => {
+                if is_row_id_column(column) {
+                    return None;
+                }
                 let new_index = (*mapping.get(*index)?)?;
                 Some(Predicate::Leaf {
                     column: column.clone(),
@@ -472,7 +475,9 @@ impl Predicate {
     /// retained as a residual data predicate after partition projection.
     pub(crate) fn references_only_mapped_fields(&self, mapping: &[Option<usize>]) -> bool {
         match self {
-            Predicate::Leaf { index, .. } => mapping.get(*index).is_some_and(Option::is_some),
+            Predicate::Leaf { column, index, .. } => {
+                !is_row_id_column(column) && mapping.get(*index).is_some_and(Option::is_some)
+            }
             Predicate::And(children) | Predicate::Or(children) => children
                 .iter()
                 .all(|child| child.references_only_mapped_fields(mapping)),
@@ -482,6 +487,8 @@ impl Predicate {
     }
 
     /// Project leaf field indices from table schema space into a smaller field space.
+    ///
+    /// A `_ROW_ID` leaf never maps — see [`is_row_id_column`].
     ///
     /// Unlike [`Self::remap_field_index`], mixed `AND` subtrees keep the children
     /// that can be projected and drop the rest. `OR` and `NOT` still require all
@@ -501,6 +508,9 @@ impl Predicate {
                 op,
                 literals,
             } => {
+                if is_row_id_column(column) {
+                    return None;
+                }
                 let new_index = (*mapping.get(*index)?)?;
                 Some(Predicate::Leaf {
                     column: column.clone(),
@@ -1344,6 +1354,19 @@ fn validate_datum_matches_type(datum: &Datum, data_type: &DataType) -> Result<()
     Ok(())
 }
 
+/// Build a `_ROW_ID` leaf the way callers have to: the column is in no schema, so
+/// [`PredicateBuilder`] cannot resolve it and the index is a placeholder.
+#[cfg(test)]
+pub(crate) fn row_id_leaf(op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
+    Predicate::Leaf {
+        column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+        index: 0,
+        data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+        op,
+        literals,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // field_idx_to_partition_idx
 // ---------------------------------------------------------------------------
@@ -1718,6 +1741,64 @@ mod tests {
             DataField::new(2, "dt".to_string(), DataType::Date(DateType::new())),
             DataField::new(3, "hr".to_string(), DataType::Int(IntType::new())),
         ]
+    }
+
+    #[test]
+    fn test_system_column_never_maps_onto_a_field_space() {
+        let fields = test_fields();
+        let partition_first = [
+            fields[2].clone(),
+            fields[0].clone(),
+            fields[1].clone(),
+            fields[3].clone(),
+        ];
+        let mapping =
+            field_idx_to_partition_idx(&partition_first, &["dt".to_string(), "hr".to_string()]);
+        assert_eq!(mapping[0], Some(0), "field 0 is the dt partition key");
+
+        let leaf = row_id_leaf(PredicateOperator::GtEq, vec![Datum::Long(10)]);
+        assert_eq!(leaf.project_field_index_inclusive(&mapping), None);
+        assert_eq!(leaf.remap_field_index(&mapping), None);
+        assert!(!leaf.references_only_mapped_fields(&mapping));
+    }
+
+    #[test]
+    fn test_system_column_does_not_drag_a_conjunction_onto_a_field_space() {
+        let fields = test_fields();
+        let mapping = field_idx_to_partition_idx(&fields, &["hr".to_string()]);
+        let dt = PredicateBuilder::new(&fields)
+            .greater_or_equal("hr", Datum::Int(3))
+            .unwrap();
+
+        let conjunction = Predicate::and(vec![
+            row_id_leaf(PredicateOperator::GtEq, vec![Datum::Long(10)]),
+            dt.clone(),
+        ]);
+        let projected = conjunction.project_field_index_inclusive(&mapping).unwrap();
+        assert!(!matches!(projected, Predicate::And(_)), "only hr survives");
+        assert!(!conjunction.references_only_mapped_fields(&mapping));
+
+        let disjunction = Predicate::or(vec![
+            row_id_leaf(PredicateOperator::GtEq, vec![Datum::Long(10)]),
+            dt,
+        ]);
+        assert_eq!(disjunction.project_field_index_inclusive(&mapping), None);
+    }
+
+    #[test]
+    fn test_only_row_id_is_unresolvable_by_index() {
+        let fields = vec![
+            DataField::new(0, "rowkind".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "hr".to_string(), DataType::Int(IntType::new())),
+        ];
+        let mapping = field_idx_to_partition_idx(&fields, &["rowkind".to_string()]);
+        let leaf = PredicateBuilder::new(&fields)
+            .equal("rowkind", Datum::Int(1))
+            .unwrap();
+
+        assert!(leaf.project_field_index_inclusive(&mapping).is_some());
+        assert!(leaf.remap_field_index(&mapping).is_some());
+        assert!(leaf.references_only_mapped_fields(&mapping));
     }
 
     // ======================== PredicateBuilder basics ========================

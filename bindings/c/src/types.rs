@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
-use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
+use paimon::table::{
+    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
+    PostponeFixedBucketTableWrite, Table, TableCommit, TableWrite,
+};
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -205,15 +208,30 @@ pub struct paimon_arrow_batch {
 
 // === Write/Commit opaque types ===
 
-/// Internal state for WriteBuilder that stores table, shared commit_user, and overwrite flag.
 pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,
     pub overwrite: bool,
 }
 
+pub(crate) struct PostponeFixedBucketWriteBuilderState {
+    pub table: Table,
+    pub commit_user: String,
+    pub overwrite: bool,
+    pub bucket_plan: Option<PostponeBucketPlan>,
+}
+
 pub(crate) struct TableWriteState {
-    pub write: TableWrite,
+    pub write: Box<TableWrite>,
+    pub overwrite: bool,
+    pub target_schema: Arc<ArrowSchema>,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct PostponeFixedBucketTableWriteState {
+    pub write: Box<PostponeFixedBucketTableWrite>,
+    pub overwrite: bool,
     pub target_schema: Arc<ArrowSchema>,
     pub table_location: String,
     pub commit_user: String,
@@ -221,12 +239,28 @@ pub(crate) struct TableWriteState {
 
 pub(crate) struct TableCommitState {
     pub commit: TableCommit,
+    pub overwrite: bool,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct PostponeFixedBucketTableCommitState {
+    pub commit: PostponeFixedBucketTableCommit,
+    pub overwrite: bool,
     pub table_location: String,
     pub commit_user: String,
 }
 
 pub(crate) struct CommitMessagesState {
     pub messages: Vec<CommitMessage>,
+    pub overwrite: bool,
+    pub table_location: String,
+    pub commit_user: String,
+}
+
+pub(crate) struct PostponeFixedBucketCommitMessagesState {
+    pub messages: Vec<CommitMessage>,
+    pub overwrite: bool,
     pub table_location: String,
     pub commit_user: String,
 }
@@ -249,5 +283,25 @@ pub struct paimon_table_commit {
 /// Opaque container for commit messages and their originating write context.
 #[repr(C)]
 pub struct paimon_commit_messages {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_postpone_fixed_bucket_write_builder {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_postpone_fixed_bucket_table_write {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_postpone_fixed_bucket_table_commit {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_postpone_fixed_bucket_commit_messages {
     pub inner: *mut c_void,
 }

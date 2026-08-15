@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeAlias, Union
+from os import PathLike
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, Union
 
 import pyarrow
 
@@ -65,8 +66,14 @@ class ReadBuilder:
         set before ``with_filter`` for the filter to honor it.
         """
         ...
-    def with_limit(self, limit: int) -> "ReadBuilder": ...
+    def with_limit(self, limit: int) -> "ReadBuilder":
+        """Set a scan-planning row-limit hint, not an exact cap: a matching split is
+        returned whole. Apply application-level limiting for an exact bound."""
+        ...
     def with_filter(self, predicate: dict) -> "ReadBuilder": ...
+    def with_row_ranges(self, ranges: Sequence[tuple[int, int]]) -> "ReadBuilder":
+        """Set Data Evolution row ranges. Empty selects no rows; format tables are unsupported."""
+        ...
     def new_scan(self) -> TableScan: ...
     def new_read(self) -> "TableRead": ...
 
@@ -135,6 +142,10 @@ class TableWrite:
 
 class TableCommit:
     def commit(self, messages: Sequence[CommitMessage]) -> None: ...
+    def abort(self, messages: Sequence[CommitMessage]) -> None:
+        """Delete the files the messages refer to. Best-effort: missing files and
+        storage errors are ignored. The messages must not be committed afterwards."""
+        ...
 
 class WriteBuilder:
     def new_write(self) -> TableWrite: ...
@@ -185,10 +196,23 @@ def udf(
     ...
 
 class SQLContext:
-    def __init__(self) -> None: ...
-    def register_catalog(
-        self, catalog_name: str, catalog_options: Dict[str, str]
+    def __init__(
+        self,
+        *,
+        memory_pool_type: Optional[Literal["fair", "greedy"]] = None,
+        memory_pool_bytes: Optional[int] = None,
+        temp_directory: Optional[Union[str, PathLike[str]]] = None,
+        max_temp_directory_size_bytes: Optional[int] = None,
     ) -> None: ...
+    def register_catalog(
+        self,
+        catalog_name: str,
+        catalog_options: Dict[str, str],
+        default_database: Optional[str] = None,
+    ) -> None:
+        """Register a Paimon catalog. ``default_database``: omitted or ``None`` uses
+        ``"default"``; ``""`` skips default-database init; a name uses that database."""
+        ...
     def set_current_catalog(self, catalog_name: str) -> None: ...
     def set_current_database(self, database_name: str) -> None: ...
     def register_batch(self, name: str, batch: pyarrow.RecordBatch) -> None: ...

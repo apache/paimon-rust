@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
+use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
 use std::cmp::Ordering;
 
 pub(crate) trait StatsAccessor {
@@ -426,6 +426,8 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
         Predicate::Not(inner) => {
             !predicate_must_match_with_schema(inner, stats, field_mapping, file_fields)
         }
+        // `_ROW_ID` has no column stats, so never prune on it.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => true,
         Predicate::Leaf {
             index,
             data_type,
@@ -469,6 +471,8 @@ fn predicate_must_match_with_schema<T: StatsAccessor>(
         Predicate::Not(inner) => {
             !predicate_may_match_with_schema(inner, stats, field_mapping, file_fields)
         }
+        // Stats cannot decide `_ROW_ID`, so it never provably matches.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => false,
         Predicate::Leaf {
             index,
             data_type,

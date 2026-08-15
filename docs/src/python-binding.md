@@ -94,6 +94,30 @@ for batch in batches:
     print(batch)
 ```
 
+### Runtime Resource Configuration
+
+`SQLContext` can use a bounded DataFusion memory pool and a dedicated temporary
+directory. This allows spill-capable operators, such as sorts and aggregations,
+to move intermediate data to disk when execution memory is constrained.
+
+```python
+ctx = SQLContext(
+    memory_pool_type="fair",
+    memory_pool_bytes=512 * 1024 * 1024,
+    temp_directory="/tmp/paimon-spill",
+    max_temp_directory_size_bytes=4 * 1024 * 1024 * 1024,
+)
+```
+
+`memory_pool_type` accepts `"fair"` or `"greedy"` and requires
+`memory_pool_bytes`. If only `memory_pool_bytes` is provided, the greedy pool is
+used. All arguments are optional, and `SQLContext()` continues to use
+DataFusion's default runtime environment.
+
+Memory limits apply to allocations tracked by DataFusion's memory pool. They do
+not account for every allocation made by the host application or by external
+libraries.
+
 ## Reading a Table
 
 Paimon Python uses a **scan-then-read** pattern: first scan the table to produce splits, then read data from those splits as PyArrow RecordBatches.
@@ -204,6 +228,18 @@ rb.with_limit(100)
 
 !!! warning
     `with_limit` is a scan-planning hint, not an exact row cap. When all rows fall within a single split, the entire split is returned regardless of the limit value. Callers should apply application-level limiting if an exact upper bound is required.
+
+## Row Ranges
+
+Use `with_row_ranges` to restrict a Data Evolution scan to inclusive row ID ranges. Each range is a `(from, to)` tuple; `from` must not exceed `to`.
+
+```python
+rb = table.new_read_builder()
+rb.with_row_ranges([(0, 99), (200, 299)])
+```
+
+!!! warning
+    An empty list selects **zero** rows, not all rows. Format tables are not supported and raise `NotImplementedError`.
 
 ## Case Sensitivity
 

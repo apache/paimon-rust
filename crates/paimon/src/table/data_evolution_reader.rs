@@ -27,8 +27,7 @@ use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, BlobDescriptor, BlobViewStruct, DataField, DataFileMeta, DataType, Predicate,
-    ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BlobDescriptor, BlobViewStruct, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
@@ -132,7 +131,7 @@ impl DataEvolutionReader {
         blob_view_resolve_enabled: bool,
         blob_view_rest_env: Option<RESTEnv>,
     ) -> crate::Result<Self> {
-        let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
+        let projected_row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
             .iter()
             .filter(|f| f.name() != ROW_ID_FIELD_NAME)
@@ -153,11 +152,25 @@ impl DataEvolutionReader {
         let wide_file_read_type =
             crate::arrow::residual::widen_scan_fields(&file_read_type, file_predicates.as_ref());
         // Wide batches at the _ROW_ID attach point: original read_type columns
-        // (caller order, _ROW_ID at row_id_index) followed by the extras.
-        // row_id_index <= file_read_type.len(), so inserting _ROW_ID never
-        // displaces a trailing extra column.
+        // (caller order, _ROW_ID at row_id_index) followed by the extras. A
+        // projected row_id_index is <= file_read_type.len(), so inserting
+        // _ROW_ID never displaces a trailing extra column.
         let mut wide_read_type = read_type;
         wide_read_type.extend_from_slice(&wide_file_read_type[file_read_type.len()..]);
+        // A residual on `_ROW_ID` needs the column when `filter_wide_batch`
+        // runs, even unprojected. `widen_scan_fields` cannot supply a
+        // synthesized column, so append it and let `project_output` trim it.
+        let row_id_index = match projected_row_id_index {
+            Some(index) => Some(index),
+            None if predicates
+                .iter()
+                .any(super::row_id_predicate::references_row_id) =>
+            {
+                wide_read_type.push(crate::spec::row_id_data_field());
+                Some(wide_read_type.len() - 1)
+            }
+            None => None,
+        };
         let wide_output_schema = build_target_arrow_schema(&wide_read_type)?;
 
         Ok(Self {
@@ -413,8 +426,9 @@ impl DataEvolutionReader {
     ///
     /// Layout invariant: the first `output_schema.fields().len()` columns of
     /// `batch` are exactly the original read_type columns. Extras were appended
-    /// at the end by `widen_scan_fields`, and `_ROW_ID` insertion at
-    /// `row_id_index` keeps them trailing.
+    /// at the end — by `widen_scan_fields`, plus an unprojected `_ROW_ID` a
+    /// residual needs — and `_ROW_ID` insertion at `row_id_index` keeps them
+    /// trailing.
     fn project_output(&self, filtered: RecordBatch) -> crate::Result<RecordBatch> {
         let final_width = self.output_schema.fields().len();
         if filtered.num_columns() == final_width {
@@ -919,6 +933,11 @@ fn predicate_references_any_field(
 ) -> bool {
     match predicate {
         Predicate::Leaf { column, index, .. } => {
+            // Never a BLOB column; resolving its placeholder index would force
+            // every BLOB to be resolved before filtering.
+            if crate::spec::is_row_id_column(column) {
+                return false;
+            }
             field_names.contains(column)
                 || table_fields
                     .get(*index)
@@ -1083,7 +1102,7 @@ impl BlobViewLookup {
             let table = table.copy_with_options(options);
             let row_ranges = row_ranges_for_blob_view_refs(&refs);
             let mut read_builder = table.new_read_builder();
-            read_builder.with_read_type(vec![field.clone(), row_id_field()]);
+            read_builder.with_read_type(vec![field.clone(), crate::spec::row_id_data_field()]);
             read_builder.with_row_ranges(row_ranges);
             let plan = read_builder.new_scan().plan().await?;
             let read = read_builder.new_read()?;
@@ -1195,14 +1214,6 @@ fn row_ranges_for_blob_view_refs(refs: &[BlobViewStruct]) -> Vec<RowRange> {
     }
     ranges.push(RowRange::new(start, end));
     ranges
-}
-
-fn row_id_field() -> DataField {
-    DataField::new(
-        ROW_ID_FIELD_ID,
-        ROW_ID_FIELD_NAME.to_string(),
-        DataType::BigInt(BigIntType::with_nullable(true)),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6985,6 +6996,198 @@ mod tests {
         assert_eq!(
             collect_long_values(&batches, crate::spec::ROW_ID_FIELD_NAME),
             vec![102, 103]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evolution_read_applies_row_id_residual_to_the_row_ids() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                100,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            )])
+            .build()
+            .unwrap();
+
+        let predicate = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::NotEq,
+            vec![Datum::Long(102)],
+        );
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 4]);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[test]
+    fn test_row_id_filter_is_not_blob_dependent() {
+        let table_fields = vec![
+            DataField::new(0, "payload".to_string(), DataType::Blob(BlobType::new())),
+            DataField::new(1, "v".to_string(), DataType::Int(IntType::new())),
+        ];
+        let blob_fields: HashSet<String> = ["payload".to_string()].into_iter().collect();
+        let row_id = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::Between,
+            vec![Datum::Long(10), Datum::Long(20)],
+        );
+
+        assert!(!predicate_references_any_field(
+            &row_id,
+            &blob_fields,
+            &table_fields
+        ));
+        let on_blob = PredicateBuilder::new(&table_fields)
+            .is_null("payload")
+            .unwrap();
+        assert!(predicate_references_any_field(
+            &on_blob,
+            &blob_fields,
+            &table_fields
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_evolution_read_enforces_a_row_id_leaf_nested_in_a_disjunction() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                100,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            )])
+            .build()
+            .unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        let rid = |op, v| crate::spec::row_id_leaf(op, vec![Datum::Long(v)]);
+        builder.with_filter(Predicate::and(vec![
+            rid(crate::spec::PredicateOperator::GtEq, 100),
+            Predicate::or(vec![
+                Predicate::and(vec![
+                    rid(crate::spec::PredicateOperator::Eq, 999),
+                    pb.equal("id", Datum::Int(2)).unwrap(),
+                ]),
+                pb.equal("id", Datum::Int(4)).unwrap(),
+            ]),
+        ]));
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_filter_without_data_evolution_is_rejected() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "plain_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                100,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            )])
+            .build()
+            .unwrap();
+
+        let predicate = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::NotEq,
+            vec![Datum::Long(102)],
+        );
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(predicate);
+        let err = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, crate::Error::Unsupported { message } if message.contains("_ROW_ID")),
+            "unexpected error: {err:?}"
         );
     }
 

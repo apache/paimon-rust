@@ -39,6 +39,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     partition_filter: Option<PartitionFilter>,
     data_predicates: Vec<Predicate>,
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
@@ -52,6 +53,7 @@ impl<'a> FormatReadBuilder<'a> {
             partition_filter: None,
             data_predicates: Vec::new(),
             limit: None,
+            row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
         }
@@ -98,7 +100,8 @@ impl<'a> FormatReadBuilder<'a> {
         false
     }
 
-    pub(crate) fn with_row_ranges(&mut self, _ranges: Vec<RowRange>) -> &mut Self {
+    pub(crate) fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
+        self.row_ranges = Some(ranges);
         self
     }
 
@@ -119,11 +122,18 @@ impl<'a> FormatReadBuilder<'a> {
             Vec::new(),
             None,
             self.limit,
-            None,
+            self.row_ranges.clone(),
         )
     }
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
+        // Fail closed here as well as in `FormatTableScan::plan`, so a caller that
+        // goes straight to `new_read` cannot silently read unfiltered rows.
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Row ranges are not supported for format tables".to_string(),
+            });
+        }
         let core_options = self.table.schema().core_options();
         core_options.ensure_read_authorized()?;
         let read_type = match self.resolve_read_type()? {

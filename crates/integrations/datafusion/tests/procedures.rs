@@ -140,6 +140,38 @@ async fn setup_btree_global_index_table(
     (tmp, sql_context)
 }
 
+/// An `ARRAY<FLOAT>` table configured so the pure-Rust `ivf-flat` builder can
+/// train and commit an index without a native library.
+async fn setup_vindex_global_index_table(
+    table_name: &str,
+) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.{table_name} (id INT, embedding ARRAY<FLOAT>) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'global-index.enabled' = 'true',\
+                'global-index.row-count-per-shard' = '100',\
+                'ivf-flat.dimension' = '2',\
+                'ivf-flat.nlist' = '1',\
+                'ivf-flat.distance.metric' = 'l2'\
+            )"
+        ),
+    )
+    .await;
+    exec(
+        &sql_context,
+        &format!(
+            "INSERT INTO paimon.test_db.{table_name} (id, embedding) VALUES \
+             (1, [1.0, 0.0]), (2, [0.0, 1.0]), (3, [1.0, 1.0])"
+        ),
+    )
+    .await;
+    (tmp, sql_context)
+}
+
 #[tokio::test]
 async fn test_create_global_index_requires_index_column() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_missing_col").await;
@@ -180,6 +212,89 @@ async fn test_create_global_index_rejects_options() {
         &sql_context,
         "CALL sys.create_global_index(table => 'test_db.btree_options', index_column => 'id', options => 'x=y')",
         "options are not supported",
+    )
+    .await;
+}
+
+/// `index_type` was matched case-insensitively for btree/bitmap but exactly for
+/// the vindex types, so `'IVF-FLAT'` was rejected as unsupported while `'BTREE'`
+/// worked. Build with an uppercase vindex type and assert the index lands with
+/// the canonical lowercase `index_type` in the manifest, which is what the read
+/// path matches on.
+#[tokio::test]
+async fn test_create_global_index_accepts_uppercase_vindex_type() {
+    let (_tmp, sql_context) = setup_vindex_global_index_table("vindex_upper").await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.vindex_upper', index_column => 'embedding', index_type => 'IVF-FLAT')",
+    )
+    .await;
+
+    let index_count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`vindex_upper$table_indexes` \
+         WHERE index_type = 'ivf-flat' AND index_field_name = 'embedding'",
+    )
+    .await;
+    assert_eq!(index_count, 1);
+}
+
+/// Neither procedure trimmed the argument, so `' btree '` was reported as an
+/// unsupported type. Both sides now absorb surrounding whitespace, matching
+/// Java's `toLowerCase().trim()`.
+#[tokio::test]
+async fn test_global_index_procedures_ignore_surrounding_whitespace() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_trim").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_trim (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_trim', index_column => 'id', index_type => ' btree ')",
+    )
+    .await;
+    let after_create = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_trim$table_indexes` \
+         WHERE index_type = 'btree' AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(after_create, 1);
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_trim', index_column => 'id', index_type => ' BTREE ')",
+    )
+    .await;
+    let after_drop = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_trim$table_indexes` \
+         WHERE index_type = 'btree' AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(after_drop, 0);
+}
+
+/// An unsupported type must be echoed back exactly as written, not lowercased,
+/// so a typo stays recognizable in the error message.
+#[tokio::test]
+async fn test_global_index_procedures_echo_raw_unsupported_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_echo").await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Full-Text')",
+        "got 'Full-Text'",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Full-Text')",
+        "unsupported global index type 'Full-Text'",
     )
     .await;
 }

@@ -44,6 +44,7 @@ atomic-waker@1.1.2		X									X
 autocfg@1.5.1		X									X						
 aws-lc-rs@1.17.3		X							X								
 aws-lc-sys@0.43.0		X			X				X		X	X					
+backon@1.6.0		X															
 base64@0.22.1		X									X						
 base64ct@1.8.3		X									X						
 better_io@0.2.0		X															
@@ -173,6 +174,7 @@ getrandom@0.2.17		X									X
 getrandom@0.3.4		X									X						
 getrandom@0.4.3		X									X						
 glob@0.3.3		X									X						
+gloo-timers@0.3.0		X									X						
 h2@0.4.15											X						
 half@2.7.1		X									X						
 hashbrown@0.14.5		X									X						
@@ -255,6 +257,7 @@ litemap@0.8.2														X
 lock_api@0.4.14		X									X						
 log@0.4.33		X									X						
 lru@0.16.4											X						
+lru@0.18.2											X						
 lz4_flex@0.11.6											X						
 lz4_flex@0.13.1											X						
 lzokay-native@0.1.0											X						
@@ -297,6 +300,7 @@ oneshot@0.1.13		X									X
 oneshot@0.2.1		X									X						
 opendal-core@0.58.0		X															
 opendal-http-transport-reqwest@0.58.0		X															
+opendal-layer-retry@0.58.0		X															
 opendal-service-azdls@0.58.0		X															
 opendal-service-azure-common@0.58.0		X															
 opendal-service-cos@0.58.0		X															

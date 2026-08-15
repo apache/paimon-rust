@@ -236,7 +236,7 @@ impl<'a> FullTextSearchBuilder<'a> {
         }
 
         // FAST-only: reject FULL/DETAIL loud rather than silently degrading.
-        if core.global_index_search_mode()? != GlobalIndexSearchMode::Fast {
+        if core.full_text_index_search_mode()? != GlobalIndexSearchMode::Fast {
             return Err(crate::Error::DataInvalid {
                 message: "primary-key full-text search supports only the FAST global-index search \
                           mode"
@@ -318,7 +318,7 @@ async fn evaluate_full_text_search(
 ) -> crate::Result<SearchResult> {
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
-    let search_mode = core_options.global_index_search_mode()?;
+    let search_mode = core_options.full_text_index_search_mode()?;
 
     let field_id = match find_field_id_by_name(evaluation.schema_fields, &search.field_name) {
         Some(id) => id,
@@ -873,7 +873,10 @@ mod tests {
             DataType::Int(IntType::default()),
         )];
         let search = FullTextSearch::new("hello".to_string(), 10, "body".to_string()).unwrap();
-        let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
+        let options = HashMap::from([(
+            "full-text-index.search-mode".to_string(),
+            "full".to_string(),
+        )]);
 
         let result = evaluate_full_text_search(
             FullTextSearchEvaluation {

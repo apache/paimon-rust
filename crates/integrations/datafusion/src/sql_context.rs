@@ -55,6 +55,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
@@ -101,6 +102,75 @@ pub struct SQLContext {
     blob_reader_registry: BlobReaderRegistry,
 }
 
+/// Builder for [`SQLContext`].
+///
+/// The builder preserves Paimon's session configuration while allowing callers
+/// to customize DataFusion runtime resources such as memory pools, temporary
+/// directories, and object store registries.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+///
+/// use datafusion::execution::memory_pool::FairSpillPool;
+/// use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+/// use paimon_datafusion::SQLContext;
+///
+/// let runtime_env = RuntimeEnvBuilder::new()
+///     .with_memory_pool(Arc::new(FairSpillPool::new(512 * 1024 * 1024)))
+///     .with_temp_file_path("/tmp/paimon-spill")
+///     .with_max_temp_directory_size(4 * 1024 * 1024 * 1024)
+///     .build_arc()?;
+/// let ctx = SQLContext::builder()
+///     .with_runtime_env(runtime_env)
+///     .build();
+/// ```
+#[derive(Default)]
+pub struct SQLContextBuilder {
+    runtime_env: Option<Arc<RuntimeEnv>>,
+}
+
+impl SQLContextBuilder {
+    /// Creates a builder with DataFusion's default runtime environment.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Uses the provided DataFusion runtime environment.
+    pub fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
+        self.runtime_env = Some(runtime_env);
+        self
+    }
+
+    /// Builds a [`SQLContext`].
+    pub fn build(self) -> SQLContext {
+        let mut state_builder = SessionStateBuilder::new()
+            .with_config(crate::lateral_vector_search::session_config())
+            .with_default_features()
+            .with_relation_planners(vec![Arc::new(
+                crate::relation_planner::PaimonRelationPlanner::new(),
+            )])
+            .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
+            .with_query_planner(Arc::new(
+                crate::lateral_vector_search::PaimonQueryPlanner::new(),
+            ));
+        if let Some(runtime_env) = self.runtime_env {
+            state_builder = state_builder.with_runtime_env(runtime_env);
+        }
+        let state = state_builder.build();
+        let ctx = SessionContext::new_with_state(state);
+        crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
+        crate::variant_functions::register_variant_functions(&ctx);
+        SQLContext {
+            ctx,
+            catalogs: HashMap::new(),
+            dynamic_options: Default::default(),
+            blob_reader_registry: BlobReaderRegistry::default(),
+        }
+    }
+}
+
 impl Default for SQLContext {
     fn default() -> Self {
         Self::new()
@@ -110,26 +180,12 @@ impl Default for SQLContext {
 impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
-        let state = SessionStateBuilder::new()
-            .with_config(crate::lateral_vector_search::session_config())
-            .with_default_features()
-            .with_relation_planners(vec![Arc::new(
-                crate::relation_planner::PaimonRelationPlanner::new(),
-            )])
-            .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
-            .with_query_planner(Arc::new(
-                crate::lateral_vector_search::PaimonQueryPlanner::new(),
-            ))
-            .build();
-        let ctx = SessionContext::new_with_state(state);
-        crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
-        crate::variant_functions::register_variant_functions(&ctx);
-        Self {
-            ctx,
-            catalogs: HashMap::new(),
-            dynamic_options: Default::default(),
-            blob_reader_registry: BlobReaderRegistry::default(),
-        }
+        Self::builder().build()
+    }
+
+    /// Creates a builder for customizing the underlying DataFusion session.
+    pub fn builder() -> SQLContextBuilder {
+        SQLContextBuilder::new()
     }
 
     pub fn blob_reader_registry(&self) -> BlobReaderRegistry {
@@ -3601,12 +3657,29 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::StringViewArray;
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use paimon::catalog::Database;
     use paimon::spec::{
         DataField as PaimonDataField, DataType as PaimonDataType, IntType, Schema as PaimonSchema,
     };
     use paimon::table::Table;
+
+    #[test]
+    fn test_sql_context_builder_uses_custom_runtime_env() {
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(1024)))
+            .build_arc()
+            .unwrap();
+
+        let ctx = SQLContext::builder()
+            .with_runtime_env(Arc::clone(&runtime_env))
+            .build();
+
+        assert!(Arc::ptr_eq(&runtime_env, &ctx.ctx().runtime_env()));
+        assert_eq!("fair", ctx.ctx().runtime_env().memory_pool.name());
+    }
 
     // ==================== Mock Catalog ====================
 

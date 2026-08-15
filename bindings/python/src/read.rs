@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, Table};
+use paimon::table::{DataSplit, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -31,8 +31,9 @@ use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 4] = [
+const TIME_TRAVEL_SELECTORS: [&str; 5] = [
     "scan.timestamp-millis",
+    "scan.watermark",
     "scan.version",
     "scan.snapshot-id",
     "scan.tag-name",
@@ -62,8 +63,7 @@ fn find_time_travel_selector(opts: &HashMap<String, String>) -> Option<(&str, &s
         .find_map(|&name| opts.get(name).map(|v| (name, v.as_str())))
 }
 
-/// Apply projection/limit/filter from a config snapshot onto a core ReadBuilder.
-/// Shared by PyTableScan::plan and PyTableRead::read so scan and read stay consistent.
+/// Apply common scan/read config onto a core ReadBuilder.
 fn apply_read_config(
     builder: &mut paimon::table::ReadBuilder<'_>,
     projection: &Option<Vec<String>>,
@@ -110,6 +110,7 @@ pub struct PyReadBuilder {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -120,6 +121,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            row_ranges: None,
             case_sensitive: true,
         }
     }
@@ -162,6 +164,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            row_ranges: None,
             case_sensitive: true,
         })
     }
@@ -203,12 +206,32 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
+    /// Set inclusive row ID ranges for Data Evolution scan planning.
+    /// Planned splits carry the ranges used by readers.
+    fn with_row_ranges(
+        mut slf: PyRefMut<'_, Self>,
+        ranges: Vec<(i64, i64)>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let mut row_ranges = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            if from > to {
+                return Err(PyValueError::new_err(format!(
+                    "row range start {from} exceeds end {to}"
+                )));
+            }
+            row_ranges.push(RowRange::new(from, to));
+        }
+        slf.row_ranges = Some(row_ranges);
+        Ok(slf)
+    }
+
     fn new_scan(&self) -> PyTableScan {
         PyTableScan {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
         }
     }
@@ -230,6 +253,7 @@ pub struct PyTableScan {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
 }
 
@@ -247,6 +271,9 @@ impl PyTableScan {
                     &self.filter,
                     self.case_sensitive,
                 )?;
+                if let Some(row_ranges) = &self.row_ranges {
+                    builder.with_row_ranges(row_ranges.clone());
+                }
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())
             })

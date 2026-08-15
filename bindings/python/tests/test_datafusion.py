@@ -18,6 +18,7 @@
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -81,6 +82,47 @@ def sample_image_bytes(
 def extract_rows(batches):
     table = pa.Table.from_batches(batches)
     return sorted(zip(table["id"].to_pylist(), table["name"].to_pylist()))
+
+
+def test_sql_context_accepts_runtime_resource_configuration():
+    with tempfile.TemporaryDirectory() as temp_directory:
+        ctx = SQLContext(
+            memory_pool_type="fair",
+            memory_pool_bytes=16 * 1024 * 1024,
+            temp_directory=temp_directory,
+            max_temp_directory_size_bytes=256 * 1024 * 1024,
+        )
+
+        batches = ctx.sql(
+            """
+            EXPLAIN ANALYZE
+            SELECT value
+            FROM generate_series(1, 1000000) AS t(value)
+            ORDER BY value DESC
+            """
+        )
+        plan = pa.Table.from_batches(batches)["plan"].to_pylist()[0]
+        spill_count = re.search(r"spill_count=(\d+)", plan)
+
+        assert spill_count is not None
+        assert int(spill_count.group(1)) > 0
+        assert any(Path(temp_directory).iterdir())
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"memory_pool_type": "fair"}, "requires memory_pool_bytes"),
+        ({"memory_pool_bytes": 0}, "must be greater than zero"),
+        (
+            {"memory_pool_type": "unknown", "memory_pool_bytes": 1024},
+            "expected 'fair' or 'greedy'",
+        ),
+    ],
+)
+def test_sql_context_rejects_invalid_runtime_resource_configuration(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        SQLContext(**kwargs)
 
 
 def test_video_snapshot_builtin_registered_on_context_init():

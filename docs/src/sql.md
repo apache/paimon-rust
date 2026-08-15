@@ -1032,10 +1032,10 @@ CALL sys.create_global_index(
 );
 ```
 
-`index_type` defaults to `btree`. BTree and bitmap global indexes support
-scalar columns and do not accept the `options` argument yet. Bitmap global
-indexes use the same on-disk file format as Java Paimon's
-`BitmapGlobalIndexFormat`.
+`index_type` defaults to `btree`. It is case-insensitive and surrounding
+whitespace is ignored. BTree and bitmap global indexes support scalar columns
+and do not accept the `options` argument yet. Bitmap global indexes use the same
+on-disk file format as Java Paimon's `BitmapGlobalIndexFormat`.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1092,6 +1092,7 @@ Supported vindex options:
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | `256` | all vindex types | Number of IVF lists. |
+| `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
 
@@ -1119,7 +1120,8 @@ CALL sys.drop_global_index(
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
 `lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat` and `ivf-pq`.
-It defaults to `btree`.
+It defaults to `btree`, is case-insensitive and surrounding whitespace is
+ignored.
 
 ### create_lumina_index
 
@@ -1129,8 +1131,9 @@ Build and commit a Lumina global vector index for a table column:
 CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
 ```
 
-The optional `index_type` argument selects the Lumina index identifier. It defaults to
-`lumina`. Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
+The optional `index_type` argument selects the Lumina index identifier. It
+defaults to `lumina`, is case-insensitive and surrounding whitespace is ignored.
+Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
 
 ```sql
 CALL sys.create_lumina_index(
@@ -1607,6 +1610,30 @@ SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00';
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
 
+### By Watermark
+
+Use `VERSION AS OF 'watermark-<value>'` syntax:
+
+```sql
+SELECT * FROM paimon.default.my_table
+VERSION AS OF 'watermark-1704067200000';
+```
+
+This resolves the tag first if a tag with that exact name exists. Otherwise,
+the suffix is parsed as a watermark in milliseconds. The session-scoped dynamic
+option `scan.watermark` is also available:
+
+```sql
+SET 'paimon.scan.watermark' = '1704067200000';
+SELECT * FROM paimon.default.my_table;
+RESET 'paimon.scan.watermark';
+```
+
+This reads the earliest snapshot whose watermark is greater than or equal to the
+given value (snapshots without a watermark are skipped). It is mutually
+exclusive with the other time-travel selectors. If no matching snapshot exists,
+scan planning fails.
+
 ## Dynamic Options (SET / RESET)
 
 Use `SET` to configure session-scoped Paimon dynamic options that apply to subsequent table loads:
@@ -1797,8 +1824,26 @@ Columns:
 | `schema_id` | BIGINT | Schema ID |
 | `commit_time` | TIMESTAMP | Commit time |
 | `record_count` | BIGINT | Record count |
-| `create_time` | TIMESTAMP | Tag creation time |
-| `time_retained` | STRING | Retention duration |
+| `create_time` | TIMESTAMP | Always `NULL`: the Rust snapshot does not carry a tag creation time |
+| `time_retained` | STRING | Always `NULL`: the Rust snapshot does not carry a tag retention |
+
+### $branches
+
+View all branches of a table:
+
+```sql
+SELECT * FROM paimon.default.my_table$branches;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `branch_name` | STRING | Branch name |
+| `create_time` | TIMESTAMP | Branch creation time |
+
+Unlike the other system tables, `$branches` ignores a `$branch_<name>` prefix and
+always reports the branches of the base table.
 
 ### $manifests
 
@@ -1822,6 +1867,39 @@ Columns:
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
 
+### $files
+
+View the data files of the current snapshot, with per-file statistics:
+
+```sql
+SELECT * FROM paimon.default.my_table$files;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `partition` | STRING | Partition spec, formatted as a Java row cast string; `{}` for unpartitioned tables |
+| `bucket` | INT | Bucket id the file belongs to |
+| `file_path` | STRING | Full data file path, or `external_path` when the file has one |
+| `file_format` | STRING | Data file format, such as `parquet` or `orc` |
+| `schema_id` | BIGINT | Id of the schema the file was written with |
+| `level` | INT | LSM level of the file (`0` for unmerged files) |
+| `record_count` | BIGINT | Number of rows in the file, including deletes |
+| `file_size_in_bytes` | BIGINT | File size in bytes |
+| `min_key` | STRING | Minimum primary key in the file, `NULL` for append tables |
+| `max_key` | STRING | Maximum primary key in the file, `NULL` for append tables |
+| `null_value_counts` | STRING | Per-column null counts, as a `{col=count}` map |
+| `min_value_stats` | STRING | Per-column minimum values, as a `{col=value}` map |
+| `max_value_stats` | STRING | Per-column maximum values, as a `{col=value}` map |
+| `min_sequence_number` | BIGINT | Minimum sequence number in the file |
+| `max_sequence_number` | BIGINT | Maximum sequence number in the file |
+| `creation_time` | TIMESTAMP | File creation time |
+| `delete_row_count` | BIGINT | Number of delete rows in the file |
+| `file_source` | STRING | How the file was produced: `APPEND` or `COMPACT` |
+| `first_row_id` | BIGINT | First row id in the file (when row tracking is enabled) |
+| `write_cols` | ARRAY | Columns actually written, for data-evolution tables |
+
 ### $partitions
 
 View all partitions of a table with aggregated record counts and file sizes:
@@ -1840,8 +1918,8 @@ Columns:
 | `file_count` | BIGINT | Number of data files |
 | `last_update_time` | TIMESTAMP | Latest data-file creation time |
 | `created_at` | TIMESTAMP | Partition creation time (only available with metastore-tracked catalogs) |
-| `created_by` | STRING | Snapshot id that created the partition (catalog-tracked only) |
-| `updated_by` | STRING | Snapshot id that last updated the partition (catalog-tracked only) |
+| `created_by` | STRING | User who created the partition (catalog-tracked only) |
+| `updated_by` | STRING | User who last updated the partition (catalog-tracked only) |
 | `options` | STRING | Per-partition options as flat JSON (catalog-tracked only) |
 | `total_buckets` | INT | Total bucket count for the partition (0 unless catalog-tracked) |
 | `done` | BOOLEAN | Whether the partition is marked done (false unless catalog-tracked) |
@@ -1859,7 +1937,7 @@ Columns:
 
 | Column | Type | Description |
 |---|---|---|
-| `partition` | STRING | Partition spec for the indexed data, or `NULL` for unpartitioned tables |
+| `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
 | `index_type` | STRING | Index type, such as `btree`, `bitmap`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name under the table index directory |
@@ -1879,7 +1957,7 @@ Files are classified by their table-relative path:
 - `manifest/manifest-*`, `manifest/manifest-list-*`, and `manifest/index-manifest-*` → manifest
 - `statistics/*` → manifest file counters for the current compatible output schema
 - `index/*` → index
-- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth
+- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth, except names starting with `index-`
 - unknown files are ignored by this summary
 
 ```sql
@@ -1975,6 +2053,14 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
 | `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
 
+For deletion-vector-enabled primary-key tables using the default `deduplicate`
+engine, batch scans hide uncompacted level-0 files by default. Set
+`'deletion-vectors.merge-on-read' = 'true'` to include those files and merge
+their key versions on read. Existing deletion vectors are applied before the
+key merge. This option affects batch snapshot reads only; it does not change
+streaming or changelog behavior. It takes effect only when
+`'deletion-vectors.enabled' = 'true'`; otherwise it is ignored.
+
 Rust supports the basic partial-update engine with latest-non-null semantics.
 Set either `'ignore-delete' = 'true'` or
 `'partial-update.ignore-delete' = 'true'` to ignore `DELETE` and
@@ -2046,7 +2132,7 @@ deletion vectors enabled.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
-| `global-index.thread-num` | `32` | Number of threads used to search global index fields concurrently; must be greater than 0. |
+| `global-index.thread-num` | `32` | Number of threads used to search global index fields concurrently; must be greater than 0 and must not exceed the runtime's task limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
 
 ### Variant Shredding Options
@@ -2079,6 +2165,7 @@ the normal physical format without wrapping the writer.
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
+| `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
 
 Cross-partition updates are not configured by an option: a primary-key table is

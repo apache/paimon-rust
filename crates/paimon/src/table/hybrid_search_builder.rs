@@ -611,7 +611,7 @@ impl<'a> HybridSearchBuilder<'a> {
         // payloads and rejects FULL/DETAIL loud rather than silently degrading,
         // mirroring `full_text_search_builder::execute_read` and Java
         // `PrimaryKeyFullTextRead.checkFastSearchMode`.
-        if core.global_index_search_mode()? != GlobalIndexSearchMode::Fast {
+        if core.full_text_index_search_mode()? != GlobalIndexSearchMode::Fast {
             return Err(crate::Error::DataInvalid {
                 message: "primary-key full-text search supports only the FAST global-index search \
                           mode"
@@ -1787,7 +1787,7 @@ mod pk_hybrid_tests {
                 [7.0, 0.0, 0.0, 0.0],
             ],
             &["alpha", "beta", "alpha alpha alpha", "gamma"],
-            &[("global-index.search-mode", "full")],
+            &[("full-text-index.search-mode", "full")],
         )
         .await;
 
