@@ -699,13 +699,15 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
-    /// Maximum number of concurrent tasks for global-index I/O, mirroring Java
+    /// Maximum number of concurrent global-index search tasks, mirroring Java
     /// `CoreOptions.GLOBAL_INDEX_THREAD_NUM` (key `global-index.thread-num`,
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
-    /// search. A value of `1` reproduces strict sequential execution. A
-    /// non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`], is a
-    /// misconfiguration and fails loud rather than being silently clamped.
+    /// search. Vindex file range reads use
+    /// [`Self::global_index_range_read_thread_num`] instead. A value of `1`
+    /// makes these search tasks sequential, but does not serialize Vindex range
+    /// reads. A non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`],
+    /// is a misconfiguration and fails loud rather than being silently clamped.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?
@@ -732,7 +734,8 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Maximum number of concurrent range reads shared by Vindex readers in one
-    /// search operation. This is independent of [`Self::global_index_thread_num`].
+    /// search operation (key `global-index.range-read-thread-num`, default 32).
+    /// This is independent of [`Self::global_index_thread_num`].
     pub fn global_index_range_read_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION)?
