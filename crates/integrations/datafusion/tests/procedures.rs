@@ -449,6 +449,60 @@ async fn test_drop_global_index_removes_btree_and_reads_fallback() {
 }
 
 #[tokio::test]
+async fn test_drop_global_index_dry_run_previews_without_removing() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_dry_run").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.btree_dry_run (id, name) VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.btree_dry_run', index_column => 'id')",
+    )
+    .await;
+
+    // dry-run: must NOT remove the index.
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_dry_run', index_column => 'id', index_type => 'btree', dry_run => true)",
+    )
+    .await;
+    let after_dry = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_dry_run$table_indexes` \
+         WHERE index_type = 'btree' AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(after_dry, 1);
+
+    // real drop removes it.
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_dry_run', index_column => 'id', index_type => 'btree')",
+    )
+    .await;
+    let after_real = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`btree_dry_run$table_indexes` \
+         WHERE index_type = 'btree' AND index_field_name = 'id'",
+    )
+    .await;
+    assert_eq!(after_real, 0);
+}
+
+#[tokio::test]
+async fn test_drop_global_index_rejects_invalid_dry_run() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("btree_bad_dry_run").await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.btree_bad_dry_run', index_column => 'id', dry_run => 'maybe')",
+        "dry_run",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_drop_global_index_removes_bitmap() {
     let (_tmp, sql_context) = setup_btree_global_index_table("bitmap_drop").await;
     exec(

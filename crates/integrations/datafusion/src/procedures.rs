@@ -26,7 +26,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'lumina', or a vindex type such as 'ivf-pq')
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'lumina', or a vindex type such as 'ivf-pq'; optional `dry_run => true` previews the matched count without committing)
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 //!
 //! The `index_type` argument of the three global index procedures is
@@ -616,17 +616,27 @@ async fn proc_drop_global_index(
             "drop_global_index partitions are not supported yet".to_string(),
         ));
     }
-    if args.contains_key("dry_run") {
-        return Err(DataFusionError::NotImplemented(
-            "drop_global_index dry_run is not supported yet".to_string(),
-        ));
-    }
+    let dry_run = match args.get("dry_run") {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("true") => true,
+        Some(v) if v.eq_ignore_ascii_case("false") => false,
+        Some(v) => {
+            return Err(DataFusionError::Plan(format!(
+                "drop_global_index dry_run must be 'true' or 'false', got '{v}'"
+            )));
+        }
+    };
 
     let mut builder = table.new_global_index_drop_builder();
     builder.with_index_column(index_column);
     builder.with_index_type(index_type);
-    builder.execute().await.map_err(to_datafusion_error)?;
-    ok_result(ctx)
+    builder.with_dry_run(dry_run);
+    let matched = builder.execute().await.map_err(to_datafusion_error)?;
+    if dry_run {
+        message_result(ctx, format!("Would drop {matched} global index file(s)"))
+    } else {
+        ok_result(ctx)
+    }
 }
 
 /// Precondition: `index_type` is already canonical (see `normalize_index_type`).
@@ -664,15 +674,16 @@ fn parse_key_value_options(options: &str) -> DFResult<HashMap<String, String>> {
 }
 
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
+    message_result(ctx, "OK".to_string())
+}
+
+fn message_result(ctx: &SessionContext, message: String) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "result",
         ArrowDataType::Utf8,
         false,
     )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec!["OK"]))],
-    )?;
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![message]))])?;
     ctx.read_batch(batch)
 }
 

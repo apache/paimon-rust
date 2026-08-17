@@ -19,7 +19,7 @@ use super::global_index_types::{
     normalize_global_index_type_for_drop, BTREE_GLOBAL_INDEX_TYPE,
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
-use crate::spec::{DataField, FileKind, IndexFileMeta, IndexManifest};
+use crate::spec::{DataField, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
+    dry_run: bool,
 }
 
 impl<'a> GlobalIndexDropBuilder<'a> {
@@ -36,6 +37,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            dry_run: false,
         }
     }
 
@@ -46,6 +48,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
 
     pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
         self.index_type = index_type.to_string();
+        self
+    }
+
+    pub fn with_dry_run(&mut self, dry_run: bool) -> &mut Self {
+        self.dry_run = dry_run;
         self
     }
 
@@ -71,7 +78,10 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                 message: "Global index column is required".to_string(),
                 source: None,
             })?;
-        let index_field = find_index_field(self.table, index_column)?;
+        let requested_field_ids = parse_index_field_ids(self.table, index_column)?;
+        if requested_field_ids.is_empty() {
+            return Ok(0);
+        }
 
         let snapshot_manager = SnapshotManager::new(
             self.table.file_io().clone(),
@@ -104,7 +114,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
                 continue;
             };
-            if global_meta.index_field_id != index_field.id() {
+            if global_meta_indexed_field_ids(global_meta) != requested_field_ids {
                 continue;
             }
             dropped += 1;
@@ -112,6 +122,9 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                 .entry((entry.partition, entry.bucket))
                 .or_default()
                 .push(entry.index_file);
+        }
+        if self.dry_run {
+            return Ok(dropped);
         }
         if dropped == 0 {
             return Ok(0);
@@ -157,6 +170,28 @@ fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField>
             full_name: table.identifier().full_name(),
             column: column.to_string(),
         })
+}
+
+/// Ordered field-id list requested for a drop, parsed from a comma-separated
+/// `index_column`. Mirrors Java `DropGlobalIndexProcedure`: split on `,`, trim,
+/// drop empty fragments, resolve each name to its field id (unknown -> error).
+fn parse_index_field_ids(table: &Table, index_column: &str) -> Result<Vec<i32>> {
+    index_column
+        .split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(|column| find_index_field(table, column).map(DataField::id))
+        .collect()
+}
+
+/// Full indexed-field-id list of a global index file: `[index_field_id]` followed
+/// by `extra_field_ids`. Drop-side mirror of the identity built in `TableCommit`.
+fn global_meta_indexed_field_ids(global_meta: &GlobalIndexMeta) -> Vec<i32> {
+    let mut ids = vec![global_meta.index_field_id];
+    if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
+        ids.extend(extra_field_ids.iter().copied());
+    }
+    ids
 }
 
 #[cfg(test)]
@@ -270,6 +305,27 @@ mod tests {
                 index_meta: None,
             }),
         }
+    }
+
+    fn composite_global_index_file(
+        index_type: &str,
+        name: &str,
+        index_field_id: i32,
+        extra_field_ids: Vec<i32>,
+        row_range_start: i64,
+        row_range_end: i64,
+    ) -> IndexFileMeta {
+        let mut file = global_index_file(
+            index_type,
+            name,
+            index_field_id,
+            row_range_start,
+            row_range_end,
+        );
+        if let Some(meta) = file.global_index_meta.as_mut() {
+            meta.extra_field_ids = Some(extra_field_ids);
+        }
+        file
     }
 
     fn hash_index_file(name: &str) -> IndexFileMeta {
@@ -529,5 +585,324 @@ mod tests {
             Error::Unsupported { message }
                 if message.contains("unsupported global index type") && message.contains("ivf-pq")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_previews_without_committing() {
+        let table = test_table("memory:/test_drop_dry_run_preview");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-id.index",
+            0,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // dry-run: returns the matched count, commits nothing.
+        let would_drop = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_dry_run(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(would_drop, 1);
+
+        // Entry is still present (no commit happened).
+        let after_dry = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(after_dry, vec!["btree-id.index".to_string()]);
+
+        // A real drop (dry_run defaults false) removes it.
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+        assert!(latest_index_entries(&table).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_without_match_returns_zero() {
+        let table = test_table("memory:/test_drop_dry_run_no_match");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(vec![], 0, vec![data_file("data-0.parquet")]);
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-name.index",
+            1,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let would_drop = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_dry_run(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(would_drop, 0);
+    }
+
+    #[tokio::test]
+    async fn test_drop_single_column_does_not_delete_composite() {
+        let table = test_table("memory:/test_drop_single_vs_composite");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+            composite_global_index_file(
+                BTREE_GLOBAL_INDEX_TYPE,
+                "btree-id-name.index",
+                0,
+                vec![1],
+                0,
+                9,
+            ),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+
+        let remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["btree-id-name.index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_composite_column_matches_only_composite() {
+        let table = test_table("memory:/test_drop_composite_hit");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+            composite_global_index_file(
+                BTREE_GLOBAL_INDEX_TYPE,
+                "btree-id-name.index",
+                0,
+                vec![1],
+                0,
+                9,
+            ),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id,name")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+
+        let remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["btree-id.index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_composite_field_order_is_significant() {
+        let table = test_table("memory:/test_drop_composite_order");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![composite_global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-id-name.index",
+            0,
+            vec![1],
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // Requested [name, id] = [1, 0] must NOT match stored [id, name] = [0, 1].
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("name,id")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 0);
+
+        let remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["btree-id-name.index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_unknown_column_in_list_errors_on_trimmed_name() {
+        let table = test_table("memory:/test_drop_unknown_column");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-id.index",
+            0,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let err = table
+            .new_global_index_drop_builder()
+            .with_index_column("id, bogus")
+            .execute()
+            .await
+            .expect_err("unknown column must error");
+        assert!(matches!(err, Error::ColumnNotExist { column, .. } if column == "bogus"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_trims_and_filters_empty_fragments() {
+        let table = test_table("memory:/test_drop_trim_filter");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+            composite_global_index_file(
+                BTREE_GLOBAL_INDEX_TYPE,
+                "btree-id-name.index",
+                0,
+                vec![1],
+                0,
+                9,
+            ),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // "id, name," -> trim + drop empty trailing fragment -> [id, name] = [0, 1].
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id, name,")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+
+        let remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["btree-id.index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_all_empty_column_returns_zero_without_touching_manifest() {
+        let table = test_table("memory:/test_drop_all_empty_column");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-id.index",
+            0,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // An all-empty index_column parses to an empty field list -> Ok(0),
+        // returned before the manifest is read, so nothing is removed.
+        for empty in [",", ", ,", " "] {
+            let dropped = table
+                .new_global_index_drop_builder()
+                .with_index_column(empty)
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(dropped, 0, "index_column {empty:?} should match nothing");
+
+            let remaining = latest_index_entries(&table)
+                .await
+                .into_iter()
+                .map(|e| e.index_file.file_name)
+                .collect::<Vec<_>>();
+            assert_eq!(remaining, vec!["btree-id.index".to_string()]);
+        }
     }
 }
