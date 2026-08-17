@@ -58,7 +58,7 @@ use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, Vindex
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
-use crate::vindex::range_reader::VindexFileReader;
+use crate::vindex::range_reader::{RangeIoStats, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled, VindexVectorIndexOptions};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
@@ -138,6 +138,23 @@ fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {
 
 fn vindex_index_parallelism(entry_count: usize, max_concurrency: usize) -> usize {
     entry_count.min(max_concurrency).max(1)
+}
+
+fn log_vindex_range_io_stats(file: &str, query_count: usize, stats: &RangeIoStats) {
+    let stats = stats.snapshot();
+    log::debug!(
+        target: "paimon::vector_search",
+        "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3}",
+        file,
+        query_count,
+        stats.logical_ranges,
+        stats.requested_bytes,
+        stats.file_read_calls,
+        stats.returned_bytes,
+        stats.read_ahead_hits,
+        stats.io_wait_nanos as f64 / 1_000_000.0,
+        stats.range_permit_wait_nanos as f64 / 1_000_000.0,
+    );
 }
 
 pub struct VectorSearchBuilder<'a> {
@@ -921,9 +938,11 @@ async fn plan_and_search_pk_candidates_batch(
                     reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
                 }
                 (VectorIndexBackend::Vindex, AnnSegmentSource::Vindex(source)) => {
+                    let range_io_stats = source.range_io_stats();
                     let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone())
                         .with_batch_index_parallelism(batch_index_parallelism);
-                    reader.load_validated(
+                    let results = reader.visit_batch_vector_search_validated(
+                        searches,
                         |_| Ok(source),
                         |metadata| {
                             verify_segment_metric(
@@ -932,7 +951,10 @@ async fn plan_and_search_pk_candidates_batch(
                             )
                         },
                     )?;
-                    reader.search_batch(searches)
+                    if let Some(stats) = range_io_stats {
+                        log_vindex_range_io_stats(&segment.path, searches.len(), &stats);
+                    }
+                    Ok(results)
                 }
                 (VectorIndexBackend::Lumina, AnnSegmentSource::Vindex(_))
                 | (VectorIndexBackend::Vindex, AnnSegmentSource::Buffered(_)) => {
@@ -1718,19 +1740,10 @@ async fn evaluate_batch_vector_search(
                                     )
                                     .await?;
                                     if let Some(stats) = range_io_stats {
-                                        let stats = stats.snapshot();
-                                        log::debug!(
-                                            target: "paimon::vector_search",
-                                            "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3}",
-                                            file_name,
+                                        log_vindex_range_io_stats(
+                                            &file_name,
                                             query_count,
-                                            stats.logical_ranges,
-                                            stats.requested_bytes,
-                                            stats.file_read_calls,
-                                            stats.returned_bytes,
-                                            stats.read_ahead_hits,
-                                            stats.io_wait_nanos as f64 / 1_000_000.0,
-                                            stats.range_permit_wait_nanos as f64 / 1_000_000.0,
+                                            &stats,
                                         );
                                     }
                                     results
@@ -3396,7 +3409,37 @@ mod tests {
     use arrow_array::ArrayRef;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, Once};
+
+    const VECTOR_SEARCH_LOG_TARGET: &str = "paimon::vector_search";
+    static VECTOR_SEARCH_TEST_LOGGER: VectorSearchTestLogger = VectorSearchTestLogger;
+    static VECTOR_SEARCH_TEST_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct VectorSearchTestLogger;
+
+    impl log::Log for VectorSearchTestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target() == VECTOR_SEARCH_LOG_TARGET && metadata.level() <= log::Level::Debug
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                VECTOR_SEARCH_TEST_LOGS
+                    .lock()
+                    .unwrap()
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn reset_vector_search_test_logs() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| log::set_logger(&VECTOR_SEARCH_TEST_LOGGER).unwrap());
+        log::set_max_level(log::LevelFilter::Debug);
+        VECTOR_SEARCH_TEST_LOGS.lock().unwrap().clear();
+    }
 
     fn l2_score(distance: f32) -> f32 {
         VectorSearchMetric::L2.distance_to_score(distance)
@@ -5229,7 +5272,9 @@ mod tests {
 
     // ---- search_pk_route: candidate-only producer returns candidates + context ----
     #[tokio::test]
-    async fn search_pk_route_returns_candidates_and_source_context() {
+    async fn search_pk_route_returns_candidates_and_publishes_diagnostics() {
+        reset_vector_search_test_logs();
+        let _timing = crate::vindex::enable_vector_search_timing_for_test();
         // query [0,1]: squared-L2 distances pos1=0 < pos2=1 < pos0=2, so the
         // strict-gap top-2 is [pos1, pos2] (best-first, not physical order).
         let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
@@ -5264,6 +5309,22 @@ mod tests {
                 .iter()
                 .all(|c| c.split_index < route.splits.len()),
             "candidate split_index must refer into the returned splits"
+        );
+
+        let logs = VECTOR_SEARCH_TEST_LOGS.lock().unwrap();
+        assert!(
+            logs.iter().any(|entry| {
+                entry.contains("event=paimon_vindex_reader")
+                    && entry.contains("vector-ivf-flat-route.index")
+            }),
+            "PK vector search must publish vindex reader timing"
+        );
+        assert!(
+            logs.iter().any(|entry| {
+                entry.contains("event=paimon_vector_range_io")
+                    && entry.contains("vector-ivf-flat-route.index")
+            }),
+            "PK vector search must publish range-I/O timing"
         );
     }
 

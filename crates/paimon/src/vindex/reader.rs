@@ -202,8 +202,21 @@ impl VindexVectorGlobalIndexReader {
         vector_searches: &[VectorSearch],
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        self.visit_batch_vector_search_validated(vector_searches, stream_fn, |_| Ok(()))
+    }
+
+    pub(crate) fn visit_batch_vector_search_validated<S, F>(
+        &mut self,
+        vector_searches: &[VectorSearch],
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+        validate: F,
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>>
+    where
+        S: SeekRead + 'static,
+        F: FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
+    {
         let total_start = self.timing_enabled.then(Instant::now);
-        self.ensure_loaded(stream_fn, |_| Ok(()))?;
+        self.ensure_loaded(stream_fn, validate)?;
         let search_start = self.timing_enabled.then(Instant::now);
         let results = self.search_batch(vector_searches)?;
         if let (Some(total_start), Some(search_start), Some(stats)) =
@@ -259,18 +272,6 @@ impl VindexVectorGlobalIndexReader {
         self.ensure_loaded(stream_fn, |_| Ok(()))
     }
 
-    pub(crate) fn load_validated<S, F>(
-        &mut self,
-        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
-        validate: F,
-    ) -> crate::Result<()>
-    where
-        S: SeekRead + 'static,
-        F: FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
-    {
-        self.ensure_loaded(stream_fn, validate)
-    }
-
     pub(crate) fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
         self.metadata
             .as_ref()
@@ -280,7 +281,7 @@ impl VindexVectorGlobalIndexReader {
             })
     }
 
-    pub(crate) fn search_batch(
+    fn search_batch(
         &mut self,
         vector_searches: &[VectorSearch],
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
