@@ -875,12 +875,9 @@ mod tests {
     async fn test_disk_cache_restart_defers_crc_validation_until_first_hit() {
         let directory = tempfile::tempdir().unwrap();
         let key = BlockKey::new("s3://bucket/table/snapshot/snapshot-1", 4, 0);
-        let cache = DiskCache::new(directory.path(), None).unwrap();
-        cache.put_block(&key, Bytes::from_static(b"data")).await;
-        drop(cache);
-
         let block_path = directory.path().join(key.cache_relative_path());
-        let mut encoded = std::fs::read(&block_path).unwrap();
+        std::fs::create_dir_all(block_path.parent().unwrap()).unwrap();
+        let mut encoded = encode_block(&key, &Bytes::from_static(b"data"));
         let payload_offset = encoded.len() - CHECKSUM_LEN - 1;
         encoded[payload_offset] ^= 0xff;
         std::fs::write(&block_path, encoded).unwrap();
