@@ -58,6 +58,14 @@ struct MergedRange {
     requested_bytes: u64,
 }
 
+struct InFlightRead<'a>(&'a AtomicU64);
+
+impl Drop for InFlightRead<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RangeIoStats {
     logical_ranges: AtomicU64,
@@ -67,6 +75,7 @@ pub(crate) struct RangeIoStats {
     read_ahead_hits: AtomicU64,
     io_wait_nanos: AtomicU64,
     range_permit_wait_nanos: AtomicU64,
+    in_flight_reads: AtomicU64,
     peak_in_flight_reads: AtomicU64,
     read_many_merged_ranges: AtomicU64,
     read_many_chunks: AtomicU64,
@@ -284,21 +293,21 @@ impl VindexFileReader {
                         io::Error::other("vindex range read concurrency limiter closed")
                     })?;
                     let expected = (range.end - range.start) as usize;
-                    if let Some(stats) = &stats {
+                    let in_flight_read = stats.as_ref().map(|stats| {
                         stats.file_read_calls.fetch_add(1, Ordering::Relaxed);
-                        stats.peak_in_flight_reads.fetch_max(
-                            max_range_read_concurrency
-                                .saturating_sub(permits.available_permits())
-                                as u64,
-                            Ordering::Relaxed,
-                        );
-                    }
+                        let active = stats.in_flight_reads.fetch_add(1, Ordering::Relaxed) + 1;
+                        stats
+                            .peak_in_flight_reads
+                            .fetch_max(active, Ordering::Relaxed);
+                        InFlightRead(&stats.in_flight_reads)
+                    });
                     let data = reader.read(range.clone()).await.map_err(|error| {
                         io::Error::other(format!(
                             "failed to read vindex file '{path}' range {}..{}: {error}",
                             range.start, range.end
                         ))
                     })?;
+                    drop(in_flight_read);
                     if data.len() != expected {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
