@@ -144,7 +144,7 @@ fn log_vindex_range_io_stats(file: &str, query_count: usize, stats: &RangeIoStat
     let stats = stats.snapshot();
     log::debug!(
         target: "paimon::vector_search",
-        "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3}",
+        "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3} peak_in_flight_reads={} read_many_merged_ranges={} read_many_chunks={} read_many_chunk_sizes={:?}",
         file,
         query_count,
         stats.logical_ranges,
@@ -154,7 +154,22 @@ fn log_vindex_range_io_stats(file: &str, query_count: usize, stats: &RangeIoStat
         stats.read_ahead_hits,
         stats.io_wait_nanos as f64 / 1_000_000.0,
         stats.range_permit_wait_nanos as f64 / 1_000_000.0,
+        stats.peak_in_flight_reads,
+        stats.read_many_merged_ranges,
+        stats.read_many_chunks,
+        stats.read_many_chunk_sizes,
     );
+}
+
+fn vindex_concurrency_limits(
+    core_options: &CoreOptions<'_>,
+    entry_count: usize,
+    max_concurrency: usize,
+) -> crate::Result<(usize, usize)> {
+    Ok((
+        vindex_index_parallelism(entry_count, max_concurrency),
+        core_options.global_index_range_read_thread_num()?,
+    ))
 }
 
 pub struct VectorSearchBuilder<'a> {
@@ -844,15 +859,16 @@ async fn plan_and_search_pk_candidates_batch(
             source: None,
         }
     })?;
-    let batch_index_parallelism = match backend {
-        VectorIndexBackend::Vindex => vindex_index_parallelism(
+    let (batch_index_parallelism, range_read_concurrency) = match backend {
+        VectorIndexBackend::Vindex => vindex_concurrency_limits(
+            core,
             plan.splits
                 .iter()
                 .map(|split| split.ann_segments.len())
                 .sum(),
             concurrency,
-        ),
-        VectorIndexBackend::Lumina => 1,
+        )?,
+        VectorIndexBackend::Lumina => (1, 0),
     };
 
     // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
@@ -878,11 +894,16 @@ async fn plan_and_search_pk_candidates_batch(
     let field_name = pk_col.to_string();
 
     let loader_io = table.file_io().clone();
-    let loader_range_read_permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let loader_range_read_permits = match backend {
+        VectorIndexBackend::Vindex => Some(Arc::new(tokio::sync::Semaphore::new(
+            range_read_concurrency,
+        ))),
+        VectorIndexBackend::Lumina => None,
+    };
     let loader: crate::vindex::pkvector::ann::SourceSegmentLoader = Box::new(
         move |segment: &BucketAnnSegment| {
             let io = loader_io.clone();
-            let range_read_permits = Arc::clone(&loader_range_read_permits);
+            let range_read_permits = loader_range_read_permits.clone();
             let path = segment.path.clone();
             let file_size = segment.file_size;
             Box::pin(async move {
@@ -911,7 +932,8 @@ async fn plan_and_search_pk_candidates_batch(
                             VindexFileReader::new_with_permits(
                                 Arc::new(file_reader),
                                 current_tokio_runtime_handle()?,
-                                range_read_permits,
+                                range_read_permits.expect("Vindex range-read permits"),
+                                range_read_concurrency,
                                 file_size,
                                 path,
                             ),
@@ -1629,18 +1651,28 @@ async fn evaluate_batch_vector_search(
             });
         }
         ensure_global_index_executor_capacity(concurrency);
-        let range_read_permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let batch_index_parallelism = vindex_index_parallelism(
-            vector_entries
-                .iter()
-                .filter(|entry| is_vindex_index_type(&entry.index_file.index_type))
-                .count(),
-            concurrency,
-        );
+        let vindex_entry_count = vector_entries
+            .iter()
+            .filter(|entry| is_vindex_index_type(&entry.index_file.index_type))
+            .count();
+        let (batch_index_parallelism, range_read_concurrency, range_read_permits) =
+            if vindex_entry_count == 0 {
+                (1, 0, None)
+            } else {
+                let (index_parallelism, range_read_concurrency) =
+                    vindex_concurrency_limits(&core_options, vindex_entry_count, concurrency)?;
+                (
+                    index_parallelism,
+                    range_read_concurrency,
+                    Some(Arc::new(tokio::sync::Semaphore::new(
+                        range_read_concurrency,
+                    ))),
+                )
+            };
         let futures: Vec<_> = vector_entries
             .into_iter()
             .map(|entry| {
-                let range_read_permits = Arc::clone(&range_read_permits);
+                let range_read_permits = range_read_permits.clone();
                 let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
                     .expect("filtered vector index type");
@@ -1724,7 +1756,8 @@ async fn evaluate_batch_vector_search(
                                     let source = VindexFileReader::new_with_permits(
                                         Arc::new(file_reader),
                                         runtime,
-                                        range_read_permits,
+                                        range_read_permits.expect("Vindex range-read permits"),
+                                        range_read_concurrency,
                                         file_size,
                                         file_name.clone(),
                                     );
@@ -3446,11 +3479,25 @@ mod tests {
     }
 
     #[test]
-    fn vindex_batch_parallelism_tracks_active_entries() {
-        assert_eq!(vindex_index_parallelism(1, 1), 1);
-        assert_eq!(vindex_index_parallelism(1, 64), 1);
-        assert_eq!(vindex_index_parallelism(8, 4), 4);
-        assert_eq!(vindex_index_parallelism(4, 8), 4);
+    fn vindex_concurrency_limits_are_independent() {
+        let default_options = HashMap::new();
+        let default_core = CoreOptions::new(&default_options);
+        assert_eq!(
+            vindex_concurrency_limits(&default_core, 1, 32).unwrap(),
+            (1, 32)
+        );
+        assert_eq!(
+            vindex_concurrency_limits(&default_core, 8, 4).unwrap(),
+            (4, 32)
+        );
+
+        let options = HashMap::from([(
+            "global-index.range-read-thread-num".to_string(),
+            "64".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(vindex_concurrency_limits(&core, 1, 32).unwrap(), (1, 64));
+        assert_eq!(vindex_concurrency_limits(&core, 8, 4).unwrap(), (4, 64));
     }
 
     fn make_field(id: i32, name: &str) -> DataField {
