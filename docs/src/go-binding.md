@@ -19,11 +19,15 @@ under the License.
 
 # Go Integration
 
-The Go integration is a binding built on top of Apache Paimon Rust, allowing you to access Paimon tables from Go programs. It uses the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy data transfer.
+The Go binding uses the
+[Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html).
+Writes copy Arrow buffers into C-owned memory because writers may retain them
+after the call returns.
 
 ## Prerequisites
 
 - Go 1.22.4 or later
+- CGO enabled with a C toolchain
 - Supported platforms: Linux (amd64, arm64), macOS (amd64, arm64)
 
 ## Installation
@@ -32,7 +36,8 @@ The Go integration is a binding built on top of Apache Paimon Rust, allowing you
 go get github.com/apache/paimon-rust/bindings/go
 ```
 
-The pre-built native library is embedded in the package and automatically loaded at runtime — no manual build step is needed.
+The native library is embedded and loaded automatically. Build with
+`CGO_ENABLED=1`.
 
 ## Creating a Catalog
 
@@ -71,6 +76,54 @@ catalog, err := paimon.NewCatalog(map[string]string{
     "warehouse": "my_warehouse",
 })
 ```
+
+## Writing a Table
+
+Use `NewWriteBuilder` for ordinary and fixed-bucket tables. The `arrow.Record`
+schema must match the table schema.
+
+```go
+builder, err := table.NewWriteBuilder()
+if err != nil {
+    log.Fatal(err)
+}
+defer builder.Close()
+
+writer, err := builder.NewWrite()
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+if err := writer.WriteArrowBatch(record); err != nil {
+    log.Fatal(err)
+}
+messages, err := writer.PrepareCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer messages.Close()
+
+commit, err := builder.NewCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer commit.Close()
+
+if err := commit.Commit(messages); err != nil {
+    log.Fatal(err)
+}
+```
+
+Call `WriteArrowBatch` multiple times before `PrepareCommit`. `WithOverwrite`
+replaces the partitions touched by the batch. `Commit` is for one-shot batch
+jobs: it consumes the maximum commit identifier, so later filtered retries by
+the same commit user are treated as already committed. Reuse a writer across
+rounds with `CommitWithIdentifier` and increasing identifiers. Multiple writers in one process
+must share a commit user and merge their messages. Commit messages are
+process-local and cannot be sent to another process. For primary-key
+fixed-bucket tables, assign each `(partition, bucket)` to one writer before
+writing; merging messages does not establish ownership.
 
 ## Reading a Table
 
@@ -284,7 +337,8 @@ pred, _ := pb.Eq("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
 
 ## Resource Management
 
-All Paimon objects (`Catalog`, `Table`, `ReadBuilder`, `TableScan`, `Plan`, `TableRead`, `RecordBatchReader`) hold native resources and must be closed when no longer needed. Use `defer` to ensure cleanup:
+Paimon objects with a `Close` method hold native resources and must be closed.
+Use `defer` immediately after creation:
 
 ```go
 catalog, err := paimon.NewCatalog(opts)

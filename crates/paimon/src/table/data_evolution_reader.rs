@@ -3628,6 +3628,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -3714,6 +3715,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -3813,6 +3815,7 @@ mod tests {
                     DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
                 )
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -3936,6 +3939,7 @@ mod tests {
                     DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
                 )
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4066,6 +4070,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4233,6 +4238,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4243,6 +4249,7 @@ mod tests {
                 .column("payload", DataType::Blob(BlobType::new()))
                 .column("added", DataType::Int(IntType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4362,6 +4369,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4466,6 +4474,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4541,6 +4550,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4631,6 +4641,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4729,6 +4740,7 @@ mod tests {
                 .column("payload", DataType::Blob(BlobType::new()))
                 .column("payload2", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -4959,6 +4971,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5079,6 +5092,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5217,6 +5231,7 @@ mod tests {
                 .column("emb1", vector_float_type(2))
                 .column("emb2", vector_float_type(3))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5347,6 +5362,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5419,6 +5435,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5514,6 +5531,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5624,6 +5642,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5795,6 +5814,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -5925,6 +5945,10 @@ mod tests {
                 Some(vec!["payload"]),
             ));
         }
+        for file in &mut files {
+            file.first_row_id = None;
+            file.file_source = Some(0);
+        }
 
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
@@ -5934,6 +5958,7 @@ mod tests {
                 .column("embedding", vector_float_type(2))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -6043,7 +6068,7 @@ mod tests {
         let normal_path = bucket_dir.join("data.parquet");
         write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3, 4, 5, 6])], None);
 
-        let files = vec![
+        let mut files = vec![
             data_file_meta_with_path(
                 "data.parquet",
                 0,
@@ -6061,6 +6086,14 @@ mod tests {
                 Some(vec!["embedding"]),
             ),
             data_file_meta_with_path(
+                "emb-middle.vector.parquet",
+                2,
+                2,
+                1,
+                1,
+                Some(vec!["embedding"]),
+            ),
+            data_file_meta_with_path(
                 "emb-right.vector.parquet",
                 4,
                 2,
@@ -6069,8 +6102,13 @@ mod tests {
                 Some(vec!["embedding"]),
             ),
             data_file_meta_with_path("payload-left.blob", 0, 2, 1, 1, Some(vec!["payload"])),
+            data_file_meta_with_path("payload-middle.blob", 2, 2, 1, 1, Some(vec!["payload"])),
             data_file_meta_with_path("payload-right.blob", 4, 2, 1, 1, Some(vec!["payload"])),
         ];
+        for file in &mut files {
+            file.first_row_id = None;
+            file.file_source = Some(0);
+        }
 
         let file_io = FileIOBuilder::new("file").build().unwrap();
         let table_schema = TableSchema::new(
@@ -6080,6 +6118,7 @@ mod tests {
                 .column("embedding", vector_float_type(2))
                 .column("payload", DataType::Blob(BlobType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -6090,7 +6129,8 @@ mod tests {
             table_schema,
             None,
         );
-        TableCommit::new(table.clone(), "missing-selected-dedicated-test".to_string())
+        let commit = TableCommit::new(table.clone(), "missing-selected-dedicated-test".to_string());
+        commit
             .commit(vec![CommitMessage::new(
                 BinaryRowBuilder::new(0).build_serialized(),
                 0,
@@ -6098,6 +6138,23 @@ mod tests {
             )])
             .await
             .unwrap();
+        let mut delete_middle =
+            CommitMessage::new(BinaryRowBuilder::new(0).build_serialized(), 0, Vec::new());
+        delete_middle.deleted_files = vec![
+            data_file_meta_with_path(
+                "emb-middle.vector.parquet",
+                2,
+                2,
+                1,
+                1,
+                Some(vec!["embedding"]),
+            ),
+            data_file_meta_with_path("payload-middle.blob", 2, 2, 1, 1, Some(vec!["payload"])),
+        ];
+        for file in &mut delete_middle.deleted_files {
+            file.file_source = Some(0);
+        }
+        commit.commit(vec![delete_middle]).await.unwrap();
 
         for (field, provider_kind) in [("embedding", "Vector"), ("payload", "Blob")] {
             let mut builder = table.new_read_builder();
@@ -6226,6 +6283,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("embedding", vector_float_type(2))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -6507,6 +6565,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("value", DataType::Int(IntType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -6536,6 +6595,7 @@ mod tests {
                 .column("payload", DataType::Blob(BlobType::new()))
                 .column("id", DataType::Int(IntType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -6869,6 +6929,7 @@ mod tests {
                 .column("id", DataType::Int(IntType::new()))
                 .column("value", DataType::Int(IntType::new()))
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .option("read.batch-size", "2")
                 .build()
                 .unwrap(),

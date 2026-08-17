@@ -778,6 +778,42 @@ mod tests {
         assert_eq!(tracking.max_active.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_many_caps_each_batch_at_32_ranges() {
+        let range_count = RANGE_READ_CONCURRENCY + 1;
+        let stride = RANGE_COALESCE_GAP + 2;
+        let data = Bytes::from(vec![8u8; range_count * stride as usize]);
+        let tracking = Arc::new(ConcurrencyTrackingRead {
+            data: data.clone(),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let source: Arc<dyn FileRead> = tracking.clone();
+        let mut reader = VindexFileReader::new(
+            source,
+            tokio::runtime::Handle::current(),
+            data.len() as u64,
+            "index".to_string(),
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let mut buffers = vec![[0u8; 1]; range_count];
+            let mut requests = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(index, buffer)| ReadRequest::new(index as u64 * stride, buffer))
+                .collect::<Vec<_>>();
+            reader.pread(&mut requests).unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tracking.max_active.load(Ordering::SeqCst),
+            RANGE_READ_CONCURRENCY
+        );
+    }
+
     #[test]
     fn local_fs_read_completes_with_one_host_blocking_thread() {
         let temp_dir = tempfile::tempdir().unwrap();

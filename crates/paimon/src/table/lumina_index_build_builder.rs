@@ -71,6 +71,9 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
+        // Building the index scans the table's rows.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         self.table.ensure_not_branch_reference_for_write()?;
 
         if !is_lumina_index_type(&self.index_type) {
@@ -262,6 +265,11 @@ pub(crate) struct LuminaIndexShard {
 }
 
 fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<()> {
+    if !table.schema().primary_keys().is_empty() {
+        return Err(Error::Unsupported {
+            message: "Lumina index build does not support primary-key tables".to_string(),
+        });
+    }
     if !core_options.row_tracking_enabled() {
         return Err(Error::DataInvalid {
             message: "Lumina index build requires 'row-tracking.enabled' = 'true'".to_string(),
@@ -278,11 +286,6 @@ fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<(
         return Err(Error::DataInvalid {
             message: "Lumina index build requires 'global-index.enabled' = 'true'".to_string(),
             source: None,
-        });
-    }
-    if !table.schema().primary_keys().is_empty() {
-        return Err(Error::Unsupported {
-            message: "Lumina index build does not support primary-key tables".to_string(),
         });
     }
     if core_options.deletion_vectors_enabled() {
@@ -1222,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_rejects_primary_key_table() {
         let table = test_table_with_schema(
-            vector_schema_builder(table_options("10"))
+            vector_schema_builder(HashMap::new())
                 .primary_key(["id"])
                 .build()
                 .unwrap(),

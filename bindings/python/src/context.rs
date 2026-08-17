@@ -119,8 +119,8 @@ pub struct PaimonCatalog {
 impl PaimonCatalog {
     /// Create a Paimon catalog that can be registered into a DataFusion session.
     #[new]
-    fn new(catalog_options: HashMap<String, String>) -> PyResult<Self> {
-        let catalog = build_paimon_catalog(catalog_options)?;
+    fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
+        let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
         let provider = Arc::new(
             PaimonCatalogProvider::new(
                 None,
@@ -148,21 +148,28 @@ impl PaimonCatalog {
     }
 
     /// List all databases in this catalog.
-    fn list_databases(&self) -> PyResult<Vec<String>> {
-        runtime()
-            .block_on(self.catalog.list_databases())
-            .map_err(to_py_err)
+    fn list_databases(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let catalog = Arc::clone(&self.catalog);
+        py.detach(|| {
+            runtime()
+                .block_on(catalog.list_databases())
+                .map_err(to_py_err)
+        })
     }
 
     /// List all tables in the given database.
-    fn list_tables(&self, database_name: &str) -> PyResult<Vec<String>> {
-        runtime()
-            .block_on(self.catalog.list_tables(database_name))
-            .map_err(to_py_err)
+    fn list_tables(&self, py: Python<'_>, database_name: &str) -> PyResult<Vec<String>> {
+        let catalog = Arc::clone(&self.catalog);
+        let database_name = database_name.to_string();
+        py.detach(|| {
+            runtime()
+                .block_on(catalog.list_tables(&database_name))
+                .map_err(to_py_err)
+        })
     }
 
     /// Get a table handle by `"db.table"` identifier.
-    fn get_table(&self, identifier: &str) -> PyResult<PyTable> {
+    fn get_table(&self, py: Python<'_>, identifier: &str) -> PyResult<PyTable> {
         let parts: Vec<&str> = identifier.splitn(2, '.').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(PyValueError::new_err(format!(
@@ -170,9 +177,12 @@ impl PaimonCatalog {
             )));
         }
         let id = Identifier::new(parts[0], parts[1]);
-        let table = runtime()
-            .block_on(self.catalog.get_table(&id))
-            .map_err(to_py_err)?;
+        let catalog = Arc::clone(&self.catalog);
+        let table = py.detach(|| {
+            runtime()
+                .block_on(catalog.get_table(&id))
+                .map_err(to_py_err)
+        })?;
         Ok(PyTable::new(Arc::new(table)))
     }
 }

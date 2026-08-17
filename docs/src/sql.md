@@ -964,10 +964,10 @@ CALL sys.create_global_index(
 );
 ```
 
-`index_type` defaults to `btree`. BTree and bitmap global indexes support
-scalar columns and do not accept the `options` argument yet. Bitmap global
-indexes use the same on-disk file format as Java Paimon's
-`BitmapGlobalIndexFormat`.
+`index_type` defaults to `btree`. It is case-insensitive and surrounding
+whitespace is ignored. BTree and bitmap global indexes support scalar columns
+and do not accept the `options` argument yet. Bitmap global indexes use the same
+on-disk file format as Java Paimon's `BitmapGlobalIndexFormat`.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1052,7 +1052,8 @@ CALL sys.drop_global_index(
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
 `lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat` and `ivf-pq`.
-It defaults to `btree`.
+It defaults to `btree`, is case-insensitive and surrounding whitespace is
+ignored.
 
 ### create_lumina_index
 
@@ -1062,8 +1063,9 @@ Build and commit a Lumina global vector index for a table column:
 CALL sys.create_lumina_index(table => 'paimon.my_db.my_table', index_column => 'embedding');
 ```
 
-The optional `index_type` argument selects the Lumina index identifier. It defaults to
-`lumina`. Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
+The optional `index_type` argument selects the Lumina index identifier. It
+defaults to `lumina`, is case-insensitive and surrounding whitespace is ignored.
+Valid values are `lumina` and the legacy-compatible `lumina-vector-ann`.
 
 ```sql
 CALL sys.create_lumina_index(

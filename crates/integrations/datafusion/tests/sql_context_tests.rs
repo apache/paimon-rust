@@ -1036,9 +1036,11 @@ async fn test_create_table_with_blob_type() {
         .sql(
             "CREATE TABLE paimon.mydb.assets (
                 id INT NOT NULL,
-                payload BLOB,
-                PRIMARY KEY (id)
-            ) WITH ('data-evolution.enabled' = 'true')",
+                payload BLOB
+            ) WITH (
+                'data-evolution.enabled' = 'true',
+                'row-tracking.enabled' = 'true'
+            )",
         )
         .await
         .expect("CREATE TABLE with BLOB should succeed");
@@ -1049,7 +1051,7 @@ async fn test_create_table_with_blob_type() {
         .unwrap();
     let schema = table.schema();
     assert_eq!(schema.fields().len(), 2);
-    assert_eq!(schema.primary_keys(), &["id"]);
+    assert!(schema.primary_keys().is_empty());
     assert_eq!(
         *schema.fields()[1].data_type(),
         DataType::Blob(BlobType::new())
@@ -2512,7 +2514,10 @@ async fn test_show_create_table_various_types() {
              h DATE, \
              i TIMESTAMP(3), \
              j BLOB) \
-             WITH ('data-evolution.enabled' = 'true')",
+             WITH (\
+                 'data-evolution.enabled' = 'true', \
+                 'row-tracking.enabled' = 'true'\
+             )",
         )
         .await
         .expect("CREATE TABLE should succeed");

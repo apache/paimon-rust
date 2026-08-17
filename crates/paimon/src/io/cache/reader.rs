@@ -253,14 +253,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cached_range_reader_reads_unaligned_blocks_and_reuses_them() {
-        let directory = tempfile::tempdir().unwrap();
         let delegate = Arc::new(CountingReader {
             data: Bytes::from_static(b"abcdefghijkl"),
             reads: AtomicUsize::new(0),
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -304,14 +303,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cached_range_single_flight_reads_cold_block_once() {
-        let directory = tempfile::tempdir().unwrap();
         let delegate = Arc::new(SlowCountingReader {
             data: Bytes::from_static(b"abcdefgh"),
             reads: AtomicUsize::new(0),
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -341,7 +339,7 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let config = || LocalCacheConfig {
-            dir: directory.path().to_path_buf(),
+            dir: Some(directory.path().to_path_buf()),
             namespace: "test".to_string(),
             max_size: None,
             block_size: 4,
@@ -385,11 +383,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_flight_miss_does_not_republish_after_invalidation() {
-        let directory = tempfile::tempdir().unwrap();
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -438,7 +435,7 @@ mod tests {
         let path = "s3://bucket/table/snapshot/snapshot-1";
         let cache_a = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -448,7 +445,7 @@ mod tests {
         );
         let cache_b = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -498,16 +495,15 @@ mod tests {
         let first_path = "s3://bucket/table/snapshot/snapshot-1";
         let observed_path = "s3://bucket/table/snapshot/snapshot-2";
         let blocked_path = "s3://bucket/table/snapshot/snapshot-3";
-        let cache = Arc::new(
-            LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
-                namespace: "test".to_string(),
-                max_size: None,
-                block_size: 4,
-                whitelist: std::collections::HashSet::from([FileType::Meta]),
-            })
-            .unwrap(),
-        );
+        let config = || LocalCacheConfig {
+            dir: Some(directory.path().to_path_buf()),
+            namespace: "test".to_string(),
+            max_size: None,
+            block_size: 4,
+            whitelist: std::collections::HashSet::from([FileType::Meta]),
+        };
+        let cache_a = Arc::new(LocalCache::new(config()).unwrap());
+        let cache_b = Arc::new(LocalCache::new(config()).unwrap());
         let old_reader = CachedFileReader::new(
             Arc::new(CountingReader {
                 data: Bytes::from_static(b"old!"),
@@ -515,21 +511,21 @@ mod tests {
             }),
             first_path,
             4,
-            cache.clone(),
+            cache_a.clone(),
         );
         assert_eq!(
             old_reader.read(0..4).await.unwrap(),
             Bytes::from_static(b"old!")
         );
-        let warm_size_token = cache.read_token(first_path);
-        cache.put_file_size(first_path, 4, &warm_size_token).await;
+        let warm_size_token = cache_a.read_token(first_path);
+        cache_a.put_file_size(first_path, 4, &warm_size_token).await;
         drop(warm_size_token);
         drop(old_reader);
 
-        let observed_token = cache.read_token(observed_path);
-        let blocked_token = cache.read_token(blocked_path);
+        let observed_token = cache_a.read_token(observed_path);
+        let blocked_token = cache_a.read_token(blocked_path);
         let blocked_guard = blocked_token.publish_guard().await;
-        let invalidating_cache = cache.clone();
+        let invalidating_cache = cache_b;
         let invalidation =
             tokio::spawn(async move { invalidating_cache.invalidate_prefix(prefix).await });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -545,9 +541,9 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let current_reader =
-            CachedFileReader::new(current_delegate.clone(), first_path, 4, cache.clone());
+            CachedFileReader::new(current_delegate.clone(), first_path, 4, cache_a.clone());
         let mut current_load = tokio::spawn(async move { current_reader.read(0..4).await });
-        let size_cache = cache.clone();
+        let size_cache = cache_a;
         let mut current_size = tokio::spawn(async move {
             let token = size_cache.read_token(first_path);
             size_cache.file_size(first_path, &token).await
@@ -646,7 +642,7 @@ mod tests {
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -680,7 +676,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: Some(directory.path().to_path_buf()),
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,
@@ -695,14 +691,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cached_full_reader_loads_source_once_then_hits_blocks() {
-        let directory = tempfile::tempdir().unwrap();
         let delegate = Arc::new(CountingReader {
             data: Bytes::from_static(b"abcdefghijkl"),
             reads: AtomicUsize::new(0),
         });
         let cache = Arc::new(
             LocalCache::new(LocalCacheConfig {
-                dir: directory.path().to_path_buf(),
+                dir: None,
                 namespace: "test".to_string(),
                 max_size: None,
                 block_size: 4,

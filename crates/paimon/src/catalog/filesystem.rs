@@ -510,17 +510,12 @@ mod tests {
     #[test]
     fn test_filesystem_catalog_builds_local_cache_from_catalog_options() {
         let warehouse = TempDir::new().unwrap();
-        let cache = TempDir::new().unwrap();
         let mut options = Options::new();
         options.set(
             CatalogOptions::WAREHOUSE,
             warehouse.path().to_string_lossy(),
         );
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(
-            CatalogOptions::LOCAL_CACHE_DIR,
-            cache.path().to_string_lossy(),
-        );
 
         let catalog = FileSystemCatalog::new(options).unwrap();
 

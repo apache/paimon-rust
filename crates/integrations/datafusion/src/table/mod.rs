@@ -713,6 +713,7 @@ mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         let table_schema = TableSchema::new(0, &schema);

@@ -4,6 +4,7 @@ ahash@0.8.12		X									X
 aho-corasick@1.1.4											X			X	
 alloc-no-stdlib@2.0.4					X										
 alloc-stdlib@0.2.4					X										
+allocator-api2@0.2.21		X									X				
 android_system_properties@0.1.5		X									X				
 anyhow@1.0.104		X									X				
 apache-avro@0.21.0		X													
@@ -93,6 +94,7 @@ find-msvc-tools@0.1.9		X									X
 flatbuffers@25.12.19		X													
 flate2@1.1.9		X									X				
 fnv@1.0.7		X									X				
+foldhash@0.2.0															X
 foreign-types@0.3.2		X									X				
 foreign-types-shared@0.1.1		X									X				
 form_urlencoded@1.2.2		X									X				
@@ -168,6 +170,7 @@ libm@0.2.16											X
 linux-raw-sys@0.12.1		X	X								X				
 litemap@0.8.2													X		
 log@0.4.33		X									X				
+lru@0.18.2											X				
 lz4_flex@0.11.6											X				
 lz4_flex@0.13.1											X				
 lzokay-native@0.1.0											X				

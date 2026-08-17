@@ -32,6 +32,8 @@ use crate::Result;
 /// Scan a table's manifest entries and aggregate them into [`Partition`] rows,
 /// matching the shape catalogs would otherwise return from a metastore.
 pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Partition>> {
+    // Manifests carry partition values and per-column stats.
+    crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
     let file_io = table.file_io();
     let snapshot_sm = table.snapshot_manager();
     let manifest_sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
@@ -112,4 +114,20 @@ pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Parti
         });
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_query_auth_table_refuses_partition_listing() {
+        let table = crate::table::query_auth_table();
+        let err = list_partitions_from_file_system(&table).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "listing partitions on a query-auth.enabled table must fail closed, got {err:?}"
+        );
+    }
 }

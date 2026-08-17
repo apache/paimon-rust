@@ -109,3 +109,27 @@ pub struct paimon_result_prepare_commit {
     pub messages: *mut paimon_commit_messages,
     pub error: *mut paimon_error,
 }
+
+#[repr(C)]
+pub struct paimon_result_postpone_fixed_bucket_write_builder {
+    pub write_builder: *mut paimon_postpone_fixed_bucket_write_builder,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_postpone_fixed_bucket_table_write {
+    pub write: *mut paimon_postpone_fixed_bucket_table_write,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_postpone_fixed_bucket_table_commit {
+    pub commit: *mut paimon_postpone_fixed_bucket_table_commit,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_postpone_fixed_bucket_prepare_commit {
+    pub messages: *mut paimon_postpone_fixed_bucket_commit_messages,
+    pub error: *mut paimon_error,
+}

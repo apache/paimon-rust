@@ -108,7 +108,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     vector_searches: Vec<VectorSearch>,
     source: S,
     file_name: String,
-    shard_concurrency: usize,
+    index_parallelism: usize,
     guard: G,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     let panic_context = if vector_searches.len() > 1 {
@@ -118,7 +118,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     };
     execute_global_index_with_guard(panic_context, guard, move || {
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
-            .with_batch_shard_concurrency(shard_concurrency);
+            .with_batch_index_parallelism(index_parallelism);
         reader
             .visit_batch_vector_search(&vector_searches, |_| Ok(source))
             .map_err(|e| crate::Error::DataInvalid {
@@ -134,6 +134,10 @@ fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {
         message: "Vector index range reader requires a Tokio runtime".to_string(),
         source: Some(Box::new(error)),
     })
+}
+
+fn vindex_index_parallelism(entry_count: usize, max_concurrency: usize) -> usize {
+    entry_count.min(max_concurrency).max(1)
 }
 
 pub struct VectorSearchBuilder<'a> {
@@ -823,6 +827,16 @@ async fn plan_and_search_pk_candidates_batch(
             source: None,
         }
     })?;
+    let batch_index_parallelism = match backend {
+        VectorIndexBackend::Vindex => vindex_index_parallelism(
+            plan.splits
+                .iter()
+                .map(|split| split.ann_segments.len())
+                .sum(),
+            concurrency,
+        ),
+        VectorIndexBackend::Lumina => 1,
+    };
 
     // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
     // but projecting only the vector column with no predicates.
@@ -908,7 +922,7 @@ async fn plan_and_search_pk_candidates_batch(
                 }
                 (VectorIndexBackend::Vindex, AnnSegmentSource::Vindex(source)) => {
                     let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone())
-                        .with_batch_shard_concurrency(concurrency);
+                        .with_batch_index_parallelism(batch_index_parallelism);
                     reader.load_validated(
                         |_| Ok(source),
                         |metadata| {
@@ -1592,6 +1606,13 @@ async fn evaluate_batch_vector_search(
         }
         ensure_global_index_executor_capacity(concurrency);
         let range_read_permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let batch_index_parallelism = vindex_index_parallelism(
+            vector_entries
+                .iter()
+                .filter(|entry| is_vindex_index_type(&entry.index_file.index_type))
+                .count(),
+            concurrency,
+        );
         let futures: Vec<_> = vector_entries
             .into_iter()
             .map(|entry| {
@@ -1685,7 +1706,7 @@ async fn evaluate_batch_vector_search(
                                         vector_searches,
                                         source,
                                         file_name.clone(),
-                                        concurrency,
+                                        batch_index_parallelism,
                                         permit,
                                     )
                                     .await?;
@@ -1720,7 +1741,7 @@ async fn evaluate_batch_vector_search(
                                         vector_searches,
                                         Cursor::new(data),
                                         file_name,
-                                        concurrency,
+                                        batch_index_parallelism,
                                         permit,
                                     )
                                     .await?
@@ -3356,6 +3377,14 @@ mod tests {
 
     fn l2_score(distance: f32) -> f32 {
         VectorSearchMetric::L2.distance_to_score(distance)
+    }
+
+    #[test]
+    fn vindex_batch_parallelism_tracks_active_entries() {
+        assert_eq!(vindex_index_parallelism(1, 1), 1);
+        assert_eq!(vindex_index_parallelism(1, 64), 1);
+        assert_eq!(vindex_index_parallelism(8, 4), 4);
+        assert_eq!(vindex_index_parallelism(4, 8), 4);
     }
 
     fn make_field(id: i32, name: &str) -> DataField {

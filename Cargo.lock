@@ -3791,6 +3791,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4576,6 +4585,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libloading 0.9.0",
  "log",
+ "lru 0.18.2",
  "lz4_flex 0.13.1",
  "md-5 0.10.6",
  "opendal-core",
@@ -6700,7 +6710,7 @@ dependencies = [
  "itertools 0.14.0",
  "levenshtein_automata",
  "log",
- "lru",
+ "lru 0.16.4",
  "lz4_flex 0.13.1",
  "measure_time",
  "memmap2",

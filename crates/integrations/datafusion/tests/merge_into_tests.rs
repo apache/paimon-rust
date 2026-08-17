@@ -1152,7 +1152,7 @@ async fn test_rejects_partition_column_in_set() {
 }
 
 #[tokio::test]
-async fn test_rejects_table_without_row_tracking() {
+async fn test_rejects_enabling_data_evolution_without_row_tracking() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
 
@@ -1169,29 +1169,11 @@ async fn test_rejects_table_without_row_tracking() {
         .await
         .unwrap();
 
-    sql_context
-        .sql("INSERT INTO paimon.test_db.no_tracking (id, name) VALUES (1, 'alice')")
+    let error = sql_context
+        .sql("ALTER TABLE paimon.test_db.no_tracking SET TBLPROPERTIES('data-evolution.enabled' = 'true')")
         .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    sql_context.sql("ALTER TABLE paimon.test_db.no_tracking SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
-
-    register_source(
-        &sql_context,
-        "CREATE TEMPORARY TABLE paimon.test_db.src_nrt AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
-    )
-    .await;
-
-    assert_merge_error(
-        &sql_context,
-        "MERGE INTO paimon.test_db.no_tracking t USING paimon.test_db.src_nrt s ON t.id = s.id \
-         WHEN MATCHED THEN UPDATE SET name = s.name",
-        "row-tracking.enabled",
-    )
-    .await;
+        .unwrap_err();
+    assert!(error.to_string().contains("row-tracking.enabled"));
 }
 
 #[tokio::test]
@@ -1471,7 +1453,7 @@ async fn test_rejects_table_with_primary_keys() {
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .unwrap();
-    sql_context
+    let error = sql_context
         .sql(
             "CREATE TABLE paimon.test_db.pk_target (\
                 id INT NOT NULL, name STRING, PRIMARY KEY (id)\
@@ -1480,23 +1462,10 @@ async fn test_rejects_table_with_primary_keys() {
             )",
         )
         .await
-        .unwrap();
-
-    register_source(
-        &sql_context,
-        "CREATE TEMPORARY TABLE paimon.test_db.src_pk AS SELECT * FROM (VALUES (1, 'ALICE')) AS t(id, name)",
-    )
-    .await;
-
-    sql_context.sql("ALTER TABLE paimon.test_db.pk_target SET TBLPROPERTIES('data-evolution.enabled' = 'true')").await.unwrap();
-
-    assert_merge_error(
-        &sql_context,
-        "MERGE INTO paimon.test_db.pk_target t USING paimon.test_db.src_pk s ON t.id = s.id \
-         WHEN MATCHED THEN UPDATE SET name = s.name",
-        "does not support primary keys",
-    )
-    .await;
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Cannot define primary-key for row tracking table"));
 }
 
 #[tokio::test]

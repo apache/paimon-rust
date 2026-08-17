@@ -6421,7 +6421,7 @@ mod tests {
         let sql_context = make_sql_context(catalog.clone()).await;
 
         sql_context
-            .sql("CREATE TABLE mydb.t1 (id INT, payload BLOB NOT NULL) WITH ('data-evolution.enabled' = 'true')")
+            .sql("CREATE TABLE mydb.t1 (id INT, payload BLOB NOT NULL) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')")
             .await
             .unwrap();
 
@@ -6451,7 +6451,7 @@ mod tests {
                  photo BYTES COMMENT '__BLOB_FIELD; raw photo', \
                  thumb BINARY COMMENT '__BLOB_DESCRIPTOR_FIELD', \
                  preview VARBINARY COMMENT '__BLOB_VIEW_FIELD; preview ref'\
-                 ) WITH ('data-evolution.enabled' = 'true')",
+                 ) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')",
             )
             .await
             .unwrap();

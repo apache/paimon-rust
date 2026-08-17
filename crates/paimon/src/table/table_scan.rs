@@ -336,20 +336,19 @@ fn retain_manifest_entry_row_ranges(
 fn data_evolution_row_range_groups(
     data_files: Vec<DataFileMeta>,
     row_ranges: Option<&[RowRange]>,
-) -> (Vec<Vec<DataFileMeta>>, usize) {
+) -> crate::Result<(Vec<Vec<DataFileMeta>>, usize)> {
     if data_files.is_empty() {
-        return (Vec::new(), 0);
+        return Ok((Vec::new(), 0));
+    }
+    if let Some(file) = data_files.iter().find(|file| file.first_row_id.is_none()) {
+        return Err(crate::Error::DataInvalid {
+            message: format!("First row id of '{}' should not be null.", file.file_name),
+            source: None,
+        });
     }
     let Some(row_ranges) = row_ranges else {
-        return (group_by_overlapping_row_id(data_files), 0);
+        return Ok((group_by_overlapping_row_id(data_files), 0));
     };
-    let all_ranges_known = data_files.iter().all(|file| file.row_id_range().is_some());
-    if !all_ranges_known {
-        // Avoid unchecked row-range arithmetic in downstream grouping and keep
-        // the whole bucket as one non-raw group. The reader will then fail on
-        // invalid metadata instead of silently losing dedicated providers.
-        return (vec![data_files], 0);
-    }
     let row_id_groups = group_by_overlapping_row_id(data_files);
     let groups_before_pruning = row_id_groups.len();
 
@@ -362,7 +361,7 @@ fn data_evolution_row_range_groups(
         })
         .collect::<Vec<_>>();
     let pruned = groups_before_pruning - retained.len();
-    (retained, pruned)
+    Ok((retained, pruned))
 }
 
 fn split_row_ranges_for_files(
@@ -1930,7 +1929,7 @@ impl<'a> PaimonTableScan<'a> {
             // Data-evolution reads merge overlapping row-id groups column-wise.
             let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
                 let (row_id_groups, groups_pruned_by_row_ranges) =
-                    data_evolution_row_range_groups(data_files, effective_row_ranges.as_deref());
+                    data_evolution_row_range_groups(data_files, effective_row_ranges.as_deref())?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.data_evolution_groups_before_stats += row_id_groups.len();
                     trace.data_evolution_groups_pruned_by_row_ranges += groups_pruned_by_row_ranges;
@@ -2336,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_evolution_row_range_group_pruning_fails_open_on_unknown_range() {
+    fn test_data_evolution_row_range_group_rejects_unknown_range() {
         let files = vec![
             make_evo_file("unknown-anchor", 1, 6, 0, None),
             make_evo_file("left.blob", 1, 2, 0, Some(0)),
@@ -2344,16 +2343,11 @@ mod tests {
         ];
         let ranges = [RowRange::new(2, 2)];
 
-        let (groups, pruned) = data_evolution_row_range_groups(files, Some(&ranges));
-
-        assert_eq!(pruned, 0);
-        let mut names = groups
-            .into_iter()
-            .flatten()
-            .map(|file| file.file_name)
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(names, vec!["left.blob", "right.blob", "unknown-anchor"]);
+        for row_ranges in [None, Some(ranges.as_slice())] {
+            let error = data_evolution_row_range_groups(files.clone(), row_ranges).unwrap_err();
+            assert!(matches!(error, Error::DataInvalid { message, .. }
+                if message == "First row id of 'unknown-anchor' should not be null."));
+        }
     }
 
     #[test]
@@ -2899,7 +2893,7 @@ mod tests {
             make_evo_file("b", 10, 100, 2, None),
         ];
         let groups = group_by_overlapping_row_id(files);
-        assert_eq!(file_names(&groups), vec![vec!["b"], vec!["a"]]);
+        assert_eq!(file_names(&groups), vec![vec!["a"], vec!["b"]]);
     }
 
     #[test]
@@ -3247,8 +3241,8 @@ mod tests {
     #[test]
     fn test_group_by_overlapping_row_id_non_overlapping() {
         let files = vec![
-            make_evo_file("a", 10, 100, 1, Some(0)),
             make_evo_file("b", 10, 100, 2, Some(100)),
+            make_evo_file("a", 10, 100, 1, Some(0)),
         ];
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 2);
@@ -3266,12 +3260,12 @@ mod tests {
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(
             file_names(&groups),
-            vec![vec!["c"], vec!["b", "a"], vec!["d"]]
+            vec![vec!["c"], vec!["a", "b"], vec!["d"]]
         );
     }
 
     #[test]
-    fn test_group_by_overlapping_row_id_sorted_by_seq() {
+    fn test_group_by_overlapping_row_id_preserves_input_order() {
         let files = vec![
             make_evo_file("a", 10, 100, 1, Some(0)),
             make_evo_file("b", 10, 100, 3, Some(0)),
@@ -3279,7 +3273,7 @@ mod tests {
         ];
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 1);
-        assert_eq!(file_names(&groups), vec![vec!["b", "c", "a"]]);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b", "c"]]);
     }
 
     #[test]

@@ -697,7 +697,6 @@ async fn diff_rejects_row_ranges_instead_of_dropping_them() {
             ("changelog-producer", "none"),
             ("merge-engine", "deduplicate"),
             ("bucket", "1"),
-            ("row-tracking.enabled", "true"),
             ("target-file-size", "1b"),
             ("source.split.target-size", "1b"),
             ("source.split.open-file-cost", "1b"),

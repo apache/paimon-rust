@@ -27,9 +27,11 @@ pub struct CommitMessage {
     pub partition: Vec<u8>,
     /// Bucket id.
     pub bucket: i32,
+    /// Per-partition bucket count for fixed-bucket postpone writes.
+    pub total_buckets: Option<i32>,
     /// New data files to be added.
     pub new_files: Vec<DataFileMeta>,
-    /// Snapshot id from which row-id/column conflicts should be checked.
+    /// Snapshot id from which state-dependent write conflicts should be checked.
     pub check_from_snapshot: Option<i64>,
     /// New changelog files to be added.
     pub new_changelog_files: Vec<DataFileMeta>,
@@ -39,6 +41,7 @@ pub struct CommitMessage {
     pub deleted_index_files: Vec<IndexFileMeta>,
     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
     pub deleted_files: Vec<DataFileMeta>,
+    fixed_bucket_overwrite: bool,
 }
 
 impl CommitMessage {
@@ -46,12 +49,22 @@ impl CommitMessage {
         Self {
             partition,
             bucket,
+            total_buckets: None,
             new_files,
             check_from_snapshot: None,
             new_changelog_files: Vec::new(),
             new_index_files: Vec::new(),
             deleted_index_files: Vec::new(),
             deleted_files: Vec::new(),
+            fixed_bucket_overwrite: false,
         }
+    }
+
+    pub(crate) fn mark_fixed_bucket_overwrite(&mut self) {
+        self.fixed_bucket_overwrite = true;
+    }
+
+    pub(crate) fn is_fixed_bucket_overwrite(&self) -> bool {
+        self.fixed_bucket_overwrite
     }
 }

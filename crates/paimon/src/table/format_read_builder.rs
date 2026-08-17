@@ -127,6 +127,13 @@ impl<'a> FormatReadBuilder<'a> {
     }
 
     pub(crate) fn new_read(&self) -> Result<TableRead<'a>> {
+        // Fail closed here as well as in `FormatTableScan::plan`, so a caller that
+        // goes straight to `new_read` cannot silently read unfiltered rows.
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Row ranges are not supported for format tables".to_string(),
+            });
+        }
         let core_options = self.table.schema().core_options();
         core_options.ensure_read_authorized()?;
         let read_type = match self.resolve_read_type()? {

@@ -1157,6 +1157,7 @@ impl Schema {
     ) -> crate::Result<()> {
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, primary_keys, options)?;
+        Self::validate_row_tracking(primary_keys, options)?;
         Self::validate_blob_fields(fields, partition_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
         PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
@@ -1172,6 +1173,42 @@ impl Schema {
         Self::validate_read_batch_size(options)?;
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        Ok(())
+    }
+
+    fn validate_row_tracking(
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let core_options = CoreOptions::new(options);
+        if core_options.row_tracking_enabled() {
+            if !primary_keys.is_empty() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Cannot define primary-key for row tracking table.".to_string(),
+                });
+            }
+            if core_options.bucket() != -1 {
+                return Err(crate::Error::ConfigInvalid {
+                    message:
+                        "Cannot define bucket for row tracking table, it only support bucket = -1"
+                            .to_string(),
+                });
+            }
+        }
+        if core_options.data_evolution_enabled() {
+            if !core_options.row_tracking_enabled() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Data evolution config must enabled with row-tracking.enabled"
+                        .to_string(),
+                });
+            }
+            if core_options.clustering_incremental_enabled() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "Data evolution config must disabled with clustering.incremental"
+                        .to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2519,6 +2556,85 @@ mod tests {
     }
 
     #[test]
+    fn test_row_tracking_rejects_primary_key_and_bucket() {
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(vec!["id".to_string()])
+                .option("row-tracking.enabled", "true")
+                .build(),
+            "primary-key",
+        );
+
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("bucket", "1")
+                .build(),
+            "bucket = -1",
+        );
+
+        // Combination reported in review: PK + bucket=1 + row tracking + DE.
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .primary_key(vec!["id".to_string()])
+                .option("bucket", "1")
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .build(),
+            "row tracking",
+        );
+    }
+
+    #[test]
+    fn test_data_evolution_rejects_incremental_clustering() {
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("row-tracking.enabled", "true")
+                .option("data-evolution.enabled", "true")
+                .option("clustering.incremental", "true")
+                .build(),
+            "clustering.incremental",
+        );
+    }
+
+    #[test]
+    fn test_data_evolution_requires_row_tracking() {
+        assert_config_invalid(
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build(),
+            "row-tracking.enabled",
+        );
+
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        assert_config_invalid(
+            table_schema.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "data-evolution.enabled".to_string(),
+                "true".to_string(),
+            )]),
+            "row-tracking.enabled",
+        );
+    }
+
+    #[test]
     fn test_blob_schema_validation_requires_data_evolution() {
         let err = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -2537,6 +2653,7 @@ mod tests {
         let err = Schema::builder()
             .column("payload", DataType::Blob(BlobType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -2553,6 +2670,7 @@ mod tests {
             .column("payload", DataType::Blob(BlobType::new()))
             .partition_keys(["payload"])
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -2568,6 +2686,7 @@ mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
 
@@ -2587,6 +2706,7 @@ mod tests {
             )
             .option("blob-field", "payload")
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
 
@@ -2606,6 +2726,7 @@ mod tests {
                 Some("__BLOB_FIELD; payload bytes".to_string()),
             )
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
 
@@ -2630,6 +2751,7 @@ mod tests {
                 Some("__BLOB_FIEL; payload bytes".to_string()),
             )
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -2652,6 +2774,7 @@ mod tests {
                 Some("__BLOB_FIELD ; payload bytes".to_string()),
             )
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -2675,6 +2798,7 @@ mod tests {
             )
             .option("blob-descriptor-field", "preview")
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -2694,6 +2818,7 @@ mod tests {
             .column("thumb", DataType::Blob(BlobType::new()))
             .option("blob-descriptor-field", "thumb")
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
 
@@ -2730,6 +2855,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
 
@@ -2758,6 +2884,7 @@ mod tests {
             .column("payload", DataType::Int(IntType::new()))
             .option("blob-field", "payload")
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap_err();
 
@@ -3339,6 +3466,7 @@ mod tests {
                     DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
                 )
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -3386,6 +3514,7 @@ mod tests {
                     DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
                 )
                 .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),
         );
@@ -3471,6 +3600,10 @@ mod tests {
             .apply_changes(vec![
                 crate::spec::SchemaChange::set_option(
                     "data-evolution.enabled".to_string(),
+                    "true".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "row-tracking.enabled".to_string(),
                     "true".to_string(),
                 ),
                 crate::spec::SchemaChange::add_column(
@@ -3719,7 +3852,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("Row tracking config must enabled")),
+                if message.contains("row-tracking.enabled")),
             "dedicated VECTOR storage should require row-tracking.enabled, got {err:?}"
         );
     }

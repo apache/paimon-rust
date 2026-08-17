@@ -1725,7 +1725,6 @@ mod pk_hybrid_tests {
                     )
                 })
                 .column(TEXT_COLUMN, DataType::VarChar(VarCharType::string_type()))
-                .option("bucket", "1")
                 .option("row-tracking.enabled", "true")
                 .build()
                 .unwrap(),

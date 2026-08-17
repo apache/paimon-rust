@@ -24,14 +24,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::cache::LocalCache;
-use crate::io::FileIO;
+use crate::io::{FileIO, FileIOProvider};
 use crate::Result;
 
 use super::rest_token::RESTToken;
@@ -40,135 +40,95 @@ use super::rest_token::RESTToken;
 const TOKEN_EXPIRATION_SAFE_TIME_MILLIS: i64 = 3_600_000;
 const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 
-/// A FileIO wrapper that supports getting data access tokens from a REST Server.
-///
-/// This struct handles:
-/// - Token caching with expiration detection
-/// - Automatic token refresh via `RESTApi::load_table_token`
-/// - Merging token credentials into catalog options to build the underlying `FileIO`
+/// A FileIO wrapper that refreshes data access tokens from the REST server.
+#[derive(Debug)]
+struct TokenState {
+    token: RESTToken,
+    file_io: FileIO,
+}
+
 pub struct RESTTokenFileIO {
-    /// Table identifier for token requests.
     identifier: Identifier,
-    /// Table path (e.g. "oss://bucket/warehouse/db.db/table").
     path: String,
-    /// Catalog options used to build FileIO and create RESTApi.
     catalog_options: Options,
-    /// Lazily-initialized REST API client for token refresh.
-    /// Created on first token refresh and reused for subsequent refreshes.
-    api: OnceCell<RESTApi>,
-    /// Cached token with RwLock for concurrent access.
-    token: RwLock<Option<RESTToken>>,
-    /// Catalog-scoped cache preserved across token-driven FileIO rebuilds.
+    api: Arc<RESTApi>,
+    state: RwLock<Option<TokenState>>,
+    refresh_lock: Mutex<()>,
     local_cache: Option<Arc<LocalCache>>,
 }
 
+impl std::fmt::Debug for RESTTokenFileIO {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RESTTokenFileIO")
+            .field("identifier", &self.identifier)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RESTTokenFileIO {
-    /// Create a new RESTTokenFileIO.
-    ///
-    /// # Arguments
-    /// * `identifier` - Table identifier for token requests.
-    /// * `path` - Table path for FileIO construction.
-    /// * `catalog_options` - Catalog options for RESTApi and FileIO.
-    /// * `local_cache` - Catalog-scoped local cache shared across FileIO rebuilds.
     pub(crate) fn new(
         identifier: Identifier,
         path: String,
         catalog_options: Options,
+        api: Arc<RESTApi>,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Self {
         Self {
             identifier,
             path,
             catalog_options,
-            api: OnceCell::new(),
-            token: RwLock::new(None),
+            api,
+            state: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
             local_cache,
         }
     }
 
-    /// Build a `FileIO` instance with the current token merged into options.
-    ///
-    /// This method:
-    /// 1. Refreshes the token if expired or not yet obtained.
-    /// 2. Merges token credentials into catalog options.
-    /// 3. Builds a `FileIO` from the merged options.
-    ///
-    /// This method builds a FileIO with the current token,
-    /// which can be passed to `Table::new`. If the token expires, a new
-    /// `get_table` call is needed.
-    pub async fn build_file_io(&self) -> Result<FileIO> {
-        // Ensure token is fresh
-        self.try_to_refresh_token().await?;
-
-        let token_guard = self.token.read().await;
-        match token_guard.as_ref() {
-            Some(token) => {
-                // Merge catalog options (base) with token credentials (override)
-                let merged_props =
-                    RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
-                // Build FileIO with merged properties
-                let mut builder = FileIO::from_path(&self.path)?;
-                builder = builder.with_props(merged_props);
-                if let Some(local_cache) = &self.local_cache {
-                    builder = builder.with_local_cache(local_cache.clone());
-                }
-                builder.build()
-            }
-            None => {
-                // No token available, build FileIO from path only
-                let mut builder = FileIO::from_path(&self.path)?;
-                if let Some(local_cache) = &self.local_cache {
-                    builder = builder.with_local_cache(local_cache.clone());
-                }
-                builder.build()
-            }
-        }
+    pub(crate) async fn build_file_io(self: &Arc<Self>) -> Result<FileIO> {
+        let file_io = self.current_file_io().await?;
+        Ok(file_io.with_provider(self.clone()))
     }
 
-    /// Try to refresh the token if it is expired or not yet obtained.
-    async fn try_to_refresh_token(&self) -> Result<()> {
-        // Fast path: check if token is still valid under read lock
-        {
-            let token_guard = self.token.read().await;
-            if let Some(token) = token_guard.as_ref() {
-                if !Self::is_token_expired(token) {
-                    return Ok(());
-                }
-            }
+    async fn current_file_io(&self) -> Result<FileIO> {
+        if let Some(file_io) = self.valid_file_io().await {
+            return Ok(file_io);
         }
 
-        // Slow path: acquire write lock and check again
-        {
-            let token_guard = self.token.write().await;
-            if let Some(token) = token_guard.as_ref() {
-                if !Self::is_token_expired(token) {
-                    return Ok(());
-                }
-            }
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(file_io) = self.valid_file_io().await {
+            return Ok(file_io);
         }
-        // Write lock released before .await to avoid potential deadlock
 
-        // Refresh the token WITHOUT holding the lock
-        let new_token = self.refresh_token().await?;
-
-        // Acquire write lock again to update
-        let mut token_guard = self.token.write().await;
-        *token_guard = Some(new_token);
-        Ok(())
+        let token = self.refresh_token().await?;
+        let file_io = self.build_static_file_io(&token)?;
+        *self.state.write().await = Some(TokenState {
+            token,
+            file_io: file_io.clone(),
+        });
+        Ok(file_io)
     }
 
-    /// Refresh the token by calling `RESTApi::load_table_token`.
-    ///
-    /// Lazily creates a `RESTApi` instance on first call and reuses it
-    /// for subsequent refreshes.
+    async fn valid_file_io(&self) -> Option<FileIO> {
+        self.state
+            .read()
+            .await
+            .as_ref()
+            .filter(|state| !Self::is_token_expired(&state.token))
+            .map(|state| state.file_io.clone())
+    }
+
+    fn build_static_file_io(&self, token: &RESTToken) -> Result<FileIO> {
+        let merged_props = RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
+        let mut builder = FileIO::from_path(&self.path)?.with_props(merged_props);
+        if let Some(local_cache) = &self.local_cache {
+            builder = builder.with_local_cache(local_cache.clone());
+        }
+        builder.build()
+    }
+
     async fn refresh_token(&self) -> Result<RESTToken> {
-        let api = self
-            .api
-            .get_or_try_init(|| async { RESTApi::new(self.catalog_options.clone(), false).await })
-            .await?;
-
-        let response = api.load_table_token(&self.identifier).await?;
-
+        let response = self.api.load_table_token(&self.identifier).await?;
         let expires_at_millis =
             response
                 .expires_at_millis
@@ -180,27 +140,23 @@ impl RESTTokenFileIO {
                     source: None,
                 })?;
 
-        // Merge token with catalog options (e.g. DLF OSS endpoint override)
         let merged_token = self.merge_token_with_catalog_options(response.token);
         Ok(RESTToken::new(merged_token, expires_at_millis))
     }
 
-    /// Check if a token is expired (within the safe time margin).
     fn is_token_expired(token: &RESTToken) -> bool {
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        (token.expire_at_millis - current_time) < TOKEN_EXPIRATION_SAFE_TIME_MILLIS
+        token.expire_at_millis - current_time < TOKEN_EXPIRATION_SAFE_TIME_MILLIS
     }
 
-    /// Merge token credentials with catalog options for DLF OSS endpoint override.
     fn merge_token_with_catalog_options(
         &self,
         token: HashMap<String, String>,
     ) -> HashMap<String, String> {
         let mut merged = token;
-        // If catalog options contain a DLF OSS endpoint, override the standard OSS endpoint
         if let Some(dlf_oss_endpoint) = self.catalog_options.get(CatalogOptions::DLF_OSS_ENDPOINT) {
             if !dlf_oss_endpoint.trim().is_empty() {
                 merged.insert(OSS_ENDPOINT.to_string(), dlf_oss_endpoint.clone());
@@ -210,37 +166,130 @@ impl RESTTokenFileIO {
     }
 }
 
+#[async_trait::async_trait]
+impl FileIOProvider for RESTTokenFileIO {
+    async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
+        self.current_file_io().await?.create_static(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::State;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use bytes::Bytes;
+
     use super::*;
+    use crate::api::GetTableTokenResponse;
     use crate::io::cache::create_local_cache;
+
+    async fn token(State(requests): State<Arc<AtomicUsize>>) -> Json<GetTableTokenResponse> {
+        let request = requests.fetch_add(1, Ordering::SeqCst);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let lifetime = if request == 0 {
+            TOKEN_EXPIRATION_SAFE_TIME_MILLIS / 2
+        } else {
+            TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2
+        };
+        Json(GetTableTokenResponse {
+            token: HashMap::new(),
+            expires_at_millis: Some(now + lifetime),
+        })
+    }
+
+    async fn token_api() -> (
+        Options,
+        Arc<RESTApi>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/databases/database/tables/table/token", get(token))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, format!("http://{address}"));
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        (options, api, requests, server)
+    }
 
     #[tokio::test]
     async fn test_token_file_io_keeps_catalog_local_cache() {
-        let cache_directory = tempfile::tempdir().unwrap();
         let table_directory = tempfile::tempdir().unwrap();
-        let mut options = Options::new();
+        let (mut options, api, _, server) = token_api().await;
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(
-            CatalogOptions::LOCAL_CACHE_DIR,
-            cache_directory.path().to_string_lossy(),
-        );
         let local_cache = create_local_cache(&options).unwrap();
-        let token_file_io = RESTTokenFileIO::new(
+        let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,
+            api,
             local_cache,
-        );
-        let valid_until = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-            + TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2;
-        *token_file_io.token.write().await = Some(RESTToken::new(HashMap::new(), valid_until));
+        ));
 
         let file_io = token_file_io.build_file_io().await.unwrap();
 
         assert!(file_io.has_local_cache());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_file_io_refreshes_expiring_token() {
+        let table_directory = tempfile::tempdir().unwrap();
+        let file_path = table_directory.path().join("data");
+        let (options, api, requests, server) = token_api().await;
+        let token_file_io = Arc::new(RESTTokenFileIO::new(
+            Identifier::new("database", "table"),
+            table_directory.path().to_string_lossy().into_owned(),
+            options,
+            api,
+            None,
+        ));
+
+        let file_io = token_file_io.build_file_io().await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let file_io = Arc::new(file_io);
+        let mut checks = Vec::new();
+        for _ in 0..8 {
+            let file_io = file_io.clone();
+            let path = file_path.to_string_lossy().into_owned();
+            checks.push(tokio::spawn(async move { file_io.exists(&path).await }));
+        }
+        for check in checks {
+            assert!(!check.await.unwrap().unwrap());
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        file_io
+            .new_output(file_path.to_string_lossy().as_ref())
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        let bytes = file_io
+            .new_input(file_path.to_string_lossy().as_ref())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"data"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }

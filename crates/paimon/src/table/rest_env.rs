@@ -153,12 +153,13 @@ impl RESTEnv {
         })?;
 
         let file_io = if data_token_enabled && !is_external {
-            RESTTokenFileIO::new(
+            Arc::new(RESTTokenFileIO::new(
                 identifier.clone(),
                 table_path.clone(),
                 options.clone(),
+                api.clone(),
                 local_cache.clone(),
-            )
+            ))
             .build_file_io()
             .await?
         } else {

@@ -130,6 +130,43 @@ var (
 		}[0],
 	}
 
+	// Write result types all have the layout { opaque pointer, *paimon_error }.
+	typeResultWriteBuilder = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultTableWrite = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultTableCommit = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	typeResultPrepareCommit = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	// paimon_datum { tag: i32, int_val: i64, double_val: f64, str_data: *u8, str_len: usize,
 	//                int_val2: i64, uint_val: u32, uint_val2: u32 }
 	typePaimonDatum = ffi.Type{
@@ -182,6 +219,10 @@ type paimonTableRead struct{}
 type paimonPlan struct{}
 type paimonRecordBatchReader struct{}
 type paimonPredicate struct{}
+type paimonWriteBuilder struct{}
+type paimonTableWrite struct{}
+type paimonTableCommit struct{}
+type paimonCommitMessages struct{}
 
 // Result types matching the C repr structs
 type resultCatalogNew struct {
@@ -227,6 +268,26 @@ type resultRecordBatchReader struct {
 type resultPredicate struct {
 	predicate *paimonPredicate
 	error     *paimonError
+}
+
+type resultWriteBuilder struct {
+	writeBuilder *paimonWriteBuilder
+	error        *paimonError
+}
+
+type resultTableWrite struct {
+	write *paimonTableWrite
+	error *paimonError
+}
+
+type resultTableCommit struct {
+	commit *paimonTableCommit
+	error  *paimonError
+}
+
+type resultPrepareCommit struct {
+	messages *paimonCommitMessages
+	error    *paimonError
 }
 
 // paimonDatumC mirrors the C paimon_datum struct.

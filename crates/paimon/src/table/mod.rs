@@ -72,7 +72,11 @@ mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
 mod pk_vector_scan;
+mod postpone_bucket_plan;
 mod postpone_file_writer;
+mod postpone_fixed_bucket_router;
+mod postpone_fixed_bucket_write;
+mod postpone_fixed_bucket_write_builder;
 mod prepared_files;
 mod read_builder;
 pub mod referenced_files;
@@ -120,6 +124,11 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use partition_stat::PartitionStat;
+pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
+pub use postpone_fixed_bucket_write::{
+    PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,
+};
+pub use postpone_fixed_bucket_write_builder::PostponeFixedBucketWriteBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
@@ -357,6 +366,13 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_write_builder(&self) -> WriteBuilder<'_> {
         WriteBuilder::new(self)
+    }
+
+    /// Create a one-shot fixed-bucket builder for a postpone table.
+    pub fn new_postpone_fixed_bucket_write_builder(
+        &self,
+    ) -> Result<PostponeFixedBucketWriteBuilder<'_>> {
+        PostponeFixedBucketWriteBuilder::new(self)
     }
 
     /// Create a copy of this table with extra options merged into the schema.

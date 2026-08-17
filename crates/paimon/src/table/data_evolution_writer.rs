@@ -159,6 +159,9 @@ impl DataEvolutionWriter {
     /// Returns `CommitMessage`s for the caller to commit via [`TableCommit`](super::TableCommit).
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
+        // A row-id update reads the original rows it rewrites.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         let total_matched: usize = self.matched_batches.iter().map(|b| b.num_rows()).sum();
         if total_matched == 0 {
             return Ok(Vec::new());
@@ -455,6 +458,9 @@ impl DataEvolutionDeleteWriter {
 
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(mut self) -> Result<Vec<CommitMessage>> {
+        // A row-id delete reads the files it rewrites.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         dedup_i64_in_place(&mut self.row_ids);
         if self.row_ids.is_empty() {
             return Ok(Vec::new());

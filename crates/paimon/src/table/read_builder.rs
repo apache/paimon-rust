@@ -868,6 +868,15 @@ mod tests {
         assert!(
             matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
         );
+
+        // `new_read` must reject too: a caller that skips planning would otherwise
+        // read every row instead of the requested ranges.
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+        let error = builder.new_read().unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
     }
 
     fn dv_pk_table(table_path: &str, merge_engine: &str) -> Table {
@@ -1224,7 +1233,7 @@ mod tests {
             "the conjunct must stay so the read can reject it"
         );
 
-        for (row_tracking, data_evolution) in [(true, false), (false, true), (true, true)] {
+        for (row_tracking, data_evolution) in [(true, false), (true, true)] {
             let table = row_id_table(row_tracking, data_evolution);
             let mut builder = PaimonReadBuilder::new(&table);
             builder.with_filter(row_id_leaf(PredicateOperator::GtEq, 102));

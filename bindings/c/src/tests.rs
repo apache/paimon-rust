@@ -38,7 +38,7 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
-use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharType};
 use paimon::table::{SnapshotManager, Table};
 
 use crate::error::*;
@@ -73,6 +73,19 @@ fn not_null_table_schema() -> TableSchema {
     TableSchema::new(0, &schema)
 }
 
+fn partitioned_postpone_table_schema() -> TableSchema {
+    let schema = Schema::builder()
+        .column("pt", DataType::VarChar(VarCharType::string_type()))
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["pt", "id"])
+        .partition_keys(["pt"])
+        .option("bucket", "-2")
+        .build()
+        .unwrap();
+    TableSchema::new(0, &schema)
+}
+
 unsafe fn wrap_table(table: Table) -> *mut paimon_table {
     let inner = Box::into_raw(Box::new(table)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table { inner }))
@@ -99,6 +112,38 @@ fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
         vec![
             Arc::new(Int32Array::from(ids)),
             Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_partitioned_write_batch(pts: Vec<&str>, ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("pt", ArrowDataType::Utf8, false),
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(pts)),
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_postpone_bucket_plan_batch(partitions: Vec<&str>, counts: Vec<i32>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("pt", ArrowDataType::Utf8, false),
+        ArrowField::new("total_buckets", ArrowDataType::Int32, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(partitions)),
+            Arc::new(Int32Array::from(counts)),
         ],
     )
     .unwrap()
@@ -1272,6 +1317,75 @@ fn test_commit_rejects_messages_from_different_builder_identity() {
 }
 
 #[test]
+fn test_fixed_commit_rejects_mismatched_overwrite_mode() {
+    let path = "memory:/test_fixed_commit_overwrite_mode";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("fixed-overwrite-mode-job").unwrap();
+
+    unsafe {
+        let append_wb = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        let (array, schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+        assert!(paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+            append_wb,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let tw = paimon_postpone_fixed_bucket_write_builder_new_write(append_wb).write;
+        let (array, schema) = export_batch_to_ffi(make_partitioned_write_batch(
+            vec!["p"],
+            vec![1],
+            vec!["append"],
+        ));
+        assert!(paimon_postpone_fixed_bucket_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let messages = paimon_postpone_fixed_bucket_table_write_prepare_commit(tw).messages;
+
+        let overwrite_wb = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        assert!(paimon_postpone_fixed_bucket_write_builder_with_overwrite(overwrite_wb).is_null());
+        let commit = paimon_postpone_fixed_bucket_write_builder_new_commit(overwrite_wb).commit;
+        let error = paimon_postpone_fixed_bucket_table_commit_commit(commit, messages);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("different overwrite mode"));
+        paimon_error_free(error);
+
+        assert!(crate::runtime()
+            .block_on(SnapshotManager::new(file_io, path.to_string()).get_latest_snapshot())
+            .unwrap()
+            .is_none());
+
+        paimon_postpone_fixed_bucket_table_commit_free(commit);
+        paimon_postpone_fixed_bucket_write_builder_free(overwrite_wb);
+        paimon_postpone_fixed_bucket_commit_messages_free(messages);
+        paimon_postpone_fixed_bucket_table_write_free(tw);
+        paimon_postpone_fixed_bucket_write_builder_free(append_wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_commit_messages_live_until_explicit_free() {
     const CHILD_ENV: &str = "PAIMON_C_MESSAGES_LIFETIME_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {
@@ -1442,6 +1556,234 @@ fn test_commit_messages_merge_preserves_all_writer_files() {
     }
 }
 
+#[test]
+fn test_postpone_bucket_plan_arrow_ownership_on_errors() {
+    let path = "memory:/test_postpone_bucket_plan_arrow_ownership";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let (mut array, mut schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+        let error = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+            ptr::null_mut(),
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert!(!array.is_released());
+        assert!(schema.release.is_some());
+        paimon_error_free(error);
+        ManuallyDrop::drop(array.as_mut());
+        ManuallyDrop::drop(schema.as_mut());
+
+        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle).write_builder;
+        let (array, schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![0]));
+        let error = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+            fixed,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert!(array.is_released());
+        assert!(schema.release.is_none());
+        paimon_error_free(error);
+
+        paimon_postpone_fixed_bucket_write_builder_free(fixed);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_distributed_postpone_writers_share_bucket_plan() {
+    let path = "memory:/test_distributed_postpone_bucket_plan";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("distributed-postpone-job").unwrap();
+
+    unsafe {
+        let normal = paimon_table_new_write_builder(handle);
+        assert!(normal.error.is_null());
+        assert!(!normal.write_builder.is_null());
+        paimon_write_builder_free(normal.write_builder);
+
+        let fixed = paimon_table_new_postpone_fixed_bucket_write_builder(handle);
+        assert!(fixed.error.is_null());
+        assert!(!fixed.write_builder.is_null());
+        let write = paimon_postpone_fixed_bucket_write_builder_new_write(fixed.write_builder);
+        assert!(write.write.is_null());
+        assert!(error_message(write.error).contains("bucket plan is required"));
+        paimon_error_free(write.error);
+        paimon_postpone_fixed_bucket_write_builder_free(fixed.write_builder);
+
+        let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        let wb2 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+
+        for wb in [wb1, wb2] {
+            assert!(paimon_postpone_fixed_bucket_write_builder_with_overwrite(wb).is_null());
+            let (array, schema) = export_batch_to_ffi(make_postpone_bucket_plan_batch(
+                vec!["p1", "p2"],
+                vec![3, 3],
+            ));
+            let error = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+                wb,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(error.is_null());
+        }
+
+        let tw1 = paimon_postpone_fixed_bucket_write_builder_new_write(wb1).write;
+        let tw2 = paimon_postpone_fixed_bucket_write_builder_new_write(wb2).write;
+        for (tw, partitions, ids, names) in [
+            (tw1, vec!["p1"], vec![1], vec!["a"]),
+            (
+                tw2,
+                vec!["p2", "p2", "p2", "p2"],
+                vec![2, 3, 4, 5],
+                vec!["b", "c", "d", "e"],
+            ),
+        ] {
+            let (array, schema) =
+                export_batch_to_ffi(make_partitioned_write_batch(partitions, ids, names));
+            let error = paimon_postpone_fixed_bucket_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(error.is_null());
+        }
+
+        let messages1 = paimon_postpone_fixed_bucket_table_write_prepare_commit(tw1).messages;
+        let messages2 = paimon_postpone_fixed_bucket_table_write_prepare_commit(tw2).messages;
+        for messages in [messages1, messages2] {
+            let state = &*((*messages).inner as *const PostponeFixedBucketCommitMessagesState);
+            assert!(!state.messages.is_empty());
+            assert!(state
+                .messages
+                .iter()
+                .all(|message| message.total_buckets == Some(3)));
+        }
+        let error = paimon_postpone_fixed_bucket_commit_messages_merge(messages1, messages2);
+        assert!(error.is_null());
+        let commit = paimon_postpone_fixed_bucket_write_builder_new_commit(wb1).commit;
+        let error = paimon_postpone_fixed_bucket_table_commit_commit(commit, messages1);
+        assert!(error.is_null());
+        let snapshot = crate::runtime()
+            .block_on(
+                SnapshotManager::new(table_ref(handle).file_io().clone(), path.to_string())
+                    .get_latest_snapshot(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+
+        paimon_postpone_fixed_bucket_table_commit_free(commit);
+        paimon_postpone_fixed_bucket_commit_messages_free(messages2);
+        paimon_postpone_fixed_bucket_commit_messages_free(messages1);
+        paimon_postpone_fixed_bucket_table_write_free(tw2);
+        paimon_postpone_fixed_bucket_table_write_free(tw1);
+        paimon_postpone_fixed_bucket_write_builder_free(wb2);
+        paimon_postpone_fixed_bucket_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_distributed_postpone_writers_reject_overlapping_bucket_ownership() {
+    let path = "memory:/test_distributed_postpone_overlapping_ownership";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("overlapping-postpone-job").unwrap();
+
+    unsafe {
+        let wb1 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        let wb2 = paimon_table_new_postpone_fixed_bucket_write_builder_with_commit_user(
+            handle,
+            commit_user.as_ptr(),
+        )
+        .write_builder;
+        for wb in [wb1, wb2] {
+            let (array, schema) =
+                export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+            assert!(paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+                wb,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            )
+            .is_null());
+        }
+
+        let tw1 = paimon_postpone_fixed_bucket_write_builder_new_write(wb1).write;
+        let tw2 = paimon_postpone_fixed_bucket_write_builder_new_write(wb2).write;
+        for (tw, name) in [(tw1, "first"), (tw2, "second")] {
+            let (array, schema) =
+                export_batch_to_ffi(make_partitioned_write_batch(vec!["p"], vec![1], vec![name]));
+            assert!(paimon_postpone_fixed_bucket_table_write_write_arrow_batch(
+                tw,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            )
+            .is_null());
+        }
+
+        let messages1 = paimon_postpone_fixed_bucket_table_write_prepare_commit(tw1).messages;
+        let messages2 = paimon_postpone_fixed_bucket_table_write_prepare_commit(tw2).messages;
+        let error = paimon_postpone_fixed_bucket_commit_messages_merge(messages1, messages2);
+        assert!(error.is_null());
+        let commit = paimon_postpone_fixed_bucket_write_builder_new_commit(wb1).commit;
+        let error = paimon_postpone_fixed_bucket_table_commit_commit(commit, messages1);
+        assert!(!error.is_null());
+        assert!(error_message(error).contains("writer ownership conflict for bucket 0"));
+        paimon_error_free(error);
+
+        paimon_postpone_fixed_bucket_table_commit_free(commit);
+        paimon_postpone_fixed_bucket_commit_messages_free(messages2);
+        paimon_postpone_fixed_bucket_commit_messages_free(messages1);
+        paimon_postpone_fixed_bucket_table_write_free(tw2);
+        paimon_postpone_fixed_bucket_table_write_free(tw1);
+        paimon_postpone_fixed_bucket_write_builder_free(wb2);
+        paimon_postpone_fixed_bucket_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
+}
 #[test]
 fn test_write_multiple_batches() {
     let path = "memory:/test_write_multi_batch";
@@ -1721,7 +2063,17 @@ fn test_null_pointer_handling() {
         assert!(result.write_builder.is_null());
         paimon_error_free(result.error);
 
+        let result = paimon_table_new_postpone_fixed_bucket_write_builder(ptr::null());
+        assert!(!result.error.is_null());
+        assert!(result.write_builder.is_null());
+        paimon_error_free(result.error);
+
         let result = paimon_write_builder_new_write(ptr::null());
+        assert!(!result.error.is_null());
+        assert!(result.write.is_null());
+        paimon_error_free(result.error);
+
+        let result = paimon_postpone_fixed_bucket_write_builder_new_write(ptr::null());
         assert!(!result.error.is_null());
         assert!(result.write.is_null());
         paimon_error_free(result.error);
@@ -1731,8 +2083,29 @@ fn test_null_pointer_handling() {
         assert!(result.commit.is_null());
         paimon_error_free(result.error);
 
+        let result = paimon_postpone_fixed_bucket_write_builder_new_commit(ptr::null());
+        assert!(!result.error.is_null());
+        assert!(result.commit.is_null());
+        paimon_error_free(result.error);
+
+        let err = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        assert!(!err.is_null());
+        paimon_error_free(err);
+
         let err =
             paimon_table_write_write_arrow_batch(ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        assert!(!err.is_null());
+        paimon_error_free(err);
+
+        let err = paimon_postpone_fixed_bucket_table_write_write_arrow_batch(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
         assert!(!err.is_null());
         paimon_error_free(err);
 
@@ -1741,7 +2114,16 @@ fn test_null_pointer_handling() {
         assert!(result.messages.is_null());
         paimon_error_free(result.error);
 
+        let result = paimon_postpone_fixed_bucket_table_write_prepare_commit(ptr::null_mut());
+        assert!(!result.error.is_null());
+        assert!(result.messages.is_null());
+        paimon_error_free(result.error);
+
         let err = paimon_table_commit_commit(ptr::null(), ptr::null_mut());
+        assert!(!err.is_null());
+        paimon_error_free(err);
+
+        let err = paimon_postpone_fixed_bucket_table_commit_commit(ptr::null(), ptr::null_mut());
         assert!(!err.is_null());
         paimon_error_free(err);
 
@@ -1749,6 +2131,10 @@ fn test_null_pointer_handling() {
         paimon_table_write_free(ptr::null_mut());
         paimon_table_commit_free(ptr::null_mut());
         paimon_commit_messages_free(ptr::null_mut());
+        paimon_postpone_fixed_bucket_write_builder_free(ptr::null_mut());
+        paimon_postpone_fixed_bucket_table_write_free(ptr::null_mut());
+        paimon_postpone_fixed_bucket_table_commit_free(ptr::null_mut());
+        paimon_postpone_fixed_bucket_commit_messages_free(ptr::null_mut());
     }
 }
 

@@ -206,6 +206,9 @@ impl CopyOnWriteMergeWriter {
     /// Rewrite affected files and produce CommitMessages.
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
+        // A copy-on-write rewrite reads the rows it replaces.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+
         if self.affected_files.is_empty() {
             return Ok(Vec::new());
         }
@@ -573,6 +576,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         let table = Table::new(

@@ -548,17 +548,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_rest_catalog_builds_local_cache_from_client_options() {
-        let cache = tempfile::tempdir().unwrap();
         let mut options = Options::new();
         options.set(CatalogOptions::URI, "http://localhost:1");
         options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
         options.set("token.provider", "bear");
         options.set("token", "test-token");
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(
-            CatalogOptions::LOCAL_CACHE_DIR,
-            cache.path().to_string_lossy(),
-        );
 
         let catalog = RESTCatalog::new(options, false).await.unwrap();
 

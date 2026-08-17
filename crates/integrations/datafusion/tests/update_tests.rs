@@ -507,14 +507,14 @@ async fn test_update_rejects_primary_key_table_without_data_evolution() {
 }
 
 #[tokio::test]
-async fn test_update_rejects_primary_key_table_with_data_evolution() {
+async fn test_rejects_primary_key_data_evolution_table_at_create() {
     let (tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;
     sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .unwrap();
-    sql_context
+    let error = sql_context
         .sql(
             "CREATE TABLE paimon.test_db.pk_de_t (\
                 id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)\
@@ -525,14 +525,10 @@ async fn test_update_rejects_primary_key_table_with_data_evolution() {
             )",
         )
         .await
-        .unwrap();
-
-    assert_sql_error(
-        &sql_context,
-        "UPDATE paimon.test_db.pk_de_t SET name = 'x' WHERE id = 1",
-        "does not support primary keys",
-    )
-    .await;
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Cannot define primary-key for row tracking table"));
     drop(tmp);
 }
 

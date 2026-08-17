@@ -67,6 +67,7 @@ async fn setup_data_evolution_shredded_variant_table_with_rows() -> (tempfile::T
         ) WITH (
             'file.format' = 'parquet',
             'data-evolution.enabled' = 'true',
+            'row-tracking.enabled' = 'true',
             'variant.shreddingSchema' =
                 '{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"age","type":"INT"},{"name":"city","type":"STRING"}]}}]}'
         )

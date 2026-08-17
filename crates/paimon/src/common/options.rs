@@ -76,10 +76,10 @@ impl CatalogOptions {
     /// Whether to enable local block caching for file reads.
     pub const LOCAL_CACHE_ENABLED: &'static str = "local-cache.enabled";
 
-    /// Directory for the local disk block cache.
+    /// Directory for the local disk block cache. If unset, an in-memory cache is used.
     pub const LOCAL_CACHE_DIR: &'static str = "local-cache.dir";
 
-    /// Maximum total encoded size of the local block cache.
+    /// Maximum total size of the local block cache.
     pub const LOCAL_CACHE_MAX_SIZE: &'static str = "local-cache.max-size";
 
     /// Block size used by the local cache.
@@ -175,6 +175,40 @@ impl From<HashMap<String, String>> for Options {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ParseMemorySizeError {
+    Invalid,
+    Overflow,
+}
+
+/// Parses Java Paimon memory sizes, plus the binary unit aliases previously
+/// accepted by the Rust local cache.
+pub(crate) fn parse_memory_size(value: &str) -> Result<i64, ParseMemorySizeError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ParseMemorySizeError::Invalid);
+    }
+
+    let pos = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(pos);
+    let number = number
+        .parse::<i64>()
+        .map_err(|_| ParseMemorySizeError::Invalid)?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" | "bytes" => 1,
+        "k" | "kb" | "kib" | "kibibytes" => 1024,
+        "m" | "mb" | "mib" | "mebibytes" => 1024 * 1024,
+        "g" | "gb" | "gib" | "gibibytes" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" | "tebibytes" => 1024_i64.pow(4),
+        _ => return Err(ParseMemorySizeError::Invalid),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or(ParseMemorySizeError::Overflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +276,25 @@ mod tests {
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_WHITELIST,
             "local-cache.whitelist"
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_size_supports_java_and_rust_units() {
+        for unit in ["k", "kb", "kib", "kibibytes"] {
+            assert_eq!(parse_memory_size(&format!("2 {unit}")), Ok(2 * 1024));
+        }
+        assert_eq!(parse_memory_size("2 bytes"), Ok(2));
+        assert_eq!(parse_memory_size("2 MiB"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_memory_size("2 gib"), Ok(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_size("2 TiB"), Ok(2 * 1024_i64.pow(4)));
+        assert_eq!(
+            parse_memory_size("2 unknown"),
+            Err(ParseMemorySizeError::Invalid)
+        );
+        assert_eq!(
+            parse_memory_size("9223372036854775807 tb"),
+            Err(ParseMemorySizeError::Overflow)
         );
     }
 }

@@ -69,6 +69,7 @@ const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
 const FIELDS_PREFIX: &str = "fields";
 const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
 pub(crate) const PATH_OPTION: &str = "path";
@@ -971,6 +972,14 @@ impl<'a> CoreOptions<'a> {
     pub fn row_tracking_enabled(&self) -> bool {
         self.options
             .get(ROW_TRACKING_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether incremental clustering is enabled. Default is false.
+    pub fn clustering_incremental_enabled(&self) -> bool {
+        self.options
+            .get(CLUSTERING_INCREMENTAL_OPTION)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
@@ -1901,6 +1910,10 @@ mod tests {
                 Some(3 * multiplier),
                 "unit '{unit}' should parse case-insensitively with a space"
             );
+        }
+
+        for unit in ["kib", "mib", "gib", "tib"] {
+            assert_eq!(parse_memory_size(&format!("3{unit}")), None);
         }
     }
 

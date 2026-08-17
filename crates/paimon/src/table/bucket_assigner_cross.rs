@@ -71,6 +71,9 @@ impl GlobalPartitionIndex {
         target_bucket_row_number: i64,
         merge_engine: MergeEngine,
     ) -> Result<Self> {
+        // The cross-partition index reads every primary key.
+        crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+
         let mut key_to_location: HashMap<Vec<u8>, (Vec<u8>, i32)> = HashMap::new();
         let mut bucket_row_counts: HashMap<(Vec<u8>, i32), i64> = HashMap::new();
 

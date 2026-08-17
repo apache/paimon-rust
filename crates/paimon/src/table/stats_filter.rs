@@ -571,29 +571,39 @@ fn data_evolution_predicate_must_match(
 
 /// Groups data files by overlapping `row_id_range` for data evolution.
 ///
-/// Files are sorted by `(first_row_id, -max_sequence_number)`. Files whose row ID ranges
-/// overlap are merged into the same group (they contain different columns for the same rows).
-/// Files without `first_row_id` become their own group.
+/// Groups are sorted by row ID range. Files whose row ID ranges overlap are merged into
+/// the same group while preserving their input order. Files without `first_row_id` become
+/// their own group.
 ///
-/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/splitread/DataEvolutionSplitGenerator.java)
-pub(crate) fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
-    files.sort_by(|a, b| {
-        let a_row_id = a.first_row_id.unwrap_or(i64::MIN);
-        let b_row_id = b.first_row_id.unwrap_or(i64::MIN);
-        a_row_id
-            .cmp(&b_row_id)
-            .then_with(|| b.max_sequence_number.cmp(&a.max_sequence_number))
+/// Reference: [DataEvolutionSplitGenerator](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/DataEvolutionSplitGenerator.java)
+pub(crate) fn group_by_overlapping_row_id(files: Vec<DataFileMeta>) -> Vec<Vec<DataFileMeta>> {
+    let mut indexed_files: Vec<(usize, DataFileMeta)> = files.into_iter().enumerate().collect();
+    indexed_files.sort_by(|(a_index, a), (b_index, b)| {
+        match (a.row_id_range(), b.row_id_range()) {
+            (None, None) => a_index.cmp(b_index),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some((a_start, a_end)), Some((b_start, b_end))) => a_start
+                .cmp(&b_start)
+                .then_with(|| a_end.cmp(&b_end))
+                .then_with(|| a_index.cmp(b_index)),
+        }
     });
 
     let mut result: Vec<Vec<DataFileMeta>> = Vec::new();
-    let mut current_group: Vec<DataFileMeta> = Vec::new();
+    let mut current_group: Vec<(usize, DataFileMeta)> = Vec::new();
     let mut current_range_end: i64 = i64::MIN;
 
-    for file in files {
+    let restore_input_order = |mut group: Vec<(usize, DataFileMeta)>| {
+        group.sort_by_key(|(index, _)| *index);
+        group.into_iter().map(|(_, file)| file).collect()
+    };
+
+    for (index, file) in indexed_files {
         match file.row_id_range() {
             None => {
                 if !current_group.is_empty() {
-                    result.push(std::mem::take(&mut current_group));
+                    result.push(restore_input_order(std::mem::take(&mut current_group)));
                     current_range_end = i64::MIN;
                 }
                 result.push(vec![file]);
@@ -603,17 +613,17 @@ pub(crate) fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<V
                     if end > current_range_end {
                         current_range_end = end;
                     }
-                    current_group.push(file);
+                    current_group.push((index, file));
                 } else {
-                    result.push(std::mem::take(&mut current_group));
+                    result.push(restore_input_order(std::mem::take(&mut current_group)));
                     current_range_end = end;
-                    current_group.push(file);
+                    current_group.push((index, file));
                 }
             }
         }
     }
     if !current_group.is_empty() {
-        result.push(current_group);
+        result.push(restore_input_order(current_group));
     }
     result
 }
