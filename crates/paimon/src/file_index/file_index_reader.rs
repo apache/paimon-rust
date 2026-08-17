@@ -15,13 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod file_index_format;
-// Keep the predicate foundation crate-private until a concrete reader validates its contract.
-#[allow(dead_code)]
-pub(crate) mod file_index_predicate;
-#[allow(dead_code)]
-pub(crate) mod file_index_reader;
-#[allow(dead_code)]
-pub(crate) mod file_index_result;
+use crate::file_index::file_index_result::FileIndexResult;
+use crate::spec::{DataType, Datum, PredicateOperator};
 
-pub use file_index_format::*;
+/// Evaluates leaf predicates against one concrete file index.
+pub(crate) trait FileIndexReader {
+    /// Evaluates the fields carried by [`crate::spec::Predicate::Leaf`].
+    ///
+    /// Readers must return [`FileIndexResult::Remain`] for unsupported operators.
+    fn evaluate(
+        &self,
+        _column: &str,
+        _index: usize,
+        _data_type: &DataType,
+        _operator: PredicateOperator,
+        _literals: &[Datum],
+    ) -> FileIndexResult {
+        FileIndexResult::Remain
+    }
+}
