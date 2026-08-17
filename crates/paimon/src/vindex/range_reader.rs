@@ -225,7 +225,6 @@ impl VindexFileReader {
     }
 
     fn fetch_range_batch(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
-        debug_assert!(ranges.len() <= self.max_range_read_concurrency);
         let reader = Arc::clone(&self.reader);
         let permits = Arc::clone(&self.permits);
         let path = self.path.clone();
@@ -350,25 +349,23 @@ impl VindexFileReader {
                 .read_many_merged_ranges
                 .fetch_add(merged.len() as u64, Ordering::Relaxed);
         }
-        for batch in merged.chunks(self.max_range_read_concurrency) {
-            if let Some(stats) = &self.stats {
-                stats.read_many_chunks.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .read_many_chunk_sizes
-                    .lock()
-                    .unwrap()
-                    .push(batch.len());
-            }
-            let ranges: Vec<_> = batch.iter().map(|merged| merged.range.clone()).collect();
-            let fetched = self.fetch_range_batch(&ranges)?;
-            for (merged_range, data) in batch.iter().zip(fetched) {
-                for &request_index in &merged_range.request_indices {
-                    let request = &mut requests[request_index];
-                    let start = (request.pos - merged_range.range.start) as usize;
-                    request
-                        .buf
-                        .copy_from_slice(&data[start..start + request.buf.len()]);
-                }
+        if let Some(stats) = &self.stats {
+            stats.read_many_chunks.fetch_add(1, Ordering::Relaxed);
+            stats
+                .read_many_chunk_sizes
+                .lock()
+                .unwrap()
+                .push(merged.len());
+        }
+        let ranges: Vec<_> = merged.iter().map(|merged| merged.range.clone()).collect();
+        let fetched = self.fetch_range_batch(&ranges)?;
+        for (merged_range, data) in merged.iter().zip(fetched) {
+            for &request_index in &merged_range.request_indices {
+                let request = &mut requests[request_index];
+                let start = (request.pos - merged_range.range.start) as usize;
+                request
+                    .buf
+                    .copy_from_slice(&data[start..start + request.buf.len()]);
             }
         }
         Ok(())
@@ -421,7 +418,7 @@ impl SeekRead for VindexFileReader {
 
     fn read_capabilities(&self) -> SeekReadCapabilities {
         // `max_ranges_per_pread` is a planning hint, not an I/O concurrency limit.
-        // This adapter accepts any number of ranges and chunks them internally.
+        // This adapter accepts any number of ranges and limits concurrent I/O with permits.
         SeekReadCapabilities::default()
     }
 }
@@ -947,10 +944,62 @@ mod tests {
                 snapshot.read_many_chunks,
                 snapshot.read_many_chunk_sizes,
             ),
-            (65, 65, 65, 65, 0, 64, 65, 2, vec![64, 1])
+            (65, 65, 65, 65, 0, 64, 65, 1, vec![65])
         );
         assert!(snapshot.io_wait_nanos > 0);
         assert!(snapshot.range_permit_wait_nanos > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn range_reads_refill_before_slowest_batch_member_finishes() {
+        let concurrency = 2;
+        let range_count = 3;
+        let stride = RANGE_COALESCE_GAP + 2;
+        let data = Bytes::from(vec![8u8; range_count * stride as usize]);
+        let tracking = Arc::new(ConcurrencyTrackingRead {
+            data: data.clone(),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let source: Arc<dyn FileRead> = tracking.clone();
+        let mut reader = VindexFileReader::new_with_permits(
+            source,
+            tokio::runtime::Handle::current(),
+            permits,
+            concurrency,
+            data.len() as u64,
+            "index".to_string(),
+        );
+
+        let read = tokio::task::spawn_blocking(move || {
+            let mut buffers = vec![[0u8; 1]; range_count];
+            let mut requests = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(index, buffer)| ReadRequest::new(index as u64 * stride, buffer))
+                .collect::<Vec<_>>();
+            reader.pread(&mut requests).unwrap();
+        });
+
+        tracking
+            .started
+            .acquire_many(concurrency as u32)
+            .await
+            .unwrap()
+            .forget();
+        tracking.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), tracking.started.acquire())
+            .await
+            .expect("next range did not refill while another range was still running")
+            .unwrap()
+            .forget();
+        tracking.release.add_permits(concurrency);
+        read.await.unwrap();
+
+        assert_eq!(tracking.max_active.load(Ordering::SeqCst), concurrency);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
