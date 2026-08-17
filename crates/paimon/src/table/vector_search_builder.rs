@@ -1650,10 +1650,12 @@ async fn evaluate_batch_vector_search(
                     let input = input?;
                     let query_count = vector_searches.len();
                     let mut file_reader_open = Duration::ZERO;
+                    let mut full_file_read = None;
                     let io_meta =
                         GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
                     let results = match backend {
                         VectorIndexBackend::Lumina => {
+                            let read_start = timing_enabled.then(Instant::now);
                             let data = input.read().await.map_err(|e| {
                                 crate::Error::DataInvalid {
                                     message: format!(
@@ -1665,6 +1667,9 @@ async fn evaluate_batch_vector_search(
                                     source: None,
                                 }
                             })?;
+                            if let Some(start) = read_start {
+                                full_file_read = Some((start.elapsed(), data.len()));
+                            }
                             execute_global_index_with_guard(
                                 "Lumina global-index batch search task failed",
                                 permit,
@@ -1716,7 +1721,7 @@ async fn evaluate_batch_vector_search(
                                         let stats = stats.snapshot();
                                         log::debug!(
                                             target: "paimon::vector_search",
-                                            "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={}",
+                                            "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3}",
                                             file_name,
                                             query_count,
                                             stats.logical_ranges,
@@ -1724,11 +1729,14 @@ async fn evaluate_batch_vector_search(
                                             stats.file_read_calls,
                                             stats.returned_bytes,
                                             stats.read_ahead_hits,
+                                            stats.io_wait_nanos as f64 / 1_000_000.0,
+                                            stats.range_permit_wait_nanos as f64 / 1_000_000.0,
                                         );
                                     }
                                     results
                                 }
                                 Err(_) if query_count > 1 => {
+                                    let read_start = timing_enabled.then(Instant::now);
                                     let data = input.read().await.map_err(|e| {
                                         crate::Error::DataInvalid {
                                             message: format!(
@@ -1738,12 +1746,15 @@ async fn evaluate_batch_vector_search(
                                             source: None,
                                         }
                                     })?;
+                                    if let Some(start) = read_start {
+                                        full_file_read = Some((start.elapsed(), data.len()));
+                                    }
                                     execute_vindex_searches(
                                         io_meta,
                                         options,
                                         vector_searches,
                                         Cursor::new(data),
-                                        file_name,
+                                        file_name.clone(),
                                         batch_index_parallelism,
                                         permit,
                                     )
@@ -1760,6 +1771,18 @@ async fn evaluate_batch_vector_search(
                             }
                         }
                     };
+                    if let Some((read, returned_bytes)) = full_file_read {
+                        log::debug!(
+                            target: "paimon::vector_search",
+                            "event=paimon_vector_full_file_io backend={} file={} nq={} requested_bytes={} returned_bytes={} read_ms={:.3}",
+                            backend.error_name(),
+                            file_name,
+                            query_count,
+                            file_size,
+                            returned_bytes,
+                            read.as_secs_f64() * 1000.0,
+                        );
+                    }
                     if results.len() != query_count {
                         return Err(crate::Error::DataInvalid {
                             message: format!(

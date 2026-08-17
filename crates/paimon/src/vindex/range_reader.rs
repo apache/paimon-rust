@@ -24,6 +24,7 @@ use std::io;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 const SCALAR_READ_MAX: usize = 64;
 const SCALAR_READ_AHEAD: u64 = 64 * 1024;
@@ -63,6 +64,8 @@ pub(crate) struct RangeIoStats {
     file_read_calls: AtomicU64,
     returned_bytes: AtomicU64,
     read_ahead_hits: AtomicU64,
+    io_wait_nanos: AtomicU64,
+    range_permit_wait_nanos: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +75,8 @@ pub(crate) struct RangeIoStatsSnapshot {
     pub(crate) file_read_calls: u64,
     pub(crate) returned_bytes: u64,
     pub(crate) read_ahead_hits: u64,
+    pub(crate) io_wait_nanos: u64,
+    pub(crate) range_permit_wait_nanos: u64,
 }
 
 impl RangeIoStats {
@@ -82,6 +87,8 @@ impl RangeIoStats {
             file_read_calls: self.file_read_calls.load(Ordering::Relaxed),
             returned_bytes: self.returned_bytes.load(Ordering::Relaxed),
             read_ahead_hits: self.read_ahead_hits.load(Ordering::Relaxed),
+            io_wait_nanos: self.io_wait_nanos.load(Ordering::Relaxed),
+            range_permit_wait_nanos: self.range_permit_wait_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -206,6 +213,7 @@ impl VindexFileReader {
         let requested = ranges.to_vec();
         let stats = self.stats.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let wait_start = self.stats.as_ref().map(|_| Instant::now());
         self.runtime.spawn(async move {
             let fetched = try_join_all(requested.iter().cloned().map(|range| {
                 let reader = Arc::clone(&reader);
@@ -213,7 +221,14 @@ impl VindexFileReader {
                 let path = path.clone();
                 let stats = stats.clone();
                 async move {
-                    let _permit = permits.acquire_owned().await.map_err(|_| {
+                    let permit_wait_start = stats.as_ref().map(|_| Instant::now());
+                    let permit = permits.acquire_owned().await;
+                    if let (Some(stats), Some(start)) = (&stats, permit_wait_start) {
+                        stats
+                            .range_permit_wait_nanos
+                            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    let _permit = permit.map_err(|_| {
                         io::Error::other("vindex range read concurrency limiter closed")
                     })?;
                     let expected = (range.end - range.start) as usize;
@@ -248,7 +263,13 @@ impl VindexFileReader {
             .await;
             let _ = sender.send(fetched);
         });
-        receiver.recv().map_err(|_| {
+        let result = receiver.recv();
+        if let (Some(stats), Some(start)) = (&self.stats, wait_start) {
+            stats
+                .io_wait_nanos
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        result.map_err(|_| {
             io::Error::other(format!(
                 "vindex range read task for '{}' was cancelled",
                 self.path
@@ -685,16 +706,18 @@ mod tests {
         .await
         .unwrap();
 
+        let stats = stats.snapshot();
         assert_eq!(
-            stats.snapshot(),
-            RangeIoStatsSnapshot {
-                logical_ranges: 2,
-                requested_bytes: 256,
-                file_read_calls: 2,
-                returned_bytes: 256,
-                read_ahead_hits: 0,
-            }
+            (
+                stats.logical_ranges,
+                stats.requested_bytes,
+                stats.file_read_calls,
+                stats.returned_bytes,
+                stats.read_ahead_hits,
+            ),
+            (2, 256, 2, 256, 0)
         );
+        assert!(stats.io_wait_nanos > 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -741,7 +764,7 @@ mod tests {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
         });
-        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
         let make_reader = |path: &str| {
             let source: Arc<dyn FileRead> = tracking.clone();
             VindexFileReader::new_with_permits(
@@ -754,6 +777,9 @@ mod tests {
         };
         let mut first_reader = make_reader("first.index");
         let mut second_reader = make_reader("second.index");
+        let stats = Arc::new(RangeIoStats::default());
+        first_reader.stats = Some(Arc::clone(&stats));
+        second_reader.stats = Some(Arc::clone(&stats));
         assert!(Arc::ptr_eq(&first_reader.permits, &second_reader.permits));
 
         let first = tokio::task::spawn_blocking(move || {
@@ -768,10 +794,15 @@ mod tests {
                 .pread(&mut [ReadRequest::new(128, &mut output)])
                 .unwrap();
         });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        permits.add_permits(1);
         first.await.unwrap();
         second.await.unwrap();
 
         assert_eq!(tracking.max_active.load(Ordering::SeqCst), 1);
+        let stats = stats.snapshot();
+        assert!(stats.range_permit_wait_nanos > 0);
+        assert!(stats.io_wait_nanos >= stats.range_permit_wait_nanos);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

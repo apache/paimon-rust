@@ -191,8 +191,10 @@ impl VindexVectorGlobalIndexReader {
         vector_search: &VectorSearch,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<Option<HashMap<u64, f32>>> {
-        self.ensure_loaded(stream_fn, |_| Ok(()))?;
-        self.search(vector_search)
+        Ok(self
+            .visit_batch_vector_search(std::slice::from_ref(vector_search), stream_fn)?
+            .pop()
+            .expect("single vector search result"))
     }
 
     pub fn visit_batch_vector_search<S: SeekRead + 'static>(
@@ -308,6 +310,7 @@ impl VindexVectorGlobalIndexReader {
         Ok(results)
     }
 
+    #[cfg(test)]
     fn search(&mut self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
         let reader = self
             .reader
@@ -390,6 +393,7 @@ impl VindexVectorGlobalIndexReader {
     }
 }
 
+#[cfg(test)]
 fn search_vindex(
     reader: &mut VIndexReader<impl SeekRead>,
     metadata: &VectorIndexMetadata,
