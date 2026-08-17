@@ -1256,7 +1256,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 if let Some(total_start) = total_start {
                     let total = total_start.elapsed();
                     let unattributed = total.saturating_sub(setup.saturating_add(snapshot));
-                    eprintln!(
+                    log::debug!(
+                        target: "paimon::vector_search",
                         "event=paimon_vector_search_api nq={} index_entries=0 result_count=0 total_ms={:.3} setup_ms={:.3} snapshot_ms={:.3} manifest_ms=0.000 evaluate_ms=0.000 unattributed_ms={:.3}",
                         vector_searches.len(),
                         total.as_secs_f64() * 1000.0,
@@ -1305,7 +1306,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 .iter()
                 .map(|result| result.row_ids.len())
                 .sum::<usize>();
-            eprintln!(
+            log::debug!(
+                target: "paimon::vector_search",
                 "event=paimon_vector_search_api nq={} index_entries={} result_count={} total_ms={:.3} setup_ms={:.3} snapshot_ms={:.3} manifest_ms={:.3} evaluate_ms={:.3} unattributed_ms={:.3}",
                 vector_searches.len(),
                 index_entries.len(),
@@ -1712,7 +1714,8 @@ async fn evaluate_batch_vector_search(
                                     .await?;
                                     if let Some(stats) = range_io_stats {
                                         let stats = stats.snapshot();
-                                        eprintln!(
+                                        log::debug!(
+                                            target: "paimon::vector_search",
                                             "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={}",
                                             file_name,
                                             query_count,
@@ -1840,7 +1843,7 @@ async fn evaluate_batch_vector_search(
                 source: None,
             })?;
             let metric_start = timing_enabled.then(Instant::now);
-            let (metric, metric_bytes) = resolve_raw_vector_metric(
+            let metric = resolve_raw_vector_metric(
                 evaluation.file_io,
                 table_path,
                 evaluation.table_options,
@@ -1853,12 +1856,12 @@ async fn evaluate_batch_vector_search(
             let (raw_results, raw_timing) =
                 read_raw_batch_vector_search(table, vector_searches, &raw_ranges, metric).await?;
             if let Some(raw_timing) = raw_timing {
-                eprintln!(
-                    "event=paimon_vector_raw_fallback nq={} row_ranges={} metric_resolve_ms={:.3} metric_index_bytes={} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_raw_read_ms={:.3}",
+                log::debug!(
+                    target: "paimon::vector_search",
+                    "event=paimon_vector_raw_fallback nq={} row_ranges={} metric_resolve_ms={:.3} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_raw_read_ms={:.3}",
                     vector_searches.len(),
                     raw_ranges.len(),
                     metric_resolve.as_secs_f64() * 1000.0,
-                    metric_bytes,
                     raw_timing.plan.as_secs_f64() * 1000.0,
                     raw_timing.split_count,
                     raw_timing.file_count,
@@ -1899,8 +1902,9 @@ async fn evaluate_batch_vector_search(
             .iter()
             .map(|result| result.row_ids.len())
             .sum::<usize>();
-        eprintln!(
-            "event=paimon_vector_search_evaluate nq={} index_entries={} index_files={} result_count={} refine_factor={} total_ms={:.3} deletion_vector_ms={:.3} index_search_ms={:.3} global_permit_wait_ms={:.3} file_reader_open_ms={:.3} merge_ms={:.3} refine_ms={:.3} raw_fallback_ms={:.3} finalize_ms={:.3} unattributed_ms={:.3}",
+        log::debug!(
+            target: "paimon::vector_search",
+            "event=paimon_vector_search_evaluate nq={} index_entries={} index_files={} result_count={} refine_factor={} total_ms={:.3} deletion_vector_ms={:.3} index_search_ms={:.3} global_permit_wait_sum_ms={:.3} file_reader_open_sum_ms={:.3} merge_ms={:.3} refine_ms={:.3} raw_fallback_ms={:.3} finalize_ms={:.3} unattributed_ms={:.3}",
             vector_searches.len(),
             index_entries.len(),
             vector_entry_count,
@@ -2504,7 +2508,7 @@ async fn maybe_rerank_indexed_batch_results(
     let unique_candidates = union_candidates.len();
     let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
     let metric_start = timing_enabled.then(Instant::now);
-    let (metric, metric_index_bytes) = resolve_raw_vector_metric(
+    let metric = resolve_raw_vector_metric(
         evaluation.file_io,
         evaluation.table_path.trim_end_matches('/'),
         evaluation.table_options,
@@ -2518,14 +2522,14 @@ async fn maybe_rerank_indexed_batch_results(
     let (results, raw_timing) =
         read_raw_batch_vector_search(table, &candidate_searches, &raw_ranges, metric).await?;
     if let (Some(total_start), Some(raw_timing)) = (total_start, raw_timing) {
-        eprintln!(
-            "event=paimon_vector_refine nq={} candidate_references={} unique_candidates={} row_ranges={} metric_resolve_ms={:.3} metric_index_bytes={} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_refine_ms={:.3}",
+        log::debug!(
+            target: "paimon::vector_search",
+            "event=paimon_vector_refine nq={} candidate_references={} unique_candidates={} row_ranges={} metric_resolve_ms={:.3} raw_plan_ms={:.3} split_count={} file_count={} raw_stream_wait_ms={:.3} raw_score_cpu_ms={:.3} arrow_batches={} arrow_rows={} total_refine_ms={:.3}",
             vector_searches.len(),
             candidate_references,
             unique_candidates,
             raw_ranges.len(),
             metric_resolve.as_secs_f64() * 1000.0,
-            metric_index_bytes,
             raw_timing.plan.as_secs_f64() * 1000.0,
             raw_timing.split_count,
             raw_timing.file_count,
@@ -2716,7 +2720,7 @@ async fn resolve_raw_vector_metric(
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
-) -> crate::Result<(RawVectorMetric, usize)> {
+) -> crate::Result<RawVectorMetric> {
     for entry in index_entries {
         if entry.kind != FileKind::Add {
             continue;
@@ -2736,7 +2740,7 @@ async fn resolve_raw_vector_metric(
                 if let Some(index_meta) = global_meta.index_meta.as_ref() {
                     if !index_meta.is_empty() {
                         let metric = LuminaIndexMeta::deserialize(index_meta)?.metric()?;
-                        return Ok((RawVectorMetric::from_lumina(metric), 0));
+                        return Ok(RawVectorMetric::from_lumina(metric));
                     }
                 }
             }
@@ -2749,7 +2753,7 @@ async fn resolve_raw_vector_metric(
                             if let Some(metric) =
                                 RawVectorMetric::parse_normalized(&normalize_metric(metric))
                             {
-                                return Ok((metric, 0));
+                                return Ok(metric);
                             }
                         }
                     }
@@ -2775,7 +2779,6 @@ async fn resolve_raw_vector_metric(
                 };
                 let file_reader = input.reader().await.map_err(&read_error)?;
                 let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-                let index_bytes = bytes.len();
                 let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| {
                     crate::Error::DataInvalid {
                         message: format!(
@@ -2785,15 +2788,12 @@ async fn resolve_raw_vector_metric(
                         source: Some(Box::new(e)),
                     }
                 })?;
-                return Ok((
-                    RawVectorMetric::from_vindex(reader.metadata().metric),
-                    index_bytes,
-                ));
+                return Ok(RawVectorMetric::from_vindex(reader.metadata().metric));
             }
         }
     }
 
-    Ok((configured_raw_vector_metric(table_options, field_name)?, 0))
+    configured_raw_vector_metric(table_options, field_name)
 }
 
 fn configured_raw_vector_metric(
@@ -3486,7 +3486,7 @@ mod tests {
             .unwrap()
             .index_meta = Some(index_meta);
 
-        let (metric, index_bytes) = resolve_raw_vector_metric(
+        let metric = resolve_raw_vector_metric(
             &file_io,
             "memory:///test_table",
             &HashMap::new(),
@@ -3498,7 +3498,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(metric, RawVectorMetric::Cosine);
-        assert_eq!(index_bytes, 0);
     }
 
     #[tokio::test]
@@ -3525,7 +3524,7 @@ mod tests {
                 .unwrap()
                 .index_meta = Some(index_meta);
 
-            let (metric, index_bytes) = resolve_raw_vector_metric(
+            let metric = resolve_raw_vector_metric(
                 &file_io,
                 "memory:///test_table",
                 &HashMap::new(),
@@ -3537,7 +3536,6 @@ mod tests {
             .unwrap();
 
             assert_eq!(metric, RawVectorMetric::InnerProduct);
-            assert!(index_bytes > 0);
         }
     }
 

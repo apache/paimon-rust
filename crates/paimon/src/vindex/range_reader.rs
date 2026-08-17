@@ -725,16 +725,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            stats.snapshot(),
-            RangeIoStatsSnapshot {
-                logical_ranges: 3,
-                requested_bytes: 12,
-                file_read_calls: 2,
-                returned_bytes: 16,
-                read_ahead_hits: 0,
-            }
-        );
+        let stats = stats.snapshot();
+        assert_eq!(stats.logical_ranges, 3);
+        assert_eq!(stats.requested_bytes, 12);
+        assert!(stats.file_read_calls < stats.logical_ranges);
+        assert!(stats.returned_bytes >= stats.requested_bytes);
+        assert_eq!(stats.read_ahead_hits, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

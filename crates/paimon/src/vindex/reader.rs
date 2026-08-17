@@ -224,9 +224,10 @@ impl VindexVectorGlobalIndexReader {
             let nprobe = self
                 .options
                 .get(NPROBE_PARAMETER)
-                .map(String::as_str)
-                .unwrap_or("16");
-            eprintln!(
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_NPROBE.to_string());
+            log::debug!(
+                target: "paimon::vector_search",
                 "event=paimon_vindex_reader file={} nq={} nprobe={} batch_index_parallelism={} memory_budget_bytes={} max_chunk_size={} native_chunk_count={} native_chunk_queries={} scalar_chunk_count={} total_ms={:.3} vindex_open_ms={:.3} metadata_ms={:.3} optimize_ms={:.3} native_search_wall_ms={:.3} unattributed_ms={:.3}",
                 self.io_meta.file_path,
                 vector_searches.len(),
