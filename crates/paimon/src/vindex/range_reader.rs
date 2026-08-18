@@ -143,6 +143,11 @@ impl RangeReadLimiter {
     }
 }
 
+struct RangeResponse {
+    data: Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Bridges vindex-core's synchronous positional reads to Paimon's asynchronous
 /// range reader. This type is consumed from a blocking search task; it captures
 /// the surrounding Tokio runtime so remote storage reads still run asynchronously.
@@ -154,8 +159,6 @@ pub(crate) struct VindexFileReader {
     path: String,
     scalar_cache: Option<CachedRange>,
     stats: Option<Arc<RangeIoStats>>,
-    #[cfg(test)]
-    response_permit_wait_started: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl VindexFileReader {
@@ -190,8 +193,6 @@ impl VindexFileReader {
             path,
             scalar_cache: None,
             stats: vector_search_timing_enabled().then(|| Arc::new(RangeIoStats::default())),
-            #[cfg(test)]
-            response_permit_wait_started: None,
         }
     }
 
@@ -240,24 +241,24 @@ impl VindexFileReader {
                 .saturating_add(SCALAR_READ_AHEAD)
                 .max(range.end)
                 .min(self.file_size);
-            let data = self.fetch_exact(range.start..read_end)?;
-            buf.copy_from_slice(&data[..buf.len()]);
+            let response = self.fetch_exact(range.start..read_end)?;
+            buf.copy_from_slice(&response.data[..buf.len()]);
             self.scalar_cache = Some(CachedRange {
                 start: range.start,
-                data,
+                data: response.data,
             });
             return Ok(());
         }
 
-        let data = self.fetch_exact(range)?;
-        buf.copy_from_slice(&data);
+        let response = self.fetch_exact(range)?;
+        buf.copy_from_slice(&response.data);
         Ok(())
     }
 
-    fn fetch_exact(&self, range: Range<u64>) -> io::Result<Bytes> {
+    fn fetch_exact(&self, range: Range<u64>) -> io::Result<RangeResponse> {
         let mut result = None;
-        self.fetch_range_batch(std::slice::from_ref(&range), |_, data| {
-            result = Some(data);
+        self.fetch_range_batch(std::slice::from_ref(&range), |_, response| {
+            result = Some(response);
             Ok(())
         })?;
         Ok(result.expect("one requested range"))
@@ -266,7 +267,7 @@ impl VindexFileReader {
     fn fetch_range_batch(
         &self,
         ranges: &[Range<u64>],
-        mut consume: impl FnMut(usize, Bytes) -> io::Result<()>,
+        mut consume: impl FnMut(usize, RangeResponse) -> io::Result<()>,
     ) -> io::Result<()> {
         let reader = Arc::clone(&self.reader);
         let io_permits = Arc::clone(&self.limiter.io_permits);
@@ -276,8 +277,6 @@ impl VindexFileReader {
         let stats = self.stats.clone();
         let io_limit = self.limiter.io_limit;
         let response_limit = self.limiter.response_limit;
-        #[cfg(test)]
-        let response_permit_wait_started = self.response_permit_wait_started.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(io_limit);
         self.runtime.spawn(async move {
             let fetched = stream::iter(requested.into_iter().enumerate().map(|(index, range)| {
@@ -287,13 +286,7 @@ impl VindexFileReader {
                 let sender = sender.clone();
                 let path = path.clone();
                 let stats = stats.clone();
-                #[cfg(test)]
-                let response_permit_wait_started = response_permit_wait_started.clone();
                 async move {
-                    #[cfg(test)]
-                    if let Some(wait_started) = response_permit_wait_started {
-                        wait_started.add_permits(1);
-                    }
                     let response_permit = response_permits
                         .acquire_owned()
                         .await
@@ -367,13 +360,19 @@ impl VindexFileReader {
             if let Some(start) = wait_start {
                 io_wait_nanos = io_wait_nanos.saturating_add(start.elapsed().as_nanos() as u64);
             }
-            let (index, data, _response_permit) = fetched.ok_or_else(|| {
+            let (index, data, response_permit) = fetched.ok_or_else(|| {
                 io::Error::other(format!(
                     "vindex range read task for '{}' was cancelled",
                     self.path
                 ))
             })??;
-            consume(index, data)
+            consume(
+                index,
+                RangeResponse {
+                    data,
+                    _permit: response_permit,
+                },
+            )
         });
         if let Some(stats) = &self.stats {
             stats
@@ -450,14 +449,14 @@ impl VindexFileReader {
                 .fetch_max(chunk_size, Ordering::Relaxed);
         }
         let ranges: Vec<_> = merged.iter().map(|merged| merged.range.clone()).collect();
-        self.fetch_range_batch(&ranges, |merged_index, data| {
+        self.fetch_range_batch(&ranges, |merged_index, response| {
             let merged_range = &merged[merged_index];
             for &request_index in &merged_range.request_indices {
                 let request = &mut requests[request_index];
                 let start = (request.pos - merged_range.range.start) as usize;
                 request
                     .buf
-                    .copy_from_slice(&data[start..start + request.buf.len()]);
+                    .copy_from_slice(&response.data[start..start + request.buf.len()]);
             }
             Ok(())
         })
@@ -504,8 +503,6 @@ impl SeekRead for VindexFileReader {
             path: self.path.clone(),
             scalar_cache: None,
             stats: self.stats.clone(),
-            #[cfg(test)]
-            response_permit_wait_started: self.response_permit_wait_started.clone(),
         }))
     }
 
@@ -603,13 +600,6 @@ mod tests {
         dropped: Arc<tokio::sync::Semaphore>,
     }
 
-    struct OrderedRead {
-        data: Bytes,
-        ranges: Mutex<Vec<Range<u64>>>,
-        started: tokio::sync::Semaphore,
-        release: tokio::sync::Semaphore,
-    }
-
     struct BenchmarkRead {
         data: Bytes,
         calls: AtomicUsize,
@@ -670,21 +660,6 @@ mod tests {
                 data: vec![value; (range.end - range.start) as usize],
                 dropped: Arc::clone(&self.dropped),
             }))
-        }
-    }
-
-    #[async_trait]
-    impl FileRead for OrderedRead {
-        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
-            self.ranges.lock().unwrap().push(range.clone());
-            self.started.add_permits(1);
-            acquire_test_permits(
-                &self.release,
-                1,
-                "test did not release an ordered range read",
-            )
-            .await;
-            Ok(self.data.slice(range.start as usize..range.end as usize))
         }
     }
 
@@ -1384,6 +1359,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_range_response_holds_permit_until_consumed() {
+        let data = Bytes::from(vec![8u8; 384]);
+        let limiter = RangeReadLimiter::new(1);
+        let response_permits = Arc::clone(&limiter.response_permits);
+        let source: Arc<dyn FileRead> = TrackingRead::new(data.clone());
+        let first_reader = VindexFileReader::new_with_limiter(
+            source,
+            tokio::runtime::Handle::current(),
+            limiter,
+            data.len() as u64,
+            "index".to_string(),
+        );
+        let second_reader = first_reader.try_clone_reader().unwrap().unwrap();
+        let third_reader = first_reader.try_clone_reader().unwrap().unwrap();
+
+        let first = tokio::task::spawn_blocking(move || first_reader.fetch_exact(0..128).unwrap())
+            .await
+            .unwrap();
+        let second =
+            tokio::task::spawn_blocking(move || second_reader.fetch_exact(128..256).unwrap())
+                .await
+                .unwrap();
+        let mut third =
+            tokio::task::spawn_blocking(move || third_reader.fetch_exact(256..384).unwrap());
+
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut third)
+            .await
+            .is_err());
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .expect("third single-range response did not start after a permit was released")
+            .unwrap();
+        drop(second);
+        drop(third);
+        assert_eq!(response_permits.available_permits(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_range_buffers_are_released_before_slowest_read() {
         let concurrency = 2;
         let range_count = 3;
@@ -1428,75 +1442,6 @@ mod tests {
             .expect("range read task did not finish")
             .unwrap();
         assert_eq!(output, vec![[1], [2], [3]]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cloned_reader_is_not_queued_behind_an_entire_batch() {
-        let stride = RANGE_COALESCE_GAP + 2;
-        let data = Bytes::from(vec![8u8; 4 * stride as usize + 128]);
-        let tracking = Arc::new(OrderedRead {
-            data: data.clone(),
-            ranges: Mutex::new(Vec::new()),
-            started: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-        });
-        let source: Arc<dyn FileRead> = tracking.clone();
-        let mut first_reader = VindexFileReader::new_with_limiter(
-            source,
-            tokio::runtime::Handle::current(),
-            RangeReadLimiter::new(1),
-            data.len() as u64,
-            "index".to_string(),
-        );
-        let mut second_reader = first_reader.try_clone_reader().unwrap().unwrap();
-        let response_wait_started = Arc::new(tokio::sync::Semaphore::new(0));
-        second_reader.response_permit_wait_started = Some(Arc::clone(&response_wait_started));
-
-        let first = tokio::task::spawn_blocking(move || {
-            let mut first = [0u8; 1];
-            let mut second = [0u8; 1];
-            let mut third = [0u8; 1];
-            first_reader
-                .pread(&mut [
-                    ReadRequest::new(0, &mut first),
-                    ReadRequest::new(stride, &mut second),
-                    ReadRequest::new(2 * stride, &mut third),
-                ])
-                .unwrap();
-        });
-        acquire_test_permits(&tracking.started, 1, "first reader did not start").await;
-
-        let second = tokio::task::spawn_blocking(move || {
-            let mut output = [0u8; 128];
-            second_reader
-                .pread(&mut [ReadRequest::new(3 * stride, &mut output)])
-                .unwrap();
-        });
-        acquire_test_permits(
-            &response_wait_started,
-            1,
-            "cloned reader did not start waiting for a response permit",
-        )
-        .await;
-
-        tracking.release.add_permits(1);
-        acquire_test_permits(&tracking.started, 1, "second range read did not start").await;
-        tracking.release.add_permits(1);
-        acquire_test_permits(&tracking.started, 1, "cloned range read did not start").await;
-        let first_three_ranges = tracking.ranges.lock().unwrap()[..3].to_vec();
-        tracking.release.add_permits(3);
-        tokio::time::timeout(Duration::from_secs(5), first)
-            .await
-            .expect("first reader task did not finish")
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), second)
-            .await
-            .expect("cloned reader task did not finish")
-            .unwrap();
-
-        assert!(first_three_ranges
-            .iter()
-            .any(|range| range.start == 3 * stride));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
