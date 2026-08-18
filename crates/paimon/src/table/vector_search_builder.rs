@@ -3478,20 +3478,20 @@ mod tests {
         let default_core = CoreOptions::new(&default_options);
         assert_eq!(
             vindex_concurrency_limits(&default_core, 1, 32).unwrap(),
-            (1, 32)
+            (1, 64)
         );
         assert_eq!(
             vindex_concurrency_limits(&default_core, 8, 4).unwrap(),
-            (4, 32)
+            (4, 64)
         );
 
         let options = HashMap::from([(
             "global-index.vindex.read-thread-num".to_string(),
-            "64".to_string(),
+            "48".to_string(),
         )]);
         let core = CoreOptions::new(&options);
-        assert_eq!(vindex_concurrency_limits(&core, 1, 32).unwrap(), (1, 64));
-        assert_eq!(vindex_concurrency_limits(&core, 8, 4).unwrap(), (4, 64));
+        assert_eq!(vindex_concurrency_limits(&core, 1, 32).unwrap(), (1, 48));
+        assert_eq!(vindex_concurrency_limits(&core, 8, 4).unwrap(), (4, 48));
     }
 
     fn make_field(id: i32, name: &str) -> DataField {
