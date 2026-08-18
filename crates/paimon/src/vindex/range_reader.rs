@@ -610,6 +610,16 @@ mod tests {
         release: tokio::sync::Semaphore,
     }
 
+    struct BenchmarkRead {
+        data: Bytes,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        fast_delay: Duration,
+        slow_every: usize,
+        slow_delay: Duration,
+    }
+
     #[async_trait]
     impl FileRead for RuntimeTrackingRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
@@ -688,6 +698,113 @@ mod tests {
             }
             Ok(self.data.slice(range.start as usize..end))
         }
+    }
+
+    #[async_trait]
+    impl FileRead for BenchmarkRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.max_active.fetch_max(active, Ordering::Relaxed);
+            let delay = if self.slow_every != 0 && call.is_multiple_of(self.slow_every) {
+                self.slow_delay
+            } else {
+                self.fast_delay
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    async fn run_range_read_benchmark(
+        case: &str,
+        range_count: usize,
+        iterations: usize,
+        fast_delay: Duration,
+        slow_every: usize,
+        slow_delay: Duration,
+    ) {
+        const RANGE_SIZE: usize = 4 * 1024;
+        let concurrency = DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM;
+        let stride = RANGE_COALESCE_GAP as usize + RANGE_SIZE + 1;
+        let source = Arc::new(BenchmarkRead {
+            data: Bytes::from(vec![7u8; range_count * stride]),
+            calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            fast_delay,
+            slow_every,
+            slow_delay,
+        });
+        let reader_source: Arc<dyn FileRead> = source.clone();
+        let mut reader = VindexFileReader::new_with_limiter(
+            reader_source,
+            tokio::runtime::Handle::current(),
+            RangeReadLimiter::new(concurrency),
+            source.data.len() as u64,
+            "benchmark-index".to_string(),
+        );
+        let task_source = source.clone();
+        let elapsed = tokio::task::spawn_blocking(move || {
+            let mut buffers = vec![[0u8; RANGE_SIZE]; range_count];
+            let mut run_iteration = || {
+                let mut requests = buffers
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, buffer)| {
+                        ReadRequest::new((index * stride) as u64, buffer.as_mut_slice())
+                    })
+                    .collect::<Vec<_>>();
+                reader.pread(&mut requests).unwrap();
+                std::hint::black_box(&buffers);
+            };
+
+            run_iteration();
+            task_source.calls.store(0, Ordering::Relaxed);
+            task_source.max_active.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                run_iteration();
+            }
+            start.elapsed()
+        })
+        .await
+        .unwrap();
+
+        let total_ranges = range_count * iterations;
+        let total_bytes = total_ranges * RANGE_SIZE;
+        let ranges_per_second = total_ranges as f64 / elapsed.as_secs_f64();
+        let mib_per_second = total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        let peak_in_flight = source.max_active.load(Ordering::Relaxed);
+        assert_eq!(source.calls.load(Ordering::Relaxed), total_ranges);
+        assert!(peak_in_flight <= concurrency);
+        eprintln!(
+            "vindex_range_read_benchmark case={case} profile={} concurrency={concurrency} range_bytes={RANGE_SIZE} ranges_per_iteration={range_count} iterations={iterations} elapsed_ms={:.3} ranges_per_second={ranges_per_second:.0} mib_per_second={mib_per_second:.2} peak_in_flight={peak_in_flight}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual performance comparison; run with --release --ignored --nocapture"]
+    async fn vindex_range_read_benchmark() {
+        run_range_read_benchmark("hot_cache", 1024, 50, Duration::ZERO, 0, Duration::ZERO).await;
+        run_range_read_benchmark(
+            "oss_straggler",
+            256,
+            10,
+            Duration::from_millis(1),
+            32,
+            Duration::from_millis(10),
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
