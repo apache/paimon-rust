@@ -134,7 +134,7 @@ const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-nu
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
-pub(crate) const DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM: usize = 32;
+pub(crate) const DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM: usize = 64;
 const MAX_GLOBAL_INDEX_RANGE_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
 const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     let tokio_max = (usize::MAX >> 3) as u64;
@@ -734,7 +734,7 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Maximum number of concurrent range reads shared by Vindex readers in one
-    /// search operation (key `global-index.vindex.read-thread-num`, default 32).
+    /// search operation (key `global-index.vindex.read-thread-num`, default 64).
     /// This is independent of [`Self::global_index_thread_num`].
     pub fn global_index_range_read_thread_num(&self) -> crate::Result<usize> {
         let value = self
@@ -1557,7 +1557,7 @@ mod tests {
         assert_eq!(core_options.global_index_thread_num().unwrap(), 32);
         assert_eq!(
             core_options.global_index_range_read_thread_num().unwrap(),
-            32
+            64
         );
         assert_eq!(
             core_options.sorted_index_records_per_range().unwrap(),
@@ -1809,7 +1809,7 @@ mod tests {
             CoreOptions::new(&HashMap::new())
                 .global_index_range_read_thread_num()
                 .unwrap(),
-            32
+            64
         );
 
         for value in [32, 64] {
