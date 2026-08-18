@@ -728,7 +728,7 @@ mod tests {
         slow_delay: Duration,
     ) {
         const RANGE_SIZE: usize = 4 * 1024;
-        let concurrency = DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM;
+        let concurrency = 64;
         let stride = RANGE_COALESCE_GAP as usize + RANGE_SIZE + 1;
         let source = Arc::new(BenchmarkRead {
             data: Bytes::from(vec![7u8; range_count * stride]),
@@ -801,7 +801,7 @@ mod tests {
             256,
             10,
             Duration::from_millis(1),
-            32,
+            64,
             Duration::from_millis(10),
         )
         .await;

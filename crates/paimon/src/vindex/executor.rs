@@ -240,7 +240,7 @@ fn max_physical_worker_count() -> usize {
 /// Shared global-index executor for synchronous search and range-I/O waits. It
 /// starts at the machine's available parallelism and grows lazily, but keeps the
 /// configured logical fan-out separate from a physical cap of four workers per
-/// CPU (and at least the default 64 I/O workers). Growth workers expire after the
+/// CPU (and at least 32 I/O workers). Growth workers expire after the
 /// same one-minute idle interval used by Java's `GlobalIndexReadThreadPool`.
 /// Smaller query limits are enforced by each query's bounded job scheduler.
 fn global_executor() -> &'static GlobalIndexExecutor {
