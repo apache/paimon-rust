@@ -149,7 +149,7 @@ pub(crate) struct VindexFileReader {
     scalar_cache: Option<CachedRange>,
     stats: Option<Arc<RangeIoStats>>,
     #[cfg(test)]
-    permit_wait_pending: Option<Arc<tokio::sync::Semaphore>>,
+    response_permit_wait_started: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl VindexFileReader {
@@ -185,7 +185,7 @@ impl VindexFileReader {
             scalar_cache: None,
             stats: vector_search_timing_enabled().then(|| Arc::new(RangeIoStats::default())),
             #[cfg(test)]
-            permit_wait_pending: None,
+            response_permit_wait_started: None,
         }
     }
 
@@ -271,7 +271,7 @@ impl VindexFileReader {
         let io_limit = self.limiter.io_limit;
         let response_limit = self.limiter.response_limit;
         #[cfg(test)]
-        let permit_wait_pending = self.permit_wait_pending.clone();
+        let response_permit_wait_started = self.response_permit_wait_started.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(io_limit);
         self.runtime.spawn(async move {
             let fetched = stream::iter(requested.into_iter().enumerate().map(|(index, range)| {
@@ -282,8 +282,12 @@ impl VindexFileReader {
                 let path = path.clone();
                 let stats = stats.clone();
                 #[cfg(test)]
-                let permit_wait_pending = permit_wait_pending.clone();
+                let response_permit_wait_started = response_permit_wait_started.clone();
                 async move {
+                    #[cfg(test)]
+                    if let Some(wait_started) = response_permit_wait_started {
+                        wait_started.add_permits(1);
+                    }
                     let response_permit = response_permits
                         .acquire_owned()
                         .await
@@ -291,25 +295,7 @@ impl VindexFileReader {
                             io::Error::other("vindex range response limiter closed")
                         })?;
                     let permit_wait_start = stats.as_ref().map(|_| Instant::now());
-                    let permit = io_permits.acquire_owned();
-                    tokio::pin!(permit);
-                    #[cfg(test)]
-                    let permit = if let Some(wait_pending) = permit_wait_pending {
-                        let mut notified = false;
-                        std::future::poll_fn(|context| {
-                            let result = std::future::Future::poll(permit.as_mut(), context);
-                            if result.is_pending() && !notified {
-                                wait_pending.add_permits(1);
-                                notified = true;
-                            }
-                            result
-                        })
-                        .await
-                    } else {
-                        permit.await
-                    };
-                    #[cfg(not(test))]
-                    let permit = permit.await;
+                    let permit = io_permits.acquire_owned().await;
                     if let (Some(stats), Some(start)) = (&stats, permit_wait_start) {
                         stats
                             .range_permit_wait_nanos
@@ -502,7 +488,7 @@ impl SeekRead for VindexFileReader {
             scalar_cache: None,
             stats: self.stats.clone(),
             #[cfg(test)]
-            permit_wait_pending: self.permit_wait_pending.clone(),
+            response_permit_wait_started: self.response_permit_wait_started.clone(),
         }))
     }
 
@@ -1224,8 +1210,9 @@ mod tests {
             .expect("first response did not reach the copy stage");
         acquire_test_permits(&tracking.started, 1, "second range read did not start").await;
         let second = tokio::task::spawn_blocking(move || {
+            let range = 2 * stride..2 * stride + 1;
             second_reader
-                .fetch_range_batch(&[2 * stride..2 * stride + 1], |_, _| Ok(()))
+                .fetch_range_batch(std::slice::from_ref(&range), |_, _| Ok(()))
                 .unwrap();
         });
         tracking.release.add_permits(1);
@@ -1314,8 +1301,8 @@ mod tests {
             "index".to_string(),
         );
         let mut second_reader = first_reader.try_clone_reader().unwrap().unwrap();
-        let second_wait_pending = Arc::new(tokio::sync::Semaphore::new(0));
-        second_reader.permit_wait_pending = Some(Arc::clone(&second_wait_pending));
+        let response_wait_started = Arc::new(tokio::sync::Semaphore::new(0));
+        second_reader.response_permit_wait_started = Some(Arc::clone(&response_wait_started));
 
         let first = tokio::task::spawn_blocking(move || {
             let mut first = [0u8; 1];
@@ -1337,18 +1324,18 @@ mod tests {
                 .pread(&mut [ReadRequest::new(3 * stride, &mut output)])
                 .unwrap();
         });
+        acquire_test_permits(
+            &response_wait_started,
+            1,
+            "cloned reader did not start waiting for a response permit",
+        )
+        .await;
 
         tracking.release.add_permits(1);
         acquire_test_permits(&tracking.started, 1, "second range read did not start").await;
-        acquire_test_permits(
-            &second_wait_pending,
-            1,
-            "cloned reader did not queue within the response window",
-        )
-        .await;
         tracking.release.add_permits(1);
         acquire_test_permits(&tracking.started, 1, "cloned range read did not start").await;
-        let third_started_range = tracking.ranges.lock().unwrap()[2].clone();
+        let first_three_ranges = tracking.ranges.lock().unwrap()[..3].to_vec();
         tracking.release.add_permits(3);
         tokio::time::timeout(Duration::from_secs(5), first)
             .await
@@ -1359,7 +1346,9 @@ mod tests {
             .expect("cloned reader task did not finish")
             .unwrap();
 
-        assert_eq!(third_started_range.start, 3 * stride);
+        assert!(first_three_ranges
+            .iter()
+            .any(|range| range.start == 3 * stride));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

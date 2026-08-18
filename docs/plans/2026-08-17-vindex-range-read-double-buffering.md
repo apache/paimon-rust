@@ -1,6 +1,25 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # Vindex range-read 双限流优化计划
 
-> 状态（2026-08-18）：已在 `perf/vindex-range-read-concurrency` 工作树实施，尚未提交。本文件现作为实施与验收记录；基线 commit 仍为 `1e172b3`，下列 Task 6 A/B 尚待执行。
+> 状态（2026-08-18）：已在 `perf/vindex-range-read-concurrency` 实施。本文件现作为实施与验收记录；基线 commit 仍为 `1e172b3`，下列 Task 6 A/B 尚待执行。
 
 ## 1. 结论
 
