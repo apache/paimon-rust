@@ -2065,10 +2065,10 @@ deletion vectors enabled.
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
-| `global-index.range-read-thread-num` | `32` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
+| `global-index.vindex.read-thread-num` | `32` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
 
-`global-index.range-read-thread-num` is independent of `global-index.thread-num`.
+`global-index.vindex.read-thread-num` is independent of `global-index.thread-num`.
 When upgrading a table that sets `global-index.thread-num`, set the new option
 explicitly to the same value if Vindex range reads should keep the previous limit;
 otherwise they use the new default of `32`.

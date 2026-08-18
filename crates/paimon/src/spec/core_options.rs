@@ -28,7 +28,7 @@ const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
-const GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION: &str = "global-index.range-read-thread-num";
+const GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
@@ -734,7 +734,7 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Maximum number of concurrent range reads shared by Vindex readers in one
-    /// search operation (key `global-index.range-read-thread-num`, default 32).
+    /// search operation (key `global-index.vindex.read-thread-num`, default 32).
     /// This is independent of [`Self::global_index_thread_num`].
     pub fn global_index_range_read_thread_num(&self) -> crate::Result<usize> {
         let value = self

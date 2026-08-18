@@ -3486,7 +3486,7 @@ mod tests {
         );
 
         let options = HashMap::from([(
-            "global-index.range-read-thread-num".to_string(),
+            "global-index.vindex.read-thread-num".to_string(),
             "64".to_string(),
         )]);
         let core = CoreOptions::new(&options);
