@@ -170,7 +170,7 @@ fn vindex_concurrency_limits(
 ) -> crate::Result<(usize, usize)> {
     Ok((
         vindex_index_parallelism(entry_count, max_concurrency),
-        core_options.global_index_range_read_thread_num()?,
+        core_options.global_index_vindex_read_thread_num()?,
     ))
 }
 

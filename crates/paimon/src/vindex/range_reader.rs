@@ -17,7 +17,7 @@
 
 use crate::io::FileRead;
 #[cfg(test)]
-use crate::spec::DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM;
+use crate::spec::DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM;
 use crate::vindex::vector_search_timing_enabled;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
@@ -172,7 +172,7 @@ impl VindexFileReader {
         Self::new_with_limiter(
             reader,
             runtime,
-            RangeReadLimiter::new(DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM),
+            RangeReadLimiter::new(DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM),
             file_size,
             path,
         )

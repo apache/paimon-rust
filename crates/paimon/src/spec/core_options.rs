@@ -28,7 +28,7 @@ const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
-const GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
+const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
@@ -134,8 +134,8 @@ const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-nu
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
-pub(crate) const DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM: usize = 64;
-const MAX_GLOBAL_INDEX_RANGE_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
+pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
+const MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
 const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     let tokio_max = (usize::MAX >> 3) as u64;
     let i32_max = i32::MAX as u64;
@@ -704,7 +704,7 @@ impl<'a> CoreOptions<'a> {
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
     /// search. Vindex file range reads use
-    /// [`Self::global_index_range_read_thread_num`] instead. A value of `1`
+    /// [`Self::global_index_vindex_read_thread_num`] instead. A value of `1`
     /// makes these search tasks sequential, but does not serialize Vindex range
     /// reads. A non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`],
     /// is a misconfiguration and fails loud rather than being silently clamped.
@@ -736,25 +736,25 @@ impl<'a> CoreOptions<'a> {
     /// Maximum number of concurrent range reads shared by Vindex readers in one
     /// search operation (key `global-index.vindex.read-thread-num`, default 64).
     /// This is independent of [`Self::global_index_thread_num`].
-    pub fn global_index_range_read_thread_num(&self) -> crate::Result<usize> {
+    pub fn global_index_vindex_read_thread_num(&self) -> crate::Result<usize> {
         let value = self
-            .parse_i64_option(GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION)?
-            .unwrap_or(DEFAULT_GLOBAL_INDEX_RANGE_READ_THREAD_NUM as i64);
+            .parse_i64_option(GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM as i64);
         if value <= 0 {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{}' must be greater than 0, got: {}",
-                    GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION, value
+                    GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION, value
                 ),
                 source: None,
             });
         }
-        if value > MAX_GLOBAL_INDEX_RANGE_READ_THREAD_NUM {
+        if value > MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{}' must not exceed {}, got: {}",
-                    GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION,
-                    MAX_GLOBAL_INDEX_RANGE_READ_THREAD_NUM,
+                    GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION,
+                    MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM,
                     value
                 ),
                 source: None,
@@ -1556,7 +1556,7 @@ mod tests {
         );
         assert_eq!(core_options.global_index_thread_num().unwrap(), 32);
         assert_eq!(
-            core_options.global_index_range_read_thread_num().unwrap(),
+            core_options.global_index_vindex_read_thread_num().unwrap(),
             64
         );
         assert_eq!(
@@ -1804,22 +1804,22 @@ mod tests {
     }
 
     #[test]
-    fn test_global_index_range_read_thread_num_default_and_custom() {
+    fn test_global_index_vindex_read_thread_num_default_and_custom() {
         assert_eq!(
             CoreOptions::new(&HashMap::new())
-                .global_index_range_read_thread_num()
+                .global_index_vindex_read_thread_num()
                 .unwrap(),
             64
         );
 
         for value in [32, 64] {
             let options = HashMap::from([(
-                GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION.to_string(),
+                GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION.to_string(),
                 value.to_string(),
             )]);
             assert_eq!(
                 CoreOptions::new(&options)
-                    .global_index_range_read_thread_num()
+                    .global_index_vindex_read_thread_num()
                     .unwrap(),
                 value
             );
@@ -1827,19 +1827,21 @@ mod tests {
     }
 
     #[test]
-    fn test_global_index_range_read_thread_num_rejects_invalid_values() {
+    fn test_global_index_vindex_read_thread_num_rejects_invalid_values() {
         for value in [
             "0".to_string(),
             "abc".to_string(),
-            (MAX_GLOBAL_INDEX_RANGE_READ_THREAD_NUM + 1).to_string(),
+            (MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM + 1).to_string(),
         ] {
-            let options =
-                HashMap::from([(GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION.to_string(), value)]);
+            let options = HashMap::from([(
+                GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION.to_string(),
+                value,
+            )]);
             let err = CoreOptions::new(&options)
-                .global_index_range_read_thread_num()
-                .expect_err("invalid range-read-thread-num should fail");
+                .global_index_vindex_read_thread_num()
+                .expect_err("invalid vindex.read-thread-num should fail");
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
-                    if message.contains(GLOBAL_INDEX_RANGE_READ_THREAD_NUM_OPTION)));
+                    if message.contains(GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION)));
         }
     }
 
