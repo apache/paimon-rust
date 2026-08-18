@@ -58,7 +58,7 @@ use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, Vindex
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
-use crate::vindex::range_reader::{RangeIoStats, VindexFileReader};
+use crate::vindex::range_reader::{RangeIoStats, RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled, VindexVectorIndexOptions};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
@@ -894,16 +894,14 @@ async fn plan_and_search_pk_candidates_batch(
     let field_name = pk_col.to_string();
 
     let loader_io = table.file_io().clone();
-    let loader_range_read_permits = match backend {
-        VectorIndexBackend::Vindex => Some(Arc::new(tokio::sync::Semaphore::new(
-            range_read_concurrency,
-        ))),
+    let loader_range_read_limiter = match backend {
+        VectorIndexBackend::Vindex => Some(RangeReadLimiter::new(range_read_concurrency)),
         VectorIndexBackend::Lumina => None,
     };
     let loader: crate::vindex::pkvector::ann::SourceSegmentLoader = Box::new(
         move |segment: &BucketAnnSegment| {
             let io = loader_io.clone();
-            let range_read_permits = loader_range_read_permits.clone();
+            let range_read_limiter = loader_range_read_limiter.clone();
             let path = segment.path.clone();
             let file_size = segment.file_size;
             Box::pin(async move {
@@ -929,11 +927,10 @@ async fn plan_and_search_pk_candidates_batch(
                                     source: None,
                                 })?;
                         Ok(AnnSegmentSource::Vindex(
-                            VindexFileReader::new_with_permits(
+                            VindexFileReader::new_with_limiter(
                                 Arc::new(file_reader),
                                 current_tokio_runtime_handle()?,
-                                range_read_permits.expect("Vindex range-read permits"),
-                                range_read_concurrency,
+                                range_read_limiter.expect("Vindex range-read limiter"),
                                 file_size,
                                 path,
                             ),
@@ -1655,24 +1652,20 @@ async fn evaluate_batch_vector_search(
             .iter()
             .filter(|entry| is_vindex_index_type(&entry.index_file.index_type))
             .count();
-        let (batch_index_parallelism, range_read_concurrency, range_read_permits) =
-            if vindex_entry_count == 0 {
-                (1, 0, None)
-            } else {
-                let (index_parallelism, range_read_concurrency) =
-                    vindex_concurrency_limits(&core_options, vindex_entry_count, concurrency)?;
-                (
-                    index_parallelism,
-                    range_read_concurrency,
-                    Some(Arc::new(tokio::sync::Semaphore::new(
-                        range_read_concurrency,
-                    ))),
-                )
-            };
+        let (batch_index_parallelism, range_read_limiter) = if vindex_entry_count == 0 {
+            (1, None)
+        } else {
+            let (index_parallelism, range_read_concurrency) =
+                vindex_concurrency_limits(&core_options, vindex_entry_count, concurrency)?;
+            (
+                index_parallelism,
+                Some(RangeReadLimiter::new(range_read_concurrency)),
+            )
+        };
         let futures: Vec<_> = vector_entries
             .into_iter()
             .map(|entry| {
-                let range_read_permits = range_read_permits.clone();
+                let range_read_limiter = range_read_limiter.clone();
                 let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
                     .expect("filtered vector index type");
@@ -1753,11 +1746,10 @@ async fn evaluate_batch_vector_search(
                                     })?;
                                     file_reader_open = file_reader_open_start
                                         .map_or(Duration::ZERO, |start| start.elapsed());
-                                    let source = VindexFileReader::new_with_permits(
+                                    let source = VindexFileReader::new_with_limiter(
                                         Arc::new(file_reader),
                                         runtime,
-                                        range_read_permits.expect("Vindex range-read permits"),
-                                        range_read_concurrency,
+                                        range_read_limiter.expect("Vindex range-read limiter"),
                                         file_size,
                                         file_name.clone(),
                                     );
