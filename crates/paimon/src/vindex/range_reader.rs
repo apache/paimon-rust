@@ -79,7 +79,9 @@ pub(crate) struct RangeIoStats {
     peak_in_flight_reads: AtomicU64,
     read_many_merged_ranges: AtomicU64,
     read_many_chunks: AtomicU64,
-    read_many_chunk_sizes: std::sync::Mutex<Vec<usize>>,
+    read_many_chunk_size_sum: AtomicU64,
+    read_many_chunk_size_min: AtomicU64,
+    read_many_chunk_size_max: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,7 +96,9 @@ pub(crate) struct RangeIoStatsSnapshot {
     pub(crate) peak_in_flight_reads: u64,
     pub(crate) read_many_merged_ranges: u64,
     pub(crate) read_many_chunks: u64,
-    pub(crate) read_many_chunk_sizes: Vec<usize>,
+    pub(crate) read_many_chunk_size_sum: u64,
+    pub(crate) read_many_chunk_size_min: u64,
+    pub(crate) read_many_chunk_size_max: u64,
 }
 
 impl RangeIoStats {
@@ -110,7 +114,9 @@ impl RangeIoStats {
             peak_in_flight_reads: self.peak_in_flight_reads.load(Ordering::Relaxed),
             read_many_merged_ranges: self.read_many_merged_ranges.load(Ordering::Relaxed),
             read_many_chunks: self.read_many_chunks.load(Ordering::Relaxed),
-            read_many_chunk_sizes: self.read_many_chunk_sizes.lock().unwrap().clone(),
+            read_many_chunk_size_sum: self.read_many_chunk_size_sum.load(Ordering::Relaxed),
+            read_many_chunk_size_min: self.read_many_chunk_size_min.load(Ordering::Relaxed),
+            read_many_chunk_size_max: self.read_many_chunk_size_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -420,17 +426,28 @@ impl VindexFileReader {
         }
 
         if let Some(stats) = &self.stats {
+            let chunk_size = merged.len() as u64;
             stats
                 .read_many_merged_ranges
-                .fetch_add(merged.len() as u64, Ordering::Relaxed);
-        }
-        if let Some(stats) = &self.stats {
+                .fetch_add(chunk_size, Ordering::Relaxed);
             stats.read_many_chunks.fetch_add(1, Ordering::Relaxed);
             stats
-                .read_many_chunk_sizes
-                .lock()
-                .unwrap()
-                .push(merged.len());
+                .read_many_chunk_size_sum
+                .fetch_add(chunk_size, Ordering::Relaxed);
+            let _ = stats.read_many_chunk_size_min.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| {
+                    Some(if current == 0 {
+                        chunk_size
+                    } else {
+                        current.min(chunk_size)
+                    })
+                },
+            );
+            stats
+                .read_many_chunk_size_max
+                .fetch_max(chunk_size, Ordering::Relaxed);
         }
         let ranges: Vec<_> = merged.iter().map(|merged| merged.range.clone()).collect();
         self.fetch_range_batch(&ranges, |merged_index, data| {
@@ -924,9 +941,11 @@ mod tests {
                 stats.peak_in_flight_reads,
                 stats.read_many_merged_ranges,
                 stats.read_many_chunks,
-                stats.read_many_chunk_sizes,
+                stats.read_many_chunk_size_sum,
+                stats.read_many_chunk_size_min,
+                stats.read_many_chunk_size_max,
             ),
-            (2, 256, 2, 256, 0, 1, 0, 0, Vec::new())
+            (2, 256, 2, 256, 0, 1, 0, 0, 0, 0, 0)
         );
         assert!(stats.io_wait_nanos > 0);
     }
@@ -955,6 +974,14 @@ mod tests {
                     ReadRequest::new(20_000, &mut third),
                 ])
                 .unwrap();
+            let mut fourth = [0u8; 4];
+            let mut fifth = [0u8; 4];
+            reader
+                .pread(&mut [
+                    ReadRequest::new(40, &mut fourth),
+                    ReadRequest::new(48, &mut fifth),
+                ])
+                .unwrap();
         })
         .await
         .unwrap();
@@ -970,9 +997,11 @@ mod tests {
                 stats.peak_in_flight_reads,
                 stats.read_many_merged_ranges,
                 stats.read_many_chunks,
-                stats.read_many_chunk_sizes,
+                stats.read_many_chunk_size_sum,
+                stats.read_many_chunk_size_min,
+                stats.read_many_chunk_size_max,
             ),
-            (3, 12, 2, 16, 0, 1, 2, 1, vec![2])
+            (5, 20, 3, 28, 0, 1, 3, 2, 3, 1, 2)
         );
         assert!(stats.io_wait_nanos > 0);
     }
@@ -1110,9 +1139,11 @@ mod tests {
                 snapshot.peak_in_flight_reads,
                 snapshot.read_many_merged_ranges,
                 snapshot.read_many_chunks,
-                snapshot.read_many_chunk_sizes,
+                snapshot.read_many_chunk_size_sum,
+                snapshot.read_many_chunk_size_min,
+                snapshot.read_many_chunk_size_max,
             ),
-            (65, 65, 65, 65, 0, 64, 65, 1, vec![65])
+            (65, 65, 65, 65, 0, 64, 65, 1, 65, 65, 65)
         );
         assert!(snapshot.io_wait_nanos > 0);
         assert!(snapshot.range_permit_wait_nanos > 0);

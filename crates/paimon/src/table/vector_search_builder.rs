@@ -144,7 +144,7 @@ fn log_vindex_range_io_stats(file: &str, query_count: usize, stats: &RangeIoStat
     let stats = stats.snapshot();
     log::debug!(
         target: "paimon::vector_search",
-        "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3} peak_in_flight_reads={} read_many_merged_ranges={} read_many_chunks={} read_many_chunk_sizes={:?}",
+        "event=paimon_vector_range_io file={} nq={} logical_ranges={} requested_bytes={} file_read_calls={} returned_bytes={} read_ahead_hits={} io_wait_sum_ms={:.3} range_permit_wait_sum_ms={:.3} peak_in_flight_reads={} read_many_merged_ranges={} read_many_chunks={} read_many_chunk_size_sum={} read_many_chunk_size_min={} read_many_chunk_size_max={}",
         file,
         query_count,
         stats.logical_ranges,
@@ -157,7 +157,9 @@ fn log_vindex_range_io_stats(file: &str, query_count: usize, stats: &RangeIoStat
         stats.peak_in_flight_reads,
         stats.read_many_merged_ranges,
         stats.read_many_chunks,
-        stats.read_many_chunk_sizes,
+        stats.read_many_chunk_size_sum,
+        stats.read_many_chunk_size_min,
+        stats.read_many_chunk_size_max,
     );
 }
 
