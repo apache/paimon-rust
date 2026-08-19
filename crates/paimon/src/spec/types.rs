@@ -1537,7 +1537,11 @@ pub struct VarCharType {
 
 impl Display for VarCharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VARCHAR({})", self.length)?;
+        if self.length == Self::MAX_LENGTH {
+            write!(f, "{STRING_TYPE_NAME}")?;
+        } else {
+            write!(f, "VARCHAR({})", self.length)?;
+        }
         if !self.nullable {
             write!(f, " NOT NULL")?;
         }
@@ -2534,24 +2538,32 @@ mod tests {
         }
     }
 
-    /// Regression: `MAX_LENGTH` for `VarCharType`/`VarBinaryType` must fit in a
-    /// Java `int`, otherwise `DataTypeJsonParser` rejects the `CreateTableRequest`
-    /// REST payload with `NumberFormatException` on `Integer.parseInt`.
     #[test]
-    fn test_max_length_fits_java_integer() {
+    fn test_string_type_serializes_like_java() {
+        let nullable = DataType::VarChar(VarCharType::string_type());
+        assert_eq!(serde_json::to_string(&nullable).unwrap(), r#""STRING""#);
+
+        let not_null =
+            DataType::VarChar(VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap());
+        assert_eq!(
+            serde_json::to_string(&not_null).unwrap(),
+            r#""STRING NOT NULL""#
+        );
+
+        let bounded = DataType::VarChar(VarCharType::new(42).unwrap());
+        assert_eq!(serde_json::to_string(&bounded).unwrap(), r#""VARCHAR(42)""#);
+    }
+
+    /// Regression: `MAX_LENGTH` must match Java's `Integer.MAX_VALUE` even though
+    /// an unbounded `VarCharType` is serialized through Java's `STRING` alias.
+    #[test]
+    fn test_max_length_matches_java_integer() {
         const JAVA_INTEGER_MAX_VALUE: u32 = i32::MAX as u32;
 
         assert_eq!(VarCharType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
         assert_eq!(VarBinaryType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
 
-        let varchar = VarCharType::string_type().to_string();
-        let length_token = varchar
-            .strip_prefix("VARCHAR(")
-            .and_then(|s| s.split(')').next())
-            .expect("VARCHAR display format");
-        length_token
-            .parse::<i32>()
-            .expect("VARCHAR length must parse as Java int");
+        assert_eq!(VarCharType::string_type().to_string(), STRING_TYPE_NAME);
 
         let varbinary = VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH)
             .unwrap()
