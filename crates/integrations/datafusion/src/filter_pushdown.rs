@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion::arrow::array::Array;
+use datafusion::arrow::datatypes::DataType as ArrowDataType;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::{
@@ -169,6 +170,13 @@ impl<'a> FilterTranslator<'a> {
             // must keep its residual filter for NULL / three-valued semantics.
             Expr::Not(inner) => {
                 let inner = self.translate(inner.as_ref())?;
+                // A positive inexact predicate is only guaranteed to be a
+                // conservative superset. Negating it would turn that into a
+                // subset and could remove rows before DataFusion's residual
+                // runs (notably for floating-array NaN payload semantics).
+                if inner.requires_residual {
+                    return None;
+                }
                 Some(TranslatedPredicate {
                     predicate: Predicate::negate(inner.predicate),
                     requires_residual: true,
@@ -351,26 +359,37 @@ impl<'a> FilterTranslator<'a> {
         if func.args.len() != 2 {
             return None;
         }
-        let field = self.resolve_field(&func.args[0])?;
+        let (field, comparison_element_type) = self.resolve_array_field(&func.args[0])?;
         let DataType::Array(array_type) = field.data_type() else {
             return None;
         };
         let predicate = match func.name() {
             "array_has" | "list_has" => {
-                let scalar = extract_scalar_literal(&func.args[1])?;
-                let literal = scalar_to_datum(scalar, array_type.element_type())?;
+                let literal = extract_array_scalar_literal(
+                    &func.args[1],
+                    array_type.element_type(),
+                    &comparison_element_type,
+                )?;
                 self.predicate_builder
                     .array_contains(field.name(), literal)
                     .ok()?
             }
             "array_has_any" | "list_has_any" | "arrays_overlap" => {
-                let literals = extract_array_literals(&func.args[1], array_type.element_type())?;
+                let literals = extract_array_literals(
+                    &func.args[1],
+                    array_type.element_type(),
+                    &comparison_element_type,
+                )?;
                 self.predicate_builder
                     .arrays_overlap(field.name(), literals)
                     .ok()?
             }
             "array_has_all" | "list_has_all" => {
-                let literals = extract_array_literals(&func.args[1], array_type.element_type())?;
+                let literals = extract_array_literals(
+                    &func.args[1],
+                    array_type.element_type(),
+                    &comparison_element_type,
+                )?;
                 // DataFusion 54's empty-needle fast path currently returns true
                 // even for a NULL haystack, while Paimon/Java ARRAY_CONTAINS_ALL
                 // returns false for NULL arrays. Pushing it would remove rows
@@ -394,6 +413,44 @@ impl<'a> FilterTranslator<'a> {
                 DataType::Float(_) | DataType::Double(_)
             ),
         })
+    }
+
+    /// Resolve an ARRAY column, accepting only the lossless element-wise casts
+    /// inserted by DataFusion's array function type coercion.
+    fn resolve_array_field(&self, expr: &Expr) -> Option<(&'a DataField, ArrowDataType)> {
+        match expr {
+            Expr::Column(_) => {
+                let field = self.resolve_field(expr)?;
+                let DataType::Array(array_type) = field.data_type() else {
+                    return None;
+                };
+                let comparison_type =
+                    paimon::arrow::paimon_type_to_arrow(array_type.element_type()).ok()?;
+                Some((field, comparison_type))
+            }
+            Expr::Cast(cast) => {
+                let field = self.resolve_field(cast.expr.as_ref())?;
+                let DataType::Array(array_type) = field.data_type() else {
+                    return None;
+                };
+                // Paimon ARRAY columns are Arrow List values. DataFusion's
+                // numeric coercion keeps that container and only widens its
+                // element. In particular, List -> FixedSizeList is
+                // value-dependent and must not be erased here.
+                let ArrowDataType::List(target_field) = cast.field.data_type() else {
+                    return None;
+                };
+                if array_type.element_type().is_nullable() && !target_field.is_nullable() {
+                    return None;
+                }
+                let target_element = target_field.data_type();
+                if !is_lossless_array_element_cast(array_type.element_type(), target_element) {
+                    return None;
+                }
+                Some((field, target_element.clone()))
+            }
+            _ => None,
+        }
     }
 
     fn translate_like(&self, like: &Like) -> Option<TranslatedPredicate> {
@@ -460,14 +517,45 @@ fn extract_scalar_literal(expr: &Expr) -> Option<&ScalarValue> {
     }
 }
 
-fn extract_array_literals(expr: &Expr, element_type: &DataType) -> Option<Vec<Datum>> {
+fn extract_array_scalar_literal(
+    expr: &Expr,
+    element_type: &DataType,
+    comparison_element_type: &ArrowDataType,
+) -> Option<Datum> {
+    match expr {
+        Expr::Literal(scalar, _) if !scalar.is_null() => {
+            scalar_to_array_datum(scalar, element_type)
+        }
+        Expr::Cast(cast) if cast.field.data_type() == comparison_element_type => {
+            let scalar = extract_scalar_literal(cast.expr.as_ref())?;
+            if !is_lossless_arrow_scalar_cast(&scalar.data_type(), comparison_element_type) {
+                return None;
+            }
+            scalar_to_array_datum(scalar, element_type)
+        }
+        _ => None,
+    }
+}
+
+fn extract_array_literals(
+    expr: &Expr,
+    element_type: &DataType,
+    comparison_element_type: &ArrowDataType,
+) -> Option<Vec<Datum>> {
     match expr {
         Expr::ScalarFunction(function) if matches!(function.name(), "make_array" | "make_list") => {
             function
                 .args
                 .iter()
-                .map(|expr| scalar_to_datum(extract_scalar_literal(expr)?, element_type))
+                .map(|expr| {
+                    extract_array_scalar_literal(expr, element_type, comparison_element_type)
+                })
                 .collect()
+        }
+        Expr::Cast(cast)
+            if arrow_list_element_type(cast.field.data_type()) == Some(comparison_element_type) =>
+        {
+            extract_array_literals(cast.expr.as_ref(), element_type, comparison_element_type)
         }
         Expr::Literal(scalar, _) => {
             let values = match scalar {
@@ -482,12 +570,59 @@ fn extract_array_literals(expr: &Expr, element_type: &DataType) -> Option<Vec<Da
                     if scalar.is_null() {
                         return None;
                     }
-                    scalar_to_datum(&scalar, element_type)
+                    scalar_to_array_datum(&scalar, element_type)
                 })
                 .collect()
         }
         _ => None,
     }
+}
+
+fn scalar_to_array_datum(scalar: &ScalarValue, element_type: &DataType) -> Option<Datum> {
+    if let (DataType::Float(_), ScalarValue::Float64(Some(value))) = (element_type, scalar) {
+        let narrowed = *value as f32;
+        return ((narrowed as f64).to_bits() == value.to_bits()).then_some(Datum::Float(narrowed));
+    }
+    scalar_to_datum(scalar, element_type)
+}
+
+fn arrow_list_element_type(data_type: &ArrowDataType) -> Option<&ArrowDataType> {
+    match data_type {
+        ArrowDataType::List(field) => Some(field.data_type()),
+        _ => None,
+    }
+}
+
+fn is_lossless_array_element_cast(source: &DataType, target: &ArrowDataType) -> bool {
+    if paimon::arrow::paimon_type_to_arrow(source).ok().as_ref() == Some(target) {
+        return true;
+    }
+    matches!(
+        (source, target),
+        (
+            DataType::TinyInt(_),
+            ArrowDataType::Int16 | ArrowDataType::Int32 | ArrowDataType::Int64
+        ) | (
+            DataType::SmallInt(_),
+            ArrowDataType::Int32 | ArrowDataType::Int64
+        ) | (DataType::Int(_), ArrowDataType::Int64)
+            | (DataType::Float(_), ArrowDataType::Float64)
+    )
+}
+
+fn is_lossless_arrow_scalar_cast(source: &ArrowDataType, target: &ArrowDataType) -> bool {
+    source == target
+        || matches!(
+            (source, target),
+            (
+                ArrowDataType::Int8,
+                ArrowDataType::Int16 | ArrowDataType::Int32 | ArrowDataType::Int64
+            ) | (
+                ArrowDataType::Int16,
+                ArrowDataType::Int32 | ArrowDataType::Int64
+            ) | (ArrowDataType::Int32, ArrowDataType::Int64)
+                | (ArrowDataType::Float32, ArrowDataType::Float64)
+        )
 }
 
 fn reverse_comparison_operator(op: Operator) -> Option<Operator> {
@@ -638,8 +773,8 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        ArrayType, FloatType, IntType, LocalZonedTimestampType, PredicateOperator, Schema,
-        TableSchema, TimeType, TimestampType, VarCharType,
+        ArrayType, BigIntType, FloatType, IntType, LocalZonedTimestampType, PredicateOperator,
+        Schema, SmallIntType, TableSchema, TimeType, TimestampType, VarCharType,
     };
     use paimon::table::Table;
 
@@ -775,6 +910,243 @@ mod tests {
             classify_filter_pushdown(&filter, &fields, true, |_| true),
             TableProviderFilterPushDown::Inexact
         );
+    }
+
+    #[test]
+    fn test_negated_inexact_float_array_membership_falls_open() {
+        use datafusion::functions_nested::expr_fn::array_has;
+
+        let fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )];
+        let filter = Expr::Not(Box::new(array_has(
+            Expr::Column(Column::from_name("items")),
+            lit(f32::from_bits(0xffc0_1234)),
+        )));
+
+        // Paimon/Java considers every NaN payload equal, while DataFusion
+        // distinguishes payloads. Negating that inexact positive predicate
+        // would turn its safe superset into a subset and silently drop rows.
+        assert!(build_pushed_predicate(std::slice::from_ref(&filter), &fields).is_none());
+        assert_eq!(
+            classify_filter_pushdown(&filter, &fields, true, |_| true),
+            TableProviderFilterPushDown::Unsupported
+        );
+    }
+
+    #[test]
+    fn test_translate_analyzer_inserted_array_widening_casts() {
+        use datafusion::arrow::datatypes::DataType as ArrowDataType;
+        use datafusion::functions_nested::expr_fn::{array_has, array_has_any, make_array};
+        use datafusion::logical_expr::Cast;
+
+        let fields = test_fields();
+        let widened_items = Expr::Cast(Cast::new(
+            Box::new(Expr::Column(Column::from_name("items"))),
+            ArrowDataType::new_list(ArrowDataType::Int64, true),
+        ));
+        let cases = [
+            (
+                array_has(widened_items.clone(), lit(2_i64)),
+                PredicateOperator::ArrayContains,
+                vec![Datum::Int(2)],
+            ),
+            (
+                array_has_any(widened_items, make_array(vec![lit(1_i64), lit(3_i64)])),
+                PredicateOperator::ArraysOverlap,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+        ];
+
+        for (filter, expected_op, expected_literals) in cases {
+            let predicate = build_pushed_predicate(&[filter], &fields)
+                .expect("lossless analyzer-inserted widening cast should translate");
+            assert!(matches!(
+                predicate,
+                Predicate::Leaf { op, literals, .. }
+                    if op == expected_op && literals == expected_literals
+            ));
+        }
+
+        let out_of_range = array_has(
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Column(Column::from_name("items"))),
+                ArrowDataType::new_list(ArrowDataType::Int64, true),
+            )),
+            lit(i64::MAX),
+        );
+        assert!(build_pushed_predicate(&[out_of_range], &fields).is_none());
+
+        let fixed_size_cast = array_has(
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Column(Column::from_name("items"))),
+                ArrowDataType::new_fixed_size_list(ArrowDataType::Int64, 2, true),
+            )),
+            lit(2_i64),
+        );
+        assert!(build_pushed_predicate(&[fixed_size_cast], &fields).is_none());
+
+        let non_nullable_elements = array_has(
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Column(Column::from_name("items"))),
+                ArrowDataType::new_list(ArrowDataType::Int64, false),
+            )),
+            lit(2_i64),
+        );
+        assert!(build_pushed_predicate(&[non_nullable_elements], &fields).is_none());
+
+        let fixed_size_literals = array_has_any(
+            Expr::Column(Column::from_name("items")),
+            Expr::Cast(Cast::new(
+                Box::new(make_array(vec![lit(1_i32), lit(3_i32), lit(5_i32)])),
+                ArrowDataType::new_fixed_size_list(ArrowDataType::Int32, 2, true),
+            )),
+        );
+        assert!(build_pushed_predicate(&[fixed_size_literals], &fields).is_none());
+
+        let long_fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::BigInt(BigIntType::new()))),
+        )];
+        let widened_literal = Expr::Cast(Cast::new(Box::new(lit(2_i32)), ArrowDataType::Int64));
+        let predicate = build_pushed_predicate(
+            &[array_has(
+                Expr::Column(Column::from_name("items")),
+                widened_literal,
+            )],
+            &long_fields,
+        )
+        .expect("losslessly widened scalar literal should translate");
+        assert!(matches!(
+            predicate,
+            Predicate::Leaf { literals, .. } if literals == vec![Datum::Long(2)]
+        ));
+
+        let float_fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )];
+        let widened_floats = Expr::Cast(Cast::new(
+            Box::new(Expr::Column(Column::from_name("items"))),
+            ArrowDataType::new_list(ArrowDataType::Float64, true),
+        ));
+        assert!(build_pushed_predicate(
+            &[array_has(widened_floats.clone(), lit(1.0_f64))],
+            &float_fields,
+        )
+        .is_some());
+        assert!(
+            build_pushed_predicate(&[array_has(widened_floats, lit(1.1_f64))], &float_fields)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_translate_array_membership_after_datafusion_sql_analysis() {
+        use datafusion::arrow::datatypes::{
+            DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        };
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::logical_expr::LogicalPlan;
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        fn filter_expr(plan: &LogicalPlan) -> Option<&Expr> {
+            match plan {
+                LogicalPlan::Filter(filter) => Some(&filter.predicate),
+                LogicalPlan::TableScan(scan) => scan.filters.first(),
+                other => other.inputs().into_iter().find_map(filter_expr),
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            ArrowDataType::new_list(ArrowDataType::Int32, true),
+            true,
+        )]));
+        ctx.register_table("t", Arc::new(EmptyTable::new(arrow_schema)))
+            .unwrap();
+        let fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )];
+        let cases = [
+            (
+                "SELECT * FROM t WHERE array_has(items, 2)",
+                PredicateOperator::ArrayContains,
+                vec![Datum::Int(2)],
+            ),
+            (
+                "SELECT * FROM t WHERE array_has_any(items, [1, 3])",
+                PredicateOperator::ArraysOverlap,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+            (
+                "SELECT * FROM t WHERE array_has_all(items, [1, 3])",
+                PredicateOperator::ArrayContainsAll,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+        ];
+        for (sql, expected_op, expected_literals) in cases {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let plan = ctx.state().optimize(&plan).unwrap();
+            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
+            assert!(filter.to_string().contains("CAST"));
+
+            let predicate = build_pushed_predicate(std::slice::from_ref(filter), &fields)
+                .expect("analyzed SQL array predicate should translate");
+            assert!(matches!(
+                predicate,
+                Predicate::Leaf { op, literals, .. }
+                    if op == expected_op && literals == expected_literals
+            ));
+        }
+
+        let numeric_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "small_items",
+                ArrowDataType::new_list(ArrowDataType::Int16, true),
+                true,
+            ),
+            ArrowField::new(
+                "float_items",
+                ArrowDataType::new_list(ArrowDataType::Float32, true),
+                true,
+            ),
+        ]));
+        ctx.register_table("numeric_arrays", Arc::new(EmptyTable::new(numeric_schema)))
+            .unwrap();
+        let numeric_fields = vec![
+            DataField::new(
+                1,
+                "small_items".to_string(),
+                DataType::Array(ArrayType::new(DataType::SmallInt(SmallIntType::new()))),
+            ),
+            DataField::new(
+                2,
+                "float_items".to_string(),
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            ),
+        ];
+        for sql in [
+            "SELECT * FROM numeric_arrays WHERE array_has(small_items, 2)",
+            "SELECT * FROM numeric_arrays WHERE array_has(float_items, 1.0)",
+        ] {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let plan = ctx.state().optimize(&plan).unwrap();
+            let filter = filter_expr(&plan).expect("optimized plan should retain the filter");
+            assert!(filter.to_string().contains("CAST"));
+            assert!(
+                build_pushed_predicate(std::slice::from_ref(filter), &numeric_fields).is_some(),
+                "analyzed numeric ARRAY predicate should translate: {filter}"
+            );
+        }
     }
 
     #[test]

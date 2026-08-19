@@ -196,37 +196,65 @@ pub(crate) fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
 
 /// Compare two decimals by mathematical value.
 ///
-/// Normalizes both to the larger scale, then compares unscaled values.
-/// E.g. `(10, scale=1)` vs `(100, scale=2)` → both represent 1.0 → equal.
+/// Compares the sign, decimal exponent, then significant digits. Padding the
+/// shorter significand with trailing zeroes is equivalent to normalizing both
+/// values to the larger scale, without overflowing `i128`.
 fn decimal_cmp(ua: i128, sa: u32, ub: i128, sb: u32) -> Option<Ordering> {
     if sa == sb {
-        return ua.partial_cmp(&ub);
+        return Some(ua.cmp(&ub));
     }
-    let (na, nb) = if sa < sb {
-        (ua.checked_mul(pow10_i128(sb - sa))?, ub)
+    let normalized = if sa < sb {
+        10_i128
+            .checked_pow(sb - sa)
+            .and_then(|factor| ua.checked_mul(factor))
+            .map(|scaled| scaled.cmp(&ub))
     } else {
-        (ua, ub.checked_mul(pow10_i128(sa - sb))?)
+        10_i128
+            .checked_pow(sa - sb)
+            .and_then(|factor| ub.checked_mul(factor))
+            .map(|scaled| ua.cmp(&scaled))
     };
-    na.partial_cmp(&nb)
+    if normalized.is_some() {
+        return normalized;
+    }
+
+    let sign_a = ua.signum();
+    let sign_b = ub.signum();
+    if sign_a != sign_b {
+        return Some(sign_a.cmp(&sign_b));
+    }
+    if sign_a == 0 {
+        return Some(Ordering::Equal);
+    }
+
+    let digits_a = ua.unsigned_abs().to_string();
+    let digits_b = ub.unsigned_abs().to_string();
+    let exponent_a = digits_a.len() as i64 - i64::from(sa);
+    let exponent_b = digits_b.len() as i64 - i64::from(sb);
+    let mut magnitude = exponent_a.cmp(&exponent_b);
+    if magnitude == Ordering::Equal {
+        let a = digits_a.as_bytes();
+        let b = digits_b.as_bytes();
+        for index in 0..a.len().max(b.len()) {
+            let digit_a = a.get(index).copied().unwrap_or(b'0');
+            let digit_b = b.get(index).copied().unwrap_or(b'0');
+            magnitude = digit_a.cmp(&digit_b);
+            if magnitude != Ordering::Equal {
+                break;
+            }
+        }
+    }
+    Some(if sign_a < 0 {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
 }
 
 /// Match Java `CompareUtils.compare(byte[], byte[])`, which compares bytes as
 /// unsigned values lexicographically.
 fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
-}
-
-/// 10^exp as i128.  Returns i128::MAX for exponents that would overflow.
-fn pow10_i128(exp: u32) -> i128 {
-    const MAX_EXP: u32 = 38; // 10^38 fits in i128
-    if exp > MAX_EXP {
-        return i128::MAX;
-    }
-    let mut result: i128 = 1;
-    for _ in 0..exp {
-        result = result.saturating_mul(10);
-    }
-    result
 }
 
 // PredicateOperator
@@ -2412,6 +2440,33 @@ mod tests {
             scale: 5,
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decimal_extreme_scale_comparison_does_not_overflow() {
+        let two = Datum::Decimal {
+            unscaled: 2,
+            precision: 1,
+            scale: 0,
+        };
+        let below_one = Datum::Decimal {
+            unscaled: 10_i128.pow(38) - 1,
+            precision: 38,
+            scale: 38,
+        };
+        assert!(two > below_one);
+
+        let negative_two = Datum::Decimal {
+            unscaled: -2,
+            precision: 1,
+            scale: 0,
+        };
+        let above_negative_one = Datum::Decimal {
+            unscaled: -(10_i128.pow(38) - 1),
+            precision: 38,
+            scale: 38,
+        };
+        assert!(negative_two < above_negative_one);
     }
 
     // ======================== PartialOrd ========================

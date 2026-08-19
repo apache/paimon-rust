@@ -587,8 +587,7 @@ fn evaluate_decimal_leaf(
 
     // Compare one column value (as a Datum::Decimal at the column scale) against a
     // literal Datum. `precision` is irrelevant to `datum_cmp` (it compares by
-    // value), so any value is fine. `None` means the cross-scale normalization
-    // overflowed i128 — surface it rather than silently drop rows.
+    // value), so any value is fine.
     let cmp = |v: i128, lit: &Datum| -> Result<Ordering, ArrowError> {
         let cell = Datum::Decimal {
             unscaled: v,
@@ -597,7 +596,7 @@ fn evaluate_decimal_leaf(
         };
         crate::spec::datum_cmp(&cell, lit).ok_or_else(|| {
             ArrowError::ComputeError(
-                "decimal comparison overflowed while normalizing scales".to_string(),
+                "decimal column compared against a non-decimal literal".to_string(),
             )
         })
     };
@@ -1403,6 +1402,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bool_values(&contains_all), vec![true, false, false]);
+    }
+
+    #[test]
+    fn test_decimal_array_membership_handles_extreme_scale_differences() {
+        let decimal_arrow_type = ArrowDataType::Decimal128(38, 38);
+        let element = Arc::new(ArrowField::new("element", decimal_arrow_type.clone(), true));
+        let values = Decimal128Builder::new().with_data_type(decimal_arrow_type);
+        let mut decimals = ListBuilder::new(values).with_field(element);
+        decimals.values().append_value(10_i128.pow(38) - 1);
+        decimals.append(true);
+        let decimals: ArrayRef = Arc::new(decimals.finish());
+        let decimal_type = DataType::Array(ArrayType::new(DataType::Decimal(
+            DecimalType::new(38, 38).unwrap(),
+        )));
+        let two = Datum::Decimal {
+            unscaled: 2,
+            precision: 1,
+            scale: 0,
+        };
+
+        for op in [
+            PredicateOperator::ArrayContains,
+            PredicateOperator::ArraysOverlap,
+            PredicateOperator::ArrayContainsAll,
+        ] {
+            let mask = evaluate_exact_leaf_predicate(
+                &decimals,
+                &decimal_type,
+                op,
+                std::slice::from_ref(&two),
+            )
+            .expect("valid cross-scale decimal comparison must not overflow");
+            assert_eq!(bool_values(&mask), vec![false]);
+        }
     }
 
     fn int_values(batch: &RecordBatch) -> Vec<i32> {
