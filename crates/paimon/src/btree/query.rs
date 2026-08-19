@@ -138,6 +138,12 @@ where
                 })
                 .await
             }
+            PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("BTree index does not support {op}"),
+            )),
         }
     }
 }

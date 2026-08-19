@@ -4587,6 +4587,7 @@ dependencies = [
  "log",
  "lru 0.18.2",
  "lz4_flex 0.13.1",
+ "lzokay-native",
  "md-5 0.10.6",
  "opendal-core",
  "opendal-http-transport-reqwest",

@@ -945,6 +945,13 @@ pub fn extract_datum_from_arrow(
                 .ok_or_else(|| type_mismatch_err("Date", col_idx))?;
             Datum::Date(arr.value(row_idx))
         }
+        DataType::Time(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Time32MillisecondArray>()
+                .ok_or_else(|| type_mismatch_err("Time", col_idx))?;
+            Datum::Time(arr.value(row_idx))
+        }
         DataType::Decimal(d) => {
             let arr = col
                 .as_any()
@@ -1555,6 +1562,33 @@ pub fn batch_hash_codes(
 mod tests {
     use super::*;
     use crate::variant::GenericVariant;
+
+    #[test]
+    fn test_extract_time_datum_from_arrow() {
+        let schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "time_col",
+                arrow_schema::DataType::Time32(arrow_schema::TimeUnit::Millisecond),
+                true,
+            )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(
+                arrow_array::Time32MillisecondArray::from(vec![Some(12_345), None]),
+            )],
+        )
+        .unwrap();
+        let data_type = DataType::Time(crate::spec::TimeType::new(3).unwrap());
+
+        assert_eq!(
+            extract_datum_from_arrow(&batch, 0, 0, &data_type).unwrap(),
+            Some(Datum::Time(12_345))
+        );
+        assert_eq!(
+            extract_datum_from_arrow(&batch, 1, 0, &data_type).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn test_empty_binary_row() {

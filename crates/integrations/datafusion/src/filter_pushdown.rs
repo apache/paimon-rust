@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::arrow::array::Array;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::{
@@ -311,6 +312,18 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
+        if matches!(
+            func.name(),
+            "array_has"
+                | "list_has"
+                | "array_has_any"
+                | "list_has_any"
+                | "arrays_overlap"
+                | "array_has_all"
+                | "list_has_all"
+        ) {
+            return self.translate_array_function(func);
+        }
         // DataFusion built-in UDFs surfaced from `LIKE 'x%' / '%x' / '%x%'`
         // rewrites and direct `starts_with(col, 'x') / ends_with / contains`
         // calls. Only `(col, literal)` shapes are handled; anything else
@@ -332,6 +345,55 @@ impl<'a> FilterTranslator<'a> {
             _ => return None,
         };
         self.exact(predicate)
+    }
+
+    fn translate_array_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
+        if func.args.len() != 2 {
+            return None;
+        }
+        let field = self.resolve_field(&func.args[0])?;
+        let DataType::Array(array_type) = field.data_type() else {
+            return None;
+        };
+        let predicate = match func.name() {
+            "array_has" | "list_has" => {
+                let scalar = extract_scalar_literal(&func.args[1])?;
+                let literal = scalar_to_datum(scalar, array_type.element_type())?;
+                self.predicate_builder
+                    .array_contains(field.name(), literal)
+                    .ok()?
+            }
+            "array_has_any" | "list_has_any" | "arrays_overlap" => {
+                let literals = extract_array_literals(&func.args[1], array_type.element_type())?;
+                self.predicate_builder
+                    .arrays_overlap(field.name(), literals)
+                    .ok()?
+            }
+            "array_has_all" | "list_has_all" => {
+                let literals = extract_array_literals(&func.args[1], array_type.element_type())?;
+                // DataFusion 54's empty-needle fast path currently returns true
+                // even for a NULL haystack, while Paimon/Java ARRAY_CONTAINS_ALL
+                // returns false for NULL arrays. Pushing it would remove rows
+                // before DataFusion can apply its own semantics.
+                if literals.is_empty() {
+                    return None;
+                }
+                self.predicate_builder
+                    .array_contains_all(field.name(), literals)
+                    .ok()?
+            }
+            _ => return None,
+        };
+        Some(TranslatedPredicate {
+            predicate,
+            // Paimon's core residual follows Java Float.compare / Double.compare
+            // and canonicalizes all NaNs. DataFusion's Arrow equality keeps NaN
+            // payloads distinct, so retain its residual for floating arrays.
+            requires_residual: matches!(
+                array_type.element_type(),
+                DataType::Float(_) | DataType::Double(_)
+            ),
+        })
     }
 
     fn translate_like(&self, like: &Like) -> Option<TranslatedPredicate> {
@@ -394,6 +456,36 @@ impl<'a> FilterTranslator<'a> {
 fn extract_scalar_literal(expr: &Expr) -> Option<&ScalarValue> {
     match expr {
         Expr::Literal(scalar, _) if !scalar.is_null() => Some(scalar),
+        _ => None,
+    }
+}
+
+fn extract_array_literals(expr: &Expr, element_type: &DataType) -> Option<Vec<Datum>> {
+    match expr {
+        Expr::ScalarFunction(function) if matches!(function.name(), "make_array" | "make_list") => {
+            function
+                .args
+                .iter()
+                .map(|expr| scalar_to_datum(extract_scalar_literal(expr)?, element_type))
+                .collect()
+        }
+        Expr::Literal(scalar, _) => {
+            let values = match scalar {
+                ScalarValue::List(list) if !list.is_null(0) => list.value(0),
+                ScalarValue::LargeList(list) if !list.is_null(0) => list.value(0),
+                ScalarValue::FixedSizeList(list) if !list.is_null(0) => list.value(0),
+                _ => return None,
+            };
+            (0..values.len())
+                .map(|index| {
+                    let scalar = ScalarValue::try_from_array(values.as_ref(), index).ok()?;
+                    if scalar.is_null() {
+                        return None;
+                    }
+                    scalar_to_datum(&scalar, element_type)
+                })
+                .collect()
+        }
         _ => None,
     }
 }
@@ -546,7 +638,8 @@ mod tests {
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{
-        IntType, LocalZonedTimestampType, Schema, TableSchema, TimeType, TimestampType, VarCharType,
+        ArrayType, FloatType, IntType, LocalZonedTimestampType, PredicateOperator, Schema,
+        TableSchema, TimeType, TimestampType, VarCharType,
     };
     use paimon::table::Table;
 
@@ -566,6 +659,10 @@ mod tests {
                 .column(
                     "lzts_col",
                     DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(9).unwrap()),
+                )
+                .column(
+                    "items",
+                    DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
                 )
                 .partition_keys(["dt", "hr"])
                 .build()
@@ -601,6 +698,83 @@ mod tests {
             }
             other => panic!("expected Leaf, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_translate_datafusion_array_membership_functions() {
+        use datafusion::functions_nested::expr_fn::{
+            array_has, array_has_all, array_has_any, make_array,
+        };
+
+        let column = Expr::Column(Column::from_name("items"));
+        let cases = [
+            (
+                array_has(column.clone(), lit(2)),
+                PredicateOperator::ArrayContains,
+                vec![Datum::Int(2)],
+            ),
+            (
+                array_has_any(column.clone(), make_array(vec![lit(1), lit(3)])),
+                PredicateOperator::ArraysOverlap,
+                vec![Datum::Int(1), Datum::Int(3)],
+            ),
+            (
+                array_has_all(column, make_array(vec![lit(2), lit(2), lit(4)])),
+                PredicateOperator::ArrayContainsAll,
+                vec![Datum::Int(2), Datum::Int(2), Datum::Int(4)],
+            ),
+        ];
+
+        let fields = test_fields();
+        for (filter, expected_op, expected_literals) in cases {
+            let predicate = build_pushed_predicate(&[filter], &fields)
+                .expect("array membership function should translate");
+            assert!(matches!(
+                predicate,
+                Predicate::Leaf { op, literals, .. }
+                    if op == expected_op && literals == expected_literals
+            ));
+        }
+    }
+
+    #[test]
+    fn test_empty_array_has_all_falls_open_for_datafusion_null_semantics() {
+        use datafusion::functions_nested::expr_fn::{array_has_all, make_array};
+
+        let filter = array_has_all(
+            Expr::Column(Column::from_name("items")),
+            make_array(Vec::<Expr>::new()),
+        );
+        let fields = test_fields();
+
+        assert!(build_pushed_predicate(std::slice::from_ref(&filter), &fields).is_none());
+        assert_eq!(
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
+            TableProviderFilterPushDown::Unsupported
+        );
+    }
+
+    #[test]
+    fn test_float_array_membership_keeps_datafusion_residual() {
+        use datafusion::functions_nested::expr_fn::array_has;
+
+        let fields = vec![DataField::new(
+            1,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )];
+        let filter = array_has(
+            Expr::Column(Column::from_name("items")),
+            lit(f32::from_bits(0x7fc0_1234)),
+        );
+        let analysis = analyze_filters(std::slice::from_ref(&filter), &fields, true);
+
+        assert!(analysis.pushed_predicate.is_some());
+        assert!(analysis.requires_residual);
+        assert_eq!(
+            classify_filter_pushdown(&filter, &fields, true, |_| true),
+            TableProviderFilterPushDown::Inexact
+        );
     }
 
     #[test]

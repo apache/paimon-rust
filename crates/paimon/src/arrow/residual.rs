@@ -49,9 +49,9 @@ use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, Predi
 use crate::Error;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
-    StringArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    LargeListArray, ListArray, RecordBatch, Scalar, StringArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
@@ -327,6 +327,14 @@ pub(crate) fn evaluate_exact_leaf_predicate(
     op: PredicateOperator,
     literals: &[Datum],
 ) -> Result<BooleanArray, ArrowError> {
+    if matches!(
+        op,
+        PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
+    ) {
+        return evaluate_array_membership_predicate(array, data_type, op, literals);
+    }
     // Decimals are compared by mathematical value across scales (Paimon
     // `datum_cmp`/`decimal_cmp`). Arrow scalar comparison requires the literal to
     // be representable at the column scale, which fails for a finer-scale literal
@@ -377,6 +385,176 @@ pub(crate) fn evaluate_exact_leaf_predicate(
         }
         PredicateOperator::Between | PredicateOperator::NotBetween => {
             evaluate_between_predicate(array, data_type, op, literals)
+        }
+        PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => unreachable!("handled before scalar dispatch"),
+    }
+}
+
+fn evaluate_array_membership_predicate(
+    array: &ArrayRef,
+    data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> Result<BooleanArray, ArrowError> {
+    let DataType::Array(array_type) = data_type else {
+        return Err(ArrowError::ComputeError(format!(
+            "array predicate {op} requires an ARRAY column, got {data_type:?}"
+        )));
+    };
+    if matches!(op, PredicateOperator::ArrayContains) && literals.len() != 1 {
+        return Err(unconvertible_literal_error(op, data_type));
+    }
+
+    #[derive(Clone, Copy)]
+    enum ListLayout<'a> {
+        List(&'a ListArray),
+        Large(&'a LargeListArray),
+        Fixed(&'a FixedSizeListArray),
+    }
+    let layout = if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+        ListLayout::List(list)
+    } else if let Some(list) = array.as_any().downcast_ref::<LargeListArray>() {
+        ListLayout::Large(list)
+    } else if let Some(list) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        ListLayout::Fixed(list)
+    } else {
+        return Err(ArrowError::ComputeError(format!(
+            "array predicate {op} requires an Arrow list array, got {:?}",
+            array.data_type()
+        )));
+    };
+    let values = match layout {
+        ListLayout::List(list) => list.values(),
+        ListLayout::Large(list) => list.values(),
+        ListLayout::Fixed(list) => list.values(),
+    };
+
+    let mut row_ranges = Vec::with_capacity(array.len());
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            row_ranges.push(None);
+            continue;
+        }
+        let (start, end) = match layout {
+            ListLayout::List(list) => {
+                let offsets = list.value_offsets();
+                (
+                    usize::try_from(offsets[row]),
+                    usize::try_from(offsets[row + 1]),
+                )
+            }
+            ListLayout::Large(list) => {
+                let offsets = list.value_offsets();
+                (
+                    usize::try_from(offsets[row]),
+                    usize::try_from(offsets[row + 1]),
+                )
+            }
+            ListLayout::Fixed(list) => {
+                let start = usize::try_from(list.value_offset(row));
+                let end = usize::try_from(list.value_offset(row) + list.value_length());
+                (start, end)
+            }
+        };
+        let (start, end) = match (start, end) {
+            (Ok(start), Ok(end)) => (start, end),
+            _ => {
+                return Err(ArrowError::ComputeError(
+                    "array predicate encountered a negative list offset".to_string(),
+                ))
+            }
+        };
+        row_ranges.push(Some((start, end)));
+    }
+
+    // Fold one child mask at a time. Besides bounding temporary memory to one
+    // flattened-child mask, the specialized equality below preserves Java's
+    // Float.compare / Double.compare NaN semantics and decimal by-value
+    // comparison for nested elements.
+    let contains_all = matches!(op, PredicateOperator::ArrayContainsAll);
+    let mut result = row_ranges
+        .iter()
+        .map(|range| range.is_some() && contains_all)
+        .collect::<Vec<_>>();
+    for literal in literals {
+        let mask = evaluate_array_element_equality(values, array_type.element_type(), literal, op)?;
+        for (row, range) in row_ranges.iter().enumerate() {
+            let Some((start, end)) = range else {
+                continue;
+            };
+            if (contains_all && !result[row]) || (!contains_all && result[row]) {
+                continue;
+            }
+            let matches_literal = (*start..*end).any(|element| mask.value(element));
+            if contains_all {
+                result[row] &= matches_literal;
+            } else {
+                result[row] |= matches_literal;
+            }
+        }
+    }
+    Ok(BooleanArray::from(result))
+}
+
+fn evaluate_array_element_equality(
+    values: &ArrayRef,
+    element_type: &DataType,
+    literal: &Datum,
+    op: PredicateOperator,
+) -> Result<BooleanArray, ArrowError> {
+    match element_type {
+        DataType::Float(_) => {
+            let expected = float32_literal(literal)
+                .ok_or_else(|| unconvertible_literal_error(op, element_type))?;
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    ArrowError::ComputeError(
+                        "FLOAT array elements require an Arrow Float32Array".to_string(),
+                    )
+                })?;
+            Ok(BooleanArray::from_iter(values.iter().map(|value| {
+                Some(value.is_some_and(|value| {
+                    (value.is_nan() && expected.is_nan()) || value.to_bits() == expected.to_bits()
+                }))
+            })))
+        }
+        DataType::Double(_) => {
+            let expected = float64_literal(literal)
+                .ok_or_else(|| unconvertible_literal_error(op, element_type))?;
+            let values = values
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    ArrowError::ComputeError(
+                        "DOUBLE array elements require an Arrow Float64Array".to_string(),
+                    )
+                })?;
+            Ok(BooleanArray::from_iter(values.iter().map(|value| {
+                Some(value.is_some_and(|value| {
+                    (value.is_nan() && expected.is_nan()) || value.to_bits() == expected.to_bits()
+                }))
+            })))
+        }
+        DataType::Decimal(_) => Ok(sanitize_filter_mask(evaluate_decimal_leaf(
+            values,
+            PredicateOperator::Eq,
+            std::slice::from_ref(literal),
+        )?)),
+        _ => {
+            let Some(scalar) = literal_scalar_for_arrow_filter(literal, element_type)
+                .map_err(|error| ArrowError::ComputeError(error.to_string()))?
+            else {
+                return Err(unconvertible_literal_error(op, element_type));
+            };
+            Ok(sanitize_filter_mask(evaluate_column_predicate(
+                values,
+                &scalar,
+                PredicateOperator::Eq,
+            )?))
         }
     }
 }
@@ -743,7 +921,10 @@ fn evaluate_column_predicate(
         | PredicateOperator::In
         | PredicateOperator::NotIn
         | PredicateOperator::Between
-        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::NotBetween
+        | PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => Ok(BooleanArray::new_null(column.len())),
     }
 }
 
@@ -991,7 +1172,13 @@ fn float64_literal(literal: &Datum) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{row_id_leaf, IntType, VarCharType, ROW_ID_FIELD_NAME};
+    use crate::spec::{
+        row_id_leaf, ArrayType, DecimalType, DoubleType, FloatType, IntType, VarCharType,
+        ROW_ID_FIELD_NAME,
+    };
+    use arrow_array::builder::{
+        Decimal128Builder, Float32Builder, Float64Builder, Int32Builder, ListBuilder,
+    };
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
@@ -1047,6 +1234,175 @@ mod tests {
             true,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+    }
+
+    fn int_list_array() -> ArrayRef {
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
+        let mut builder = ListBuilder::new(Int32Builder::new()).with_field(element);
+
+        builder.values().append_value(1);
+        builder.values().append_null();
+        builder.values().append_value(2);
+        builder.values().append_value(2);
+        builder.append(true);
+
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+
+        builder.append(true); // empty array
+        builder.append(false); // null array
+        Arc::new(builder.finish())
+    }
+
+    fn bool_values(mask: &BooleanArray) -> Vec<bool> {
+        mask.iter().map(|value| value.unwrap_or(false)).collect()
+    }
+
+    #[test]
+    fn test_array_membership_predicates_match_java_multivalue_semantics() {
+        let array = int_list_array();
+        let data_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
+
+        let contains = evaluate_exact_leaf_predicate(
+            &array,
+            &data_type,
+            PredicateOperator::ArrayContains,
+            &[Datum::Int(2)],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&contains), vec![true, true, false, false]);
+
+        let overlap = evaluate_exact_leaf_predicate(
+            &array,
+            &data_type,
+            PredicateOperator::ArraysOverlap,
+            &[Datum::Int(9), Datum::Int(2), Datum::Int(2)],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&overlap), vec![true, true, false, false]);
+
+        let contains_all = evaluate_exact_leaf_predicate(
+            &array,
+            &data_type,
+            PredicateOperator::ArrayContainsAll,
+            &[Datum::Int(1), Datum::Int(2), Datum::Int(1)],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&contains_all), vec![true, false, false, false]);
+
+        let contains_all_empty = evaluate_exact_leaf_predicate(
+            &array,
+            &data_type,
+            PredicateOperator::ArrayContainsAll,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            bool_values(&contains_all_empty),
+            vec![true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn test_array_membership_uses_java_nan_and_signed_zero_semantics() {
+        let float_element = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut floats = ListBuilder::new(Float32Builder::new()).with_field(float_element);
+        floats.values().append_value(f32::from_bits(0x7fc0_0001));
+        floats.append(true);
+        floats.values().append_value(0.0);
+        floats.append(true);
+        floats.values().append_value(-0.0);
+        floats.append(true);
+        let floats: ArrayRef = Arc::new(floats.finish());
+        let float_type = DataType::Array(ArrayType::new(DataType::Float(FloatType::new())));
+
+        let nan = evaluate_exact_leaf_predicate(
+            &floats,
+            &float_type,
+            PredicateOperator::ArrayContains,
+            &[Datum::Float(f32::from_bits(0xffc0_1234))],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&nan), vec![true, false, false]);
+        let positive_zero = evaluate_exact_leaf_predicate(
+            &floats,
+            &float_type,
+            PredicateOperator::ArrayContains,
+            &[Datum::Float(0.0)],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&positive_zero), vec![false, true, false]);
+
+        let double_element = Arc::new(ArrowField::new("element", ArrowDataType::Float64, true));
+        let mut doubles = ListBuilder::new(Float64Builder::new()).with_field(double_element);
+        doubles
+            .values()
+            .append_value(f64::from_bits(0x7ff8_0000_0000_0001));
+        doubles.append(true);
+        doubles.values().append_value(-0.0);
+        doubles.append(true);
+        let doubles: ArrayRef = Arc::new(doubles.finish());
+        let double_type = DataType::Array(ArrayType::new(DataType::Double(DoubleType::new())));
+        let double_nan = evaluate_exact_leaf_predicate(
+            &doubles,
+            &double_type,
+            PredicateOperator::ArraysOverlap,
+            &[Datum::Double(f64::from_bits(0xfff8_0000_0000_4321))],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&double_nan), vec![true, false]);
+    }
+
+    #[test]
+    fn test_decimal_array_membership_compares_by_value_across_scales() {
+        let decimal_arrow_type = ArrowDataType::Decimal128(10, 2);
+        let element = Arc::new(ArrowField::new("element", decimal_arrow_type.clone(), true));
+        let values = Decimal128Builder::new().with_data_type(decimal_arrow_type);
+        let mut decimals = ListBuilder::new(values).with_field(element);
+        decimals.values().append_value(100);
+        decimals.values().append_value(200);
+        decimals.append(true);
+        decimals.values().append_value(110);
+        decimals.append(true);
+        decimals.append(false);
+        let decimals: ArrayRef = Arc::new(decimals.finish());
+        let decimal_type = DataType::Array(ArrayType::new(DataType::Decimal(
+            DecimalType::new(10, 2).unwrap(),
+        )));
+
+        let contains = evaluate_exact_leaf_predicate(
+            &decimals,
+            &decimal_type,
+            PredicateOperator::ArrayContains,
+            &[Datum::Decimal {
+                unscaled: 10,
+                precision: 2,
+                scale: 1,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&contains), vec![true, false, false]);
+
+        let contains_all = evaluate_exact_leaf_predicate(
+            &decimals,
+            &decimal_type,
+            PredicateOperator::ArrayContainsAll,
+            &[
+                Datum::Decimal {
+                    unscaled: 1,
+                    precision: 1,
+                    scale: 0,
+                },
+                Datum::Decimal {
+                    unscaled: 2,
+                    precision: 1,
+                    scale: 0,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&contains_all), vec![true, false, false]);
     }
 
     fn int_values(batch: &RecordBatch) -> Vec<i32> {

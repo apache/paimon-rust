@@ -903,6 +903,9 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::Like
             | PredicateOperator::Between
             | PredicateOperator::NotBetween
+            | PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
     )
 }
 
@@ -962,6 +965,27 @@ fn parquet_row_filter_literals_supported(
             for literal in literals {
                 if crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
                     .is_none()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => {
+            let DataType::Array(array_type) = file_data_type else {
+                return Ok(false);
+            };
+            if matches!(op, PredicateOperator::ArrayContains) && literals.len() != 1 {
+                return Ok(false);
+            }
+            for literal in literals {
+                if crate::arrow::residual::literal_scalar_for_arrow_filter(
+                    literal,
+                    array_type.element_type(),
+                )?
+                .is_none()
                 {
                     return Ok(false);
                 }

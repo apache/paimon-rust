@@ -69,6 +69,15 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::NotIn => {
             return true;
         }
+        PredicateOperator::ArrayContains => {
+            return all_null != Some(true);
+        }
+        PredicateOperator::ArraysOverlap => {
+            return !literals.is_empty() && all_null != Some(true);
+        }
+        PredicateOperator::ArrayContainsAll => {
+            return all_null != Some(true);
+        }
         PredicateOperator::EndsWith | PredicateOperator::Contains => {
             // String min/max ordering carries no information about suffix /
             // substring matches, so fail open.
@@ -203,7 +212,10 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
         | PredicateOperator::Between
-        | PredicateOperator::NotBetween => true,
+        | PredicateOperator::NotBetween
+        | PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => true,
     }
 }
 
@@ -301,7 +313,10 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
         | PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
-        | PredicateOperator::Like => false,
+        | PredicateOperator::Like
+        | PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => false,
     }
 }
 
@@ -904,6 +919,25 @@ mod tests {
             &dt,
             PredicateOperator::NotBetween,
             &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn array_contains_prunes_all_null_file_like_java() {
+        let dt = DataType::Array(crate::spec::ArrayType::new(DataType::Int(IntType::new())));
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(10),
+            min: None,
+            max: None,
+        };
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::ArrayContains,
+            &[Datum::Int(1)],
             &stats,
         ));
     }

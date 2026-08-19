@@ -274,6 +274,12 @@ impl BitmapGlobalIndexReader {
             return self.is_not_null().await;
         }
         match op {
+            PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Scalar bitmap index does not support {op}"),
+            )),
             PredicateOperator::Eq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.equal(&key, data_type).await
@@ -654,7 +660,7 @@ async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io:
         BlockCompressionType::None => Ok(block_bytes.to_vec()),
         BlockCompressionType::Zstd => {
             let mut cursor = Cursor::new(block_bytes);
-            let uncompressed_size = decode_var_int(&mut cursor)? as usize;
+            let uncompressed_size = decode_uncompressed_size(&mut cursor)?;
             let compressed_start = cursor.position() as usize;
             let compressed_data = &block_bytes[compressed_start..];
             let mut decompressed = vec![0u8; uncompressed_size];
@@ -670,14 +676,80 @@ async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io:
             }
             Ok(decompressed)
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "Bitmap global index compression type {:?} is not supported",
-                compression_type
-            ),
-        )),
+        BlockCompressionType::Lz4 | BlockCompressionType::Lzo => {
+            let mut cursor = Cursor::new(block_bytes);
+            let uncompressed_size = decode_uncompressed_size(&mut cursor)?;
+            let compressed_start = cursor.position() as usize;
+            decompress_java_header_block(
+                &block_bytes[compressed_start..],
+                uncompressed_size,
+                compression_type,
+            )
+        }
     }
+}
+
+fn decode_uncompressed_size(input: &mut impl Read) -> io::Result<usize> {
+    let size = decode_var_int(input)?;
+    usize::try_from(size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid bitmap block uncompressed size: {size}"),
+        )
+    })
+}
+
+/// Decode Java's LZ4/LZO block envelope:
+/// `[compressed_len: i32 LE][original_len: i32 LE][raw codec payload]`.
+fn decompress_java_header_block(
+    block: &[u8],
+    expected_size: usize,
+    compression_type: BlockCompressionType,
+) -> io::Result<Vec<u8>> {
+    if block.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Compressed bitmap block is shorter than the Java codec header",
+        ));
+    }
+    let compressed_len = i32::from_le_bytes(block[..4].try_into().unwrap());
+    let original_len = i32::from_le_bytes(block[4..8].try_into().unwrap());
+    let (compressed_len, original_len) = match (
+        usize::try_from(compressed_len),
+        usize::try_from(original_len),
+    ) {
+        (Ok(compressed_len), Ok(original_len))
+            if original_len == expected_size
+                && compressed_len <= block.len().saturating_sub(8)
+                && ((original_len == 0) == (compressed_len == 0)) =>
+        {
+            (compressed_len, original_len)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid Java LZ4/LZO bitmap block lengths",
+            ))
+        }
+    };
+    let payload = &block[8..8 + compressed_len];
+    let decompressed = match compression_type {
+        BlockCompressionType::Lz4 => lz4_flex::block::decompress(payload, original_len)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        BlockCompressionType::Lzo => lzokay_native::decompress_all(payload, Some(original_len))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        _ => unreachable!("only Java header codecs use this decoder"),
+    };
+    if decompressed.len() != original_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Bitmap block decompressed size mismatch: expected {original_len}, got {}",
+                decompressed.len()
+            ),
+        ));
+    }
+    Ok(decompressed)
 }
 
 fn compute_crc32(data: &[u8], compression_type: BlockCompressionType) -> u32 {
@@ -1045,6 +1117,68 @@ mod tests {
             entries.extend(reader.read_dictionary_block(block.block).await.unwrap());
         }
         (reader, entries)
+    }
+
+    fn java_codec_envelope(compressed: &[u8], original_len: usize) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(8 + compressed.len());
+        encoded.extend_from_slice(&i32::try_from(compressed.len()).unwrap().to_le_bytes());
+        encoded.extend_from_slice(&i32::try_from(original_len).unwrap().to_le_bytes());
+        encoded.extend_from_slice(compressed);
+        encoded
+    }
+
+    #[tokio::test]
+    async fn test_decode_java_lz4_and_lzo_bitmap_blocks() {
+        use base64::Engine;
+
+        let original = b"java-compatible multivalue bitmap block".repeat(16);
+
+        let lz4 = lz4_flex::block::compress(&original);
+        assert_eq!(
+            decompress_java_header_block(
+                &java_codec_envelope(&lz4, original.len()),
+                original.len(),
+                BlockCompressionType::Lz4,
+            )
+            .unwrap(),
+            original
+        );
+
+        // Produced by Airlift 2.0.3 `LzoCompressor`, the implementation used
+        // by Java Paimon. Keep this as a cross-language golden rather than a
+        // Rust self-roundtrip.
+        let lzo = base64::engine::general_purpose::STANDARD
+            .decode("OGphdmEtY29tcGF0aWJsZSBtdWx0aXZhbHVlIGJpdG1hcCBibG9jayAAACWYAAJibG9jaxEAAA==")
+            .unwrap();
+        assert_eq!(
+            decompress_java_header_block(
+                &java_codec_envelope(&lzo, original.len()),
+                original.len(),
+                BlockCompressionType::Lzo,
+            )
+            .unwrap(),
+            original
+        );
+
+        let mut block = Vec::new();
+        encode_var_int(&mut block, i32::try_from(original.len()).unwrap()).unwrap();
+        block.extend_from_slice(&java_codec_envelope(&lzo, original.len()));
+        let block_len = block.len();
+        let crc = compute_crc32(&block, BlockCompressionType::Lzo);
+        block.push(BlockCompressionType::Lzo as u8);
+        block.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            read_compressible_block(
+                &BytesFileRead(Bytes::from(block)),
+                BlockInfo {
+                    offset: 0,
+                    length: block_len,
+                },
+            )
+            .await
+            .unwrap(),
+            original
+        );
     }
 
     #[test]

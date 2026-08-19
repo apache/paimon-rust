@@ -296,7 +296,10 @@ fn build_orc_leaf_predicate(
         | PredicateOperator::Contains
         | PredicateOperator::Like
         | PredicateOperator::Between
-        | PredicateOperator::NotBetween => None,
+        | PredicateOperator::NotBetween
+        | PredicateOperator::ArrayContains
+        | PredicateOperator::ArraysOverlap
+        | PredicateOperator::ArrayContainsAll => None,
     }
 }
 
