@@ -966,7 +966,8 @@ CALL sys.create_global_index(
 CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'tags',
-  index_type => 'multivalue'
+  index_type => 'multivalue',
+  options => 'multivalue-index.dictionary-block-size=16kb,multivalue-index.compression=zstd,multivalue-index.compression-level=1'
 );
 ```
 
@@ -976,8 +977,12 @@ Multivalue global indexes support `ARRAY` columns whose element type is supporte
 by sorted indexes, and accelerate `array_has`/`array_contains`,
 `array_has_any`/`arrays_overlap`, and `array_has_all` predicates. Null arrays,
 empty arrays, and null elements do not create postings; duplicate elements in a
-row are indexed once. These index types do not accept the `options` argument yet.
-Bitmap and multivalue global indexes use Java-compatible bitmap files.
+row are indexed once. Multivalue indexes accept `sorted-index.records-per-range`,
+`multivalue-index.dictionary-block-size`, `multivalue-index.compression`
+(`none`, `zstd`, `lz4`, or `lzo`), and
+`multivalue-index.compression-level`. Per-call options override table options.
+BTree and bitmap indexes do not accept the `options` argument yet. Bitmap and
+multivalue global indexes use Java-compatible bitmap files.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables

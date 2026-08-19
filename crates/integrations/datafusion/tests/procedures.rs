@@ -140,6 +140,25 @@ async fn setup_btree_global_index_table(
     (tmp, sql_context)
 }
 
+async fn setup_multivalue_global_index_table(
+    table_name: &str,
+) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        &format!(
+            "CREATE TABLE paimon.test_db.{table_name} (id INT, tags ARRAY<INT>) WITH (\
+                'row-tracking.enabled' = 'true',\
+                'data-evolution.enabled' = 'true',\
+                'global-index.enabled' = 'true',\
+                'sorted-index.records-per-range' = '10'\
+            )"
+        ),
+    )
+    .await;
+    (tmp, sql_context)
+}
+
 /// An `ARRAY<FLOAT>` table configured so the pure-Rust `ivf-flat` builder can
 /// train and commit an index without a native library.
 async fn setup_vindex_global_index_table(
@@ -214,6 +233,47 @@ async fn test_create_global_index_rejects_options() {
         "options are not supported",
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_create_multivalue_global_index_accepts_java_options() {
+    let (_tmp, sql_context) = setup_multivalue_global_index_table("multivalue_options").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.multivalue_options (id, tags) VALUES \
+         (1, [1, 2]), (2, [2, 3]), (3, [4])",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(\
+            table => 'test_db.multivalue_options', \
+            index_column => 'tags', \
+            index_type => 'multivalue', \
+            options => 'sorted-index.records-per-range=1,multivalue-index.dictionary-block-size=1kb,multivalue-index.compression=lz4,multivalue-index.compression-level=1'\
+        )",
+    )
+    .await;
+
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`multivalue_options$table_indexes` \
+             WHERE index_type = 'multivalue' AND index_field_name = 'tags'",
+        )
+        .await,
+        3,
+        "per-call sorted-index.records-per-range must override the table value"
+    );
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.multivalue_options WHERE array_has(tags, 2)",
+        )
+        .await,
+        2
+    );
 }
 
 /// `index_type` was matched case-insensitively for btree/bitmap but exactly for

@@ -44,9 +44,90 @@ use std::collections::HashMap;
 const INDEX_DIR: &str = "index";
 const BTREE_BLOCK_SIZE: usize = 4 * 1024;
 const BITMAP_DICTIONARY_BLOCK_SIZE: usize = 16 * 1024;
+const MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION: &str = "multivalue-index.dictionary-block-size";
+const MULTIVALUE_COMPRESSION_OPTION: &str = "multivalue-index.compression";
+const MULTIVALUE_COMPRESSION_LEVEL_OPTION: &str = "multivalue-index.compression-level";
+const DEFAULT_MULTIVALUE_COMPRESSION_LEVEL: i32 = 1;
 
 type BTreeKeyRow = (Option<Vec<u8>>, i64);
 type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MultivalueIndexWriteOptions {
+    dictionary_block_size: usize,
+    compression_type: BlockCompressionType,
+    compression_level: i32,
+}
+
+impl MultivalueIndexWriteOptions {
+    fn from_options(options: &HashMap<String, String>) -> Result<Self> {
+        let dictionary_block_size = match options.get(MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION) {
+            Some(raw) => {
+                let bytes = crate::common::options::parse_memory_size(raw).map_err(|_| {
+                    Error::DataInvalid {
+                        message: format!(
+                            "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' must be a valid memory size, got: {raw}"
+                        ),
+                        source: None,
+                    }
+                })?;
+                if bytes <= 0 {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' must be greater than 0, got: {raw}"
+                        ),
+                        source: None,
+                    });
+                }
+                usize::try_from(bytes).map_err(|_| Error::DataInvalid {
+                    message: format!(
+                        "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' is too large: {raw}"
+                    ),
+                    source: None,
+                })?
+            }
+            None => BITMAP_DICTIONARY_BLOCK_SIZE,
+        };
+        let compression_type = match options
+            .get(MULTIVALUE_COMPRESSION_OPTION)
+            .map(String::as_str)
+            .unwrap_or("none")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => BlockCompressionType::None,
+            "zstd" => BlockCompressionType::Zstd,
+            "lz4" => BlockCompressionType::Lz4,
+            "lzo" => BlockCompressionType::Lzo,
+            compression => {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Option '{MULTIVALUE_COMPRESSION_OPTION}' must be one of none, zstd, lz4, or lzo, got: {compression}"
+                    ),
+                    source: None,
+                })
+            }
+        };
+        let compression_level = options
+            .get(MULTIVALUE_COMPRESSION_LEVEL_OPTION)
+            .map(|raw| {
+                raw.parse::<i32>().map_err(|_| Error::DataInvalid {
+                    message: format!(
+                        "Option '{MULTIVALUE_COMPRESSION_LEVEL_OPTION}' must be an integer, got: {raw}"
+                    ),
+                    source: None,
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MULTIVALUE_COMPRESSION_LEVEL);
+        Ok(Self {
+            dictionary_block_size,
+            compression_type,
+            compression_level,
+        })
+    }
+}
 
 fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
     match index_type {
@@ -63,6 +144,7 @@ pub struct BTreeGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
+    options: HashMap<String, String>,
 }
 
 impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
@@ -71,6 +153,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            options: HashMap::new(),
         }
     }
 
@@ -81,6 +164,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 
     pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
         self.index_type = index_type.to_string();
+        self
+    }
+
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
         self
     }
 
@@ -106,9 +194,24 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        let core_options = CoreOptions::new(self.table.schema().options());
+        if index_type != MULTIVALUE_GLOBAL_INDEX_TYPE && !self.options.is_empty() {
+            return Err(Error::Unsupported {
+                message: "Sorted global index build options are currently supported only for multivalue indexes"
+                    .to_string(),
+            });
+        }
+        let mut resolved_options = self.table.schema().options().clone();
+        resolved_options.extend(self.options.clone());
+        let core_options = CoreOptions::new(&resolved_options);
         validate_table_options(self.table, &core_options)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
+        let multivalue_write_options = if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+            Some(MultivalueIndexWriteOptions::from_options(
+                &resolved_options,
+            )?)
+        } else {
+            None
+        };
 
         let index_field = find_index_field(self.table, index_column)?;
         index_key_type(index_type, index_field)?;
@@ -172,7 +275,12 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = self
-                .build_index_file(&shard, index_field, index_column)
+                .build_index_file(
+                    &shard,
+                    index_field,
+                    index_column,
+                    multivalue_write_options.as_ref(),
+                )
                 .await?;
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
@@ -199,6 +307,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         shard: &BTreeGlobalIndexShard,
         index_field: &DataField,
         index_column: &str,
+        multivalue_write_options: Option<&MultivalueIndexWriteOptions>,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -294,10 +403,13 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 (row_count, meta)
             }
             MULTIVALUE_GLOBAL_INDEX_TYPE => {
-                let mut writer = BitmapGlobalIndexWriter::new(
+                let options = multivalue_write_options
+                    .expect("multivalue writer options were resolved before building shards");
+                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
                     writer,
-                    BITMAP_DICTIONARY_BLOCK_SIZE,
-                    BlockCompressionType::None,
+                    options.dictionary_block_size,
+                    options.compression_type,
+                    options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -1099,6 +1211,58 @@ mod tests {
                 records_per_range.to_string(),
             ),
         ])
+    }
+
+    #[test]
+    fn test_multivalue_write_options_match_java_defaults_and_overrides() {
+        assert_eq!(
+            MultivalueIndexWriteOptions::from_options(&HashMap::new()).unwrap(),
+            MultivalueIndexWriteOptions {
+                dictionary_block_size: 16 * 1024,
+                compression_type: BlockCompressionType::None,
+                compression_level: 1,
+            }
+        );
+
+        let options = HashMap::from([
+            (
+                MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION.to_string(),
+                "32kb".to_string(),
+            ),
+            (MULTIVALUE_COMPRESSION_OPTION.to_string(), "LZ4".to_string()),
+            (
+                MULTIVALUE_COMPRESSION_LEVEL_OPTION.to_string(),
+                "7".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            MultivalueIndexWriteOptions::from_options(&options).unwrap(),
+            MultivalueIndexWriteOptions {
+                dictionary_block_size: 32 * 1024,
+                compression_type: BlockCompressionType::Lz4,
+                compression_level: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn test_multivalue_write_options_reject_invalid_values() {
+        for (key, value) in [
+            (MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION, "0"),
+            (MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION, "invalid"),
+            (MULTIVALUE_COMPRESSION_OPTION, "snappy"),
+            (MULTIVALUE_COMPRESSION_LEVEL_OPTION, "fast"),
+        ] {
+            let error = MultivalueIndexWriteOptions::from_options(&HashMap::from([(
+                key.to_string(),
+                value.to_string(),
+            )]))
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::DataInvalid { ref message, .. } if message.contains(key)),
+                "{key}={value}: {error}"
+            );
+        }
     }
 
     fn test_table(options: HashMap<String, String>) -> Table {
