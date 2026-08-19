@@ -56,7 +56,6 @@ mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
-mod multivalue_global_index;
 mod partition_filter;
 mod partition_stat;
 #[cfg(feature = "fulltext")]

@@ -22,7 +22,6 @@ use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
-use super::multivalue_global_index::serialize_multivalue_index_meta;
 use crate::btree::key_serde::KeyComparator;
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
 use crate::spec::{
@@ -338,11 +337,6 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             });
         }
 
-        let serialized_index_meta = if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
-            serialize_multivalue_index_meta(&index_meta, key_type)?
-        } else {
-            index_meta.serialize()
-        };
         let status = self.table.file_io().get_status(&index_path).await?;
         Ok(IndexFileMeta {
             index_type: index_type.to_string(),
@@ -359,7 +353,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 index_field_id: index_field.id(),
                 extra_field_ids: None,
                 source_meta: None,
-                index_meta: Some(serialized_index_meta),
+                index_meta: Some(index_meta.serialize()),
             }),
         })
     }
@@ -1031,6 +1025,7 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::BTreeIndexMeta;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
@@ -2176,13 +2171,10 @@ mod tests {
         assert_eq!(index_file.index_type, MULTIVALUE_GLOBAL_INDEX_TYPE);
         assert_eq!(index_file.row_count, 5, "source rows, not postings");
         let global_meta = index_file.global_index_meta.as_ref().unwrap();
+        let serialized_meta = global_meta.index_meta.as_deref().unwrap();
+        let sorted_meta = BTreeIndexMeta::deserialize(serialized_meta).unwrap();
+        assert_eq!(serialized_meta, sorted_meta.serialize());
         let element_type = DataType::Int(IntType::new());
-        assert!(
-            super::super::multivalue_global_index::has_compatible_element_type(
-                global_meta.index_meta.as_deref(),
-                &element_type,
-            )
-        );
 
         let index_path = format!("{table_path}/index/{}", index_file.file_name);
         let input = table.file_io().new_input(&index_path).unwrap();

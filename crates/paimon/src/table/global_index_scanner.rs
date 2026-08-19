@@ -28,7 +28,6 @@ use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
-use super::multivalue_global_index::has_compatible_element_type;
 use crate::btree::query::{extract_between, BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::deletion_vector::DeletionVectorFactory;
@@ -152,7 +151,6 @@ struct GlobalIndexEntry {
     file_size: i64,
     row_range_start: i64,
     meta: BTreeIndexMeta,
-    multivalue_element_type_compatible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,20 +371,6 @@ impl GlobalIndexScanner {
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
                 meta: sorted_meta,
-                multivalue_element_type_compatible: if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
-                    schema_fields
-                        .iter()
-                        .find(|field| field.id() == global_meta.index_field_id)
-                        .and_then(|field| match field.data_type() {
-                            DataType::Array(array) => Some(array.element_type()),
-                            _ => None,
-                        })
-                        .is_some_and(|element_type| {
-                            has_compatible_element_type(Some(index_meta), element_type)
-                        })
-                } else {
-                    true
-                },
             };
 
             let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
@@ -453,16 +437,7 @@ impl GlobalIndexScanner {
                         Some(e) => e,
                         None => return Ok(None),
                     };
-                    let Some(schema_data_type) = self.field_data_type(field_id) else {
-                        return Ok(None);
-                    };
-                    if !entries_support_predicate(
-                        entries,
-                        *op,
-                        data_type,
-                        schema_data_type,
-                        literals,
-                    ) {
+                    if !entries_support_predicate(entries, *op, literals) {
                         return Ok(None);
                     }
                     self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
@@ -492,17 +467,7 @@ impl GlobalIndexScanner {
                             if is_sorted_global_index_supported_op(*op) {
                                 if let Some(field_id) = self.find_field_id_by_name(column)? {
                                     if self.entries_for_field(field_id).is_some_and(|entries| {
-                                        self.field_data_type(field_id).is_some_and(
-                                            |schema_data_type| {
-                                                entries_support_predicate(
-                                                    entries,
-                                                    *op,
-                                                    data_type,
-                                                    schema_data_type,
-                                                    literals,
-                                                )
-                                            },
-                                        )
+                                        entries_support_predicate(entries, *op, literals)
                                     }) {
                                         leaf_groups.entry(field_id).or_default().push((
                                             *op,
@@ -1072,13 +1037,6 @@ impl GlobalIndexScanner {
             .map(|(_, entries)| entries.as_slice())
     }
 
-    fn field_data_type(&self, field_id: i32) -> Option<&DataType> {
-        self.schema_fields
-            .iter()
-            .find(|field| field.id() == field_id)
-            .map(DataField::data_type)
-    }
-
     /// Return row ranges not covered by global indexes for this predicate.
     ///
     /// `full` uses `[0, snapshot.next_row_id - 1]`; `detail` uses actual
@@ -1184,26 +1142,15 @@ fn is_multivalue_predicate(op: PredicateOperator) -> bool {
 fn entries_support_predicate(
     entries: &[GlobalIndexEntry],
     op: PredicateOperator,
-    predicate_data_type: &DataType,
-    schema_data_type: &DataType,
     literals: &[Datum],
 ) -> bool {
     if is_multivalue_predicate(op) {
         if matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty() {
             return false;
         }
-        let (DataType::Array(predicate_array), DataType::Array(schema_array)) =
-            (predicate_data_type, schema_data_type)
-        else {
-            return false;
-        };
-        if predicate_array.element_type() != schema_array.element_type() {
-            return false;
-        }
-        entries.iter().all(|entry| {
-            entry.index_type == GlobalIndexFileKind::Multivalue
-                && entry.multivalue_element_type_compatible
-        })
+        entries
+            .iter()
+            .all(|entry| entry.index_type == GlobalIndexFileKind::Multivalue)
     } else {
         entries
             .iter()
@@ -1715,32 +1662,6 @@ mod tests {
                 RowRange::new(10, 10),
             ]
         );
-    }
-
-    #[test]
-    fn test_multivalue_index_rejects_stale_predicate_element_type() {
-        let entries = vec![GlobalIndexEntry {
-            file_name: "unused.index".to_string(),
-            index_type: GlobalIndexFileKind::Multivalue,
-            file_size: 0,
-            row_range_start: 0,
-            meta: BTreeIndexMeta::new(None, None, false),
-            multivalue_element_type_compatible: true,
-        }];
-        let predicate_type = DataType::Array(crate::spec::ArrayType::new(DataType::Int(
-            crate::spec::IntType::new(),
-        )));
-        let schema_type = DataType::Array(crate::spec::ArrayType::new(DataType::BigInt(
-            crate::spec::BigIntType::new(),
-        )));
-
-        assert!(!entries_support_predicate(
-            &entries,
-            PredicateOperator::ArrayContains,
-            &predicate_type,
-            &schema_type,
-            &[Datum::Int(1)],
-        ));
     }
 
     #[test]
