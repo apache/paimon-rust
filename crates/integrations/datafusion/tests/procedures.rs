@@ -198,7 +198,7 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
                     index_type => '{index_type}'\
                 )"
             ),
-            "only supports index_type => 'btree', 'bitmap', or vindex types ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann')",
+            "only supports index_type => 'btree', 'bitmap', 'multivalue', or vindex types",
         )
         .await;
     }
