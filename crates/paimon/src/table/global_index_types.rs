@@ -23,12 +23,15 @@ use crate::vindex::{
 
 pub(crate) const BTREE_GLOBAL_INDEX_TYPE: &str = "btree";
 pub(crate) const BITMAP_GLOBAL_INDEX_TYPE: &str = "bitmap";
+pub(crate) const MULTIVALUE_GLOBAL_INDEX_TYPE: &str = "multivalue";
 
 pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'static str> {
     if index_type.eq_ignore_ascii_case(BTREE_GLOBAL_INDEX_TYPE) {
         Some(BTREE_GLOBAL_INDEX_TYPE)
     } else if index_type.eq_ignore_ascii_case(BITMAP_GLOBAL_INDEX_TYPE) {
         Some(BITMAP_GLOBAL_INDEX_TYPE)
+    } else if index_type.eq_ignore_ascii_case(MULTIVALUE_GLOBAL_INDEX_TYPE) {
+        Some(MULTIVALUE_GLOBAL_INDEX_TYPE)
     } else {
         None
     }
@@ -38,7 +41,7 @@ pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'s
 /// Used verbatim in the unsupported-type error of both the builder and the
 /// DataFusion procedure so the two messages stay in sync.
 pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
-    "btree, bitmap, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
+    "btree, bitmap, multivalue, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
 /// `None` if unsupported. Case-insensitive. Order: sorted -> lumina -> vindex.
@@ -86,6 +89,10 @@ mod tests {
         assert_eq!(
             normalize_global_index_type_for_drop("Bitmap"),
             Some("bitmap")
+        );
+        assert_eq!(
+            normalize_global_index_type_for_drop("MultiValue"),
+            Some("multivalue")
         );
     }
 

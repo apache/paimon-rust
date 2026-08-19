@@ -26,7 +26,9 @@ use super::bitmap_global_index_reader::{
 };
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+    MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
+use super::multivalue_global_index::has_compatible_element_type;
 use crate::btree::query::{extract_between, BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::deletion_vector::DeletionVectorFactory;
@@ -150,12 +152,14 @@ struct GlobalIndexEntry {
     file_size: i64,
     row_range_start: i64,
     meta: BTreeIndexMeta,
+    multivalue_element_type_compatible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GlobalIndexFileKind {
     BTree,
     Bitmap,
+    Multivalue,
 }
 
 fn is_floating_point(data_type: &DataType) -> bool {
@@ -192,11 +196,32 @@ fn bitmap_meta_may_match_between(
     }
 }
 
+fn multivalue_meta_may_match(
+    meta: &BTreeIndexMeta,
+    op: PredicateOperator,
+    serialized_literals: &[Vec<u8>],
+    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+) -> bool {
+    match op {
+        PredicateOperator::ArrayContains => {
+            meta.may_match(PredicateOperator::Eq, serialized_literals, cmp)
+        }
+        PredicateOperator::ArraysOverlap => {
+            meta.may_match(PredicateOperator::In, serialized_literals, cmp)
+        }
+        PredicateOperator::ArrayContainsAll => serialized_literals.iter().all(|literal| {
+            meta.may_match(PredicateOperator::Eq, std::slice::from_ref(literal), cmp)
+        }),
+        _ => false,
+    }
+}
+
 impl GlobalIndexFileKind {
     fn name(self) -> &'static str {
         match self {
             Self::BTree => "BTree",
             Self::Bitmap => "bitmap",
+            Self::Multivalue => "multivalue",
         }
     }
 }
@@ -225,7 +250,7 @@ impl FallbackScanPlan {
     fn allowed(self, kind: GlobalIndexFileKind) -> bool {
         match kind {
             GlobalIndexFileKind::BTree => self.allow_btree,
-            GlobalIndexFileKind::Bitmap => self.allow_bitmap,
+            GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => self.allow_bitmap,
         }
     }
 }
@@ -342,11 +367,26 @@ impl GlobalIndexScanner {
                 index_type: match index_type {
                     BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
                     BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
+                    MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
                     _ => unreachable!("normalized sorted global index type"),
                 },
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
                 meta: sorted_meta,
+                multivalue_element_type_compatible: if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+                    schema_fields
+                        .iter()
+                        .find(|field| field.id() == global_meta.index_field_id)
+                        .and_then(|field| match field.data_type() {
+                            DataType::Array(array) => Some(array.element_type()),
+                            _ => None,
+                        })
+                        .is_some_and(|element_type| {
+                            has_compatible_element_type(Some(index_meta), element_type)
+                        })
+                } else {
+                    true
+                },
             };
 
             let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
@@ -413,6 +453,18 @@ impl GlobalIndexScanner {
                         Some(e) => e,
                         None => return Ok(None),
                     };
+                    let Some(schema_data_type) = self.field_data_type(field_id) else {
+                        return Ok(None);
+                    };
+                    if !entries_support_predicate(
+                        entries,
+                        *op,
+                        data_type,
+                        schema_data_type,
+                        literals,
+                    ) {
+                        return Ok(None);
+                    }
                     self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
                         .await
                         .map(|ranges| {
@@ -439,7 +491,19 @@ impl GlobalIndexScanner {
                         {
                             if is_sorted_global_index_supported_op(*op) {
                                 if let Some(field_id) = self.find_field_id_by_name(column)? {
-                                    if self.entries_for_field(field_id).is_some() {
+                                    if self.entries_for_field(field_id).is_some_and(|entries| {
+                                        self.field_data_type(field_id).is_some_and(
+                                            |schema_data_type| {
+                                                entries_support_predicate(
+                                                    entries,
+                                                    *op,
+                                                    data_type,
+                                                    schema_data_type,
+                                                    literals,
+                                                )
+                                            },
+                                        )
+                                    }) {
                                         leaf_groups.entry(field_id).or_default().push((
                                             *op,
                                             literals.as_slice(),
@@ -536,6 +600,27 @@ impl GlobalIndexScanner {
         entries: &[GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<Vec<RowRange>>> {
+        let normalized_predicates = predicates
+            .iter()
+            .map(|(op, literals, data_type)| {
+                let key_type = if is_multivalue_predicate(*op) {
+                    let DataType::Array(array) = data_type else {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "Array global-index predicate {op} requires an ARRAY field type"
+                            ),
+                            source: None,
+                        });
+                    };
+                    array.element_type()
+                } else {
+                    *data_type
+                };
+                Ok((*op, *literals, key_type))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicates = normalized_predicates.as_slice();
+
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 
@@ -587,6 +672,12 @@ impl GlobalIndexScanner {
                                 bitmap_serialized,
                                 bitmap_cmp.as_ref(),
                             ),
+                            GlobalIndexFileKind::Multivalue => multivalue_meta_may_match(
+                                &entry.meta,
+                                *op,
+                                bitmap_serialized,
+                                bitmap_cmp.as_ref(),
+                            ),
                         })
                         .collect()
                 },
@@ -624,6 +715,7 @@ impl GlobalIndexScanner {
                             &bitmap_to,
                             bitmap_cmp.as_ref(),
                         ),
+                        GlobalIndexFileKind::Multivalue => false,
                     })
                     .collect()
             }
@@ -768,7 +860,9 @@ impl GlobalIndexScanner {
             let between = between.expect("evaluated between query is present");
             let serialize_key = match entry.index_type {
                 GlobalIndexFileKind::BTree => serialize_datum,
-                GlobalIndexFileKind::Bitmap => serialize_bitmap_datum,
+                GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => {
+                    serialize_bitmap_datum
+                }
             };
             let from_key = serialize_key(between.from, between.data_type);
             let to_key = serialize_key(between.to, between.data_type);
@@ -877,6 +971,17 @@ impl GlobalIndexScanner {
                     ),
                     source: Some(Box::new(e)),
                 }),
+            GlobalIndexFileKind::Multivalue => self
+                .open_bitmap_reader(entry)
+                .await
+                .map(OpenedGlobalIndexReader::Bitmap)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to open multivalue global index file: {}",
+                        entry.file_name
+                    ),
+                    source: Some(Box::new(e)),
+                }),
         }
     }
 
@@ -929,6 +1034,10 @@ impl GlobalIndexScanner {
                     plan.selected_bitmap += 1;
                     bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
                 }
+                GlobalIndexFileKind::Multivalue => {
+                    plan.selected_bitmap += 1;
+                    bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
+                }
             }
         }
 
@@ -961,6 +1070,13 @@ impl GlobalIndexScanner {
             .iter()
             .find(|(id, _)| *id == field_id)
             .map(|(_, entries)| entries.as_slice())
+    }
+
+    fn field_data_type(&self, field_id: i32) -> Option<&DataType> {
+        self.schema_fields
+            .iter()
+            .find(|field| field.id() == field_id)
+            .map(DataField::data_type)
     }
 
     /// Return row ranges not covered by global indexes for this predicate.
@@ -1050,7 +1166,49 @@ fn is_sorted_global_index_supported_op(op: PredicateOperator) -> bool {
             | PredicateOperator::EndsWith
             | PredicateOperator::Contains
             | PredicateOperator::Like
+            | PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
     )
+}
+
+fn is_multivalue_predicate(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
+    )
+}
+
+fn entries_support_predicate(
+    entries: &[GlobalIndexEntry],
+    op: PredicateOperator,
+    predicate_data_type: &DataType,
+    schema_data_type: &DataType,
+    literals: &[Datum],
+) -> bool {
+    if is_multivalue_predicate(op) {
+        if matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty() {
+            return false;
+        }
+        let (DataType::Array(predicate_array), DataType::Array(schema_array)) =
+            (predicate_data_type, schema_data_type)
+        else {
+            return false;
+        };
+        if predicate_array.element_type() != schema_array.element_type() {
+            return false;
+        }
+        entries.iter().all(|entry| {
+            entry.index_type == GlobalIndexFileKind::Multivalue
+                && entry.multivalue_element_type_compatible
+        })
+    } else {
+        entries
+            .iter()
+            .all(|entry| entry.index_type != GlobalIndexFileKind::Multivalue)
+    }
 }
 
 fn requires_fallback_scan(op: PredicateOperator) -> bool {
@@ -1557,6 +1715,32 @@ mod tests {
                 RowRange::new(10, 10),
             ]
         );
+    }
+
+    #[test]
+    fn test_multivalue_index_rejects_stale_predicate_element_type() {
+        let entries = vec![GlobalIndexEntry {
+            file_name: "unused.index".to_string(),
+            index_type: GlobalIndexFileKind::Multivalue,
+            file_size: 0,
+            row_range_start: 0,
+            meta: BTreeIndexMeta::new(None, None, false),
+            multivalue_element_type_compatible: true,
+        }];
+        let predicate_type = DataType::Array(crate::spec::ArrayType::new(DataType::Int(
+            crate::spec::IntType::new(),
+        )));
+        let schema_type = DataType::Array(crate::spec::ArrayType::new(DataType::BigInt(
+            crate::spec::BigIntType::new(),
+        )));
+
+        assert!(!entries_support_predicate(
+            &entries,
+            PredicateOperator::ArrayContains,
+            &predicate_type,
+            &schema_type,
+            &[Datum::Int(1)],
+        ));
     }
 
     #[test]

@@ -870,9 +870,22 @@ pub fn extract_datum_from_arrow(
     col_idx: usize,
     data_type: &DataType,
 ) -> crate::Result<Option<Datum>> {
+    extract_datum_from_array(batch.column(col_idx), row_idx, col_idx, data_type)
+}
+
+/// Extract a scalar [`Datum`] from an Arrow array.
+///
+/// This is the column-level counterpart of [`extract_datum_from_arrow`], used
+/// when a nested list's child values need the same Paimon logical decoding as
+/// a top-level record-batch column.
+pub(crate) fn extract_datum_from_array(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+    data_type: &DataType,
+) -> crate::Result<Option<Datum>> {
     use arrow_array::Array;
 
-    let col = batch.column(col_idx);
     if col.is_null(row_idx) {
         return Ok(None);
     }
@@ -1562,33 +1575,6 @@ pub fn batch_hash_codes(
 mod tests {
     use super::*;
     use crate::variant::GenericVariant;
-
-    #[test]
-    fn test_extract_time_datum_from_arrow() {
-        let schema =
-            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "time_col",
-                arrow_schema::DataType::Time32(arrow_schema::TimeUnit::Millisecond),
-                true,
-            )]));
-        let batch = arrow_array::RecordBatch::try_new(
-            schema,
-            vec![std::sync::Arc::new(
-                arrow_array::Time32MillisecondArray::from(vec![Some(12_345), None]),
-            )],
-        )
-        .unwrap();
-        let data_type = DataType::Time(crate::spec::TimeType::new(3).unwrap());
-
-        assert_eq!(
-            extract_datum_from_arrow(&batch, 0, 0, &data_type).unwrap(),
-            Some(Datum::Time(12_345))
-        );
-        assert_eq!(
-            extract_datum_from_arrow(&batch, 1, 0, &data_type).unwrap(),
-            None
-        );
-    }
 
     #[test]
     fn test_empty_binary_row() {

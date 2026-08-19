@@ -962,12 +962,22 @@ CALL sys.create_global_index(
   index_column => 'tag',
   index_type => 'bitmap'
 );
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'tags',
+  index_type => 'multivalue'
+);
 ```
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
-whitespace is ignored. BTree and bitmap global indexes support scalar columns
-and do not accept the `options` argument yet. Bitmap global indexes use the same
-on-disk file format as Java Paimon's `BitmapGlobalIndexFormat`.
+whitespace is ignored. BTree and bitmap global indexes support scalar columns.
+Multivalue global indexes support `ARRAY` columns whose element type is supported
+by sorted indexes, and accelerate `array_has`/`array_contains`,
+`array_has_any`/`arrays_overlap`, and `array_has_all` predicates. Null arrays,
+empty arrays, and null elements do not create postings; duplicate elements in a
+row are indexed once. These index types do not accept the `options` argument yet.
+Bitmap and multivalue global indexes use Java-compatible bitmap files.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1110,9 +1120,9 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`, `ivf-pq`,
-`ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is case-insensitive
-and surrounding whitespace is ignored.
+`multivalue`, `lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`,
+`ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
+case-insensitive and surrounding whitespace is ignored.
 
 ### create_lumina_index
 
@@ -1966,7 +1976,7 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name under the table index directory |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |

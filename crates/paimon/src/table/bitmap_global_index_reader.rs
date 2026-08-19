@@ -198,7 +198,36 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
         Ok(())
     }
 
-    pub(crate) async fn finish(mut self) -> io::Result<BitmapWriteResult> {
+    /// Add one normalized multivalue posting without changing source-row
+    /// accounting or the scalar null/non-null bitmaps.
+    pub(crate) fn write_posting(&mut self, key: &[u8], relative_row_id: i64) -> io::Result<()> {
+        if relative_row_id < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Bitmap global index row id must be non-negative: {relative_row_id}"),
+            ));
+        }
+        let row_id = relative_row_id as u64;
+        self.bitmaps.entry(key.to_vec()).or_default().insert(row_id);
+        self.update_min_max(key);
+        Ok(())
+    }
+
+    pub(crate) async fn finish(self) -> io::Result<BitmapWriteResult> {
+        let row_count = self.row_count;
+        self.finish_with_row_count(row_count).await
+    }
+
+    /// Finish a zero-to-many-key index while reporting the number of source
+    /// rows covered by the file rather than the number of emitted postings.
+    pub(crate) async fn finish_with_source_row_count(
+        self,
+        source_row_count: u64,
+    ) -> io::Result<BitmapWriteResult> {
+        self.finish_with_row_count(source_row_count).await
+    }
+
+    async fn finish_with_row_count(mut self, row_count: u64) -> io::Result<BitmapWriteResult> {
         let mut bitmaps = std::mem::take(&mut self.bitmaps)
             .into_iter()
             .collect::<Vec<_>>();
@@ -224,7 +253,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
 
         Ok(BitmapWriteResult {
             meta: BTreeIndexMeta::new(self.first_key, self.last_key, !self.null_rows.is_empty()),
-            row_count: self.row_count,
+            row_count,
         })
     }
 
@@ -274,12 +303,37 @@ impl BitmapGlobalIndexReader {
             return self.is_not_null().await;
         }
         match op {
-            PredicateOperator::ArrayContains
-            | PredicateOperator::ArraysOverlap
-            | PredicateOperator::ArrayContainsAll => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Scalar bitmap index does not support {op}"),
-            )),
+            PredicateOperator::ArrayContains => {
+                let key = serialize_bitmap_datum(&literals[0], data_type);
+                self.equal(&key, data_type).await
+            }
+            PredicateOperator::ArraysOverlap => {
+                let keys = literals
+                    .iter()
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
+                    .collect::<Vec<_>>();
+                self.in_keys(&keys, data_type).await
+            }
+            PredicateOperator::ArrayContainsAll => {
+                let mut keys = literals
+                    .iter()
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                let mut result = None;
+                for key in keys {
+                    let current = self.equal(&key, data_type).await?;
+                    result = Some(match result {
+                        None => current,
+                        Some(mut existing) => {
+                            existing &= current;
+                            existing
+                        }
+                    });
+                }
+                Ok(result.unwrap_or_default())
+            }
             PredicateOperator::Eq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.equal(&key, data_type).await
@@ -1179,6 +1233,42 @@ mod tests {
             .unwrap(),
             original
         );
+    }
+
+    #[tokio::test]
+    async fn test_multivalue_writer_keeps_empty_source_coverage() {
+        let data_type = DataType::Int(IntType::new());
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            1 << 20,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+
+        let result = writer.finish_with_source_row_count(4).await.unwrap();
+        assert_eq!(result.row_count, 4);
+        assert_eq!(result.meta.first_key, None);
+        assert_eq!(result.meta.last_key, None);
+        assert!(!result.meta.has_nulls);
+
+        let bytes = captured.to_vec();
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        let rows = reader
+            .query(
+                PredicateOperator::ArrayContains,
+                &[Datum::Int(10)],
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
