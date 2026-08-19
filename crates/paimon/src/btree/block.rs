@@ -39,6 +39,7 @@
 use crate::btree::var_len::{
     decode_var_int, decode_var_int_from_slice, encode_var_int, encode_var_int_to_slice,
 };
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Cursor, Read, Write};
 
@@ -65,6 +66,155 @@ impl BlockCompressionType {
             )),
         }
     }
+}
+
+/// Compress a Java Paimon block, including the outer uncompressed-size varint
+/// and the LZ4/LZO codec envelope when applicable. Compression is retained only
+/// when it saves at least 12.5%, matching Java's block writer.
+pub(crate) fn compress_block(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    compression_level: i32,
+) -> io::Result<(Cow<'_, [u8]>, BlockCompressionType)> {
+    if compression_type == BlockCompressionType::None {
+        return Ok((Cow::Borrowed(data), BlockCompressionType::None));
+    }
+
+    let payload = match compression_type {
+        BlockCompressionType::None => unreachable!("handled above"),
+        BlockCompressionType::Zstd => zstd::bulk::compress(data, compression_level)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        BlockCompressionType::Lz4 => lz4_flex::block::compress(data),
+        BlockCompressionType::Lzo => lzokay_native::compress(data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    };
+    let mut encoded = Vec::with_capacity(13 + payload.len());
+    encode_var_int(
+        &mut encoded,
+        i32::try_from(data.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Block is larger than i32::MAX")
+        })?,
+    )?;
+    if matches!(
+        compression_type,
+        BlockCompressionType::Lz4 | BlockCompressionType::Lzo
+    ) {
+        encoded.extend_from_slice(
+            &i32::try_from(payload.len())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Compressed block is larger than i32::MAX",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(
+            &i32::try_from(data.len())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Block is larger than i32::MAX")
+                })?
+                .to_le_bytes(),
+        );
+    }
+    encoded.extend_from_slice(&payload);
+    if encoded.len() < data.len() - (data.len() / 8) {
+        Ok((Cow::Owned(encoded), compression_type))
+    } else {
+        Ok((Cow::Borrowed(data), BlockCompressionType::None))
+    }
+}
+
+/// Decode the payload written by [`compress_block`] or Java's corresponding
+/// block compressors.
+pub(crate) fn decompress_block(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+) -> io::Result<Vec<u8>> {
+    if compression_type == BlockCompressionType::None {
+        return Ok(data.to_vec());
+    }
+
+    let mut cursor = Cursor::new(data);
+    let uncompressed_size = usize::try_from(decode_var_int(&mut cursor)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid negative uncompressed block size",
+        )
+    })?;
+    let compressed_start = cursor.position() as usize;
+    let compressed = &data[compressed_start..];
+    match compression_type {
+        BlockCompressionType::None => unreachable!("handled above"),
+        BlockCompressionType::Zstd => {
+            let mut decompressed = vec![0u8; uncompressed_size];
+            let actual = zstd::bulk::decompress_to_buffer(compressed, &mut decompressed)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if actual != uncompressed_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Block decompressed size mismatch: expected {uncompressed_size}, got {actual}"
+                    ),
+                ));
+            }
+            Ok(decompressed)
+        }
+        BlockCompressionType::Lz4 | BlockCompressionType::Lzo => {
+            decompress_java_header_block(compressed, uncompressed_size, compression_type)
+        }
+    }
+}
+
+fn decompress_java_header_block(
+    block: &[u8],
+    expected_size: usize,
+    compression_type: BlockCompressionType,
+) -> io::Result<Vec<u8>> {
+    if block.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Compressed block is shorter than the Java codec header",
+        ));
+    }
+    let compressed_len = i32::from_le_bytes(block[..4].try_into().unwrap());
+    let original_len = i32::from_le_bytes(block[4..8].try_into().unwrap());
+    let (compressed_len, original_len) = match (
+        usize::try_from(compressed_len),
+        usize::try_from(original_len),
+    ) {
+        (Ok(compressed_len), Ok(original_len))
+            if original_len == expected_size
+                && compressed_len <= block.len().saturating_sub(8)
+                && ((original_len == 0) == (compressed_len == 0)) =>
+        {
+            (compressed_len, original_len)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid Java LZ4/LZO block lengths",
+            ))
+        }
+    };
+    let payload = &block[8..8 + compressed_len];
+    let decompressed = match compression_type {
+        BlockCompressionType::Lz4 => lz4_flex::block::decompress(payload, original_len)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        BlockCompressionType::Lzo => lzokay_native::decompress_all(payload, Some(original_len))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        _ => unreachable!("only Java header codecs use this decoder"),
+    };
+    if decompressed.len() != original_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Block decompressed size mismatch: expected {original_len}, got {}",
+                decompressed.len()
+            ),
+        ));
+    }
+    Ok(decompressed)
 }
 
 /// Block aligned type.

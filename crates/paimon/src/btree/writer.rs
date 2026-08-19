@@ -60,8 +60,22 @@ impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
         block_size: usize,
         compression_type: BlockCompressionType,
     ) -> Self {
+        Self::with_compression_level(writer, block_size, compression_type, 1)
+    }
+
+    pub fn with_compression_level(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
+    ) -> Self {
         Self {
-            sst_writer: SstFileWriter::new(writer, block_size, compression_type),
+            sst_writer: SstFileWriter::with_compression_level(
+                writer,
+                block_size,
+                compression_type,
+                compression_level,
+            ),
             current_row_ids: Vec::new(),
             last_key: None,
             first_key: None,
@@ -80,8 +94,23 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         compression_type: BlockCompressionType,
         cmp: F,
     ) -> Self {
+        Self::with_comparator_and_compression_level(writer, block_size, compression_type, 1, cmp)
+    }
+
+    pub fn with_comparator_and_compression_level(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
+        cmp: F,
+    ) -> Self {
         Self {
-            sst_writer: SstFileWriter::new(writer, block_size, compression_type),
+            sst_writer: SstFileWriter::with_compression_level(
+                writer,
+                block_size,
+                compression_type,
+                compression_level,
+            ),
             current_row_ids: Vec::new(),
             last_key: None,
             first_key: None,

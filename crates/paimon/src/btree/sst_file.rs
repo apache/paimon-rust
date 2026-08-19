@@ -18,14 +18,12 @@
 //! SST file writer and reader compatible with Java Paimon's SstFileWriter/SstFileReader.
 
 use crate::btree::block::{
-    compute_crc32, BlockCompressionType, BlockHandle, BlockReader, BlockTrailer, BlockWriter,
-    BLOCK_HANDLE_MAX_ENCODED_LENGTH, BLOCK_TRAILER_LENGTH,
+    compress_block, compute_crc32, decompress_block, BlockCompressionType, BlockHandle,
+    BlockReader, BlockTrailer, BlockWriter, BLOCK_HANDLE_MAX_ENCODED_LENGTH, BLOCK_TRAILER_LENGTH,
 };
-use crate::btree::var_len::encode_var_int_to_slice;
 use crate::io::FileWrite;
 use bytes::Bytes;
-use std::borrow::Cow;
-use std::io::{self, Cursor};
+use std::io;
 
 /// SstFileWriter writes sorted key-value pairs into an SST file format
 /// via streaming writes to a `FileWrite`.
@@ -41,15 +39,26 @@ pub struct SstFileWriter {
     data_block_writer: BlockWriter,
     index_block_writer: BlockWriter,
     compression_type: BlockCompressionType,
+    compression_level: i32,
     last_key: Option<Vec<u8>>,
     record_count: u64,
 }
 
 impl SstFileWriter {
+    #[cfg(test)]
     pub fn new(
         writer: Box<dyn FileWrite>,
         block_size: usize,
         compression_type: BlockCompressionType,
+    ) -> Self {
+        Self::with_compression_level(writer, block_size, compression_type, 1)
+    }
+
+    pub fn with_compression_level(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
     ) -> Self {
         Self {
             writer,
@@ -58,6 +67,7 @@ impl SstFileWriter {
             data_block_writer: BlockWriter::new((block_size as f64 * 1.1) as usize),
             index_block_writer: BlockWriter::new(BLOCK_HANDLE_MAX_ENCODED_LENGTH * 1024),
             compression_type,
+            compression_level,
             last_key: None,
             record_count: 0,
         }
@@ -117,7 +127,8 @@ impl SstFileWriter {
     async fn write_block_data(&mut self) -> io::Result<BlockHandle> {
         let block = self.data_block_writer.finish();
 
-        let (final_data, block_compression_type) = self.maybe_compress(&block);
+        let (final_data, block_compression_type) =
+            compress_block(&block, self.compression_type, self.compression_level)?;
 
         let crc = compute_crc32(&final_data, block_compression_type);
         let trailer = BlockTrailer {
@@ -131,34 +142,6 @@ impl SstFileWriter {
         self.write_bytes(&trailer.to_bytes()).await?;
 
         Ok(block_handle)
-    }
-
-    fn maybe_compress<'a>(&self, block: &'a [u8]) -> (Cow<'a, [u8]>, BlockCompressionType) {
-        match self.compression_type {
-            BlockCompressionType::None => (Cow::Borrowed(block), BlockCompressionType::None),
-            BlockCompressionType::Zstd => {
-                // Prepend uncompressed length as var-int, then compressed data
-                let mut compressed_buf =
-                    vec![0u8; 5 + zstd::zstd_safe::compress_bound(block.len())];
-                let var_len = encode_var_int_to_slice(&mut compressed_buf, 0, block.len() as i32);
-                let compressed_size =
-                    zstd::bulk::compress_to_buffer(block, &mut compressed_buf[var_len..], 3)
-                        .unwrap_or(0);
-
-                if compressed_size > 0
-                    && (var_len + compressed_size) < block.len() - (block.len() / 8)
-                {
-                    compressed_buf.truncate(var_len + compressed_size);
-                    (Cow::Owned(compressed_buf), BlockCompressionType::Zstd)
-                } else {
-                    (Cow::Borrowed(block), BlockCompressionType::None)
-                }
-            }
-            _ => {
-                // LZ4/LZO not implemented yet, fall back to no compression
-                (Cow::Borrowed(block), BlockCompressionType::None)
-            }
-        }
     }
 
     /// Write the index block. Returns the index block handle.
@@ -210,39 +193,8 @@ pub fn read_block_from_bytes(bytes: &[u8], size: u32) -> io::Result<BlockReader>
         ));
     }
 
-    let decompressed = decompress_block(block_data, &trailer)?;
+    let decompressed = decompress_block(block_data, trailer.compression_type)?;
     BlockReader::create_from_vec(decompressed)
-}
-
-fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> {
-    match trailer.compression_type {
-        BlockCompressionType::None => Ok(data.to_vec()),
-        BlockCompressionType::Zstd => {
-            let mut cursor = Cursor::new(data);
-            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)? as usize;
-            let compressed_start = cursor.position() as usize;
-            let compressed_data = &data[compressed_start..];
-            let mut decompressed = vec![0u8; uncompressed_size];
-            let actual = zstd::bulk::decompress_to_buffer(compressed_data, &mut decompressed)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if actual != uncompressed_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Decompressed size mismatch: expected {uncompressed_size}, got {actual}"
-                    ),
-                ));
-            }
-            Ok(decompressed)
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "Compression type {:?} not supported",
-                trailer.compression_type
-            ),
-        )),
-    }
 }
 
 /// SstFileReader reads an SST file index block for async on-demand data block loading.

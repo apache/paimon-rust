@@ -224,13 +224,13 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
 }
 
 #[tokio::test]
-async fn test_create_global_index_rejects_options() {
+async fn test_create_global_index_rejects_invalid_sorted_options() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_options").await;
 
     assert_sql_error(
         &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.btree_options', index_column => 'id', options => 'x=y')",
-        "options are not supported",
+        "CALL sys.create_global_index(table => 'test_db.btree_options', index_column => 'id', options => 'btree-index.block-size=0')",
+        "btree-index.block-size' must be greater than 0",
     )
     .await;
 }
@@ -370,7 +370,12 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
 
     exec(
         &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.btree_build', index_column => 'id', index_type => 'btree')",
+        "CALL sys.create_global_index(\
+            table => 'test_db.btree_build', \
+            index_column => 'id', \
+            index_type => 'btree', \
+            options => 'btree-index.block-size=1kb,btree-index.compression=lz4,btree-index.compression-level=1'\
+        )",
     )
     .await;
 
@@ -426,7 +431,12 @@ async fn test_create_global_index_builds_bitmap_with_java_format() {
 
     exec(
         &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.bitmap_build', index_column => 'name', index_type => 'bitmap')",
+        "CALL sys.create_global_index(\
+            table => 'test_db.bitmap_build', \
+            index_column => 'name', \
+            index_type => 'bitmap', \
+            options => 'bitmap-index.dictionary-block-size=1kb,bitmap-index.compression=lzo,bitmap-index.compression-level=1'\
+        )",
     )
     .await;
 

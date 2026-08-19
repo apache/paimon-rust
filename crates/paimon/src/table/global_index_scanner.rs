@@ -20,10 +20,10 @@
 //!
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
-use super::bitmap_global_index_reader::{
+use super::bitmap_global_index_format::{
     is_bitmap_floating_residual_sensitive_op, make_bitmap_key_comparator, serialize_bitmap_datum,
-    BitmapGlobalIndexReader,
 };
+use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     MULTIVALUE_GLOBAL_INDEX_TYPE,
@@ -1606,7 +1606,7 @@ mod tests {
     use super::*;
     use crate::btree::test_util::VecFileWrite;
     use crate::btree::{BTreeIndexWriter, BlockCompressionType};
-    use crate::table::bitmap_global_index_reader::BitmapGlobalIndexWriter;
+    use crate::table::bitmap_global_index_writer::BitmapGlobalIndexWriter;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 

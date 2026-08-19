@@ -563,14 +563,7 @@ async fn proc_create_global_index(
     let index_type = normalize_index_type(index_type_arg);
     let index_type = index_type.as_str();
     if is_sorted_global_index_type(index_type) {
-        if index_type != "multivalue" && args.contains_key("options") {
-            return Err(DataFusionError::NotImplemented(
-                "create_global_index options are not supported for btree or bitmap indexes yet"
-                    .to_string(),
-            ));
-        }
-
-        let mut builder = table.new_btree_global_index_build_builder();
+        let mut builder = table.new_sorted_global_index_build_builder();
         builder.with_index_column(index_column);
         builder.with_index_type(index_type);
         if let Some(options) = args.get("options") {

@@ -31,6 +31,7 @@ const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
+const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
 const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -764,15 +765,20 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
+        let option = if self
+            .options
+            .contains_key(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)
+        {
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION
+        } else {
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION
+        };
         let value = self
-            .parse_i64_option(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)?
+            .parse_i64_option(option)?
             .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
         if value <= 0 {
             return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Option '{}' must be greater than 0, got: {}",
-                    SORTED_INDEX_RECORDS_PER_RANGE_OPTION, value
-                ),
+                message: format!("Option '{}' must be greater than 0, got: {}", option, value),
                 source: None,
             });
         }
@@ -1847,19 +1853,52 @@ mod tests {
 
     #[test]
     fn test_sorted_index_records_per_range_rejects_invalid_values() {
-        for value in ["0", "-1", "abc"] {
-            let options = HashMap::from([(
-                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
-                value.to_string(),
-            )]);
-            let core = CoreOptions::new(&options);
+        for option in [
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
+        ] {
+            for value in ["0", "-1", "abc"] {
+                let options = HashMap::from([(option.to_string(), value.to_string())]);
+                let core = CoreOptions::new(&options);
 
-            let err = core
-                .sorted_index_records_per_range()
-                .expect_err("invalid records-per-range should fail");
-            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
-                    if message.contains(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)));
+                let err = core
+                    .sorted_index_records_per_range()
+                    .expect_err("invalid records-per-range should fail");
+                assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                        if message.contains(option)));
+            }
         }
+    }
+
+    #[test]
+    fn test_sorted_index_records_per_range_prefers_primary_over_fallback() {
+        let options = HashMap::from([
+            (
+                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                "20".to_string(),
+            ),
+            (
+                BTREE_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                "10".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            20
+        );
+
+        let fallback = HashMap::from([(
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+            "10".to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&fallback)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            10
+        );
     }
 
     #[test]

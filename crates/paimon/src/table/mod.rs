@@ -20,10 +20,11 @@
 pub(crate) mod aggregator;
 mod audit_log_table;
 pub(crate) mod bin_pack;
+mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
+mod bitmap_global_index_writer;
 mod blob_resolver;
 mod branch_manager;
-mod btree_global_index_build_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -88,6 +89,8 @@ pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
 mod sort_merge;
+mod sorted_global_index_build_builder;
+mod sorted_global_index_options;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
@@ -105,7 +108,6 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use audit_log_table::AuditLogTable;
 pub use branch_manager::BranchManager;
-pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -135,6 +137,9 @@ pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
+pub use sorted_global_index_build_builder::{
+    BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
+};
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
@@ -349,8 +354,12 @@ impl Table {
         LuminaIndexBuildBuilder::new(self)
     }
 
+    pub fn new_sorted_global_index_build_builder(&self) -> SortedGlobalIndexBuildBuilder<'_> {
+        SortedGlobalIndexBuildBuilder::new(self)
+    }
+
     pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
-        BTreeGlobalIndexBuildBuilder::new(self)
+        self.new_sorted_global_index_build_builder()
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {

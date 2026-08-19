@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::bitmap_global_index_reader::{
-    make_bitmap_key_comparator, serialize_bitmap_datum, BitmapGlobalIndexWriter, BitmapWriteResult,
-};
+use super::bitmap_global_index_format::{make_bitmap_key_comparator, serialize_bitmap_datum};
+use super::bitmap_global_index_writer::{BitmapGlobalIndexWriter, BitmapWriteResult};
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
+use super::sorted_global_index_options::SortedIndexWriteOptions;
 use crate::btree::key_serde::KeyComparator;
-use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
+use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter};
 use crate::spec::{
     bucket_dir_name, extract_datum_from_array, extract_datum_from_arrow, BinaryRow, CoreOptions,
     DataField, DataFileMeta, DataType, Datum, FileKind, GlobalIndexMeta, IndexFileMeta,
@@ -42,92 +42,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 const INDEX_DIR: &str = "index";
-const BTREE_BLOCK_SIZE: usize = 4 * 1024;
-const BITMAP_DICTIONARY_BLOCK_SIZE: usize = 16 * 1024;
-const MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION: &str = "multivalue-index.dictionary-block-size";
-const MULTIVALUE_COMPRESSION_OPTION: &str = "multivalue-index.compression";
-const MULTIVALUE_COMPRESSION_LEVEL_OPTION: &str = "multivalue-index.compression-level";
-const DEFAULT_MULTIVALUE_COMPRESSION_LEVEL: i32 = 1;
 
-type BTreeKeyRow = (Option<Vec<u8>>, i64);
+type SortedIndexKeyRow = (Option<Vec<u8>>, i64);
 type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MultivalueIndexWriteOptions {
-    dictionary_block_size: usize,
-    compression_type: BlockCompressionType,
-    compression_level: i32,
-}
-
-impl MultivalueIndexWriteOptions {
-    fn from_options(options: &HashMap<String, String>) -> Result<Self> {
-        let dictionary_block_size = match options.get(MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION) {
-            Some(raw) => {
-                let bytes = crate::common::options::parse_memory_size(raw).map_err(|_| {
-                    Error::DataInvalid {
-                        message: format!(
-                            "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' must be a valid memory size, got: {raw}"
-                        ),
-                        source: None,
-                    }
-                })?;
-                if bytes <= 0 {
-                    return Err(Error::DataInvalid {
-                        message: format!(
-                            "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' must be greater than 0, got: {raw}"
-                        ),
-                        source: None,
-                    });
-                }
-                usize::try_from(bytes).map_err(|_| Error::DataInvalid {
-                    message: format!(
-                        "Option '{MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION}' is too large: {raw}"
-                    ),
-                    source: None,
-                })?
-            }
-            None => BITMAP_DICTIONARY_BLOCK_SIZE,
-        };
-        let compression_type = match options
-            .get(MULTIVALUE_COMPRESSION_OPTION)
-            .map(String::as_str)
-            .unwrap_or("none")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "none" => BlockCompressionType::None,
-            "zstd" => BlockCompressionType::Zstd,
-            "lz4" => BlockCompressionType::Lz4,
-            "lzo" => BlockCompressionType::Lzo,
-            compression => {
-                return Err(Error::DataInvalid {
-                    message: format!(
-                        "Option '{MULTIVALUE_COMPRESSION_OPTION}' must be one of none, zstd, lz4, or lzo, got: {compression}"
-                    ),
-                    source: None,
-                })
-            }
-        };
-        let compression_level = options
-            .get(MULTIVALUE_COMPRESSION_LEVEL_OPTION)
-            .map(|raw| {
-                raw.parse::<i32>().map_err(|_| Error::DataInvalid {
-                    message: format!(
-                        "Option '{MULTIVALUE_COMPRESSION_LEVEL_OPTION}' must be an integer, got: {raw}"
-                    ),
-                    source: None,
-                })
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MULTIVALUE_COMPRESSION_LEVEL);
-        Ok(Self {
-            dictionary_block_size,
-            compression_type,
-            compression_level,
-        })
-    }
-}
 
 fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
     match index_type {
@@ -140,14 +57,18 @@ fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparato
     }
 }
 
-pub struct BTreeGlobalIndexBuildBuilder<'a> {
+pub struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
     options: HashMap<String, String>,
 }
 
-impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
+/// Backward-compatible name retained for callers that used the original
+/// BTree-only builder API before it also supported bitmap and multivalue.
+pub type BTreeGlobalIndexBuildBuilder<'a> = SortedGlobalIndexBuildBuilder<'a>;
+
+impl<'a> SortedGlobalIndexBuildBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -194,24 +115,12 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        if index_type != MULTIVALUE_GLOBAL_INDEX_TYPE && !self.options.is_empty() {
-            return Err(Error::Unsupported {
-                message: "Sorted global index build options are currently supported only for multivalue indexes"
-                    .to_string(),
-            });
-        }
         let mut resolved_options = self.table.schema().options().clone();
         resolved_options.extend(self.options.clone());
         let core_options = CoreOptions::new(&resolved_options);
         validate_table_options(self.table, &core_options)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
-        let multivalue_write_options = if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
-            Some(MultivalueIndexWriteOptions::from_options(
-                &resolved_options,
-            )?)
-        } else {
-            None
-        };
+        let write_options = SortedIndexWriteOptions::from_options(index_type, &resolved_options)?;
 
         let index_field = find_index_field(self.table, index_column)?;
         index_key_type(index_type, index_field)?;
@@ -244,7 +153,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let shards = plan_btree_shards(
+        let shards = plan_sorted_index_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
             self.table.schema().fields(),
@@ -275,12 +184,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = self
-                .build_index_file(
-                    &shard,
-                    index_field,
-                    index_column,
-                    multivalue_write_options.as_ref(),
-                )
+                .build_index_file(&shard, index_field, index_column, &write_options)
                 .await?;
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
@@ -304,10 +208,10 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 
     async fn build_index_file(
         &self,
-        shard: &BTreeGlobalIndexShard,
+        shard: &SortedGlobalIndexShard,
         index_field: &DataField,
         index_column: &str,
-        multivalue_write_options: Option<&MultivalueIndexWriteOptions>,
+        write_options: &SortedIndexWriteOptions,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
@@ -355,10 +259,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let writer = output.writer().await?;
         let (written_row_count, index_meta) = match index_type {
             BTREE_GLOBAL_INDEX_TYPE => {
-                let mut writer = BTreeIndexWriter::with_comparator(
+                let mut writer = BTreeIndexWriter::with_comparator_and_compression_level(
                     writer,
-                    BTREE_BLOCK_SIZE,
-                    BlockCompressionType::None,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -379,10 +284,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 (write_result.row_count, write_result.meta)
             }
             BITMAP_GLOBAL_INDEX_TYPE => {
-                let mut writer = BitmapGlobalIndexWriter::new(
+                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
                     writer,
-                    BITMAP_DICTIONARY_BLOCK_SIZE,
-                    BlockCompressionType::None,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -403,13 +309,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 (row_count, meta)
             }
             MULTIVALUE_GLOBAL_INDEX_TYPE => {
-                let options = multivalue_write_options
-                    .expect("multivalue writer options were resolved before building shards");
                 let mut writer = BitmapGlobalIndexWriter::with_compression_level(
                     writer,
-                    options.dictionary_block_size,
-                    options.compression_type,
-                    options.compression_level,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -472,7 +376,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BTreeGlobalIndexShard {
+pub(crate) struct SortedGlobalIndexShard {
     pub partition: BinaryRow,
     pub partition_bytes: Vec<u8>,
     pub files: Vec<DataFileMeta>,
@@ -537,7 +441,7 @@ fn validate_btree_field(field: &DataField) -> Result<()> {
     if !is_btree_supported_data_type(field.data_type()) {
         return Err(Error::Unsupported {
             message: format!(
-                "BTree global index only supports scalar columns, got {:?} for column '{}'",
+                "Sorted global index only supports scalar columns, got {:?} for column '{}'",
                 field.data_type(),
                 field.name()
             ),
@@ -594,7 +498,7 @@ fn is_btree_supported_data_type(data_type: &DataType) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_btree_shards(
+fn plan_sorted_index_shards(
     table_location: &str,
     partition_keys: &[String],
     schema_fields: &[DataField],
@@ -603,7 +507,7 @@ fn plan_btree_shards(
     entries: Vec<crate::spec::ManifestEntry>,
     records_per_range: i64,
     indexed: &[RowRange],
-) -> Result<Vec<BTreeGlobalIndexShard>> {
+) -> Result<Vec<SortedGlobalIndexShard>> {
     if records_per_range <= 0 {
         return Err(Error::DataInvalid {
             message: format!(
@@ -664,7 +568,7 @@ fn plan_btree_shards(
                     let range_end = range_start + records_per_range - 1;
                     let row_range_start = seg_start.max(range_start);
                     let row_range_end = seg_end.min(range_end);
-                    result.push(BTreeGlobalIndexShard {
+                    result.push(SortedGlobalIndexShard {
                         partition: partition.clone(),
                         partition_bytes: partition_bytes.clone(),
                         files: group.files.clone(),
@@ -799,12 +703,12 @@ fn bucket_path(
 
 async fn extract_index_rows(
     table: &Table,
-    shard: &BTreeGlobalIndexShard,
+    shard: &SortedGlobalIndexShard,
     index_column: &str,
     index_field: &DataField,
     index_type: &str,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<BTreeKeyRow>> {
+) -> Result<Vec<SortedIndexKeyRow>> {
     let splits = build_read_splits_for_shard(shard)?;
 
     let mut read_builder = table.new_read_builder();
@@ -839,7 +743,7 @@ async fn extract_index_rows(
     }
 }
 
-fn build_read_splits_for_shard(shard: &BTreeGlobalIndexShard) -> Result<Vec<DataSplit>> {
+fn build_read_splits_for_shard(shard: &SortedGlobalIndexShard) -> Result<Vec<DataSplit>> {
     let shard_range = RowRange::new(shard.row_range_start, shard.row_range_end);
     group_by_overlapping_row_id(shard.files.clone())
         .into_iter()
@@ -879,7 +783,7 @@ fn extract_index_rows_from_batches(
     row_range_start: i64,
     expected_row_count: i64,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<BTreeKeyRow>> {
+) -> Result<Vec<SortedIndexKeyRow>> {
     let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
     let mut rows = Vec::with_capacity(row_count);
     let mut expected_row_id = row_range_start;
@@ -905,14 +809,14 @@ fn extract_index_rows_from_batches(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| Error::DataInvalid {
-                message: "BTree global index build requires non-null Int64 _ROW_ID".to_string(),
+                message: "Sorted global index build requires non-null Int64 _ROW_ID".to_string(),
                 source: None,
             })?;
 
         for row in 0..batch.num_rows() {
             if row_ids.is_null(row) {
                 return Err(Error::DataInvalid {
-                    message: "BTree global index build found null _ROW_ID".to_string(),
+                    message: "Sorted global index build found null _ROW_ID".to_string(),
                     source: None,
                 });
             }
@@ -920,7 +824,7 @@ fn extract_index_rows_from_batches(
             if row_id != expected_row_id {
                 return Err(Error::DataInvalid {
                     message: format!(
-                        "BTree global index build expected _ROW_ID {}, got {}",
+                        "Sorted global index build expected _ROW_ID {}, got {}",
                         expected_row_id, row_id
                     ),
                     source: None,
@@ -937,7 +841,7 @@ fn extract_index_rows_from_batches(
     if actual_row_count != expected_row_count {
         return Err(Error::DataInvalid {
             message: format!(
-                "BTree global index build expected {} rows, got {}",
+                "Sorted global index build expected {} rows, got {}",
                 expected_row_count, actual_row_count
             ),
             source: None,
@@ -953,7 +857,7 @@ fn extract_multivalue_index_rows_from_batches(
     row_range_start: i64,
     expected_row_count: i64,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<BTreeKeyRow>> {
+) -> Result<Vec<SortedIndexKeyRow>> {
     let mut rows = Vec::new();
     let mut expected_row_id = row_range_start;
     for batch in batches {
@@ -1095,7 +999,7 @@ fn extract_multivalue_index_rows_from_batches(
     Ok(rows)
 }
 
-fn sort_index_rows(rows: &mut [BTreeKeyRow], cmp: &dyn Fn(&[u8], &[u8]) -> Ordering) {
+fn sort_index_rows(rows: &mut [SortedIndexKeyRow], cmp: &dyn Fn(&[u8], &[u8]) -> Ordering) {
     rows.sort_by(|left, right| match (&left.0, &right.0) {
         (None, None) => left.1.cmp(&right.1),
         (None, Some(_)) => Ordering::Less,
@@ -1213,58 +1117,6 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn test_multivalue_write_options_match_java_defaults_and_overrides() {
-        assert_eq!(
-            MultivalueIndexWriteOptions::from_options(&HashMap::new()).unwrap(),
-            MultivalueIndexWriteOptions {
-                dictionary_block_size: 16 * 1024,
-                compression_type: BlockCompressionType::None,
-                compression_level: 1,
-            }
-        );
-
-        let options = HashMap::from([
-            (
-                MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION.to_string(),
-                "32kb".to_string(),
-            ),
-            (MULTIVALUE_COMPRESSION_OPTION.to_string(), "LZ4".to_string()),
-            (
-                MULTIVALUE_COMPRESSION_LEVEL_OPTION.to_string(),
-                "7".to_string(),
-            ),
-        ]);
-        assert_eq!(
-            MultivalueIndexWriteOptions::from_options(&options).unwrap(),
-            MultivalueIndexWriteOptions {
-                dictionary_block_size: 32 * 1024,
-                compression_type: BlockCompressionType::Lz4,
-                compression_level: 7,
-            }
-        );
-    }
-
-    #[test]
-    fn test_multivalue_write_options_reject_invalid_values() {
-        for (key, value) in [
-            (MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION, "0"),
-            (MULTIVALUE_DICTIONARY_BLOCK_SIZE_OPTION, "invalid"),
-            (MULTIVALUE_COMPRESSION_OPTION, "snappy"),
-            (MULTIVALUE_COMPRESSION_LEVEL_OPTION, "fast"),
-        ] {
-            let error = MultivalueIndexWriteOptions::from_options(&HashMap::from([(
-                key.to_string(),
-                value.to_string(),
-            )]))
-            .unwrap_err();
-            assert!(
-                matches!(error, Error::DataInvalid { ref message, .. } if message.contains(key)),
-                "{key}={value}: {error}"
-            );
-        }
-    }
-
     fn test_table(options: HashMap<String, String>) -> Table {
         test_table_with_path("memory:/test_btree_global_index_builder", options)
     }
@@ -1307,10 +1159,10 @@ mod tests {
     fn plan(
         entries: Vec<ManifestEntry>,
         records_per_range: i64,
-    ) -> Result<Vec<BTreeGlobalIndexShard>> {
+    ) -> Result<Vec<SortedGlobalIndexShard>> {
         let table = test_table(table_options(&records_per_range.to_string()));
         let core = CoreOptions::new(table.schema().options());
-        plan_btree_shards(
+        plan_sorted_index_shards(
             table.location(),
             table.schema().partition_keys(),
             table.schema().fields(),
