@@ -3869,7 +3869,7 @@ mod tests {
             &queries,
             4,
             2,
-            &vec![query_l2_squared_norm; 4],
+            &[query_l2_squared_norm; 4],
             &[0, 1, 2, 3],
             RawVectorMetric::Cosine,
         )
