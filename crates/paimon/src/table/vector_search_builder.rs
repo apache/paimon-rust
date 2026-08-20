@@ -3441,35 +3441,29 @@ fn compute_raw_vector_score_matrix(
             let query_l2_squared_norm = query_l2_squared_norms[query_index];
             *score = match metric {
                 RawVectorMetric::L2 => {
-                    if !stored_l2_squared_norm.is_finite() || !query_l2_squared_norm.is_finite() {
+                    let squared_distance =
+                        stored_l2_squared_norm + query_l2_squared_norm - 2.0 * *score;
+                    // The norm/dot reconstruction loses the low-order difference when two
+                    // large vectors are close. Estimate a conservative accumulation-error
+                    // bound and preserve the former scalar semantics inside that region.
+                    let roundoff_bound = (stored_l2_squared_norm.abs()
+                        + query_l2_squared_norm.abs()
+                        + 2.0 * score.abs())
+                        * f32::EPSILON
+                        * (dimension as f32 + 2.0)
+                        * 4.0;
+                    if !squared_distance.is_finite() || squared_distance <= roundoff_bound {
                         let stored =
                             &stored_vectors[row_index * dimension..(row_index + 1) * dimension];
                         let query = &query_vectors
                             [matrix_query_index * dimension..(matrix_query_index + 1) * dimension];
-                        let squared_distance = query
-                            .iter()
-                            .zip(stored)
-                            .map(|(query_value, stored_value)| {
-                                let difference = query_value - stored_value;
-                                difference * difference
-                            })
-                            .sum::<f32>();
-                        1.0 / (1.0 + squared_distance)
+                        compute_raw_vector_l2_score(query, stored)
                     } else {
-                        let squared_distance =
-                            stored_l2_squared_norm + query_l2_squared_norm - 2.0 * *score;
-                        // GEMM can produce a tiny negative value for identical vectors due to
-                        // rounding. Preserve NaN while clamping only finite negative distances.
-                        let squared_distance = if squared_distance < 0.0 {
-                            0.0
-                        } else {
-                            squared_distance
-                        };
                         1.0 / (1.0 + squared_distance)
                     }
                 }
                 RawVectorMetric::Cosine => {
-                    let denominator = (stored_l2_squared_norm * query_l2_squared_norm).sqrt();
+                    let denominator = stored_l2_squared_norm.sqrt() * query_l2_squared_norm.sqrt();
                     if denominator == 0.0 {
                         0.0
                     } else {
@@ -3543,17 +3537,7 @@ fn compute_raw_vector_score_from_values(
 ) -> f32 {
     debug_assert_eq!(query.len(), end - start);
     match metric {
-        RawVectorMetric::L2 => {
-            let sum_sq = query
-                .iter()
-                .zip(start..end)
-                .map(|(q, value_index)| {
-                    let diff = q - values.value(value_index);
-                    diff * diff
-                })
-                .sum::<f32>();
-            1.0 / (1.0 + sum_sq)
-        }
+        RawVectorMetric::L2 => compute_raw_vector_l2_score(query, &values.values()[start..end]),
         RawVectorMetric::Cosine => {
             let mut dot = 0.0;
             let mut norm_b = 0.0;
@@ -3562,7 +3546,7 @@ fn compute_raw_vector_score_from_values(
                 dot += q * stored;
                 norm_b += stored * stored;
             }
-            let denominator = (query_l2_squared_norm * norm_b).sqrt();
+            let denominator = query_l2_squared_norm.sqrt() * norm_b.sqrt();
             if denominator == 0.0 {
                 0.0
             } else {
@@ -3577,6 +3561,18 @@ fn compute_raw_vector_score_from_values(
     }
 }
 
+fn compute_raw_vector_l2_score(query: &[f32], stored: &[f32]) -> f32 {
+    let squared_distance = query
+        .iter()
+        .zip(stored)
+        .map(|(query_value, stored_value)| {
+            let difference = query_value - stored_value;
+            difference * difference
+        })
+        .sum::<f32>();
+    1.0 / (1.0 + squared_distance)
+}
+
 fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
     u64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
         message: format!("Negative _ROW_ID {row_id} cannot be used for global index search"),
@@ -3587,17 +3583,7 @@ fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
 #[cfg(test)]
 fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetric) -> f32 {
     match metric {
-        RawVectorMetric::L2 => {
-            let sum_sq = query
-                .iter()
-                .zip(stored.iter())
-                .map(|(q, s)| {
-                    let diff = q - s;
-                    diff * diff
-                })
-                .sum::<f32>();
-            1.0 / (1.0 + sum_sq)
-        }
+        RawVectorMetric::L2 => compute_raw_vector_l2_score(query, stored),
         RawVectorMetric::Cosine => {
             let mut dot = 0.0;
             let mut norm_a = 0.0;
@@ -3824,6 +3810,73 @@ mod tests {
         )
         .unwrap()[0];
         assert_eq!(non_finite_score, 0.0);
+    }
+
+    #[test]
+    fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
+        let dimension = 128;
+        let query = vec![1.0e10_f32; dimension];
+        let mut nearby = query.clone();
+        nearby[0] += 1024.0;
+        let mut stored = query.clone();
+        stored.extend_from_slice(&nearby);
+        let queries = query.repeat(4);
+        let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
+        let query_l2_squared_norms = vec![query_l2_squared_norm; 4];
+        let query_indices = vec![0, 1, 2, 3];
+
+        let matrix_scores = compute_raw_vector_score_matrix(
+            &stored,
+            2,
+            &queries,
+            4,
+            dimension,
+            &query_l2_squared_norms,
+            &query_indices,
+            RawVectorMetric::L2,
+        )
+        .unwrap();
+        let exact_score = compute_raw_vector_score(&query, &query, RawVectorMetric::L2);
+        let nearby_score = compute_raw_vector_score(&query, &nearby, RawVectorMetric::L2);
+
+        for query_index in 0..4 {
+            assert_eq!(matrix_scores[query_index * 2], exact_score);
+            assert_eq!(matrix_scores[query_index * 2 + 1], nearby_score);
+            assert!(matrix_scores[query_index * 2] > matrix_scores[query_index * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
+        let query = vec![1.0e15_f32, 0.0];
+        let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
+        assert!(query_l2_squared_norm.is_finite());
+        let values = Float32Array::from(query.clone());
+        let scalar_score = compute_raw_vector_score_from_values(
+            &query,
+            query_l2_squared_norm,
+            &values,
+            0,
+            2,
+            RawVectorMetric::Cosine,
+        );
+        assert!((scalar_score - 1.0).abs() < 1e-6);
+
+        let queries = query.repeat(4);
+        let matrix_scores = compute_raw_vector_score_matrix(
+            &query,
+            1,
+            &queries,
+            4,
+            2,
+            &vec![query_l2_squared_norm; 4],
+            &[0, 1, 2, 3],
+            RawVectorMetric::Cosine,
+        )
+        .unwrap();
+        assert!(matrix_scores
+            .iter()
+            .all(|score| (*score - 1.0).abs() < 1e-6));
     }
 
     #[test]
