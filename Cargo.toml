@@ -19,6 +19,8 @@
 resolver = "2"
 members = [
     "crates/paimon",
+    "crates/query-service",
+    "crates/query-service-server",
     "crates/paimon-rest-server",
     "crates/integration_tests",
     "bindings/c",

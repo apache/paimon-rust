@@ -1,0 +1,53 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "paimon-query-service-server"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP service for snapshot-consistent Paimon point queries"
+publish = false
+
+[lib]
+name = "paimon_query_service_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "paimon-query-service-server"
+path = "src/main.rs"
+
+[dependencies]
+paimon = { workspace = true }
+paimon-query-service = { path = "../query-service" }
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.120"
+sha2 = "0.10"
+subtle = "2.6"
+tokio = { version = "1.39.2", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
