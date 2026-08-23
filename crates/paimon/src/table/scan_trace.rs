@@ -53,6 +53,8 @@ pub struct ScanTrace {
     pub splits_after_limit: usize,
     pub final_splits: usize,
     pub final_files: usize,
+    /// Sum of known data-file sizes referenced by the final plan.
+    pub planned_data_file_bytes: u64,
     pub limit: Option<usize>,
 }
 
@@ -99,7 +101,7 @@ impl fmt::Display for ScanTrace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "snapshot={:?}, manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}",
+            "snapshot={:?}, manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",
             self.snapshot_id,
             self.manifest_files_after_partition_pruning,
             self.manifest_files_before_partition_pruning,
@@ -114,7 +116,8 @@ impl fmt::Display for ScanTrace {
             self.limit_early_stopped,
             self.splits_before_limit,
             self.splits_after_limit,
-            self.final_files
+            self.final_files,
+            self.planned_data_file_bytes
         )
     }
 }

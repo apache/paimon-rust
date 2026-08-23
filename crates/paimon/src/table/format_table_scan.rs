@@ -64,6 +64,7 @@ impl<'a> FormatTableScan<'a> {
         self.ensure_query_auth_allowed()?;
         let mut trace = ScanTrace::default();
         let plan = self.plan_inner(Some(&mut trace)).await?;
+        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
         Ok((plan, trace))
     }
 

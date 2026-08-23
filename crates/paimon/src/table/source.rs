@@ -1295,6 +1295,19 @@ impl Plan {
         &self.splits
     }
 
+    /// Sum of data-file bytes referenced by this plan.
+    ///
+    /// Negative file sizes are treated as unknown and do not contribute. The
+    /// result is therefore a lower bound when a connector cannot provide every
+    /// file size.
+    pub fn planned_data_file_bytes(&self) -> u64 {
+        self.splits
+            .iter()
+            .flat_map(DataSplit::data_files)
+            .filter_map(|file| u64::try_from(file.file_size).ok())
+            .sum()
+    }
+
     /// Consume this plan and return its splits without cloning their file metadata.
     #[must_use = "consuming a plan without using its splits drops the planned work"]
     pub fn into_splits(self) -> Vec<DataSplit> {

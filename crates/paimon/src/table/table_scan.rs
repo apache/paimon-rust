@@ -1101,6 +1101,7 @@ impl<'a> PaimonTableScan<'a> {
                 Some(&mut trace),
             )
             .await?;
+        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
         Ok((plan, trace))
     }
 
