@@ -209,10 +209,7 @@ impl SnapshotManager {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
         if !snap_input.exists().await? {
-            return Err(crate::Error::DataInvalid {
-                message: format!("snapshot file does not exist: {snapshot_path}"),
-                source: None,
-            });
+            return Err(crate::Error::SnapshotNotExist { snapshot_id });
         }
         let snap_bytes = snap_input.read().await?;
         let snapshot: Snapshot =

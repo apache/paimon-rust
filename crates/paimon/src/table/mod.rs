@@ -434,19 +434,42 @@ impl Table {
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
     pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
+        self.copy_with_time_travel_mode(extra, false).await
+    }
+
+    /// Like [`Self::copy_with_time_travel`], but propagates selector resolution
+    /// failures. Services should use this variant so a missing or unreadable
+    /// snapshot cannot silently fall back to the current schema.
+    pub async fn copy_with_time_travel_strict(
+        &self,
+        extra: HashMap<String, String>,
+    ) -> Result<Self> {
+        self.copy_with_time_travel_mode(extra, true).await
+    }
+
+    async fn copy_with_time_travel_mode(
+        &self,
+        extra: HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Self> {
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
         // travel_to_snapshot returns Ok(None) without IO when the merged
         // options contain no selector.
-        if let Ok(Some(snapshot)) = time_travel::travel_to_snapshot(
+        let resolved = time_travel::travel_to_snapshot(
             &table.snapshot_manager(),
             &table.tag_manager(),
             table.schema.options(),
         )
-        .await
-        {
+        .await;
+        let snapshot = if strict {
+            resolved?
+        } else {
+            resolved.ok().flatten()
+        };
+        if let Some(snapshot) = snapshot {
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
                 table.schema =

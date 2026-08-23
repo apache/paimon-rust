@@ -102,6 +102,8 @@ pub enum Error {
     TableAlreadyExist { full_name: String },
     #[snafu(display("Table {} does not exist.", full_name))]
     TableNotExist { full_name: String },
+    #[snafu(display("Snapshot {} does not exist.", snapshot_id))]
+    SnapshotNotExist { snapshot_id: i64 },
     #[snafu(display("View {} already exists.", full_name))]
     ViewAlreadyExist { full_name: String },
     #[snafu(display("View {} does not exist.", full_name))]

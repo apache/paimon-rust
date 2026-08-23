@@ -70,6 +70,10 @@ impl BlobDescriptor {
         &self.uri
     }
 
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
     pub fn offset(&self) -> i64 {
         self.offset
     }
@@ -78,7 +82,12 @@ impl BlobDescriptor {
         self.length
     }
 
-    pub(crate) fn range_spec(&self) -> crate::Result<BlobRangeSpec> {
+    /// Validate that this descriptor represents a usable byte range.
+    ///
+    /// A length of `-1` means reading from `offset` to the end of the object.
+    /// Other negative lengths, negative offsets, and overflowing bounded ranges
+    /// are rejected.
+    pub fn validate(&self) -> crate::Result<()> {
         if self.offset < 0 {
             return Err(Error::DataInvalid {
                 message: format!(
@@ -98,22 +107,29 @@ impl BlobDescriptor {
             });
         }
 
+        if self.length >= 0 {
+            (self.offset as u64)
+                .checked_add(self.length as u64)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "BlobDescriptor range overflows u64: offset={}, length={}",
+                        self.offset, self.length
+                    ),
+                    source: None,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn range_spec(&self) -> crate::Result<BlobRangeSpec> {
+        self.validate()?;
+
         let offset = self.offset as u64;
         let length = if self.length == -1 {
             None
         } else {
             Some(self.length as u64)
         };
-        if let Some(length) = length {
-            offset
-                .checked_add(length)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor range overflows u64: offset={offset}, length={length}"
-                    ),
-                    source: None,
-                })?;
-        }
 
         Ok(BlobRangeSpec { offset, length })
     }
@@ -231,6 +247,20 @@ mod tests {
         let bytes = desc.serialize();
         let deserialized = BlobDescriptor::deserialize(&bytes).unwrap();
         assert_eq!(desc, deserialized);
+        assert_eq!(deserialized.version(), CURRENT_VERSION);
+        deserialized.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_ranges() {
+        let negative_offset = BlobDescriptor::new("file:///tmp/a".to_string(), -1, 1);
+        assert!(negative_offset.validate().is_err());
+
+        let negative_length = BlobDescriptor::new("file:///tmp/a".to_string(), 0, -2);
+        assert!(negative_length.validate().is_err());
+
+        let to_end = BlobDescriptor::new("file:///tmp/a".to_string(), i64::MAX, -1);
+        to_end.validate().unwrap();
     }
 
     #[test]
