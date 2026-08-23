@@ -1299,13 +1299,14 @@ impl Plan {
     ///
     /// Negative file sizes are treated as unknown and do not contribute. The
     /// result is therefore a lower bound when a connector cannot provide every
-    /// file size.
+    /// file size. Totals larger than [`u64::MAX`] saturate at that value so
+    /// callers cannot under-count an oversized plan due to integer overflow.
     pub fn planned_data_file_bytes(&self) -> u64 {
         self.splits
             .iter()
             .flat_map(DataSplit::data_files)
             .filter_map(|file| u64::try_from(file.file_size).ok())
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     /// Consume this plan and return its splits without cloning their file metadata.
@@ -1401,6 +1402,22 @@ mod tests {
 
         assert_eq!(splits.len(), 1);
         assert!(Arc::ptr_eq(&data_files, &splits[0].data_files));
+    }
+
+    #[test]
+    fn planned_data_file_bytes_saturates_on_overflow() {
+        let mut first = file("a.parquet", 10, Some(0));
+        first.file_size = i64::MAX;
+        let mut second = file("b.parquet", 10, Some(10));
+        second.file_size = i64::MAX;
+        let mut overflow = file("c.parquet", 10, Some(20));
+        overflow.file_size = 2;
+        let mut unknown = file("unknown.parquet", 10, Some(30));
+        unknown.file_size = -1;
+
+        let plan = Plan::new(vec![split(vec![first, second, overflow, unknown], true)]);
+
+        assert_eq!(plan.planned_data_file_bytes(), u64::MAX);
     }
 
     #[test]
